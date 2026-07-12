@@ -1,0 +1,7 @@
+/target
+/test/
+.synapse/
+**/*.rs.bk
+.DS_Store
+.idea/
+.vscode/
