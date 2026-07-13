@@ -350,6 +350,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "neoengram"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "fs2",
+ "futures",
+ "libc",
+ "neoengram-core",
+ "reflink-copy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "unicode-normalization",
+ "walkdir",
+]
+
+[[package]]
+name = "neoengram-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "fastcdc",
+ "memmap2",
+ "reflink-copy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -495,41 +530,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "synapse"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "fastcdc",
- "memmap2",
- "reflink-copy",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "synapse-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "fs2",
- "futures",
- "libc",
- "reflink-copy",
- "serde",
- "serde_json",
- "synapse",
- "tempfile",
- "tokio",
- "unicode-normalization",
- "walkdir",
 ]
 
 [[package]]

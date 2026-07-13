@@ -1,6 +1,6 @@
 # 百 TB 存储架构
 
-Synapse 的目标是管理至少 100 TB 的逻辑 payload。这个目标首先约束接口和算法：命令的
+NeoEngram 的目标是管理至少 100 TB 的逻辑 payload。这个目标首先约束接口和算法：命令的
 内存占用必须由分页大小与有界并发决定，不能随文件数、Chunk 数、历史数或对象数线性增长。
 
 项目仍处开发阶段。仓库格式可以直接演进，不提供旧格式自动兼容；但同一格式内的内容 ID、
@@ -30,7 +30,7 @@ Synapse 的目标是管理至少 100 TB 的逻辑 payload。这个目标首先�
 不是百 TB 性能后端。
 
 每个元数据操作的输入、输出、事务、Drop 和错误语义以
-[`storage/metadata/README.md`](../crates/synapse-cli/src/storage/metadata/README.md) 为准；本文只
+[`storage/metadata/README.md`](../crates/neoengram-cli/src/storage/metadata/README.md) 为准；本文只
 维护跨模块发布顺序、规模热点和演进方向。
 
 ### ObjectStore
