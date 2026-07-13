@@ -1,9 +1,9 @@
-//! JSON 元数据与工作区恢复流程共用的 crash-safe 本地文件原语。
+//! 本地存储初始化、JSON 元数据与工作区恢复流程共用的 crash-safe 文件原语。
 
 use std::{
     fs,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{ensure, Context, Result};
@@ -29,6 +29,66 @@ pub(crate) fn ensure_or_create_directory(path: &Path) -> Result<()> {
         }
         Err(error) => Err(error).with_context(|| format!("无法检查仓库目录: {}", path.display())),
     }
+}
+
+pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let mut missing = Vec::<PathBuf>::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match fs::metadata(&current) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_dir(),
+                    "仓库目录的祖先不是目录: {}",
+                    current.display()
+                );
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.clone());
+                current = current
+                    .parent()
+                    .with_context(|| format!("仓库路径没有现有祖先: {}", path.display()))?
+                    .to_path_buf();
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("无法检查仓库目录祖先: {}", current.display()));
+            }
+        }
+    }
+
+    for directory in missing.into_iter().rev() {
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                ensure!(
+                    fs::metadata(&directory)
+                        .with_context(|| format!(
+                            "无法检查并发创建的目录: {}",
+                            directory.display()
+                        ))?
+                        .is_dir(),
+                    "并发创建的仓库路径不是目录: {}",
+                    directory.display()
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("无法创建仓库目录: {}", directory.display()));
+            }
+        }
+        sync_parent(&directory)?;
+    }
+
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("无法检查新建仓库目录: {}", path.display()))?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "初始化路径不是普通目录: {}",
+        path.display()
+    );
+    Ok(())
 }
 
 pub(crate) fn ensure_directory(path: &Path, kind: &str) -> Result<()> {
@@ -167,6 +227,98 @@ pub(crate) fn rename_durable(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn rename_noreplace_durable(source: &Path, destination: &Path) -> Result<()> {
+    let source_parent = source
+        .parent()
+        .with_context(|| format!("源路径没有父目录: {}", source.display()))?;
+    let destination_parent = destination
+        .parent()
+        .with_context(|| format!("目标路径没有父目录: {}", destination.display()))?;
+
+    rename_noreplace(source, destination)?;
+
+    if source_parent == destination_parent {
+        sync_directory(destination_parent)?;
+    } else {
+        sync_directory(destination_parent)?;
+        sync_directory(source_parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)
+    .with_context(|| {
+        format!(
+            "无法以 no-replace 方式重命名 {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    ensure!(
+        !source_wide[..source_wide.len() - 1].contains(&0)
+            && !destination_wide[..destination_wide.len() - 1].contains(&0),
+        "重命名路径包含 NUL"
+    );
+
+    // flags=0 不包含 MOVEFILE_REPLACE_EXISTING，目标存在时 Windows 会原子失败。
+    // SAFETY: 两个缓冲区都以 NUL 结尾、已拒绝内嵌 NUL，并在只读调用期间保持存活。
+    let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), 0) };
+    if moved == 0 {
+        return Err(io::Error::last_os_error()).with_context(|| {
+            format!(
+                "无法以 no-replace 方式重命名 {} -> {}",
+                source.display(),
+                destination.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    windows
+)))]
+fn rename_noreplace(_source: &Path, _destination: &Path) -> Result<()> {
+    anyhow::bail!("当前平台不支持原子 no-replace rename，无法安全发布新仓库")
+}
+
 pub(crate) fn sync_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
@@ -189,4 +341,28 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
         let _ = path;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use anyhow::Result;
+
+    use super::rename_noreplace_durable;
+
+    #[test]
+    fn noreplace_rename_preserves_an_existing_directory() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&source)?;
+        fs::create_dir(&destination)?;
+        fs::write(source.join("source.txt"), b"source")?;
+
+        assert!(rename_noreplace_durable(&source, &destination).is_err());
+        assert_eq!(fs::read(source.join("source.txt"))?, b"source");
+        assert_eq!(fs::read_dir(&destination)?.count(), 0);
+        Ok(())
+    }
 }

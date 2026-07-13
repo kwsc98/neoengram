@@ -1,7 +1,7 @@
 //! 可替换的元数据持久化边界。
 //!
-//! 当前 `JsonMetadataStore` 是开发期本地实现；后续 SQLite 后端应实现同一契约。Chunk
-//! payload 与工作区恢复 journal 具有不同生命周期和原子性边界，因此不在本模块中。
+//! `JsonMetadataStore` 和 `SqliteMetadataStore` 实现同一契约。Chunk payload 与工作区
+//! 恢复 journal 具有不同生命周期和原子性边界，因此不在本模块中。
 //! 完整的逐操作语义见同目录 `README.md`。
 
 use std::{fmt::Debug, num::NonZeroU32, path::Path, sync::Arc};
@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::storage::STORAGE_TEMP_FILE_PREFIX;
 
 mod json;
+mod sqlite;
 
 use json::JsonMetadataStore;
+use sqlite::SqliteMetadataStore;
 
 /// 单次存储扫描允许返回的最大记录数。后端必须拒绝更大的请求，防止调用方绕过分页接口
 /// 再次把完整仓库物化到内存。
@@ -152,6 +154,7 @@ pub(crate) trait TreeWriter: Debug {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MetadataStoreKind {
     Json,
+    Sqlite,
 }
 
 /// 一个命名引用及其目标。引用名使用 `refs/...` 形式，与具体后端的文件名或表结构无关。
@@ -237,6 +240,9 @@ pub(crate) fn open_metadata_store(
 ) -> Arc<dyn MetadataStore> {
     match kind {
         MetadataStoreKind::Json => Arc::new(JsonMetadataStore::new(metadata_root.to_path_buf())),
+        MetadataStoreKind::Sqlite => {
+            Arc::new(SqliteMetadataStore::new(metadata_root.to_path_buf()))
+        }
     }
 }
 
@@ -322,6 +328,55 @@ impl ManifestHasher {
 }
 
 pub(crate) fn tree_records_id(files: &[FileRecord]) -> Result<String> {
+    let mut hasher = TreeHasher::new();
+    for file in files {
+        hasher.push(file)?;
+    }
+    Ok(hasher.finish().0)
+}
+
+#[derive(Debug)]
+struct TreeHasher {
+    hasher: blake3::Hasher,
+    first: bool,
+    file_count: u64,
+}
+
+impl TreeHasher {
+    fn new() -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(TREE_HASH_DOMAIN);
+        hasher.update(&[0]);
+        hasher.update(b"[");
+        Self {
+            hasher,
+            first: true,
+            file_count: 0,
+        }
+    }
+
+    fn push(&mut self, file: &FileRecord) -> Result<()> {
+        if !self.first {
+            self.hasher.update(b",");
+        }
+        let encoded = serde_json::to_vec(file).context("无法序列化 Tree 文件记录")?;
+        self.hasher.update(&encoded);
+        self.file_count = self
+            .file_count
+            .checked_add(1)
+            .context("Tree 文件数量溢出")?;
+        self.first = false;
+        Ok(())
+    }
+
+    fn finish(mut self) -> (String, u64) {
+        self.hasher.update(b"]");
+        (self.hasher.finalize().to_hex().to_string(), self.file_count)
+    }
+}
+
+#[cfg(test)]
+fn legacy_tree_records_id(files: &[FileRecord]) -> Result<String> {
     let canonical = serde_json::to_vec(files).context("无法序列化 Tree 文件记录")?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(TREE_HASH_DOMAIN);

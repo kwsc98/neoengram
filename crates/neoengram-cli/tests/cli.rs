@@ -1,10 +1,14 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 use neoengram_core::{Chunk, Commit, FileNode, Index, Tree, INDEX_FORMAT_VERSION};
 use serde::{de::DeserializeOwned, Deserialize};
 
 #[test]
-fn initializes_repository_layout_idempotently() -> Result<(), Box<dyn std::error::Error>> {
+fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
 
     let first = command(temporary.path()).arg("init").output()?;
@@ -16,6 +20,145 @@ fn initializes_repository_layout_idempotently() -> Result<(), Box<dyn std::error
     assert!(temporary.path().join(".neoengram/files").is_dir());
     assert!(temporary.path().join(".neoengram/staging").is_dir());
     assert!(temporary.path().join(".neoengram/transactions").is_dir());
+    let repository_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
+    assert_eq!(repository_config["format_version"], 3);
+    assert_eq!(repository_config["metadata_store"], "sqlite");
+    assert_eq!(repository_config["object_store"], "loose");
+    assert!(metadata_dir.join("metadata.sqlite3").is_file());
+    assert!(!metadata_dir.join("index.json").exists());
+
+    let second = command(temporary.path()).arg("init").output()?;
+    assert!(second.status.success());
+    assert!(
+        String::from_utf8(second.stdout)?.contains("Reinitialized existing NeoEngram repository")
+    );
+    let reopened_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
+    assert_eq!(reopened_config["metadata_store"], "sqlite");
+    assert!(metadata_dir.join("metadata.sqlite3").is_file());
+    assert!(!metadata_dir.join("index.json").exists());
+    Ok(())
+}
+
+#[test]
+fn init_creates_a_missing_nested_repository_root() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let output = command(temporary.path())
+        .args(["init", "nested/repository"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "nested init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let metadata_dir = temporary
+        .path()
+        .join("nested/repository/.neoengram/metadata");
+    let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
+    assert_eq!(config["metadata_store"], "sqlite");
+    assert!(metadata_dir.join("metadata.sqlite3").is_file());
+    Ok(())
+}
+
+#[test]
+fn crashed_new_init_does_not_pin_the_metadata_backend() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+
+    let failed = command(temporary.path())
+        .env("NEOENGRAM_TEST_CRASH_AT", "init-before-publish")
+        .arg("init")
+        .output()?;
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("init-before-publish"));
+    assert!(!temporary.path().join(".neoengram").exists());
+    assert!(
+        fs::read_dir(temporary.path())?.any(|entry| entry.is_ok_and(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".neoengram-tmp-")))
+    );
+
+    let retried = command(temporary.path())
+        .args(["init", "--metadata-store", "json"])
+        .output()?;
+    assert!(
+        retried.status.success(),
+        "json retry failed: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let metadata_dir = temporary.path().join(".neoengram/metadata");
+    let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
+    assert_eq!(config["metadata_store"], "json");
+    assert!(metadata_dir.join("index.json").is_file());
+    assert!(!metadata_dir.join("metadata.sqlite3").exists());
+    let add = command(temporary.path()).args(["add", "."]).output()?;
+    assert!(
+        add.status.success(),
+        "add after retry failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    assert_eq!(read_index(&metadata_dir)?, Index::default());
+    Ok(())
+}
+
+#[test]
+fn concurrent_init_publishes_exactly_one_metadata_backend() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let sqlite = command(temporary.path())
+        .args(["init", "--metadata-store", "sqlite"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let json = command(temporary.path())
+        .args(["init", "--metadata-store", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let sqlite = sqlite.wait_with_output()?;
+    let json = json.wait_with_output()?;
+    assert_ne!(
+        sqlite.status.success(),
+        json.status.success(),
+        "sqlite stderr: {}\njson stderr: {}",
+        String::from_utf8_lossy(&sqlite.stderr),
+        String::from_utf8_lossy(&json.stderr)
+    );
+
+    let metadata_dir = temporary.path().join(".neoengram/metadata");
+    let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
+    match config["metadata_store"].as_str() {
+        Some("sqlite") => {
+            assert!(sqlite.status.success());
+            assert!(metadata_dir.join("metadata.sqlite3").is_file());
+            assert!(!metadata_dir.join("index.json").exists());
+        }
+        Some("json") => {
+            assert!(json.status.success());
+            assert!(metadata_dir.join("index.json").is_file());
+            assert!(!metadata_dir.join("metadata.sqlite3").exists());
+        }
+        backend => panic!("unexpected metadata backend: {backend:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn initializes_and_reopens_an_explicit_json_metadata_repository(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+
+    let first = command(temporary.path())
+        .args(["init", "--metadata-store", "json"])
+        .output()?;
+    assert!(
+        first.status.success(),
+        "json init failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let metadata_dir = temporary.path().join(".neoengram/metadata");
     assert!(metadata_dir.join("trees").is_dir());
     assert!(metadata_dir.join("manifests").is_dir());
     assert!(metadata_dir.join("commits").is_dir());
@@ -24,20 +167,59 @@ fn initializes_repository_layout_idempotently() -> Result<(), Box<dyn std::error
         fs::read_to_string(metadata_dir.join("HEAD"))?,
         "ref: refs/heads/main\n"
     );
-    let index = read_index(&metadata_dir)?;
-    assert_eq!(index, Index::default());
+    assert_eq!(read_index(&metadata_dir)?, Index::default());
     let repository_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
     assert_eq!(repository_config["format_version"], 3);
     assert_eq!(repository_config["metadata_store"], "json");
     assert_eq!(repository_config["object_store"], "loose");
-
+    assert!(metadata_dir.join("index.json").is_file());
+    assert!(!metadata_dir.join("metadata.sqlite3").exists());
     let original_index = fs::read(metadata_dir.join("index.json"))?;
+
     let second = command(temporary.path()).arg("init").output()?;
-    assert!(second.status.success());
+    assert!(
+        second.status.success(),
+        "json reinit failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
     assert!(
         String::from_utf8(second.stdout)?.contains("Reinitialized existing NeoEngram repository")
     );
+    let reopened_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
+    assert_eq!(reopened_config["metadata_store"], "json");
     assert_eq!(fs::read(metadata_dir.join("index.json"))?, original_index);
+    assert!(!metadata_dir.join("metadata.sqlite3").exists());
+    Ok(())
+}
+
+#[test]
+fn init_rejects_an_explicit_metadata_backend_change() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let initialized = command(temporary.path())
+        .args(["init", "--metadata-store", "sqlite"])
+        .output()?;
+    assert!(
+        initialized.status.success(),
+        "sqlite init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+
+    let metadata_dir = temporary.path().join(".neoengram/metadata");
+    let config_before = fs::read(metadata_dir.join("repository.json"))?;
+    let conflicting = command(temporary.path())
+        .args(["init", "--metadata-store", "json"])
+        .output()?;
+
+    assert!(!conflicting.status.success());
+    let stderr = String::from_utf8(conflicting.stderr)?;
+    assert!(stderr.contains("已有仓库使用 `sqlite` 元数据后端"));
+    assert!(stderr.contains("不会自动迁移元数据后端"));
+    assert_eq!(
+        fs::read(metadata_dir.join("repository.json"))?,
+        config_before
+    );
+    assert!(metadata_dir.join("metadata.sqlite3").is_file());
+    assert!(!metadata_dir.join("index.json").exists());
     Ok(())
 }
 
@@ -649,7 +831,9 @@ fn add_requires_an_initialized_repository() -> Result<(), Box<dyn std::error::Er
 }
 
 fn initialize(path: &Path) -> std::io::Result<()> {
-    let output = command(path).arg("init").output()?;
+    let output = command(path)
+        .args(["init", "--metadata-store", "json"])
+        .output()?;
     assert!(
         output.status.success(),
         "init failed: {}",

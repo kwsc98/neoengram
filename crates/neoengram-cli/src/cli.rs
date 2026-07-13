@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::commands;
+use crate::{commands, storage::metadata::MetadataStoreKind};
 
-/// 面向 AI 数据集和模型权重的分布式文件版本控制系统。
+/// 面向 AI 数据集和模型权重的内容寻址版本控制系统。
 #[derive(Debug, Parser)]
 #[command(name = "neoengram", version, about)]
 struct Cli {
@@ -42,6 +42,24 @@ struct InitArgs {
     /// 要初始化为 NeoEngram 仓库的目录。
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
+    /// 新仓库使用的元数据后端；省略时默认使用 SQLite。
+    #[arg(long, value_enum, value_name = "BACKEND")]
+    metadata_store: Option<MetadataStoreArgument>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MetadataStoreArgument {
+    Json,
+    Sqlite,
+}
+
+impl From<MetadataStoreArgument> for MetadataStoreKind {
+    fn from(value: MetadataStoreArgument) -> Self {
+        match value {
+            MetadataStoreArgument::Json => Self::Json,
+            MetadataStoreArgument::Sqlite => Self::Sqlite,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -107,7 +125,9 @@ struct RecoverArgs {
 
 pub(crate) async fn run() -> Result<()> {
     match Cli::parse().command {
-        Command::Init(arguments) => commands::init::execute(arguments.path).await,
+        Command::Init(arguments) => {
+            commands::init::execute(arguments.path, arguments.metadata_store.map(Into::into)).await
+        }
         Command::Add(arguments) => {
             if arguments.all {
                 commands::add::execute_with_options(arguments.path, true).await

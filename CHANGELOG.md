@@ -14,8 +14,9 @@
 - 增加 `add -A [PATH]`，支持按路径范围暂存删除。
 - 增加 checkout/rm 持久 journal、故障恢复和进程退出故障注入测试。
 - 增加分页 `MetadataStore`、单次流式发布的独立 FileManifest、Index version transaction、
-  Tree reader/writer、ref CAS、默认 `JsonMetadataStore` 和可复用后端契约测试。
-- 元数据契约、JSON 后端、契约测试和逐操作文档集中到独立 `storage/metadata` 模块。
+  Tree reader/writer、ref CAS 和可复用后端契约测试。
+- 增加行式 `SqliteMetadataStore` 并作为新仓库默认后端；保留可显式选择的 JSON 后端。
+- 元数据契约、JSON/SQLite 后端、契约测试和逐操作文档集中到独立 `storage/metadata` 模块。
 - 增加流式 `ObjectStore`、真实 `LooseObjectStore`、抽象切块入口及对象后端契约测试。
 - `repository.json` 格式 3 显式记录 `metadata_store` 和 `object_store`；开发期不兼容旧格式。
 
@@ -32,6 +33,8 @@
 
 ### Fixed
 
+- 新仓库改为在私有临时目录中完整初始化后原子发布；失败或退出不再暴露会锁定后端选择的
+  半初始化 `.neoengram`。
 - 已有同长度损坏对象不再被 `add` 接受。
 - 缺失或损坏 Chunk 不再能进入新 Commit。
 - checkout 支持文件与目录类型互换，并拒绝父级符号链接和路径逃逸。
