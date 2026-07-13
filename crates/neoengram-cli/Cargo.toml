@@ -1,7 +1,7 @@
 [package]
 name = "neoengram"
 description = "Version control for AI models and large datasets"
-publish = false
+publish = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
