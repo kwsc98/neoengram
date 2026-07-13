@@ -1,7 +1,10 @@
 # 元数据存储模块
 
-本目录定义 NeoEngram 的元数据持久化契约，并提供开发期使用的 JSON 后端。接口面向未来的
-SQLite 或其他行式后端设计，不暴露文件路径、SQL 连接或物理表结构。
+本目录定义 NeoEngram 的元数据持久化契约，并提供 JSON 与 SQLite 两个本地后端。
+上层不暴露文件路径、SQL 连接或物理表结构，所有后端共享同一套可观察契约。
+
+新仓库默认选择 SQLite；CLI 可以在初始化时显式选择 JSON。选择结果由 Repository 写入
+`metadata/repository.json`，后续打开必须沿用该后端，当前不会自动迁移已有元数据。
 
 `MetadataStore` 可以跨线程共享；它返回的 Reader、Snapshot、Transaction 和 Writer 只在
 创建它们的线程内使用，因此 SQLite read transaction 不需要额外实现 `Sync`。
@@ -88,8 +91,9 @@ Index 和 Tree 只保存轻量 `FileRecord`：
 - `items`：数量不能超过请求上限；
 - `next`：`None` 表示结束，否则作为下一页的 `after`。
 
-文件前缀包含路径本身及其 `/` 子孙；`None` 或空前缀表示全部文件。引用前缀采用同样
-规则，`refs` 表示全部引用。Chunk cursor 对调用方是不透明值。
+文件前缀包含路径本身及其 `/` 子孙；`None` 或空前缀表示全部文件。引用前缀也包含名称
+本身及其 `/` 子孙，但全量扫描必须使用 `refs`，空引用前缀非法。Chunk cursor 对调用方
+是不透明值。
 
 当前上限约束记录数，不约束单页序列化后的字节数。
 
@@ -172,8 +176,8 @@ Snapshot 同时实现 `MetadataReader`。创建后，后续 ref 更新或历史�
 结果和引用点查结果；Drop 时释放对应 read transaction 或内存视图。
 
 JSON 后端先在共享 ref 锁内固定 HEAD 和 refs，再按 Commit、Tree、Manifest 顺序捕获 ID。
-结合 Manifest -> Tree -> Commit -> ref 的发布顺序和不可变对象不删除规则，已捕获 ref 的
-依赖不会遗漏。不可达对象不保证来自同一个物理时刻。
+SQLite 后端使用 WAL read transaction 固定 HEAD、refs 和历史对象集合。两者都保证创建
+Snapshot 后的引用更新或新对象发布不会漂移该读视图。
 
 ## 引用 CAS
 
@@ -217,6 +221,9 @@ target 非空且不包含换行；目标格式和可达性由 Repository 与 fsc
 
 因此该方法不能描述为完整仓库 fsck。
 
+SQLite `verify_integrity` 另外执行 SQLite integrity/foreign-key check，并流式复算已发布
+Manifest、Tree 和 Index 版本摘要。它同样不代替 Repository 层的图可达性和 Chunk payload fsck。
+
 ## 发布与原子性
 
 一次 Commit 的可见性顺序必须是：
@@ -237,6 +244,9 @@ JSON 后端使用同目录临时文件、文件同步和原子 rename/no-clobber
 目录，其他平台依赖系统 rename 语义。Index 事务使用排他 advisory lock；ref CAS 使用
 排他 ref 锁；Snapshot 固定 refs 时使用共享 ref 锁。
 
+SQLite 后端使用 WAL、`synchronous=FULL`、外键与短写事务。Manifest/Tree 行先写入没有
+发布 header 的 staging set，最后只在短事务中发布 header；因此中断写入不会被 Reader 看到。
+
 持久写入可能在状态已经可见、结果返回前发生 I/O 错误。调用方遇到此类错误时应重新读取
 Index 版本、ref 或不可变对象确认结果，不能假定错误必然代表零副作用。
 
@@ -252,7 +262,7 @@ rename 前退出可能留下 `.neoengram-tmp-` 开头的普通临时文件。枚
 - Index expected version 不匹配；
 - Manifest recipe、Tree 顺序或关联 Manifest 不一致；
 - 同一内容 ID 已存在不同内容；
-- JSON 损坏、布局异常、符号链接或非普通文件；
+- JSON 或 SQLite 数据损坏、SQLite identity/schema 不匹配、布局异常、符号链接或非普通文件；
 - 后端锁竞争和 I/O 失败。
 
 对象不存在使用 `Option::None`。ref CAS 冲突使用 `ReferenceCas::Mismatch`，不转换成后端
@@ -264,8 +274,8 @@ rename 前退出可能留下 `.neoengram-tmp-` 开头的普通临时文件。枚
 metadata/
   HEAD
   index.json
-  index.lock
-  refs.lock
+  index.lock           # 按需创建
+  refs.lock            # 按需创建
   refs/heads/[main]    # 首次 ref CAS 后才存在
   manifests/<id>.json
   trees/<id>.json
@@ -283,5 +293,26 @@ JSON 是功能后端，不是百 TB 性能后端：
 - 文件锁只提供单机进程间协调；
 - 没有元数据 GC generation、条件删除或可恢复 scan cursor。
 
-SQLite 后端必须保持上述可观察契约，并使用行式 Index/Manifest、短写事务、MVCC Snapshot、
-数据库内 ref CAS 和真正有界的分页查询。
+## SQLite 后端
+
+```text
+metadata/
+  metadata.sqlite3
+  metadata.sqlite3-wal   # 运行期 sidecar
+  metadata.sqlite3-shm   # 运行期 sidecar
+```
+
+SQLite 后端把 Index、Manifest Chunk、Tree File、Commit 和 ref 按行保存：
+
+- Reader 使用 keyset 查询，只物化当前页；
+- Index 基于固定 base version 构建 overlay，提交时复核版本并原子应用；
+- Manifest/Tree 使用不可见 staging set，支持有界批量写入；
+- Snapshot 持有 WAL read transaction，ref CAS 在单个 write transaction 内比较和更新；
+- 数据库使用 `application_id` 标识所有权，拒绝把非空外部 SQLite 文件初始化为元数据后端；
+- schema 通过 `user_version` 版本化，未知版本直接拒绝打开。
+
+操作返回错误或 `TreeWriter` 被丢弃时会尽力回收对应 staging set。进程崩溃可能留下不可见的
+staging 行；当前不会按时间自动删除，以免误删仍在运行的长写入，后续 GC 需要租约或安全 cutoff。
+
+SQLite 解除了 JSON 物理布局的全量物化限制，但命令层仍可能把分页重新收集成完整快照，
+因此不能单凭选用 SQLite 宣称整个命令已适用于百 TB。

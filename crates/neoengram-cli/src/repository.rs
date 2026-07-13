@@ -23,6 +23,7 @@ use crate::storage::{
         StoredReference,
     },
     object::{open_object_store, ObjectStoreKind},
+    STORAGE_TEMP_FILE_PREFIX,
 };
 
 #[cfg(unix)]
@@ -73,8 +74,15 @@ impl RepositoryConfig {
 }
 
 pub(crate) fn is_neoengram_dir_name(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| name.eq_ignore_ascii_case(NEOENGRAM_DIR_NAME))
+    name.to_str().is_some_and(|name| {
+        name.eq_ignore_ascii_case(NEOENGRAM_DIR_NAME)
+            || name
+                .as_bytes()
+                .get(..STORAGE_TEMP_FILE_PREFIX.len())
+                .is_some_and(|prefix| {
+                    prefix.eq_ignore_ascii_case(STORAGE_TEMP_FILE_PREFIX.as_bytes())
+                })
+    })
 }
 
 fn neoengram_dir_exists(root: &Path) -> Result<bool> {
@@ -105,20 +113,38 @@ pub(crate) struct Repository {
 
 impl Repository {
     pub(crate) fn at(root: PathBuf) -> Result<Self> {
-        Self::with_store_kinds(root, MetadataStoreKind::Json, ObjectStoreKind::Loose)
+        Self::with_store_kinds(root, MetadataStoreKind::Sqlite, ObjectStoreKind::Loose)
     }
 
-    pub(crate) fn open_or_default(root: PathBuf) -> Result<Self> {
+    pub(crate) fn open_or_with_metadata_store(
+        root: PathBuf,
+        requested_metadata_store: Option<MetadataStoreKind>,
+    ) -> Result<Self> {
         if neoengram_dir_exists(&root)? {
             let repository_dir = root.join(NEOENGRAM_DIR_NAME);
-            Self::open(root).with_context(|| {
+            let repository = Self::open(root).with_context(|| {
                 format!(
                     "已有目录不是受支持的 NeoEngram 仓库: {}",
                     repository_dir.display()
                 )
-            })
+            })?;
+            if let Some(requested) = requested_metadata_store {
+                let actual = repository.metadata_store.kind();
+                ensure!(
+                    requested == actual,
+                    "已有仓库使用 `{}` 元数据后端，不能以 `{}` 重新初始化；NeoEngram 不会自动迁移元数据后端",
+                    metadata_store_kind_name(actual),
+                    metadata_store_kind_name(requested)
+                );
+            }
+            Ok(repository)
         } else {
-            Self::at(root)
+            match requested_metadata_store {
+                Some(metadata_store) => {
+                    Self::with_store_kinds(root, metadata_store, ObjectStoreKind::Loose)
+                }
+                None => Self::at(root),
+            }
         }
     }
 
@@ -248,10 +274,24 @@ impl Repository {
         ] {
             ensure_or_create_directory(&directory)?;
         }
-        self.object_store.initialize()?;
 
         let current_config =
             RepositoryConfig::current(self.metadata_store.kind(), self.object_store_kind);
+        if self.repository_file().try_exists()? {
+            let config = read_repository_config(&self.repository_file())?;
+            ensure!(
+                config == current_config,
+                "已有仓库使用不受支持的格式版本 {}",
+                config.format_version
+            );
+        }
+
+        self.object_store.initialize()?;
+        self.metadata_store.initialize(DEFAULT_HEAD_REFERENCE)?;
+        self.metadata_store.read_index()?;
+        self.object_store.validate_layout()?;
+        self.metadata_store.validate_layout()?;
+
         publish_json_if_absent(&self.repository_file(), &current_config)?;
         let config = read_repository_config(&self.repository_file())?;
         ensure!(
@@ -259,10 +299,6 @@ impl Repository {
             "已有仓库使用不受支持的格式版本 {}",
             config.format_version
         );
-
-        self.metadata_store.initialize(DEFAULT_HEAD_REFERENCE)?;
-        self.metadata_store.read_index()?;
-
         self.validate()
     }
 
@@ -535,6 +571,13 @@ impl Repository {
                 actual
             ),
         }
+    }
+}
+
+const fn metadata_store_kind_name(kind: MetadataStoreKind) -> &'static str {
+    match kind {
+        MetadataStoreKind::Json => "json",
+        MetadataStoreKind::Sqlite => "sqlite",
     }
 }
 
@@ -900,6 +943,7 @@ mod tests {
             "name ",
             "bad?.bin",
             ".NeoEngram/private.bin",
+            ".neoengram-tmp-orphan/private.bin",
             "cafe\u{301}.bin",
         ] {
             assert!(

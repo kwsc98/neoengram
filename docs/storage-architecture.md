@@ -26,8 +26,13 @@ NeoEngram 的目标是管理至少 100 TB 的逻辑 payload。这个目标首先
 `IndexVersion` 同时包含单调 revision 和内容摘要。revision 与 Index 在一次原子写入中更新，
 因此即使内容发生 A -> B -> A，也不会产生 ABA 误判。
 
-当前 `JsonMetadataStore` 实现上述完整契约，但内部仍会整份读取或重写 JSON。它是功能后端，
-不是百 TB 性能后端。
+`JsonMetadataStore` 和 `SqliteMetadataStore` 均实现上述完整契约。JSON 后端会整份读取或
+重写元数据；SQLite 后端使用行式存储、keyset 分页、MVCC snapshot 和数据库内 ref CAS。
+新仓库默认使用 SQLite，也可以在初始化时显式选择 JSON。后端类型持久化在
+`metadata/repository.json` 中，后续打开以该配置为准；当前不提供后端间自动迁移。
+新控制目录先在同文件系统的私有临时目录中完整初始化，再通过 no-replace rename 原子发布，
+因此配置或后端初始化失败不会暴露半初始化的 `.neoengram`。缺少原子 no-replace 目录重命名
+能力的平台会拒绝新仓库初始化，而不是退化为存在覆盖竞态的发布方式。
 
 每个元数据操作的输入、输出、事务、Drop 和错误语义以
 [`storage/metadata/README.md`](../crates/neoengram-cli/src/storage/metadata/README.md) 为准；本文只
@@ -73,9 +78,8 @@ Repository 的领域校验。
 后续独立能力。
 
 `MetadataReader` 用于点查，`MetadataSnapshot` 只用于需要固定枚举边界的操作，避免 log 每读
-一个 Commit 都加载全部历史。JSON snapshot 先固定 refs，再按发布顺序的逆序捕获 Commit、
-Tree 和 Manifest ID，从而保证已捕获 ref 的依赖闭包完整。数据库后端应使用 MVCC read
-transaction 或等价 cutoff。
+一个 Commit 都加载全部历史。JSON snapshot 固定 refs 和历史 ID 集合；SQLite snapshot 使用
+WAL read transaction 固定同一个 MVCC 视图。
 
 ObjectStore 的当前分页是 weak scan，没有固定 generation。它可用于检查，但不能作为并发 GC
 的删除依据。远端或 pack 后端需要提供 snapshot/cutoff 后，GC 才能启用。
@@ -98,16 +102,15 @@ ObjectStore 的当前分页是 weak scan，没有固定 generation。它可用�
 
 ## 下一步
 
-1. 实现 SQLite 元数据后端：Index/FileManifest 行式存储、短事务、MVCC snapshot 和 ref CAS。
-2. 让 add 直接使用 IndexTxn 的 scope replace/upsert，并用 staging 批次控制内存和事务时长。
-3. 为新写入对象保存 verified receipt；commit 只核对本次变化和持久化状态，完整 rehash 留给
+1. 让 add 直接使用 IndexTxn 的 scope replace/upsert，并用 staging 批次控制内存和事务时长。
+2. 为新写入对象保存 verified receipt；commit 只核对本次变化和持久化状态，完整 rehash 留给
    fsck，避免每次提交读取整个 100 TB。
-4. 将 status/commit 改为有序分页 merge；rm 使用 revision token 和前缀事务。
-5. 将 checkout 改为逐文件物化到事务 staging；缓存变成有配额的 best-effort 层。
-6. 将 checkout/rm journal 改为追加式有界批次，只保存 before/after revision 与 root。
-7. 让 fsck 使用固定 cutoff、可恢复 cursor 和磁盘临时集合，不长期持有全仓库写锁。
-8. 用 fanout、pack 或带 catalog 的对象后端替代平铺 loose 目录，并为后端配置增加 locator。
-9. 基于实际基准决定是否引入 Merkle Tree；SQLite 分页记录和独立 FileManifest 应先解除主要
+3. 将 status/commit 改为有序分页 merge；rm 使用 revision token 和前缀事务。
+4. 将 checkout 改为逐文件物化到事务 staging；缓存变成有配额的 best-effort 层。
+5. 将 checkout/rm journal 改为追加式有界批次，只保存 before/after revision 与 root。
+6. 让 fsck 使用固定 cutoff、可恢复 cursor 和磁盘临时集合，不长期持有全仓库写锁。
+7. 用 fanout、pack 或带 catalog 的对象后端替代平铺 loose 目录，并为后端配置增加 locator。
+8. 基于实际基准决定是否引入 Merkle Tree；SQLite 分页记录和独立 FileManifest 应先解除主要
    内存瓶颈，Merkle 是局部更新与 root 计算优化，不是预先锁死的实现。
 
 ## 规模推导

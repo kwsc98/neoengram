@@ -4,14 +4,14 @@ use anyhow::{ensure, Result};
 use neoengram_core::{Chunk, Commit, FileNode, Index, INDEX_FORMAT_VERSION};
 
 use super::{
-    describe_manifest, file_manifest_id, tree_records_id, FileRecord, FileSetReader, IndexTxn,
-    JsonMetadataStore, MetadataStore, PageRequest, ReferenceCas, StoredReference, TreeWriter,
-    MAX_PAGE_SIZE,
+    describe_manifest, file_manifest_id, legacy_tree_records_id, tree_records_id, FileRecord,
+    FileSetReader, IndexTxn, JsonMetadataStore, MetadataStore, PageRequest, ReferenceCas,
+    SqliteMetadataStore, StoredReference, TreeWriter, MAX_PAGE_SIZE,
 };
 
 #[test]
 fn manifest_ids_are_stable() -> Result<()> {
-    let chunks = vec![
+    let chunks = [
         Chunk {
             hash: "1".repeat(64),
             offset: 0,
@@ -29,6 +29,30 @@ fn manifest_ids_are_stable() -> Result<()> {
             "ef41bc2c060f2113b2c52bdab58fadbce1cf93c48b4400fcdb82977bf164960e".to_owned(),
             "7f5d26a848edc1d6161c15a5d40e331f27a5781ed384c82a58bc19b07f35f9f1".to_owned()
         )
+    );
+    Ok(())
+}
+
+#[test]
+fn streaming_tree_ids_match_legacy_serialization() -> Result<()> {
+    let records = vec![
+        FileRecord {
+            path: "models/a%_quoted.bin".to_owned(),
+            total_size: 3,
+            chunk_count: 2,
+            manifest_id: "1".repeat(64),
+        },
+        FileRecord {
+            path: "weights/z.bin".to_owned(),
+            total_size: u64::MAX,
+            chunk_count: u64::MAX,
+            manifest_id: "f".repeat(64),
+        },
+    ];
+
+    assert_eq!(
+        tree_records_id(&records)?,
+        legacy_tree_records_id(&records)?
     );
     Ok(())
 }
@@ -66,6 +90,316 @@ fn json_backend_satisfies_metadata_store_contract() -> Result<()> {
     );
     assert_eq!(snapshot.get_reference("refs/heads/main")?, Some(commit_id));
     Ok(())
+}
+
+#[test]
+fn sqlite_backend_satisfies_metadata_store_contract() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("metadata");
+    let store = SqliteMetadataStore::new(root.clone());
+    let (tree_id, commit_id) = exercise_contract(&store)?;
+
+    // 新实例模拟进程重启；所有状态必须来自 SQLite，而不是连接内缓存。
+    let reopened = SqliteMetadataStore::new(root);
+    reopened.validate_layout()?;
+    assert_eq!(
+        collect_files(&reopened, reopened.read_index()?.as_ref())?[0].path,
+        "dir/model.bin"
+    );
+    let snapshot = reopened.snapshot()?;
+    assert_eq!(
+        snapshot.scan_tree_ids(&PageRequest::first(1)?)?.items,
+        vec![tree_id]
+    );
+    assert_eq!(
+        snapshot.scan_commit_ids(&PageRequest::first(1)?)?.items,
+        vec![commit_id.clone()]
+    );
+    assert_eq!(snapshot.get_reference("refs/heads/main")?, Some(commit_id));
+    Ok(())
+}
+
+#[test]
+fn json_backend_preserves_fixed_views_and_literal_prefixes() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let store = JsonMetadataStore::new(temporary.path().join("metadata"));
+    exercise_fixed_views_and_literal_prefixes(&store)
+}
+
+#[test]
+fn sqlite_backend_preserves_fixed_views_and_literal_prefixes() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let store = SqliteMetadataStore::new(temporary.path().join("metadata"));
+    exercise_fixed_views_and_literal_prefixes(&store)
+}
+
+#[test]
+fn sqlite_backend_rejects_unknown_schema_version() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("metadata");
+    let store = SqliteMetadataStore::new(root.clone());
+    store.initialize("refs/heads/main")?;
+
+    let connection = rusqlite::Connection::open(root.join("metadata.sqlite3"))?;
+    connection.pragma_update(None, "user_version", 999_i64)?;
+    drop(connection);
+
+    let reopened = SqliteMetadataStore::new(root);
+    assert!(reopened.validate_layout().is_err());
+    assert!(reopened.read_index().is_err());
+    Ok(())
+}
+
+#[test]
+fn sqlite_backend_rejects_foreign_database_without_mutating_it() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("metadata");
+    let database = root.join("metadata.sqlite3");
+    fs::create_dir(&root)?;
+
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.execute_batch("CREATE VIEW user_view AS SELECT 1 AS value")?;
+    let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    assert_eq!(journal_mode, "delete");
+    drop(connection);
+    let before = fs::read(&database)?;
+
+    let store = SqliteMetadataStore::new(root.clone());
+    let error = store
+        .initialize("refs/heads/main")
+        .expect_err("已有外部 SQLite 对象时必须拒绝初始化");
+    assert!(error
+        .to_string()
+        .contains("拒绝把已有 SQLite 数据库初始化为 NeoEngram 元数据库"));
+    assert_eq!(fs::read(&database)?, before);
+    assert!(!root.join("metadata.sqlite3-wal").exists());
+    assert!(!root.join("metadata.sqlite3-shm").exists());
+
+    let connection = rusqlite::Connection::open(database)?;
+    let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    assert_eq!(journal_mode, "delete");
+    let view_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'view' AND name = 'user_view'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(view_count, 1);
+    Ok(())
+}
+
+#[test]
+fn sqlite_tree_writer_drop_and_duplicate_finish_clean_staging_sets() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("metadata");
+    let database = root.join("metadata.sqlite3");
+    let store = SqliteMetadataStore::new(root);
+    store.initialize("refs/heads/main")?;
+
+    let writer = store.begin_tree_write()?;
+    let connection = rusqlite::Connection::open(&database)?;
+    let staging_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM tree_sets", [], |row| row.get(0))?;
+    assert_eq!(staging_count, 1);
+    drop(writer);
+    let staging_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM tree_sets", [], |row| row.get(0))?;
+    assert_eq!(staging_count, 0);
+
+    let first_id = store.begin_tree_write()?.finish()?;
+    let duplicate_id = store.begin_tree_write()?.finish()?;
+    assert_eq!(duplicate_id, first_id);
+    let published_set_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM tree_sets", [], |row| row.get(0))?;
+    assert_eq!(published_set_count, 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_backend_rejects_a_symlinked_database() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("metadata");
+    let database = root.join("metadata.sqlite3");
+    let outside = temporary.path().join("outside.sqlite3");
+    let store = SqliteMetadataStore::new(root.clone());
+    store.initialize("refs/heads/main")?;
+    fs::copy(&database, &outside)?;
+    let outside_before = fs::read(&outside)?;
+    fs::remove_file(&database)?;
+    symlink(&outside, &database)?;
+
+    let reopened = SqliteMetadataStore::new(root);
+    assert!(reopened.validate_layout().is_err());
+    assert!(reopened.read_index().is_err());
+    assert_eq!(fs::read(outside)?, outside_before);
+    Ok(())
+}
+
+fn exercise_fixed_views_and_literal_prefixes(store: &dyn MetadataStore) -> Result<()> {
+    store.initialize("refs/heads/main")?;
+    let fixed_index = store.read_index()?;
+    let fixed_index_version = fixed_index.version().clone();
+    let fixed_snapshot = store.snapshot()?;
+
+    let chunks = [
+        Chunk {
+            hash: "3".repeat(64),
+            offset: 0,
+            size: 1,
+        },
+        Chunk {
+            hash: "4".repeat(64),
+            offset: 1,
+            size: 2,
+        },
+    ];
+    let mut chunk_input = chunks.iter().cloned().map(Ok);
+    let manifest = store.put_manifest(3, &mut chunk_input)?;
+    ensure!(
+        chunk_input.next().is_none(),
+        "Manifest 写入必须消费完整 Iterator"
+    );
+    let manifest_reader = store
+        .open_manifest(&manifest.id)?
+        .expect("刚发布的 Manifest 应存在");
+    let first_chunk_page = manifest_reader.scan_chunks(&PageRequest::first(1)?)?;
+    assert_eq!(first_chunk_page.items, vec![chunks[0].clone()]);
+    let second_chunk_page =
+        manifest_reader.scan_chunks(&PageRequest::new(first_chunk_page.next, 1)?)?;
+    assert_eq!(second_chunk_page.items, vec![chunks[1].clone()]);
+    assert_eq!(second_chunk_page.next, None);
+    assert!(manifest_reader
+        .scan_chunks(&PageRequest::new(Some("not-a-cursor".to_owned()), 1)?)
+        .is_err());
+    assert!(manifest_reader
+        .scan_chunks(&PageRequest::new(Some("2".to_owned()), 1)?)
+        .is_err());
+
+    let mut records = [
+        "percent%",
+        "percent%/child",
+        "percentX/other",
+        "under_",
+        "under_/child",
+        "underX/other",
+    ]
+    .into_iter()
+    .map(|path| FileRecord::from_manifest(path.to_owned(), 3, &manifest))
+    .collect::<Vec<_>>();
+    records.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+
+    let mut transaction = store.begin_index_transaction(Some(&fixed_index_version))?;
+    for record in &records {
+        transaction.upsert_file(record)?;
+    }
+    assert_eq!(
+        collect_record_paths(transaction.as_ref(), Some("percent%"))?,
+        vec!["percent%".to_owned(), "percent%/child".to_owned()]
+    );
+    assert_eq!(
+        collect_record_paths(transaction.as_ref(), Some("under_"))?,
+        vec!["under_".to_owned(), "under_/child".to_owned()]
+    );
+    let current_version = transaction.commit()?;
+    assert_ne!(current_version, fixed_index_version);
+
+    assert_eq!(fixed_index.version(), &fixed_index_version);
+    assert!(fixed_index
+        .scan_files(None, &PageRequest::first(1)?)?
+        .items
+        .is_empty());
+    let current_index = store.read_index()?;
+    assert_eq!(
+        collect_record_paths(current_index.as_ref(), Some("percent%"))?,
+        vec!["percent%".to_owned(), "percent%/child".to_owned()]
+    );
+    assert_eq!(
+        collect_record_paths(current_index.as_ref(), Some("under_"))?,
+        vec!["under_".to_owned(), "under_/child".to_owned()]
+    );
+
+    let dropped_tree_id = tree_records_id(&records[..1])?;
+    let mut dropped_writer = store.begin_tree_write()?;
+    dropped_writer.append_file(&records[0])?;
+    drop(dropped_writer);
+    assert!(store.snapshot()?.open_tree(&dropped_tree_id)?.is_none());
+
+    let mut unordered_writer = store.begin_tree_write()?;
+    unordered_writer.append_file(records.last().expect("records 非空"))?;
+    assert!(unordered_writer.append_file(&records[0]).is_err());
+    drop(unordered_writer);
+    assert!(store
+        .snapshot()?
+        .scan_tree_ids(&PageRequest::first(1)?)?
+        .items
+        .is_empty());
+
+    let mut writer = store.begin_tree_write()?;
+    for record in &records {
+        writer.append_file(record)?;
+    }
+    let tree_id = writer.finish()?;
+    let commit_id = "d".repeat(64);
+    let commit = Commit {
+        tree_hash: tree_id.clone(),
+        parent: None,
+        message: "fixed snapshot boundary".to_owned(),
+        created_at_unix_ms: 2,
+    };
+    store.put_commit(&commit_id, &commit)?;
+
+    assert!(fixed_snapshot
+        .scan_manifest_ids(&PageRequest::first(1)?)?
+        .items
+        .is_empty());
+    assert!(fixed_snapshot.open_manifest(&manifest.id)?.is_none());
+    assert!(fixed_snapshot
+        .scan_tree_ids(&PageRequest::first(1)?)?
+        .items
+        .is_empty());
+    assert!(fixed_snapshot.open_tree(&tree_id)?.is_none());
+    assert!(fixed_snapshot
+        .scan_commit_ids(&PageRequest::first(1)?)?
+        .items
+        .is_empty());
+    assert_eq!(fixed_snapshot.get_commit(&commit_id)?, None);
+
+    let current_snapshot = store.snapshot()?;
+    assert_eq!(
+        current_snapshot
+            .scan_manifest_ids(&PageRequest::first(1)?)?
+            .items,
+        vec![manifest.id]
+    );
+    assert_eq!(
+        current_snapshot
+            .scan_tree_ids(&PageRequest::first(1)?)?
+            .items,
+        vec![tree_id]
+    );
+    assert_eq!(
+        current_snapshot
+            .scan_commit_ids(&PageRequest::first(1)?)?
+            .items,
+        vec![commit_id]
+    );
+    Ok(())
+}
+
+fn collect_record_paths(reader: &dyn FileSetReader, prefix: Option<&str>) -> Result<Vec<String>> {
+    let mut request = PageRequest::first(1)?;
+    let mut paths = Vec::new();
+    loop {
+        let page = reader.scan_files(prefix, &request)?;
+        paths.extend(page.items.into_iter().map(|record| record.path));
+        let Some(next) = page.next else {
+            break;
+        };
+        request.after = Some(next);
+    }
+    Ok(paths)
 }
 
 fn exercise_contract(store: &dyn MetadataStore) -> Result<(String, String)> {

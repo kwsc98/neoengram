@@ -1,14 +1,20 @@
 # NeoEngram
 
-NeoEngram 是一个面向 AI 模型和海量数据集的分布式文件版本控制系统。当前阶段实现了
-本地内容定义切块（CDC）、BLAKE3 内容寻址、暂存区以及无合并的线性 Commit。
+**NeoEngram** 的名字来自 *engram*（记忆痕迹），即人脑中承载和保存记忆的信息痕迹；
+“Neo”代表面向 AI 数据的新一代实现。它是一个为模型权重和大规模数据集设计的内容寻址
+版本控制系统，通过 FastCDC 切块、BLAKE3 去重和不可变快照，让大型 AI 资产能够像代码一样
+被可靠地暂存、提交、校验与恢复。
+
+项目当前聚焦单机仓库与本地工作流，已经提供 SQLite 元数据、事务化 checkout 和故障恢复
+能力；分布式对象存储、远程同步与协作能力属于后续阶段。
 
 ## 核心语义
 
 - `add` 不修改工作区文件，只把稳定输入快照按 FastCDC 分块并更新 index。
 - `add -A` 同时暂存指定路径范围内的新增、修改和删除。
 - 相同 Chunk 只保存一次；对象路径由 BLAKE3 Hash 决定。
-- 已有 Chunk、Commit 和 checkout 都会校验大小与完整 BLAKE3，而不是只看文件名。
+- Chunk 在复用和读取时都会校验大小与 BLAKE3；Tree 和 Commit 在读取时复算内容 ID。
+- `checkout` 会逐 Chunk 校验目标内容，再事务化更新工作区和 index。
 - `commit` 验证全部暂存 Chunk 后固化不可变 Tree，每个 Commit 最多只有一个父节点。
 - `checkout` 事务化恢复工作区和 index，但不会回退当前分支引用。
 - `recover` 可以继续或回滚被 kill/断电打断的 checkout/rm 事务。
@@ -29,6 +35,25 @@ cargo build -p neoengram
 ./target/debug/neoengram checkout HEAD
 ./target/debug/neoengram fsck
 ```
+
+`init` 默认使用 SQLite 行式元数据后端：
+
+```bash
+./target/debug/neoengram init .
+```
+
+需要 JSON 元数据后端时可以显式选择：
+
+```bash
+./target/debug/neoengram init --metadata-store json .
+```
+
+后端选择会写入仓库配置，后续命令会自动使用已记录的后端；在仓库根目录再次运行 `init` 也会
+沿用该后端。NeoEngram 不会自动在 JSON 和 SQLite 之间迁移已有仓库。
+
+新仓库会先在同一文件系统的 `.neoengram-tmp-*` 私有目录中完成初始化和校验，再以
+no-replace rename 原子发布为 `.neoengram`。进程在发布前退出只会留下未发布的临时目录，
+`add` 和 `status` 会忽略这些未发布目录，不会把半初始化状态当成仓库。
 
 也可以直接通过 Cargo 运行：
 
@@ -51,23 +76,25 @@ cargo run -p neoengram -- checkout HEAD
 ├── transactions/                    # checkout/rm journal、暂存文件和故障备份
 └── metadata/
     ├── repository.json              # 仓库格式版本与后端选择
-    ├── index.json                   # add 维护的完整暂存快照
-    ├── HEAD                         # ref: refs/heads/main
-    ├── write.lock                   # OS advisory lock；文件可跨进程保留
-    ├── index.lock / refs.lock       # 后端事务与 CAS 锁
-    ├── refs/heads/main              # 当前 Commit ID（首次提交后创建）
-    ├── manifests/<manifest-hash>.json # 不可变的单文件 Chunk recipe
-    ├── trees/<tree-hash>.json       # 不可变目录快照
-    └── commits/<commit-hash>.json   # 不可变单父 Commit
+    ├── write.lock                   # 按需创建的 OS advisory lock；文件可跨进程保留
+    ├── metadata.sqlite3             # SQLite 后端的行式元数据数据库（选择 SQLite 时）
+    ├── index.json                   # JSON 后端的完整暂存快照
+    ├── HEAD                         # JSON 后端：ref: refs/heads/main
+    ├── index.lock / refs.lock       # JSON 后端按需创建的事务与 CAS 锁
+    ├── refs/heads/main              # JSON 后端的当前 Commit ID（首次提交后创建）
+    ├── manifests/<manifest-hash>.json # JSON 后端的单文件 Chunk recipe
+    ├── trees/<tree-hash>.json       # JSON 后端的不可变目录快照
+    └── commits/<commit-hash>.json   # JSON 后端的不可变单父 Commit
 ```
 
 提交采用追加式发布顺序：先验证全部 Chunk 并完成 ObjectStore durability barrier，再写并同步
-Manifest、Tree 和 Commit，最后原子更新当前分支引用并同步父目录。`add`、`rm`、`commit`、
-`checkout` 和 `recover` 共享 OS advisory
-lock；进程被 kill 后内核自动释放锁，遗留的普通 `write.lock` 文件不会形成永久死锁。
+Manifest、Tree 和 Commit，最后通过 CAS 原子更新当前分支引用。JSON 后端会同步引用的父目录；
+SQLite 后端通过 `synchronous=FULL` 的 WAL 事务提交。`add`、`rm`、`commit`、`checkout`、
+`recover` 和 `fsck` 共享 OS advisory lock；进程被 kill 后内核自动释放锁，遗留的普通
+`write.lock` 文件不会形成永久死锁。
 
 仓库路径固定为 UTF-8 NFC 和 `/` 分隔，并拒绝 Windows drive prefix、设备保留名、非法
-字符、大小写碰撞、文件/目录前缀碰撞及任何 `.neoengram` 组件。
+字符、大小写碰撞、文件/目录前缀碰撞，以及 `.neoengram` 和 `.neoengram-tmp-*` 保留组件。
 
 ## 存储抽象
 
@@ -77,13 +104,13 @@ lock；进程被 kill 后内核自动释放锁，遗留的普通 `write.lock` �
 `ObjectStore` 管理，提供流式发布、单遍校验读取、批量状态检查、分页枚举和 durability
 barrier。Repository 和命令层都不再依赖对象物理路径。
 
-当前真实实现是 `JsonMetadataStore` 和 `LooseObjectStore`。开发期仓库格式直接演进，不提供
-旧格式自动回退；`repository.json` 必须显式记录两个后端：
+当前真实实现是 `JsonMetadataStore`、`SqliteMetadataStore` 和 `LooseObjectStore`。开发期仓库
+格式直接演进，不提供旧格式自动回退；`repository.json` 必须显式记录两个后端：
 
 ```json
 {
   "format_version": 3,
-  "metadata_store": "json",
+  "metadata_store": "sqlite",
   "object_store": "loose"
 }
 ```
@@ -101,7 +128,7 @@ barrier。Repository 和命令层都不再依赖对象物理路径。
 ./target/debug/neoengram add path/to/data
 ```
 
-同时暂存删除；PATH 省略时范围是整个仓库：
+同时暂存删除；PATH 省略时范围是当前目录，从仓库根目录执行时才覆盖整个仓库：
 
 ```bash
 ./target/debug/neoengram add -A [PATH]
@@ -178,7 +205,7 @@ append-only 约束。Checkout 只处理发生变化的文件，校验其 Chunk �
 ├── neoengram-core/          # Chunk、FileNode、Index、Tree、Commit 与 CDC 核心库
 └── crates/neoengram-cli/    # 命令与仓库编排
     └── src/storage/
-        ├── metadata/        # 元数据契约、JSON 后端、契约测试与操作文档
+        ├── metadata/        # 元数据契约、JSON/SQLite 后端、契约测试与操作文档
         ├── object.rs        # 对象后端选择
         └── file.rs          # 共用 crash-safe 文件原语
 ```
@@ -194,15 +221,15 @@ cargo rustdoc -p neoengram-core --all-features -- -D warnings
 
 ## 当前范围
 
-当前版本完成的是本地 Phase 1，不包含网络传输、PostgreSQL 控制面、S3、认证、分支、
-`push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS 和流式对象抽象已经落地，但 JSON
-后端内部仍整份物化 index/Tree，部分命令仍把分页重新收集为完整快照，checkout/rm journal
-也仍保存完整 Index；因此当前实现还不能宣称支持百 TB。
+当前版本完成的是本地 Phase 1，不包含网络传输、PostgreSQL 控制面、S3、认证、多分支管理、
+`push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、SQLite 行式元数据和流式对象抽象已经
+落地，但 JSON 后端内部仍整份物化 index/Tree，部分命令仍把分页重新收集为完整快照，
+checkout/rm journal 也仍保存完整 Index；因此当前实现还不能宣称支持百 TB。
 
-下一步是 SQLite 行级 Index/Manifest、追加式恢复 journal、对象 fanout/pack，以及
-PostgreSQL + S3 的缺块协商和 CAS push；是否增加 Merkle 索引由规模基准决定。目标是
-100 TB payload、千万路径和上亿 Chunk 引用下，命令内存由页大小与有界并发决定，而不是
-随仓库总量增长。
+下一步是对 SQLite 大规模工作负载做基准与调优、实现追加式恢复 journal、对象 fanout/pack，
+以及 PostgreSQL + S3 的缺块协商和 CAS push；是否增加 Merkle 索引由规模基准决定。目标是
+100 TB payload、千万路径和上亿 Chunk 引用下，命令内存由页大小与有界并发决定，而不是随
+仓库总量增长。
 
 本地层仍未保存 POSIX 权限位和符号链接，也没有 sparse checkout 或完整文件缓存配额。
 这些限制会在开发期直接演进数据模型和仓库格式解决。

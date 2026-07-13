@@ -151,7 +151,7 @@ fn checkout_force_handles_file_directory_transitions() -> TestResult {
 }
 
 fn initialize(path: &Path) -> TestResult {
-    run_success(path, &["init"])?;
+    run_success(path, &["init", "--metadata-store", "json"])?;
     Ok(())
 }
 

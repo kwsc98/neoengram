@@ -161,7 +161,7 @@ fn assert_crashed(output: &Output) {
 }
 
 fn initialize(path: &Path) -> TestResult {
-    run_success(path, &["init"])?;
+    run_success(path, &["init", "--metadata-store", "json"])?;
     Ok(())
 }
 

@@ -18,6 +18,8 @@ futures = "0.3"
 libc = "0.2"
 memmap2 = "0.9"
 reflink-copy = "0.1.30"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 neoengram-core = { path = "neoengram-core", version = "0.1.0" }
@@ -25,6 +27,7 @@ tempfile = "3.20"
 tokio = { version = "1.45", features = ["fs", "macros", "rt-multi-thread"] }
 unicode-normalization = "0.1"
 walkdir = "2.5"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [workspace.lints.rust]
 # memmap2 的映射调用天然需要一个经过审计的 unsafe 边界。默认仍拒绝 unsafe，

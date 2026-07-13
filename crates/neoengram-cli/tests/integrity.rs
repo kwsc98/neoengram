@@ -180,7 +180,9 @@ fn a_symlinked_lock_file_is_rejected_without_touching_its_target() -> TestResult
 }
 
 fn initialize(path: &Path) -> TestResult {
-    let output = command(path).arg("init").output()?;
+    let output = command(path)
+        .args(["init", "--metadata-store", "json"])
+        .output()?;
     assert_success(&output);
     Ok(())
 }
