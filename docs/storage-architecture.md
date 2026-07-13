@@ -35,12 +35,13 @@ NeoEngram 的目标是管理至少 100 TB 的逻辑 payload。这个目标首先
 能力的平台会拒绝新仓库初始化，而不是退化为存在覆盖竞态的发布方式。
 
 每个元数据操作的输入、输出、事务、Drop 和错误语义以
-[`storage/metadata/README.md`](../crates/neoengram-cli/src/storage/metadata/README.md) 为准；本文只
-维护跨模块发布顺序、规模热点和演进方向。
+[`local/metadata/README.md`](../crates/neoengram/src/local/metadata/README.md) 为准；本文只维护
+跨模块发布顺序、规模热点和演进方向。源码模块职责和依赖方向见
+[`code-architecture.md`](code-architecture.md)。
 
-### ObjectStore
+### 本地 ObjectStore
 
-Chunk payload 使用独立、object-safe 的同步流式接口：
+本地 Chunk payload 使用独立、object-safe 的同步流式接口：
 
 - `put_from`：边读边校验精确大小和 BLAKE3，再 immutable/no-clobber 发布；
 - `copy_to`：单遍校验并输出，不要求调用方获得物理路径；
@@ -48,8 +49,8 @@ Chunk payload 使用独立、object-safe 的同步流式接口：
 - `list_page`：按 opaque cursor 分页枚举；
 - `durability_barrier`：成功后，此前发布的对象才允许被元数据引用。
 
-当前 `LooseObjectStore` 每个对象保存为一个本地文件。add、commit、checkout 和 fsck 已经通过
-`ObjectStore` 工作，不再拼接 `objects/<hash>` 路径。
+当前 `local::objects` 中的 `LooseObjectStore` 每个对象保存为一个本地文件。add、commit、
+checkout 和 fsck 已经通过 `ObjectStore` 工作，不再拼接 `objects/<hash>` 路径。
 
 完整文件缓存是可淘汰派生数据，不属于 ObjectStore。checkout/rm journal 协调工作区 rename
 和元数据提交，也不属于 MetadataStore。
@@ -81,8 +82,9 @@ Repository 的领域校验。
 一个 Commit 都加载全部历史。JSON snapshot 固定 refs 和历史 ID 集合；SQLite snapshot 使用
 WAL read transaction 固定同一个 MVCC 视图。
 
-ObjectStore 的当前分页是 weak scan，没有固定 generation。它可用于检查，但不能作为并发 GC
-的删除依据。远端或 pack 后端需要提供 snapshot/cutoff 后，GC 才能启用。
+本地 ObjectStore 的当前分页是 weak scan，没有固定 generation。它可用于检查，但不能作为
+并发 GC 的删除依据；本地 pack 需要 generation/cutoff。远端对象协商、传输和 GC 属于独立的
+异步协议与服务端 catalog，不实现这个本地 trait。
 
 ## 当前全量热点
 
