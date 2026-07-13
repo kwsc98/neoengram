@@ -117,8 +117,9 @@ barrier。Repository 和命令层都不再依赖对象物理路径。
 
 完整文件缓存和 checkout/rm journal 不放进上述两个存储接口：它们分别是可淘汰派生数据和
 跨工作区 rename/元数据提交的恢复协议。逐项接口语义见
-[`storage/metadata/README.md`](crates/neoengram-cli/src/storage/metadata/README.md)，整体规模预算和
-迁移顺序见 [`docs/storage-architecture.md`](docs/storage-architecture.md)。
+[`local/metadata/README.md`](crates/neoengram/src/local/metadata/README.md)，整体规模预算和迁移顺序
+见 [`docs/storage-architecture.md`](docs/storage-architecture.md)，源码职责与未来扩展落点见
+[`docs/code-architecture.md`](docs/code-architecture.md)。
 
 ## 暂存与查看
 
@@ -202,13 +203,26 @@ append-only 约束。Checkout 只处理发生变化的文件，校验其 Chunk �
 
 ```text
 .
-├── neoengram-core/          # Chunk、FileNode、Index、Tree、Commit 与 CDC 核心库
-└── crates/neoengram-cli/    # 命令与仓库编排
-    └── src/storage/
-        ├── metadata/        # 元数据契约、JSON/SQLite 后端、契约测试与操作文档
-        ├── object.rs        # 对象后端选择
-        └── file.rs          # 共用 crash-safe 文件原语
+├── crates/
+│   ├── neoengram-core/              # 纯领域模型与格式常量
+│   │   └── src/models/
+│   └── neoengram/                   # neoengram 命令行程序与本地仓库引擎
+│       ├── src/
+│       │   ├── cli/                 # 参数解析与终端输出
+│       │   ├── app/                 # init/add/commit 等用例编排
+│       │   └── local/
+│       │       ├── repository/      # 仓库门面、配置、锁与领域校验
+│       │       ├── worktree/        # 扫描、import 切块、物化与恢复事务
+│       │       ├── metadata/        # 元数据契约及 JSON/SQLite 后端
+│       │       ├── objects/         # contract.rs 与 loose.rs 本地对象后端
+│       │       └── fs/              # crash-safe 文件系统原语
+│       └── tests/                   # CLI 与跨模块集成测试
+└── docs/                            # 代码与存储架构说明
 ```
+
+依赖保持单向：`cli -> app -> local -> neoengram-core`。远端同步、协议 crate 和服务端只定义了
+未来落点，当前源码树不创建空模块；完整约束见
+[`docs/code-architecture.md`](docs/code-architecture.md)。
 
 ## 质量检查
 

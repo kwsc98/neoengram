@@ -16,12 +16,18 @@
 - 增加分页 `MetadataStore`、单次流式发布的独立 FileManifest、Index version transaction、
   Tree reader/writer、ref CAS 和可复用后端契约测试。
 - 增加行式 `SqliteMetadataStore` 并作为新仓库默认后端；保留可显式选择的 JSON 后端。
-- 元数据契约、JSON/SQLite 后端、契约测试和逐操作文档集中到独立 `storage/metadata` 模块。
+- 元数据契约、JSON/SQLite 后端、契约测试和逐操作文档集中到独立 `local/metadata` 模块。
 - 增加流式 `ObjectStore`、真实 `LooseObjectStore`、抽象切块入口及对象后端契约测试。
 - `repository.json` 格式 3 显式记录 `metadata_store` 和 `object_store`；开发期不兼容旧格式。
 
 ### Changed
 
+- Workspace 源码统一收拢到 `crates/`：核心库迁入 `crates/neoengram-core`，命令行 crate
+  改为 `crates/neoengram`，并按 `cli`、`app`、`local/{repository,worktree,metadata,objects,fs}`
+  划分职责。
+- `neoengram-core` 的模型拆分到 `models/*`；切块入口迁入 `local/worktree/import.rs`，对象存储
+  契约与 loose 后端迁入 `local/objects/{contract.rs,loose.rs}`，文件系统实现归入本地仓库层，
+  为后续远端同步和服务端存储适配保留清晰边界。
 - `add` 先创建稳定 Reflink/复制快照再 mmap，避免并发截断导致 SIGBUS 或混合快照。
 - Commit 在发布 Tree 前校验全部暂存 Chunk；checkout 只物化实际变化文件。
 - 仓库写锁改为 OS advisory lock，并同步对象、元数据和 rename 的持久化边界。

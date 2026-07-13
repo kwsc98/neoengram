@@ -403,9 +403,11 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "fastcdc",
  "fs2",
  "futures",
  "libc",
+ "memmap2",
  "neoengram-core",
  "reflink-copy",
  "rusqlite",
@@ -423,15 +425,8 @@ dependencies = [
 name = "neoengram-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "blake3",
- "fastcdc",
- "memmap2",
- "reflink-copy",
  "serde",
  "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
