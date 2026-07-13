@@ -1,6 +1,6 @@
-# Synapse
+# NeoEngram
 
-Synapse 是一个面向 AI 模型和海量数据集的分布式文件版本控制系统。当前阶段实现了
+NeoEngram 是一个面向 AI 模型和海量数据集的分布式文件版本控制系统。当前阶段实现了
 本地内容定义切块（CDC）、BLAKE3 内容寻址、暂存区以及无合并的线性 Commit。
 
 ## 核心语义
@@ -16,34 +16,34 @@ Synapse 是一个面向 AI 模型和海量数据集的分布式文件版本控�
 
 ## 快速开始
 
-项目使用 Rust Edition 2021，需要 Rust 1.85 或更高版本。
+项目使用 Rust Edition 2021，需要 Rust 1.97.0 或更高版本。
 
 ```bash
-cargo build -p synapse-cli
+cargo build -p neoengram
 
-./target/debug/synapse init .
-./target/debug/synapse add README.md
-./target/debug/synapse status
-./target/debug/synapse commit -m "add project readme"
-./target/debug/synapse log
-./target/debug/synapse checkout HEAD
-./target/debug/synapse fsck
+./target/debug/neoengram init .
+./target/debug/neoengram add README.md
+./target/debug/neoengram status
+./target/debug/neoengram commit -m "add project readme"
+./target/debug/neoengram log
+./target/debug/neoengram checkout HEAD
+./target/debug/neoengram fsck
 ```
 
 也可以直接通过 Cargo 运行：
 
 ```bash
-cargo run -p synapse-cli -- init .
-cargo run -p synapse-cli -- add README.md
-cargo run -p synapse-cli -- status
-cargo run -p synapse-cli -- commit -m "add project readme"
-cargo run -p synapse-cli -- checkout HEAD
+cargo run -p neoengram -- init .
+cargo run -p neoengram -- add README.md
+cargo run -p neoengram -- status
+cargo run -p neoengram -- commit -m "add project readme"
+cargo run -p neoengram -- checkout HEAD
 ```
 
 ## 本地布局
 
 ```text
-.synapse/
+.neoengram/
 ├── objects/                         # 不可变 CDC 数据块：objects/<blake3>
 │   └── .tmp/                        # 未发布临时对象
 ├── files/                           # checkout 使用的完整文件缓存
@@ -67,7 +67,7 @@ Manifest、Tree 和 Commit，最后原子更新当前分支引用并同步父目
 lock；进程被 kill 后内核自动释放锁，遗留的普通 `write.lock` 文件不会形成永久死锁。
 
 仓库路径固定为 UTF-8 NFC 和 `/` 分隔，并拒绝 Windows drive prefix、设备保留名、非法
-字符、大小写碰撞、文件/目录前缀碰撞及任何 `.synapse` 组件。
+字符、大小写碰撞、文件/目录前缀碰撞及任何 `.neoengram` 组件。
 
 ## 存储抽象
 
@@ -90,7 +90,7 @@ barrier。Repository 和命令层都不再依赖对象物理路径。
 
 完整文件缓存和 checkout/rm journal 不放进上述两个存储接口：它们分别是可淘汰派生数据和
 跨工作区 rename/元数据提交的恢复协议。逐项接口语义见
-[`storage/metadata/README.md`](crates/synapse-cli/src/storage/metadata/README.md)，整体规模预算和
+[`storage/metadata/README.md`](crates/neoengram-cli/src/storage/metadata/README.md)，整体规模预算和
 迁移顺序见 [`docs/storage-architecture.md`](docs/storage-architecture.md)。
 
 ## 暂存与查看
@@ -98,29 +98,29 @@ barrier。Repository 和命令层都不再依赖对象物理路径。
 暂存新增或修改：
 
 ```bash
-./target/debug/synapse add path/to/data
+./target/debug/neoengram add path/to/data
 ```
 
 同时暂存删除；PATH 省略时范围是整个仓库：
 
 ```bash
-./target/debug/synapse add -A [PATH]
+./target/debug/neoengram add -A [PATH]
 ```
 
 安全地删除已跟踪内容，或只从 index 取消跟踪：
 
 ```bash
-./target/debug/synapse rm path/to/data
-./target/debug/synapse rm --cached path/to/data
+./target/debug/neoengram rm path/to/data
+./target/debug/neoengram rm --cached path/to/data
 ```
 
 `rm` 默认拒绝丢弃未暂存修改；只有显式 `--force` 才覆盖该保护。提交前可检查 staged、
 unstaged 和 untracked 三类状态，并查看线性历史或具体快照：
 
 ```bash
-./target/debug/synapse status
-./target/debug/synapse log --max-count 20
-./target/debug/synapse show HEAD
+./target/debug/neoengram status
+./target/debug/neoengram log --max-count 20
+./target/debug/neoengram show HEAD
 ```
 
 ## 恢复版本
@@ -128,19 +128,19 @@ unstaged 和 untracked 三类状态，并查看线性历史或具体快照：
 恢复当前版本：
 
 ```bash
-./target/debug/synapse checkout
+./target/debug/neoengram checkout
 ```
 
 恢复指定 Commit：
 
 ```bash
-./target/debug/synapse checkout <COMMIT_ID>
+./target/debug/neoengram checkout <COMMIT_ID>
 ```
 
 Checkout 默认拒绝丢弃 staged 修改、已跟踪文件修改或冲突的未跟踪文件。明确需要覆盖时：
 
 ```bash
-./target/debug/synapse checkout <COMMIT_ID> --force
+./target/debug/neoengram checkout <COMMIT_ID> --force
 ```
 
 恢复旧 Commit 只会改变工作区和当前后端的 Index，不会把 `main` 指针向后移动。此时执行
@@ -153,10 +153,10 @@ append-only 约束。Checkout 只处理发生变化的文件，校验其 Chunk �
 
 ```bash
 # 验证目标后继续原 checkout，或完成/回滚 rm 的安全状态
-./target/debug/synapse recover
+./target/debug/neoengram recover
 
 # 回到事务开始前；已经提交 index 的 rm 不允许反向 abort
-./target/debug/synapse recover --abort
+./target/debug/neoengram recover --abort
 ```
 
 恢复 journal 会记录每个逻辑路径、原 index 和发布阶段。回滚只移除能按 FileNode 验证为
@@ -165,7 +165,7 @@ append-only 约束。Checkout 只处理发生变化的文件，校验其 Chunk �
 ## 完整性检查
 
 ```bash
-./target/debug/synapse fsck
+./target/debug/neoengram fsck
 ```
 
 `fsck` 校验全部 refs、Commit/Tree 内容 ID、单父历史无环、路径规则、Chunk 引用大小，
@@ -175,8 +175,8 @@ append-only 约束。Checkout 只处理发生变化的文件，校验其 Chunk �
 
 ```text
 .
-├── synapse/                 # Chunk、FileNode、Index、Tree、Commit 与 CDC 核心库
-└── crates/synapse-cli/      # 命令与仓库编排
+├── neoengram-core/          # Chunk、FileNode、Index、Tree、Commit 与 CDC 核心库
+└── crates/neoengram-cli/    # 命令与仓库编排
     └── src/storage/
         ├── metadata/        # 元数据契约、JSON 后端、契约测试与操作文档
         ├── object.rs        # 对象后端选择
@@ -189,7 +189,7 @@ append-only 约束。Checkout 只处理发生变化的文件，校验其 Chunk �
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo rustdoc -p synapse --all-features -- -D warnings
+cargo rustdoc -p neoengram-core --all-features -- -D warnings
 ```
 
 ## 当前范围

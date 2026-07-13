@@ -1,6 +1,6 @@
 /target
 /test/
-.synapse/
+.neoengram/
 **/*.rs.bk
 .DS_Store
 .idea/

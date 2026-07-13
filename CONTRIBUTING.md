@@ -1,6 +1,6 @@
 # Contributing
 
-感谢你参与 Synapse。提交改动前，请先搜索现有 issue 和 pull request，避免重复工作。
+感谢你参与 NeoEngram。提交改动前，请先搜索现有 issue 和 pull request，避免重复工作。
 较大的功能或公共 API 变更，建议先创建 issue 讨论设计和兼容性。
 
 ## 本地开发
