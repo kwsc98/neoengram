@@ -18,10 +18,11 @@ NeoEngram 的目标是管理至少 100 TB 的逻辑 payload。这个目标首先
 - `put_manifest`：单次消费 Chunk iterator，由后端返回内容 ID 和 Chunk 数；
 - `IndexReader`：分页读取固定版本的 Index；
 - `IndexTxn`：基于 expected `IndexVersion` 执行 upsert 或前缀删除，再原子提交；
-- `MetadataReader`：Commit、Tree、Manifest 和 ref 的点查，不触发全仓库枚举；
+- `MetadataReader`：HEAD、Commit、Tree、Manifest 和 ref 的点查，不触发全仓库枚举；
 - `MetadataSnapshot`：固定 refs 以及 Tree、Manifest、Commit ID，用于一致分页枚举；
 - `TreeWriter`：追加有序 `FileRecord`，由 `finish` 发布不可变 Tree 并返回 root ID；
 - `compare_exchange_reference`：按 expected target 创建、更新或删除 ref。
+- `read_head_state` / `compare_exchange_head`：读取并 CAS 更新 symbolic 或 direct HEAD。
 
 `IndexVersion` 同时包含单调 revision 和内容摘要。revision 与 Index 在一次原子写入中更新，
 因此即使内容发生 A -> B -> A，也不会产生 ABA 误判。
@@ -63,10 +64,10 @@ Commit 必须遵守以下顺序：
 2. 发布不可变 FileManifest；
 3. 发布不可变 Tree；
 4. 发布不可变 Commit；
-5. 使用旧父 Commit 作为 expected target 执行 ref CAS。
+5. 使用旧父 Commit 作为 expected target 执行当前分支 ref 或 direct HEAD CAS。
 
-ref CAS 是新 Commit 对读者可见的最后线性化点。失败可以留下不可达 Manifest、Tree 或
-Commit，但不能覆盖并发提交，也不能让 ref 指向未完整发布的依赖。
+ref/HEAD CAS 是新 Commit 对读者可见的最后线性化点。失败可以留下不可达 Manifest、Tree
+或 Commit，但不能覆盖并发提交，也不能让 ref/HEAD 指向未完整发布的依赖。
 
 Index transaction 必须全有或全无。expected `IndexVersion` 不匹配时不能提交；事务被丢弃时不能
 产生可见 Index 变化。路径 portable-key 唯一性、文件/目录祖先冲突和 Chunk 连续性仍属于

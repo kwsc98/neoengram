@@ -9,6 +9,8 @@ use serde::Deserialize;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+const MAIN_REFERENCE: &str = "refs/heads/main";
+
 #[test]
 fn checkout_recover_can_abort_or_finish_after_a_publish_crash() -> TestResult {
     let repository = tempfile::tempdir()?;
@@ -17,16 +19,18 @@ fn checkout_recover_can_abort_or_finish_after_a_publish_crash() -> TestResult {
     fs::write(repository.path().join("b.bin"), b"b-v1")?;
     run_success(repository.path(), &["add", "."])?;
     run_success(repository.path(), &["commit", "-m", "v1"])?;
-    let first = current_commit_id(repository.path())?;
+    let first = main_commit_id(repository.path())?;
 
     fs::write(repository.path().join("a.bin"), b"a-v2")?;
     fs::write(repository.path().join("b.bin"), b"b-v2")?;
     run_success(repository.path(), &["add", "."])?;
     run_success(repository.path(), &["commit", "-m", "v2"])?;
-    let second = current_commit_id(repository.path())?;
+    let second = main_commit_id(repository.path())?;
 
     crash_checkout(repository.path(), &first, "checkout-after-publish")?;
     assert_eq!(transaction_count(repository.path())?, 1);
+    assert_eq!(main_commit_id(repository.path())?, second);
+    assert_eq!(read_head(repository.path())?, symbolic_main_head());
     let blocked = command(repository.path())
         .args(["commit", "-m", "must block"])
         .output()?;
@@ -36,39 +40,100 @@ fn checkout_recover_can_abort_or_finish_after_a_publish_crash() -> TestResult {
     run_success(repository.path(), &["recover", "--abort"])?;
     assert_eq!(fs::read(repository.path().join("a.bin"))?, b"a-v2");
     assert_eq!(fs::read(repository.path().join("b.bin"))?, b"b-v2");
-    assert_eq!(current_commit_id(repository.path())?, second);
+    assert_eq!(main_commit_id(repository.path())?, second);
+    assert_eq!(read_head(repository.path())?, symbolic_main_head());
     assert_eq!(transaction_count(repository.path())?, 0);
 
     crash_checkout(repository.path(), &first, "checkout-after-publish")?;
     run_success(repository.path(), &["recover"])?;
     assert_eq!(fs::read(repository.path().join("a.bin"))?, b"a-v1");
     assert_eq!(fs::read(repository.path().join("b.bin"))?, b"b-v1");
-    assert_eq!(current_commit_id(repository.path())?, second);
+    assert_eq!(main_commit_id(repository.path())?, second);
+    assert_eq!(read_head(repository.path())?, StoredHead::Detached(first));
     assert_eq!(transaction_count(repository.path())?, 0);
     Ok(())
 }
 
 #[test]
-fn checkout_abort_restores_index_after_it_was_atomically_published() -> TestResult {
+fn checkout_recovery_restores_or_finishes_after_index_publish_crash() -> TestResult {
     let repository = tempfile::tempdir()?;
     initialize(repository.path())?;
     fs::write(repository.path().join("model.bin"), b"v1")?;
     run_success(repository.path(), &["add", "."])?;
     run_success(repository.path(), &["commit", "-m", "v1"])?;
-    let first = current_commit_id(repository.path())?;
+    let first = main_commit_id(repository.path())?;
+    let first_index = read_index(repository.path())?;
 
     fs::write(repository.path().join("model.bin"), b"v2")?;
     run_success(repository.path(), &["add", "."])?;
     run_success(repository.path(), &["commit", "-m", "v2"])?;
+    let second = main_commit_id(repository.path())?;
     let index_before = read_index(repository.path())?;
 
     crash_checkout(repository.path(), &first, "checkout-after-index")?;
     assert_eq!(fs::read(repository.path().join("model.bin"))?, b"v1");
-    assert_ne!(read_index(repository.path())?, index_before);
+    assert_eq!(read_index(repository.path())?, first_index);
+    assert_eq!(main_commit_id(repository.path())?, second);
+    assert_eq!(read_head(repository.path())?, symbolic_main_head());
 
     run_success(repository.path(), &["recover", "--abort"])?;
     assert_eq!(fs::read(repository.path().join("model.bin"))?, b"v2");
     assert_eq!(read_index(repository.path())?, index_before);
+    assert_eq!(main_commit_id(repository.path())?, second);
+    assert_eq!(read_head(repository.path())?, symbolic_main_head());
+    assert_eq!(transaction_count(repository.path())?, 0);
+
+    crash_checkout(repository.path(), &first, "checkout-after-index")?;
+    run_success(repository.path(), &["recover"])?;
+    assert_eq!(fs::read(repository.path().join("model.bin"))?, b"v1");
+    assert_eq!(read_index(repository.path())?, first_index);
+    assert_eq!(main_commit_id(repository.path())?, second);
+    assert_eq!(read_head(repository.path())?, StoredHead::Detached(first));
+    assert_eq!(transaction_count(repository.path())?, 0);
+    Ok(())
+}
+
+#[test]
+fn checkout_recovery_handles_a_crash_after_detached_head_publish() -> TestResult {
+    let repository = tempfile::tempdir()?;
+    initialize(repository.path())?;
+    let model = repository.path().join("model.bin");
+
+    fs::write(&model, b"v1")?;
+    run_success(repository.path(), &["add", "."])?;
+    run_success(repository.path(), &["commit", "-m", "v1"])?;
+    let first = main_commit_id(repository.path())?;
+    let first_index = read_index(repository.path())?;
+
+    fs::write(&model, b"v2")?;
+    run_success(repository.path(), &["add", "."])?;
+    run_success(repository.path(), &["commit", "-m", "v2"])?;
+    let second = main_commit_id(repository.path())?;
+    let second_index = read_index(repository.path())?;
+
+    crash_checkout(repository.path(), &first, "checkout-after-head")?;
+    assert_eq!(fs::read(&model)?, b"v1");
+    assert_eq!(read_index(repository.path())?, first_index);
+    assert_eq!(main_commit_id(repository.path())?, second);
+    assert_eq!(
+        read_head(repository.path())?,
+        StoredHead::Detached(first.clone())
+    );
+    assert_eq!(transaction_count(repository.path())?, 1);
+
+    run_success(repository.path(), &["recover", "--abort"])?;
+    assert_eq!(fs::read(&model)?, b"v2");
+    assert_eq!(read_index(repository.path())?, second_index);
+    assert_eq!(main_commit_id(repository.path())?, second);
+    assert_eq!(read_head(repository.path())?, symbolic_main_head());
+    assert_eq!(transaction_count(repository.path())?, 0);
+
+    crash_checkout(repository.path(), &first, "checkout-after-head")?;
+    run_success(repository.path(), &["recover"])?;
+    assert_eq!(fs::read(&model)?, b"v1");
+    assert_eq!(read_index(repository.path())?, first_index);
+    assert_eq!(main_commit_id(repository.path())?, second);
+    assert_eq!(read_head(repository.path())?, StoredHead::Detached(first));
     assert_eq!(transaction_count(repository.path())?, 0);
     Ok(())
 }
@@ -120,12 +185,12 @@ fn checkout_abort_preserves_a_file_created_after_an_unpublished_intent() -> Test
     fs::write(repository.path().join("keep.bin"), b"keep")?;
     run_success(repository.path(), &["add", "."])?;
     run_success(repository.path(), &["commit", "-m", "without new file"])?;
-    let without_file = current_commit_id(repository.path())?;
+    let without_file = main_commit_id(repository.path())?;
 
     fs::write(repository.path().join("new.bin"), b"committed target")?;
     run_success(repository.path(), &["add", "."])?;
     run_success(repository.path(), &["commit", "-m", "with new file"])?;
-    let with_file = current_commit_id(repository.path())?;
+    let with_file = main_commit_id(repository.path())?;
     run_success(
         repository.path(),
         &["checkout", without_file.as_str(), "--force"],
@@ -141,6 +206,11 @@ fn checkout_abort_preserves_a_file_created_after_an_unpublished_intent() -> Test
         b"created after crash"
     );
     assert_eq!(transaction_count(repository.path())?, 0);
+    assert_eq!(main_commit_id(repository.path())?, with_file);
+    assert_eq!(
+        read_head(repository.path())?,
+        StoredHead::Detached(without_file)
+    );
     let index = read_index(repository.path())?;
     assert!(index.files.iter().all(|file| file.path != "new.bin"));
     Ok(())
@@ -202,7 +272,27 @@ fn read_index(repository: &Path) -> Result<StoredIndex, Box<dyn Error>> {
     )?)?)
 }
 
-fn current_commit_id(repository: &Path) -> Result<String, Box<dyn Error>> {
+#[derive(Debug, PartialEq, Eq)]
+enum StoredHead {
+    Symbolic(String),
+    Detached(String),
+}
+
+fn read_head(repository: &Path) -> Result<StoredHead, Box<dyn Error>> {
+    let contents = fs::read_to_string(repository.join(".neoengram/metadata/HEAD"))?;
+    let value = contents.trim();
+    if let Some(reference) = value.strip_prefix("ref: ") {
+        Ok(StoredHead::Symbolic(reference.to_owned()))
+    } else {
+        Ok(StoredHead::Detached(value.to_owned()))
+    }
+}
+
+fn symbolic_main_head() -> StoredHead {
+    StoredHead::Symbolic(MAIN_REFERENCE.to_owned())
+}
+
+fn main_commit_id(repository: &Path) -> Result<String, Box<dyn Error>> {
     Ok(
         fs::read_to_string(repository.join(".neoengram/metadata/refs/heads/main"))?
             .trim()

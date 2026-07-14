@@ -21,6 +21,9 @@ pub(crate) async fn execute(message: String) -> Result<()> {
 
     println!("Committed {}", outcome.commit_id);
     println!("Tree: {} ({} files)", outcome.tree_id, outcome.file_count);
+    if outcome.detached {
+        println!("HEAD is now detached at {}", outcome.commit_id);
+    }
     Ok(())
 }
 
@@ -28,16 +31,18 @@ struct CommitOutcome {
     commit_id: String,
     tree_id: String,
     file_count: usize,
+    detached: bool,
 }
 
 fn create_commit(repository: &Repository, message: String) -> Result<CommitOutcome> {
-    // 锁内重新读取 index 和分支 tip，保证 parent 恰好是当前提交。Commit 数据模型只有
-    // 一个 Option parent，发布路径也不接受第二父节点，因此无法产生 merge commit。
+    // 锁内重新读取 index 和 HEAD，保证 parent 恰好是 attached 分支 tip 或 direct HEAD。
+    // Commit 数据模型只有一个 Option parent，因此无法产生 merge commit。
     let _lock = repository.acquire_write_lock()?;
     let index = repository.read_index()?;
     validate_staged_objects(repository, &index.files)?;
     let tree = Tree { files: index.files };
-    let parent = repository.current_commit_id()?;
+    let head = repository.current_head()?;
+    let parent = head.commit_id().map(str::to_owned);
 
     let parent_tree_id = if let Some(parent_id) = &parent {
         Some(repository.read_commit(parent_id)?.tree_hash)
@@ -70,15 +75,16 @@ fn create_commit(repository: &Repository, message: String) -> Result<CommitOutco
         created_at_unix_ms,
     };
 
-    // Manifest、Tree 和 Commit 追加式发布，branch ref 是最后的线性化点。任一步失败都
-    // 不会让引用指向缺失对象；最多留下后续可由 GC 清理的不可达元数据。
+    // Manifest、Tree 和 Commit 追加式发布，branch ref 或 direct HEAD 是最后的线性化点。
+    // 任一步失败都不会让 HEAD 指向缺失对象；最多留下后续可由 GC 清理的不可达元数据。
     let commit_id = repository.store_commit(&commit)?;
-    repository.update_current_commit(commit.parent.as_deref(), &commit_id)?;
+    repository.advance_head(&head, &commit_id)?;
 
     Ok(CommitOutcome {
         commit_id,
         tree_id,
         file_count: tree.files.len(),
+        detached: head.is_detached(),
     })
 }
 

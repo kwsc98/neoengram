@@ -21,7 +21,7 @@ fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error
     assert!(temporary.path().join(".neoengram/staging").is_dir());
     assert!(temporary.path().join(".neoengram/transactions").is_dir());
     let repository_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(repository_config["format_version"], 3);
+    assert_eq!(repository_config["format_version"], 4);
     assert_eq!(repository_config["metadata_store"], "sqlite");
     assert_eq!(repository_config["object_store"], "loose");
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
@@ -169,7 +169,7 @@ fn initializes_and_reopens_an_explicit_json_metadata_repository(
     );
     assert_eq!(read_index(&metadata_dir)?, Index::default());
     let repository_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(repository_config["format_version"], 3);
+    assert_eq!(repository_config["format_version"], 4);
     assert_eq!(repository_config["metadata_store"], "json");
     assert_eq!(repository_config["object_store"], "loose");
     assert!(metadata_dir.join("index.json").is_file());
@@ -248,15 +248,15 @@ fn init_rejects_the_previous_repository_format() -> Result<(), Box<dyn std::erro
     fs::create_dir_all(&metadata_dir)?;
     fs::write(
         metadata_dir.join("repository.json"),
-        br#"{"format_version":2,"metadata_store":"json","object_store":"loose"}"#,
+        br#"{"format_version":3,"metadata_store":"json","object_store":"loose"}"#,
     )?;
 
     let output = command(temporary.path()).arg("init").output()?;
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("格式版本 2"));
-    assert!(stderr.contains("当前支持 3"));
+    assert!(stderr.contains("格式版本 3"));
+    assert!(stderr.contains("当前支持 4"));
     assert!(!temporary.path().join(".neoengram/objects").exists());
     Ok(())
 }
@@ -410,7 +410,7 @@ fn creates_linear_single_parent_commits() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
-fn checkout_old_commit_restores_snapshot_without_rewinding_main(
+fn detached_checkout_commits_from_the_target_and_can_reattach_main(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     initialize(temporary.path())?;
@@ -444,29 +444,160 @@ fn checkout_old_commit_restores_snapshot_without_rewinding_main(
         .status
         .success());
     let second_id = current_commit_id(&metadata_dir)?;
+    let second: Commit = read_json(&metadata_dir.join(format!("commits/{second_id}.json")))?;
+    let second_tree = read_tree(&metadata_dir, &second.tree_hash)?;
     fs::write(temporary.path().join("keep.local"), b"untracked")?;
 
     let checkout = command(temporary.path())
         .args(["checkout", &first_id])
         .output()?;
     assert!(checkout.status.success());
+    let checkout_stdout = String::from_utf8(checkout.stdout)?;
+    assert!(checkout_stdout.contains("HEAD is now detached at"));
+    assert!(checkout_stdout.contains(&first_id));
     assert_eq!(fs::read(temporary.path().join("a.pt"))?, b"version one");
     assert!(!temporary.path().join("b.pt").exists());
     assert_eq!(fs::read(temporary.path().join("keep.local"))?, b"untracked");
     assert_eq!(current_commit_id(&metadata_dir)?, second_id);
+    assert_eq!(read_head(&metadata_dir)?, format!("{first_id}\n"));
     let restored_index = read_index(&metadata_dir)?;
     assert_eq!(restored_index.files, first_tree.files);
 
-    // checkout 老快照后再 commit，会在原 main tip 后追加一个单父回滚提交。
+    let detached_log = command(temporary.path()).arg("log").output()?;
+    assert!(detached_log.status.success());
+    let detached_log = String::from_utf8(detached_log.stdout)?;
+    assert!(detached_log.contains(&first_id));
+    assert!(!detached_log.contains(&second_id));
+
+    let detached_show = command(temporary.path()).args(["show", "HEAD"]).output()?;
+    assert!(detached_show.status.success());
+    assert!(String::from_utf8(detached_show.stdout)?.contains(&first_id));
+
+    let detached_status = command(temporary.path()).arg("status").output()?;
+    assert!(detached_status.status.success());
+    let detached_status = String::from_utf8(detached_status.stdout)?;
+    assert!(detached_status.contains("HEAD detached at"));
+    assert!(detached_status.contains(&first_id));
+
+    fs::write(temporary.path().join("a.pt"), b"detached change")?;
     assert!(command(temporary.path())
-        .args(["commit", "-m", "restore v1"])
+        .args(["add", "a.pt"])
         .output()?
         .status
         .success());
-    let restored_id = current_commit_id(&metadata_dir)?;
-    let restored: Commit = read_json(&metadata_dir.join(format!("commits/{restored_id}.json")))?;
-    assert_eq!(restored.parent.as_deref(), Some(second_id.as_str()));
-    assert_eq!(restored.tree_hash, first.tree_hash);
+    assert!(command(temporary.path())
+        .args(["commit", "-m", "detached change"])
+        .output()?
+        .status
+        .success());
+    let detached_id = read_head(&metadata_dir)?.trim().to_owned();
+    assert!(is_hash(&detached_id));
+    assert_ne!(detached_id, first_id);
+    assert_eq!(current_commit_id(&metadata_dir)?, second_id);
+    let detached: Commit = read_json(&metadata_dir.join(format!("commits/{detached_id}.json")))?;
+    assert_eq!(detached.parent.as_deref(), Some(first_id.as_str()));
+    assert_ne!(detached.tree_hash, first.tree_hash);
+
+    let detached_log = command(temporary.path()).arg("log").output()?;
+    assert!(detached_log.status.success());
+    let detached_log = String::from_utf8(detached_log.stdout)?;
+    let detached_position = detached_log
+        .find(&detached_id)
+        .ok_or("detached commit missing from log")?;
+    let first_position = detached_log
+        .find(&first_id)
+        .ok_or("detached parent missing from log")?;
+    assert!(detached_position < first_position);
+    assert!(!detached_log.contains(&second_id));
+
+    let reattach = command(temporary.path())
+        .args(["checkout", "main"])
+        .output()?;
+    assert!(reattach.status.success());
+    let reattach_stdout = String::from_utf8(reattach.stdout)?;
+    assert!(reattach_stdout.contains("main"));
+    assert_eq!(read_head(&metadata_dir)?, "ref: refs/heads/main\n");
+    assert_eq!(current_commit_id(&metadata_dir)?, second_id);
+    assert_eq!(fs::read(temporary.path().join("a.pt"))?, b"version two");
+    assert_eq!(fs::read(temporary.path().join("b.pt"))?, b"new in v2");
+    assert_eq!(read_index(&metadata_dir)?.files, second_tree.files);
+
+    let main_status = command(temporary.path()).arg("status").output()?;
+    assert!(main_status.status.success());
+    assert!(String::from_utf8(main_status.stdout)?.contains("On branch main"));
+
+    let main_log = command(temporary.path()).arg("log").output()?;
+    assert!(main_log.status.success());
+    let main_log = String::from_utf8(main_log.stdout)?;
+    let second_position = main_log
+        .find(&second_id)
+        .ok_or("main tip missing from log")?;
+    let first_position = main_log
+        .find(&first_id)
+        .ok_or("main root missing from log")?;
+    assert!(second_position < first_position);
+    assert!(!main_log.contains(&detached_id));
+
+    let detached_show = command(temporary.path())
+        .args(["show", detached_id.as_str()])
+        .output()?;
+    assert!(detached_show.status.success());
+    assert!(String::from_utf8(detached_show.stdout)?.contains(&detached_id));
+    Ok(())
+}
+
+#[test]
+fn checkout_head_preserves_the_current_head_mode() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    initialize(temporary.path())?;
+    let metadata_dir = temporary.path().join(".neoengram/metadata");
+    let model = temporary.path().join("model.pt");
+
+    fs::write(&model, b"committed")?;
+    assert!(command(temporary.path())
+        .args(["add", "model.pt"])
+        .output()?
+        .status
+        .success());
+    assert!(command(temporary.path())
+        .args(["commit", "-m", "base"])
+        .output()?
+        .status
+        .success());
+    let commit_id = current_commit_id(&metadata_dir)?;
+
+    fs::write(&model, b"attached dirty")?;
+    assert!(command(temporary.path())
+        .args(["checkout", "HEAD", "--force"])
+        .output()?
+        .status
+        .success());
+    assert_eq!(fs::read(&model)?, b"committed");
+    assert_eq!(read_head(&metadata_dir)?, "ref: refs/heads/main\n");
+    let attached_status = command(temporary.path()).arg("status").output()?;
+    assert!(attached_status.status.success());
+    assert!(String::from_utf8(attached_status.stdout)?.contains("On branch main"));
+
+    assert!(command(temporary.path())
+        .args(["checkout", commit_id.as_str()])
+        .output()?
+        .status
+        .success());
+    assert_eq!(read_head(&metadata_dir)?, format!("{commit_id}\n"));
+
+    fs::write(&model, b"detached dirty")?;
+    assert!(command(temporary.path())
+        .args(["checkout", "HEAD", "--force"])
+        .output()?
+        .status
+        .success());
+    assert_eq!(fs::read(&model)?, b"committed");
+    assert_eq!(read_head(&metadata_dir)?, format!("{commit_id}\n"));
+    let detached_status = command(temporary.path()).arg("status").output()?;
+    assert!(detached_status.status.success());
+    let detached_status = String::from_utf8(detached_status.stdout)?;
+    assert!(detached_status.contains("HEAD detached at"));
+    assert!(detached_status.contains(&commit_id));
     Ok(())
 }
 
@@ -929,6 +1060,10 @@ fn current_commit_id(metadata_dir: &Path) -> Result<String, Box<dyn std::error::
     Ok(fs::read_to_string(metadata_dir.join("refs/heads/main"))?
         .trim()
         .to_owned())
+}
+
+fn read_head(metadata_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(fs::read_to_string(metadata_dir.join("HEAD"))?)
 }
 
 fn is_hash(value: &str) -> bool {

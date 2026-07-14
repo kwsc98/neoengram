@@ -14,9 +14,9 @@
 - `add -A` 同时暂存指定路径范围内的新增、修改和删除。
 - 相同 Chunk 只保存一次；对象路径由 BLAKE3 Hash 决定。
 - Chunk 在复用和读取时都会校验大小与 BLAKE3；Tree 和 Commit 在读取时复算内容 ID。
-- `checkout` 会逐 Chunk 校验目标内容，再事务化更新工作区和 index。
+- `checkout <COMMIT_ID>` 会逐 Chunk 校验目标内容，再事务化更新工作区、index 和 detached HEAD。
 - `commit` 验证全部暂存 Chunk 后固化不可变 Tree，每个 Commit 最多只有一个父节点。
-- `checkout` 事务化恢复工作区和 index，但不会回退当前分支引用。
+- Detached HEAD 下的新 Commit 以当前 HEAD 为父节点且不移动 `main`；`checkout main` 重新附着。
 - `recover` 可以继续或回滚被 kill/断电打断的 checkout/rm 事务。
 - Tree、Commit 和分支引用保存在元数据控制面，文件分块保存在数据面。
 
@@ -79,7 +79,7 @@ cargo run -p neoengram -- checkout HEAD
     ├── write.lock                   # 按需创建的 OS advisory lock；文件可跨进程保留
     ├── metadata.sqlite3             # SQLite 后端的行式元数据数据库（选择 SQLite 时）
     ├── index.json                   # JSON 后端的完整暂存快照
-    ├── HEAD                         # JSON 后端：ref: refs/heads/main
+    ├── HEAD                         # JSON 后端：symbolic ref 或 detached Commit ID
     ├── index.lock / refs.lock       # JSON 后端按需创建的事务与 CAS 锁
     ├── refs/heads/main              # JSON 后端的当前 Commit ID（首次提交后创建）
     ├── manifests/<manifest-hash>.json # JSON 后端的单文件 Chunk recipe
@@ -88,10 +88,10 @@ cargo run -p neoengram -- checkout HEAD
 ```
 
 提交采用追加式发布顺序：先验证全部 Chunk 并完成 ObjectStore durability barrier，再写并同步
-Manifest、Tree 和 Commit，最后通过 CAS 原子更新当前分支引用。JSON 后端会同步引用的父目录；
-SQLite 后端通过 `synchronous=FULL` 的 WAL 事务提交。`add`、`rm`、`commit`、`checkout`、
-`recover` 和 `fsck` 共享 OS advisory lock；进程被 kill 后内核自动释放锁，遗留的普通
-`write.lock` 文件不会形成永久死锁。
+Manifest、Tree 和 Commit，最后通过 CAS 原子更新当前分支引用或 direct HEAD。JSON 后端会
+同步引用的父目录；SQLite 后端通过 `synchronous=FULL` 的 WAL 事务提交。`add`、`rm`、
+`commit`、`checkout`、`recover` 和 `fsck` 共享 OS advisory lock；进程被 kill 后内核自动
+释放锁，遗留的普通 `write.lock` 文件不会形成永久死锁。
 
 仓库路径固定为 UTF-8 NFC 和 `/` 分隔，并拒绝 Windows drive prefix、设备保留名、非法
 字符、大小写碰撞、文件/目录前缀碰撞，以及 `.neoengram` 和 `.neoengram-tmp-*` 保留组件。
@@ -100,7 +100,7 @@ SQLite 后端通过 `synchronous=FULL` 的 WAL 事务提交。`add`、`rm`、`co
 
 元数据通过 `MetadataStore` 访问：文件和 Chunk 分页读取，Manifest 单次流式写入并返回
 内容 ID，Index 使用 expected-version 事务，Tree 通过追加 writer 发布，Tree/Commit/ref
-使用一致读 snapshot 分页枚举，ref 更新使用 compare-exchange。Chunk payload 由独立
+使用一致读 snapshot 分页枚举，HEAD 和 ref 更新使用 compare-exchange。Chunk payload 由独立
 `ObjectStore` 管理，提供流式发布、单遍校验读取、批量状态检查、分页枚举和 durability
 barrier。Repository 和命令层都不再依赖对象物理路径。
 
@@ -109,7 +109,7 @@ barrier。Repository 和命令层都不再依赖对象物理路径。
 
 ```json
 {
-  "format_version": 3,
+  "format_version": 4,
   "metadata_store": "sqlite",
   "object_store": "loose"
 }
@@ -153,7 +153,7 @@ unstaged 和 untracked 三类状态，并查看线性历史或具体快照：
 
 ## 恢复版本
 
-恢复当前版本：
+重新物化当前 HEAD，不改变 attached/detached 状态：
 
 ```bash
 ./target/debug/neoengram checkout
@@ -165,19 +165,28 @@ unstaged 和 untracked 三类状态，并查看线性历史或具体快照：
 ./target/debug/neoengram checkout <COMMIT_ID>
 ```
 
+完整 Commit ID 会进入 detached HEAD；重新附着到默认分支：
+
+```bash
+./target/debug/neoengram checkout main
+```
+
 Checkout 默认拒绝丢弃 staged 修改、已跟踪文件修改或冲突的未跟踪文件。明确需要覆盖时：
 
 ```bash
 ./target/debug/neoengram checkout <COMMIT_ID> --force
 ```
 
-恢复旧 Commit 只会改变工作区和当前后端的 Index，不会把 `main` 指针向后移动。此时执行
-`commit` 会以当前 `main` 为唯一父节点追加一个新的恢复提交，继续满足 no-merge 和
-append-only 约束。Checkout 只处理发生变化的文件，校验其 Chunk 后组装完整文件缓存，
+切换到旧 Commit 后，`HEAD` 直接指向该 Commit，而 `main` 保持原位置。此时 `log`、
+`show HEAD` 和 `status` 都以 detached HEAD 为准；后续 `commit` 以 detached Commit 为父节点，
+只推进 direct HEAD，不移动 `main`。切回 `main` 后，未被命名引用保存的 detached Commit
+不会出现在 main 的 `log` 中，但当前仍可使用完整 ID 执行 `show` 或再次 checkout。
+
+Checkout 只处理发生变化的文件，校验其 Chunk 后组装完整文件缓存，
 并优先使用 Reflink 物化；文件系统不支持时自动退回普通复制。`--force` 支持文件和目录
 之间的类型转换，但仍拒绝跟随父级符号链接。
 
-如果进程在工作区 rename 或 index 发布期间退出，后续写命令会拒绝继续并给出恢复提示：
+如果进程在工作区 rename、index 或 HEAD 发布期间退出，后续写命令会拒绝继续并给出恢复提示：
 
 ```bash
 # 验证目标后继续原 checkout，或完成/回滚 rm 的安全状态
@@ -187,8 +196,8 @@ append-only 约束。Checkout 只处理发生变化的文件，校验其 Chunk �
 ./target/debug/neoengram recover --abort
 ```
 
-恢复 journal 会记录每个逻辑路径、原 index 和发布阶段。回滚只移除能按 FileNode 验证为
-事务产物的文件，遇到用户后来创建或修改的未知内容会停止，不会递归删除。
+恢复 journal 会记录每个逻辑路径、原 index、切换前后的 HEAD 和发布阶段。回滚只移除能按
+FileNode 验证为事务产物的文件，遇到用户后来创建或修改的未知内容会停止，不会递归删除。
 
 ## 完整性检查
 

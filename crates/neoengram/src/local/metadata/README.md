@@ -16,8 +16,8 @@ SQL 连接或物理表结构，所有本地后端共享同一套可观察契约�
 
 - 可变 Index；
 - 不可变 File Manifest、Tree 和 Commit；
-- HEAD 符号引用与 `refs/...` 引用；
-- 有界分页、固定读视图、Index 事务和 ref compare-exchange；
+- attached/detached HEAD 与 `refs/...` 引用；
+- 有界分页、固定读视图、Index 事务、HEAD/ref compare-exchange；
 - 元数据对象的原子、不可变发布。
 
 本模块不负责：
@@ -40,7 +40,7 @@ SQL 连接或物理表结构，所有本地后端共享同一套可观察契约�
 | File Manifest | 不可变 | 单个文件的大小和有序 Chunk recipe |
 | Tree | 不可变 | 一次提交中的完整文件集合 |
 | Commit | 不可变 | 指向 Tree 和可选父 Commit |
-| HEAD | 初始化后只读 | 指向一个 `refs/...` 引用名 |
+| HEAD | 可变 | attached 时指向 `refs/...`，detached 时直接指向 Commit ID |
 | Reference | 可变 | 名称到目标 ID 的映射，只能通过 CAS 修改 |
 | Metadata Snapshot | 固定读视图 | 固定 HEAD、refs 和历史对象 ID 集合 |
 
@@ -111,7 +111,7 @@ Index 和 Tree 只保存轻量 `FileRecord`：
 | `IndexReader::format_version` | 返回 Index 数据格式版本 |
 | `IndexReader::version` | 返回该固定 Index 视图的并发令牌 |
 | `TreeReader::file_count` | 返回 Tree 文件总数 |
-| `MetadataReader::read_head_reference` | 返回 HEAD 指向的引用名 |
+| `MetadataReader::read_head_state` | 返回 `HeadState::Attached` 或 `HeadState::Detached` |
 | `MetadataReader::get_reference` | 点查引用，不存在时返回 `None` |
 | `MetadataReader::open_manifest` | 按 ID 打开 Manifest，不存在时返回 `None` |
 | `MetadataReader::open_tree` | 按 ID 打开 Tree，不存在时返回 `None` |
@@ -181,13 +181,20 @@ JSON 后端先在共享 ref 锁内固定 HEAD 和 refs，再按 Commit、Tree、
 SQLite 后端使用 WAL read transaction 固定 HEAD、refs 和历史对象集合。两者都保证创建
 Snapshot 后的引用更新或新对象发布不会漂移该读视图。
 
-## 引用 CAS
+## HEAD 与引用 CAS
 
 | 操作或结果 | 语义 |
 | --- | --- |
+| `MetadataStore::compare_exchange_head` | HEAD 等于 `expected` 时原子替换为 `new_state` |
+| `HeadCas::Updated` | HEAD CAS 成功 |
+| `HeadCas::Mismatch` | HEAD 状态不匹配，返回锁内重新读取的 `actual` |
 | `MetadataStore::compare_exchange_reference` | 当前目标等于 `expected` 时原子更新为 `new_target` |
 | `ReferenceCas::Updated` | CAS 成功 |
 | `ReferenceCas::Mismatch` | 当前值不匹配，`actual` 是锁内重新读取的值 |
+
+`HeadState::Attached { reference }` 的引用名必须通过引用名校验；
+`HeadState::Detached { commit_id }` 必须包含 64 位小写十六进制 Commit ID。HEAD CAS 不提供
+无条件覆盖，JSON 后端与 ref CAS 共用同一把锁，SQLite 后端在单个即时写事务内比较和更新。
 
 参数含义：
 
@@ -235,22 +242,23 @@ Manifest、Tree 和 Index 版本摘要。它同样不代替 Repository 层的图
 3. 发布不可变 Manifest；
 4. 发布不可变 Tree；
 5. 发布不可变 Commit；
-6. 以旧父 Commit 为 expected target 执行 ref CAS。
+6. attached 时以旧父 Commit 为 expected target 执行 ref CAS；detached 时以旧 HEAD 状态为
+   expected 执行 HEAD CAS。
 
-ref CAS 是新 Commit 对引用读者可见的最后线性化点。失败可以留下不可达元数据，但不能
-覆盖并发提交，也不能让 ref 提前指向未完整发布的依赖。
+ref/HEAD CAS 是新 Commit 对历史读者可见的最后线性化点。失败可以留下不可达元数据，但
+不能覆盖并发提交，也不能让 HEAD 或 ref 提前指向未完整发布的依赖。
 
 Index 事务是独立原子边界。MetadataStore 不提供跨 Index、历史对象和 refs 的全局事务。
 
 JSON 后端使用同目录临时文件、文件同步和原子 rename/no-clobber；Unix 上额外显式同步
-目录，其他平台依赖系统 rename 语义。Index 事务使用排他 advisory lock；ref CAS 使用
-排他 ref 锁；Snapshot 固定 refs 时使用共享 ref 锁。
+目录，其他平台依赖系统 rename 语义。Index 事务使用排他 advisory lock；HEAD/ref CAS
+使用排他 ref 锁；Snapshot 固定 HEAD/refs 时使用共享 ref 锁。
 
 SQLite 后端使用 WAL、`synchronous=FULL`、外键与短写事务。Manifest/Tree 行先写入没有
 发布 header 的 staging set，最后只在短事务中发布 header；因此中断写入不会被 Reader 看到。
 
 持久写入可能在状态已经可见、结果返回前发生 I/O 错误。调用方遇到此类错误时应重新读取
-Index 版本、ref 或不可变对象确认结果，不能假定错误必然代表零副作用。
+Index 版本、HEAD、ref 或不可变对象确认结果，不能假定错误必然代表零副作用。
 
 rename 前退出可能留下 `.neoengram-tmp-` 开头的普通临时文件。枚举会忽略这些文件，但同前缀
 的目录、符号链接或其他异常项仍必须报错。
@@ -267,14 +275,14 @@ rename 前退出可能留下 `.neoengram-tmp-` 开头的普通临时文件。枚
 - JSON 或 SQLite 数据损坏、SQLite identity/schema 不匹配、布局异常、符号链接或非普通文件；
 - 后端锁竞争和 I/O 失败。
 
-对象不存在使用 `Option::None`。ref CAS 冲突使用 `ReferenceCas::Mismatch`，不转换成后端
-损坏错误。
+对象不存在使用 `Option::None`。HEAD/ref CAS 冲突分别使用 `HeadCas::Mismatch` 和
+`ReferenceCas::Mismatch`，不转换成后端损坏错误。
 
 ## JSON 后端
 
 ```text
 metadata/
-  HEAD
+  HEAD                    # ref: refs/heads/main，或 detached Commit ID
   index.json
   index.lock           # 按需创建
   refs.lock            # 按需创建
@@ -309,7 +317,7 @@ SQLite 后端把 Index、Manifest Chunk、Tree File、Commit 和 ref 按行保�
 - Reader 使用 keyset 查询，只物化当前页；
 - Index 基于固定 base version 构建 overlay，提交时复核版本并原子应用；
 - Manifest/Tree 使用不可见 staging set，支持有界批量写入；
-- Snapshot 持有 WAL read transaction，ref CAS 在单个 write transaction 内比较和更新；
+- Snapshot 持有 WAL read transaction，HEAD/ref CAS 在单个 write transaction 内比较和更新；
 - 数据库使用 `application_id` 标识所有权，拒绝把非空外部 SQLite 文件初始化为元数据后端；
 - schema 通过 `user_version` 版本化，未知版本直接拒绝打开。
 

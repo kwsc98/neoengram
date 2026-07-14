@@ -85,6 +85,48 @@ fn fsck_accepts_a_valid_repository_and_reports_object_corruption() -> TestResult
 }
 
 #[test]
+fn fsck_accepts_a_valid_detached_head() -> TestResult {
+    let repository = tempfile::tempdir()?;
+    initialize(repository.path())?;
+    fs::write(repository.path().join("dataset.bin"), b"detached payload")?;
+    run_success(repository.path(), &["add", "dataset.bin"])?;
+    run_success(repository.path(), &["commit", "-m", "detached target"])?;
+    let commit_id = current_commit_id(repository.path())?;
+
+    run_success(repository.path(), &["checkout", commit_id.as_str()])?;
+    assert_eq!(
+        fs::read_to_string(repository.path().join(".neoengram/metadata/HEAD"))?,
+        format!("{commit_id}\n")
+    );
+
+    let fsck = command(repository.path()).arg("fsck").output()?;
+    assert_success(&fsck);
+    assert!(String::from_utf8_lossy(&fsck.stdout).contains("Fsck OK"));
+    Ok(())
+}
+
+#[test]
+fn fsck_rejects_a_dangling_detached_head() -> TestResult {
+    let repository = tempfile::tempdir()?;
+    initialize(repository.path())?;
+    fs::write(repository.path().join("dataset.bin"), b"valid payload")?;
+    run_success(repository.path(), &["add", "dataset.bin"])?;
+    run_success(repository.path(), &["commit", "-m", "valid snapshot"])?;
+
+    let dangling = "f".repeat(64);
+    fs::write(
+        repository.path().join(".neoengram/metadata/HEAD"),
+        format!("{dangling}\n"),
+    )?;
+    let fsck = command(repository.path()).arg("fsck").output()?;
+    assert!(!fsck.status.success());
+    let stderr = String::from_utf8_lossy(&fsck.stderr);
+    assert!(stderr.contains("HEAD"));
+    assert!(stderr.contains(&dangling));
+    Ok(())
+}
+
+#[test]
 fn log_is_newest_first_honors_max_count_and_show_lists_files() -> TestResult {
     let repository = tempfile::tempdir()?;
     initialize(repository.path())?;

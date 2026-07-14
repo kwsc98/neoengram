@@ -18,7 +18,9 @@
 - 增加行式 `SqliteMetadataStore` 并作为新仓库默认后端；保留可显式选择的 JSON 后端。
 - 元数据契约、JSON/SQLite 后端、契约测试和逐操作文档集中到独立 `local/metadata` 模块。
 - 增加流式 `ObjectStore`、真实 `LooseObjectStore`、抽象切块入口及对象后端契约测试。
-- `repository.json` 格式 3 显式记录 `metadata_store` 和 `object_store`；开发期不兼容旧格式。
+- `repository.json` 格式 4 显式记录 `metadata_store` 和 `object_store`，并支持 attached/direct
+  HEAD；开发期不兼容旧格式。
+- SQLite 元数据 schema 升级为 2，结构化保存 symbolic/direct HEAD，并提供 HEAD CAS。
 
 ### Changed
 
@@ -36,6 +38,8 @@
   不再直接扫描 JSON 或对象目录。
 - `add` 通过 ObjectStore 流式发布对象；checkout 单遍校验并组装文件；Commit ref 使用
   expected-parent CAS，拒绝覆盖并发提交。
+- `checkout <COMMIT_ID>` 采用 Git 式 detached HEAD；`checkout main` 重新附着默认分支，
+  detached Commit 的提交只推进 direct HEAD。
 
 ### Fixed
 

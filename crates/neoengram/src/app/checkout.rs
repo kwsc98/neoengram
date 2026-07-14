@@ -18,11 +18,10 @@ pub(crate) async fn execute(target: String, force: bool) -> Result<()> {
         outcome.file_count(),
         outcome.removed_count()
     );
-    if outcome.commit_id() != outcome.head_id() {
-        println!(
-            "HEAD remains at {}; commit to append this restored snapshot",
-            outcome.head_id()
-        );
+    if outcome.is_detached() {
+        println!("HEAD is now detached at {}", outcome.commit_id());
+    } else if let Some(branch) = outcome.branch_name() {
+        println!("HEAD is now on branch {branch}");
     }
     Ok(())
 }

@@ -21,9 +21,10 @@ use crate::local::STORAGE_TEMP_FILE_PREFIX;
 
 use super::{
     file_manifest_id, tree_records_id, validate_metadata_object_id, validate_reference_name,
-    validate_reference_prefix, FileRecord, FileSetReader, IndexReader, IndexTxn, IndexVersion,
-    ManifestHasher, ManifestReader, ManifestRef, MetadataReader, MetadataSnapshot, MetadataStore,
-    MetadataStoreKind, Page, PageRequest, ReferenceCas, StoredReference, TreeReader, TreeWriter,
+    validate_reference_prefix, FileRecord, FileSetReader, HeadCas, HeadState, IndexReader,
+    IndexTxn, IndexVersion, ManifestHasher, ManifestReader, ManifestRef, MetadataReader,
+    MetadataSnapshot, MetadataStore, MetadataStoreKind, Page, PageRequest, ReferenceCas,
+    StoredReference, TreeReader, TreeWriter,
 };
 
 #[cfg(unix)]
@@ -169,18 +170,26 @@ impl JsonMetadataStore {
         Ok(())
     }
 
-    fn read_head_reference_data(&self) -> Result<String> {
+    fn read_head_state_data(&self) -> Result<HeadState> {
         let path = self.head_file();
         ensure_regular_file(&path, "HEAD")?;
         let contents = fs::read_to_string(&path)
             .with_context(|| format!("无法读取 HEAD: {}", path.display()))?;
-        let reference = contents
-            .strip_prefix("ref: ")
-            .and_then(|value| value.strip_suffix('\n'))
-            .context("HEAD 格式无效")?;
-        ensure!(!reference.contains('\n'), "HEAD 包含多余内容");
-        validate_reference_name(reference)?;
-        Ok(reference.to_owned())
+        let target = contents.strip_suffix('\n').context("HEAD 格式无效")?;
+        ensure!(
+            !target.contains('\n') && !target.contains('\r'),
+            "HEAD 包含多余内容"
+        );
+        let state = match target.strip_prefix("ref: ") {
+            Some(reference) => HeadState::Attached {
+                reference: reference.to_owned(),
+            },
+            None => HeadState::Detached {
+                commit_id: target.to_owned(),
+            },
+        };
+        state.validate()?;
+        Ok(state)
     }
 
     fn read_reference_data(&self, name: &str) -> Result<Option<String>> {
@@ -265,9 +274,18 @@ impl JsonMetadataStore {
     }
 }
 
+fn encode_head_state(state: &HeadState) -> Result<Vec<u8>> {
+    state.validate()?;
+    let value = match state {
+        HeadState::Attached { reference } => format!("ref: {reference}\n"),
+        HeadState::Detached { commit_id } => format!("{commit_id}\n"),
+    };
+    Ok(value.into_bytes())
+}
+
 impl MetadataReader for JsonMetadataStore {
-    fn read_head_reference(&self) -> Result<String> {
-        self.read_head_reference_data()
+    fn read_head_state(&self) -> Result<HeadState> {
+        self.read_head_state_data()
     }
 
     fn get_reference(&self, name: &str) -> Result<Option<String>> {
@@ -321,7 +339,9 @@ impl MetadataStore for JsonMetadataStore {
         )?;
         publish_bytes_if_absent(
             &self.head_file(),
-            format!("ref: {head_reference}\n").as_bytes(),
+            &encode_head_state(&HeadState::Attached {
+                reference: head_reference.to_owned(),
+            })?,
         )?;
         self.validate_layout()
     }
@@ -337,7 +357,7 @@ impl MetadataStore for JsonMetadataStore {
             ensure_directory(directory, kind)?;
         }
         ensure_regular_file(&self.index_file(), "index")?;
-        self.read_head_reference_data()?;
+        self.read_head_state_data()?;
         Ok(())
     }
 
@@ -428,7 +448,7 @@ impl MetadataStore for JsonMetadataStore {
         // 先固定 refs，再按发布顺序的逆序捕获 Commit、Tree 和 Manifest ID。不可变对象
         // 不删除，因此任何可见 ref 的依赖闭包都包含在同一个 snapshot 中。
         let refs_lock = self.acquire_storage_lock(REFS_LOCK_FILE_NAME, "引用事务锁", true)?;
-        let head_reference = self.read_head_reference_data()?;
+        let head_state = self.read_head_state_data()?;
         let references = self.list_references_data()?;
         drop(refs_lock);
         let commit_ids = list_json_ids(&self.commits_dir(), "Commit")?;
@@ -437,7 +457,7 @@ impl MetadataStore for JsonMetadataStore {
 
         Ok(Box::new(JsonMetadataSnapshot {
             store: self,
-            head_reference,
+            head_state,
             references,
             tree_ids,
             manifest_ids,
@@ -481,6 +501,22 @@ impl MetadataStore for JsonMetadataStore {
         let path = self.commit_file(id)?;
         ensure_regular_file_if_present(&path, "Commit")?;
         publish_immutable_json(&path, commit)
+    }
+
+    fn compare_exchange_head(
+        &self,
+        expected: &HeadState,
+        new_state: &HeadState,
+    ) -> Result<HeadCas> {
+        expected.validate()?;
+        let encoded = encode_head_state(new_state)?;
+        let _lock = self.acquire_storage_lock(REFS_LOCK_FILE_NAME, "引用事务锁", false)?;
+        let actual = self.read_head_state_data()?;
+        if &actual != expected {
+            return Ok(HeadCas::Mismatch { actual });
+        }
+        write_bytes_atomic(&self.head_file(), &encoded)?;
+        Ok(HeadCas::Updated)
     }
 
     fn compare_exchange_reference(
@@ -730,7 +766,7 @@ impl TreeWriter for JsonTreeWriter<'_> {
 #[derive(Debug)]
 struct JsonMetadataSnapshot<'a> {
     store: &'a JsonMetadataStore,
-    head_reference: String,
+    head_state: HeadState,
     references: Vec<StoredReference>,
     tree_ids: Vec<String>,
     manifest_ids: Vec<String>,
@@ -738,8 +774,8 @@ struct JsonMetadataSnapshot<'a> {
 }
 
 impl MetadataReader for JsonMetadataSnapshot<'_> {
-    fn read_head_reference(&self) -> Result<String> {
-        Ok(self.head_reference.clone())
+    fn read_head_state(&self) -> Result<HeadState> {
+        Ok(self.head_state.clone())
     }
 
     fn get_reference(&self, name: &str) -> Result<Option<String>> {

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::local::{fs::durable::read_json, metadata::MetadataStoreKind, objects::ObjectStoreKind};
 
-pub(super) const CURRENT_FORMAT_VERSION: u32 = 3;
+pub(super) const CURRENT_FORMAT_VERSION: u32 = 4;
 
 /// 保存在 NeoEngram 控制目录 `metadata/repository.json` 中的后端选择与仓库格式配置。
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]

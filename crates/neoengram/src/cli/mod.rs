@@ -25,11 +25,11 @@ enum Command {
     Status,
     /// 将暂存区固化为一个只有单父节点的不可变提交。
     Commit(CommitArgs),
-    /// 按时间倒序显示当前分支的单父提交历史。
+    /// 按时间倒序显示当前 HEAD 的单父提交历史。
     Log(LogArgs),
     /// 显示一个 Commit 及其完整文件清单。
     Show(ShowArgs),
-    /// 从 Commit 恢复工作区和 index，但不回退当前分支。
+    /// 切换到分支或 Commit，并恢复对应的工作区和 index。
     Checkout(CheckoutArgs),
     /// 完成或回滚一次被中断的工作区事务。
     Recover(RecoverArgs),
@@ -108,7 +108,7 @@ struct ShowArgs {
 
 #[derive(Debug, Args)]
 struct CheckoutArgs {
-    /// 完整 Commit ID；省略时使用当前 HEAD。
+    /// `main`、`HEAD` 或完整 Commit ID；Commit ID 会进入 detached HEAD。
     #[arg(value_name = "TARGET", default_value = "HEAD")]
     target: String,
     /// 丢弃暂存修改、已跟踪修改以及冲突的叶子文件。

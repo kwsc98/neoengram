@@ -12,20 +12,21 @@ use tempfile::{Builder, NamedTempFile};
 
 use crate::local::{
     fs::durable::{rename_durable, sync_directory, sync_parent, write_json_atomic},
+    metadata::HeadState,
     objects::ObjectSpec,
     repository::{Repository, RepositoryWriteLock},
 };
 
 const FILE_HASH_DOMAIN: &[u8] = b"neoengram-file-v2";
 const IO_BUFFER_SIZE: usize = 64 * 1024;
-const JOURNAL_FORMAT_VERSION: u32 = 1;
+const JOURNAL_FORMAT_VERSION: u32 = 2;
 const JOURNAL_FILE_NAME: &str = "journal.json";
 const ORIGINAL_INDEX_FILE_NAME: &str = "index.before.json";
 const OPERATION_FILE_NAME: &str = "OPERATION";
 
 pub(crate) struct CheckoutOutcome {
     commit_id: String,
-    head_id: String,
+    head_state: HeadState,
     file_count: usize,
     removed_count: usize,
 }
@@ -35,8 +36,17 @@ impl CheckoutOutcome {
         &self.commit_id
     }
 
-    pub(crate) fn head_id(&self) -> &str {
-        &self.head_id
+    pub(crate) fn is_detached(&self) -> bool {
+        matches!(self.head_state, HeadState::Detached { .. })
+    }
+
+    pub(crate) fn branch_name(&self) -> Option<&str> {
+        match &self.head_state {
+            HeadState::Attached { reference } => {
+                reference.strip_prefix("refs/heads/").or(Some(reference))
+            }
+            HeadState::Detached { .. } => None,
+        }
     }
 
     pub(crate) fn file_count(&self) -> usize {
@@ -63,12 +73,13 @@ fn checkout_snapshot_locked(
     force: bool,
     lock: &mut RepositoryWriteLock,
 ) -> Result<CheckoutOutcome> {
-    let head_id = repository
-        .current_commit_id()?
+    let original_head = repository.current_head()?;
+    let head_id = original_head
+        .commit_id()
         .context("仓库还没有 Commit；请先运行 `neoengram commit`")?;
     let current_index = repository.read_index()?;
     if !force {
-        let head_commit = repository.read_commit(&head_id)?;
+        let head_commit = repository.read_commit(head_id)?;
         let index_tree = Tree {
             files: current_index.files.clone(),
         };
@@ -78,11 +89,22 @@ fn checkout_snapshot_locked(
         );
     }
 
-    let target_id = if target.eq_ignore_ascii_case("HEAD") {
-        head_id.clone()
+    let (target_id, target_head) = if target.eq_ignore_ascii_case("HEAD") {
+        (head_id.to_owned(), original_head.state().clone())
+    } else if target == "main" || target == "refs/heads/main" {
+        let branch_head = repository.default_branch_head()?;
+        let branch_id = branch_head
+            .commit_id()
+            .context("分支 main 还没有 Commit；请先运行 `neoengram commit`")?;
+        (branch_id.to_owned(), branch_head.state().clone())
     } else {
         ensure!(!target.is_empty(), "Checkout TARGET 不能为空");
-        target.to_owned()
+        (
+            target.to_owned(),
+            HeadState::Detached {
+                commit_id: target.to_owned(),
+            },
+        )
     };
     let target_commit = repository.read_commit(&target_id)?;
     let target_tree = repository.read_tree(&target_commit.tree_hash)?;
@@ -93,7 +115,14 @@ fn checkout_snapshot_locked(
     // 不可达对象做完整检查时使用 `neoengram fsck`。
     let file_caches = prepare_file_caches(repository, &target_tree, &initial_plan.writes)?;
 
-    let mut transaction = CheckoutTransaction::create(repository, &target_id, &current_index)?;
+    let mut transaction = CheckoutTransaction::create(
+        repository,
+        &target_id,
+        original_head.state(),
+        head_id,
+        &target_head,
+        &current_index,
+    )?;
     lock.set_operation("checkout", Some(transaction.id()))?;
     let checkout_result = apply_checkout_transaction(
         repository,
@@ -111,7 +140,7 @@ fn checkout_snapshot_locked(
             lock.set_operation("checkout", None)?;
             Ok(CheckoutOutcome {
                 commit_id: target_id,
-                head_id,
+                head_state: target_head,
                 file_count: target_tree.files.len(),
                 removed_count,
             })
@@ -152,6 +181,9 @@ fn apply_checkout_transaction(
     })?;
     super::test_crash_at("checkout-after-index");
     transaction.set_phase(CheckoutPhase::IndexUpdated)?;
+    transaction.publish_head(repository)?;
+    super::test_crash_at("checkout-after-head");
+    transaction.set_phase(CheckoutPhase::HeadUpdated)?;
     Ok(final_plan.removals.len())
 }
 
@@ -633,6 +665,7 @@ enum CheckoutPhase {
     Applying,
     WorkspaceApplied,
     IndexUpdated,
+    HeadUpdated,
     RolledBack,
 }
 
@@ -648,6 +681,9 @@ struct JournalChange {
 struct CheckoutJournal {
     format_version: u32,
     target_id: String,
+    head_before: HeadState,
+    head_before_commit_id: String,
+    head_after: HeadState,
     phase: CheckoutPhase,
     changes: Vec<JournalChange>,
     created_directories: Vec<String>,
@@ -660,7 +696,14 @@ struct CheckoutTransaction {
 }
 
 impl CheckoutTransaction {
-    fn create(repository: &Repository, target_id: &str, original_index: &Index) -> Result<Self> {
+    fn create(
+        repository: &Repository,
+        target_id: &str,
+        head_before: &HeadState,
+        head_before_commit_id: &str,
+        head_after: &HeadState,
+        original_index: &Index,
+    ) -> Result<Self> {
         let temporary = Builder::new()
             .prefix("checkout-")
             .tempdir_in(repository.transactions_dir())
@@ -671,6 +714,9 @@ impl CheckoutTransaction {
         let journal = CheckoutJournal {
             format_version: JOURNAL_FORMAT_VERSION,
             target_id: target_id.to_owned(),
+            head_before: head_before.clone(),
+            head_before_commit_id: head_before_commit_id.to_owned(),
+            head_after: head_after.clone(),
             phase: CheckoutPhase::Prepared,
             changes: Vec::new(),
             created_directories: Vec::new(),
@@ -710,6 +756,22 @@ impl CheckoutTransaction {
             "不支持的 Checkout journal 版本 {}",
             journal.format_version
         );
+        journal.head_before.validate()?;
+        journal.head_after.validate()?;
+        repository.validate_commit_id(&journal.target_id)?;
+        repository.validate_commit_id(&journal.head_before_commit_id)?;
+        if let HeadState::Detached { commit_id } = &journal.head_before {
+            ensure!(
+                commit_id == &journal.head_before_commit_id,
+                "Checkout journal 的原 Detached HEAD 与原 Commit 不一致"
+            );
+        }
+        if let HeadState::Detached { commit_id } = &journal.head_after {
+            ensure!(
+                commit_id == &journal.target_id,
+                "Checkout journal 的目标 Detached HEAD 与目标 Commit 不一致"
+            );
+        }
         for change in &journal.changes {
             repository.validate_logical_path(&change.path)?;
             if let Some(file) = &change.expected_file {
@@ -756,6 +818,24 @@ impl CheckoutTransaction {
         self.journal.changes.clear();
         self.journal.created_directories.clear();
         self.persist_journal()
+    }
+
+    fn publish_head(&self, repository: &Repository) -> Result<()> {
+        let before = repository.resolve_head_state(self.journal.head_before.clone())?;
+        ensure!(
+            before.commit_id() == Some(self.journal.head_before_commit_id.as_str()),
+            "HEAD 的原分支在 Checkout 期间发生变化（期望 {}，实际 {:?}）",
+            self.journal.head_before_commit_id,
+            before.commit_id()
+        );
+        let after = repository.resolve_head_state(self.journal.head_after.clone())?;
+        ensure!(
+            after.commit_id() == Some(self.journal.target_id.as_str()),
+            "Checkout 目标 HEAD 不再指向目标 Commit（期望 {}，实际 {:?}）",
+            self.journal.target_id,
+            after.commit_id()
+        );
+        repository.transition_head(&self.journal.head_before, &self.journal.head_after)
     }
 
     fn staged_path(&self, logical_path: &str) -> PathBuf {
@@ -862,6 +942,14 @@ impl CheckoutTransaction {
     }
 
     fn rollback(&mut self, repository: &Repository) -> Result<()> {
+        repository.transition_head(&self.journal.head_after, &self.journal.head_before)?;
+        let restored_head = repository.resolve_head_state(self.journal.head_before.clone())?;
+        ensure!(
+            restored_head.commit_id() == Some(self.journal.head_before_commit_id.as_str()),
+            "回滚后的 HEAD 不再指向事务开始时的 Commit（期望 {}，实际 {:?}）",
+            self.journal.head_before_commit_id,
+            restored_head.commit_id()
+        );
         for change in self.journal.changes.iter().rev() {
             let destination = workspace_path(repository.root(), &change.path);
             let backup = self.backup_path(&change.path);

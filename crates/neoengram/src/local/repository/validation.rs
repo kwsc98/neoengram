@@ -53,6 +53,10 @@ impl Repository {
         validate_commit(commit)?;
         typed_json_hash(COMMIT_HASH_DOMAIN, commit)
     }
+
+    pub(crate) fn validate_commit_id(&self, id: &str) -> Result<()> {
+        validate_hash(id, "Commit")
+    }
 }
 
 pub(super) fn file_record_from_node(file: &FileNode) -> Result<FileRecord> {
