@@ -20,11 +20,11 @@ use crate::local::fs::durable::{
 use crate::local::STORAGE_TEMP_FILE_PREFIX;
 
 use super::{
-    file_manifest_id, tree_records_id, validate_metadata_object_id, validate_reference_name,
-    validate_reference_prefix, FileRecord, FileSetReader, HeadCas, HeadState, IndexReader,
-    IndexTxn, IndexVersion, ManifestHasher, ManifestReader, ManifestRef, MetadataReader,
-    MetadataSnapshot, MetadataStore, MetadataStoreKind, Page, PageRequest, ReferenceCas,
-    StoredReference, TreeReader, TreeWriter,
+    file_manifest_id, normalize_head_state, tree_records_id, validate_metadata_object_id,
+    validate_reference_name, validate_reference_prefix, FileRecord, FileSetReader, HeadCas,
+    HeadState, IndexReader, IndexTxn, IndexVersion, ManifestHasher, ManifestReader, ManifestRef,
+    MetadataReader, MetadataSnapshot, MetadataStore, MetadataStoreKind, Page, PageRequest,
+    ReferenceCas, StoredReference, TreeReader, TreeWriter,
 };
 
 #[cfg(unix)]
@@ -182,10 +182,10 @@ impl JsonMetadataStore {
         );
         let state = match target.strip_prefix("ref: ") {
             Some(reference) => HeadState::Attached {
-                reference: reference.to_owned(),
+                reference: reference.trim().to_owned(),
             },
             None => HeadState::Detached {
-                commit_id: target.to_owned(),
+                commit_id: target.trim().to_owned(),
             },
         };
         state.validate()?;
@@ -445,15 +445,15 @@ impl MetadataStore for JsonMetadataStore {
     }
 
     fn snapshot(&self) -> Result<Box<dyn MetadataSnapshot + '_>> {
-        // 先固定 refs，再按发布顺序的逆序捕获 Commit、Tree 和 Manifest ID。不可变对象
-        // 不删除，因此任何可见 ref 的依赖闭包都包含在同一个 snapshot 中。
+        // HEAD、refs 与历史对象 ID 必须在同一把共享 ref 锁下捕获，避免创建瞬间出现
+        // refs 固定而 ID 枚举漂移的非单点视图。
         let refs_lock = self.acquire_storage_lock(REFS_LOCK_FILE_NAME, "引用事务锁", true)?;
         let head_state = self.read_head_state_data()?;
         let references = self.list_references_data()?;
-        drop(refs_lock);
         let commit_ids = list_json_ids(&self.commits_dir(), "Commit")?;
         let tree_ids = list_json_ids(&self.trees_dir(), "Tree")?;
         let manifest_ids = list_json_ids(&self.manifests_dir(), "Manifest")?;
+        drop(refs_lock);
 
         Ok(Box::new(JsonMetadataSnapshot {
             store: self,
@@ -508,11 +508,14 @@ impl MetadataStore for JsonMetadataStore {
         expected: &HeadState,
         new_state: &HeadState,
     ) -> Result<HeadCas> {
+        let expected = normalize_head_state(expected);
+        let new_state = normalize_head_state(new_state);
         expected.validate()?;
-        let encoded = encode_head_state(new_state)?;
+        new_state.validate()?;
+        let encoded = encode_head_state(&new_state)?;
         let _lock = self.acquire_storage_lock(REFS_LOCK_FILE_NAME, "引用事务锁", false)?;
-        let actual = self.read_head_state_data()?;
-        if &actual != expected {
+        let actual = normalize_head_state(&self.read_head_state_data()?);
+        if actual != expected {
             return Ok(HeadCas::Mismatch { actual });
         }
         write_bytes_atomic(&self.head_file(), &encoded)?;

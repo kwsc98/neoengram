@@ -15,11 +15,11 @@ use rusqlite::{params, params_from_iter, types::Value, Connection, OpenFlags, Op
 use crate::local::fs::durable::{ensure_or_create_directory, sync_parent};
 
 use super::{
-    validate_metadata_object_id, validate_reference_name, validate_reference_prefix, FileRecord,
-    FileSetReader, HeadCas, HeadState, IndexReader, IndexTxn, IndexVersion, ManifestHasher,
-    ManifestReader, ManifestRef, MetadataReader, MetadataSnapshot, MetadataStore,
-    MetadataStoreKind, Page, PageRequest, ReferenceCas, StoredReference, TreeHasher, TreeReader,
-    TreeWriter,
+    normalize_head_state, validate_metadata_object_id, validate_reference_name,
+    validate_reference_prefix, FileRecord, FileSetReader, HeadCas, HeadState, IndexReader,
+    IndexTxn, IndexVersion, ManifestHasher, ManifestReader, ManifestRef, MetadataReader,
+    MetadataSnapshot, MetadataStore, MetadataStoreKind, Page, PageRequest, ReferenceCas,
+    StoredReference, TreeHasher, TreeReader, TreeWriter,
 };
 
 const DATABASE_FILE_NAME: &str = "metadata.sqlite3";
@@ -1459,8 +1459,12 @@ fn read_head_state(connection: &Connection) -> Result<HeadState> {
         )
         .context("无法读取 SQLite HEAD 状态")?;
     let state = match kind.as_str() {
-        "attached" => HeadState::Attached { reference: target },
-        "detached" => HeadState::Detached { commit_id: target },
+        "attached" => HeadState::Attached {
+            reference: target.trim().to_owned(),
+        },
+        "detached" => HeadState::Detached {
+            commit_id: target.trim().to_owned(),
+        },
         _ => bail!("SQLite HEAD 类型无效: {kind}"),
     };
     state.validate()?;
@@ -1886,12 +1890,15 @@ impl MetadataStore for SqliteMetadataStore {
         expected: &HeadState,
         new_state: &HeadState,
     ) -> Result<HeadCas> {
+        let expected = normalize_head_state(expected);
+        let new_state = normalize_head_state(new_state);
         expected.validate()?;
-        let (new_kind, new_target) = encode_head_state(new_state)?;
+        new_state.validate()?;
+        let (new_kind, new_target) = encode_head_state(&new_state)?;
         let connection = self.open_existing(false)?;
         run_immediate(&connection, || {
-            let actual = read_head_state(&connection)?;
-            if &actual != expected {
+            let actual = normalize_head_state(&read_head_state(&connection)?);
+            if actual != expected {
                 return Ok(HeadCas::Mismatch { actual });
             }
             connection.execute(

@@ -174,6 +174,18 @@ impl HeadState {
     }
 }
 
+/// 规范化 HEAD 状态以便 compare-exchange 比较；引用名与 Commit ID 去除首尾空白。
+fn normalize_head_state(state: &HeadState) -> HeadState {
+    match state {
+        HeadState::Attached { reference } => HeadState::Attached {
+            reference: reference.trim().to_owned(),
+        },
+        HeadState::Detached { commit_id } => HeadState::Detached {
+            commit_id: commit_id.trim().to_owned(),
+        },
+    }
+}
+
 /// 一个命名引用及其目标。引用名使用 `refs/...` 形式，与具体后端的文件名或表结构无关。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredReference {

@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -15,7 +15,8 @@ use crate::local::{
     repository::{is_neoengram_dir_name, Repository},
 };
 
-const IO_BUFFER_SIZE: usize = 64 * 1024;
+use super::workspace::{file_matches_node, logical_join, safe_leaf_metadata, workspace_path};
+
 const TRANSACTION_FORMAT_VERSION: u32 = 1;
 const PREPARED_STATE: &str = "PREPARED";
 const INDEX_COMMITTED_STATE: &str = "INDEX_COMMITTED";
@@ -277,16 +278,29 @@ struct RemovalManifestEntry {
     state: String,
 }
 
+/// rm 事务恢复的实际结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemovalRecovery {
+    /// index 已经发布，恢复只完成了事务收尾，删除保持生效。
+    Completed,
+    /// index 尚未发布，备份文件已恢复到工作区，等同于回到事务开始前。
+    RolledBack,
+}
+
 /// 恢复单个遗留的 rm 事务。
 ///
 /// 调用方必须已经持有全仓库 recovery 锁；这里不能再获取普通写锁，因为普通写锁会把
 /// transactions 中的遗留项视为需要人工处理的异常。`abort` 只允许回滚尚未发布 index
 /// 的事务，绝不会把已经提交的新 index 反向改写。
+///
+/// 与 checkout 的“回滚后重放”不同，rm 没有续完路径：index 尚未发布（`PREPARED`）时，
+/// 无论是否 `abort` 都会恢复备份并回到事务开始前。原因是事务不记录 `--force` 标志，
+/// 崩溃后无法安全重放工作区一致性检查；需要删除时重新执行 `rm` 即可。
 pub(super) fn recover_transaction(
     repository: &Repository,
     transaction_root: &Path,
     abort: bool,
-) -> Result<()> {
+) -> Result<RemovalRecovery> {
     validate_transaction_root(repository, transaction_root)?;
     let operation =
         fs::read_to_string(transaction_root.join("OPERATION")).context("无法读取 rm 事务类型")?;
@@ -313,8 +327,9 @@ pub(super) fn recover_transaction(
             !abort,
             "rm 的 index 已经提交，不能 abort；请执行普通 recover 完成清理"
         );
-        return remove_dir_all_durable(transaction_root)
-            .with_context(|| format!("无法清理已提交的 rm 事务: {}", transaction_root.display()));
+        remove_dir_all_durable(transaction_root)
+            .with_context(|| format!("无法清理已提交的 rm 事务: {}", transaction_root.display()))?;
+        return Ok(RemovalRecovery::Completed);
     }
 
     ensure!(
@@ -328,7 +343,8 @@ pub(super) fn recover_transaction(
 
     restore_manifest_backups(repository, transaction_root, &manifest)?;
     remove_dir_all_durable(transaction_root)
-        .with_context(|| format!("无法清理已回滚的 rm 事务: {}", transaction_root.display()))
+        .with_context(|| format!("无法清理已回滚的 rm 事务: {}", transaction_root.display()))?;
+    Ok(RemovalRecovery::RolledBack)
 }
 
 fn validate_transaction_root(repository: &Repository, transaction_root: &Path) -> Result<()> {
@@ -510,74 +526,6 @@ fn path_is_in_scope(path: &str, scope: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn safe_leaf_metadata(repository_root: &Path, logical_path: &str) -> Result<Option<fs::Metadata>> {
-    let components: Vec<&str> = logical_path.split('/').collect();
-    let mut current = repository_root.to_path_buf();
-    for (index, component) in components.iter().enumerate() {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if index + 1 < components.len() => ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "工作区路径祖先不是普通目录: {}",
-                current.display()
-            ),
-            Ok(metadata) => return Ok(Some(metadata)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("无法检查工作区路径: {}", current.display()));
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn file_matches_node(path: &Path, node: &FileNode) -> Result<bool> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("无法读取工作区文件元数据: {}", path.display()))?;
-    if !metadata.is_file() || metadata.len() != node.total_size {
-        return Ok(false);
-    }
-
-    let mut reader =
-        File::open(path).with_context(|| format!("无法打开工作区文件: {}", path.display()))?;
-    for chunk in &node.chunks {
-        let Some(actual_hash) = read_exact_hash(&mut reader, chunk.size)? else {
-            return Ok(false);
-        };
-        if actual_hash != chunk.hash {
-            return Ok(false);
-        }
-    }
-
-    let mut trailing = [0_u8; 1];
-    Ok(reader
-        .read(&mut trailing)
-        .with_context(|| format!("无法检查工作区文件结尾: {}", path.display()))?
-        == 0)
-}
-
-fn read_exact_hash(reader: &mut File, size: u64) -> Result<Option<String>> {
-    let mut remaining = size;
-    let mut buffer = [0_u8; IO_BUFFER_SIZE];
-    let mut hasher = blake3::Hasher::new();
-    while remaining > 0 {
-        let limit = usize::try_from(remaining.min(IO_BUFFER_SIZE as u64))
-            .context("当前平台无法表示读取缓冲区大小")?;
-        let read = reader
-            .read(&mut buffer[..limit])
-            .context("无法读取工作区文件")?;
-        if read == 0 {
-            return Ok(None);
-        }
-        hasher.update(&buffer[..read]);
-        remaining = remaining
-            .checked_sub(u64::try_from(read).context("读取长度超出 u64 范围")?)
-            .context("工作区文件读取长度溢出")?;
-    }
-    Ok(Some(hasher.finalize().to_hex().to_string()))
-}
-
 fn ensure_path_absent(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -691,16 +639,4 @@ fn write_atomic_synced(path: &Path, contents: &[u8]) -> Result<()> {
         .map_err(|error| error.error)
         .with_context(|| format!("无法原子更新事务状态: {}", path.display()))?;
     sync_directory(parent)
-}
-
-fn workspace_path(repository_root: &Path, logical_path: &str) -> PathBuf {
-    logical_join(repository_root, logical_path)
-}
-
-fn logical_join(base: &Path, logical_path: &str) -> PathBuf {
-    let mut path = base.to_path_buf();
-    for component in logical_path.split('/') {
-        path.push(component);
-    }
-    path
 }

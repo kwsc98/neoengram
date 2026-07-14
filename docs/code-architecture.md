@@ -17,7 +17,7 @@ crates/
     │   └── local/
     │       ├── repository/      # 仓库门面、布局配置、锁、历史与领域校验
     │       ├── worktree/        # import.rs 切块、输入快照、物化和恢复事务
-│       ├── metadata/        # MetadataStore 契约、attached/direct HEAD、JSON/SQLite 后端
+    │       ├── metadata/        # MetadataStore 契约、attached/direct HEAD、JSON/SQLite 后端
     │       ├── objects/         # contract.rs 契约、loose.rs/未来 pack 本地后端
     │       └── fs/              # 持久写入、原子发布和安全路径原语
     └── tests/                   # CLI 端到端与跨模块集成测试

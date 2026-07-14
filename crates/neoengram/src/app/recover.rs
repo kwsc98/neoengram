@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::local::{
     repository::Repository,
-    worktree::{self, RecoveryReport},
+    worktree::{self, RecoveryReport, RemovalRecovery},
 };
 
 pub(crate) async fn execute(abort: bool) -> Result<()> {
@@ -20,15 +20,21 @@ pub(crate) async fn execute(abort: bool) -> Result<()> {
                 println!("Aborted checkout transaction for {target_id}");
             } else {
                 println!("Recovered checkout transaction to {target_id}");
+                println!(
+                    "Note: recovery replayed checkout with --force semantics; \
+                     conflicting local changes may have been discarded"
+                );
             }
         }
-        RecoveryReport::Removal { id, aborted } => {
-            if aborted {
-                println!("Aborted rm transaction {id}");
-            } else {
-                println!("Recovered rm transaction {id}");
+        RecoveryReport::Removal { id, outcome } => match outcome {
+            RemovalRecovery::Completed => {
+                println!("Completed rm transaction {id}");
             }
-        }
+            RemovalRecovery::RolledBack => {
+                println!("Rolled back rm transaction {id}");
+                println!("Re-run `neoengram rm` if you still want to remove those paths");
+            }
+        },
     }
     Ok(())
 }

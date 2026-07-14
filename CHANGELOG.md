@@ -49,3 +49,12 @@
 - 缺失或损坏 Chunk 不再能进入新 Commit。
 - checkout 支持文件与目录类型互换，并拒绝父级符号链接和路径逃逸。
 - 被 kill 后遗留的 lock 文件不再永久阻塞仓库。
+- `recover` 对 index 尚未发布的 rm 事务如实报告“已回滚”而不是“已恢复”，并说明 rm
+  没有续完路径；checkout 恢复完成时提示重放使用了 `--force` 语义。
+- JSON 后端的 Snapshot 在同一把共享 ref 锁内捕获 HEAD、refs 和全部历史对象 ID，
+  消除创建瞬间的非单点视图。
+- HEAD compare-exchange 与 HEAD 读取按契约对引用名和 Commit ID 执行 `trim()`。
+- checkout 在真正 rename 每个文件前按 rm 同等标准二次校验工作区内容，未暂存修改
+  不再可能被静默备份后随事务清理丢弃。
+- checkout/rm/status 共用 `worktree/workspace.rs` 的路径与内容校验原语，消除三份
+  重复实现之间的语义漂移。

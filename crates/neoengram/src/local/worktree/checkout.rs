@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -17,8 +17,9 @@ use crate::local::{
     repository::{Repository, RepositoryWriteLock},
 };
 
+use super::workspace::{file_matches_node, logical_join, safe_leaf_metadata, workspace_path};
+
 const FILE_HASH_DOMAIN: &[u8] = b"neoengram-file-v2";
-const IO_BUFFER_SIZE: usize = 64 * 1024;
 const JOURNAL_FORMAT_VERSION: u32 = 2;
 const JOURNAL_FILE_NAME: &str = "journal.json";
 const ORIGINAL_INDEX_FILE_NAME: &str = "index.before.json";
@@ -173,7 +174,14 @@ fn apply_checkout_transaction(
     );
 
     transaction.set_phase(CheckoutPhase::Applying)?;
-    apply_workspace_changes(repository, target_tree, &final_plan, transaction)?;
+    apply_workspace_changes(
+        repository,
+        current_index,
+        target_tree,
+        force,
+        &final_plan,
+        transaction,
+    )?;
     transaction.set_phase(CheckoutPhase::WorkspaceApplied)?;
     repository.write_index(&Index {
         format_version: INDEX_FORMAT_VERSION,
@@ -405,35 +413,6 @@ fn check_target_conflict(
     Ok(true)
 }
 
-fn safe_leaf_metadata(repository_root: &Path, logical_path: &str) -> Result<Option<fs::Metadata>> {
-    let components: Vec<&str> = logical_path.split('/').collect();
-    let mut current = repository_root.to_path_buf();
-    for component in components.iter().take(components.len().saturating_sub(1)) {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "Checkout 路径的父级不是普通目录: {}",
-                current.display()
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("无法检查工作区路径: {}", current.display()));
-            }
-        }
-    }
-
-    let destination = workspace_path(repository_root, logical_path);
-    match fs::symlink_metadata(&destination) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("无法检查工作区路径: {}", destination.display()))
-        }
-    }
-}
-
 fn prepare_file_caches(
     repository: &Repository,
     tree: &Tree,
@@ -526,52 +505,6 @@ fn ensure_file_cache(repository: &Repository, file: &FileNode, file_id: &str) ->
     }
 }
 
-fn file_matches_node(path: &Path, file_node: &FileNode) -> Result<bool> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error).with_context(|| format!("无法检查文件: {}", path.display()));
-        }
-    };
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() != file_node.total_size
-    {
-        return Ok(false);
-    }
-
-    let mut file = File::open(path).with_context(|| format!("无法打开文件: {}", path.display()))?;
-    for chunk in &file_node.chunks {
-        let Some(actual_hash) = read_exact_hash(&mut file, chunk.size)? else {
-            return Ok(false);
-        };
-        if actual_hash != chunk.hash {
-            return Ok(false);
-        }
-    }
-    let mut trailing = [0_u8; 1];
-    Ok(file.read(&mut trailing)? == 0)
-}
-
-fn read_exact_hash(reader: &mut File, size: u64) -> Result<Option<String>> {
-    let mut remaining = size;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; IO_BUFFER_SIZE];
-
-    while remaining > 0 {
-        let limit =
-            usize::try_from(remaining.min(IO_BUFFER_SIZE as u64)).context("读取大小超出 usize")?;
-        let read = reader.read(&mut buffer[..limit])?;
-        if read == 0 {
-            return Ok(None);
-        }
-        hasher.update(&buffer[..read]);
-        remaining -= u64::try_from(read).context("读取大小超出 u64")?;
-    }
-    Ok(Some(hasher.finalize().to_hex().to_string()))
-}
-
 fn stage_files(
     transaction: &CheckoutTransaction,
     tree: &Tree,
@@ -614,10 +547,18 @@ fn stage_files(
 
 fn apply_workspace_changes(
     repository: &Repository,
+    current_index: &Index,
     target_tree: &Tree,
+    force: bool,
     plan: &CheckoutPlan,
     transaction: &mut CheckoutTransaction,
 ) -> Result<()> {
+    let current_files: BTreeMap<&str, &FileNode> = current_index
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+
     // 类型转换的冲突根必须整体备份。例如当前是文件 `a`、目标是 `a/b`，或当前是目录
     // `a/`、目标是文件 `a`。先移动最短冲突根可同时保留其中未跟踪内容，并避免 backup
     // 目录内出现“父路径是文件”的冲突。
@@ -627,6 +568,9 @@ fn apply_workspace_changes(
     }
 
     for file in &plan.removals {
+        if !force {
+            ensure_workspace_unchanged(repository.root(), file)?;
+        }
         let destination = workspace_path(repository.root(), &file.path);
         match fs::symlink_metadata(&destination) {
             Ok(_) => transaction.back_up(&file.path, &destination, false, None)?,
@@ -642,6 +586,21 @@ fn apply_workspace_changes(
         if !plan.writes.contains(&file.path) {
             continue;
         }
+        if !force {
+            if let Some(current) = current_files.get(file.path.as_str()) {
+                ensure_workspace_unchanged(repository.root(), current)?;
+            } else if safe_leaf_metadata(repository.root(), &file.path)?.is_some() {
+                // preflight 通过时该路径要么不存在，要么内容已等于目标（后者不进入
+                // writes）。此刻出现其他内容说明有并发写入，备份会随事务结束被删除，
+                // 因此必须拒绝而不是静默覆盖。
+                let destination = workspace_path(repository.root(), &file.path);
+                ensure!(
+                    file_matches_node(&destination, file)?,
+                    "未跟踪文件在 Checkout 执行期间出现: {}；请重试",
+                    file.path
+                );
+            }
+        }
         let destination = workspace_path(repository.root(), &file.path);
         transaction.ensure_worktree_parents(repository.root(), &file.path)?;
         transaction.back_up(&file.path, &destination, true, Some(file))?;
@@ -655,6 +614,19 @@ fn apply_workspace_changes(
         })?;
         super::test_crash_at("checkout-after-publish");
     }
+    Ok(())
+}
+
+fn ensure_workspace_unchanged(repository_root: &Path, expected: &FileNode) -> Result<()> {
+    // 与 rm 的 rename 前二次校验对齐：先重查祖先（symlink/非目录直接报错），再核对
+    // 叶子内容，缩小 preflight 与真正修改工作区之间的竞态窗口。
+    safe_leaf_metadata(repository_root, &expected.path)?;
+    let destination = workspace_path(repository_root, &expected.path);
+    ensure!(
+        file_matches_node(&destination, expected)?,
+        "工作区文件在 Checkout 执行期间发生变化: {}；请重试",
+        expected.path
+    );
     Ok(())
 }
 
@@ -1240,16 +1212,4 @@ fn write_transaction_marker(path: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all()
         .with_context(|| format!("无法同步 Checkout 事务标记: {}", path.display()))?;
     sync_parent(path)
-}
-
-fn workspace_path(repository_root: &Path, logical_path: &str) -> PathBuf {
-    logical_join(repository_root, logical_path)
-}
-
-fn logical_join(base: &Path, logical_path: &str) -> PathBuf {
-    let mut path = base.to_path_buf();
-    for component in logical_path.split('/') {
-        path.push(component);
-    }
-    path
 }
