@@ -177,9 +177,10 @@ Commit 是否有效，由 Repository 校验。
 Snapshot 同时实现 `MetadataReader`。创建后，后续 ref 更新或历史对象发布不能改变其枚举
 结果和引用点查结果；Drop 时释放对应 read transaction 或内存视图。
 
-JSON 后端先在共享 ref 锁内固定 HEAD 和 refs，再按 Commit、Tree、Manifest 顺序捕获 ID。
-SQLite 后端使用 WAL read transaction 固定 HEAD、refs 和历史对象集合。两者都保证创建
-Snapshot 后的引用更新或新对象发布不会漂移该读视图。
+JSON 后端在同一把共享 ref 锁内固定 HEAD、refs 以及 Commit、Tree、Manifest ID 集合，
+避免创建瞬间出现 refs 与 ID 枚举分属两个时刻的非单点视图。SQLite 后端使用 WAL read
+transaction 固定 HEAD、refs 和历史对象集合。两者都保证创建 Snapshot 后的引用更新或
+新对象发布不会漂移该读视图。
 
 ## HEAD 与引用 CAS
 

@@ -4,12 +4,18 @@ use anyhow::{bail, ensure, Context, Result};
 
 use crate::local::repository::Repository;
 
-use super::{checkout, remove};
+use super::{checkout, remove, RemovalRecovery};
 
 pub(crate) enum RecoveryReport {
     Nothing,
-    Checkout { target_id: String, aborted: bool },
-    Removal { id: String, aborted: bool },
+    Checkout {
+        target_id: String,
+        aborted: bool,
+    },
+    Removal {
+        id: String,
+        outcome: RemovalRecovery,
+    },
 }
 
 pub(crate) fn recover_repository(repository: &Repository, abort: bool) -> Result<RecoveryReport> {
@@ -47,9 +53,9 @@ pub(crate) fn recover_repository(repository: &Repository, abort: bool) -> Result
                 .context("rm 事务目录名不是有效 UTF-8")?
                 .to_owned();
             lock.set_operation("rm-recover", Some(&id))?;
-            remove::recover_transaction(repository, transaction, abort)?;
+            let outcome = remove::recover_transaction(repository, transaction, abort)?;
             lock.set_operation("rm-recover", None)?;
-            Ok(RecoveryReport::Removal { id, aborted: abort })
+            Ok(RecoveryReport::Removal { id, outcome })
         }
         other => bail!("不支持的事务类型 {other:?}: {}", transaction.display()),
     }

@@ -118,7 +118,8 @@ struct CheckoutArgs {
 
 #[derive(Debug, Args)]
 struct RecoverArgs {
-    /// 回滚到事务开始前的工作区和 index，不继续原操作。
+    /// 对 checkout：回滚到事务开始前，不继续切换。对 rm：仅在 index 已提交时拒绝 abort；
+    /// index 尚未提交时无论是否指定此选项都会恢复备份并回到事务开始前。
     #[arg(long)]
     abort: bool,
 }

@@ -1,17 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::{self, Read},
-    path::{Component, Path, PathBuf},
+    fs,
+    path::{Component, Path},
 };
 
 use anyhow::{ensure, Context, Result};
 use neoengram_core::FileNode;
 use walkdir::WalkDir;
 
-use crate::local::repository::{is_neoengram_dir_name, Repository};
-
-const IO_BUFFER_SIZE: usize = 64 * 1024;
+use crate::local::{
+    repository::{is_neoengram_dir_name, Repository},
+    worktree::{file_matches_node, lenient_leaf_metadata, workspace_path},
+};
 
 pub(crate) async fn execute() -> Result<()> {
     let current_dir = std::env::current_dir().context("无法确定当前工作目录")?;
@@ -97,7 +97,7 @@ fn build_report(repository: &Repository) -> Result<StatusReport> {
     let mut unstaged = Vec::new();
     for file in &index.files {
         let path = workspace_path(repository.root(), &file.path);
-        match safe_leaf_metadata(repository.root(), &file.path)? {
+        match lenient_leaf_metadata(repository.root(), &file.path)? {
             None => unstaged.push(PathChange {
                 path: file.path.clone(),
                 kind: ChangeKind::Deleted,
@@ -206,31 +206,6 @@ fn repository_path(path: &Path, repository_root: &Path) -> Result<String> {
     Ok(names.join("/"))
 }
 
-fn safe_leaf_metadata(repository_root: &Path, logical_path: &str) -> Result<Option<fs::Metadata>> {
-    let components: Vec<&str> = logical_path.split('/').collect();
-    let mut current = repository_root.to_path_buf();
-    for (index, component) in components.iter().enumerate() {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if index + 1 < components.len() => {
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    // 例如 index 中有 a/b，但工作区把 a 换成了普通文件。此时 a/b 对
-                    // index 而言是 deleted，后续工作区扫描会把 a 单独报告为 untracked。
-                    // symlink 祖先也在这里停止，绝不会继续跟随到仓库之外。
-                    return Ok(None);
-                }
-            }
-            Ok(metadata) => return Ok(Some(metadata)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("无法检查工作区路径: {}", current.display()));
-            }
-        }
-    }
-    Ok(None)
-}
-
 fn ensure_no_unfinished_transaction(repository: &Repository) -> Result<()> {
     let mut entries = fs::read_dir(repository.transactions_dir()).with_context(|| {
         format!(
@@ -246,52 +221,6 @@ fn ensure_no_unfinished_transaction(repository: &Repository) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn file_matches_node(path: &Path, node: &FileNode) -> Result<bool> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("无法读取工作区文件元数据: {}", path.display()))?;
-    if !metadata.is_file() || metadata.len() != node.total_size {
-        return Ok(false);
-    }
-
-    let mut reader =
-        File::open(path).with_context(|| format!("无法打开工作区文件: {}", path.display()))?;
-    for chunk in &node.chunks {
-        let Some(actual_hash) = read_exact_hash(&mut reader, chunk.size)? else {
-            return Ok(false);
-        };
-        if actual_hash != chunk.hash {
-            return Ok(false);
-        }
-    }
-
-    let mut trailing = [0_u8; 1];
-    Ok(reader
-        .read(&mut trailing)
-        .with_context(|| format!("无法检查工作区文件结尾: {}", path.display()))?
-        == 0)
-}
-
-fn read_exact_hash(reader: &mut File, size: u64) -> Result<Option<String>> {
-    let mut remaining = size;
-    let mut buffer = [0_u8; IO_BUFFER_SIZE];
-    let mut hasher = blake3::Hasher::new();
-    while remaining > 0 {
-        let limit = usize::try_from(remaining.min(IO_BUFFER_SIZE as u64))
-            .context("当前平台无法表示读取缓冲区大小")?;
-        let read = reader
-            .read(&mut buffer[..limit])
-            .context("无法读取工作区文件")?;
-        if read == 0 {
-            return Ok(None);
-        }
-        hasher.update(&buffer[..read]);
-        remaining = remaining
-            .checked_sub(u64::try_from(read).context("读取长度超出 u64 范围")?)
-            .context("工作区文件读取长度溢出")?;
-    }
-    Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
 fn print_report(report: &StatusReport) {
@@ -324,19 +253,12 @@ fn print_changes(title: &str, changes: &[PathChange]) {
     }
 }
 
-fn workspace_path(repository_root: &Path, logical_path: &str) -> PathBuf {
-    let mut path = repository_root.to_path_buf();
-    for component in logical_path.split('/') {
-        path.push(component);
-    }
-    path
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use super::{compare_snapshots, safe_leaf_metadata, ChangeKind, PathChange};
+    use super::{compare_snapshots, ChangeKind, PathChange};
+    use crate::local::worktree::lenient_leaf_metadata;
     use neoengram_core::{Chunk, FileNode};
 
     #[test]
@@ -368,7 +290,7 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         fs::write(temporary.path().join("a"), b"now a file")?;
 
-        assert!(safe_leaf_metadata(temporary.path(), "a/b")?.is_none());
+        assert!(lenient_leaf_metadata(temporary.path(), "a/b")?.is_none());
         Ok(())
     }
 
