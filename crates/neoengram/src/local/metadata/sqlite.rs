@@ -16,14 +16,15 @@ use crate::local::fs::durable::{ensure_or_create_directory, sync_parent};
 
 use super::{
     validate_metadata_object_id, validate_reference_name, validate_reference_prefix, FileRecord,
-    FileSetReader, IndexReader, IndexTxn, IndexVersion, ManifestHasher, ManifestReader,
-    ManifestRef, MetadataReader, MetadataSnapshot, MetadataStore, MetadataStoreKind, Page,
-    PageRequest, ReferenceCas, StoredReference, TreeHasher, TreeReader, TreeWriter,
+    FileSetReader, HeadCas, HeadState, IndexReader, IndexTxn, IndexVersion, ManifestHasher,
+    ManifestReader, ManifestRef, MetadataReader, MetadataSnapshot, MetadataStore,
+    MetadataStoreKind, Page, PageRequest, ReferenceCas, StoredReference, TreeHasher, TreeReader,
+    TreeWriter,
 };
 
 const DATABASE_FILE_NAME: &str = "metadata.sqlite3";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f45;
-const SQLITE_SCHEMA_VERSION: i64 = 1;
+const SQLITE_SCHEMA_VERSION: i64 = 2;
 const WRITE_BATCH_SIZE: usize = 1_024;
 const WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -33,7 +34,11 @@ const INDEX_VERSION_HASH_DOMAIN: &[u8] = b"neoengram-sqlite-index-version-v1";
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE store_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    head_reference TEXT NOT NULL,
+    head_kind TEXT NOT NULL CHECK (head_kind IN ('attached', 'detached')),
+    head_target TEXT NOT NULL CHECK (
+        head_target <> '' AND instr(head_target, char(10)) = 0
+            AND instr(head_target, char(13)) = 0
+    ),
     index_format INTEGER NOT NULL CHECK (index_format >= 0),
     index_revision INTEGER NOT NULL CHECK (index_revision >= 0),
     index_count INTEGER NOT NULL CHECK (index_count >= 0),
@@ -1445,16 +1450,29 @@ fn cleanup_tree_set(store: &SqliteMetadataStore, set_id: &[u8]) -> Result<()> {
     })
 }
 
-fn read_head_reference(connection: &Connection) -> Result<String> {
-    let reference: String = connection
+fn read_head_state(connection: &Connection) -> Result<HeadState> {
+    let (kind, target): (String, String) = connection
         .query_row(
-            "SELECT head_reference FROM store_state WHERE singleton = 1",
+            "SELECT head_kind, head_target FROM store_state WHERE singleton = 1",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .context("无法读取 SQLite HEAD 引用")?;
-    validate_reference_name(&reference)?;
-    Ok(reference)
+        .context("无法读取 SQLite HEAD 状态")?;
+    let state = match kind.as_str() {
+        "attached" => HeadState::Attached { reference: target },
+        "detached" => HeadState::Detached { commit_id: target },
+        _ => bail!("SQLite HEAD 类型无效: {kind}"),
+    };
+    state.validate()?;
+    Ok(state)
+}
+
+fn encode_head_state(state: &HeadState) -> Result<(&'static str, &str)> {
+    state.validate()?;
+    Ok(match state {
+        HeadState::Attached { reference } => ("attached", reference),
+        HeadState::Detached { commit_id } => ("detached", commit_id),
+    })
 }
 
 fn get_reference_from_connection(connection: &Connection, name: &str) -> Result<Option<String>> {
@@ -1549,9 +1567,9 @@ fn get_commit_from_connection(connection: &Connection, id: &str) -> Result<Optio
 }
 
 impl MetadataReader for SqliteMetadataStore {
-    fn read_head_reference(&self) -> Result<String> {
+    fn read_head_state(&self) -> Result<HeadState> {
         let connection = self.open_existing(true)?;
-        read_head_reference(&connection)
+        read_head_state(&connection)
     }
 
     fn get_reference(&self, name: &str) -> Result<Option<String>> {
@@ -1579,8 +1597,8 @@ struct SqliteMetadataSnapshot {
 }
 
 impl MetadataReader for SqliteMetadataSnapshot {
-    fn read_head_reference(&self) -> Result<String> {
-        read_head_reference(&self.session.connection)
+    fn read_head_state(&self) -> Result<HeadState> {
+        read_head_state(&self.session.connection)
     }
 
     fn get_reference(&self, name: &str) -> Result<Option<String>> {
@@ -1669,8 +1687,9 @@ impl MetadataStore for SqliteMetadataStore {
                 connection.pragma_update(None, "application_id", SQLITE_APPLICATION_ID)?;
                 connection.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
                 connection.execute(
-                    "INSERT INTO store_state(singleton, head_reference, index_format, \
-                     index_revision, index_count, index_accumulator) VALUES (1, ?1, ?2, 0, 0, ?3)",
+                    "INSERT INTO store_state(singleton, head_kind, head_target, index_format, \
+                     index_revision, index_count, index_accumulator) \
+                     VALUES (1, 'attached', ?1, ?2, 0, 0, ?3)",
                     params![
                         head_reference,
                         i64::from(INDEX_FORMAT_VERSION),
@@ -1706,7 +1725,7 @@ impl MetadataStore for SqliteMetadataStore {
         )?;
         ensure!(required_tables == 10, "SQLite 元数据库缺少必要数据表");
         read_index_state(&connection)?;
-        read_head_reference(&connection)?;
+        read_head_state(&connection)?;
         Ok(())
     }
 
@@ -1859,6 +1878,27 @@ impl MetadataStore for SqliteMetadataStore {
                     Ok(())
                 }
             }
+        })
+    }
+
+    fn compare_exchange_head(
+        &self,
+        expected: &HeadState,
+        new_state: &HeadState,
+    ) -> Result<HeadCas> {
+        expected.validate()?;
+        let (new_kind, new_target) = encode_head_state(new_state)?;
+        let connection = self.open_existing(false)?;
+        run_immediate(&connection, || {
+            let actual = read_head_state(&connection)?;
+            if &actual != expected {
+                return Ok(HeadCas::Mismatch { actual });
+            }
+            connection.execute(
+                "UPDATE store_state SET head_kind = ?1, head_target = ?2 WHERE singleton = 1",
+                params![new_kind, new_target],
+            )?;
+            Ok(HeadCas::Updated)
         })
     }
 

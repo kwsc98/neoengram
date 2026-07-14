@@ -2,7 +2,8 @@ use anyhow::{bail, ensure, Context, Result};
 use neoengram_core::{Commit, FileNode, Index, Tree};
 
 use crate::local::metadata::{
-    FileRecord, FileSetReader, MetadataReader, Page, PageRequest, ReferenceCas, StoredReference,
+    FileRecord, FileSetReader, HeadCas, HeadState, MetadataReader, Page, PageRequest, ReferenceCas,
+    StoredReference,
 };
 
 use super::{
@@ -14,6 +15,35 @@ use super::{
 };
 
 const STORAGE_SCAN_PAGE_SIZE: u32 = 1_024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryHead {
+    state: HeadState,
+    commit_id: Option<String>,
+}
+
+impl RepositoryHead {
+    pub(crate) fn state(&self) -> &HeadState {
+        &self.state
+    }
+
+    pub(crate) fn commit_id(&self) -> Option<&str> {
+        self.commit_id.as_deref()
+    }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        matches!(self.state, HeadState::Detached { .. })
+    }
+
+    pub(crate) fn branch_name(&self) -> Option<&str> {
+        match &self.state {
+            HeadState::Attached { reference } => {
+                reference.strip_prefix("refs/heads/").or(Some(reference))
+            }
+            HeadState::Detached { .. } => None,
+        }
+    }
+}
 
 impl Repository {
     pub(crate) fn read_index(&self) -> Result<Index> {
@@ -130,51 +160,99 @@ impl Repository {
         self.metadata_store.verify_integrity()
     }
 
-    pub(crate) fn current_commit_id(&self) -> Result<Option<String>> {
-        current_commit_id(self.metadata_store.as_ref())
+    pub(crate) fn current_head(&self) -> Result<RepositoryHead> {
+        let state = self.metadata_store.read_head_state()?;
+        self.resolve_head_state(state)
     }
 
-    pub(crate) fn update_current_commit(&self, expected: Option<&str>, id: &str) -> Result<()> {
+    pub(crate) fn current_commit_id(&self) -> Result<Option<String>> {
+        Ok(self.current_head()?.commit_id)
+    }
+
+    pub(crate) fn default_branch_head(&self) -> Result<RepositoryHead> {
+        self.resolve_head_state(HeadState::Attached {
+            reference: DEFAULT_HEAD_REFERENCE.to_owned(),
+        })
+    }
+
+    pub(crate) fn advance_head(&self, expected: &RepositoryHead, id: &str) -> Result<()> {
         validate_hash(id, "Commit")?;
-        if let Some(expected) = expected {
-            validate_hash(expected, "期望父 Commit")?;
+        if let Some(expected_id) = expected.commit_id() {
+            validate_hash(expected_id, "期望父 Commit")?;
         }
-        match self.metadata_store.compare_exchange_reference(
-            DEFAULT_HEAD_REFERENCE,
-            expected,
-            Some(id),
-        )? {
-            ReferenceCas::Updated => Ok(()),
-            ReferenceCas::Mismatch { actual } => bail!(
-                "分支在提交期间发生变化（期望 {:?}，实际 {:?}），拒绝覆盖并发提交",
+
+        match expected.state() {
+            HeadState::Attached { reference } => {
+                let actual_head = self.metadata_store.read_head_state()?;
+                ensure!(
+                    &actual_head == expected.state(),
+                    "HEAD 在提交期间发生变化（期望 {:?}，实际 {:?}），拒绝覆盖并发提交",
+                    expected.state(),
+                    actual_head
+                );
+                match self.metadata_store.compare_exchange_reference(
+                    reference,
+                    expected.commit_id(),
+                    Some(id),
+                )? {
+                    ReferenceCas::Updated => Ok(()),
+                    ReferenceCas::Mismatch { actual } => bail!(
+                        "分支在提交期间发生变化（期望 {:?}，实际 {:?}），拒绝覆盖并发提交",
+                        expected.commit_id(),
+                        actual
+                    ),
+                }
+            }
+            HeadState::Detached { commit_id } => {
+                ensure!(
+                    expected.commit_id() == Some(commit_id.as_str()),
+                    "Detached HEAD 状态与解析出的 Commit 不一致"
+                );
+                let new_head = HeadState::Detached {
+                    commit_id: id.to_owned(),
+                };
+                match self
+                    .metadata_store
+                    .compare_exchange_head(expected.state(), &new_head)?
+                {
+                    HeadCas::Updated => Ok(()),
+                    HeadCas::Mismatch { actual } => bail!(
+                        "Detached HEAD 在提交期间发生变化（期望 {:?}，实际 {:?}），拒绝覆盖并发提交",
+                        expected.state(),
+                        actual
+                    ),
+                }
+            }
+        }
+    }
+
+    /// 幂等切换 HEAD。恢复事务可能在 durable HEAD 写入后、journal 阶段更新前崩溃，
+    /// 因此实际值已经等于目标时也视为成功；任何第三种状态都拒绝覆盖。
+    pub(crate) fn transition_head(&self, expected: &HeadState, target: &HeadState) -> Result<()> {
+        match self
+            .metadata_store
+            .compare_exchange_head(expected, target)?
+        {
+            HeadCas::Updated => Ok(()),
+            HeadCas::Mismatch { actual } if actual == *target => Ok(()),
+            HeadCas::Mismatch { actual } => bail!(
+                "HEAD 状态与 Checkout 事务不一致（期望 {:?}，实际 {:?}），拒绝覆盖",
                 expected,
                 actual
             ),
         }
     }
-}
 
-fn current_commit_id<R: MetadataReader + ?Sized>(reader: &R) -> Result<Option<String>> {
-    validate_head(reader)?;
-    let contents = reader.get_reference(DEFAULT_HEAD_REFERENCE)?;
-    let Some(contents) = contents else {
-        return Ok(None);
-    };
-    let id = contents.trim();
-    if id.is_empty() {
-        return Ok(None);
+    pub(crate) fn resolve_head_state(&self, state: HeadState) -> Result<RepositoryHead> {
+        let commit_id = match &state {
+            HeadState::Attached { reference } => self.metadata_store.get_reference(reference)?,
+            HeadState::Detached { commit_id } => Some(commit_id.clone()),
+        };
+        if let Some(commit_id) = &commit_id {
+            validate_hash(commit_id, "HEAD Commit")?;
+        }
+        Ok(RepositoryHead { state, commit_id })
     }
-    validate_hash(id, "Commit")?;
-    Ok(Some(id.to_owned()))
-}
-
-fn validate_head<R: MetadataReader + ?Sized>(reader: &R) -> Result<()> {
-    let reference = reader.read_head_reference()?;
-    ensure!(
-        reference == DEFAULT_HEAD_REFERENCE,
-        "HEAD 必须指向 {DEFAULT_HEAD_REFERENCE}，实际为 {reference}"
-    );
-    Ok(())
 }
 
 fn read_commit<R: MetadataReader + ?Sized>(reader: &R, id: &str) -> Result<Commit> {

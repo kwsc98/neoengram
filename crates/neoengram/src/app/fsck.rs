@@ -38,6 +38,13 @@ fn check_repository(repository: &Repository) -> Result<FsckReport> {
     let commits = read_all_commits(repository)?;
     let trees = read_all_trees(repository)?;
     let refs = read_all_refs(repository, &commits)?;
+    let head = repository.current_head()?;
+    if let Some(commit_id) = head.commit_id() {
+        ensure!(
+            commits.contains_key(commit_id),
+            "HEAD 指向不存在的 Commit: {commit_id}"
+        );
+    }
 
     validate_commit_graph(&commits, &trees)?;
 

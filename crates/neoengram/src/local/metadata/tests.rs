@@ -5,8 +5,8 @@ use neoengram_core::{Chunk, Commit, FileNode, Index, INDEX_FORMAT_VERSION};
 
 use super::{
     describe_manifest, file_manifest_id, legacy_tree_records_id, tree_records_id, FileRecord,
-    FileSetReader, IndexTxn, JsonMetadataStore, MetadataStore, PageRequest, ReferenceCas,
-    SqliteMetadataStore, StoredReference, TreeWriter, MAX_PAGE_SIZE,
+    FileSetReader, HeadCas, HeadState, IndexTxn, JsonMetadataStore, MetadataStore, PageRequest,
+    ReferenceCas, SqliteMetadataStore, StoredReference, TreeWriter, MAX_PAGE_SIZE,
 };
 
 #[test]
@@ -89,6 +89,12 @@ fn json_backend_satisfies_metadata_store_contract() -> Result<()> {
         vec![commit_id.clone()]
     );
     assert_eq!(snapshot.get_reference("refs/heads/main")?, Some(commit_id));
+    assert_eq!(
+        snapshot.read_head_state()?,
+        HeadState::Detached {
+            commit_id: "b".repeat(64)
+        }
+    );
     Ok(())
 }
 
@@ -116,6 +122,12 @@ fn sqlite_backend_satisfies_metadata_store_contract() -> Result<()> {
         vec![commit_id.clone()]
     );
     assert_eq!(snapshot.get_reference("refs/heads/main")?, Some(commit_id));
+    assert_eq!(
+        snapshot.read_head_state()?,
+        HeadState::Detached {
+            commit_id: "b".repeat(64)
+        }
+    );
     Ok(())
 }
 
@@ -415,7 +427,12 @@ fn exercise_contract(store: &dyn MetadataStore) -> Result<(String, String)> {
     );
     let initial_version = initial_reader.version().clone();
     let initial_snapshot = store.snapshot()?;
-    assert_eq!(initial_snapshot.read_head_reference()?, "refs/heads/main");
+    assert_eq!(
+        initial_snapshot.read_head_state()?,
+        HeadState::Attached {
+            reference: "refs/heads/main".to_owned()
+        }
+    );
     assert_eq!(initial_snapshot.get_reference("refs/heads/main")?, None);
     assert!(initial_snapshot.open_tree("../escape").is_err());
     assert!(store
@@ -632,6 +649,67 @@ fn exercise_contract(store: &dyn MetadataStore) -> Result<(String, String)> {
         store.compare_exchange_reference("refs/heads/main", None, Some(&commit_id))?,
         ReferenceCas::Updated
     );
+
+    let attached = HeadState::Attached {
+        reference: "refs/heads/main".to_owned(),
+    };
+    let detached = HeadState::Detached {
+        commit_id: commit_id.clone(),
+    };
+    let fixed_head_snapshot = store.snapshot()?;
+    assert_eq!(
+        store.compare_exchange_head(&attached, &detached)?,
+        HeadCas::Updated
+    );
+    assert_eq!(store.read_head_state()?, detached);
+    assert_eq!(fixed_head_snapshot.read_head_state()?, attached);
+    assert_eq!(
+        store.compare_exchange_head(
+            &HeadState::Attached {
+                reference: "refs/heads/main".to_owned(),
+            },
+            &HeadState::Detached {
+                commit_id: "c".repeat(64),
+            },
+        )?,
+        HeadCas::Mismatch {
+            actual: HeadState::Detached {
+                commit_id: commit_id.clone(),
+            }
+        }
+    );
+    assert_eq!(
+        store.compare_exchange_head(
+            &HeadState::Detached {
+                commit_id: commit_id.clone(),
+            },
+            &HeadState::Attached {
+                reference: "refs/heads/main".to_owned(),
+            },
+        )?,
+        HeadCas::Updated
+    );
+    assert_eq!(
+        store.compare_exchange_head(
+            &HeadState::Attached {
+                reference: "refs/heads/main".to_owned(),
+            },
+            &HeadState::Detached {
+                commit_id: commit_id.clone(),
+            },
+        )?,
+        HeadCas::Updated
+    );
+    assert!(store
+        .compare_exchange_head(
+            &HeadState::Detached {
+                commit_id: commit_id.clone(),
+            },
+            &HeadState::Detached {
+                commit_id: "invalid".to_owned(),
+            },
+        )
+        .is_err());
     let replacement_id = "c".repeat(64);
     assert_eq!(
         store.compare_exchange_reference("refs/heads/main", None, Some(&replacement_id))?,
@@ -664,6 +742,12 @@ fn exercise_contract(store: &dyn MetadataStore) -> Result<(String, String)> {
 
     // initialize 必须幂等，已有的可变和不可变状态都不能被默认值覆盖。
     store.initialize("refs/heads/main")?;
+    assert_eq!(
+        store.read_head_state()?,
+        HeadState::Detached {
+            commit_id: commit_id.clone()
+        }
+    );
     assert_eq!(
         collect_files(store, store.read_index()?.as_ref())?,
         index.files

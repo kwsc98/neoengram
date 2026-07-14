@@ -157,6 +157,23 @@ pub(crate) enum MetadataStoreKind {
     Sqlite,
 }
 
+/// HEAD 的持久状态。Attached 通过命名引用解析当前 Commit，Detached 直接指向 Commit。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum HeadState {
+    Attached { reference: String },
+    Detached { commit_id: String },
+}
+
+impl HeadState {
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::Attached { reference } => validate_reference_name(reference),
+            Self::Detached { commit_id } => validate_metadata_object_id(commit_id),
+        }
+    }
+}
+
 /// 一个命名引用及其目标。引用名使用 `refs/...` 形式，与具体后端的文件名或表结构无关。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredReference {
@@ -171,9 +188,16 @@ pub(crate) enum ReferenceCas {
     Mismatch { actual: Option<String> },
 }
 
+/// HEAD compare-exchange 的结果。HEAD 始终存在，因此冲突时返回完整实际状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeadCas {
+    Updated,
+    Mismatch { actual: HeadState },
+}
+
 /// HEAD/ref 与不可变历史对象的点查边界。实现不得为了一次点查枚举整个仓库。
 pub(crate) trait MetadataReader: Debug {
-    fn read_head_reference(&self) -> Result<String>;
+    fn read_head_state(&self) -> Result<HeadState>;
     fn get_reference(&self, name: &str) -> Result<Option<String>>;
     fn open_manifest(&self, id: &str) -> Result<Option<Box<dyn ManifestReader + '_>>>;
     fn open_tree(&self, id: &str) -> Result<Option<Box<dyn TreeReader + '_>>>;
@@ -223,6 +247,10 @@ pub(crate) trait MetadataStore: MetadataReader + Send + Sync {
     ) -> Result<ManifestRef>;
     fn begin_tree_write(&self) -> Result<Box<dyn TreeWriter + '_>>;
     fn put_commit(&self, id: &str, commit: &Commit) -> Result<()>;
+
+    /// 当且仅当 HEAD 当前状态等于 `expected` 时原子替换为 `new_state`。
+    fn compare_exchange_head(&self, expected: &HeadState, new_state: &HeadState)
+        -> Result<HeadCas>;
 
     /// 当且仅当当前值等于 `expected` 时写入 `new_target`。两个参数的 `None` 分别表示
     /// “期望引用不存在”和“删除引用”，因此该方法不提供无条件覆盖模式。

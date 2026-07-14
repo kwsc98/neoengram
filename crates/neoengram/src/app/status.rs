@@ -48,8 +48,15 @@ struct PathChange {
     kind: ChangeKind,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeadPosition {
+    Branch(String),
+    Detached(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct StatusReport {
+    head: HeadPosition,
     staged: Vec<PathChange>,
     unstaged: Vec<PathChange>,
     untracked: Vec<String>,
@@ -64,12 +71,26 @@ impl StatusReport {
 fn build_report(repository: &Repository) -> Result<StatusReport> {
     ensure_no_unfinished_transaction(repository)?;
     let index = repository.read_index()?;
-    let head_files = match repository.current_commit_id()? {
+    let head = repository.current_head()?;
+    let head_files = match head.commit_id() {
         Some(commit_id) => {
-            let commit = repository.read_commit(&commit_id)?;
+            let commit = repository.read_commit(commit_id)?;
             repository.read_tree(&commit.tree_hash)?.files
         }
         None => Vec::new(),
+    };
+    let head_position = if head.is_detached() {
+        HeadPosition::Detached(
+            head.commit_id()
+                .context("Detached HEAD 缺少 Commit")?
+                .to_owned(),
+        )
+    } else {
+        HeadPosition::Branch(
+            head.branch_name()
+                .context("Attached HEAD 缺少分支名")?
+                .to_owned(),
+        )
     };
 
     let staged = compare_snapshots(&head_files, &index.files);
@@ -100,7 +121,12 @@ fn build_report(repository: &Repository) -> Result<StatusReport> {
     // status 没有持有写锁，因此在完成扫描后再次检查，避免输出恰好跨越一次 rm/checkout
     // 工作区事务而混合两个时刻的状态。
     ensure_no_unfinished_transaction(repository)?;
+    ensure!(
+        repository.current_head()? == head,
+        "HEAD 在 status 扫描期间发生变化，请重试"
+    );
     Ok(StatusReport {
+        head: head_position,
         staged,
         unstaged,
         untracked,
@@ -269,6 +295,10 @@ fn read_exact_hash(reader: &mut File, size: u64) -> Result<Option<String>> {
 }
 
 fn print_report(report: &StatusReport) {
+    match &report.head {
+        HeadPosition::Branch(branch) => println!("On branch {branch}"),
+        HeadPosition::Detached(commit_id) => println!("HEAD detached at {commit_id}"),
+    }
     if report.is_clean() {
         println!("nothing to commit, working tree clean");
         return;
