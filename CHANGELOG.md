@@ -29,6 +29,9 @@
 - `repository.json` 格式 4 显式记录 `metadata_store` 和 `object_store`，并支持 attached/direct
   HEAD；开发期不兼容旧格式。
 - SQLite 元数据 schema 升级为 2，结构化保存 symbolic/direct HEAD，并提供 HEAD CAS。
+- 增加共享/独占 `worktree.lock`，并固定 object -> worktree -> state 的跨进程锁顺序。
+- 两个 crate 补齐 crates.io 元数据、包内 MIT/Apache-2.0 许可证，并在 CI 检查 `.crate` 中的
+  README、双许可证及许可证副本一致性。
 
 ### Changed
 
@@ -48,6 +51,12 @@
   expected-parent CAS，拒绝覆盖并发提交。
 - `checkout <COMMIT_ID>` 采用 Git 式 detached HEAD；`checkout main` 重新附着默认分支，
   detached Commit 的提交只推进 direct HEAD。
+- `add` 从初始 `IndexVersion` 计算并以 CAS 发布；status/diff 在输出前复核实际依赖的 Index
+  与 HEAD/main，拒绝并发变化产生的混合结果。
+- checkout/rm 在首次工作区 mutation 前先原子发布并同步正式事务；遗留 draft 只由后续独占
+  写操作或 recover 在验证后清理。
+- README 快速开始改为源码安装后在独立 demo 目录试用，并明确忽略规则、平台、备份和开发期
+  仓库格式边界。
 
 ### Fixed
 
@@ -66,3 +75,15 @@
   不再可能被静默备份后随事务清理丢弃。
 - checkout/rm/status 共用 `worktree/workspace.rs` 的路径与内容校验原语，消除三份
   重复实现之间的语义漂移。
+- rm 在 rename syscall 成功后立即记录已移动文件；即使随后的目录同步失败也能恢复唯一备份，
+  无法证明安全时保留事务供 recover 处理。
+- 工作区 restore 在最终发布前重新检查目标；无 `--force` 时不再覆盖预检后出现或变化的文件，
+  且目录、符号链接和特殊文件始终拒绝替换。
+- checkout 的嵌套 staging/backup/rollback 目录逐级持久化并拒绝父级符号链接；原路径和备份
+  同时缺失时明确报错并保留事务。
+- checkout/rm 的空目标发布与回滚改用 no-replace rename，外部程序在最终检查后创建的文件
+  不再被静默覆盖；file-to-directory 崩溃恢复正确识别被父文件备份遮蔽的子路径。
+- Checkout 恢复只把明确的 `NotFound` 当作 staged 缺失，权限和 I/O 错误不再导致外部文件被
+  当成事务产物删除；reset 会先清空并同步旧 journal 证据，再清理 staged/backup。
+- 已完成事务先原子退役为 cleanup draft 再递归删除，避免权限错误把正式 journal 部分删坏；
+  Windows 的原子文件和目录项发布使用 write-through rename。

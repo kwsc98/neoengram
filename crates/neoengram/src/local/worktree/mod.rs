@@ -29,3 +29,14 @@ fn test_crash_at(point: &str) {
         std::process::exit(86);
     }
 }
+
+/// 集成测试使用的进程级同步点。正常命令不会读取 stdin。
+fn test_pause_at(point: &str) {
+    if cfg!(debug_assertions)
+        && std::env::var("NEOENGRAM_TEST_PAUSE_AT").is_ok_and(|configured| configured == point)
+    {
+        eprintln!("test pause at {point}");
+        let mut release = String::new();
+        let _ = std::io::stdin().read_line(&mut release);
+    }
+}

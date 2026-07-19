@@ -70,10 +70,10 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 | --- | --- | --- |
 | `init` | 已完成 | 创建 SQLite 或 JSON 本地仓库，原子发布布局 |
 | `add` / `add -A` | 已完成 | FastCDC 切块、BLAKE3 去重、暂存新增/修改/删除 |
-| `rm` | 已完成 | 安全移除工作区或仅移除 index，支持事务恢复 |
-| `status` | 已完成 | 报告 staged、unstaged、deleted 和 untracked |
-| `diff` | 已完成 | 工作区、index 和 Commit 间的文件/Chunk 变化比较 |
-| `restore` | 已完成 | 恢复 index 或工作区文件 |
+| `rm` | 已完成 | 安全移除工作区或仅移除 index，支持持久事务和可验证回滚 |
+| `status` | 已完成 | 报告 staged、unstaged、deleted 和 untracked，并拒绝混合状态视图 |
+| `diff` | 已完成 | 比较工作区、index 和 Commit，并在输出前复核 Index/HEAD |
+| `restore` | 已完成 | 恢复 index 或工作区文件，最终发布时重新检查覆盖条件 |
 | `commit` | 已完成 | 发布不可变 Manifest、Tree、Commit，并以父节点 CAS 更新 HEAD/ref |
 | `log` / `show` | 已完成 | 查看线性历史和 Commit 文件清单 |
 | `checkout` | 已完成 | 物化 Commit，支持 detached HEAD 和 `main` 重新附着 |
@@ -91,14 +91,17 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
   HEAD/ref CAS 契约。
 - SQLite 是默认元数据后端，JSON 后端用于兼容和契约测试。
 - `ObjectStore` 提供流式发布、校验读取、分页枚举、durability barrier 和协调删除。
-- checkout/rm 使用持久 journal、临时 staging、原子 rename 和故障恢复。
-- `add` 与 `gc` 使用独立对象锁，避免发布和回收竞态。
+- 本地锁固定按 object -> worktree -> state 获取；工作区读操作共享、mutation 独占，冲突立即失败。
+- `add` 基于最初的 `IndexVersion` 做最终 CAS；status/diff 在输出前复核实际依赖的 Index 与
+  HEAD/main。
+- checkout/rm 在工作区 mutation 前原子发布并同步持久 journal；恢复会保留任何无法证明安全的事务。
+- `add`、`gc` 和 `fsck` 使用独立对象锁，避免发布、校验和回收竞态。
 - `fsck` 的 Chunk 引用检查已使用有界外部排序，避免完整 Chunk Hash 集合常驻内存。
 
 ### 3.3 质量基线
 
-- workspace 测试覆盖 JSON/SQLite、CLI、恢复、完整性、只读快照和忽略规则。
-- fmt、Clippy `-D warnings`、rustdoc warnings 和 CI 三平台检查已纳入质量门槛。
+- workspace 测试覆盖 JSON/SQLite、CLI、跨进程锁、Index CAS、故障恢复、完整性、只读快照和忽略规则。
+- fmt、Clippy `-D warnings`、rustdoc warnings、crate 归档内容检查和 CI 三平台测试已纳入质量门槛。
 - 当前代码和文档仍处开发期，仓库格式允许直接演进，不提供旧格式自动迁移。
 
 ### 3.4 当前能力与未来能力边界
@@ -486,7 +489,11 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 
 ## 12. 测试与发布门槛
 
-- 本地契约：JSON/SQLite、对象完整性、CAS、恢复和路径安全。
+- 本地契约：JSON/SQLite、对象完整性、Index/HEAD CAS、固定锁序、恢复和路径安全。
+- 本地竞态：shared/shared 成功，shared/exclusive 拒绝；add 暂停期间工作区 mutation 被拒绝，
+  index-only 更新使 add CAS 失败，status/diff 不输出跨版本报告。
+- 本地故障注入：rename 成功后的目录同步失败、事务 draft 发布前后退出、嵌套 backup、恢复重放、
+  restore 预检后目标出现或变化；任何不确定状态都保留 journal，不能丢失唯一副本。
 - 协议契约：DTO 编解码、版本协商、稳定错误码、cursor、幂等性、Snapshot 固定性和 lease 状态。
 - 认证测试：错误签名、错误 issuer/audience、过期、未来 `nbf`、未知 `kid`、JWKS 轮换、服务身份
   和日志脱敏。
@@ -504,7 +511,8 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 - 服务集成：PostgreSQL migration、S3 兼容存储、push/fetch/clone、quota 和全链路审计。
 - 故障注入：网络中断、进程终止、重复请求、对象损坏、数据库故障、密钥轮换、并发 CAS 和 GC。
 - 规模基准：路径数、Chunk 数、Manifest/Shard 大小、峰值 RSS、吞吐、写放大、恢复时间和 SLO。
-- 发布门槛：fmt、Clippy `-D warnings`、rustdoc、全量测试、migration dry-run、灾备演练和安全审计。
+- 发布门槛：fmt、Clippy `-D warnings`、rustdoc、全量测试、三平台 CI，以及两个 `.crate` 的 README、
+  MIT/Apache-2.0 许可证和 metadata 检查；远端阶段另需 migration dry-run、灾备演练和安全审计。
 
 ## 13. 文档维护规则
 
@@ -528,3 +536,5 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-19 | 将路线扩展为控制面/数据面/读取面，并纳入 Snapshot、Shard、Lineage、lease 和生命周期语义 | 面向 AI 训练数据维护的可复现读取需求 |
 | 2026-07-19 | 确定 Authenticator + 外部 JWT/JWKS、tenant→project→repository→ref RBAC、短期 ObjectTicket 和租户隔离基线 | 鉴权、认证、审计与跨租户安全要求 |
 | 2026-07-19 | 将基础安全从 P4 前移到 P0/P1，P4 保留安全强化、灾备、GC 和运营 | 分布式控制面上线前必须具备默认拒绝和可审计边界 |
+| 2026-07-19 | 增加 worktree 读写锁、Index CAS 复核和先发布 journal 的本地事务协议 | 消除并发覆盖、检查后覆盖和 post-rename 同步失败导致的数据风险 |
+| 2026-07-19 | 补齐 crates.io metadata、包内双许可证及归档 CI gate | 让源码安装和未来发布产物具备可审计的开源材料；当前未创建 release 或 tag |

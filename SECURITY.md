@@ -7,14 +7,14 @@
 
 ## 报告漏洞
 
-请不要为未修复漏洞创建公开 issue。请打开本仓库的 **Security** 页面，使用
-**Report a vulnerability** 私密报告功能，提供：
+请不要为未修复漏洞创建公开 issue。请直接使用
+[GitHub 私密漏洞报告](https://github.com/kwsc98/synapse/security/advisories/new) 提交：
 
 - 受影响版本或提交；
 - 可复现步骤或最小示例；
 - 可能影响和已知缓解方法；
 - 在修复发布前需要遵守的披露限制。
 
-仓库所有者应在公开接受贡献前启用 GitHub Private vulnerability reporting。如果该
-功能尚未启用，请通过维护者 GitHub 个人资料中列出的私密联系方式报告。维护者会确认
-收到报告、评估影响，并在公开披露前与报告者协调修复时间。
+该页面需要登录 GitHub。如果私密报告入口暂时不可用，请不要退回公开 issue；改用
+[维护者 GitHub 主页](https://github.com/kwsc98) 上列出的私密联系方式，只发送建立安全通道
+所需的最少信息。维护者会确认收到报告、评估影响，并在公开披露前与报告者协调修复时间。

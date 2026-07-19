@@ -21,5 +21,7 @@
 ## 执行
 
 维护者有责任澄清并执行本准则，并可删除不当内容，或对违规者采取临时或永久限制。
-请通过 [SECURITY.md](SECURITY.md) 中说明的私密渠道报告行为准则事件，不要公开披露
-当事人的敏感信息。维护者会尊重报告者的隐私，并在调查后采取适当措施。
+请通过 [GitHub 私密报告](https://github.com/kwsc98/synapse/security/advisories/new) 报告行为准则
+事件，并在标题中注明 `Code of Conduct`；不要公开披露当事人的敏感信息。如果该入口不可用，
+请按 [SECURITY.md](SECURITY.md) 中的备用私密渠道联系维护者。维护者会尊重报告者的隐私，
+并在调查后采取适当措施。

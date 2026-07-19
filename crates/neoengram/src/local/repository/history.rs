@@ -2,8 +2,8 @@ use anyhow::{bail, ensure, Context, Result};
 use neoengram_core::{Commit, FileNode, Index, Tree};
 
 use crate::local::metadata::{
-    FileRecord, FileSetReader, HeadCas, HeadState, MetadataReader, Page, PageRequest, ReferenceCas,
-    StoredReference,
+    FileRecord, FileSetReader, HeadCas, HeadState, IndexVersion, MetadataReader, Page, PageRequest,
+    ReferenceCas, StoredReference,
 };
 
 use super::{
@@ -20,6 +20,30 @@ const STORAGE_SCAN_PAGE_SIZE: u32 = 1_024;
 pub(crate) struct RepositoryHead {
     state: HeadState,
     commit_id: Option<String>,
+}
+
+/// A materialized Index and the exact opaque storage version it was read from.
+///
+/// Keeping the two values together prevents a long-running command from accidentally rereading
+/// a newer Index and combining it with work computed from the original worktree scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VersionedIndex {
+    index: Index,
+    version: IndexVersion,
+}
+
+impl VersionedIndex {
+    pub(crate) fn index(&self) -> &Index {
+        &self.index
+    }
+
+    pub(crate) fn version(&self) -> &IndexVersion {
+        &self.version
+    }
+
+    pub(crate) fn into_parts(self) -> (Index, IndexVersion) {
+        (self.index, self.version)
+    }
 }
 
 impl RepositoryHead {
@@ -47,20 +71,42 @@ impl RepositoryHead {
 
 impl Repository {
     pub(crate) fn read_index(&self) -> Result<Index> {
+        Ok(self.read_index_versioned()?.index)
+    }
+
+    pub(crate) fn read_index_versioned(&self) -> Result<VersionedIndex> {
         let reader = self.metadata_store.read_index()?;
         let index = Index {
             format_version: reader.format_version(),
             files: collect_file_set(self.metadata_store.as_ref(), reader.as_ref())?,
         };
         validate_index(&index)?;
-        Ok(index)
+        let version = reader.version().clone();
+        Ok(VersionedIndex { index, version })
+    }
+
+    /// Read only the opaque Index version for an end-of-scan consistency check.
+    pub(crate) fn current_index_version(&self) -> Result<IndexVersion> {
+        Ok(self.metadata_store.read_index()?.version().clone())
     }
 
     pub(crate) fn write_index(&self, index: &Index) -> Result<()> {
-        validate_index(index)?;
         let reader = self.metadata_store.read_index()?;
         let expected = reader.version().clone();
         drop(reader);
+        self.write_index_if_version(index, &expected)?;
+        Ok(())
+    }
+
+    /// Publish `index` only if the metadata store still has `expected` as its current version.
+    /// Immutable manifests may be published before the CAS; on a mismatch they remain harmless
+    /// unreachable objects and the Index itself is left untouched.
+    pub(crate) fn write_index_if_version(
+        &self,
+        index: &Index,
+        expected: &IndexVersion,
+    ) -> Result<IndexVersion> {
+        validate_index(index)?;
         let mut records = Vec::with_capacity(index.files.len());
         for file in &index.files {
             let mut chunks = file.chunks.iter().cloned().map(Ok);
@@ -72,13 +118,12 @@ impl Repository {
         }
         let mut transaction = self
             .metadata_store
-            .begin_index_transaction(Some(&expected))?;
+            .begin_index_transaction(Some(expected))?;
         transaction.delete_prefix("")?;
         for record in &records {
             transaction.upsert_file(record)?;
         }
-        transaction.commit()?;
-        Ok(())
+        transaction.commit()
     }
 
     pub(crate) fn store_tree(&self, tree: &Tree) -> Result<String> {
@@ -330,4 +375,47 @@ fn collect_pages<T>(mut scan: impl FnMut(&PageRequest) -> Result<Page<T>>) -> Re
         request.after = Some(next);
     }
     Ok(items)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use anyhow::Result;
+    use neoengram_core::{FileNode, Index};
+
+    use crate::local::metadata::MetadataStoreKind;
+
+    use super::Repository;
+
+    #[test]
+    fn stale_versioned_index_write_is_rejected_by_both_backends() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        for (directory, kind) in [
+            ("json", MetadataStoreKind::Json),
+            ("sqlite", MetadataStoreKind::Sqlite),
+        ] {
+            let root = temporary.path().join(directory);
+            fs::create_dir(&root)?;
+            let repository = Repository::open_or_with_metadata_store(root, Some(kind))?;
+            repository.initialize_layout()?;
+
+            let initial = repository.read_index_versioned()?;
+            repository.write_index_if_version(initial.index(), initial.version())?;
+
+            let stale_update = Index {
+                format_version: initial.index().format_version,
+                files: vec![FileNode {
+                    path: "stale.bin".to_owned(),
+                    total_size: 0,
+                    chunks: Vec::new(),
+                }],
+            };
+            assert!(repository
+                .write_index_if_version(&stale_update, initial.version())
+                .is_err());
+            assert_eq!(repository.read_index()?, *initial.index());
+        }
+        Ok(())
+    }
 }

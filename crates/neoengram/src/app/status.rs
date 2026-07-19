@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::{Component, Path},
 };
 
@@ -16,6 +15,7 @@ use crate::local::{
 pub(crate) async fn execute() -> Result<()> {
     let current_dir = std::env::current_dir().context("无法确定当前工作目录")?;
     let repository = Repository::discover(&current_dir)?;
+    let _worktree_lock = repository.acquire_worktree_shared_lock()?;
     let task_repository = repository.clone();
     let report = tokio::task::spawn_blocking(move || build_report(&task_repository))
         .await
@@ -69,9 +69,11 @@ impl StatusReport {
 }
 
 fn build_report(repository: &Repository) -> Result<StatusReport> {
-    ensure_no_unfinished_transaction(repository)?;
+    repository.ensure_no_unfinished_transactions()?;
     let ignore_rules = IgnoreRules::load(repository.root())?;
-    let index = repository.read_index()?;
+    let versioned_index = repository.read_index_versioned()?;
+    let index_version = versioned_index.version().clone();
+    let index = versioned_index.index();
     let head = repository.current_head()?;
     let head_files = match head.commit_id() {
         Some(commit_id) => {
@@ -119,9 +121,13 @@ fn build_report(repository: &Repository) -> Result<StatusReport> {
 
     let tracked: BTreeSet<&str> = index.files.iter().map(|file| file.path.as_str()).collect();
     let untracked = collect_untracked_files(repository.root(), &tracked, &ignore_rules)?;
-    // status 没有持有写锁，因此在完成扫描后再次检查，避免输出恰好跨越一次 rm/checkout
-    // 工作区事务而混合两个时刻的状态。
-    ensure_no_unfinished_transaction(repository)?;
+    // 共享 worktree 锁冻结工作区事务；Index/HEAD 的独立 state-only 写入仍可并发，
+    // 因此输出前必须复核两者，避免报告混合两个元数据时刻。
+    repository.ensure_no_unfinished_transactions()?;
+    ensure!(
+        repository.current_index_version()? == index_version,
+        "Index 在 status 扫描期间发生变化，请重试"
+    );
     ensure!(
         repository.current_head()? == head,
         "HEAD 在 status 扫描期间发生变化，请重试"
@@ -254,23 +260,6 @@ fn repository_path(path: &Path, repository_root: &Path) -> Result<String> {
     }
     ensure!(!names.is_empty(), "工作区文件路径不能为空");
     Ok(names.join("/"))
-}
-
-fn ensure_no_unfinished_transaction(repository: &Repository) -> Result<()> {
-    let mut entries = fs::read_dir(repository.transactions_dir()).with_context(|| {
-        format!(
-            "无法读取事务目录: {}",
-            repository.transactions_dir().display()
-        )
-    })?;
-    if let Some(entry) = entries.next() {
-        let entry = entry.context("无法读取事务项")?;
-        anyhow::bail!(
-            "检测到未完成的工作区事务，请先运行 recover: {}",
-            entry.path().display()
-        );
-    }
-    Ok(())
 }
 
 fn print_report(report: &StatusReport) {

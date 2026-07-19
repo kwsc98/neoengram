@@ -21,6 +21,7 @@ pub(crate) enum RecoveryReport {
 pub(crate) fn recover_repository(repository: &Repository, abort: bool) -> Result<RecoveryReport> {
     // recovery lock 不会因 transactions 非空而拒绝；它仍与 add/commit/checkout 使用
     // 同一 OS advisory lock，因此恢复期间不会有另一个 NeoEngram 写命令交错执行。
+    let _worktree_lock = repository.acquire_worktree_recovery_lock()?;
     let mut lock = repository.acquire_recovery_lock()?;
     let transactions = repository.unfinished_transactions()?;
     if transactions.is_empty() {
