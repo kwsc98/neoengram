@@ -23,6 +23,8 @@ enum Command {
     Rm(RmArgs),
     /// 显示暂存区、工作区和未跟踪文件的状态。
     Status,
+    /// 比较工作区、index 或两个不可变 Commit 的文件与 Chunk 变化。
+    Diff(DiffArgs),
     /// 将暂存区固化为一个只有单父节点的不可变提交。
     Commit(CommitArgs),
     /// 按时间倒序显示当前 HEAD 的单父提交历史。
@@ -33,6 +35,10 @@ enum Command {
     Checkout(CheckoutArgs),
     /// 完成或回滚一次被中断的工作区事务。
     Recover(RecoverArgs),
+    /// 从 HEAD 恢复 index，或从 index 恢复工作区文件。
+    Restore(RestoreArgs),
+    /// 删除未被 index 或已保存 Tree 引用的 Chunk 对象。
+    Gc(GcArgs),
     /// 验证本地 refs、历史、元数据和 Chunk 对象的完整性。
     Fsck,
 }
@@ -93,6 +99,40 @@ struct CommitArgs {
 }
 
 #[derive(Debug, Args)]
+struct DiffArgs {
+    /// 比较 HEAD 与 index；省略时比较 index 与工作区。
+    #[arg(long)]
+    staged: bool,
+    /// 只输出汇总统计。
+    #[arg(long)]
+    stat: bool,
+    /// 一个 TARGET 表示 Commit 与工作区（或 --staged 时与 index）比较；两个 TARGET
+    /// 表示 Commit 与 Commit 比较。
+    #[arg(value_name = "TARGET", num_args = 0..=2)]
+    targets: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct RestoreArgs {
+    /// 从 HEAD 恢复 index，不修改工作区。
+    #[arg(short = 'S', long)]
+    staged: bool,
+    /// 覆盖工作区中与 index 不一致的普通文件。
+    #[arg(short, long)]
+    force: bool,
+    /// 要恢复的文件或目录范围。
+    #[arg(value_name = "PATH", required = true, num_args = 1..)]
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct GcArgs {
+    /// 只报告可回收对象，不删除任何内容。
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
 struct LogArgs {
     /// 最多显示多少个 Commit。
     #[arg(short = 'n', long, value_name = "COUNT")]
@@ -112,8 +152,11 @@ struct CheckoutArgs {
     #[arg(value_name = "TARGET", default_value = "HEAD")]
     target: String,
     /// 丢弃暂存修改、已跟踪修改以及冲突的叶子文件。
-    #[arg(long)]
+    #[arg(long, conflicts_with = "read_only")]
     force: bool,
+    /// 将 TARGET 物化到一个新的独立只读目录，不修改当前工作区、index 或 HEAD。
+    #[arg(long, value_name = "DIR", conflicts_with = "force")]
+    read_only: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -140,13 +183,20 @@ pub(crate) async fn run() -> Result<()> {
             app::rm::execute(arguments.path, arguments.cached, arguments.force).await
         }
         Command::Status => app::status::execute().await,
+        Command::Diff(arguments) => {
+            app::diff::execute(arguments.staged, arguments.targets, arguments.stat).await
+        }
         Command::Commit(arguments) => app::commit::execute(arguments.message).await,
         Command::Log(arguments) => app::log::execute(arguments.max_count).await,
         Command::Show(arguments) => app::show::execute(arguments.target).await,
         Command::Checkout(arguments) => {
-            app::checkout::execute(arguments.target, arguments.force).await
+            app::checkout::execute(arguments.target, arguments.force, arguments.read_only).await
         }
         Command::Recover(arguments) => app::recover::execute(arguments.abort).await,
+        Command::Restore(arguments) => {
+            app::restore::execute(arguments.paths, arguments.staged, arguments.force).await
+        }
+        Command::Gc(arguments) => app::gc::execute(arguments.dry_run).await,
         Command::Fsck => app::fsck::execute().await,
     }
 }

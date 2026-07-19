@@ -131,6 +131,13 @@ pub(crate) trait ObjectStore: Debug + Send + Sync {
     /// Lists at most `limit` logical objects after an opaque backend cursor.
     fn list_page(&self, cursor: Option<&str>, limit: NonZeroUsize) -> Result<ObjectPage>;
 
+    /// Removes one immutable object during an explicitly coordinated garbage-collection pass.
+    ///
+    /// Object stores must treat a missing object as a successful no-op and must never follow a
+    /// symlink or remove a path outside their own layout.  The repository layer is responsible
+    /// for proving that the object is unreachable before calling this method.
+    fn remove(&self, id: &str) -> Result<bool>;
+
     /// Makes every successful publication completed before this call crash-durable.
     fn durability_barrier(&self) -> Result<()>;
 }

@@ -16,6 +16,7 @@ use super::Repository;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 const WRITE_LOCK_FILE_NAME: &str = "write.lock";
+const OBJECT_LOCK_FILE_NAME: &str = "objects.lock";
 const LOCK_FORMAT_VERSION: u32 = 1;
 
 /// 写锁文件只用于诊断，互斥语义由操作系统 advisory lock 提供。
@@ -40,18 +41,26 @@ impl Repository {
     /// 所有会改变 index、ref 或工作区的普通命令都必须走这个入口。存在未完成的 Checkout
     /// 时会统一拒绝操作，避免 add/commit 绕过恢复流程继续写元数据。
     pub(crate) fn acquire_write_lock(&self) -> Result<RepositoryWriteLock> {
-        let lock = self.acquire_lock("repository-write")?;
+        let lock = self.acquire_lock(WRITE_LOCK_FILE_NAME, "repository-write")?;
         self.ensure_no_unfinished_transactions()?;
         Ok(lock)
     }
 
-    /// 恢复命令必须能在事务目录存在时取得锁，因此使用独立入口。
-    pub(crate) fn acquire_recovery_lock(&self) -> Result<RepositoryWriteLock> {
-        self.acquire_lock("checkout-recover")
+    /// Serialize object publication with garbage collection.  The ordinary write lock is
+    /// intentionally acquired only for the short index/ref commit phase of `add`; this second
+    /// advisory lock covers the longer chunking phase so GC cannot delete an object just before
+    /// the index starts referring to it.
+    pub(crate) fn acquire_object_lock(&self) -> Result<RepositoryWriteLock> {
+        self.acquire_lock(OBJECT_LOCK_FILE_NAME, "object-publish")
     }
 
-    fn acquire_lock(&self, operation: &str) -> Result<RepositoryWriteLock> {
-        let path = self.metadata_dir().join(WRITE_LOCK_FILE_NAME);
+    /// 恢复命令必须能在事务目录存在时取得锁，因此使用独立入口。
+    pub(crate) fn acquire_recovery_lock(&self) -> Result<RepositoryWriteLock> {
+        self.acquire_lock(WRITE_LOCK_FILE_NAME, "checkout-recover")
+    }
+
+    fn acquire_lock(&self, file_name: &str, operation: &str) -> Result<RepositoryWriteLock> {
+        let path = self.metadata_dir().join(file_name);
         let existed = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 ensure!(

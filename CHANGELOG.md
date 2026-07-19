@@ -11,6 +11,8 @@
 - 初始化 Cargo Workspace、多模块核心库和命令行程序。
 - 增加测试、持续集成与开源协作模板。
 - 增加 `rm`、`status`、`log`、`show`、`recover` 和 `fsck` 本地命令。
+- 增加 `diff`、`restore` 和 `gc` 本地命令：支持文件/Chunk 级比较、暂存区与工作区恢复，
+  以及回收不再被 index 或已保存 Tree 引用的 loose Chunk 对象。
 - 增加 `add -A [PATH]`，支持按路径范围暂存删除。
 - 增加 checkout/rm 持久 journal、故障恢复和进程退出故障注入测试。
 - 增加分页 `MetadataStore`、单次流式发布的独立 FileManifest、Index version transaction、
@@ -18,6 +20,12 @@
 - 增加行式 `SqliteMetadataStore` 并作为新仓库默认后端；保留可显式选择的 JSON 后端。
 - 元数据契约、JSON/SQLite 后端、契约测试和逐操作文档集中到独立 `local/metadata` 模块。
 - 增加流式 `ObjectStore`、真实 `LooseObjectStore`、抽象切块入口及对象后端契约测试。
+- `add` 与 `gc` 增加独立对象发布锁，避免对象在 index 发布前被并发回收。
+- `checkout --read-only DIR` 可将 Commit 原子导出到仓库外的 Unix 只读快照目录；新增
+  `.neoengramignore` 并让 `add`/`status` 共享忽略规则。
+- `fsck` 使用有界外部 Chunk 标记归并，避免为对象完整性检查长期保留完整 Chunk Hash 集合。
+- 新增 [`docs/implementation-plan.md`](docs/implementation-plan.md)，集中维护当前能力、分布式
+  控制面路线、研究事项、验收标准和后续路线变更。
 - `repository.json` 格式 4 显式记录 `metadata_store` 和 `object_store`，并支持 attached/direct
   HEAD；开发期不兼容旧格式。
 - SQLite 元数据 schema 升级为 2，结构化保存 symbolic/direct HEAD，并提供 HEAD CAS。

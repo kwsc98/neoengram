@@ -85,6 +85,28 @@ fn fsck_accepts_a_valid_repository_and_reports_object_corruption() -> TestResult
 }
 
 #[test]
+fn fsck_rejects_a_missing_referenced_object() -> TestResult {
+    let repository = tempfile::tempdir()?;
+    initialize(repository.path())?;
+    fs::write(
+        repository.path().join("dataset.bin"),
+        b"missing fsck payload",
+    )?;
+    run_success(repository.path(), &["add", "dataset.bin"])?;
+    run_success(repository.path(), &["commit", "-m", "missing object"])?;
+
+    let chunk = first_indexed_chunk(repository.path())?;
+    fs::remove_file(object_path(repository.path(), &chunk.hash))?;
+
+    let fsck = command(repository.path()).arg("fsck").output()?;
+    assert!(!fsck.status.success());
+    let stderr = String::from_utf8_lossy(&fsck.stderr);
+    assert!(stderr.contains("元数据引用了不存在的 Chunk 对象"));
+    assert!(stderr.contains(&chunk.hash));
+    Ok(())
+}
+
+#[test]
 fn fsck_accepts_a_valid_detached_head() -> TestResult {
     let repository = tempfile::tempdir()?;
     initialize(repository.path())?;

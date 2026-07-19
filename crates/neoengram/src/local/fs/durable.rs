@@ -227,6 +227,103 @@ pub(crate) fn rename_durable(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Atomically replace a regular-file destination with a fully synced temporary file.
+///
+/// Unlike `rename_noreplace_durable`, replacement is intentional here: callers have already
+/// checked the destination type and verified the source contents.  Keeping the replacement in a
+/// single filesystem rename avoids the data-loss window caused by remove-then-rename.
+pub(crate) fn replace_durable(source: &Path, destination: &Path) -> Result<()> {
+    let source_parent = source
+        .parent()
+        .with_context(|| format!("源路径没有父目录: {}", source.display()))?;
+    let destination_parent = destination
+        .parent()
+        .with_context(|| format!("目标路径没有父目录: {}", destination.display()))?;
+
+    replace_path(source, destination)?;
+    if source_parent == destination_parent {
+        sync_directory(destination_parent)?;
+    } else {
+        sync_directory(destination_parent)?;
+        sync_directory(source_parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn replace_path(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "无法原子替换 {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn replace_path(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    ensure!(
+        !source_wide[..source_wide.len() - 1].contains(&0)
+            && !destination_wide[..destination_wide.len() - 1].contains(&0),
+        "替换路径包含 NUL"
+    );
+    let moved = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    ensure!(
+        moved != 0,
+        "无法原子替换 {} -> {}: {}",
+        source.display(),
+        destination.display(),
+        io::Error::last_os_error()
+    );
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    windows
+)))]
+fn replace_path(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "无法原子替换 {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
 pub(crate) fn rename_noreplace_durable(source: &Path, destination: &Path) -> Result<()> {
     let source_parent = source
         .parent()
@@ -349,7 +446,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::rename_noreplace_durable;
+    use super::{rename_noreplace_durable, replace_durable};
 
     #[test]
     fn noreplace_rename_preserves_an_existing_directory() -> Result<()> {
@@ -363,6 +460,20 @@ mod tests {
         assert!(rename_noreplace_durable(&source, &destination).is_err());
         assert_eq!(fs::read(source.join("source.txt"))?, b"source");
         assert_eq!(fs::read_dir(&destination)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_durable_replaces_an_existing_regular_file() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, b"new")?;
+        fs::write(&destination, b"old")?;
+
+        replace_durable(&source, &destination)?;
+        assert_eq!(fs::read(&destination)?, b"new");
+        assert!(!source.exists());
         Ok(())
     }
 }

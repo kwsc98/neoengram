@@ -6,7 +6,8 @@
 被可靠地暂存、提交、校验与恢复。
 
 项目当前聚焦单机仓库与本地工作流，已经提供 SQLite 元数据、事务化 checkout 和故障恢复
-能力；分布式对象存储、远程同步与协作能力属于后续阶段。
+能力；分布式对象存储、远程同步与协作能力属于后续阶段。整体产品目标、当前能力清单和
+分布式实现路线统一维护在 [`docs/implementation-plan.md`](docs/implementation-plan.md)。
 
 ## 核心语义
 
@@ -31,8 +32,11 @@ cargo build -p neoengram
 ./target/debug/neoengram add README.md
 ./target/debug/neoengram status
 ./target/debug/neoengram commit -m "add project readme"
+./target/debug/neoengram diff --staged
 ./target/debug/neoengram log
 ./target/debug/neoengram checkout HEAD
+./target/debug/neoengram checkout HEAD --read-only ../model-snapshot
+./target/debug/neoengram gc --dry-run
 ./target/debug/neoengram fsck
 ```
 
@@ -76,7 +80,8 @@ cargo run -p neoengram -- checkout HEAD
 ├── transactions/                    # checkout/rm journal、暂存文件和故障备份
 └── metadata/
     ├── repository.json              # 仓库格式版本与后端选择
-    ├── write.lock                   # 按需创建的 OS advisory lock；文件可跨进程保留
+    ├── write.lock                   # 按需创建的仓库写锁；文件可跨进程保留
+    ├── objects.lock                 # add 与 gc 共享的对象发布/回收锁
     ├── metadata.sqlite3             # SQLite 后端的行式元数据数据库（选择 SQLite 时）
     ├── index.json                   # JSON 后端的完整暂存快照
     ├── HEAD                         # JSON 后端：symbolic ref 或 detached Commit ID
@@ -90,8 +95,9 @@ cargo run -p neoengram -- checkout HEAD
 提交采用追加式发布顺序：先验证全部 Chunk 并完成 ObjectStore durability barrier，再写并同步
 Manifest、Tree 和 Commit，最后通过 CAS 原子更新当前分支引用或 direct HEAD。JSON 后端会
 同步引用的父目录；SQLite 后端通过 `synchronous=FULL` 的 WAL 事务提交。`add`、`rm`、
-`commit`、`checkout`、`recover` 和 `fsck` 共享 OS advisory lock；进程被 kill 后内核自动
-释放锁，遗留的普通 `write.lock` 文件不会形成永久死锁。
+`commit`、`checkout`、`recover` 和 `fsck` 共享 OS advisory 写锁；`add` 与 `gc` 另外共享
+`objects.lock`，覆盖对象发布和回收的整个窗口。进程被 kill 后内核自动释放锁，遗留的普通
+锁文件不会形成永久死锁。
 
 仓库路径固定为 UTF-8 NFC 和 `/` 分隔，并拒绝 Windows drive prefix、设备保留名、非法
 字符、大小写碰撞、文件/目录前缀碰撞，以及 `.neoengram` 和 `.neoengram-tmp-*` 保留组件。
@@ -119,7 +125,8 @@ barrier。Repository 和命令层都不再依赖对象物理路径。
 跨工作区 rename/元数据提交的恢复协议。逐项接口语义见
 [`local/metadata/README.md`](crates/neoengram/src/local/metadata/README.md)，整体规模预算和迁移顺序
 见 [`docs/storage-architecture.md`](docs/storage-architecture.md)，源码职责与未来扩展落点见
-[`docs/code-architecture.md`](docs/code-architecture.md)。
+[`docs/code-architecture.md`](docs/code-architecture.md)；实现路线和研究记录见
+[`docs/implementation-plan.md`](docs/implementation-plan.md)。
 
 ## 暂存与查看
 
@@ -135,6 +142,19 @@ barrier。Repository 和命令层都不再依赖对象物理路径。
 ./target/debug/neoengram add -A [PATH]
 ```
 
+仓库根目录下可用 `.neoengramignore` 排除不应纳入版本控制的输入。`add` 和 `status`
+使用同一组规则；支持空行、`#` 注释、`!` 否定、末尾 `/` 目录规则，以及 `*`、`?` 和
+`**` 通配符。例如：
+
+```text
+*.tmp
+checkpoints/
+!checkpoints/README.txt
+```
+
+忽略规则只影响未跟踪文件的发现；已经在 index 中跟踪的文件仍会被 `add -A` 更新或删除。
+该文件只从仓库根目录读取，当前不支持嵌套 `.neoengramignore`。
+
 安全地删除已跟踪内容，或只从 index 取消跟踪：
 
 ```bash
@@ -149,6 +169,23 @@ unstaged 和 untracked 三类状态，并查看线性历史或具体快照：
 ./target/debug/neoengram status
 ./target/debug/neoengram log --max-count 20
 ./target/debug/neoengram show HEAD
+```
+
+查看文件级和 Chunk 级变化（不会把未跟踪文件自动加入比较）：
+
+```bash
+./target/debug/neoengram diff
+./target/debug/neoengram diff --staged
+./target/debug/neoengram diff HEAD <COMMIT_ID>
+./target/debug/neoengram diff --stat
+```
+
+撤销暂存或恢复工作区文件：
+
+```bash
+./target/debug/neoengram restore --staged path/to/data
+./target/debug/neoengram restore path/to/data
+./target/debug/neoengram restore --force path/to/data
 ```
 
 ## 恢复版本
@@ -177,6 +214,18 @@ Checkout 默认拒绝丢弃 staged 修改、已跟踪文件修改或冲突的未
 ./target/debug/neoengram checkout <COMMIT_ID> --force
 ```
 
+将一个 Commit 导出到仓库之外的独立只读目录（不会改变当前工作区、index 或 HEAD）：
+
+```bash
+./target/debug/neoengram checkout HEAD --read-only ../model-snapshot
+./target/debug/neoengram checkout <COMMIT_ID> --read-only ../older-model-snapshot
+```
+
+目标目录必须尚不存在，且其父级不能是符号链接或位于当前仓库内。Unix/macOS 上导出的普通
+文件使用 `0444`、目录使用 `0555`；这是普通文件权限保护，不是不可绕过的 mount、ACL 或
+root 级安全边界。导出过程先在同一父目录创建临时目录，完成 Chunk 校验后再原子发布，失败
+时不会留下半成品。
+
 切换到旧 Commit 后，`HEAD` 直接指向该 Commit，而 `main` 保持原位置。此时 `log`、
 `show HEAD` 和 `status` 都以 detached HEAD 为准；后续 `commit` 以 detached Commit 为父节点，
 只推进 direct HEAD，不移动 `main`。切回 `main` 后，未被命名引用保存的 detached Commit
@@ -203,6 +252,14 @@ FileNode 验证为事务产物的文件，遇到用户后来创建或修改的�
 
 ```bash
 ./target/debug/neoengram fsck
+```
+
+清理不再被当前 index 或任何已保存 Tree 引用的 Chunk payload。不可变 Manifest、Tree 和
+Commit 元数据不会被删除，因此 detached/不可达历史目前仍会保留其对象：
+
+```bash
+./target/debug/neoengram gc --dry-run
+./target/debug/neoengram gc
 ```
 
 `fsck` 校验全部 refs、Commit/Tree 内容 ID、单父历史无环、路径规则、Chunk 引用大小，
@@ -243,6 +300,10 @@ cargo rustdoc -p neoengram-core --all-features -- -D warnings
 ```
 
 ## 当前范围
+
+完整的当前能力、已知限制、分布式目标架构、阶段验收标准和研究计划见
+[`docs/implementation-plan.md`](docs/implementation-plan.md)。本文只保留面向用户的使用说明和
+当前存储边界。
 
 当前版本完成的是本地 Phase 1，不包含网络传输、PostgreSQL 控制面、S3、认证、多分支管理、
 `push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、SQLite 行式元数据和流式对象抽象已经

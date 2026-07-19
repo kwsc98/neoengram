@@ -444,7 +444,11 @@ fn restore_manifest_backups(
     Ok(())
 }
 
-fn repository_scope(path: &Path, current_dir: &Path, repository_root: &Path) -> Result<String> {
+pub(crate) fn repository_scope(
+    path: &Path,
+    current_dir: &Path,
+    repository_root: &Path,
+) -> Result<String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {

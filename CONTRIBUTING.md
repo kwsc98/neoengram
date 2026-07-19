@@ -21,6 +21,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 - 说明改动解决的问题、实现方式和验证方法。
 - 保持每个 pull request 聚焦，避免混入无关重构。
 - 如果公共行为发生变化，请同步更新 README 或相关文档。
+- 如果涉及路线、架构、研究结论或阶段状态，请同步更新
+  [`docs/implementation-plan.md`](docs/implementation-plan.md)；该文件是能力和计划的唯一事实来源。
 - 不要求每个 pull request 修改 CHANGELOG；维护者会在发布前统一整理。
 
 ## 贡献许可

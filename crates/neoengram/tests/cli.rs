@@ -961,6 +961,184 @@ fn add_requires_an_initialized_repository() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+#[test]
+fn diff_restore_and_gc_cover_the_local_cleanup_workflow() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    initialize(temporary.path())?;
+    let model = temporary.path().join("model.bin");
+    fs::write(&model, b"version one")?;
+    assert!(command(temporary.path())
+        .args(["add", "model.bin"])
+        .output()?
+        .status
+        .success());
+    assert!(command(temporary.path())
+        .args(["commit", "-m", "initial"])
+        .output()?
+        .status
+        .success());
+
+    fs::write(&model, b"version two")?;
+    let diff = command(temporary.path()).arg("diff").output()?;
+    assert!(diff.status.success());
+    let diff_stdout = String::from_utf8(diff.stdout)?;
+    assert!(diff_stdout.contains("modified: model.bin"));
+
+    assert!(command(temporary.path())
+        .args(["add", "model.bin"])
+        .output()?
+        .status
+        .success());
+    let staged = command(temporary.path())
+        .args(["diff", "--staged"])
+        .output()?;
+    assert!(staged.status.success());
+    assert!(String::from_utf8(staged.stdout)?.contains("modified: model.bin"));
+
+    let restore_staged = command(temporary.path())
+        .args(["restore", "--staged", "model.bin"])
+        .output()?;
+    assert!(
+        restore_staged.status.success(),
+        "restore --staged failed: {}",
+        String::from_utf8_lossy(&restore_staged.stderr)
+    );
+    let status = command(temporary.path()).arg("status").output()?;
+    let status_stdout = String::from_utf8(status.stdout)?;
+    assert!(status_stdout.contains("Changes not staged for commit:"));
+    assert!(!status_stdout.contains("Changes to be committed:"));
+
+    let restore_worktree = command(temporary.path())
+        .args(["restore", "--force", "model.bin"])
+        .output()?;
+    assert!(restore_worktree.status.success());
+    assert_eq!(fs::read(&model)?, b"version one");
+
+    // Removing the index entry leaves its immutable payload unreachable; gc can report and then
+    // reclaim it without touching the committed snapshot.
+    fs::write(&model, b"orphan payload")?;
+    assert!(command(temporary.path())
+        .args(["add", "model.bin"])
+        .output()?
+        .status
+        .success());
+    let before_gc = object_entries(&temporary.path().join(".neoengram/objects"))?;
+    assert!(command(temporary.path())
+        .args(["rm", "--cached", "model.bin"])
+        .output()?
+        .status
+        .success());
+    let dry_run = command(temporary.path())
+        .args(["gc", "--dry-run"])
+        .output()?;
+    assert!(dry_run.status.success());
+    assert!(String::from_utf8(dry_run.stdout)?.contains("unreferenced objects"));
+    let collected = command(temporary.path()).arg("gc").output()?;
+    assert!(collected.status.success());
+    assert!(object_entries(&temporary.path().join(".neoengram/objects"))? < before_gc);
+    Ok(())
+}
+
+#[test]
+fn cleanup_commands_work_with_the_default_sqlite_backend() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let initialized = command(temporary.path()).arg("init").output()?;
+    assert!(initialized.status.success());
+    let model = temporary.path().join("weights.bin");
+    fs::write(&model, b"sqlite model")?;
+    for arguments in [
+        vec!["add", "weights.bin"],
+        vec!["commit", "-m", "sqlite"],
+        vec!["diff", "--staged"],
+        vec!["gc", "--dry-run"],
+    ] {
+        let output = command(temporary.path()).args(arguments).output()?;
+        assert!(
+            output.status.success(),
+            "command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn gc_preserves_payloads_for_unreachable_immutable_history(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    initialize(temporary.path())?;
+    let model = temporary.path().join("model.bin");
+
+    fs::write(&model, b"root")?;
+    assert!(command(temporary.path())
+        .args(["add", "model.bin"])
+        .output()?
+        .status
+        .success());
+    let first = command(temporary.path())
+        .args(["commit", "-m", "root"])
+        .output()?;
+    assert!(first.status.success());
+    let first_id = committed_id(&first.stdout)?;
+
+    fs::write(&model, b"main tip")?;
+    assert!(command(temporary.path())
+        .args(["add", "model.bin"])
+        .output()?
+        .status
+        .success());
+    assert!(command(temporary.path())
+        .args(["commit", "-m", "main"])
+        .output()?
+        .status
+        .success());
+
+    // Create a divergent detached commit, then reattach main so it is no longer a named/root
+    // history.  Its immutable Tree must still remain fsck-valid until metadata GC exists.
+    assert!(command(temporary.path())
+        .args(["checkout", &first_id])
+        .output()?
+        .status
+        .success());
+    fs::write(&model, b"detached tip")?;
+    assert!(command(temporary.path())
+        .args(["add", "model.bin"])
+        .output()?
+        .status
+        .success());
+    assert!(command(temporary.path())
+        .args(["commit", "-m", "detached"])
+        .output()?
+        .status
+        .success());
+    assert!(command(temporary.path())
+        .args(["checkout", "main"])
+        .output()?
+        .status
+        .success());
+
+    let collected = command(temporary.path()).arg("gc").output()?;
+    assert!(collected.status.success());
+    let fsck = command(temporary.path()).arg("fsck").output()?;
+    assert!(
+        fsck.status.success(),
+        "fsck after gc failed: {}",
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+    Ok(())
+}
+
+fn committed_id(stdout: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    let text = String::from_utf8(stdout.to_vec())?;
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("Committed "))
+        .ok_or("commit output did not contain an id")?;
+    Ok(line["Committed ".len()..].trim().to_owned())
+}
+
 fn initialize(path: &Path) -> std::io::Result<()> {
     let output = command(path)
         .args(["init", "--metadata-store", "json"])
