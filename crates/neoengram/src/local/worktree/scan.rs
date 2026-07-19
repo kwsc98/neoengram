@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -6,7 +7,7 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use walkdir::WalkDir;
 
-use crate::local::repository::is_neoengram_dir_name;
+use crate::local::{repository::is_neoengram_dir_name, worktree::ignore::IgnoreRules};
 
 pub(crate) struct InputFile {
     disk_path: PathBuf,
@@ -46,11 +47,13 @@ pub(crate) fn validate_input_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn collect_files(
+pub(crate) fn collect_files_with_ignore(
     path: &Path,
     current_dir: &Path,
     repository_root: &Path,
     allow_missing: bool,
+    ignore_rules: &IgnoreRules,
+    tracked_paths: &BTreeSet<String>,
 ) -> Result<FileCollection> {
     let requested_path = if path.is_absolute() {
         path.to_path_buf()
@@ -94,19 +97,46 @@ pub(crate) fn collect_files(
 
     let mut files = Vec::new();
     if metadata.is_file() {
-        files.push(input_file(canonical_path, repository_root)?);
+        let input = input_file(canonical_path, repository_root)?;
+        if !ignore_rules.is_ignored(input.repository_path(), false)
+            || tracked_paths.contains(input.repository_path())
+        {
+            files.push(input);
+        }
     } else {
+        let tracked_directories = tracked_directory_prefixes(tracked_paths);
+        let filter_root = repository_root.to_path_buf();
+        let filter_ignore_rules = ignore_rules.clone();
         let entries = WalkDir::new(&canonical_path)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|entry| !is_neoengram_dir_name(entry.file_name()));
+            .filter_entry(move |entry| {
+                if is_neoengram_dir_name(entry.file_name()) {
+                    return false;
+                }
+                if !entry.file_type().is_dir() {
+                    return true;
+                }
+                let Some(path) = repository_path(entry.path(), &filter_root, true).ok() else {
+                    return true;
+                };
+                path.is_empty()
+                    || tracked_directories.contains(&path)
+                    || filter_ignore_rules.has_negations()
+                    || !filter_ignore_rules.is_ignored(&path, true)
+            });
 
         for entry in entries {
             let entry =
                 entry.with_context(|| format!("遍历目录失败: {}", canonical_path.display()))?;
             // 不跟随符号链接可防止目录环和意外越过仓库边界。
             if entry.file_type().is_file() {
-                files.push(input_file(entry.into_path(), repository_root)?);
+                let input = input_file(entry.into_path(), repository_root)?;
+                if !ignore_rules.is_ignored(input.repository_path(), false)
+                    || tracked_paths.contains(input.repository_path())
+                {
+                    files.push(input);
+                }
             }
         }
     }
@@ -116,6 +146,22 @@ pub(crate) fn collect_files(
         files,
         repository_scope,
     })
+}
+
+fn tracked_directory_prefixes(tracked_paths: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut directories = BTreeSet::new();
+    for path in tracked_paths {
+        let mut current = String::new();
+        let components: Vec<_> = path.split('/').collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(component);
+            directories.insert(current.clone());
+        }
+    }
+    directories
 }
 
 fn input_file(disk_path: PathBuf, repository_root: &Path) -> Result<InputFile> {

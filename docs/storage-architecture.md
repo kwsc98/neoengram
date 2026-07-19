@@ -48,13 +48,19 @@ NeoEngram 的目标是管理至少 100 TB 的逻辑 payload。这个目标首先
 - `copy_to`：单遍校验并输出，不要求调用方获得物理路径；
 - `verify`、`stat` 和有界 `check_many`；
 - `list_page`：按 opaque cursor 分页枚举；
+- `remove`：只允许在仓库层已经证明对象不可达、且与发布者协调的 GC 中调用；
 - `durability_barrier`：成功后，此前发布的对象才允许被元数据引用。
 
 当前 `local::objects` 中的 `LooseObjectStore` 每个对象保存为一个本地文件。add、commit、
-checkout 和 fsck 已经通过 `ObjectStore` 工作，不再拼接 `objects/<hash>` 路径。
+checkout、fsck 和 gc 已经通过 `ObjectStore` 工作，不再拼接 `objects/<hash>` 路径。add 与 gc
+共享独立 advisory lock，覆盖对象发布到 index 可见以及 mark/sweep 的整个竞态窗口。
 
 完整文件缓存是可淘汰派生数据，不属于 ObjectStore。checkout/rm journal 协调工作区 rename
 和元数据提交，也不属于 MetadataStore。
+
+`checkout --read-only DIR` 是一次性工作区快照导出：它不会更新当前 index、HEAD 或仓库工作区，
+而是在目标目录的同一文件系统中完成临时物化、Chunk 校验、只读权限设置和 no-replace rename。
+当前实现要求目标目录位于仓库之外，并使用普通 Unix 权限而不是 mount/ACL 隔离。
 
 ## 发布顺序
 
@@ -97,7 +103,9 @@ WAL read transaction 固定同一个 MVCC 视图。
 - commit 在写锁内扫描完整 Index，并重新读取、Hash 全部暂存 payload；
 - status、checkout 和 rm 使用全量 BTreeMap/BTreeSet，恢复日志保存完整 Index；
 - checkout 预先建立全部变更文件的永久完整缓存，缺少 quota/lease；
-- fsck 虽已分页扫描 ObjectStore，仍在内存中保存完整元数据图并长期持有写锁；
+- fsck 虽仍需保留 Commit/Tree ID 图并长期持有写锁，但 Chunk 引用已改为有界外部排序归并，
+  不再在内存中保存完整 Chunk Hash 集合；
+- gc 同样在内存保存完整可达 Chunk 集合，并依赖全仓库写锁与对象发布锁；
 - LooseObjectStore 的平铺目录每翻一页都要重扫，完整 fsck 近似 `O(N^2 / page_size)`；
 - log/show 的展示路径尚未全面改成 cursor 输出。
 
@@ -111,7 +119,8 @@ WAL read transaction 固定同一个 MVCC 视图。
 3. 将 status/commit 改为有序分页 merge；rm 使用 revision token 和前缀事务。
 4. 将 checkout 改为逐文件物化到事务 staging；缓存变成有配额的 best-effort 层。
 5. 将 checkout/rm journal 改为追加式有界批次，只保存 before/after revision 与 root。
-6. 让 fsck 使用固定 cutoff、可恢复 cursor 和磁盘临时集合，不长期持有全仓库写锁。
+6. 继续让 fsck 使用固定 cutoff、可恢复 cursor 和更短的锁窗口；当前 Chunk 标记已使用磁盘
+   临时集合，但 Commit/Tree 图仍需后续分页化。
 7. 用 fanout、pack 或带 catalog 的对象后端替代平铺 loose 目录，并为后端配置增加 locator。
 8. 基于实际基准决定是否引入 Merkle Tree；SQLite 分页记录和独立 FileManifest 应先解除主要
    内存瓶颈，Merkle 是局部更新与 root 计算优化，不是预先锁死的实现。

@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 
 use crate::local::{
     repository::{is_neoengram_dir_name, Repository},
-    worktree::{file_matches_node, lenient_leaf_metadata, workspace_path},
+    worktree::{file_matches_node, lenient_leaf_metadata, workspace_path, IgnoreRules},
 };
 
 pub(crate) async fn execute() -> Result<()> {
@@ -70,6 +70,7 @@ impl StatusReport {
 
 fn build_report(repository: &Repository) -> Result<StatusReport> {
     ensure_no_unfinished_transaction(repository)?;
+    let ignore_rules = IgnoreRules::load(repository.root())?;
     let index = repository.read_index()?;
     let head = repository.current_head()?;
     let head_files = match head.commit_id() {
@@ -117,7 +118,7 @@ fn build_report(repository: &Repository) -> Result<StatusReport> {
     }
 
     let tracked: BTreeSet<&str> = index.files.iter().map(|file| file.path.as_str()).collect();
-    let untracked = collect_untracked_files(repository.root(), &tracked)?;
+    let untracked = collect_untracked_files(repository.root(), &tracked, &ignore_rules)?;
     // status 没有持有写锁，因此在完成扫描后再次检查，避免输出恰好跨越一次 rm/checkout
     // 工作区事务而混合两个时刻的状态。
     ensure_no_unfinished_transaction(repository)?;
@@ -162,11 +163,29 @@ fn compare_snapshots(base: &[FileNode], current: &[FileNode]) -> Vec<PathChange>
 fn collect_untracked_files(
     repository_root: &Path,
     tracked: &BTreeSet<&str>,
+    ignore_rules: &IgnoreRules,
 ) -> Result<Vec<String>> {
+    let tracked_directories = tracked_directory_prefixes(tracked);
+    let filter_root = repository_root.to_path_buf();
+    let filter_ignore_rules = ignore_rules.clone();
     let entries = WalkDir::new(repository_root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|entry| !is_neoengram_dir_name(entry.file_name()));
+        .filter_entry(move |entry| {
+            if is_neoengram_dir_name(entry.file_name()) {
+                return false;
+            }
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            let Some(path) = directory_repository_path(entry.path(), &filter_root) else {
+                return true;
+            };
+            path.is_empty()
+                || tracked_directories.contains(&path)
+                || filter_ignore_rules.has_negations()
+                || !filter_ignore_rules.is_ignored(&path, true)
+        });
     let mut untracked = Vec::new();
     for entry in entries {
         let entry =
@@ -175,12 +194,43 @@ fn collect_untracked_files(
             continue;
         }
         let path = repository_path(entry.path(), repository_root)?;
-        if !tracked.contains(path.as_str()) {
+        if !tracked.contains(path.as_str()) && !ignore_rules.is_ignored(&path, false) {
             untracked.push(path);
         }
     }
     untracked.sort_unstable();
     Ok(untracked)
+}
+
+fn tracked_directory_prefixes(tracked: &BTreeSet<&str>) -> BTreeSet<String> {
+    let mut directories = BTreeSet::new();
+    for path in tracked {
+        let components: Vec<_> = path.split('/').collect();
+        let mut current = String::new();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(component);
+            directories.insert(current.clone());
+        }
+    }
+    directories
+}
+
+fn directory_repository_path(path: &Path, repository_root: &Path) -> Option<String> {
+    let relative = path.strip_prefix(repository_root).ok()?;
+    let mut names = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        if is_neoengram_dir_name(name) {
+            return None;
+        }
+        names.push(name.to_str()?);
+    }
+    Some(names.join("/"))
 }
 
 fn repository_path(path: &Path, repository_root: &Path) -> Result<String> {

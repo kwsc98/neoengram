@@ -2,7 +2,8 @@
 
 NeoEngram 当前采用两个 crate：`neoengram-core` 定义内容模型与格式常量，`neoengram`
 承载命令行程序和本地仓库引擎。现阶段只实现本地工作流；远端同步、配置中心、S3 和服务端
-控制面在本文中仅规定未来落点，不代表已经实现。
+控制面在本文中仅规定未来落点，不代表已经实现。当前能力和分阶段实现计划统一见
+[`implementation-plan.md`](implementation-plan.md)。
 
 ## 当前目录职责
 
@@ -77,4 +78,5 @@ PostgreSQL migration 分别版本化，避免一次演进同时锁死所有层�
 
 本地磁盘布局及当前存储事务语义见
 [`storage-architecture.md`](storage-architecture.md)；元数据接口逐项契约见
-[`local/metadata/README.md`](../crates/neoengram/src/local/metadata/README.md)。
+[`local/metadata/README.md`](../crates/neoengram/src/local/metadata/README.md)；路线、研究和
+验收标准见 [`implementation-plan.md`](implementation-plan.md)。

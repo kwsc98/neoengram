@@ -11,7 +11,7 @@ use neoengram_core::{FileNode, Index};
 
 use crate::local::{
     repository::Repository,
-    worktree::{chunk_file, collect_files, validate_input_path},
+    worktree::{chunk_file, collect_files_with_ignore, validate_input_path, IgnoreRules},
 };
 
 pub(crate) async fn execute(path: PathBuf) -> Result<()> {
@@ -28,18 +28,34 @@ pub(crate) async fn execute_with_options(path: PathBuf, all: bool) -> Result<()>
     let current_dir = std::env::current_dir().context("无法确定当前工作目录")?;
     let repository = Repository::discover(&current_dir)?;
     repository.ensure_no_unfinished_transactions()?;
+    let ignore_rules = IgnoreRules::load(repository.root())?;
+    let tracked_paths: BTreeSet<String> = repository
+        .read_index()?
+        .files
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    // Object publication must be serialized with GC for the whole add operation.  The normal
+    // repository write lock is deliberately held only while publishing the index, so without
+    // this separate lock a concurrent GC could remove a freshly published object in the gap
+    // before the index starts referring to it.
+    let _object_lock = repository.acquire_object_lock()?;
 
     // WalkDir、canonicalize 和文件元数据查询都是同步系统调用。大型数据集可能包含
     // 数百万个目录项，因此把完整遍历移到阻塞线程池，避免卡住 Tokio 调度线程。
     let traversal_path = path.clone();
     let traversal_current_dir = current_dir;
     let repository_root = repository.root().to_path_buf();
+    let traversal_ignore_rules = ignore_rules.clone();
+    let traversal_tracked_paths = tracked_paths.clone();
     let collection = tokio::task::spawn_blocking(move || {
-        collect_files(
+        collect_files_with_ignore(
             &traversal_path,
             &traversal_current_dir,
             &repository_root,
             all,
+            &traversal_ignore_rules,
+            &traversal_tracked_paths,
         )
     })
     .await

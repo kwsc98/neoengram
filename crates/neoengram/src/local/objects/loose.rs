@@ -261,6 +261,29 @@ impl ObjectStore for LooseObjectStore {
         })
     }
 
+    fn remove(&self, id: &str) -> Result<bool> {
+        validate_object_id(id)?;
+        self.validate_layout()?;
+        let path = self.object_path(id)?;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => {
+                Err(error).with_context(|| format!("无法检查待删除对象: {}", path.display()))
+            }
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file() && !metadata.file_type().is_symlink(),
+                    "待删除对象不是普通文件: {}",
+                    path.display()
+                );
+                fs::remove_file(&path)
+                    .with_context(|| format!("无法删除不可达对象: {}", path.display()))?;
+                sync_directory(&self.root)?;
+                Ok(true)
+            }
+        }
+    }
+
     fn durability_barrier(&self) -> Result<()> {
         self.validate_layout()?;
         sync_directory(&self.root)
