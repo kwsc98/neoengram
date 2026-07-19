@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
 };
 
@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 use tempfile::{Builder, NamedTempFile};
 
 use crate::local::{
-    fs::durable::{rename_durable, sync_directory, sync_parent, write_json_atomic},
+    fs::durable::{
+        create_dir_all_durable, publish_transaction_draft_observed, remove_dir_all_durable,
+        rename_noreplace_durable, sync_directory, sync_parent, write_bytes_atomic,
+        write_json_atomic, CHECKOUT_TRANSACTION_DRAFT_PREFIX,
+    },
     metadata::HeadState,
     objects::ObjectSpec,
     repository::{Repository, RepositoryWriteLock},
@@ -64,6 +68,7 @@ pub(crate) fn checkout_snapshot(
     target: &str,
     force: bool,
 ) -> Result<CheckoutOutcome> {
+    let _worktree_lock = repository.acquire_worktree_lock()?;
     let mut lock = repository.acquire_write_lock()?;
     checkout_snapshot_locked(repository, target, force, &mut lock)
 }
@@ -173,6 +178,7 @@ fn apply_checkout_transaction(
         "工作区在 Checkout 准备期间发生变化，请重试"
     );
 
+    transaction.publish()?;
     transaction.set_phase(CheckoutPhase::Applying)?;
     apply_workspace_changes(
         repository,
@@ -522,7 +528,7 @@ fn stage_files(
         let parent = staged_path
             .parent()
             .with_context(|| format!("暂存路径没有父目录: {}", staged_path.display()))?;
-        fs::create_dir_all(parent)
+        create_dir_all_durable(parent)
             .with_context(|| format!("无法创建 Checkout 暂存目录: {}", parent.display()))?;
 
         reflink_copy::reflink_or_copy(cache_path, &staged_path).with_context(|| {
@@ -541,6 +547,7 @@ fn stage_files(
         staged
             .sync_all()
             .with_context(|| format!("无法同步暂存文件: {}", file.path))?;
+        sync_directory(parent)?;
     }
     Ok(())
 }
@@ -605,7 +612,8 @@ fn apply_workspace_changes(
         transaction.ensure_worktree_parents(repository.root(), &file.path)?;
         transaction.back_up(&file.path, &destination, true, Some(file))?;
         let staged_path = transaction.staged_path(&file.path);
-        rename_durable(&staged_path, &destination).with_context(|| {
+        super::test_pause_at("checkout-before-worktree-publish");
+        rename_noreplace_durable(&staged_path, &destination).with_context(|| {
             format!(
                 "无法原子发布工作区文件 {} -> {}",
                 staged_path.display(),
@@ -663,6 +671,7 @@ struct CheckoutJournal {
 
 struct CheckoutTransaction {
     root: PathBuf,
+    published: bool,
     journal: CheckoutJournal,
     original_index: Index,
 }
@@ -677,7 +686,7 @@ impl CheckoutTransaction {
         original_index: &Index,
     ) -> Result<Self> {
         let temporary = Builder::new()
-            .prefix("checkout-")
+            .prefix(CHECKOUT_TRANSACTION_DRAFT_PREFIX)
             .tempdir_in(repository.transactions_dir())
             .context("无法创建 Checkout 事务目录")?;
         let root = temporary.path().to_path_buf();
@@ -693,14 +702,16 @@ impl CheckoutTransaction {
             changes: Vec::new(),
             created_directories: Vec::new(),
         };
-        write_transaction_marker(&root.join(OPERATION_FILE_NAME), b"checkout\n")?;
+        write_bytes_atomic(&root.join(OPERATION_FILE_NAME), b"checkout\n")?;
         write_json_atomic(&root.join(ORIGINAL_INDEX_FILE_NAME), original_index)?;
         write_json_atomic(&root.join(JOURNAL_FILE_NAME), &journal)?;
+        sync_directory(&root.join("staged"))?;
+        sync_directory(&root.join("backup"))?;
         sync_directory(&root)?;
-        sync_directory(&repository.transactions_dir())?;
         let root = temporary.keep();
         Ok(Self {
             root,
+            published: false,
             journal,
             original_index: original_index.clone(),
         })
@@ -762,6 +773,7 @@ impl CheckoutTransaction {
         repository.validate_index_snapshot(&original_index)?;
         Ok(Self {
             root,
+            published: true,
             journal,
             original_index,
         })
@@ -778,18 +790,39 @@ impl CheckoutTransaction {
         write_json_atomic(&self.root.join(JOURNAL_FILE_NAME), &self.journal)
     }
 
+    fn publish(&mut self) -> Result<()> {
+        if self.published {
+            return Ok(());
+        }
+        sync_directory(&self.root.join("staged"))?;
+        sync_directory(&self.root.join("backup"))?;
+        sync_directory(&self.root)?;
+        super::test_crash_at("checkout-before-transaction-publish");
+        let draft = self.root.clone();
+        publish_transaction_draft_observed(&draft, "checkout", |published| {
+            self.root = published.to_path_buf();
+            self.published = true;
+        })?;
+        super::test_crash_at("checkout-after-transaction-publish");
+        Ok(())
+    }
+
     fn set_phase(&mut self, phase: CheckoutPhase) -> Result<()> {
         self.journal.phase = phase;
         self.persist_journal()
     }
 
     fn reset_for_replay(&mut self) -> Result<()> {
-        reset_transaction_subdirectory(&self.root.join("staged"))?;
-        reset_transaction_subdirectory(&self.root.join("backup"))?;
+        // rollback has already restored the worktree. Clear the old evidence durably before
+        // retiring staged/backup: if cleanup then fails or the process crashes, a later recover
+        // must not interpret a missing staged payload as proof that it was published again.
         self.journal.phase = CheckoutPhase::Prepared;
         self.journal.changes.clear();
         self.journal.created_directories.clear();
-        self.persist_journal()
+        self.persist_journal()?;
+        super::test_crash_at("checkout-after-reset-journal");
+        reset_transaction_subdirectory(&self.root.join("staged"))?;
+        reset_transaction_subdirectory(&self.root.join("backup"))
     }
 
     fn publish_head(&self, repository: &Repository) -> Result<()> {
@@ -869,10 +902,9 @@ impl CheckoutTransaction {
             let parent = backup
                 .parent()
                 .with_context(|| format!("备份路径没有父目录: {}", backup.display()))?;
-            fs::create_dir_all(parent)
+            create_dir_all_durable(parent)
                 .with_context(|| format!("无法创建 Checkout 备份目录: {}", parent.display()))?;
-            sync_directory(parent)?;
-            rename_durable(destination, &backup)
+            rename_noreplace_durable(destination, &backup)
                 .with_context(|| format!("无法备份工作区路径: {}", destination.display()))?;
         }
         Ok(())
@@ -900,9 +932,8 @@ impl CheckoutTransaction {
                         .created_directories
                         .push(logical_components.join("/"));
                     self.persist_journal()?;
-                    fs::create_dir(&current)
+                    create_dir_all_durable(&current)
                         .with_context(|| format!("无法创建工作区目录: {}", current.display()))?;
-                    sync_parent(&current)?;
                 }
                 Err(error) => {
                     return Err(error)
@@ -923,17 +954,11 @@ impl CheckoutTransaction {
             restored_head.commit_id()
         );
         for change in self.journal.changes.iter().rev() {
+            ensure_safe_worktree_parent_directories(repository.root(), &change.path)?;
             let destination = workspace_path(repository.root(), &change.path);
             let backup = self.backup_path(&change.path);
             let staged = self.staged_path(&change.path);
-            let backup_exists = match fs::symlink_metadata(&backup) {
-                Ok(_) => true,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("无法检查事务备份: {}", backup.display()));
-                }
-            };
+            let backup_exists = self.backup_exists_for_change(change, &backup)?;
 
             if backup_exists {
                 remove_destination_before_restore(
@@ -941,14 +966,23 @@ impl CheckoutTransaction {
                     &staged,
                     change.expected_file.as_ref(),
                 )?;
-                let parent = destination
-                    .parent()
-                    .with_context(|| format!("恢复目标没有父目录: {}", destination.display()))?;
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("无法创建恢复目标父目录: {}", parent.display()))?;
-                rename_durable(&backup, &destination)
+                super::test_pause_at("checkout-before-backup-restore");
+                rename_noreplace_durable(&backup, &destination)
                     .with_context(|| format!("回滚时无法恢复工作区路径: {}", change.path))?;
-            } else if !change.original_present {
+            } else if change.original_present {
+                match fs::symlink_metadata(&destination) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
+                        "Checkout 无法恢复原路径：工作区路径和事务备份同时缺失；事务将保留: {}",
+                        change.path
+                    ),
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("回滚时无法检查原工作区路径: {}", destination.display())
+                        });
+                    }
+                }
+            } else {
                 remove_published_absent_destination(
                     &destination,
                     &staged,
@@ -958,6 +992,7 @@ impl CheckoutTransaction {
         }
 
         for logical_path in self.journal.created_directories.iter().rev() {
+            ensure_safe_worktree_parent_directories(repository.root(), logical_path)?;
             let directory = workspace_path(repository.root(), logical_path);
             match fs::symlink_metadata(&directory) {
                 Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {}
@@ -982,19 +1017,44 @@ impl CheckoutTransaction {
         self.persist_journal()
     }
 
+    fn backup_exists_for_change(&self, change: &JournalChange, backup: &Path) -> Result<bool> {
+        match fs::symlink_metadata(backup) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+                // During a file -> directory transition, the original parent is stored as a
+                // regular file at backup/<parent>. A later child write has no independent backup,
+                // so probing backup/<parent>/<child> reports ENOTDIR rather than ENOENT. Accept
+                // that as absence only when the journal and the on-disk parent backup prove this
+                // exact displacement; otherwise retain the transaction as malformed.
+                let covered_by_file_backup = self.journal.changes.iter().any(|candidate| {
+                    candidate.original_present
+                        && candidate.path != change.path
+                        && path_is_same_or_descendant(&change.path, &candidate.path)
+                        && fs::symlink_metadata(self.backup_path(&candidate.path)).is_ok_and(
+                            |metadata| metadata.is_file() && !metadata.file_type().is_symlink(),
+                        )
+                });
+                ensure!(
+                    covered_by_file_backup,
+                    "Checkout 事务备份祖先不是目录，且没有对应的文件备份: {}",
+                    backup.display()
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("无法检查事务备份: {}", backup.display()))
+            }
+        }
+    }
+
     fn finish(self) -> Result<()> {
-        let parent = self
-            .root
-            .parent()
-            .map(Path::to_path_buf)
-            .with_context(|| format!("Checkout 事务目录没有父目录: {}", self.root.display()))?;
-        fs::remove_dir_all(&self.root).with_context(|| {
+        remove_dir_all_durable(&self.root).with_context(|| {
             format!(
                 "Checkout 已完成，但无法清理事务目录: {}",
                 self.root.display()
             )
-        })?;
-        sync_directory(&parent)
+        })
     }
 }
 
@@ -1014,7 +1074,7 @@ fn remove_destination_before_restore(
 
     if let Some(file) = expected_file {
         ensure!(
-            !staged.exists(),
+            !transaction_entry_exists(staged, "Checkout staged 文件")?,
             "Checkout 发布前目标路径被外部创建，拒绝覆盖: {}",
             destination.display()
         );
@@ -1050,7 +1110,7 @@ fn remove_published_absent_destination(
     expected_file: Option<&FileNode>,
 ) -> Result<()> {
     // staged 仍存在说明 publish rename 尚未执行；此时同名工作区路径不属于事务，必须保留。
-    if fs::symlink_metadata(staged).is_ok() {
+    if transaction_entry_exists(staged, "Checkout staged 文件")? {
         return Ok(());
     }
     let Some(expected_file) = expected_file else {
@@ -1073,6 +1133,42 @@ fn remove_published_absent_destination(
         Err(error) => Err(error)
             .with_context(|| format!("回滚时无法检查已发布文件: {}", destination.display())),
     }
+}
+
+fn transaction_entry_exists(path: &Path, kind: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("无法检查{kind}: {}", path.display())),
+    }
+}
+
+fn ensure_safe_worktree_parent_directories(
+    repository_root: &Path,
+    logical_path: &str,
+) -> Result<()> {
+    let components: Vec<&str> = logical_path.split('/').collect();
+    let mut current = repository_root.to_path_buf();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "Checkout 恢复路径祖先不是普通目录: {}",
+                current.display()
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                create_dir_all_durable(&current).with_context(|| {
+                    format!("无法创建 Checkout 恢复目录: {}", current.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("无法检查 Checkout 恢复目录: {}", current.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handle_checkout_failure(
@@ -1182,7 +1278,7 @@ pub(super) fn recover_transaction(
 fn reset_transaction_subdirectory(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            fs::remove_dir_all(path)
+            remove_dir_all_durable(path)
                 .with_context(|| format!("无法清理 Checkout 事务子目录: {}", path.display()))?;
         }
         Ok(_) => bail!("Checkout 事务子路径不是普通目录: {}", path.display()),
@@ -1192,9 +1288,8 @@ fn reset_transaction_subdirectory(path: &Path) -> Result<()> {
                 .with_context(|| format!("无法检查 Checkout 事务子目录: {}", path.display()));
         }
     }
-    fs::create_dir(path)
-        .with_context(|| format!("无法重建 Checkout 事务子目录: {}", path.display()))?;
-    sync_parent(path)
+    create_dir_all_durable(path)
+        .with_context(|| format!("无法重建 Checkout 事务子目录: {}", path.display()))
 }
 
 fn read_transaction_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -1202,14 +1297,4 @@ fn read_transaction_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T>
         .with_context(|| format!("无法读取 Checkout 事务 JSON: {}", path.display()))?;
     serde_json::from_slice(&bytes)
         .with_context(|| format!("Checkout 事务 JSON 格式无效: {}", path.display()))
-}
-
-fn write_transaction_marker(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = File::create(path)
-        .with_context(|| format!("无法创建 Checkout 事务标记: {}", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("无法写入 Checkout 事务标记: {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("无法同步 Checkout 事务标记: {}", path.display()))?;
-    sync_parent(path)
 }

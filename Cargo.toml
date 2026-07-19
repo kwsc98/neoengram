@@ -7,6 +7,12 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.97.0"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/kwsc98/synapse"
+homepage = "https://github.com/kwsc98/synapse"
+documentation = "https://docs.rs/neoengram"
+readme = "README.md"
+keywords = ["version-control", "datasets", "machine-learning", "content-addressed"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 anyhow = "1.0"

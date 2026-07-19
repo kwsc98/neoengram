@@ -36,7 +36,9 @@ struct FsckReport {
 
 fn check_repository(repository: &Repository) -> Result<FsckReport> {
     // fsck 会扫描多个相互引用的文件。持有仓库写锁可阻止并发 add/commit/checkout
-    // 在扫描中途发布新状态，从而让本次检查对应一个一致的本地元数据快照。
+    // 在扫描中途发布新状态；对象锁同时冻结 add 的对象发布，保证对象枚举也对应同一个
+    // 固定集合。锁顺序与 add/gc 一致：objects -> state。
+    let _object_lock = repository.acquire_object_lock()?;
     let _lock = repository.acquire_write_lock()?;
     repository.verify_metadata_store_integrity()?;
     let index = repository.read_index()?;

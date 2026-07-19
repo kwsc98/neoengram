@@ -52,8 +52,8 @@ NeoEngram 的目标是管理至少 100 TB 的逻辑 payload。这个目标首先
 - `durability_barrier`：成功后，此前发布的对象才允许被元数据引用。
 
 当前 `local::objects` 中的 `LooseObjectStore` 每个对象保存为一个本地文件。add、commit、
-checkout、fsck 和 gc 已经通过 `ObjectStore` 工作，不再拼接 `objects/<hash>` 路径。add 与 gc
-共享独立 advisory lock，覆盖对象发布到 index 可见以及 mark/sweep 的整个竞态窗口。
+checkout、fsck 和 gc 已经通过 `ObjectStore` 工作，不再拼接 `objects/<hash>` 路径。add、gc
+和 fsck 通过独立 advisory object lock 协调对象发布、校验和回收窗口。
 
 完整文件缓存是可淘汰派生数据，不属于 ObjectStore。checkout/rm journal 协调工作区 rename
 和元数据提交，也不属于 MetadataStore。
@@ -61,6 +61,53 @@ checkout、fsck 和 gc 已经通过 `ObjectStore` 工作，不再拼接 `objects
 `checkout --read-only DIR` 是一次性工作区快照导出：它不会更新当前 index、HEAD 或仓库工作区，
 而是在目标目录的同一文件系统中完成临时物化、Chunk 校验、只读权限设置和 no-replace rename。
 当前实现要求目标目录位于仓库之外，并使用普通 Unix 权限而不是 mount/ACL 隔离。
+
+## 本地并发与一致视图
+
+仓库级锁只能按 `objects.lock -> worktree.lock -> write.lock` 的顺序获取。调用方可以跳过不需要
+的层级，但不能逆序补锁。所有锁都使用 fail-fast `try_lock`；锁冲突返回可重试错误，不等待
+另一个进程。共享 worktree lock 不改写锁文件中的诊断内容，独占持有者可以记录操作信息。
+
+| 操作 | object lock | worktree lock | state/write lock |
+| --- | --- | --- | --- |
+| `add` | 协调对象发布 | 共享 | 发布 Index 时短暂持有 |
+| `status` / `diff` | 无 | 共享 | 无；读取后复核版本 |
+| checkout / `rm` / 工作区 restore / `recover` | 无 | 独占 | 持有 |
+| `commit` / `restore --staged` | 无 | 无 | 持有 |
+| `gc` / `fsck` | 先持有 | 无 | 后持有 |
+
+Index 读取必须同时返回 `IndexVersion`。`add` 从该固定版本计算完整候选结果，最后使用 expected
+version 提交；版本不匹配时整个 Index 更新失败并提示重试，禁止末尾重读后把两个时刻的数据
+拼接。`status` 和 `diff` 在形成输出后复核实际使用过的 IndexVersion 与 HEAD/main，任何一个变化
+都拒绝输出混合报告。revision 与内容摘要共同防止 A -> B -> A 的 ABA 误判。
+
+工作区锁只协调 NeoEngram 进程，不能阻止编辑器、训练任务或其他程序直接修改文件。因此所有
+破坏性发布点仍必须重新检查叶子文件类型和内容，不能把早期预检当作最终授权。
+
+## 工作区事务发布与恢复
+
+checkout/rm 先在 `transactions/.neoengram-tmp-{operation}-*` 中构造完整 draft。journal、staging、
+backup 和每一级新建目录都必须同步；随后通过同父目录 no-replace rename 发布为正式事务目录，
+并同步 `transactions/`。第一次工作区 mutation 只能发生在这个 durability barrier 之后。
+
+未完成事务扫描只识别正式 checkout/rm 目录。保留前缀的 draft 不能进入 replay；下一次独占
+工作区写操作或 `recover` 可以在验证目录名和边界后清理它。开发期不兼容的旧 journal 必须
+明确拒绝，不能猜测其阶段。该协议不改变对象、Index 或 SQLite schema，也不提升仓库格式版本。
+事务完成或成功回滚后，正式目录先以 no-replace rename 原子退役为受忽略的 cleanup draft 并
+同步 `transactions/`，之后才递归删除；因此权限错误最多留下可重试 draft，不会先删坏正式
+journal。Unix 在 rename/create 后同步目录，Windows 的文件发布与 rename 使用 write-through。
+
+rename 原语在 syscall 成功后、同步源/目标目录前立即把移动结果告知调用方。这样后续 fsync
+失败时，rm 回滚仍知道唯一备份已经产生。回滚逐项检查 original/backup：只在所有文件均已恢复
+或证明从未移动后删除事务；两者同时存在、同时缺失或再次同步失败都保留 journal 并要求
+`recover`。checkout 回滚重建父目录时逐组件拒绝符号链接，并同步每一级新祖先。checkout/rm
+凡已证明目标应为空的正向发布或回滚恢复都使用 no-replace rename；外部进程抢先创建路径时
+保留新内容与事务，不把 advisory lock 当成覆盖授权。
+
+工作区 restore 先在目标同目录组装、Hash、flush 并同步 payload，发布前再次读取叶子。目标已与
+Index 一致时跳过；内容不同且没有 `--force` 时拒绝；只有已观察到的普通文件可在 `--force` 下
+原子替换。最终检查时不存在的目标始终使用 no-replace rename，目录、符号链接和特殊文件始终
+拒绝。
 
 ## 发布顺序
 

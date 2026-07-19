@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fs,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -10,7 +9,7 @@ use neoengram_core::{FileNode, Index, Tree};
 use tempfile::NamedTempFile;
 
 use crate::local::{
-    fs::durable::{create_dir_all_durable, replace_durable, sync_directory},
+    fs::durable::{create_dir_all_durable, rename_noreplace_durable, replace_durable},
     objects::ObjectSpec,
     repository::Repository,
     worktree::{file_matches_node, repository_scope, safe_leaf_metadata, workspace_path},
@@ -46,16 +45,19 @@ fn restore_paths(
     staged: bool,
     force: bool,
 ) -> Result<Vec<String>> {
-    repository.ensure_no_unfinished_transactions()?;
-    let _lock = repository.acquire_write_lock()?;
     let scopes = requested_paths
         .iter()
         .map(|path| repository_scope(path, current_dir, repository.root()))
         .collect::<Result<Vec<_>>>()?;
 
     if staged {
+        let _lock = repository.acquire_write_lock()?;
         restore_index(repository, &scopes)
     } else {
+        // Worktree operations always acquire worktree before state. This excludes checkout/rm
+        // while allowing add/status/diff to share a stable read view.
+        let _worktree_lock = repository.acquire_worktree_lock()?;
+        let _lock = repository.acquire_write_lock()?;
         restore_worktree(repository, &scopes, force)
     }
 }
@@ -152,7 +154,7 @@ fn restore_worktree(
                 continue;
             }
         }
-        materialize_file(repository, file, &destination)?;
+        materialize_file(repository, file, &destination, force)?;
     }
     Ok(files.into_iter().map(|file| file.path).collect())
 }
@@ -165,7 +167,12 @@ fn current_head_tree(repository: &Repository) -> Result<Tree> {
     repository.read_tree(&commit.tree_hash)
 }
 
-fn materialize_file(repository: &Repository, file: &FileNode, destination: &Path) -> Result<()> {
+fn materialize_file(
+    repository: &Repository,
+    file: &FileNode,
+    destination: &Path,
+    force: bool,
+) -> Result<()> {
     let parent = destination.parent().context("restore 目标路径没有父目录")?;
     create_dir_all_durable(parent)?;
     let mut temporary = NamedTempFile::new_in(parent)
@@ -194,27 +201,41 @@ fn materialize_file(repository: &Repository, file: &FileNode, destination: &Path
         .sync_all()
         .with_context(|| format!("无法同步 restore 临时文件: {}", file.path))?;
 
-    // The destination was checked above.  Replace it with one filesystem rename after the
-    // complete payload has been verified and synced; a crash therefore leaves either the old or
-    // the new regular file, never a half-written file.
-    match fs::symlink_metadata(destination) {
-        Ok(metadata) => {
+    super::test_pause_at("restore-before-publish");
+
+    // The worktree may be changed by a process that does not participate in NeoEngram's advisory
+    // locks. Revalidate at the publication point and use no-replace for an absent destination so
+    // a file created after this check is never silently overwritten.
+    match safe_leaf_metadata(repository.root(), &file.path)? {
+        Some(metadata) => {
             ensure!(
                 metadata.is_file() && !metadata.file_type().is_symlink(),
                 "restore 目标不是普通文件: {}",
                 destination.display()
             );
+
+            if file_matches_node(destination, file)? {
+                return Ok(());
+            }
+            ensure!(
+                force,
+                "工作区文件包含未暂存修改: {}；使用 `--force`",
+                file.path
+            );
+
+            let staged_path = temporary.into_temp_path();
+            replace_durable(&staged_path, destination)?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("无法检查 restore 目标: {}", destination.display()));
+        None => {
+            super::test_pause_at("restore-before-noreplace");
+            let staged_path = temporary.into_temp_path();
+            rename_noreplace_durable(&staged_path, destination).with_context(|| {
+                format!(
+                    "restore 目标在发布前被创建，拒绝覆盖: {}",
+                    destination.display()
+                )
+            })?;
         }
-    }
-    let staged_path = temporary.into_temp_path();
-    replace_durable(&staged_path, destination)?;
-    if let Some(parent) = destination.parent() {
-        sync_directory(parent)?;
     }
     Ok(())
 }

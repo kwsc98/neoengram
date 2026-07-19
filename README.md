@@ -23,33 +23,51 @@
 
 ## 快速开始
 
-项目使用 Rust Edition 2021，需要 Rust 1.97.0 或更高版本。
+项目使用 Rust Edition 2021，需要 Rust 1.97.0 或更高版本。从源码以 release profile 安装二进制：
 
 ```bash
-cargo build -p neoengram
-
-./target/debug/neoengram init .
-./target/debug/neoengram add README.md
-./target/debug/neoengram status
-./target/debug/neoengram commit -m "add project readme"
-./target/debug/neoengram diff --staged
-./target/debug/neoengram log
-./target/debug/neoengram checkout HEAD
-./target/debug/neoengram checkout HEAD --read-only ../model-snapshot
-./target/debug/neoengram gc --dry-run
-./target/debug/neoengram fsck
+git clone https://github.com/kwsc98/synapse.git
+cd synapse
+cargo install --locked --path crates/neoengram
+cd ..
 ```
 
-`init` 默认使用 SQLite 行式元数据后端：
+请在独立的数据目录中试用，不要在 NeoEngram 源码 checkout 内直接执行 `neoengram init .`。
+NeoEngram 不读取 `.gitignore`，源码 checkout 中的 `.git/`、`target/` 和其他构建产物会成为扫描
+候选。创建一个独立 demo 仓库：
 
 ```bash
-./target/debug/neoengram init .
+mkdir neoengram-demo
+cd neoengram-demo
 ```
 
-需要 JSON 元数据后端时可以显式选择：
+在这个目录中创建 `.neoengramignore`，例如内容如下：
+
+```text
+.git/
+target/
+*.tmp
+cache/
+```
+
+然后完成一次本地工作流：
 
 ```bash
-./target/debug/neoengram init --metadata-store json .
+neoengram init .
+neoengram add -A .
+neoengram status
+neoengram diff --staged
+neoengram commit -m "initial snapshot"
+neoengram log
+neoengram checkout HEAD --read-only ../model-snapshot
+neoengram gc --dry-run
+neoengram fsck
+```
+
+`init` 默认使用 SQLite 行式元数据后端。需要 JSON 元数据后端时可以显式选择：
+
+```bash
+neoengram init --metadata-store json .
 ```
 
 后端选择会写入仓库配置，后续命令会自动使用已记录的后端；在仓库根目录再次运行 `init` 也会
@@ -59,15 +77,17 @@ cargo build -p neoengram
 no-replace rename 原子发布为 `.neoengram`。进程在发布前退出只会留下未发布的临时目录，
 `add` 和 `status` 会忽略这些未发布目录，不会把半初始化状态当成仓库。
 
-也可以直接通过 Cargo 运行：
+## 使用边界
 
-```bash
-cargo run -p neoengram -- init .
-cargo run -p neoengram -- add README.md
-cargo run -p neoengram -- status
-cargo run -p neoengram -- commit -m "add project readme"
-cargo run -p neoengram -- checkout HEAD
-```
+- 当前仓库格式仍处开发期，可能直接演进且不提供旧格式迁移。升级前应先保留可验证的独立备份。
+- `.neoengram` 与工作区位于同一个本地故障域；NeoEngram 不能替代离线或异机备份，也不应保存
+  重要数据的唯一副本。
+- `rm`、`restore --force` 和 `checkout --force` 会按请求修改工作区。虽然命令间使用 fail-fast
+  锁和恢复事务，运行期间仍应避免让其他程序改写同一路径。
+- 常规本地工作流在 Linux、macOS 和 Windows CI 上测试；`checkout --read-only` 只在 Unix/macOS
+  可用。它依赖普通权限位，不是 mount、ACL、容器或 root 级安全边界。
+- 当前模型不保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。提交前应确认这些语义不会
+  影响数据的可复现性。
 
 ## 本地布局
 
@@ -81,6 +101,7 @@ cargo run -p neoengram -- checkout HEAD
 └── metadata/
     ├── repository.json              # 仓库格式版本与后端选择
     ├── write.lock                   # 按需创建的仓库写锁；文件可跨进程保留
+    ├── worktree.lock                # 工作区共享/独占 advisory lock
     ├── objects.lock                 # add 与 gc 共享的对象发布/回收锁
     ├── metadata.sqlite3             # SQLite 后端的行式元数据数据库（选择 SQLite 时）
     ├── index.json                   # JSON 后端的完整暂存快照
@@ -94,10 +115,15 @@ cargo run -p neoengram -- checkout HEAD
 
 提交采用追加式发布顺序：先验证全部 Chunk 并完成 ObjectStore durability barrier，再写并同步
 Manifest、Tree 和 Commit，最后通过 CAS 原子更新当前分支引用或 direct HEAD。JSON 后端会
-同步引用的父目录；SQLite 后端通过 `synchronous=FULL` 的 WAL 事务提交。`add`、`rm`、
-`commit`、`checkout`、`recover` 和 `fsck` 共享 OS advisory 写锁；`add` 与 `gc` 另外共享
-`objects.lock`，覆盖对象发布和回收的整个窗口。进程被 kill 后内核自动释放锁，遗留的普通
-锁文件不会形成永久死锁。
+同步引用的父目录；SQLite 后端通过 `synchronous=FULL` 的 WAL 事务提交。
+
+本地并发协调使用三层 OS advisory lock，固定获取顺序为
+`objects.lock -> worktree.lock -> write.lock`。`add`、`status` 和 `diff` 共享工作区锁；checkout、
+rm、工作区 restore 和 recover 独占工作区锁；commit 与 `restore --staged` 只锁元数据状态；
+gc/fsck 先协调对象再锁状态。
+锁冲突会立即失败并要求重试。`add` 最终以最初读取的 `IndexVersion` 做 CAS，status/diff 在
+输出前复核实际使用的 IndexVersion 与 HEAD/main，因此并发的 index-only 更新不会被覆盖或
+混入报告。进程被 kill 后内核会释放锁；磁盘上保留的 lock 文件本身不会形成永久死锁。
 
 仓库路径固定为 UTF-8 NFC 和 `/` 分隔，并拒绝 Windows drive prefix、设备保留名、非法
 字符、大小写碰撞、文件/目录前缀碰撞，以及 `.neoengram` 和 `.neoengram-tmp-*` 保留组件。
@@ -133,13 +159,13 @@ barrier。Repository 和命令层都不再依赖对象物理路径。
 暂存新增或修改：
 
 ```bash
-./target/debug/neoengram add path/to/data
+neoengram add path/to/data
 ```
 
 同时暂存删除；PATH 省略时范围是当前目录，从仓库根目录执行时才覆盖整个仓库：
 
 ```bash
-./target/debug/neoengram add -A [PATH]
+neoengram add -A [PATH]
 ```
 
 仓库根目录下可用 `.neoengramignore` 排除不应纳入版本控制的输入。`add` 和 `status`
@@ -153,72 +179,75 @@ checkpoints/
 ```
 
 忽略规则只影响未跟踪文件的发现；已经在 index 中跟踪的文件仍会被 `add -A` 更新或删除。
-该文件只从仓库根目录读取，当前不支持嵌套 `.neoengramignore`。
+该文件只从仓库根目录读取，当前不支持嵌套 `.neoengramignore`，也不会自动合并 `.gitignore`。
 
 安全地删除已跟踪内容，或只从 index 取消跟踪：
 
 ```bash
-./target/debug/neoengram rm path/to/data
-./target/debug/neoengram rm --cached path/to/data
+neoengram rm path/to/data
+neoengram rm --cached path/to/data
 ```
 
 `rm` 默认拒绝丢弃未暂存修改；只有显式 `--force` 才覆盖该保护。提交前可检查 staged、
 unstaged 和 untracked 三类状态，并查看线性历史或具体快照：
 
 ```bash
-./target/debug/neoengram status
-./target/debug/neoengram log --max-count 20
-./target/debug/neoengram show HEAD
+neoengram status
+neoengram log --max-count 20
+neoengram show HEAD
 ```
 
 查看文件级和 Chunk 级变化（不会把未跟踪文件自动加入比较）：
 
 ```bash
-./target/debug/neoengram diff
-./target/debug/neoengram diff --staged
-./target/debug/neoengram diff HEAD <COMMIT_ID>
-./target/debug/neoengram diff --stat
+neoengram diff
+neoengram diff --staged
+neoengram diff HEAD <COMMIT_ID>
+neoengram diff --stat
 ```
 
 撤销暂存或恢复工作区文件：
 
 ```bash
-./target/debug/neoengram restore --staged path/to/data
-./target/debug/neoengram restore path/to/data
-./target/debug/neoengram restore --force path/to/data
+neoengram restore --staged path/to/data
+neoengram restore path/to/data
+neoengram restore --force path/to/data
 ```
+
+工作区 restore 在最终发布前会重新检查目标。没有 `--force` 时拒绝覆盖检查后出现或变化的内容；
+`--force` 也只替换已经观察到的普通文件，始终拒绝目录、符号链接和特殊文件。
 
 ## 恢复版本
 
 重新物化当前 HEAD，不改变 attached/detached 状态：
 
 ```bash
-./target/debug/neoengram checkout
+neoengram checkout
 ```
 
 恢复指定 Commit：
 
 ```bash
-./target/debug/neoengram checkout <COMMIT_ID>
+neoengram checkout <COMMIT_ID>
 ```
 
 完整 Commit ID 会进入 detached HEAD；重新附着到默认分支：
 
 ```bash
-./target/debug/neoengram checkout main
+neoengram checkout main
 ```
 
 Checkout 默认拒绝丢弃 staged 修改、已跟踪文件修改或冲突的未跟踪文件。明确需要覆盖时：
 
 ```bash
-./target/debug/neoengram checkout <COMMIT_ID> --force
+neoengram checkout <COMMIT_ID> --force
 ```
 
 将一个 Commit 导出到仓库之外的独立只读目录（不会改变当前工作区、index 或 HEAD）：
 
 ```bash
-./target/debug/neoengram checkout HEAD --read-only ../model-snapshot
-./target/debug/neoengram checkout <COMMIT_ID> --read-only ../older-model-snapshot
+neoengram checkout HEAD --read-only ../model-snapshot
+neoengram checkout <COMMIT_ID> --read-only ../older-model-snapshot
 ```
 
 目标目录必须尚不存在，且其父级不能是符号链接或位于当前仓库内。Unix/macOS 上导出的普通
@@ -239,27 +268,30 @@ Checkout 只处理发生变化的文件，校验其 Chunk 后组装完整文件�
 
 ```bash
 # 验证目标后继续原 checkout，或完成/回滚 rm 的安全状态
-./target/debug/neoengram recover
+neoengram recover
 
 # 回到事务开始前；已经提交 index 的 rm 不允许反向 abort
-./target/debug/neoengram recover --abort
+neoengram recover --abort
 ```
 
-恢复 journal 会记录每个逻辑路径、原 index、切换前后的 HEAD 和发布阶段。回滚只移除能按
-FileNode 验证为事务产物的文件，遇到用户后来创建或修改的未知内容会停止，不会递归删除。
+checkout/rm 会先在 `transactions/.neoengram-tmp-{operation}-*` 构造并同步完整 draft，再以
+no-replace rename 发布正式 journal 并同步事务目录；工作区第一次 mutation 只会发生在正式
+journal 持久化之后。recover 只恢复正式事务，并清理经过验证的遗留 draft。回滚只移除能按
+FileNode 验证为事务产物的文件，遇到用户后来创建或修改的未知内容会停止，不会递归删除；
+原路径与备份都缺失等不可恢复状态会保留事务并报错。
 
 ## 完整性检查
 
 ```bash
-./target/debug/neoengram fsck
+neoengram fsck
 ```
 
 清理不再被当前 index 或任何已保存 Tree 引用的 Chunk payload。不可变 Manifest、Tree 和
 Commit 元数据不会被删除，因此 detached/不可达历史目前仍会保留其对象：
 
 ```bash
-./target/debug/neoengram gc --dry-run
-./target/debug/neoengram gc
+neoengram gc --dry-run
+neoengram gc
 ```
 
 `fsck` 校验全部 refs、Commit/Tree 内容 ID、单父历史无环、路径规则、Chunk 引用大小，

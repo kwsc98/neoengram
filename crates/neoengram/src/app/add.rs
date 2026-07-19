@@ -10,6 +10,7 @@ use futures::{stream, StreamExt};
 use neoengram_core::{FileNode, Index};
 
 use crate::local::{
+    metadata::IndexVersion,
     repository::Repository,
     worktree::{chunk_file, collect_files_with_ignore, validate_input_path, IgnoreRules},
 };
@@ -27,19 +28,19 @@ pub(crate) async fn execute_with_options(path: PathBuf, all: bool) -> Result<()>
 
     let current_dir = std::env::current_dir().context("无法确定当前工作目录")?;
     let repository = Repository::discover(&current_dir)?;
-    repository.ensure_no_unfinished_transactions()?;
-    let ignore_rules = IgnoreRules::load(repository.root())?;
-    let tracked_paths: BTreeSet<String> = repository
-        .read_index()?
-        .files
-        .into_iter()
-        .map(|file| file.path)
-        .collect();
-    // Object publication must be serialized with GC for the whole add operation.  The normal
-    // repository write lock is deliberately held only while publishing the index, so without
-    // this separate lock a concurrent GC could remove a freshly published object in the gap
-    // before the index starts referring to it.
+    // Lock order is fixed repository-wide: objects -> worktree -> write. Object publication is
+    // serialized with GC for the whole add operation, while the shared worktree guard prevents
+    // checkout/rm/restore from changing bytes during traversal and chunking.
     let _object_lock = repository.acquire_object_lock()?;
+    let _worktree_lock = repository.acquire_worktree_shared_lock()?;
+    let initial_index = repository.read_index_versioned()?;
+    let ignore_rules = IgnoreRules::load(repository.root())?;
+    let tracked_paths: BTreeSet<String> = initial_index
+        .index()
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect();
 
     // WalkDir、canonicalize 和文件元数据查询都是同步系统调用。大型数据集可能包含
     // 数百万个目录项，因此把完整遍历移到阻塞线程池，避免卡住 Tokio 调度线程。
@@ -96,17 +97,25 @@ pub(crate) async fn execute_with_options(path: PathBuf, all: bool) -> Result<()>
     for result in results {
         staged_files.push(result?);
     }
+    super::test_pause_at("add-before-index-publish");
 
     if staged_files.is_empty() && !all {
         return Ok(());
     }
 
-    // 文件切块完成后才短暂持有仓库写锁。锁覆盖 index 的 read-modify-write，防止
-    // 两个并发 add 都从旧 index 开始并互相覆盖；临时文件 + rename 则防止半写 JSON。
+    // 文件切块完成后才短暂持有仓库 state/write 锁，并以扫描前捕获的版本做 CAS。
+    // 因此并发的 index-only restore 会让 add 明确失败，而不会被末尾重读混入结果。
     let index_repository = repository.clone();
     let deletion_scope = all.then_some(repository_scope);
+    let (index, expected_version) = initial_index.into_parts();
     tokio::task::spawn_blocking(move || {
-        update_index(&index_repository, staged_files, deletion_scope.as_deref())
+        update_index(
+            &index_repository,
+            index,
+            &expected_version,
+            staged_files,
+            deletion_scope.as_deref(),
+        )
     })
     .await
     .context("index 更新任务异常终止")??;
@@ -115,11 +124,12 @@ pub(crate) async fn execute_with_options(path: PathBuf, all: bool) -> Result<()>
 
 fn update_index(
     repository: &Repository,
+    index: Index,
+    expected_version: &IndexVersion,
     staged_files: Vec<FileNode>,
     deletion_scope: Option<&str>,
 ) -> Result<()> {
     let _lock = repository.acquire_write_lock()?;
-    let index = repository.read_index()?;
     let mut files: BTreeMap<String, FileNode> = index
         .files
         .into_iter()
@@ -139,10 +149,16 @@ fn update_index(
         files.insert(file.path.clone(), file);
     }
 
-    repository.write_index(&Index {
-        format_version: index.format_version,
-        files: files.into_values().collect(),
-    })
+    repository
+        .write_index_if_version(
+            &Index {
+                format_version: index.format_version,
+                files: files.into_values().collect(),
+            },
+            expected_version,
+        )
+        .context("Index 在 add 扫描期间发生变化，请重试")?;
+    Ok(())
 }
 
 fn path_is_in_scope(path: &str, scope: &str) -> bool {

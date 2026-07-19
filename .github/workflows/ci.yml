@@ -32,6 +32,43 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
+      - name: Build publishable crate archives
+        run: |
+          cargo package --locked --no-verify -p neoengram-core
+          cargo package --locked --no-verify -p neoengram
+      - name: Verify package documentation and licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_package() {
+            local crate="$1"
+            local version
+            version="$(cargo pkgid -p "$crate" | sed 's/.*#//')"
+            local archive="target/package/${crate}-${version}.crate"
+            if [[ ! -f "$archive" ]]; then
+              echo "missing archive $archive" >&2
+              return 1
+            fi
+
+            local prefix
+            prefix="$(basename "${archive%.crate}")"
+
+            for required in README.md LICENSE-MIT LICENSE-APACHE; do
+              if ! tar -tzf "$archive" | grep -Fx "$prefix/$required" >/dev/null; then
+                echo "$archive is missing $required" >&2
+                return 1
+              fi
+            done
+
+            cmp -s "crates/$crate/LICENSE-MIT" LICENSE-MIT
+            cmp -s "crates/$crate/LICENSE-APACHE" LICENSE-APACHE
+            tar -xOf "$archive" "$prefix/LICENSE-MIT" | cmp -s - LICENSE-MIT
+            tar -xOf "$archive" "$prefix/LICENSE-APACHE" | cmp -s - LICENSE-APACHE
+          }
+
+          check_package neoengram-core
+          check_package neoengram
 
   test:
     name: Test (${{ matrix.os }})

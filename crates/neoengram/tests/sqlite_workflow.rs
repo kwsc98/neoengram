@@ -102,6 +102,43 @@ fn sqlite_backend_recovers_checkout_after_detached_head_publish() -> TestResult 
     Ok(())
 }
 
+#[test]
+fn sqlite_backend_recovers_rm_on_both_sides_of_index_publication() -> TestResult {
+    let repository = tempfile::tempdir()?;
+    run_success(repository.path(), &["init", "."])?;
+    let model = repository.path().join("model.bin");
+    fs::write(&model, b"model")?;
+    run_success(repository.path(), &["add", "model.bin"])?;
+    run_success(repository.path(), &["commit", "-m", "base"])?;
+
+    let before_index = command(repository.path())
+        .env("NEOENGRAM_TEST_CRASH_AT", "rm-after-backup")
+        .args(["rm", "model.bin"])
+        .output()?;
+    assert!(!before_index.status.success());
+    assert!(!model.exists());
+    assert_eq!(transaction_count(repository.path())?, 1);
+    run_success(repository.path(), &["recover", "--abort"])?;
+    assert_eq!(fs::read(&model)?, b"model");
+    assert_eq!(transaction_count(repository.path())?, 0);
+
+    let after_index = command(repository.path())
+        .env("NEOENGRAM_TEST_CRASH_AT", "rm-after-index")
+        .args(["rm", "model.bin"])
+        .output()?;
+    assert!(!after_index.status.success());
+    assert!(!model.exists());
+    assert_eq!(transaction_count(repository.path())?, 1);
+    let refused_abort = command(repository.path())
+        .args(["recover", "--abort"])
+        .output()?;
+    assert!(!refused_abort.status.success());
+    run_success(repository.path(), &["recover"])?;
+    assert!(!model.exists());
+    assert_eq!(transaction_count(repository.path())?, 0);
+    Ok(())
+}
+
 fn crash_checkout(repository: &Path, target: &str, point: &str) -> TestResult {
     let output = command(repository)
         .env("NEOENGRAM_TEST_CRASH_AT", point)

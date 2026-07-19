@@ -15,10 +15,11 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use fastcdc::v2020::StreamCDC;
-use neoengram_core::{Chunk, FileNode};
+use neoengram_core::{Chunk, FileNode, Index};
 use walkdir::WalkDir;
 
 use crate::local::{
+    metadata::{HeadState, IndexVersion},
     repository::{is_neoengram_dir_name, Repository},
     worktree::{lenient_leaf_metadata, workspace_path},
 };
@@ -45,7 +46,7 @@ pub(crate) async fn execute(staged: bool, targets: Vec<String>, stat_only: bool)
 
     let current_dir = std::env::current_dir().context("无法确定当前工作目录")?;
     let repository = Repository::discover(&current_dir)?;
-    repository.ensure_no_unfinished_transactions()?;
+    let _worktree_lock = repository.acquire_worktree_shared_lock()?;
     let task_repository = repository.clone();
     let report =
         tokio::task::spawn_blocking(move || build_report(&task_repository, staged, &targets))
@@ -198,10 +199,14 @@ pub(crate) fn build_report(
     if staged && targets.len() == 2 {
         bail!("`--staged` 不能与两个 Commit TARGET 同时使用");
     }
+    repository.ensure_no_unfinished_transactions()?;
+
+    let mut observed_index_version = None;
+    let mut observed_targets = Vec::new();
 
     let (left_label, right_label, left, right) = match (staged, targets) {
         (false, []) => {
-            let index = repository.read_index()?;
+            let index = read_observed_index(repository, &mut observed_index_version)?;
             let tracked_paths = snapshot_paths(&index.files);
             let worktree = read_worktree_snapshot(repository, Some(&tracked_paths))?;
             (
@@ -212,29 +217,36 @@ pub(crate) fn build_report(
             )
         }
         (true, []) => {
-            let index = repository.read_index()?;
-            let head = read_head_snapshot(repository)?;
+            let index = read_observed_index(repository, &mut observed_index_version)?;
+            let (head, observation) = read_head_snapshot(repository)?;
+            observed_targets.push(observation);
             ("HEAD".to_owned(), "index".to_owned(), head, index.files)
         }
         (false, [target]) => {
-            let (label, commit_files) = read_commit_snapshot(repository, target)?;
+            let (label, commit_files, observation) = read_commit_snapshot(repository, target)?;
+            observed_targets.extend(observation);
             // `diff <COMMIT>` includes files staged since that Commit as well as files present in
             // the Commit, so use the union of the target and current index paths as the worktree
             // comparison scope.  Untracked paths still remain outside this Git-like diff.
-            let index = repository.read_index()?;
+            let index = read_observed_index(repository, &mut observed_index_version)?;
             let mut tracked_paths = snapshot_paths(&commit_files);
             tracked_paths.extend(index.files.iter().map(|file| file.path.clone()));
             let worktree = read_worktree_snapshot(repository, Some(&tracked_paths))?;
             (label, "worktree".to_owned(), commit_files, worktree)
         }
         (true, [target]) => {
-            let (label, commit_files) = read_commit_snapshot(repository, target)?;
-            let index = repository.read_index()?;
+            let (label, commit_files, observation) = read_commit_snapshot(repository, target)?;
+            observed_targets.extend(observation);
+            let index = read_observed_index(repository, &mut observed_index_version)?;
             (label, "index".to_owned(), commit_files, index.files)
         }
         (false, [left_target, right_target]) => {
-            let (left_label, left) = read_commit_snapshot(repository, left_target)?;
-            let (right_label, right) = read_commit_snapshot(repository, right_target)?;
+            let (left_label, left, left_observation) =
+                read_commit_snapshot(repository, left_target)?;
+            observed_targets.extend(left_observation);
+            let (right_label, right, right_observation) =
+                read_commit_snapshot(repository, right_target)?;
+            observed_targets.extend(right_observation);
             (left_label, right_label, left, right)
         }
         (false, _) => bail!("diff 最多接受两个 Commit TARGET"),
@@ -246,6 +258,16 @@ pub(crate) fn build_report(
     for entry in &entries {
         summary.add_entry(entry)?;
     }
+    repository.ensure_no_unfinished_transactions()?;
+    if let Some(expected) = observed_index_version {
+        ensure!(
+            repository.current_index_version()? == expected,
+            "Index 在 diff 扫描期间发生变化，请重试"
+        );
+    }
+    for observation in &observed_targets {
+        observation.ensure_unchanged(repository)?;
+    }
     Ok(DiffReport {
         left_label,
         right_label,
@@ -254,34 +276,94 @@ pub(crate) fn build_report(
     })
 }
 
-fn read_head_snapshot(repository: &Repository) -> Result<Vec<FileNode>> {
-    let Some(commit_id) = repository.current_commit_id()? else {
-        return Ok(Vec::new());
-    };
-    let commit = repository.read_commit(&commit_id)?;
-    Ok(repository.read_tree(&commit.tree_hash)?.files)
+fn read_observed_index(
+    repository: &Repository,
+    observed: &mut Option<IndexVersion>,
+) -> Result<Index> {
+    let versioned = repository.read_index_versioned()?;
+    *observed = Some(versioned.version().clone());
+    Ok(versioned.into_parts().0)
 }
 
-fn read_commit_snapshot(repository: &Repository, target: &str) -> Result<(String, Vec<FileNode>)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedHead {
+    state: HeadState,
+    commit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetObservation {
+    Head(ObservedHead),
+    Main(ObservedHead),
+}
+
+impl TargetObservation {
+    fn ensure_unchanged(&self, repository: &Repository) -> Result<()> {
+        let (expected, label, actual) = match self {
+            Self::Head(expected) => (expected, "HEAD", repository.current_head()?),
+            Self::Main(expected) => (expected, "main", repository.default_branch_head()?),
+        };
+        ensure!(
+            actual.state() == &expected.state
+                && actual.commit_id() == expected.commit_id.as_deref(),
+            "{label} 在 diff 扫描期间发生变化，请重试"
+        );
+        Ok(())
+    }
+}
+
+fn observe_head(repository: &Repository, main: bool) -> Result<ObservedHead> {
+    let head = if main {
+        repository.default_branch_head()?
+    } else {
+        repository.current_head()?
+    };
+    Ok(ObservedHead {
+        state: head.state().clone(),
+        commit_id: head.commit_id().map(str::to_owned),
+    })
+}
+
+fn read_head_snapshot(repository: &Repository) -> Result<(Vec<FileNode>, TargetObservation)> {
+    let observed = observe_head(repository, false)?;
+    let files = match observed.commit_id.as_deref() {
+        Some(commit_id) => {
+            let commit = repository.read_commit(commit_id)?;
+            repository.read_tree(&commit.tree_hash)?.files
+        }
+        None => Vec::new(),
+    };
+    Ok((files, TargetObservation::Head(observed)))
+}
+
+fn read_commit_snapshot(
+    repository: &Repository,
+    target: &str,
+) -> Result<(String, Vec<FileNode>, Option<TargetObservation>)> {
     let target = target.trim();
     ensure!(!target.is_empty(), "diff TARGET 不能为空");
     let label = target.to_owned();
-    let id = if target.eq_ignore_ascii_case("HEAD") {
-        repository
-            .current_commit_id()?
-            .context("仓库还没有 Commit；请先运行 `neoengram commit`")?
+    let (id, observation) = if target.eq_ignore_ascii_case("HEAD") {
+        let observed = observe_head(repository, false)?;
+        let id = observed
+            .commit_id
+            .clone()
+            .context("仓库还没有 Commit；请先运行 `neoengram commit`")?;
+        (id, Some(TargetObservation::Head(observed)))
     } else if target == "main" {
-        repository
-            .default_branch_head()?
-            .commit_id()
+        let observed = observe_head(repository, true)?;
+        let id = observed
+            .commit_id
+            .as_deref()
             .context("main 分支还没有 Commit；请先运行 `neoengram commit`")?
-            .to_owned()
+            .to_owned();
+        (id, Some(TargetObservation::Main(observed)))
     } else {
-        target.to_owned()
+        (target.to_owned(), None)
     };
     let commit = repository.read_commit(&id)?;
     let files = repository.read_tree(&commit.tree_hash)?.files;
-    Ok((label, files))
+    Ok((label, files, observation))
 }
 
 /// Compare two complete, sorted file snapshots.  This is used for index/HEAD and Commit/Commit

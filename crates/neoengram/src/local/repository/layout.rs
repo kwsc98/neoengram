@@ -7,7 +7,10 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 
 use crate::local::{
-    fs::durable::{ensure_directory, ensure_or_create_directory, publish_json_if_absent},
+    fs::durable::{
+        ensure_directory, ensure_or_create_directory, is_transaction_draft_name,
+        publish_json_if_absent, remove_dir_all_durable,
+    },
     metadata::{open_metadata_store, MetadataStoreKind},
     objects::{open_object_store, ObjectStore, ObjectStoreKind},
 };
@@ -169,6 +172,18 @@ impl Repository {
                 "Checkout 事务项不是普通目录: {}",
                 entry.path().display()
             );
+            if is_transaction_draft_name(&entry.file_name())? {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .with_context(|| format!("事务目录名不是有效 UTF-8: {}", entry.path().display()))?;
+            ensure!(
+                valid_published_transaction_name(name),
+                "transactions 目录包含未知项目: {}",
+                entry.path().display()
+            );
             transactions.push(entry.path());
         }
         transactions.sort_unstable();
@@ -185,6 +200,29 @@ impl Repository {
                 .map_or_else(|| self.transactions_dir(), PathBuf::from)
                 .display()
         );
+        Ok(())
+    }
+
+    /// 调用方必须持有排他的工作区或恢复锁，避免删除另一个进程仍在构造的 draft。
+    pub(crate) fn cleanup_transaction_drafts(&self) -> Result<()> {
+        for entry in fs::read_dir(self.transactions_dir())
+            .with_context(|| format!("无法读取事务目录: {}", self.transactions_dir().display()))?
+        {
+            let entry = entry.context("无法读取事务 draft 项")?;
+            if !is_transaction_draft_name(&entry.file_name())? {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("无法检查事务 draft: {}", path.display()))?;
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "事务 draft 不是普通目录: {}",
+                path.display()
+            );
+            remove_dir_all_durable(&path)
+                .with_context(|| format!("无法清理遗留事务 draft: {}", path.display()))?;
+        }
         Ok(())
     }
 
@@ -260,4 +298,11 @@ impl Repository {
         self.metadata_store.validate_layout()?;
         Ok(())
     }
+}
+
+fn valid_published_transaction_name(name: &str) -> bool {
+    ["checkout-", "rm-"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty())
+    })
 }

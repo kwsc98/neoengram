@@ -1,6 +1,7 @@
 //! 本地存储初始化、JSON 元数据与工作区恢复流程共用的 crash-safe 文件原语。
 
 use std::{
+    ffi::OsStr,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -11,6 +12,11 @@ use serde::{de::DeserializeOwned, Serialize};
 use tempfile::Builder;
 
 use crate::local::STORAGE_TEMP_FILE_PREFIX;
+
+pub(crate) const TRANSACTION_DRAFT_PREFIX: &str = ".neoengram-tmp-";
+pub(crate) const CHECKOUT_TRANSACTION_DRAFT_PREFIX: &str = ".neoengram-tmp-checkout-";
+pub(crate) const RM_TRANSACTION_DRAFT_PREFIX: &str = ".neoengram-tmp-rm-";
+const DIRECTORY_CLEANUP_DRAFT_PREFIX: &str = ".neoengram-tmp-cleanup-";
 
 pub(crate) fn ensure_or_create_directory(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
@@ -35,11 +41,11 @@ pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
     let mut missing = Vec::<PathBuf>::new();
     let mut current = path.to_path_buf();
     loop {
-        match fs::metadata(&current) {
+        match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 ensure!(
-                    metadata.is_dir(),
-                    "仓库目录的祖先不是目录: {}",
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "仓库目录的祖先不是普通目录: {}",
                     current.display()
                 );
                 break;
@@ -62,14 +68,11 @@ pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
         match fs::create_dir(&directory) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&directory)
+                    .with_context(|| format!("无法检查并发创建的目录: {}", directory.display()))?;
                 ensure!(
-                    fs::metadata(&directory)
-                        .with_context(|| format!(
-                            "无法检查并发创建的目录: {}",
-                            directory.display()
-                        ))?
-                        .is_dir(),
-                    "并发创建的仓库路径不是目录: {}",
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "并发创建的仓库路径不是普通目录: {}",
                     directory.display()
                 );
             }
@@ -89,6 +92,116 @@ pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+pub(crate) fn remove_dir_all_durable(path: &Path) -> Result<()> {
+    remove_dir_all_durable_with(path, |retired| fs::remove_dir_all(retired))
+}
+
+fn remove_dir_all_durable_with<R>(path: &Path, remove: R) -> Result<()>
+where
+    R: FnOnce(&Path) -> io::Result<()>,
+{
+    let parent = path
+        .parent()
+        .with_context(|| format!("待删除目录没有父级: {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("无法检查待删除目录: {}", path.display()))?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "待删除路径不是普通目录: {}",
+        path.display()
+    );
+
+    // Recursive removal can fail after deleting the journal that makes a formal transaction
+    // recoverable. Retire the complete directory under an ignored draft name first, and make that
+    // rename durable. A partial cleanup then leaves only a retryable draft, never a damaged formal
+    // transaction that blocks the repository forever.
+    let prefix = directory_cleanup_prefix(path);
+    let reservation = Builder::new()
+        .prefix(prefix)
+        .tempdir_in(parent)
+        .with_context(|| format!("无法保留目录清理名称: {}", parent.display()))?;
+    let retired = reservation.path().to_path_buf();
+    reservation
+        .close()
+        .with_context(|| format!("无法释放目录清理名称: {}", retired.display()))?;
+    rename_noreplace(path, &retired).with_context(|| {
+        format!(
+            "无法把待删除目录转为清理 draft: {} -> {}",
+            path.display(),
+            retired.display()
+        )
+    })?;
+    sync_directory(parent)?;
+
+    remove(&retired).with_context(|| format!("无法删除目录: {}", retired.display()))?;
+    sync_directory(parent)
+}
+
+fn directory_cleanup_prefix(path: &Path) -> &'static str {
+    let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    if name.starts_with("checkout-") || name.starts_with(CHECKOUT_TRANSACTION_DRAFT_PREFIX) {
+        CHECKOUT_TRANSACTION_DRAFT_PREFIX
+    } else if name.starts_with("rm-") || name.starts_with(RM_TRANSACTION_DRAFT_PREFIX) {
+        RM_TRANSACTION_DRAFT_PREFIX
+    } else {
+        DIRECTORY_CLEANUP_DRAFT_PREFIX
+    }
+}
+
+pub(crate) fn is_transaction_draft_name(name: &OsStr) -> Result<bool> {
+    let Some(name) = name.to_str() else {
+        return Ok(false);
+    };
+    if !name.starts_with(TRANSACTION_DRAFT_PREFIX) {
+        return Ok(false);
+    }
+    let suffix = name
+        .strip_prefix(CHECKOUT_TRANSACTION_DRAFT_PREFIX)
+        .or_else(|| name.strip_prefix(RM_TRANSACTION_DRAFT_PREFIX));
+    ensure!(
+        suffix.is_some_and(|suffix| !suffix.is_empty()),
+        "事务 draft 使用了未知或无效的保留名称: {name}"
+    );
+    Ok(true)
+}
+
+pub(crate) fn publish_transaction_draft(draft: &Path, operation: &str) -> Result<PathBuf> {
+    publish_transaction_draft_observed(draft, operation, |_| {})
+}
+
+pub(crate) fn publish_transaction_draft_observed<F>(
+    draft: &Path,
+    operation: &str,
+    on_published: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce(&Path),
+{
+    let expected_prefix = match operation {
+        "checkout" => CHECKOUT_TRANSACTION_DRAFT_PREFIX,
+        "rm" => RM_TRANSACTION_DRAFT_PREFIX,
+        _ => anyhow::bail!("不支持的事务 draft 类型: {operation}"),
+    };
+    let parent = draft
+        .parent()
+        .with_context(|| format!("事务 draft 没有父目录: {}", draft.display()))?;
+    let draft_name = draft
+        .file_name()
+        .and_then(OsStr::to_str)
+        .with_context(|| format!("事务 draft 名称不是有效 UTF-8: {}", draft.display()))?;
+    let suffix = draft_name
+        .strip_prefix(expected_prefix)
+        .with_context(|| format!("事务 draft 名称不匹配 {operation}: {}", draft.display()))?;
+    ensure!(!suffix.is_empty(), "事务 draft 名称缺少唯一后缀");
+    let destination = parent.join(format!("{operation}-{suffix}"));
+
+    sync_directory(draft)?;
+    rename_noreplace(draft, &destination)?;
+    on_published(&destination);
+    sync_directory(parent)?;
+    Ok(destination)
 }
 
 pub(crate) fn ensure_directory(path: &Path, kind: &str) -> Result<()> {
@@ -166,13 +279,26 @@ pub(crate) fn publish_bytes_if_absent(path: &Path, bytes: &[u8]) -> Result<bool>
         .sync_all()
         .with_context(|| format!("无法同步临时文件: {}", path.display()))?;
 
-    match temporary.persist_noclobber(path) {
-        Ok(_) => {
-            sync_directory(parent)?;
-            Ok(true)
+    let (temporary_file, temporary_path) = temporary
+        .keep()
+        .map_err(|error| error.error)
+        .with_context(|| format!("无法保留待发布临时文件: {}", path.display()))?;
+    let publication = rename_noreplace_durable(&temporary_path, path);
+    drop(temporary_file);
+    match publication {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists) =>
+        {
+            let _ = fs::remove_file(&temporary_path);
+            Ok(false)
         }
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error.error).with_context(|| format!("无法发布文件: {}", path.display())),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_path);
+            Err(error).with_context(|| format!("无法发布文件: {}", path.display()))
+        }
     }
 }
 
@@ -195,34 +321,65 @@ pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .as_file()
         .sync_all()
         .with_context(|| format!("无法同步临时文件: {}", path.display()))?;
-    temporary
-        .persist(path)
-        .map(|_| ())
+    let (temporary_file, temporary_path) = temporary
+        .keep()
         .map_err(|error| error.error)
-        .with_context(|| format!("无法原子替换文件: {}", path.display()))?;
-    sync_directory(parent)
+        .with_context(|| format!("无法保留待替换临时文件: {}", path.display()))?;
+    let publication = replace_durable(&temporary_path, path);
+    drop(temporary_file);
+    if publication.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    publication
 }
 
-pub(crate) fn rename_durable(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn rename_durable_observed<F>(
+    source: &Path,
+    destination: &Path,
+    on_renamed: F,
+) -> Result<()>
+where
+    F: FnOnce(),
+{
+    rename_durable_observed_with_sync(source, destination, on_renamed, sync_directory)
+}
+
+fn rename_durable_observed_with_sync<F, S>(
+    source: &Path,
+    destination: &Path,
+    on_renamed: F,
+    mut sync: S,
+) -> Result<()>
+where
+    F: FnOnce(),
+    S: FnMut(&Path) -> Result<()>,
+{
     let source_parent = source
         .parent()
         .with_context(|| format!("源路径没有父目录: {}", source.display()))?;
     let destination_parent = destination
         .parent()
         .with_context(|| format!("目标路径没有父目录: {}", destination.display()))?;
-    fs::rename(source, destination).with_context(|| {
+    rename_noreplace(source, destination).with_context(|| {
         format!(
             "无法重命名 {} -> {}",
             source.display(),
             destination.display()
         )
     })?;
+    on_renamed();
+    if cfg!(debug_assertions)
+        && std::env::var("NEOENGRAM_TEST_FAIL_AFTER_RENAME")
+            .is_ok_and(|configured| configured == "before-sync")
+    {
+        anyhow::bail!("injected failure after rename and before directory sync");
+    }
     if source_parent == destination_parent {
-        sync_directory(destination_parent)?;
+        sync(destination_parent)?;
     } else {
         // Persist the new name before the old name's removal to avoid a no-name crash window.
-        sync_directory(destination_parent)?;
-        sync_directory(source_parent)?;
+        sync(destination_parent)?;
+        sync(source_parent)?;
     }
     Ok(())
 }
@@ -372,7 +529,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
 fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
-    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
     let source_wide = source
         .as_os_str()
@@ -390,9 +547,16 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
         "重命名路径包含 NUL"
     );
 
-    // flags=0 不包含 MOVEFILE_REPLACE_EXISTING，目标存在时 Windows 会原子失败。
+    // 不包含 MOVEFILE_REPLACE_EXISTING，目标存在时 Windows 会原子失败。WRITE_THROUGH 让
+    // transaction publish 和工作区 rename 在返回前跨过 Windows 的持久化屏障。
     // SAFETY: 两个缓冲区都以 NUL 结尾、已拒绝内嵌 NUL，并在只读调用期间保持存活。
-    let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), 0) };
+    let moved = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
     if moved == 0 {
         return Err(io::Error::last_os_error()).with_context(|| {
             format!(
@@ -442,11 +606,87 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{cell::Cell, fs};
 
     use anyhow::Result;
 
-    use super::{rename_noreplace_durable, replace_durable};
+    use super::{
+        is_transaction_draft_name, publish_bytes_if_absent, remove_dir_all_durable,
+        remove_dir_all_durable_with, rename_durable_observed_with_sync, rename_noreplace_durable,
+        replace_durable, write_bytes_atomic,
+    };
+
+    #[test]
+    fn atomic_file_publication_preserves_noclobber_and_replaces_intentionally() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let destination = temporary.path().join("state");
+
+        assert!(publish_bytes_if_absent(&destination, b"first")?);
+        assert!(!publish_bytes_if_absent(&destination, b"ignored")?);
+        assert_eq!(fs::read(&destination)?, b"first");
+
+        write_bytes_atomic(&destination, b"second")?;
+        assert_eq!(fs::read(&destination)?, b"second");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_recursive_cleanup_leaves_an_ignored_retryable_draft() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let transaction = temporary.path().join("checkout-test");
+        fs::create_dir(&transaction)?;
+        fs::write(transaction.join("OPERATION"), b"checkout\n")?;
+        fs::write(transaction.join("journal.json"), b"{}\n")?;
+
+        let result = remove_dir_all_durable_with(&transaction, |retired| {
+            fs::remove_file(retired.join("OPERATION"))?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected partial recursive cleanup",
+            ))
+        });
+        assert!(result.is_err());
+        assert!(!transaction.exists());
+
+        let entries = fs::read_dir(temporary.path())?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(entries.len(), 1);
+        let retired = entries[0].path();
+        assert!(is_transaction_draft_name(&entries[0].file_name())?);
+        assert_eq!(fs::read(retired.join("journal.json"))?, b"{}\n");
+
+        remove_dir_all_durable(&retired)?;
+        assert_eq!(fs::read_dir(temporary.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rename_observer_runs_after_rename_and_before_sync_error() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, b"payload")?;
+        let observed = Cell::new(false);
+
+        let result = rename_durable_observed_with_sync(
+            &source,
+            &destination,
+            || {
+                assert!(!source.exists());
+                assert_eq!(fs::read(&destination).expect("renamed payload"), b"payload");
+                observed.set(true);
+            },
+            |_| {
+                assert!(observed.get());
+                anyhow::bail!("injected directory sync failure")
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(observed.get());
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination)?, b"payload");
+        Ok(())
+    }
 
     #[test]
     fn noreplace_rename_preserves_an_existing_directory() -> Result<()> {

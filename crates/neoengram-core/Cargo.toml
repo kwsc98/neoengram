@@ -6,6 +6,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+documentation = "https://docs.rs/neoengram-core"
+keywords.workspace = true
+categories = ["data-structures", "development-tools"]
 
 [dependencies]
 serde.workspace = true
