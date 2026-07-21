@@ -5,4 +5,6 @@
 
 pub mod models;
 
-pub use models::{Chunk, Commit, FileNode, Index, Tree, INDEX_FORMAT_VERSION};
+pub use models::{
+    Chunk, Commit, DirectoryEntry, DirectoryEntryKind, FileNode, Index, Tree, INDEX_FORMAT_VERSION,
+};

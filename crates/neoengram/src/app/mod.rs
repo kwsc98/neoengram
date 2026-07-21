@@ -6,6 +6,7 @@ pub(crate) mod fsck;
 pub(crate) mod gc;
 pub(crate) mod init;
 pub(crate) mod log;
+pub(crate) mod mount;
 pub(crate) mod recover;
 pub(crate) mod restore;
 pub(crate) mod rm;

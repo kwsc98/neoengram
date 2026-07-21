@@ -1,15 +1,17 @@
+use std::collections::HashSet;
+
 use anyhow::{bail, ensure, Context, Result};
-use neoengram_core::{Commit, FileNode, Index, Tree};
+use neoengram_core::{Commit, DirectoryEntry, DirectoryEntryKind, FileNode, Index, Tree};
 
 use crate::local::metadata::{
-    FileRecord, FileSetReader, HeadCas, HeadState, IndexVersion, MetadataReader, Page, PageRequest,
-    ReferenceCas, StoredReference,
+    DirectoryWriter, FileRecord, FileSetReader, HeadCas, HeadState, IndexVersion, MetadataReader,
+    MetadataStore, Page, PageRequest, ReferenceCas, StoredReference,
 };
 
 use super::{
     validation::{
-        typed_json_hash, validate_commit, validate_files, validate_hash, validate_index,
-        validate_sorted_ids, COMMIT_HASH_DOMAIN,
+        commit_content_id, validate_commit, validate_files, validate_hash, validate_index,
+        validate_sorted_ids,
     },
     Repository, DEFAULT_HEAD_REFERENCE,
 };
@@ -126,30 +128,121 @@ impl Repository {
         transaction.commit()
     }
 
+    #[cfg(test)]
     pub(crate) fn store_tree(&self, tree: &Tree) -> Result<String> {
         validate_files(&tree.files)?;
-        let mut writer = self.metadata_store.begin_tree_write()?;
+        let mut builder = DirectoryDagBuilder::new(self.metadata_store.as_ref())?;
         for file in &tree.files {
             let mut chunks = file.chunks.iter().cloned().map(Ok);
             let manifest = self
                 .metadata_store
                 .put_manifest(file.total_size, &mut chunks)?;
             let record = FileRecord::from_manifest(file.path.clone(), file.total_size, &manifest);
-            writer.append_file(&record)?;
+            builder.push(record)?;
         }
-        writer.finish()
+        builder.finish()
+    }
+
+    /// Publishes the current ordered Index as a Directory DAG without materializing a flat Tree.
+    pub(crate) fn store_index_tree(&self, require_nonempty: bool) -> Result<(String, u64)> {
+        let index = self.metadata_store.read_index()?;
+        ensure!(
+            index.format_version() == neoengram_core::INDEX_FORMAT_VERSION,
+            "不支持的 index 格式版本 {}",
+            index.format_version()
+        );
+        let mut request = PageRequest::first(STORAGE_SCAN_PAGE_SIZE)?;
+        let mut page = index.scan_files(None, &request)?;
+        if require_nonempty {
+            ensure!(
+                !page.items.is_empty(),
+                "没有可提交的文件；请先运行 `neoengram add`"
+            );
+        }
+
+        let mut builder = DirectoryDagBuilder::new(self.metadata_store.as_ref())?;
+        let mut file_count = 0_u64;
+        loop {
+            ensure!(
+                page.items.len() <= request.limit_usize()?,
+                "元数据后端返回的 Index 分页超过请求上限"
+            );
+            for record in page.items {
+                self.verify_index_manifest(&record)?;
+                builder.push(record)?;
+                file_count = file_count.checked_add(1).context("Index 文件数量溢出")?;
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            ensure!(
+                request.after.as_deref() != Some(next.as_str()),
+                "元数据后端返回了不前进的 Index 分页游标"
+            );
+            request.after = Some(next);
+            page = index.scan_files(None, &request)?;
+        }
+        self.object_store.durability_barrier()?;
+        Ok((builder.finish()?, file_count))
+    }
+
+    fn verify_index_manifest(&self, record: &FileRecord) -> Result<()> {
+        self.validate_logical_path(&record.path)?;
+        let manifest = self.open_manifest(&record.manifest_id)?;
+        ensure!(
+            manifest.total_size() == record.total_size,
+            "Index 文件 {} 的大小与 Manifest 不一致",
+            record.path
+        );
+        ensure!(
+            manifest.chunk_count() == record.chunk_count,
+            "Index 文件 {} 的 Chunk 数量与 Manifest 不一致",
+            record.path
+        );
+        let mut request = PageRequest::first(STORAGE_SCAN_PAGE_SIZE)?;
+        let mut chunk_count = 0_u64;
+        loop {
+            let page = manifest.scan_chunks(&request)?;
+            ensure!(
+                page.items.len() <= request.limit_usize()?,
+                "元数据后端返回的 Manifest 分页超过请求上限"
+            );
+            for chunk in page.items {
+                self.object_store
+                    .verify(&crate::local::objects::ObjectSpec::new(
+                        chunk.hash, chunk.size,
+                    )?)?;
+                chunk_count = chunk_count.checked_add(1).context("Chunk 数量溢出")?;
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            ensure!(
+                request.after.as_deref() != Some(next.as_str()),
+                "元数据后端返回了不前进的 Manifest 分页游标"
+            );
+            request.after = Some(next);
+        }
+        ensure!(
+            chunk_count == record.chunk_count,
+            "Index 文件 {} 的 Chunk 数量与 Manifest 分页不一致",
+            record.path
+        );
+        Ok(())
     }
 
     pub(crate) fn read_tree(&self, id: &str) -> Result<Tree> {
         validate_hash(id, "Tree")?;
-        let reader = self
+        let root = self
             .metadata_store
-            .open_tree(id)?
-            .with_context(|| format!("Tree 不存在: {id}"))?;
-        let expected_file_count = reader.file_count();
-        let tree = Tree {
-            files: collect_file_set(self.metadata_store.as_ref(), reader.as_ref())?,
-        };
+            .open_directory(id)?
+            .with_context(|| format!("根 Directory 不存在: {id}"))?;
+        let expected_file_count = root.file_count();
+        drop(root);
+        let mut files = Vec::new();
+        let mut visiting = HashSet::new();
+        self.collect_directory(id, "", &mut visiting, &mut files)?;
+        let tree = Tree { files };
         ensure!(
             u64::try_from(tree.files.len()).context("Tree 文件数量超出 u64")?
                 == expected_file_count,
@@ -160,11 +253,209 @@ impl Repository {
         Ok(tree)
     }
 
+    #[cfg(test)]
     pub(crate) fn list_tree_ids(&self) -> Result<Vec<String>> {
         let snapshot = self.metadata_store.snapshot()?;
-        let ids = collect_pages(|request| snapshot.scan_tree_ids(request))?;
-        validate_sorted_ids(&ids, "Tree")?;
+        let ids = collect_pages(|request| snapshot.scan_directory_ids(request))?;
+        validate_sorted_ids(&ids, "Directory")?;
         Ok(ids)
+    }
+
+    pub(crate) fn list_manifest_ids(&self) -> Result<Vec<String>> {
+        let snapshot = self.metadata_store.snapshot()?;
+        let ids = collect_pages(|request| snapshot.scan_manifest_ids(request))?;
+        validate_sorted_ids(&ids, "Manifest")?;
+        Ok(ids)
+    }
+
+    pub(crate) fn visit_index_files(
+        &self,
+        mut visitor: impl FnMut(&FileRecord) -> Result<()>,
+    ) -> Result<u64> {
+        let reader = self.metadata_store.read_index()?;
+        let mut request = PageRequest::first(STORAGE_SCAN_PAGE_SIZE)?;
+        let mut count = 0_u64;
+        loop {
+            let page = reader.scan_files(None, &request)?;
+            ensure!(
+                page.items.len() <= request.limit_usize()?,
+                "元数据后端返回的 Index 分页超过请求上限"
+            );
+            for record in &page.items {
+                visitor(record)?;
+                count = count.checked_add(1).context("Index 文件数量溢出")?;
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            ensure!(
+                request.after.as_deref() != Some(next.as_str()),
+                "元数据后端返回了不前进的 Index 分页游标"
+            );
+            request.after = Some(next);
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn visit_manifest_chunks(
+        &self,
+        manifest_id: &str,
+        expected_size: u64,
+        mut visitor: impl FnMut(&neoengram_core::Chunk) -> Result<()>,
+    ) -> Result<u64> {
+        let reader = self.open_manifest(manifest_id)?;
+        ensure!(
+            reader.total_size() == expected_size,
+            "Manifest {manifest_id} 的逻辑大小与引用不一致"
+        );
+        let expected_count = reader.chunk_count();
+        let mut request = PageRequest::first(STORAGE_SCAN_PAGE_SIZE)?;
+        let mut count = 0_u64;
+        loop {
+            let page = reader.scan_chunks(&request)?;
+            ensure!(
+                page.items.len() <= request.limit_usize()?,
+                "元数据后端返回的 Manifest 分页超过请求上限"
+            );
+            for chunk in &page.items {
+                visitor(chunk)?;
+                count = count.checked_add(1).context("Manifest Chunk 数量溢出")?;
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            ensure!(
+                request.after.as_deref() != Some(next.as_str()),
+                "元数据后端返回了不前进的 Manifest 分页游标"
+            );
+            request.after = Some(next);
+        }
+        ensure!(
+            count == expected_count,
+            "Manifest {manifest_id} 的 Chunk 数量与 header 不一致"
+        );
+        Ok(count)
+    }
+
+    /// Walks unique Directory objects depth-first while retaining only one page per active depth.
+    pub(crate) fn visit_directory_dag(
+        &self,
+        roots: &[String],
+        mut visitor: impl FnMut(&DirectoryEntry) -> Result<()>,
+    ) -> Result<usize> {
+        let mut visited = HashSet::new();
+        let mut active = HashSet::new();
+        for root in roots {
+            if !visited.insert(root.clone()) {
+                continue;
+            }
+            active.insert(root.clone());
+            let mut stack = vec![DirectoryWalkFrame::open(self, root.clone())?];
+            while let Some(frame) = stack.last_mut() {
+                if let Some(entry) = frame.entries.pop_front() {
+                    frame.seen = frame
+                        .seen
+                        .checked_add(1)
+                        .context("Directory 子项数量溢出")?;
+                    visitor(&entry)?;
+                    if entry.kind == DirectoryEntryKind::Directory {
+                        ensure!(
+                            !active.contains(&entry.target_id),
+                            "Directory DAG 包含环: {}",
+                            entry.target_id
+                        );
+                        if visited.insert(entry.target_id.clone()) {
+                            active.insert(entry.target_id.clone());
+                            stack.push(DirectoryWalkFrame::open(self, entry.target_id)?);
+                        }
+                    }
+                    continue;
+                }
+                if let Some(next) = frame.next.take() {
+                    frame.load_page(self, Some(next))?;
+                    continue;
+                }
+                ensure!(
+                    frame.seen == frame.expected_entries,
+                    "Directory {} 的子项数量与 header 不一致",
+                    frame.id
+                );
+                let finished = stack.pop().expect("Directory walker 栈非空");
+                active.remove(&finished.id);
+            }
+        }
+        Ok(visited.len())
+    }
+
+    pub(crate) fn open_directory(
+        &self,
+        id: &str,
+    ) -> Result<Box<dyn crate::local::metadata::DirectoryReader + '_>> {
+        validate_hash(id, "Directory")?;
+        self.metadata_store
+            .open_directory(id)?
+            .with_context(|| format!("Directory 不存在: {id}"))
+    }
+
+    pub(crate) fn open_manifest(
+        &self,
+        id: &str,
+    ) -> Result<Box<dyn crate::local::metadata::ManifestReader + '_>> {
+        validate_hash(id, "Manifest")?;
+        self.metadata_store
+            .open_manifest(id)?
+            .with_context(|| format!("Manifest 不存在: {id}"))
+    }
+
+    fn collect_directory(
+        &self,
+        id: &str,
+        prefix: &str,
+        visiting: &mut HashSet<String>,
+        files: &mut Vec<FileNode>,
+    ) -> Result<()> {
+        ensure!(visiting.insert(id.to_owned()), "Directory DAG 包含环: {id}");
+        let reader = self.open_directory(id)?;
+        let entries = collect_pages(|request| reader.scan_entries(request))?;
+        ensure!(
+            u64::try_from(entries.len()).context("Directory 子项数量超出 u64")?
+                == reader.entry_count(),
+            "Directory 子项数量与 header 不一致: {id}"
+        );
+        drop(reader);
+        for entry in entries {
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{prefix}/{}", entry.name)
+            };
+            match entry.kind {
+                DirectoryEntryKind::File => {
+                    let manifest = self.open_manifest(&entry.target_id)?;
+                    ensure!(
+                        manifest.total_size() == entry.total_size,
+                        "Directory 文件大小与 Manifest 不一致: {path}"
+                    );
+                    let chunk_count = manifest.chunk_count();
+                    let chunks = collect_pages(|request| manifest.scan_chunks(request))?;
+                    ensure!(
+                        u64::try_from(chunks.len()).context("Chunk 数量超出 u64")? == chunk_count,
+                        "Manifest Chunk 数量与 header 不一致: {}",
+                        entry.target_id
+                    );
+                    files.push(FileNode {
+                        path,
+                        total_size: entry.total_size,
+                        chunks,
+                    });
+                }
+                DirectoryEntryKind::Directory => {
+                    self.collect_directory(&entry.target_id, &path, visiting, files)?;
+                }
+            }
+        }
+        visiting.remove(id);
+        Ok(())
     }
 
     pub(crate) fn store_commit(&self, commit: &Commit) -> Result<String> {
@@ -307,10 +598,160 @@ fn read_commit<R: MetadataReader + ?Sized>(reader: &R, id: &str) -> Result<Commi
         .with_context(|| format!("Commit 不存在: {id}"))?;
     validate_commit(&commit)?;
     ensure!(
-        typed_json_hash(COMMIT_HASH_DOMAIN, &commit)? == id,
+        commit_content_id(&commit)? == id,
         "Commit 内容与其 ID 不匹配: {id}"
     );
     Ok(commit)
+}
+
+struct DirectoryFrame<'a> {
+    name_in_parent: Option<String>,
+    next_ordinal: u64,
+    writer: Box<dyn DirectoryWriter + 'a>,
+}
+
+struct DirectoryWalkFrame {
+    id: String,
+    entries: std::collections::VecDeque<DirectoryEntry>,
+    next: Option<String>,
+    seen: u64,
+    expected_entries: u64,
+}
+
+impl DirectoryWalkFrame {
+    fn open(repository: &Repository, id: String) -> Result<Self> {
+        let expected_entries = repository.open_directory(&id)?.entry_count();
+        let mut frame = Self {
+            id,
+            entries: std::collections::VecDeque::new(),
+            next: None,
+            seen: 0,
+            expected_entries,
+        };
+        frame.load_page(repository, None)?;
+        Ok(frame)
+    }
+
+    fn load_page(&mut self, repository: &Repository, after: Option<String>) -> Result<()> {
+        let request = PageRequest::new(after.clone(), STORAGE_SCAN_PAGE_SIZE)?;
+        let page = repository
+            .open_directory(&self.id)?
+            .scan_entries(&request)?;
+        ensure!(
+            page.items.len() <= request.limit_usize()?,
+            "元数据后端返回的 Directory 分页超过请求上限"
+        );
+        if let Some(next) = &page.next {
+            let next = next.parse::<u64>().context("Directory cursor 无效")?;
+            if let Some(after) = after.as_deref() {
+                let after = after.parse::<u64>().context("Directory cursor 无效")?;
+                ensure!(next > after, "元数据后端返回了不前进的 Directory 分页游标");
+            }
+        }
+        self.entries = page.items.into();
+        self.next = page.next;
+        Ok(())
+    }
+}
+
+struct DirectoryDagBuilder<'a> {
+    store: &'a dyn MetadataStore,
+    frames: Vec<DirectoryFrame<'a>>,
+    open_path: Vec<String>,
+    previous_path: Option<String>,
+}
+
+impl<'a> DirectoryDagBuilder<'a> {
+    fn new(store: &'a dyn MetadataStore) -> Result<Self> {
+        Ok(Self {
+            store,
+            frames: vec![DirectoryFrame {
+                name_in_parent: None,
+                next_ordinal: 0,
+                writer: store.begin_directory_write()?,
+            }],
+            open_path: Vec::new(),
+            previous_path: None,
+        })
+    }
+
+    fn push(&mut self, record: FileRecord) -> Result<()> {
+        if let Some(previous) = &self.previous_path {
+            ensure!(
+                previous.as_str() < record.path.as_str(),
+                "Index 文件路径必须严格升序且唯一: {}",
+                record.path
+            );
+            ensure!(
+                !record.path.starts_with(&format!("{previous}/")),
+                "Tree 同时包含文件及其子路径: {}",
+                record.path
+            );
+        }
+        let components = record.path.split('/').collect::<Vec<_>>();
+        let (file_name, directory_components) =
+            components.split_last().context("Tree 路径不能为空")?;
+        let common = self
+            .open_path
+            .iter()
+            .zip(directory_components.iter())
+            .take_while(|(left, right)| left.as_str() == **right)
+            .count();
+        while self.open_path.len() > common {
+            self.close_child()?;
+        }
+        for component in &directory_components[common..] {
+            self.frames.push(DirectoryFrame {
+                name_in_parent: Some((*component).to_owned()),
+                next_ordinal: 0,
+                writer: self.store.begin_directory_write()?,
+            });
+            self.open_path.push((*component).to_owned());
+        }
+        let current = self.frames.last_mut().context("Directory 构造栈为空")?;
+        let ordinal = current.next_ordinal;
+        current.writer.append_entry(&DirectoryEntry {
+            ordinal,
+            name: (*file_name).to_owned(),
+            kind: DirectoryEntryKind::File,
+            target_id: record.manifest_id,
+            total_size: record.total_size,
+        })?;
+        current.next_ordinal = ordinal.checked_add(1).context("Directory ordinal 溢出")?;
+        self.previous_path = Some(record.path);
+        Ok(())
+    }
+
+    fn close_child(&mut self) -> Result<()> {
+        ensure!(self.frames.len() > 1, "不能提前关闭根 Directory");
+        let frame = self.frames.pop().context("Directory 构造栈为空")?;
+        let directory = frame.writer.finish()?;
+        let name = frame.name_in_parent.context("子 Directory 缺少父级名称")?;
+        self.open_path.pop().context("Directory 路径栈为空")?;
+        let parent = self.frames.last_mut().context("Directory 父级不存在")?;
+        let ordinal = parent.next_ordinal;
+        parent.writer.append_entry(&DirectoryEntry {
+            ordinal,
+            name,
+            kind: DirectoryEntryKind::Directory,
+            target_id: directory.id,
+            total_size: 0,
+        })?;
+        parent.next_ordinal = ordinal.checked_add(1).context("Directory ordinal 溢出")?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<String> {
+        while self.frames.len() > 1 {
+            self.close_child()?;
+        }
+        self.frames
+            .pop()
+            .context("根 Directory 不存在")?
+            .writer
+            .finish()
+            .map(|directory| directory.id)
+    }
 }
 
 fn collect_file_set<R: MetadataReader + ?Sized>(
@@ -384,38 +825,61 @@ mod tests {
     use anyhow::Result;
     use neoengram_core::{FileNode, Index};
 
-    use crate::local::metadata::MetadataStoreKind;
-
     use super::Repository;
 
     #[test]
-    fn stale_versioned_index_write_is_rejected_by_both_backends() -> Result<()> {
+    fn stale_versioned_index_write_is_rejected() -> Result<()> {
         let temporary = tempfile::tempdir()?;
-        for (directory, kind) in [
-            ("json", MetadataStoreKind::Json),
-            ("sqlite", MetadataStoreKind::Sqlite),
-        ] {
-            let root = temporary.path().join(directory);
-            fs::create_dir(&root)?;
-            let repository = Repository::open_or_with_metadata_store(root, Some(kind))?;
-            repository.initialize_layout()?;
+        let root = temporary.path().join("sqlite");
+        fs::create_dir(&root)?;
+        let repository = Repository::open_or_create(root)?;
+        repository.initialize_layout()?;
 
-            let initial = repository.read_index_versioned()?;
-            repository.write_index_if_version(initial.index(), initial.version())?;
+        let initial = repository.read_index_versioned()?;
+        repository.write_index_if_version(initial.index(), initial.version())?;
 
-            let stale_update = Index {
-                format_version: initial.index().format_version,
-                files: vec![FileNode {
-                    path: "stale.bin".to_owned(),
+        let stale_update = Index {
+            format_version: initial.index().format_version,
+            files: vec![FileNode {
+                path: "stale.bin".to_owned(),
+                total_size: 0,
+                chunks: Vec::new(),
+            }],
+        };
+        assert!(repository
+            .write_index_if_version(&stale_update, initial.version())
+            .is_err());
+        assert_eq!(repository.read_index()?, *initial.index());
+        Ok(())
+    }
+
+    #[test]
+    fn identical_subdirectories_are_deduplicated() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("sqlite-dag");
+        fs::create_dir(&root)?;
+        let repository = Repository::open_or_create(root)?;
+        repository.initialize_layout()?;
+        let tree = neoengram_core::Tree {
+            files: vec![
+                FileNode {
+                    path: "left/file".to_owned(),
                     total_size: 0,
                     chunks: Vec::new(),
-                }],
-            };
-            assert!(repository
-                .write_index_if_version(&stale_update, initial.version())
-                .is_err());
-            assert_eq!(repository.read_index()?, *initial.index());
-        }
+                },
+                FileNode {
+                    path: "right/file".to_owned(),
+                    total_size: 0,
+                    chunks: Vec::new(),
+                },
+            ],
+        };
+        let root_id = repository.store_tree(&tree)?;
+        let root = repository.open_directory(&root_id)?;
+        let left = root.get_entry("left")?.expect("left directory");
+        let right = root.get_entry("right")?.expect("right directory");
+        assert_eq!(left.target_id, right.target_id);
+        assert_eq!(repository.list_tree_ids()?.len(), 2);
         Ok(())
     }
 }

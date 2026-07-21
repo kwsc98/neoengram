@@ -6,7 +6,7 @@ use std::{
 };
 
 use neoengram_core::Commit;
-use serde::Deserialize;
+use rusqlite::{params, Connection};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -151,7 +151,7 @@ fn checkout_force_handles_file_directory_transitions() -> TestResult {
 }
 
 fn initialize(path: &Path) -> TestResult {
-    run_success(path, &["init", "--metadata-store", "json"])?;
+    run_success(path, &["init"])?;
     Ok(())
 }
 
@@ -172,36 +172,84 @@ fn command(current_dir: &Path) -> Command {
     command
 }
 
-#[derive(Deserialize)]
 struct StoredFileSet {
     files: Vec<StoredFileRecord>,
 }
 
-#[derive(Deserialize)]
 struct StoredFileRecord {
     path: String,
 }
 
 fn read_index(repository: &Path) -> Result<StoredFileSet, Box<dyn Error>> {
-    Ok(serde_json::from_slice(&fs::read(
-        repository.join(".neoengram/metadata/index.json"),
-    )?)?)
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    let mut statement = connection.prepare("SELECT path FROM index_files ORDER BY path")?;
+    let files = statement
+        .query_map([], |row| Ok(StoredFileRecord { path: row.get(0)? }))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(StoredFileSet { files })
 }
 
 fn head_tree(repository: &Path) -> Result<StoredFileSet, Box<dyn Error>> {
     let id = current_commit_id(repository)?;
-    let commit: Commit = serde_json::from_slice(&fs::read(
-        repository.join(format!(".neoengram/metadata/commits/{id}.json")),
-    )?)?;
-    Ok(serde_json::from_slice(&fs::read(repository.join(
-        format!(".neoengram/metadata/trees/{}.json", commit.tree_hash),
-    ))?)?)
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    let commit_id = blake3::Hash::from_hex(&id)?;
+    let payload: Vec<u8> = connection.query_row(
+        "SELECT payload FROM commits WHERE id = ?1",
+        params![commit_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let commit: Commit = serde_json::from_slice(&payload)?;
+    let mut files = Vec::new();
+    collect_directory_paths(&connection, &commit.tree_hash, "", &mut files)?;
+    Ok(StoredFileSet { files })
 }
 
 fn current_commit_id(repository: &Path) -> Result<String, Box<dyn Error>> {
-    Ok(
-        fs::read_to_string(repository.join(".neoengram/metadata/refs/heads/main"))?
-            .trim()
-            .to_owned(),
-    )
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    let target = connection.query_row(
+        "SELECT target FROM refs WHERE name = 'refs/heads/main'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(target)
+}
+
+fn collect_directory_paths(
+    connection: &Connection,
+    id: &str,
+    prefix: &str,
+    files: &mut Vec<StoredFileRecord>,
+) -> Result<(), Box<dyn Error>> {
+    let id = blake3::Hash::from_hex(id)?;
+    let set_id: Vec<u8> = connection.query_row(
+        "SELECT set_id FROM directories WHERE id = ?1",
+        params![id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT name, kind, lower(hex(target_id)) FROM directory_entries \
+         WHERE set_id = ?1 ORDER BY ordinal",
+    )?;
+    let entries = statement
+        .query_map(params![set_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, kind, target) in entries {
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if kind == 1 {
+            files.push(StoredFileRecord { path });
+        } else {
+            collect_directory_paths(connection, &target, &path, files)?;
+        }
+    }
+    Ok(())
 }

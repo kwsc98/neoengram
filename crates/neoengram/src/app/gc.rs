@@ -1,14 +1,13 @@
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
+};
 
 use anyhow::{ensure, Context, Result};
 
 use crate::local::{objects::ObjectSpec, repository::Repository};
 
-/// Remove loose objects that are not referenced by the current index or any persisted Tree.
-///
-/// Immutable metadata has no deletion operation yet, so every persisted Tree is retained in the
-/// mark set; otherwise fsck would correctly report unreachable history as corrupt.  This command
-/// therefore reclaims failed/incomplete add payloads, while history pruning remains separate.
+/// Remove loose objects that are not referenced by the current Index or any persisted Commit.
 pub(crate) async fn execute(dry_run: bool) -> Result<()> {
     let current_dir = std::env::current_dir().context("无法确定当前工作目录")?;
     let repository = Repository::discover(&current_dir)?;
@@ -52,35 +51,67 @@ fn collect_and_reclaim(repository: &Repository, dry_run: bool) -> Result<GcRepor
 
 fn mark_referenced_chunks(repository: &Repository) -> Result<HashMap<String, u64>> {
     let mut referenced = HashMap::new();
-    let index = repository.read_index()?;
-    collect_files(&index.files, &mut referenced)?;
+    let mut manifests = HashSet::new();
+    repository.visit_index_files(|record| {
+        collect_manifest(
+            repository,
+            &record.manifest_id,
+            record.total_size,
+            &mut manifests,
+            &mut referenced,
+        )
+    })?;
 
-    // Keep all persisted history for now.  A future metadata GC can delete unreachable Trees and
-    // then narrow this mark set to refs/HEAD roots in the same transaction.
-    for tree_id in repository.list_tree_ids()? {
-        let tree = repository.read_tree(&tree_id)?;
-        collect_files(&tree.files, &mut referenced)?;
+    // Every persisted Commit remains a GC root until history pruning and mount leases exist.
+    let mut roots = Vec::new();
+    for commit_id in repository.list_commit_ids()? {
+        roots.push(repository.read_commit(&commit_id)?.tree_hash);
     }
+    // Validate and explicitly include HEAD/ref roots as well. This makes GC fail closed on a
+    // dangling reference instead of silently treating its payload as reclaimable.
+    if let Some(head_id) = repository.current_head()?.commit_id() {
+        roots.push(repository.read_commit(head_id)?.tree_hash);
+    }
+    for reference in repository.list_references("refs")? {
+        roots.push(repository.read_commit(&reference.target)?.tree_hash);
+    }
+    repository.visit_directory_dag(&roots, |entry| {
+        if entry.kind == neoengram_core::DirectoryEntryKind::File {
+            collect_manifest(
+                repository,
+                &entry.target_id,
+                entry.total_size,
+                &mut manifests,
+                &mut referenced,
+            )?;
+        }
+        Ok(())
+    })?;
     Ok(referenced)
 }
 
-fn collect_files(
-    files: &[neoengram_core::FileNode],
+fn collect_manifest(
+    repository: &Repository,
+    manifest_id: &str,
+    total_size: u64,
+    manifests: &mut HashSet<String>,
     referenced: &mut HashMap<String, u64>,
 ) -> Result<()> {
-    for file in files {
-        for chunk in &file.chunks {
-            if let Some(previous) = referenced.insert(chunk.hash.clone(), chunk.size) {
-                ensure!(
-                    previous == chunk.size,
-                    "Chunk {} 在持久化元数据中具有冲突大小: {} 与 {}",
-                    chunk.hash,
-                    previous,
-                    chunk.size
-                );
-            }
-        }
+    if !manifests.insert(manifest_id.to_owned()) {
+        return Ok(());
     }
+    repository.visit_manifest_chunks(manifest_id, total_size, |chunk| {
+        if let Some(previous) = referenced.insert(chunk.hash.clone(), chunk.size) {
+            ensure!(
+                previous == chunk.size,
+                "Chunk {} 在持久化元数据中具有冲突大小: {} 与 {}",
+                chunk.hash,
+                previous,
+                chunk.size
+            );
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -142,23 +173,26 @@ fn sweep_objects(
 mod tests {
     use std::collections::HashMap;
 
-    use neoengram_core::{Chunk, FileNode};
+    use anyhow::{ensure, Result};
+    use neoengram_core::Chunk;
 
-    use super::collect_files;
+    fn collect_chunk(chunk: &Chunk, referenced: &mut HashMap<String, u64>) -> Result<()> {
+        if let Some(previous) = referenced.insert(chunk.hash.clone(), chunk.size) {
+            ensure!(previous == chunk.size, "conflicting Chunk size");
+        }
+        Ok(())
+    }
 
     #[test]
     fn mark_keeps_a_single_size_for_deduplicated_chunks() {
         let mut referenced = HashMap::new();
-        let file = FileNode {
-            path: "a".to_owned(),
-            total_size: 1,
-            chunks: vec![Chunk {
-                hash: "a".repeat(64),
-                offset: 0,
-                size: 1,
-            }],
+        let chunk = Chunk {
+            hash: "a".repeat(64),
+            offset: 0,
+            size: 1,
         };
-        assert!(collect_files(&[file], &mut referenced).is_ok());
+        assert!(collect_chunk(&chunk, &mut referenced).is_ok());
+        assert!(collect_chunk(&chunk, &mut referenced).is_ok());
         assert_eq!(referenced.len(), 1);
     }
 }

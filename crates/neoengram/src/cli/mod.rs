@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
-use crate::{app, local::metadata::MetadataStoreKind};
+use crate::app;
 
 /// 面向 AI 数据集和模型权重的内容寻址版本控制系统。
 #[derive(Debug, Parser)]
@@ -41,6 +41,10 @@ enum Command {
     Gc(GcArgs),
     /// 验证本地 refs、历史、元数据和 Chunk 对象的完整性。
     Fsck,
+    /// 把固定 Commit 作为只读 FUSE 文件系统挂载到空目录。
+    Mount(MountArgs),
+    /// 卸载 NeoEngram FUSE 文件系统。
+    Unmount(UnmountArgs),
 }
 
 #[derive(Debug, Args)]
@@ -48,24 +52,6 @@ struct InitArgs {
     /// 要初始化为 NeoEngram 仓库的目录。
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
-    /// 新仓库使用的元数据后端；省略时默认使用 SQLite。
-    #[arg(long, value_enum, value_name = "BACKEND")]
-    metadata_store: Option<MetadataStoreArgument>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum MetadataStoreArgument {
-    Json,
-    Sqlite,
-}
-
-impl From<MetadataStoreArgument> for MetadataStoreKind {
-    fn from(value: MetadataStoreArgument) -> Self {
-        match value {
-            MetadataStoreArgument::Json => Self::Json,
-            MetadataStoreArgument::Sqlite => Self::Sqlite,
-        }
-    }
 }
 
 #[derive(Debug, Args)]
@@ -167,11 +153,28 @@ struct RecoverArgs {
     abort: bool,
 }
 
+#[derive(Debug, Args)]
+struct MountArgs {
+    /// `HEAD`、`main` 或完整 Commit ID；挂载后视图不再跟随引用移动。
+    #[arg(value_name = "TARGET")]
+    target: String,
+    /// 已存在、为空且位于仓库之外的挂载目录。
+    #[arg(value_name = "MOUNTPOINT")]
+    mountpoint: PathBuf,
+    /// 已验证 Chunk 的有界内存缓存大小。
+    #[arg(long, value_name = "MIB", default_value_t = 512)]
+    cache_size_mib: u64,
+}
+
+#[derive(Debug, Args)]
+struct UnmountArgs {
+    #[arg(value_name = "MOUNTPOINT")]
+    mountpoint: PathBuf,
+}
+
 pub(crate) async fn run() -> Result<()> {
     match Cli::parse().command {
-        Command::Init(arguments) => {
-            app::init::execute(arguments.path, arguments.metadata_store.map(Into::into)).await
-        }
+        Command::Init(arguments) => app::init::execute(arguments.path).await,
         Command::Add(arguments) => {
             if arguments.all {
                 app::add::execute_with_options(arguments.path, true).await
@@ -198,5 +201,14 @@ pub(crate) async fn run() -> Result<()> {
         }
         Command::Gc(arguments) => app::gc::execute(arguments.dry_run).await,
         Command::Fsck => app::fsck::execute().await,
+        Command::Mount(arguments) => {
+            app::mount::execute(
+                arguments.target,
+                arguments.mountpoint,
+                arguments.cache_size_mib,
+            )
+            .await
+        }
+        Command::Unmount(arguments) => app::mount::unmount(arguments.mountpoint).await,
     }
 }

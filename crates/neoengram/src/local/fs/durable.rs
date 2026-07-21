@@ -1,4 +1,4 @@
-//! 本地存储初始化、JSON 元数据与工作区恢复流程共用的 crash-safe 文件原语。
+//! 本地存储初始化、配置文件与工作区恢复流程共用的 crash-safe 文件原语。
 
 use std::{
     ffi::OsStr,
@@ -224,19 +224,6 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_slice(&contents).with_context(|| format!("JSON 格式无效: {}", path.display()))
 }
 
-pub(crate) fn read_json_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    let contents = match fs::read(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("无法读取 JSON: {}", path.display()));
-        }
-    };
-    serde_json::from_slice(&contents)
-        .map(Some)
-        .with_context(|| format!("JSON 格式无效: {}", path.display()))
-}
-
 pub(crate) fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(value).context("无法序列化 JSON")?;
     bytes.push(b'\n');
@@ -245,22 +232,6 @@ pub(crate) fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 
 pub(crate) fn publish_json_if_absent<T: Serialize>(path: &Path, value: &T) -> Result<bool> {
     publish_bytes_if_absent(path, &json_bytes(value)?)
-}
-
-pub(crate) fn publish_immutable_json<T>(path: &Path, value: &T) -> Result<()>
-where
-    T: Serialize + DeserializeOwned + PartialEq,
-{
-    if publish_json_if_absent(path, value)? {
-        return Ok(());
-    }
-    let existing: T = read_json(path)?;
-    ensure!(
-        &existing == value,
-        "不可变 JSON 发生内容冲突或文件已损坏: {}",
-        path.display()
-    );
-    Ok(())
 }
 
 pub(crate) fn publish_bytes_if_absent(path: &Path, bytes: &[u8]) -> Result<bool> {

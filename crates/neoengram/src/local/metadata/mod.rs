@@ -1,32 +1,26 @@
-//! 可替换的元数据持久化边界。
+//! SQLite-backed local metadata contracts.
 //!
-//! `JsonMetadataStore` 和 `SqliteMetadataStore` 实现同一契约。Chunk payload 与工作区
-//! 恢复 journal 具有不同生命周期和原子性边界，因此不在本模块中。
-//! 完整的逐操作语义见同目录 `README.md`。
+//! File payloads live in `ObjectStore`. The mutable Index refers to immutable file Manifests,
+//! while Commits refer to immutable, hierarchical Directory objects. Directory and Manifest
+//! readers are paged so a mounted snapshot never has to materialize the whole namespace.
 
 use std::{fmt::Debug, num::NonZeroU32, path::Path, sync::Arc};
 
 use anyhow::{ensure, Context, Result};
-use neoengram_core::{Chunk, Commit};
+use neoengram_core::{Chunk, Commit, DirectoryEntry, DirectoryEntryKind};
 use serde::{Deserialize, Serialize};
 
 use crate::local::STORAGE_TEMP_FILE_PREFIX;
 
-mod json;
 mod sqlite;
 
-use json::JsonMetadataStore;
 use sqlite::SqliteMetadataStore;
 
-/// 单次存储扫描允许返回的最大记录数。后端必须拒绝更大的请求，防止调用方绕过分页接口
-/// 再次把完整仓库物化到内存。
 const MAX_PAGE_SIZE: u32 = 4_096;
-const MANIFEST_HASH_DOMAIN: &[u8] = b"neoengram-file-manifest-v2";
-const TREE_HASH_DOMAIN: &[u8] = b"neoengram-tree-v2";
+const MANIFEST_HASH_DOMAIN: &[u8] = b"neoengram-manifest-v3";
+const DIRECTORY_HASH_DOMAIN: &[u8] = b"neoengram-directory-v1";
+const CANONICAL_ENCODING_VERSION: u32 = 1;
 
-/// 基于排他 continuation cursor 的有界扫描请求。
-///
-/// Cursor 只允许传回产生它的同类 reader；它不是可跨后端、跨 snapshot 持久化的标识。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PageRequest {
     pub(crate) after: Option<String>,
@@ -60,14 +54,12 @@ impl PageRequest {
     }
 }
 
-/// 一个有界结果页。`next` 为 `None` 表示扫描完成；否则把它放进下一次请求的 `after`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Page<T> {
     pub(crate) items: Vec<T>,
     pub(crate) next: Option<String>,
 }
 
-/// Index 的不透明版本。它只用于乐观并发检查，不得被解释成递增序号。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct IndexVersion {
     revision: u64,
@@ -80,14 +72,20 @@ impl IndexVersion {
     }
 }
 
-/// 已发布 Manifest 的逻辑引用。内容 ID 和 Chunk 数由存储层在单次流式消费后返回。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManifestRef {
     pub(crate) id: String,
     pub(crate) chunk_count: u64,
 }
 
-/// 文件集合中的轻量记录。Chunk 清单通过对应的 `ManifestReader` 分页读取。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectoryRef {
+    pub(crate) id: String,
+    pub(crate) entry_count: u64,
+    pub(crate) file_count: u64,
+    pub(crate) total_size: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileRecord {
@@ -108,18 +106,19 @@ impl FileRecord {
     }
 }
 
-/// 一个不可变文件 recipe 的分页读取边界。
 pub(crate) trait ManifestReader: Debug {
     fn total_size(&self) -> u64;
     fn chunk_count(&self) -> u64;
     fn scan_chunks(&self, request: &PageRequest) -> Result<Page<Chunk>>;
+
+    /// Returns chunks beginning with the Chunk covering `offset`, or the first Chunk after it.
+    /// A continuation cursor is the byte offset immediately after the last returned Chunk.
+    #[cfg_attr(not(feature = "fuse-mount"), allow(dead_code))]
+    fn scan_chunks_from_offset(&self, offset: u64, limit: NonZeroU32) -> Result<Page<Chunk>>;
 }
 
-/// Index 和 Tree 共同提供的文件/Chunk 有界读取协议。
 pub(crate) trait FileSetReader: Debug {
     fn get_file(&self, path: &str) -> Result<Option<FileRecord>>;
-
-    /// `prefix` 为空时扫描所有文件；非空时包含该路径本身及其 `/` 子孙。
     fn scan_files(&self, prefix: Option<&str>, request: &PageRequest) -> Result<Page<FileRecord>>;
 }
 
@@ -128,36 +127,26 @@ pub(crate) trait IndexReader: FileSetReader {
     fn version(&self) -> &IndexVersion;
 }
 
-/// Index 的串行化 read-modify-write 边界。
-///
-/// JSON 后端可以在内部物化完整 Index；SQLite 后端应把这些方法映射到同一数据库事务。
 pub(crate) trait IndexTxn: IndexReader {
-    /// 新增或替换文件；引用的 Manifest 必须已存在且大小、Chunk 数与记录一致。
     fn upsert_file(&mut self, file: &FileRecord) -> Result<()>;
     fn delete_prefix(&mut self, prefix: &str) -> Result<u64>;
     fn commit(self: Box<Self>) -> Result<IndexVersion>;
 }
 
-pub(crate) trait TreeReader: FileSetReader {
+pub(crate) trait DirectoryReader: Debug {
+    fn entry_count(&self) -> u64;
     fn file_count(&self) -> u64;
+    fn total_size(&self) -> u64;
+    #[cfg_attr(not(feature = "fuse-mount"), allow(dead_code))]
+    fn get_entry(&self, name: &str) -> Result<Option<DirectoryEntry>>;
+    fn scan_entries(&self, request: &PageRequest) -> Result<Page<DirectoryEntry>>;
 }
 
-/// 追加式 Tree 构造器。批次之间也必须保持路径严格递增；`finish` 是唯一发布点。
-pub(crate) trait TreeWriter: Debug {
-    /// 追加文件；引用的 Manifest 必须已存在且大小、Chunk 数与记录一致。
-    fn append_file(&mut self, file: &FileRecord) -> Result<()>;
-    fn finish(self: Box<Self>) -> Result<String>;
+pub(crate) trait DirectoryWriter: Debug {
+    fn append_entry(&mut self, entry: &DirectoryEntry) -> Result<()>;
+    fn finish(self: Box<Self>) -> Result<DirectoryRef>;
 }
 
-/// 仓库元数据的物理存储类型。该值会写入 repository.json，打开仓库时据此选择后端。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum MetadataStoreKind {
-    Json,
-    Sqlite,
-}
-
-/// HEAD 的持久状态。Attached 通过命名引用解析当前 Commit，Detached 直接指向 Commit。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum HeadState {
@@ -174,7 +163,6 @@ impl HeadState {
     }
 }
 
-/// 规范化 HEAD 状态以便 compare-exchange 比较；引用名与 Commit ID 去除首尾空白。
 fn normalize_head_state(state: &HeadState) -> HeadState {
     match state {
         HeadState::Attached { reference } => HeadState::Attached {
@@ -186,58 +174,42 @@ fn normalize_head_state(state: &HeadState) -> HeadState {
     }
 }
 
-/// 一个命名引用及其目标。引用名使用 `refs/...` 形式，与具体后端的文件名或表结构无关。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredReference {
     pub(crate) name: String,
     pub(crate) target: String,
 }
 
-/// 引用 compare-exchange 的结果。`actual` 是发生冲突时锁内重新读取的当前值。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReferenceCas {
     Updated,
     Mismatch { actual: Option<String> },
 }
 
-/// HEAD compare-exchange 的结果。HEAD 始终存在，因此冲突时返回完整实际状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HeadCas {
     Updated,
     Mismatch { actual: HeadState },
 }
 
-/// HEAD/ref 与不可变历史对象的点查边界。实现不得为了一次点查枚举整个仓库。
 pub(crate) trait MetadataReader: Debug {
     fn read_head_state(&self) -> Result<HeadState>;
     fn get_reference(&self, name: &str) -> Result<Option<String>>;
     fn open_manifest(&self, id: &str) -> Result<Option<Box<dyn ManifestReader + '_>>>;
-    fn open_tree(&self, id: &str) -> Result<Option<Box<dyn TreeReader + '_>>>;
+    fn open_directory(&self, id: &str) -> Result<Option<Box<dyn DirectoryReader + '_>>>;
     fn get_commit(&self, id: &str) -> Result<Option<Commit>>;
 }
 
-/// 一次固定的历史元数据读视图。Tree/Manifest/Commit ID 和 refs 的翻页 cursor 都只在
-/// 这个 snapshot 内有效；SQLite 后端应使用 read transaction 实现相同语义。
 pub(crate) trait MetadataSnapshot: MetadataReader {
-    fn scan_tree_ids(&self, request: &PageRequest) -> Result<Page<String>>;
+    #[allow(dead_code)]
+    fn scan_directory_ids(&self, request: &PageRequest) -> Result<Page<String>>;
     fn scan_manifest_ids(&self, request: &PageRequest) -> Result<Page<String>>;
     fn scan_commit_ids(&self, request: &PageRequest) -> Result<Page<String>>;
     fn scan_references(&self, prefix: &str, request: &PageRequest)
         -> Result<Page<StoredReference>>;
 }
 
-/// Index、不可变历史元数据和 refs 的持久化边界。
-///
-/// Repository 负责工作区路径、Tree/Commit 内容 ID 和对象内容等领域校验；后端仍必须在
-/// 访问物理存储前拒绝非法对象 ID、引用名和引用前缀。后端负责事务化 Index、引用 CAS、
-/// 不可变且幂等地发布 Manifest/Tree/Commit，以及有界、严格递增的 snapshot 枚举。
-///
-/// `initialize` 必须幂等且不能覆盖现有状态。`begin_index_transaction` 成功后必须基于一个
-/// 固定版本执行 read-modify-write；`expected` 不匹配时不得返回事务。Chunk payload 和
-/// checkout/rm journal 不属于这个接口。
 pub(crate) trait MetadataStore: MetadataReader + Send + Sync {
-    fn kind(&self) -> MetadataStoreKind;
-
     fn initialize(&self, head_reference: &str) -> Result<()>;
     fn validate_layout(&self) -> Result<()>;
     fn verify_integrity(&self) -> Result<()>;
@@ -247,25 +219,18 @@ pub(crate) trait MetadataStore: MetadataReader + Send + Sync {
         &self,
         expected: Option<&IndexVersion>,
     ) -> Result<Box<dyn IndexTxn + '_>>;
-
     fn snapshot(&self) -> Result<Box<dyn MetadataSnapshot + '_>>;
 
-    /// 单次消费完整 Chunk 流并发布不可变 Manifest。输入或校验失败时不得发布；成功时
-    /// 返回由实际内容计算出的 ID 和 Chunk 数，调用方无需预先物化或 Hash 清单。
     fn put_manifest(
         &self,
         total_size: u64,
         chunks: &mut dyn Iterator<Item = Result<Chunk>>,
     ) -> Result<ManifestRef>;
-    fn begin_tree_write(&self) -> Result<Box<dyn TreeWriter + '_>>;
+    fn begin_directory_write(&self) -> Result<Box<dyn DirectoryWriter + '_>>;
     fn put_commit(&self, id: &str, commit: &Commit) -> Result<()>;
 
-    /// 当且仅当 HEAD 当前状态等于 `expected` 时原子替换为 `new_state`。
     fn compare_exchange_head(&self, expected: &HeadState, new_state: &HeadState)
         -> Result<HeadCas>;
-
-    /// 当且仅当当前值等于 `expected` 时写入 `new_target`。两个参数的 `None` 分别表示
-    /// “期望引用不存在”和“删除引用”，因此该方法不提供无条件覆盖模式。
     fn compare_exchange_reference(
         &self,
         name: &str,
@@ -274,19 +239,11 @@ pub(crate) trait MetadataStore: MetadataReader + Send + Sync {
     ) -> Result<ReferenceCas>;
 }
 
-pub(crate) fn open_metadata_store(
-    kind: MetadataStoreKind,
-    metadata_root: &Path,
-) -> Arc<dyn MetadataStore> {
-    match kind {
-        MetadataStoreKind::Json => Arc::new(JsonMetadataStore::new(metadata_root.to_path_buf())),
-        MetadataStoreKind::Sqlite => {
-            Arc::new(SqliteMetadataStore::new(metadata_root.to_path_buf()))
-        }
-    }
+pub(crate) fn open_metadata_store(metadata_root: &Path) -> Arc<dyn MetadataStore> {
+    Arc::new(SqliteMetadataStore::new(metadata_root.to_path_buf()))
 }
 
-fn validate_metadata_object_id(id: &str) -> Result<()> {
+pub(crate) fn validate_metadata_object_id(id: &str) -> Result<()> {
     ensure!(
         id.len() == 64
             && id
@@ -297,8 +254,10 @@ fn validate_metadata_object_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn file_manifest_id(total_size: u64, chunks: &[Chunk]) -> Result<String> {
-    Ok(describe_manifest(total_size, chunks)?.id)
+fn decode_id(id: &str) -> Result<[u8; 32]> {
+    validate_metadata_object_id(id)?;
+    let hash = blake3::Hash::from_hex(id).context("无法解析内容 ID")?;
+    Ok(*hash.as_bytes())
 }
 
 pub(crate) fn describe_manifest(total_size: u64, chunks: &[Chunk]) -> Result<ManifestRef> {
@@ -309,7 +268,7 @@ pub(crate) fn describe_manifest(total_size: u64, chunks: &[Chunk]) -> Result<Man
     hasher.finish()
 }
 
-struct ManifestHasher {
+pub(crate) struct ManifestHasher {
     hasher: blake3::Hasher,
     total_size: u64,
     next_offset: u64,
@@ -317,10 +276,8 @@ struct ManifestHasher {
 }
 
 impl ManifestHasher {
-    fn new(total_size: u64) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(MANIFEST_HASH_DOMAIN);
-        hasher.update(&[0]);
+    pub(crate) fn new(total_size: u64) -> Self {
+        let mut hasher = canonical_hasher(MANIFEST_HASH_DOMAIN);
         hasher.update(&total_size.to_le_bytes());
         Self {
             hasher,
@@ -330,31 +287,29 @@ impl ManifestHasher {
         }
     }
 
-    fn push(&mut self, chunk: &Chunk) -> Result<()> {
-        validate_metadata_object_id(&chunk.hash)?;
+    pub(crate) fn push(&mut self, chunk: &Chunk) -> Result<()> {
         ensure!(chunk.size > 0, "Manifest Chunk 大小必须大于零");
         ensure!(
             chunk.offset == self.next_offset,
             "Manifest Chunk 偏移不连续: {}",
             chunk.hash
         );
-        let next_offset = self
+        let id = decode_id(&chunk.hash)?;
+        self.hasher.update(&id);
+        self.hasher.update(&chunk.offset.to_le_bytes());
+        self.hasher.update(&chunk.size.to_le_bytes());
+        self.next_offset = self
             .next_offset
             .checked_add(chunk.size)
             .context("Manifest Chunk 总大小溢出")?;
-        let chunk_count = self
+        self.chunk_count = self
             .chunk_count
             .checked_add(1)
             .context("Manifest Chunk 数量溢出")?;
-        self.hasher.update(chunk.hash.as_bytes());
-        self.hasher.update(&chunk.offset.to_le_bytes());
-        self.hasher.update(&chunk.size.to_le_bytes());
-        self.next_offset = next_offset;
-        self.chunk_count = chunk_count;
         Ok(())
     }
 
-    fn finish(mut self) -> Result<ManifestRef> {
+    pub(crate) fn finish(mut self) -> Result<ManifestRef> {
         ensure!(
             self.next_offset == self.total_size,
             "Manifest Chunk 总大小与文件大小不一致"
@@ -367,62 +322,82 @@ impl ManifestHasher {
     }
 }
 
-pub(crate) fn tree_records_id(files: &[FileRecord]) -> Result<String> {
-    let mut hasher = TreeHasher::new();
-    for file in files {
-        hasher.push(file)?;
-    }
-    Ok(hasher.finish().0)
-}
-
-#[derive(Debug)]
-struct TreeHasher {
+pub(crate) struct DirectoryHasher {
     hasher: blake3::Hasher,
-    first: bool,
-    file_count: u64,
+    last_name: Option<String>,
+    entry_count: u64,
 }
 
-impl TreeHasher {
-    fn new() -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(TREE_HASH_DOMAIN);
-        hasher.update(&[0]);
-        hasher.update(b"[");
+impl DirectoryHasher {
+    pub(crate) fn new() -> Self {
         Self {
-            hasher,
-            first: true,
-            file_count: 0,
+            hasher: canonical_hasher(DIRECTORY_HASH_DOMAIN),
+            last_name: None,
+            entry_count: 0,
         }
     }
 
-    fn push(&mut self, file: &FileRecord) -> Result<()> {
-        if !self.first {
-            self.hasher.update(b",");
+    pub(crate) fn push(&mut self, entry: &DirectoryEntry) -> Result<()> {
+        validate_directory_entry(entry)?;
+        ensure!(
+            entry.ordinal == self.entry_count,
+            "Directory entry ordinal 不连续: {}",
+            entry.name
+        );
+        if let Some(previous) = &self.last_name {
+            ensure!(previous < &entry.name, "Directory 子项未按名称严格递增");
         }
-        let encoded = serde_json::to_vec(file).context("无法序列化 Tree 文件记录")?;
-        self.hasher.update(&encoded);
-        self.file_count = self
-            .file_count
+        let name = entry.name.as_bytes();
+        self.hasher.update(&[match entry.kind {
+            DirectoryEntryKind::File => 1,
+            DirectoryEntryKind::Directory => 2,
+        }]);
+        self.hasher.update(&(name.len() as u64).to_le_bytes());
+        self.hasher.update(name);
+        self.hasher.update(&decode_id(&entry.target_id)?);
+        self.hasher.update(&entry.total_size.to_le_bytes());
+        self.entry_count = self
+            .entry_count
             .checked_add(1)
-            .context("Tree 文件数量溢出")?;
-        self.first = false;
+            .context("Directory entry 数量溢出")?;
+        self.last_name = Some(entry.name.clone());
         Ok(())
     }
 
-    fn finish(mut self) -> (String, u64) {
-        self.hasher.update(b"]");
-        (self.hasher.finalize().to_hex().to_string(), self.file_count)
+    pub(crate) fn finish(mut self) -> (String, u64) {
+        self.hasher.update(&self.entry_count.to_le_bytes());
+        (
+            self.hasher.finalize().to_hex().to_string(),
+            self.entry_count,
+        )
     }
 }
 
-#[cfg(test)]
-fn legacy_tree_records_id(files: &[FileRecord]) -> Result<String> {
-    let canonical = serde_json::to_vec(files).context("无法序列化 Tree 文件记录")?;
+fn canonical_hasher(domain: &[u8]) -> blake3::Hasher {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(TREE_HASH_DOMAIN);
-    hasher.update(&[0]);
-    hasher.update(&canonical);
-    Ok(hasher.finalize().to_hex().to_string())
+    hasher.update(&(domain.len() as u64).to_le_bytes());
+    hasher.update(domain);
+    hasher.update(&CANONICAL_ENCODING_VERSION.to_le_bytes());
+    hasher
+}
+
+pub(crate) fn validate_directory_entry(entry: &DirectoryEntry) -> Result<()> {
+    ensure!(
+        !entry.name.is_empty()
+            && entry.name != "."
+            && entry.name != ".."
+            && !entry.name.contains('/')
+            && !entry.name.contains('\\'),
+        "Directory 子项名称无效: {}",
+        entry.name
+    );
+    validate_metadata_object_id(&entry.target_id)?;
+    ensure!(
+        entry.kind == DirectoryEntryKind::File || entry.total_size == 0,
+        "Directory 类型子项不能携带文件大小: {}",
+        entry.name
+    );
+    Ok(())
 }
 
 fn validate_reference_name(name: &str) -> Result<()> {
@@ -441,7 +416,7 @@ fn validate_reference_name(name: &str) -> Result<()> {
             component
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
-            "引用名包含不支持的字符: {name}"
+            "引用名包含非法字符: {name}"
         );
     }
     Ok(())

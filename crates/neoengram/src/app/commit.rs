@@ -1,12 +1,9 @@
-use std::{
-    collections::BTreeMap,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{ensure, Context, Result};
-use neoengram_core::{Commit, FileNode, Tree};
+use neoengram_core::Commit;
 
-use crate::local::{objects::ObjectSpec, repository::Repository};
+use crate::local::repository::Repository;
 
 pub(crate) async fn execute(message: String) -> Result<()> {
     let message = message.trim().to_owned();
@@ -20,7 +17,10 @@ pub(crate) async fn execute(message: String) -> Result<()> {
         .context("Commit 任务异常终止")??;
 
     println!("Committed {}", outcome.commit_id);
-    println!("Tree: {} ({} files)", outcome.tree_id, outcome.file_count);
+    println!(
+        "Directory: {} ({} files)",
+        outcome.tree_id, outcome.file_count
+    );
     if outcome.detached {
         println!("HEAD is now detached at {}", outcome.commit_id);
     }
@@ -30,7 +30,7 @@ pub(crate) async fn execute(message: String) -> Result<()> {
 struct CommitOutcome {
     commit_id: String,
     tree_id: String,
-    file_count: usize,
+    file_count: u64,
     detached: bool,
 }
 
@@ -38,22 +38,15 @@ fn create_commit(repository: &Repository, message: String) -> Result<CommitOutco
     // 锁内重新读取 index 和 HEAD，保证 parent 恰好是 attached 分支 tip 或 direct HEAD。
     // Commit 数据模型只有一个 Option parent，因此无法产生 merge commit。
     let _lock = repository.acquire_write_lock()?;
-    let index = repository.read_index()?;
-    validate_staged_objects(repository, &index.files)?;
-    let tree = Tree { files: index.files };
     let head = repository.current_head()?;
     let parent = head.commit_id().map(str::to_owned);
 
     let parent_tree_id = if let Some(parent_id) = &parent {
         Some(repository.read_commit(parent_id)?.tree_hash)
     } else {
-        ensure!(
-            !tree.files.is_empty(),
-            "没有可提交的文件；请先运行 `neoengram add`"
-        );
         None
     };
-    let tree_id = repository.store_tree(&tree)?;
+    let (tree_id, file_count) = repository.store_index_tree(parent.is_none())?;
     if let Some(parent_tree_id) = parent_tree_id {
         ensure!(
             parent_tree_id != tree_id,
@@ -83,33 +76,7 @@ fn create_commit(repository: &Repository, message: String) -> Result<CommitOutco
     Ok(CommitOutcome {
         commit_id,
         tree_id,
-        file_count: tree.files.len(),
+        file_count,
         detached: head.is_detached(),
     })
-}
-
-fn validate_staged_objects(repository: &Repository, files: &[FileNode]) -> Result<()> {
-    // Commit 会让 index 中的 Chunk 成为历史可达对象。发布 Tree 之前逐个复算 Hash，
-    // 保证分支引用不会指向缺失或损坏的 payload；同一 Hash 只校验一次，避免去重对象
-    // 被多个文件引用时重复读取。
-    let mut chunks = BTreeMap::new();
-    for file in files {
-        for chunk in &file.chunks {
-            if let Some(previous_size) = chunks.insert(chunk.hash.as_str(), chunk.size) {
-                ensure!(
-                    previous_size == chunk.size,
-                    "Chunk {} 在 index 中具有冲突的大小: {} 与 {}",
-                    chunk.hash,
-                    previous_size,
-                    chunk.size
-                );
-            }
-        }
-    }
-
-    let object_store = repository.object_store();
-    for (hash, size) in chunks {
-        object_store.verify(&ObjectSpec::new(hash, size)?)?;
-    }
-    object_store.durability_barrier()
 }

@@ -8,17 +8,13 @@ use tempfile::Builder;
 
 use crate::local::{
     fs::durable::{create_dir_all_durable, rename_noreplace_durable},
-    metadata::MetadataStoreKind,
     repository::{Repository, NEOENGRAM_DIR_NAME},
     STORAGE_TEMP_FILE_PREFIX,
 };
 
-pub(crate) async fn execute(
-    path: PathBuf,
-    metadata_store: Option<MetadataStoreKind>,
-) -> Result<()> {
+pub(crate) async fn execute(path: PathBuf) -> Result<()> {
     let task_path = path.clone();
-    let outcome = tokio::task::spawn_blocking(move || initialize(&task_path, metadata_store))
+    let outcome = tokio::task::spawn_blocking(move || initialize(&task_path))
         .await
         .with_context(|| format!("仓库初始化任务异常终止: {}", path.display()))??;
 
@@ -41,7 +37,7 @@ struct InitOutcome {
     reinitialized: bool,
 }
 
-fn initialize(path: &Path, metadata_store: Option<MetadataStoreKind>) -> Result<InitOutcome> {
+fn initialize(path: &Path) -> Result<InitOutcome> {
     ensure_repository_root(path)?;
     let root =
         fs::canonicalize(path).with_context(|| format!("无法解析仓库目录: {}", path.display()))?;
@@ -55,10 +51,10 @@ fn initialize(path: &Path, metadata_store: Option<MetadataStoreKind>) -> Result<
         }
     };
     if reinitialized {
-        let repository = Repository::open_or_with_metadata_store(root, metadata_store)?;
+        let repository = Repository::open_or_create(root)?;
         repository.initialize_layout()?;
     } else {
-        initialize_new_repository(&root, metadata_store)?;
+        initialize_new_repository(&root)?;
     }
     Ok(InitOutcome {
         repository_dir,
@@ -66,13 +62,13 @@ fn initialize(path: &Path, metadata_store: Option<MetadataStoreKind>) -> Result<
     })
 }
 
-fn initialize_new_repository(root: &Path, metadata_store: Option<MetadataStoreKind>) -> Result<()> {
+fn initialize_new_repository(root: &Path) -> Result<()> {
     let temporary = Builder::new()
         .prefix(STORAGE_TEMP_FILE_PREFIX)
         .tempdir_in(root)
         .with_context(|| format!("无法创建仓库初始化临时目录: {}", root.display()))?;
     let staging_root = temporary.path().to_path_buf();
-    let repository = Repository::open_or_with_metadata_store(staging_root.clone(), metadata_store)?;
+    let repository = Repository::open_or_create(staging_root.clone())?;
     repository.initialize_layout()?;
     super::test_crash_at("init-before-publish");
 
@@ -86,7 +82,7 @@ fn initialize_new_repository(root: &Path, metadata_store: Option<MetadataStoreKi
         )
     })?;
 
-    let published = Repository::open_or_with_metadata_store(root.to_path_buf(), metadata_store)?;
+    let published = Repository::open_or_create(root.to_path_buf())?;
     published.validate()
 }
 

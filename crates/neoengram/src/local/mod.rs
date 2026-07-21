@@ -2,6 +2,7 @@
 
 pub(crate) mod fs;
 pub(crate) mod metadata;
+pub(crate) mod mount;
 pub(crate) mod objects;
 pub(crate) mod repository;
 pub(crate) mod worktree;

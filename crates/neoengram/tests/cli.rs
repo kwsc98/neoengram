@@ -1,11 +1,12 @@
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use neoengram_core::{Chunk, Commit, FileNode, Index, Tree, INDEX_FORMAT_VERSION};
-use serde::{de::DeserializeOwned, Deserialize};
+use rusqlite::{params, Connection};
+use serde::de::DeserializeOwned;
 
 #[test]
 fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,8 +22,8 @@ fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error
     assert!(temporary.path().join(".neoengram/staging").is_dir());
     assert!(temporary.path().join(".neoengram/transactions").is_dir());
     let repository_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(repository_config["format_version"], 4);
-    assert_eq!(repository_config["metadata_store"], "sqlite");
+    assert_eq!(repository_config["format_version"], 5);
+    assert!(repository_config.get("metadata_store").is_none());
     assert_eq!(repository_config["object_store"], "loose");
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     assert!(!metadata_dir.join("index.json").exists());
@@ -33,7 +34,7 @@ fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error
         String::from_utf8(second.stdout)?.contains("Reinitialized existing NeoEngram repository")
     );
     let reopened_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(reopened_config["metadata_store"], "sqlite");
+    assert!(reopened_config.get("metadata_store").is_none());
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     assert!(!metadata_dir.join("index.json").exists());
     Ok(())
@@ -55,13 +56,13 @@ fn init_creates_a_missing_nested_repository_root() -> Result<(), Box<dyn std::er
         .path()
         .join("nested/repository/.neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["metadata_store"], "sqlite");
+    assert_eq!(config["format_version"], 5);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     Ok(())
 }
 
 #[test]
-fn crashed_new_init_does_not_pin_the_metadata_backend() -> Result<(), Box<dyn std::error::Error>> {
+fn crashed_new_init_can_be_retried() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
 
     let failed = command(temporary.path())
@@ -78,19 +79,16 @@ fn crashed_new_init_does_not_pin_the_metadata_backend() -> Result<(), Box<dyn st
             .starts_with(".neoengram-tmp-")))
     );
 
-    let retried = command(temporary.path())
-        .args(["init", "--metadata-store", "json"])
-        .output()?;
+    let retried = command(temporary.path()).arg("init").output()?;
     assert!(
         retried.status.success(),
-        "json retry failed: {}",
+        "retry failed: {}",
         String::from_utf8_lossy(&retried.stderr)
     );
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["metadata_store"], "json");
-    assert!(metadata_dir.join("index.json").is_file());
-    assert!(!metadata_dir.join("metadata.sqlite3").exists());
+    assert_eq!(config["format_version"], 5);
+    assert!(metadata_dir.join("metadata.sqlite3").is_file());
     let add = command(temporary.path()).args(["add", "."]).output()?;
     assert!(
         add.status.success(),
@@ -102,124 +100,85 @@ fn crashed_new_init_does_not_pin_the_metadata_backend() -> Result<(), Box<dyn st
 }
 
 #[test]
-fn concurrent_init_publishes_exactly_one_metadata_backend() -> Result<(), Box<dyn std::error::Error>>
-{
+fn concurrent_init_publishes_exactly_one_repository() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
-    let sqlite = command(temporary.path())
-        .args(["init", "--metadata-store", "sqlite"])
+    let first = command(temporary.path())
+        .arg("init")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let json = command(temporary.path())
-        .args(["init", "--metadata-store", "json"])
+    let second = command(temporary.path())
+        .arg("init")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let sqlite = sqlite.wait_with_output()?;
-    let json = json.wait_with_output()?;
+    let first = first.wait_with_output()?;
+    let second = second.wait_with_output()?;
     assert_ne!(
-        sqlite.status.success(),
-        json.status.success(),
-        "sqlite stderr: {}\njson stderr: {}",
-        String::from_utf8_lossy(&sqlite.stderr),
-        String::from_utf8_lossy(&json.stderr)
+        first.status.success(),
+        second.status.success(),
+        "first stderr: {}\nsecond stderr: {}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&second.stderr)
     );
 
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    match config["metadata_store"].as_str() {
-        Some("sqlite") => {
-            assert!(sqlite.status.success());
-            assert!(metadata_dir.join("metadata.sqlite3").is_file());
-            assert!(!metadata_dir.join("index.json").exists());
-        }
-        Some("json") => {
-            assert!(json.status.success());
-            assert!(metadata_dir.join("index.json").is_file());
-            assert!(!metadata_dir.join("metadata.sqlite3").exists());
-        }
-        backend => panic!("unexpected metadata backend: {backend:?}"),
-    }
-    Ok(())
-}
-
-#[test]
-fn initializes_and_reopens_an_explicit_json_metadata_repository(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
-
-    let first = command(temporary.path())
-        .args(["init", "--metadata-store", "json"])
-        .output()?;
-    assert!(
-        first.status.success(),
-        "json init failed: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-
-    let metadata_dir = temporary.path().join(".neoengram/metadata");
-    assert!(metadata_dir.join("trees").is_dir());
-    assert!(metadata_dir.join("manifests").is_dir());
-    assert!(metadata_dir.join("commits").is_dir());
-    assert!(metadata_dir.join("refs/heads").is_dir());
-    assert_eq!(
-        fs::read_to_string(metadata_dir.join("HEAD"))?,
-        "ref: refs/heads/main\n"
-    );
-    assert_eq!(read_index(&metadata_dir)?, Index::default());
-    let repository_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(repository_config["format_version"], 4);
-    assert_eq!(repository_config["metadata_store"], "json");
-    assert_eq!(repository_config["object_store"], "loose");
-    assert!(metadata_dir.join("index.json").is_file());
-    assert!(!metadata_dir.join("metadata.sqlite3").exists());
-    let original_index = fs::read(metadata_dir.join("index.json"))?;
-
-    let second = command(temporary.path()).arg("init").output()?;
-    assert!(
-        second.status.success(),
-        "json reinit failed: {}",
-        String::from_utf8_lossy(&second.stderr)
-    );
-    assert!(
-        String::from_utf8(second.stdout)?.contains("Reinitialized existing NeoEngram repository")
-    );
-    let reopened_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(reopened_config["metadata_store"], "json");
-    assert_eq!(fs::read(metadata_dir.join("index.json"))?, original_index);
-    assert!(!metadata_dir.join("metadata.sqlite3").exists());
-    Ok(())
-}
-
-#[test]
-fn init_rejects_an_explicit_metadata_backend_change() -> Result<(), Box<dyn std::error::Error>> {
-    let temporary = tempfile::tempdir()?;
-    let initialized = command(temporary.path())
-        .args(["init", "--metadata-store", "sqlite"])
-        .output()?;
-    assert!(
-        initialized.status.success(),
-        "sqlite init failed: {}",
-        String::from_utf8_lossy(&initialized.stderr)
-    );
-
-    let metadata_dir = temporary.path().join(".neoengram/metadata");
-    let config_before = fs::read(metadata_dir.join("repository.json"))?;
-    let conflicting = command(temporary.path())
-        .args(["init", "--metadata-store", "json"])
-        .output()?;
-
-    assert!(!conflicting.status.success());
-    let stderr = String::from_utf8(conflicting.stderr)?;
-    assert!(stderr.contains("已有仓库使用 `sqlite` 元数据后端"));
-    assert!(stderr.contains("不会自动迁移元数据后端"));
-    assert_eq!(
-        fs::read(metadata_dir.join("repository.json"))?,
-        config_before
-    );
+    assert_eq!(config["format_version"], 5);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
-    assert!(!metadata_dir.join("index.json").exists());
+    Ok(())
+}
+
+#[test]
+fn removed_metadata_store_option_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let output = command(temporary.path())
+        .args(["init", "--metadata-store", "json"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)?.contains("unexpected argument '--metadata-store'"));
+    assert!(!temporary.path().join(".neoengram").exists());
+    Ok(())
+}
+
+#[test]
+fn mount_rejects_nonempty_and_in_repository_mountpoints() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_temporary, repository, mountpoint) = committed_mount_fixture()?;
+    fs::write(mountpoint.join("occupied"), b"x")?;
+    let nonempty = command(&repository)
+        .arg("mount")
+        .arg("HEAD")
+        .arg(&mountpoint)
+        .output()?;
+    assert!(!nonempty.status.success());
+    assert!(String::from_utf8_lossy(&nonempty.stderr).contains("挂载点必须为空"));
+
+    let inside = repository.join("inside-mount");
+    fs::create_dir(&inside)?;
+    let nested = command(&repository)
+        .arg("mount")
+        .arg("HEAD")
+        .arg(&inside)
+        .output()?;
+    assert!(!nested.status.success());
+    assert!(String::from_utf8_lossy(&nested.stderr).contains("仓库根目录完全分离"));
+    Ok(())
+}
+
+#[cfg(not(feature = "fuse-mount"))]
+#[test]
+fn mount_without_feature_reports_the_required_build_option(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temporary, repository, mountpoint) = committed_mount_fixture()?;
+    let output = command(&repository)
+        .arg("mount")
+        .arg("HEAD")
+        .arg(&mountpoint)
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--features fuse-mount"));
     Ok(())
 }
 
@@ -248,15 +207,15 @@ fn init_rejects_the_previous_repository_format() -> Result<(), Box<dyn std::erro
     fs::create_dir_all(&metadata_dir)?;
     fs::write(
         metadata_dir.join("repository.json"),
-        br#"{"format_version":3,"metadata_store":"json","object_store":"loose"}"#,
+        br#"{"format_version":4,"object_store":"loose"}"#,
     )?;
 
     let output = command(temporary.path()).arg("init").output()?;
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("格式版本 3"));
-    assert!(stderr.contains("当前支持 4"));
+    assert!(stderr.contains("格式版本 4"));
+    assert!(stderr.contains("当前支持 5"));
     assert!(!temporary.path().join(".neoengram/objects").exists());
     Ok(())
 }
@@ -368,7 +327,7 @@ fn creates_linear_single_parent_commits() -> Result<(), Box<dyn std::error::Erro
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     let first_id = current_commit_id(&metadata_dir)?;
     assert!(is_hash(&first_id));
-    let first: Commit = read_json(&metadata_dir.join(format!("commits/{first_id}.json")))?;
+    let first = read_commit(&metadata_dir, &first_id)?;
     assert_eq!(first.parent, None);
     assert_eq!(first.message, "initial dataset");
     let first_tree = read_tree(&metadata_dir, &first.tree_hash)?;
@@ -381,7 +340,7 @@ fn creates_linear_single_parent_commits() -> Result<(), Box<dyn std::error::Erro
         .output()?;
     assert!(!unchanged.status.success());
     assert!(String::from_utf8(unchanged.stderr)?.contains("没有可提交的变更"));
-    assert_eq!(directory_entries(&metadata_dir.join("commits"))?, 1);
+    assert_eq!(metadata_count(&metadata_dir, "commits")?, 1);
 
     fs::write(temporary.path().join("a.pt"), b"second version")?;
     assert!(command(temporary.path())
@@ -396,7 +355,7 @@ fn creates_linear_single_parent_commits() -> Result<(), Box<dyn std::error::Erro
 
     let second_id = current_commit_id(&metadata_dir)?;
     assert_ne!(second_id, first_id);
-    let second: Commit = read_json(&metadata_dir.join(format!("commits/{second_id}.json")))?;
+    let second = read_commit(&metadata_dir, &second_id)?;
     assert_eq!(second.parent.as_deref(), Some(first_id.as_str()));
     let second_tree = read_tree(&metadata_dir, &second.tree_hash)?;
     let second_paths: Vec<&str> = second_tree
@@ -405,7 +364,7 @@ fn creates_linear_single_parent_commits() -> Result<(), Box<dyn std::error::Erro
         .map(|file| file.path.as_str())
         .collect();
     assert_eq!(second_paths, ["a.pt", "b.pt"]);
-    assert_eq!(directory_entries(&metadata_dir.join("commits"))?, 2);
+    assert_eq!(metadata_count(&metadata_dir, "commits")?, 2);
     Ok(())
 }
 
@@ -428,7 +387,7 @@ fn detached_checkout_commits_from_the_target_and_can_reattach_main(
         .status
         .success());
     let first_id = current_commit_id(&metadata_dir)?;
-    let first: Commit = read_json(&metadata_dir.join(format!("commits/{first_id}.json")))?;
+    let first = read_commit(&metadata_dir, &first_id)?;
     let first_tree = read_tree(&metadata_dir, &first.tree_hash)?;
 
     fs::write(temporary.path().join("a.pt"), b"version two")?;
@@ -444,7 +403,7 @@ fn detached_checkout_commits_from_the_target_and_can_reattach_main(
         .status
         .success());
     let second_id = current_commit_id(&metadata_dir)?;
-    let second: Commit = read_json(&metadata_dir.join(format!("commits/{second_id}.json")))?;
+    let second = read_commit(&metadata_dir, &second_id)?;
     let second_tree = read_tree(&metadata_dir, &second.tree_hash)?;
     fs::write(temporary.path().join("keep.local"), b"untracked")?;
 
@@ -494,7 +453,7 @@ fn detached_checkout_commits_from_the_target_and_can_reattach_main(
     assert!(is_hash(&detached_id));
     assert_ne!(detached_id, first_id);
     assert_eq!(current_commit_id(&metadata_dir)?, second_id);
-    let detached: Commit = read_json(&metadata_dir.join(format!("commits/{detached_id}.json")))?;
+    let detached = read_commit(&metadata_dir, &detached_id)?;
     assert_eq!(detached.parent.as_deref(), Some(first_id.as_str()));
     assert_ne!(detached.tree_hash, first.tree_hash);
 
@@ -635,7 +594,7 @@ fn checkout_refuses_dirty_files_before_writing_and_force_restores_them(
         .status
         .success());
     let second_id = current_commit_id(&metadata_dir)?;
-    let index_before = fs::read(metadata_dir.join("index.json"))?;
+    let index_before = read_index(&metadata_dir)?;
     fs::write(temporary.path().join("z.pt"), b"local change")?;
 
     let refused = command(temporary.path())
@@ -647,7 +606,7 @@ fn checkout_refuses_dirty_files_before_writing_and_force_restores_them(
     assert!(stderr.contains("--force"));
     assert_eq!(fs::read(temporary.path().join("a.pt"))?, b"a-v2");
     assert_eq!(fs::read(temporary.path().join("z.pt"))?, b"local change");
-    assert_eq!(fs::read(metadata_dir.join("index.json"))?, index_before);
+    assert_eq!(read_index(&metadata_dir)?, index_before);
     assert_eq!(current_commit_id(&metadata_dir)?, second_id);
 
     let forced = command(temporary.path())
@@ -709,10 +668,7 @@ fn checkout_requires_force_for_staged_or_missing_tracked_files(
         .success());
     assert_eq!(fs::read(&file_path)?, b"committed");
 
-    let head: Commit = read_json(&metadata_dir.join(format!(
-        "commits/{}.json",
-        current_commit_id(&metadata_dir)?
-    )))?;
+    let head = read_commit(&metadata_dir, &current_commit_id(&metadata_dir)?)?;
     let index = read_index(&metadata_dir)?;
     let tree = read_tree(&metadata_dir, &head.tree_hash)?;
     assert_eq!(index.files, tree.files);
@@ -739,7 +695,7 @@ fn checkout_detects_chunk_corruption_before_mutating_workspace(
         .status
         .success());
     let head_id = current_commit_id(&metadata_dir)?;
-    let head: Commit = read_json(&metadata_dir.join(format!("commits/{head_id}.json")))?;
+    let head = read_commit(&metadata_dir, &head_id)?;
     let tree = read_tree(&metadata_dir, &head.tree_hash)?;
 
     fs::write(temporary.path().join("a.pt"), b"staged-a")?;
@@ -749,7 +705,7 @@ fn checkout_detects_chunk_corruption_before_mutating_workspace(
         .output()?
         .status
         .success());
-    let index_before = fs::read(metadata_dir.join("index.json"))?;
+    let index_before = read_index(&metadata_dir)?;
 
     let z_node = tree
         .files
@@ -773,7 +729,7 @@ fn checkout_detects_chunk_corruption_before_mutating_workspace(
     assert!(String::from_utf8(output.stderr)?.contains("Hash 损坏"));
     assert_eq!(fs::read(temporary.path().join("a.pt"))?, b"staged-a");
     assert_eq!(fs::read(temporary.path().join("z.pt"))?, b"staged-z");
-    assert_eq!(fs::read(metadata_dir.join("index.json"))?, index_before);
+    assert_eq!(read_index(&metadata_dir)?, index_before);
     assert_eq!(current_commit_id(&metadata_dir)?, head_id);
     Ok(())
 }
@@ -805,7 +761,7 @@ fn checkout_rebuilds_nested_multichunk_and_empty_files() -> Result<(), Box<dyn s
         .output()?
         .status
         .success());
-    let head_before = fs::read(metadata_dir.join("refs/heads/main"))?;
+    let head_before = current_commit_id(&metadata_dir)?;
 
     fs::remove_file(nested.join("model.bin"))?;
     fs::remove_dir(&nested)?;
@@ -821,7 +777,7 @@ fn checkout_rebuilds_nested_multichunk_and_empty_files() -> Result<(), Box<dyn s
     assert_eq!(fs::read(temporary.path().join("nested/model.bin"))?, large);
     assert_eq!(fs::metadata(temporary.path().join("empty.bin"))?.len(), 0);
     assert_eq!(fs::read(runner.join("keep.local"))?, b"keep");
-    assert_eq!(fs::read(metadata_dir.join("refs/heads/main"))?, head_before);
+    assert_eq!(current_commit_id(&metadata_dir)?, head_before);
     Ok(())
 }
 
@@ -909,9 +865,9 @@ fn empty_repository_has_nothing_to_commit() -> Result<(), Box<dyn std::error::Er
     assert!(String::from_utf8(output.stderr)?.contains("请先运行 `neoengram add`"));
 
     let metadata_dir = temporary.path().join(".neoengram/metadata");
-    assert_eq!(directory_entries(&metadata_dir.join("trees"))?, 0);
-    assert_eq!(directory_entries(&metadata_dir.join("commits"))?, 0);
-    assert!(!metadata_dir.join("refs/heads/main").exists());
+    assert_eq!(metadata_count(&metadata_dir, "directories")?, 0);
+    assert_eq!(metadata_count(&metadata_dir, "commits")?, 0);
+    assert_eq!(metadata_count(&metadata_dir, "refs")?, 0);
     Ok(())
 }
 
@@ -1140,9 +1096,7 @@ fn committed_id(stdout: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn initialize(path: &Path) -> std::io::Result<()> {
-    let output = command(path)
-        .args(["init", "--metadata-store", "json"])
-        .output()?;
+    let output = command(path).arg("init").output()?;
     assert!(
         output.status.success(),
         "init failed: {}",
@@ -1151,73 +1105,164 @@ fn initialize(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn committed_mount_fixture(
+) -> Result<(tempfile::TempDir, PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir_in(std::env::current_dir()?)?;
+    let repository = temporary.path().join("repository");
+    let mountpoint = temporary.path().join("mount");
+    fs::create_dir(&repository)?;
+    fs::create_dir(&mountpoint)?;
+    initialize(&repository)?;
+    fs::write(repository.join("payload.bin"), b"payload")?;
+    let add = command(&repository).args(["add", "payload.bin"]).output()?;
+    assert!(
+        add.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let commit = command(&repository)
+        .args(["commit", "-m", "mount fixture"])
+        .output()?;
+    assert!(
+        commit.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    Ok((temporary, repository, mountpoint))
+}
+
 fn command(current_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_neoengram"));
     command.current_dir(current_dir);
     command
 }
 
-#[derive(Deserialize)]
-struct StoredFileSet {
-    files: Vec<StoredFileRecord>,
-}
-
-#[derive(Deserialize)]
-struct StoredFileRecord {
-    path: String,
-    total_size: u64,
-    chunk_count: u64,
-    manifest_id: String,
-}
-
-#[derive(Deserialize)]
-struct StoredManifest {
-    total_size: u64,
-    chunks: Vec<Chunk>,
-}
-
 fn read_index(metadata_dir: &Path) -> Result<Index, Box<dyn std::error::Error>> {
+    let connection = Connection::open(metadata_dir.join("metadata.sqlite3"))?;
+    let mut statement = connection.prepare(
+        "SELECT path, total_size, chunk_count, lower(hex(manifest_id)) \
+         FROM index_files ORDER BY path",
+    )?;
+    let stored = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut files = Vec::with_capacity(stored.len());
+    for (path, total_size, chunk_count, manifest_id) in stored {
+        let chunks = read_manifest(&connection, &manifest_id)?;
+        assert_eq!(u64::try_from(chunks.len())?, u64::try_from(chunk_count)?);
+        files.push(FileNode {
+            path,
+            total_size: u64::try_from(total_size)?,
+            chunks,
+        });
+    }
     Ok(Index {
         format_version: INDEX_FORMAT_VERSION,
-        files: read_file_set(metadata_dir, &metadata_dir.join("index.json"))?,
+        files,
     })
 }
 
 fn read_tree(metadata_dir: &Path, id: &str) -> Result<Tree, Box<dyn std::error::Error>> {
-    Ok(Tree {
-        files: read_file_set(metadata_dir, &metadata_dir.join(format!("trees/{id}.json")))?,
-    })
+    let connection = Connection::open(metadata_dir.join("metadata.sqlite3"))?;
+    let mut files = Vec::new();
+    read_directory(&connection, id, "", &mut files)?;
+    Ok(Tree { files })
 }
 
-fn read_file_set(
-    metadata_dir: &Path,
-    path: &Path,
-) -> Result<Vec<FileNode>, Box<dyn std::error::Error>> {
-    let stored: StoredFileSet = read_json(path)?;
-    let mut files = Vec::with_capacity(stored.files.len());
-    for record in stored.files {
-        let manifest: StoredManifest =
-            read_json(&metadata_dir.join(format!("manifests/{}.json", record.manifest_id)))?;
-        assert_eq!(manifest.total_size, record.total_size);
-        assert_eq!(u64::try_from(manifest.chunks.len())?, record.chunk_count);
-        files.push(FileNode {
-            path: record.path,
-            total_size: record.total_size,
-            chunks: manifest.chunks,
-        });
+fn read_directory(
+    connection: &Connection,
+    id: &str,
+    prefix: &str,
+    files: &mut Vec<FileNode>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let id = blake3::Hash::from_hex(id)?;
+    let set_id: Vec<u8> = connection.query_row(
+        "SELECT set_id FROM directories WHERE id = ?1",
+        params![id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT name, kind, lower(hex(target_id)), total_size \
+         FROM directory_entries WHERE set_id = ?1 ORDER BY ordinal",
+    )?;
+    let entries = statement
+        .query_map(params![set_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, kind, target_id, total_size) in entries {
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if kind == 1 {
+            files.push(FileNode {
+                path,
+                total_size: u64::try_from(total_size)?,
+                chunks: read_manifest(connection, &target_id)?,
+            });
+        } else {
+            read_directory(connection, &target_id, &path, files)?;
+        }
     }
-    Ok(files)
+    Ok(())
+}
+
+fn read_manifest(
+    connection: &Connection,
+    id: &str,
+) -> Result<Vec<Chunk>, Box<dyn std::error::Error>> {
+    let id = blake3::Hash::from_hex(id)?;
+    let set_id: Vec<u8> = connection.query_row(
+        "SELECT set_id FROM manifests WHERE id = ?1",
+        params![id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT lower(hex(object_id)), offset, size FROM manifest_chunks \
+         WHERE set_id = ?1 ORDER BY ordinal",
+    )?;
+    let chunks = statement
+        .query_map(params![set_id], |row| {
+            Ok(Chunk {
+                hash: row.get(0)?,
+                offset: u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        error.into(),
+                    )
+                })?,
+                size: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        error.into(),
+                    )
+                })?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(chunks)
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, Box<dyn std::error::Error>> {
     let bytes = fs::read(path)?;
     let value = serde_json::from_slice(&bytes)?;
     Ok(value)
-}
-
-fn directory_entries(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
-    let entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-    Ok(entries.len())
 }
 
 fn object_entries(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
@@ -1235,13 +1280,51 @@ fn object_entries(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
 }
 
 fn current_commit_id(metadata_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(fs::read_to_string(metadata_dir.join("refs/heads/main"))?
-        .trim()
-        .to_owned())
+    let connection = Connection::open(metadata_dir.join("metadata.sqlite3"))?;
+    Ok(connection.query_row(
+        "SELECT target FROM refs WHERE name = 'refs/heads/main'",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 fn read_head(metadata_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(fs::read_to_string(metadata_dir.join("HEAD"))?)
+    let connection = Connection::open(metadata_dir.join("metadata.sqlite3"))?;
+    let (kind, target): (String, String) = connection.query_row(
+        "SELECT head_kind, head_target FROM store_state WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if kind == "attached" {
+        Ok(format!("ref: {target}\n"))
+    } else {
+        Ok(format!("{target}\n"))
+    }
+}
+
+fn read_commit(metadata_dir: &Path, id: &str) -> Result<Commit, Box<dyn std::error::Error>> {
+    let connection = Connection::open(metadata_dir.join("metadata.sqlite3"))?;
+    let id = blake3::Hash::from_hex(id)?;
+    let payload: Vec<u8> = connection.query_row(
+        "SELECT payload FROM commits WHERE id = ?1",
+        params![id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok(serde_json::from_slice(&payload)?)
+}
+
+fn metadata_count(metadata_dir: &Path, table: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let table = match table {
+        "directories" => "directories",
+        "commits" => "commits",
+        "refs" => "refs",
+        _ => return Err("unsupported metadata table".into()),
+    };
+    let connection = Connection::open(metadata_dir.join("metadata.sqlite3"))?;
+    let count: i64 = connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })?;
+    Ok(usize::try_from(count)?)
 }
 
 fn is_hash(value: &str) -> bool {

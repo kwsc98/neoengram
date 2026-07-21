@@ -21,6 +21,7 @@ clap = { version = "4.5", features = ["derive"] }
 fastcdc = "3.2"
 fs2 = "0.4"
 futures = "0.3"
+fuser = { version = "0.16", default-features = false }
 libc = "0.2"
 memmap2 = "0.9"
 neoengram-core = { path = "crates/neoengram-core", version = "0.1.0" }
@@ -30,7 +31,7 @@ rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.20"
-tokio = { version = "1.45", features = ["fs", "macros", "rt-multi-thread"] }
+tokio = { version = "1.45", features = ["fs", "macros", "rt-multi-thread", "signal"] }
 unicode-normalization = "0.1"
 walkdir = "2.5"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

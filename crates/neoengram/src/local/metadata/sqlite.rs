@@ -3,28 +3,29 @@
 use std::{
     collections::BTreeMap,
     fmt, fs,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use neoengram_core::{Chunk, Commit, INDEX_FORMAT_VERSION};
+use neoengram_core::{Chunk, Commit, DirectoryEntry, DirectoryEntryKind, INDEX_FORMAT_VERSION};
 use rusqlite::{params, params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension};
 
 use crate::local::fs::durable::{ensure_or_create_directory, sync_parent};
 
 use super::{
-    normalize_head_state, validate_metadata_object_id, validate_reference_name,
-    validate_reference_prefix, FileRecord, FileSetReader, HeadCas, HeadState, IndexReader,
+    normalize_head_state, validate_directory_entry, validate_metadata_object_id,
+    validate_reference_name, validate_reference_prefix, DirectoryHasher, DirectoryReader,
+    DirectoryRef, DirectoryWriter, FileRecord, FileSetReader, HeadCas, HeadState, IndexReader,
     IndexTxn, IndexVersion, ManifestHasher, ManifestReader, ManifestRef, MetadataReader,
-    MetadataSnapshot, MetadataStore, MetadataStoreKind, Page, PageRequest, ReferenceCas,
-    StoredReference, TreeHasher, TreeReader, TreeWriter,
+    MetadataSnapshot, MetadataStore, Page, PageRequest, ReferenceCas, StoredReference,
 };
 
 const DATABASE_FILE_NAME: &str = "metadata.sqlite3";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f45;
-const SQLITE_SCHEMA_VERSION: i64 = 2;
+const SQLITE_SCHEMA_VERSION: i64 = 3;
 const WRITE_BATCH_SIZE: usize = 1_024;
 const WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,6 +64,8 @@ CREATE TABLE manifest_chunks (
     FOREIGN KEY (set_id) REFERENCES manifest_sets(set_id) ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 
+CREATE INDEX manifest_chunks_by_offset ON manifest_chunks(set_id, offset);
+
 CREATE TABLE manifests (
     id BLOB PRIMARY KEY CHECK (length(id) = 32),
     set_id BLOB NOT NULL UNIQUE,
@@ -73,31 +76,38 @@ CREATE TABLE manifests (
         REFERENCES manifest_sets(set_id, total_size, chunk_count) ON DELETE RESTRICT
 ) STRICT;
 
-CREATE TABLE tree_sets (
+CREATE TABLE directory_sets (
     set_id BLOB PRIMARY KEY CHECK (length(set_id) = 16),
+    entry_count INTEGER CHECK (entry_count IS NULL OR entry_count >= 0),
     file_count INTEGER CHECK (file_count IS NULL OR file_count >= 0),
+    total_size INTEGER CHECK (total_size IS NULL OR total_size >= 0),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
-    UNIQUE (set_id, file_count)
+    UNIQUE (set_id, entry_count, file_count, total_size)
 ) STRICT;
 
-CREATE TABLE tree_files (
+CREATE TABLE directory_entries (
     set_id BLOB NOT NULL,
-    path TEXT NOT NULL COLLATE BINARY,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    name TEXT NOT NULL COLLATE BINARY CHECK (
+        name <> '' AND name <> '.' AND name <> '..'
+            AND instr(name, '/') = 0 AND instr(name, char(92)) = 0
+    ),
+    kind INTEGER NOT NULL CHECK (kind IN (1, 2)),
+    target_id BLOB NOT NULL CHECK (length(target_id) = 32),
     total_size INTEGER NOT NULL CHECK (total_size >= 0),
-    chunk_count INTEGER NOT NULL CHECK (chunk_count >= 0),
-    manifest_id BLOB NOT NULL CHECK (length(manifest_id) = 32),
-    PRIMARY KEY (set_id, path),
-    FOREIGN KEY (set_id) REFERENCES tree_sets(set_id) ON DELETE CASCADE,
-    FOREIGN KEY (manifest_id, total_size, chunk_count)
-        REFERENCES manifests(id, total_size, chunk_count) ON DELETE RESTRICT
+    PRIMARY KEY (set_id, ordinal),
+    UNIQUE (set_id, name),
+    FOREIGN KEY (set_id) REFERENCES directory_sets(set_id) ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE trees (
+CREATE TABLE directories (
     id BLOB PRIMARY KEY CHECK (length(id) = 32),
     set_id BLOB NOT NULL UNIQUE,
+    entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
     file_count INTEGER NOT NULL CHECK (file_count >= 0),
-    FOREIGN KEY (set_id, file_count)
-        REFERENCES tree_sets(set_id, file_count) ON DELETE RESTRICT
+    total_size INTEGER NOT NULL CHECK (total_size >= 0),
+    FOREIGN KEY (set_id, entry_count, file_count, total_size)
+        REFERENCES directory_sets(set_id, entry_count, file_count, total_size) ON DELETE RESTRICT
 ) STRICT;
 
 CREATE TABLE index_files (
@@ -181,13 +191,15 @@ impl SqliteMetadataStore {
         Ok(set_id)
     }
 
-    fn create_tree_set(&self) -> Result<Vec<u8>> {
+    fn create_directory_set(&self) -> Result<Vec<u8>> {
         let connection = self.open_existing(false)?;
         let set_id = random_set_id(&connection)?;
         let now = current_unix_ms()?;
         run_immediate(&connection, || {
             connection.execute(
-                "INSERT INTO tree_sets(set_id, file_count, created_at_ms) VALUES (?1, NULL, ?2)",
+                "INSERT INTO directory_sets(\
+                    set_id, entry_count, file_count, total_size, created_at_ms\
+                 ) VALUES (?1, NULL, NULL, NULL, ?2)",
                 params![set_id.as_slice(), now],
             )?;
             Ok(())
@@ -224,21 +236,26 @@ impl SqliteMetadataStore {
         })
     }
 
-    fn insert_tree_batch(&self, set_id: &[u8], files: &[FileRecord]) -> Result<()> {
+    fn insert_directory_batch(&self, set_id: &[u8], entries: &[DirectoryEntry]) -> Result<()> {
         let connection = self.open_existing(false)?;
         run_immediate(&connection, || {
             let mut statement = connection.prepare_cached(
-                "INSERT INTO tree_files(set_id, path, total_size, chunk_count, manifest_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO directory_entries(\
+                    set_id, ordinal, name, kind, target_id, total_size\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
-            for file in files {
-                let manifest_id = decode_id(&file.manifest_id)?;
+            for entry in entries {
+                let target_id = decode_id(&entry.target_id)?;
                 statement.execute(params![
                     set_id,
-                    file.path,
-                    encode_u64(file.total_size, "Tree 文件大小")?,
-                    encode_u64(file.chunk_count, "Tree Chunk 数量")?,
-                    manifest_id.as_slice(),
+                    encode_u64(entry.ordinal, "Directory 子项序号")?,
+                    entry.name,
+                    match entry.kind {
+                        DirectoryEntryKind::File => 1_i64,
+                        DirectoryEntryKind::Directory => 2_i64,
+                    },
+                    target_id.as_slice(),
+                    encode_u64(entry.total_size, "Directory 文件大小")?,
                 ])?;
             }
             Ok(())
@@ -358,6 +375,47 @@ fn validate_stored_file_record(connection: &Connection, file: &FileRecord) -> Re
         file.path
     );
     Ok(())
+}
+
+fn validate_stored_directory_entry(
+    connection: &Connection,
+    entry: &DirectoryEntry,
+) -> Result<(u64, u64)> {
+    validate_directory_entry(entry)?;
+    let target_id = decode_id(&entry.target_id)?;
+    match entry.kind {
+        DirectoryEntryKind::File => {
+            let total_size = connection
+                .query_row(
+                    "SELECT total_size FROM manifests WHERE id = ?1",
+                    params![target_id.as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .with_context(|| format!("Manifest 不存在: {}", entry.target_id))?;
+            let total_size = decode_u64(total_size, "Manifest 文件大小")?;
+            ensure!(
+                total_size == entry.total_size,
+                "Directory 文件 {} 的大小与 Manifest 不一致",
+                entry.name
+            );
+            Ok((1, total_size))
+        }
+        DirectoryEntryKind::Directory => {
+            let stats = connection
+                .query_row(
+                    "SELECT file_count, total_size FROM directories WHERE id = ?1",
+                    params![target_id.as_slice()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?
+                .with_context(|| format!("Directory 不存在: {}", entry.target_id))?;
+            Ok((
+                decode_u64(stats.0, "Directory 文件数量")?,
+                decode_u64(stats.1, "Directory 逻辑大小")?,
+            ))
+        }
+    }
 }
 
 fn run_immediate<T>(connection: &Connection, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -530,6 +588,36 @@ fn file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         total_size,
         chunk_count,
         manifest_id,
+    })
+}
+
+fn directory_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DirectoryEntry> {
+    let ordinal = decode_u64(row.get(0)?, "Directory 子项序号").map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, error.into())
+    })?;
+    let kind = match row.get::<_, i64>(2)? {
+        1 => DirectoryEntryKind::File,
+        2 => DirectoryEntryKind::Directory,
+        value => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Integer,
+                anyhow::anyhow!("Directory 子项类型无效: {value}").into(),
+            ));
+        }
+    };
+    let target_id = encode_id(row.get(3)?, "Directory target").map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Blob, error.into())
+    })?;
+    let total_size = decode_u64(row.get(4)?, "Directory 文件大小").map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Integer, error.into())
+    })?;
+    Ok(DirectoryEntry {
+        ordinal,
+        name: row.get(1)?,
+        kind,
+        target_id,
+        total_size,
     })
 }
 
@@ -831,39 +919,139 @@ impl ManifestReader for SqliteManifestReader {
             next,
         })
     }
+
+    fn scan_chunks_from_offset(&self, offset: u64, limit: NonZeroU32) -> Result<Page<Chunk>> {
+        ensure!(offset <= self.total_size, "Manifest 读取偏移超出文件范围");
+        let limit = PageRequest::new(None, limit.get())?.limit_usize()?;
+        let retained_limit = limit.checked_add(1).context("Chunk range 页大小溢出")?;
+        let mut statement = self.session.connection.prepare(
+            "SELECT ordinal, object_id, offset, size FROM manifest_chunks \
+             WHERE set_id = ?1 AND offset + size > ?2 \
+             ORDER BY ordinal LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                self.set_id.as_slice(),
+                encode_u64(offset, "Manifest 读取偏移")?,
+                i64::try_from(retained_limit)?
+            ],
+            |row| {
+                Ok(Chunk {
+                    hash: encode_id(row.get(1)?, "Chunk").map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Blob,
+                            error.into(),
+                        )
+                    })?,
+                    offset: decode_u64(row.get(2)?, "Chunk 偏移").map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            error.into(),
+                        )
+                    })?,
+                    size: decode_u64(row.get(3)?, "Chunk 大小").map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            error.into(),
+                        )
+                    })?,
+                })
+            },
+        )?;
+        let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = items.len() > limit;
+        if has_more {
+            items.pop();
+        }
+        let next = has_more.then(|| {
+            let last = items
+                .last()
+                .expect("有后续 Chunk range 页时当前页不可能为空");
+            last.offset
+                .checked_add(last.size)
+                .expect("已验证的 Manifest Chunk 结束偏移不会溢出")
+                .to_string()
+        });
+        Ok(Page { items, next })
+    }
 }
 
 #[derive(Debug)]
-struct SqliteTreeReader {
+struct SqliteDirectoryReader {
     session: Rc<ReadSession>,
     set_id: Vec<u8>,
+    entry_count: u64,
     file_count: u64,
+    total_size: u64,
 }
 
-impl FileSetReader for SqliteTreeReader {
-    fn get_file(&self, path: &str) -> Result<Option<FileRecord>> {
-        get_file_from_table(
-            &self.session.connection,
-            "tree_files",
-            Some(&self.set_id),
-            path,
-        )
+impl DirectoryReader for SqliteDirectoryReader {
+    fn entry_count(&self) -> u64 {
+        self.entry_count
     }
 
-    fn scan_files(&self, prefix: Option<&str>, request: &PageRequest) -> Result<Page<FileRecord>> {
-        scan_files_from_table(
-            &self.session.connection,
-            "tree_files",
-            Some(&self.set_id),
-            prefix,
-            request,
-        )
-    }
-}
-
-impl TreeReader for SqliteTreeReader {
     fn file_count(&self) -> u64 {
         self.file_count
+    }
+
+    fn total_size(&self) -> u64 {
+        self.total_size
+    }
+
+    fn get_entry(&self, name: &str) -> Result<Option<DirectoryEntry>> {
+        self.session
+            .connection
+            .query_row(
+                "SELECT ordinal, name, kind, target_id, total_size \
+                 FROM directory_entries WHERE set_id = ?1 AND name = ?2",
+                params![self.set_id.as_slice(), name],
+                directory_entry_from_row,
+            )
+            .optional()
+            .with_context(|| format!("无法点查 Directory 子项: {name}"))
+    }
+
+    fn scan_entries(&self, request: &PageRequest) -> Result<Page<DirectoryEntry>> {
+        let limit = request.limit_usize()?;
+        let retained_limit = limit.checked_add(1).context("Directory 页大小溢出")?;
+        let after = request
+            .after
+            .as_deref()
+            .map(|value| value.parse::<u64>().context("Directory cursor 无效"))
+            .transpose()?;
+        let after = after
+            .map(|value| encode_u64(value, "Directory cursor"))
+            .transpose()?
+            .unwrap_or(-1);
+        let mut statement = self.session.connection.prepare(
+            "SELECT ordinal, name, kind, target_id, total_size \
+             FROM directory_entries WHERE set_id = ?1 AND ordinal > ?2 \
+             ORDER BY ordinal LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                self.set_id.as_slice(),
+                after,
+                i64::try_from(retained_limit)?
+            ],
+            directory_entry_from_row,
+        )?;
+        let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = items.len() > limit;
+        if has_more {
+            items.pop();
+        }
+        let next = has_more.then(|| {
+            items
+                .last()
+                .expect("有后续 Directory 页时当前页不可能为空")
+                .ordinal
+                .to_string()
+        });
+        Ok(Page { items, next })
     }
 }
 
@@ -1184,24 +1372,26 @@ fn apply_index_upsert(
     Ok(())
 }
 
-struct SqliteTreeWriter<'a> {
+struct SqliteDirectoryWriter<'a> {
     store: &'a SqliteMetadataStore,
     validation_connection: Connection,
     set_id: Vec<u8>,
-    hasher: Option<TreeHasher>,
-    last_path: Option<String>,
-    batch: Vec<FileRecord>,
+    hasher: Option<DirectoryHasher>,
+    last_name: Option<String>,
+    batch: Vec<DirectoryEntry>,
     batch_bytes: usize,
+    file_count: u64,
+    total_size: u64,
     poisoned: bool,
     cleanup_required: bool,
 }
 
-impl fmt::Debug for SqliteTreeWriter<'_> {
+impl fmt::Debug for SqliteDirectoryWriter<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("SqliteTreeWriter")
+            .debug_struct("SqliteDirectoryWriter")
             .field("set_id", &self.set_id)
-            .field("last_path", &self.last_path)
+            .field("last_name", &self.last_name)
             .field("batch_len", &self.batch.len())
             .field("batch_bytes", &self.batch_bytes)
             .field("poisoned", &self.poisoned)
@@ -1210,73 +1400,92 @@ impl fmt::Debug for SqliteTreeWriter<'_> {
     }
 }
 
-impl SqliteTreeWriter<'_> {
+impl SqliteDirectoryWriter<'_> {
     fn flush(&mut self) -> Result<()> {
         if self.batch.is_empty() {
             return Ok(());
         }
         let batch = std::mem::take(&mut self.batch);
         self.batch_bytes = 0;
-        if let Err(error) = self.store.insert_tree_batch(&self.set_id, &batch) {
+        if let Err(error) = self.store.insert_directory_batch(&self.set_id, &batch) {
             self.poisoned = true;
-            return Err(error).context("无法写入 SQLite Tree staging 批次");
+            return Err(error).context("无法写入 SQLite Directory staging 批次");
         }
         Ok(())
     }
 }
 
-impl Drop for SqliteTreeWriter<'_> {
+impl Drop for SqliteDirectoryWriter<'_> {
     fn drop(&mut self) {
         if self.cleanup_required {
-            let _ = cleanup_tree_set(self.store, &self.set_id);
+            let _ = cleanup_directory_set(self.store, &self.set_id);
         }
     }
 }
 
-impl TreeWriter for SqliteTreeWriter<'_> {
-    fn append_file(&mut self, file: &FileRecord) -> Result<()> {
-        ensure!(!self.poisoned, "SQLite TreeWriter 已因先前写入错误失效");
-        validate_stored_file_record(&self.validation_connection, file)?;
-        if let Some(previous) = &self.last_path {
+impl DirectoryWriter for SqliteDirectoryWriter<'_> {
+    fn append_entry(&mut self, entry: &DirectoryEntry) -> Result<()> {
+        ensure!(
+            !self.poisoned,
+            "SQLite DirectoryWriter 已因先前写入错误失效"
+        );
+        let (file_count, total_size) =
+            validate_stored_directory_entry(&self.validation_connection, entry)?;
+        if let Some(previous) = &self.last_name {
             ensure!(
-                previous.as_str() < file.path.as_str(),
-                "TreeWriter 要求文件路径严格递增: {}",
-                file.path
+                previous.as_str() < entry.name.as_str(),
+                "DirectoryWriter 要求子项名称严格递增: {}",
+                entry.name
             );
         }
-        encode_u64(file.total_size, "Tree 文件大小")?;
-        encode_u64(file.chunk_count, "Tree Chunk 数量")?;
         let next_batch_bytes = self
             .batch_bytes
-            .checked_add(file.path.len().saturating_add(128))
-            .context("Tree staging 批次大小溢出")?;
+            .checked_add(entry.name.len().saturating_add(96))
+            .context("Directory staging 批次大小溢出")?;
         self.hasher
             .as_mut()
-            .context("SQLite TreeWriter hasher 已结束")?
-            .push(file)?;
+            .context("SQLite DirectoryWriter hasher 已结束")?
+            .push(entry)?;
+        self.file_count = self
+            .file_count
+            .checked_add(file_count)
+            .context("Directory 文件数量溢出")?;
+        self.total_size = self
+            .total_size
+            .checked_add(total_size)
+            .context("Directory 逻辑大小溢出")?;
         self.batch_bytes = next_batch_bytes;
-        self.last_path = Some(file.path.clone());
-        self.batch.push(file.clone());
+        self.last_name = Some(entry.name.clone());
+        self.batch.push(entry.clone());
         if self.batch.len() >= WRITE_BATCH_SIZE || self.batch_bytes >= WRITE_BATCH_BYTES {
             self.flush()?;
         }
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>) -> Result<String> {
-        ensure!(!self.poisoned, "SQLite TreeWriter 已因先前写入错误失效");
+    fn finish(mut self: Box<Self>) -> Result<DirectoryRef> {
+        ensure!(
+            !self.poisoned,
+            "SQLite DirectoryWriter 已因先前写入错误失效"
+        );
         self.flush()?;
-        let (id, file_count) = self
+        let (id, entry_count) = self
             .hasher
             .take()
-            .context("SQLite TreeWriter hasher 已结束")?
+            .context("SQLite DirectoryWriter hasher 已结束")?
             .finish();
-        let created = publish_tree_set(self.store, &self.set_id, &id, file_count)?;
+        let directory = DirectoryRef {
+            id,
+            entry_count,
+            file_count: self.file_count,
+            total_size: self.total_size,
+        };
+        let created = publish_directory_set(self.store, &self.set_id, &directory)?;
         if !created {
-            let _ = cleanup_tree_set(self.store, &self.set_id);
+            let _ = cleanup_directory_set(self.store, &self.set_id);
         }
         self.cleanup_required = false;
-        Ok(id)
+        Ok(directory)
     }
 }
 
@@ -1337,43 +1546,63 @@ fn publish_manifest_set(
     })
 }
 
-fn publish_tree_set(
+fn publish_directory_set(
     store: &SqliteMetadataStore,
     set_id: &[u8],
-    id: &str,
-    file_count: u64,
+    directory: &DirectoryRef,
 ) -> Result<bool> {
     let connection = store.open_existing(false)?;
-    let id_bytes = decode_id(id)?;
+    let id_bytes = decode_id(&directory.id)?;
     run_immediate(&connection, || {
         let updated = connection.execute(
-            "UPDATE tree_sets SET file_count = ?1 WHERE set_id = ?2 AND file_count IS NULL",
-            params![encode_u64(file_count, "Tree 文件数量")?, set_id],
+            "UPDATE directory_sets SET entry_count = ?1, file_count = ?2, total_size = ?3 \
+             WHERE set_id = ?4 AND entry_count IS NULL",
+            params![
+                encode_u64(directory.entry_count, "Directory 子项数量")?,
+                encode_u64(directory.file_count, "Directory 文件数量")?,
+                encode_u64(directory.total_size, "Directory 逻辑大小")?,
+                set_id
+            ],
         )?;
-        ensure!(updated == 1, "Tree staging set 不存在或已经结束");
+        ensure!(updated == 1, "Directory staging set 不存在或已经结束");
 
         let existing = connection
             .query_row(
-                "SELECT set_id, file_count FROM trees WHERE id = ?1",
+                "SELECT set_id, entry_count, file_count, total_size \
+                 FROM directories WHERE id = ?1",
                 params![id_bytes.as_slice()],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
             )
             .optional()?;
-        if let Some((existing_set, existing_count)) = existing {
+        if let Some((existing_set, entries, files, size)) = existing {
             ensure!(
-                decode_u64(existing_count, "已有 Tree 文件数量")? == file_count
-                    && tree_sets_equal(&connection, &existing_set, set_id)?,
-                "同一 Tree ID 已存在不同内容: {id}"
+                decode_u64(entries, "已有 Directory 子项数量")? == directory.entry_count
+                    && decode_u64(files, "已有 Directory 文件数量")? == directory.file_count
+                    && decode_u64(size, "已有 Directory 逻辑大小")? == directory.total_size
+                    && directory_sets_equal(&connection, &existing_set, set_id)?,
+                "同一 Directory ID 已存在不同内容: {}",
+                directory.id
             );
             return Ok(false);
         }
 
         connection.execute(
-            "INSERT INTO trees(id, set_id, file_count) VALUES (?1, ?2, ?3)",
+            "INSERT INTO directories(\
+                id, set_id, entry_count, file_count, total_size\
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 id_bytes.as_slice(),
                 set_id,
-                encode_u64(file_count, "Tree 文件数量")?
+                encode_u64(directory.entry_count, "Directory 子项数量")?,
+                encode_u64(directory.file_count, "Directory 文件数量")?,
+                encode_u64(directory.total_size, "Directory 逻辑大小")?,
             ],
         )?;
         Ok(true)
@@ -1403,21 +1632,22 @@ fn manifest_sets_equal(connection: &Connection, left: &[u8], right: &[u8]) -> Re
     Ok(different == 0)
 }
 
-fn tree_sets_equal(connection: &Connection, left: &[u8], right: &[u8]) -> Result<bool> {
+fn directory_sets_equal(connection: &Connection, left: &[u8], right: &[u8]) -> Result<bool> {
     let different: i64 = connection.query_row(
         "SELECT EXISTS( \
-             SELECT 1 FROM tree_files AS left_file \
-             LEFT JOIN tree_files AS right_file \
-               ON right_file.set_id = ?2 AND right_file.path = left_file.path \
-             WHERE left_file.set_id = ?1 AND (right_file.path IS NULL \
-                OR right_file.total_size <> left_file.total_size \
-                OR right_file.chunk_count <> left_file.chunk_count \
-                OR right_file.manifest_id <> left_file.manifest_id) \
+             SELECT 1 FROM directory_entries AS left_entry \
+             LEFT JOIN directory_entries AS right_entry \
+               ON right_entry.set_id = ?2 AND right_entry.ordinal = left_entry.ordinal \
+             WHERE left_entry.set_id = ?1 AND (right_entry.ordinal IS NULL \
+                OR right_entry.name <> left_entry.name \
+                OR right_entry.kind <> left_entry.kind \
+                OR right_entry.target_id <> left_entry.target_id \
+                OR right_entry.total_size <> left_entry.total_size) \
              UNION ALL \
-             SELECT 1 FROM tree_files AS right_file \
-             LEFT JOIN tree_files AS left_file \
-               ON left_file.set_id = ?1 AND left_file.path = right_file.path \
-             WHERE right_file.set_id = ?2 AND left_file.path IS NULL \
+             SELECT 1 FROM directory_entries AS right_entry \
+             LEFT JOIN directory_entries AS left_entry \
+               ON left_entry.set_id = ?1 AND left_entry.ordinal = right_entry.ordinal \
+             WHERE right_entry.set_id = ?2 AND left_entry.ordinal IS NULL \
              LIMIT 1 \
          )",
         params![left, right],
@@ -1438,12 +1668,15 @@ fn cleanup_manifest_set(store: &SqliteMetadataStore, set_id: &[u8]) -> Result<()
     })
 }
 
-fn cleanup_tree_set(store: &SqliteMetadataStore, set_id: &[u8]) -> Result<()> {
+fn cleanup_directory_set(store: &SqliteMetadataStore, set_id: &[u8]) -> Result<()> {
     let connection = store.open_existing(false)?;
     run_immediate(&connection, || {
         connection.execute(
-            "DELETE FROM tree_sets WHERE set_id = ?1 \
-             AND NOT EXISTS (SELECT 1 FROM trees WHERE trees.set_id = tree_sets.set_id)",
+            "DELETE FROM directory_sets WHERE set_id = ?1 \
+             AND NOT EXISTS (\
+                 SELECT 1 FROM directories \
+                 WHERE directories.set_id = directory_sets.set_id\
+             )",
             params![set_id],
         )?;
         Ok(())
@@ -1531,24 +1764,37 @@ fn open_manifest_in_session(
         .transpose()
 }
 
-fn open_tree_in_session(session: Rc<ReadSession>, id: &str) -> Result<Option<Box<dyn TreeReader>>> {
+fn open_directory_in_session(
+    session: Rc<ReadSession>,
+    id: &str,
+) -> Result<Option<Box<dyn DirectoryReader>>> {
     let id_bytes = decode_id(id)?;
     let stored = session
         .connection
         .query_row(
-            "SELECT set_id, file_count FROM trees WHERE id = ?1",
+            "SELECT set_id, entry_count, file_count, total_size \
+             FROM directories WHERE id = ?1",
             params![id_bytes.as_slice()],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
         )
         .optional()
-        .with_context(|| format!("无法打开 SQLite Tree: {id}"))?;
+        .with_context(|| format!("无法打开 SQLite Directory: {id}"))?;
     stored
-        .map(|(set_id, file_count)| {
-            Ok(Box::new(SqliteTreeReader {
+        .map(|(set_id, entry_count, file_count, total_size)| {
+            Ok(Box::new(SqliteDirectoryReader {
                 session,
                 set_id,
-                file_count: decode_u64(file_count, "Tree 文件数量")?,
-            }) as Box<dyn TreeReader>)
+                entry_count: decode_u64(entry_count, "Directory 子项数量")?,
+                file_count: decode_u64(file_count, "Directory 文件数量")?,
+                total_size: decode_u64(total_size, "Directory 逻辑大小")?,
+            }) as Box<dyn DirectoryReader>)
         })
         .transpose()
 }
@@ -1585,8 +1831,8 @@ impl MetadataReader for SqliteMetadataStore {
         open_manifest_in_session(self.read_session()?, id)
     }
 
-    fn open_tree(&self, id: &str) -> Result<Option<Box<dyn TreeReader + '_>>> {
-        open_tree_in_session(self.read_session()?, id)
+    fn open_directory(&self, id: &str) -> Result<Option<Box<dyn DirectoryReader + '_>>> {
+        open_directory_in_session(self.read_session()?, id)
     }
 
     fn get_commit(&self, id: &str) -> Result<Option<Commit>> {
@@ -1613,8 +1859,8 @@ impl MetadataReader for SqliteMetadataSnapshot {
         open_manifest_in_session(Rc::clone(&self.session), id)
     }
 
-    fn open_tree(&self, id: &str) -> Result<Option<Box<dyn TreeReader + '_>>> {
-        open_tree_in_session(Rc::clone(&self.session), id)
+    fn open_directory(&self, id: &str) -> Result<Option<Box<dyn DirectoryReader + '_>>> {
+        open_directory_in_session(Rc::clone(&self.session), id)
     }
 
     fn get_commit(&self, id: &str) -> Result<Option<Commit>> {
@@ -1623,8 +1869,8 @@ impl MetadataReader for SqliteMetadataSnapshot {
 }
 
 impl MetadataSnapshot for SqliteMetadataSnapshot {
-    fn scan_tree_ids(&self, request: &PageRequest) -> Result<Page<String>> {
-        scan_id_table(&self.session.connection, "trees", request)
+    fn scan_directory_ids(&self, request: &PageRequest) -> Result<Page<String>> {
+        scan_id_table(&self.session.connection, "directories", request)
     }
 
     fn scan_manifest_ids(&self, request: &PageRequest) -> Result<Page<String>> {
@@ -1645,10 +1891,6 @@ impl MetadataSnapshot for SqliteMetadataSnapshot {
 }
 
 impl MetadataStore for SqliteMetadataStore {
-    fn kind(&self) -> MetadataStoreKind {
-        MetadataStoreKind::Sqlite
-    }
-
     fn initialize(&self, head_reference: &str) -> Result<()> {
         validate_reference_name(head_reference)?;
         ensure_database_root(&self.root)?;
@@ -1722,8 +1964,8 @@ impl MetadataStore for SqliteMetadataStore {
         let connection = self.open_existing(true)?;
         let required_tables: i64 = connection.query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN ( \
-             'store_state', 'manifest_sets', 'manifest_chunks', 'manifests', 'tree_sets', \
-             'tree_files', 'trees', 'index_files', 'commits', 'refs')",
+             'store_state', 'manifest_sets', 'manifest_chunks', 'manifests', 'directory_sets', \
+             'directory_entries', 'directories', 'index_files', 'commits', 'refs')",
             [],
             |row| row.get(0),
         )?;
@@ -1751,7 +1993,7 @@ impl MetadataStore for SqliteMetadataStore {
         }
         verify_index(&session.connection)?;
         verify_published_manifests(Rc::clone(&session))?;
-        verify_published_trees(Rc::clone(&session))?;
+        verify_published_directories(Rc::clone(&session))?;
         verify_commits_and_references(Rc::clone(&session))?;
         Ok(())
     }
@@ -1840,16 +2082,18 @@ impl MetadataStore for SqliteMetadataStore {
         result
     }
 
-    fn begin_tree_write(&self) -> Result<Box<dyn TreeWriter + '_>> {
+    fn begin_directory_write(&self) -> Result<Box<dyn DirectoryWriter + '_>> {
         let validation_connection = self.open_existing(true)?;
-        Ok(Box::new(SqliteTreeWriter {
+        Ok(Box::new(SqliteDirectoryWriter {
             store: self,
             validation_connection,
-            set_id: self.create_tree_set()?,
-            hasher: Some(TreeHasher::new()),
-            last_path: None,
+            set_id: self.create_directory_set()?,
+            hasher: Some(DirectoryHasher::new()),
+            last_name: None,
             batch: Vec::with_capacity(WRITE_BATCH_SIZE),
             batch_bytes: 0,
+            file_count: 0,
+            total_size: 0,
             poisoned: false,
             cleanup_required: true,
         }))
@@ -2015,39 +2259,52 @@ fn verify_published_manifests(session: Rc<ReadSession>) -> Result<()> {
     Ok(())
 }
 
-fn verify_published_trees(session: Rc<ReadSession>) -> Result<()> {
+fn verify_published_directories(session: Rc<ReadSession>) -> Result<()> {
     let mut id_request = PageRequest::first(4_096)?;
     loop {
-        let id_page = scan_id_table(&session.connection, "trees", &id_request)?;
+        let id_page = scan_id_table(&session.connection, "directories", &id_request)?;
         for id in &id_page.items {
-            let reader = open_tree_in_session(Rc::clone(&session), id)?
-                .with_context(|| format!("Tree 在完整性检查期间消失: {id}"))?;
-            let mut hasher = TreeHasher::new();
-            let mut file_request = PageRequest::first(4_096)?;
-            let mut count = 0_u64;
+            let reader = open_directory_in_session(Rc::clone(&session), id)?
+                .with_context(|| format!("Directory 在完整性检查期间消失: {id}"))?;
+            let mut hasher = DirectoryHasher::new();
+            let mut entry_request = PageRequest::first(4_096)?;
+            let mut entry_count = 0_u64;
+            let mut file_count = 0_u64;
+            let mut total_size = 0_u64;
             let mut previous: Option<String> = None;
             loop {
-                let page = reader.scan_files(None, &file_request)?;
-                for file in page.items {
-                    validate_file_record(&file)?;
+                let page = reader.scan_entries(&entry_request)?;
+                for entry in page.items {
+                    validate_directory_entry(&entry)?;
                     if let Some(previous) = &previous {
-                        ensure!(previous < &file.path, "Tree 路径未严格递增: {id}");
+                        ensure!(previous < &entry.name, "Directory 名称未严格递增: {id}");
                     }
-                    hasher.push(&file)?;
-                    count = count.checked_add(1).context("Tree 文件数量溢出")?;
-                    previous = Some(file.path);
+                    let stats = validate_stored_directory_entry(&session.connection, &entry)?;
+                    hasher.push(&entry)?;
+                    entry_count = entry_count
+                        .checked_add(1)
+                        .context("Directory 子项数量溢出")?;
+                    file_count = file_count
+                        .checked_add(stats.0)
+                        .context("Directory 文件数量溢出")?;
+                    total_size = total_size
+                        .checked_add(stats.1)
+                        .context("Directory 大小溢出")?;
+                    previous = Some(entry.name);
                 }
                 let Some(next) = page.next else {
                     break;
                 };
-                file_request.after = Some(next);
+                entry_request.after = Some(next);
             }
             let (calculated, calculated_count) = hasher.finish();
             ensure!(
                 calculated == *id
-                    && calculated_count == reader.file_count()
-                    && count == reader.file_count(),
-                "Tree 内容与其 ID 或 header 不匹配: {id}"
+                    && calculated_count == reader.entry_count()
+                    && entry_count == reader.entry_count()
+                    && file_count == reader.file_count()
+                    && total_size == reader.total_size(),
+                "Directory 内容与其 ID 或 header 不匹配: {id}"
             );
         }
         let Some(next) = id_page.next else {
@@ -2078,6 +2335,10 @@ fn verify_commits_and_references(session: Rc<ReadSession>) -> Result<()> {
     loop {
         let page =
             scan_references_from_connection(&session.connection, "refs", &reference_request)?;
+        for reference in &page.items {
+            validate_reference_name(&reference.name)?;
+            validate_metadata_object_id(&reference.target)?;
+        }
         let Some(next) = page.next else {
             break;
         };

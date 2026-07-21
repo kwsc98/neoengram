@@ -13,6 +13,10 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+fuse-mount = ["dep:fuser"]
+
 [[bin]]
 name = "neoengram"
 path = "src/main.rs"
@@ -37,6 +41,12 @@ tempfile.workspace = true
 tokio.workspace = true
 unicode-normalization.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { workspace = true, optional = true, features = ["abi-7-31"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { workspace = true, optional = true, features = ["libfuse", "abi-7-19"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

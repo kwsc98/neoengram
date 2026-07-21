@@ -11,14 +11,12 @@ use crate::local::{
         ensure_directory, ensure_or_create_directory, is_transaction_draft_name,
         publish_json_if_absent, remove_dir_all_durable,
     },
-    metadata::{open_metadata_store, MetadataStoreKind},
+    metadata::open_metadata_store,
     objects::{open_object_store, ObjectStore, ObjectStoreKind},
 };
 
 use super::{
-    config::{
-        metadata_store_kind_name, read_repository_config, RepositoryConfig, CURRENT_FORMAT_VERSION,
-    },
+    config::{read_repository_config, RepositoryConfig, CURRENT_FORMAT_VERSION},
     Repository, DEFAULT_HEAD_REFERENCE, NEOENGRAM_DIR_NAME,
 };
 
@@ -49,38 +47,20 @@ fn neoengram_dir_exists(root: &Path) -> Result<bool> {
 
 impl Repository {
     pub(crate) fn at(root: PathBuf) -> Result<Self> {
-        Self::with_store_kinds(root, MetadataStoreKind::Sqlite, ObjectStoreKind::Loose)
+        Self::with_object_store(root, ObjectStoreKind::Loose)
     }
 
-    pub(crate) fn open_or_with_metadata_store(
-        root: PathBuf,
-        requested_metadata_store: Option<MetadataStoreKind>,
-    ) -> Result<Self> {
+    pub(crate) fn open_or_create(root: PathBuf) -> Result<Self> {
         if neoengram_dir_exists(&root)? {
             let repository_dir = root.join(NEOENGRAM_DIR_NAME);
-            let repository = Self::open(root).with_context(|| {
+            Self::open(root).with_context(|| {
                 format!(
                     "已有目录不是受支持的 NeoEngram 仓库: {}",
                     repository_dir.display()
                 )
-            })?;
-            if let Some(requested) = requested_metadata_store {
-                let actual = repository.metadata_store.kind();
-                ensure!(
-                    requested == actual,
-                    "已有仓库使用 `{}` 元数据后端，不能以 `{}` 重新初始化；NeoEngram 不会自动迁移元数据后端",
-                    metadata_store_kind_name(actual),
-                    metadata_store_kind_name(requested)
-                );
-            }
-            Ok(repository)
+            })
         } else {
-            match requested_metadata_store {
-                Some(metadata_store) => {
-                    Self::with_store_kinds(root, metadata_store, ObjectStoreKind::Loose)
-                }
-                None => Self::at(root),
-            }
+            Self::at(root)
         }
     }
 
@@ -94,19 +74,15 @@ impl Repository {
             config.format_version,
             CURRENT_FORMAT_VERSION
         );
-        Self::with_store_kinds(root, config.metadata_store, config.object_store)
+        Self::with_object_store(root, config.object_store)
     }
 
-    fn with_store_kinds(
-        root: PathBuf,
-        metadata_kind: MetadataStoreKind,
-        object_kind: ObjectStoreKind,
-    ) -> Result<Self> {
+    fn with_object_store(root: PathBuf, object_kind: ObjectStoreKind) -> Result<Self> {
         let metadata_dir = root.join(NEOENGRAM_DIR_NAME).join(METADATA_DIR_NAME);
         let objects_dir = root.join(NEOENGRAM_DIR_NAME).join(OBJECTS_DIR_NAME);
         Ok(Self {
             root,
-            metadata_store: open_metadata_store(metadata_kind, &metadata_dir),
+            metadata_store: open_metadata_store(&metadata_dir),
             object_store: open_object_store(object_kind, &objects_dir),
             object_store_kind: object_kind,
         })
@@ -242,8 +218,7 @@ impl Repository {
             ensure_or_create_directory(&directory)?;
         }
 
-        let current_config =
-            RepositoryConfig::current(self.metadata_store.kind(), self.object_store_kind);
+        let current_config = RepositoryConfig::current(self.object_store_kind);
         if self.repository_file().try_exists()? {
             let config = read_repository_config(&self.repository_file())?;
             ensure!(
@@ -285,10 +260,6 @@ impl Repository {
             "不支持的 NeoEngram 仓库格式版本 {}（当前支持 {}）",
             config.format_version,
             CURRENT_FORMAT_VERSION
-        );
-        ensure!(
-            config.metadata_store == self.metadata_store.kind(),
-            "仓库元数据后端配置与已打开后端不一致"
         );
         ensure!(
             config.object_store == self.object_store_kind,

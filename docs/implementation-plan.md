@@ -3,8 +3,8 @@
 > 本文是 NeoEngram 的唯一实现路线、能力状态和研究计划记录。代码、架构文档或
 > README 中出现的路线描述应与本文保持一致；如果出现冲突，以本文为准。
 
-最后更新：2026-07-19
-当前阶段：本地 Phase 1 已完成，分布式控制面尚未开始实现
+最后更新：2026-07-20
+当前阶段：本地 format v5 与只读 FUSE 已实现，跨平台实挂基准待完成
 
 ## 1. 产品目标
 
@@ -12,7 +12,7 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 训练数据的可复现维护、发布和读取，而不是完整的 AI 训练平台：
 
 - 客户端负责工作区、切块、校验、本地缓存和离线提交；
-- 中心控制面负责 tenant/project/repository/ref、Commit/Tree/Manifest、并发提交、权限、
+- 中心控制面负责 tenant/project/repository/ref、Commit/Directory/Manifest、并发提交、权限、
   会话和审计；
 - 数据面使用 S3-compatible 对象存储保存 Chunk/Pack payload，客户端保留本地缓存；
 - 读取面以固定的 Dataset Snapshot、Shard 分页和租约向训练任务提供一致数据；
@@ -22,8 +22,8 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 本项目只维护训练数据的文件、快照、分片和来源摘要，不建设训练调度、样本标注、特征工程、
 实验管理或训练 Run 平台。
 
-当前目标是中心化元数据控制面，不是 FUSE/内核挂载文件系统。`checkout --read-only` 是
-一次性只读快照目录；它不提供不可绕过的 mount、ACL 或 root 级安全隔离。
+本地读取面已增加固定 Commit 的只读 FUSE。`checkout --read-only` 仍是一次性权限快照；
+FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端下载或可写 overlay。
 
 第一阶段继续保持线性历史，暂不实现 `branch`、`switch`、merge、rebase 和远端协作分支
 管理；这些功能不能阻塞中心元数据和对象同步主链路。
@@ -68,28 +68,29 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 
 | 能力 | 状态 | 当前语义 |
 | --- | --- | --- |
-| `init` | 已完成 | 创建 SQLite 或 JSON 本地仓库，原子发布布局 |
+| `init` | 已完成 | 创建 format v5 SQLite 本地仓库，原子发布布局 |
 | `add` / `add -A` | 已完成 | FastCDC 切块、BLAKE3 去重、暂存新增/修改/删除 |
 | `rm` | 已完成 | 安全移除工作区或仅移除 index，支持持久事务和可验证回滚 |
 | `status` | 已完成 | 报告 staged、unstaged、deleted 和 untracked，并拒绝混合状态视图 |
 | `diff` | 已完成 | 比较工作区、index 和 Commit，并在输出前复核 Index/HEAD |
 | `restore` | 已完成 | 恢复 index 或工作区文件，最终发布时重新检查覆盖条件 |
-| `commit` | 已完成 | 发布不可变 Manifest、Tree、Commit，并以父节点 CAS 更新 HEAD/ref |
+| `commit` | 已完成 | 从分页 Index 流式发布 Manifest/Directory DAG/Commit，并 CAS 更新 HEAD/ref |
 | `log` / `show` | 已完成 | 查看线性历史和 Commit 文件清单 |
 | `checkout` | 已完成 | 物化 Commit，支持 detached HEAD 和 `main` 重新附着 |
 | `checkout --read-only DIR` | 已完成 | 在仓库外原子生成 Unix 只读快照，不改变当前仓库状态 |
 | `recover` | 已完成 | 恢复被中断的 checkout/rm 事务 |
-| `gc` | 已完成 | 回收未被 index 或已保存 Tree 引用的 Chunk |
-| `fsck` | 已完成 | 校验 refs、历史、Tree、Chunk 和对象完整性 |
+| `gc` | 已完成 | 从 Index 与全部 Commit roots 标记并回收 Chunk |
+| `fsck` | 已完成 | 校验 refs、历史、Directory/Manifest、Chunk 和对象完整性 |
+| `mount` / `unmount` | 进行中 | FUSE 协议和生命周期已实现；Linux/macOS 实挂矩阵与百万文件基准待完成 |
 | `.neoengramignore` | 已完成 | `add` 与 `status` 共用根目录忽略规则 |
 | `branch` / `switch` | 暂缓 | 按当前产品约束不实现 |
 
 ### 3.2 本地存储与一致性
 
-- `neoengram-core` 提供 Chunk、FileNode、Index、Tree、Commit 等领域模型。
+- `neoengram-core` 提供 Chunk、DirectoryEntry、FileNode、Index、Tree compatibility view、Commit 等领域模型。
 - `MetadataStore` 已有分页、固定 snapshot、Manifest reader/writer、Index transaction 和
   HEAD/ref CAS 契约。
-- SQLite 是默认元数据后端，JSON 后端用于兼容和契约测试。
+- SQLite 是唯一元数据后端；JSON 后端和旧格式兼容已删除。
 - `ObjectStore` 提供流式发布、校验读取、分页枚举、durability barrier 和协调删除。
 - 本地锁固定按 object -> worktree -> state 获取；工作区读操作共享、mutation 独占，冲突立即失败。
 - `add` 基于最初的 `IndexVersion` 做最终 CAS；status/diff 在输出前复核实际依赖的 Index 与
@@ -100,7 +101,7 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 
 ### 3.3 质量基线
 
-- workspace 测试覆盖 JSON/SQLite、CLI、跨进程锁、Index CAS、故障恢复、完整性、只读快照和忽略规则。
+- workspace 测试覆盖 SQLite、CLI、跨进程锁、Index CAS、故障恢复、完整性、FUSE core、只读快照和忽略规则。
 - fmt、Clippy `-D warnings`、rustdoc warnings、crate 归档内容检查和 CI 三平台测试已纳入质量门槛。
 - 当前代码和文档仍处开发期，仓库格式允许直接演进，不提供旧格式自动迁移。
 
@@ -109,9 +110,9 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 | 能力层 | 当前能力（已完成） | 下一步/未来能力 |
 | --- | --- | --- |
 | 客户端数据面 | 工作区、Index、FastCDC Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
-| 本地控制面 | SQLite/JSON 元数据、线性历史、HEAD/ref CAS、fsck/gc | 中心 PostgreSQL、租户/项目/仓库/ref、远端 CAS |
+| 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | 中心 PostgreSQL、租户/项目/仓库/ref、远端 CAS |
 | 远端数据面 | 尚未实现 | S3-compatible Chunk/Pack、幂等上传、Signed PUT/GET、对象生命周期 |
-| 读取面 | checkout 和 Unix 只读快照 | 固定 Dataset Snapshot、Shard 分页、Snapshot lease、训练读取票据 |
+| 读取面 | checkout、权限快照和固定 Commit FUSE | Dataset Snapshot、Shard 分页、mount lease、训练读取票据 |
 | 安全治理 | 本地路径安全和普通 Unix 权限 | JWT、RBAC、RLS、租户隔离、审计、密钥轮换和威胁模型 |
 | 训练数据语义 | 普通文件版本控制 | 可选 dataset sidecar、schema/source 摘要、确定性文件级 ShardSet |
 
@@ -166,7 +167,7 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 
 - PostgreSQL/S3 不作为本地 `MetadataStoreKind` 或 `ObjectStoreKind` 的简单枚举值。
 - 客户端只访问 `neoengramd` 的版本化 API，不直连 PostgreSQL，也不持有长期 S3 凭证。
-- 服务端必须在 ref CAS 前验证 Commit → Tree → Manifest → Chunk 的完整引用图。
+- 服务端必须在 ref CAS 前验证 Commit → Directory → Manifest → Chunk 的完整引用图。
 - 控制面负责认证、授权、元数据强一致、租约和审计；数据面只接受服务端签发的受限票据。
 - 读取面先把 ref 解析为固定 Commit，再分页读取 Manifest/Shard；ref 后续移动不能改变已打开
   Snapshot 的内容。
@@ -184,7 +185,7 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 
 交付：
 
-- 确认 Commit、Tree、Manifest、Chunk 的规范序列化、内容 ID 和引用完整性规则。
+- 确认 Commit、Directory、Manifest、Chunk 的规范序列化、内容 ID 和引用完整性规则。
 - 新建 `crates/neoengram-protocol`，定义版本化 DTO、cursor、错误码和 capability；DTO 不依赖
   SQLite、S3、CLI 或具体 HTTP 框架。
 - 固定 `PrincipalContext`、`Authenticator`、`Authorizer`、Action/ResourceScope、租户上下文、
@@ -209,7 +210,7 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
   role bindings、sessions、snapshots、leases/holds 和 append-only audit。
 - 实现外部 OIDC/JWKS Bearer JWT 验证、User/Service principal、RBAC、tenant context 和 PostgreSQL
   RLS；数据库运行角色不得拥有 `BYPASSRLS`。
-- 提供 repository 创建、读取 ref、固定 ref→Commit 的 Snapshot resolve、读取 Commit/Tree/Manifest、
+- 提供 repository 创建、读取 ref、固定 ref→Commit 的 Snapshot resolve、读取 Commit/Directory/Manifest、
   `ContentReady`/`Ready` 状态校验、lease acquire/renew/release、pin/hold 和 ref CAS API；P1 只实现
   元数据和 API 契约，不宣称远端对象已经可供训练读取。
 - 校验可选 `.neoengram-dataset.json`；解析 schema/source/lineage/shard 摘要但不建设样本级平台。
@@ -228,7 +229,7 @@ ID 和完整引用图校验。
 
 - 客户端 `remote add` 和 `push` 初版，创建绑定 tenant、repository、principal 和幂等键的上传
   session。
-- 服务端返回缺失的 Commit/Tree/Manifest/Chunk inventory；对象存在性、缺块结果和 CAS 当前值不
+- 服务端返回缺失的 Commit/Directory/Manifest/Chunk inventory；对象存在性、缺块结果和 CAS 当前值不
   泄漏给无权 tenant/project/repository/ref，已授权调用者才可看到冲突的当前 ref。
 - 通过短期 Signed PUT/multipart ticket 上传到 tenant-scoped S3；上传前后验证 hash、size、
   checksum 和 KMS/存储策略。
@@ -287,11 +288,12 @@ ID 和完整引用图校验。
 
 ### P6：通用文件系统语义
 
-状态：**研究**
+状态：**进行中**
 
+- 固定 Commit 的 Linux FUSE3/macFUSE 只读视图已实现；Dokan、可写 overlay 和远端下载不在 v1。
 - 新格式保存 POSIX mode、符号链接和必要的节点类型。
 - 明确跨平台路径、ACL/xattr、sparse 文件和权限恢复策略。
-- 评估真正的 FUSE/Dokan 只读视图是否需要独立产品线；普通 `checkout --read-only` 仍不是安全边界。
+- 普通 `checkout --read-only` 仍是权限快照，不等价于内核只读挂载。
 
 ## 7. 远端同步与读取不变量
 
@@ -401,17 +403,17 @@ root、外部 IdP/数据库/S3/KMS 管理员完全失陷，也不把 `checkout -
 
 ### 9.1 Snapshot 身份与描述
 
-- `DatasetSnapshot` 的稳定身份是 `tenant_id + project_id + repository_id + commit_id`；Tree ID
+- `DatasetSnapshot` 的稳定身份是 `tenant_id + project_id + repository_id + commit_id`；Directory ID
   只表示文件内容指纹，不另复制一套文件图。
 - ref（例如 `main`）只在训练开始时解析一次；训练、恢复、重试和审计始终记录完整 Commit ID。
-- 只有 Commit → Tree → Manifest → Chunk 全图已持久化并校验后才进入 `ContentReady`。普通文件
+- 只有 Commit → Directory → Manifest → Chunk 全图已持久化并校验后才进入 `ContentReady`。普通文件
   读取可以使用 `ContentReady`，但训练数据 API 只接受 `Ready`。
 - `Ready` 表示 `ContentReady` 且 sidecar 存在并通过 schema/source/ShardSet 校验；只有 `Ready`
   Snapshot 可获取训练 lease 和读取票据。sidecar 缺失的快照仍是合法的普通文件快照，但不能被
   宣布为可训练 Dataset Snapshot；sidecar 无效进入 `Rejected/Quarantined`，不得部分发布。
-- 根目录可有 `.neoengram-dataset.json`，作为普通版本文件进入 Tree，记录 schema digest、直接
+- 根目录可有 `.neoengram-dataset.json`，作为普通版本文件进入 Directory，记录 schema digest、直接
   source locator/version/digest、上游 `repository_id + commit_id`、transform recipe digest 和
-  ShardSet 参数。它不得包含当前 Commit/Tree ID、凭证或签名 URL；默认不进入训练文件选择集。
+ ShardSet 参数。它不得包含当前 Commit/Directory ID、凭证或签名 URL；默认不进入训练文件选择集。
 - source lineage v1 只记录直接来源和稳定 digest/版本；locator 必须移除凭证、签名参数和其他秘密，
   不执行或编排数据转换。
 - lineage 引用是不可自动展开的不透明摘要；读取上游 repository/Commit 的详细 metadata 仍需单独
@@ -425,7 +427,7 @@ root、外部 IdP/数据库/S3/KMS 管理员完全失陷，也不把 `checkout -
   分片，参数包括算法版本、seed、shard count 和 include roots。
 - 纳入选择集的文件恰好属于一个 shard，允许空 shard；不承诺样本、行、压缩包内部或任意
   byte-range 分片。Manifest/Shard 分页 cursor 必须绑定 tenant、repository、Commit 和查询参数。
-- `SnapshotHandle` 固定 Commit、Tree、状态和查询上下文；ref 后续移动不影响已经打开的 Snapshot。
+- `SnapshotHandle` 固定 Commit、Directory、状态和查询上下文；ref 后续移动不影响已经打开的 Snapshot。
 - 客户端暴露训练数据前必须完成 Chunk hash/receipt 校验；缺失、损坏或大小不符必须硬失败。
 
 ### 9.3 Lease、保留和 GC
@@ -489,7 +491,8 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 
 ## 12. 测试与发布门槛
 
-- 本地契约：JSON/SQLite、对象完整性、Index/HEAD CAS、固定锁序、恢复和路径安全。
+- 本地契约：SQLite、规范内容 ID、Directory/Manifest 分页、对象完整性、Index/HEAD CAS、固定锁序、恢复和路径安全。
+- FUSE 契约：inode/cookie、跨 Chunk range read、LRU/single-flight、只读错误码、固定 Commit、信号和 mount table 卸载验证。
 - 本地竞态：shared/shared 成功，shared/exclusive 拒绝；add 暂停期间工作区 mutation 被拒绝，
   index-only 更新使 add CAS 失败，status/diff 不输出跨版本报告。
 - 本地故障注入：rename 成功后的目录同步失败、事务 draft 发布前后退出、嵌套 backup、恢复重放、

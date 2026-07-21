@@ -6,7 +6,7 @@ use std::{
 };
 
 use neoengram_core::{Chunk, FileNode, Index, INDEX_FORMAT_VERSION};
-use serde::Deserialize;
+use rusqlite::{params, Connection};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -29,7 +29,7 @@ fn commit_rejects_a_missing_staged_object_without_publishing_ref() -> TestResult
         .output()?;
     assert!(!commit.status.success());
     assert!(String::from_utf8_lossy(&commit.stderr).contains(&chunk.hash));
-    assert!(!current_ref(repository.path()).exists());
+    assert!(!current_ref_exists(repository.path())?);
     Ok(())
 }
 
@@ -55,7 +55,7 @@ fn commit_rejects_same_size_corruption_without_publishing_ref() -> TestResult {
     let stderr = String::from_utf8_lossy(&commit.stderr);
     assert!(stderr.contains(&chunk.hash));
     assert!(stderr.contains("Hash"));
-    assert!(!current_ref(repository.path()).exists());
+    assert!(!current_ref_exists(repository.path())?);
     Ok(())
 }
 
@@ -117,8 +117,8 @@ fn fsck_accepts_a_valid_detached_head() -> TestResult {
 
     run_success(repository.path(), &["checkout", commit_id.as_str()])?;
     assert_eq!(
-        fs::read_to_string(repository.path().join(".neoengram/metadata/HEAD"))?,
-        format!("{commit_id}\n")
+        read_head(repository.path())?,
+        ("detached".to_owned(), commit_id)
     );
 
     let fsck = command(repository.path()).arg("fsck").output()?;
@@ -136,9 +136,10 @@ fn fsck_rejects_a_dangling_detached_head() -> TestResult {
     run_success(repository.path(), &["commit", "-m", "valid snapshot"])?;
 
     let dangling = "f".repeat(64);
-    fs::write(
-        repository.path().join(".neoengram/metadata/HEAD"),
-        format!("{dangling}\n"),
+    let connection = metadata_connection(repository.path())?;
+    connection.execute(
+        "UPDATE store_state SET head_kind = 'detached', head_target = ?1 WHERE singleton = 1",
+        params![dangling],
     )?;
     let fsck = command(repository.path()).arg("fsck").output()?;
     assert!(!fsck.status.success());
@@ -214,7 +215,7 @@ fn an_unlocked_stale_lock_file_does_not_block_writers() -> TestResult {
     run_success(repository.path(), &["add", "checkpoint.pt"])?;
     run_success(repository.path(), &["commit", "-m", "stale lock recovered"])?;
 
-    assert!(current_ref(repository.path()).is_file());
+    assert!(current_ref_exists(repository.path())?);
     Ok(())
 }
 
@@ -244,9 +245,7 @@ fn a_symlinked_lock_file_is_rejected_without_touching_its_target() -> TestResult
 }
 
 fn initialize(path: &Path) -> TestResult {
-    let output = command(path)
-        .args(["init", "--metadata-store", "json"])
-        .output()?;
+    let output = command(path).arg("init").output()?;
     assert_success(&output);
     Ok(())
 }
@@ -282,19 +281,59 @@ fn first_indexed_chunk(repository: &Path) -> Result<Chunk, Box<dyn Error>> {
 }
 
 fn read_index(repository: &Path) -> Result<Index, Box<dyn Error>> {
-    let metadata_dir = repository.join(".neoengram/metadata");
-    let stored: StoredIndex = serde_json::from_slice(&fs::read(metadata_dir.join("index.json"))?)?;
-    let mut files = Vec::with_capacity(stored.files.len());
-    for record in stored.files {
-        let manifest: StoredManifest = serde_json::from_slice(&fs::read(
-            metadata_dir.join(format!("manifests/{}.json", record.manifest_id)),
-        )?)?;
-        assert_eq!(manifest.total_size, record.total_size);
-        assert_eq!(u64::try_from(manifest.chunks.len())?, record.chunk_count);
+    let connection = metadata_connection(repository)?;
+    let mut statement = connection.prepare(
+        "SELECT path, total_size, chunk_count, lower(hex(manifest_id)) \
+         FROM index_files ORDER BY path",
+    )?;
+    let records = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut files = Vec::with_capacity(records.len());
+    for (path, total_size, chunk_count, manifest_id) in records {
+        let manifest_id = blake3::Hash::from_hex(&manifest_id)?;
+        let set_id: Vec<u8> = connection.query_row(
+            "SELECT set_id FROM manifests WHERE id = ?1",
+            params![manifest_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        let mut chunks = connection.prepare(
+            "SELECT lower(hex(object_id)), offset, size FROM manifest_chunks \
+             WHERE set_id = ?1 ORDER BY ordinal",
+        )?;
+        let chunks = chunks
+            .query_map(params![set_id], |row| {
+                Ok(Chunk {
+                    hash: row.get(0)?,
+                    offset: u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            error.into(),
+                        )
+                    })?,
+                    size: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            error.into(),
+                        )
+                    })?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(u64::try_from(chunks.len())?, u64::try_from(chunk_count)?);
         files.push(FileNode {
-            path: record.path,
-            total_size: record.total_size,
-            chunks: manifest.chunks,
+            path,
+            total_size: u64::try_from(total_size)?,
+            chunks,
         });
     }
     Ok(Index {
@@ -303,35 +342,39 @@ fn read_index(repository: &Path) -> Result<Index, Box<dyn Error>> {
     })
 }
 
-#[derive(Deserialize)]
-struct StoredIndex {
-    files: Vec<StoredFileRecord>,
-}
-
-#[derive(Deserialize)]
-struct StoredFileRecord {
-    path: String,
-    total_size: u64,
-    chunk_count: u64,
-    manifest_id: String,
-}
-
-#[derive(Deserialize)]
-struct StoredManifest {
-    total_size: u64,
-    chunks: Vec<Chunk>,
-}
-
 fn object_path(repository: &Path, hash: &str) -> PathBuf {
     repository.join(".neoengram/objects").join(hash)
 }
 
-fn current_ref(repository: &Path) -> PathBuf {
-    repository.join(".neoengram/metadata/refs/heads/main")
+fn metadata_connection(repository: &Path) -> Result<Connection, Box<dyn Error>> {
+    Ok(Connection::open(
+        repository.join(".neoengram/metadata/metadata.sqlite3"),
+    )?)
+}
+
+fn current_ref_exists(repository: &Path) -> Result<bool, Box<dyn Error>> {
+    let connection = metadata_connection(repository)?;
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM refs WHERE name = 'refs/heads/main')",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 fn current_commit_id(repository: &Path) -> Result<String, Box<dyn Error>> {
-    Ok(fs::read_to_string(current_ref(repository))?
-        .trim()
-        .to_owned())
+    let connection = metadata_connection(repository)?;
+    Ok(connection.query_row(
+        "SELECT target FROM refs WHERE name = 'refs/heads/main'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn read_head(repository: &Path) -> Result<(String, String), Box<dyn Error>> {
+    let connection = metadata_connection(repository)?;
+    Ok(connection.query_row(
+        "SELECT head_kind, head_target FROM store_state WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
 }

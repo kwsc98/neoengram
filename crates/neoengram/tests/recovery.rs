@@ -6,7 +6,7 @@ use std::{
     process::{Child, ChildStderr, Command, Output, Stdio},
 };
 
-use serde::Deserialize;
+use rusqlite::Connection;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -718,7 +718,7 @@ fn release_paused(
 }
 
 fn initialize(path: &Path) -> TestResult {
-    run_success(path, &["init", "--metadata-store", "json"])?;
+    run_success(path, &["init"])?;
     Ok(())
 }
 
@@ -739,13 +739,13 @@ fn command(current_dir: &Path) -> Command {
     command
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
 struct StoredIndex {
     format_version: u32,
     files: Vec<StoredFileRecord>,
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
 struct StoredFileRecord {
     path: String,
     total_size: u64,
@@ -754,9 +754,42 @@ struct StoredFileRecord {
 }
 
 fn read_index(repository: &Path) -> Result<StoredIndex, Box<dyn Error>> {
-    Ok(serde_json::from_slice(&fs::read(
-        repository.join(".neoengram/metadata/index.json"),
-    )?)?)
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    let format_version: i64 = connection.query_row(
+        "SELECT index_format FROM store_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT path, total_size, chunk_count, lower(hex(manifest_id)) \
+         FROM index_files ORDER BY path",
+    )?;
+    let files = statement
+        .query_map([], |row| {
+            Ok(StoredFileRecord {
+                path: row.get(0)?,
+                total_size: u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        error.into(),
+                    )
+                })?,
+                chunk_count: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        error.into(),
+                    )
+                })?,
+                manifest_id: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(StoredIndex {
+        format_version: u32::try_from(format_version)?,
+        files,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -766,12 +799,16 @@ enum StoredHead {
 }
 
 fn read_head(repository: &Path) -> Result<StoredHead, Box<dyn Error>> {
-    let contents = fs::read_to_string(repository.join(".neoengram/metadata/HEAD"))?;
-    let value = contents.trim();
-    if let Some(reference) = value.strip_prefix("ref: ") {
-        Ok(StoredHead::Symbolic(reference.to_owned()))
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    let (kind, target): (String, String) = connection.query_row(
+        "SELECT head_kind, head_target FROM store_state WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if kind == "attached" {
+        Ok(StoredHead::Symbolic(target))
     } else {
-        Ok(StoredHead::Detached(value.to_owned()))
+        Ok(StoredHead::Detached(target))
     }
 }
 
@@ -780,11 +817,12 @@ fn symbolic_main_head() -> StoredHead {
 }
 
 fn main_commit_id(repository: &Path) -> Result<String, Box<dyn Error>> {
-    Ok(
-        fs::read_to_string(repository.join(".neoengram/metadata/refs/heads/main"))?
-            .trim()
-            .to_owned(),
-    )
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    Ok(connection.query_row(
+        "SELECT target FROM refs WHERE name = 'refs/heads/main'",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 fn transaction_count(repository: &Path) -> Result<usize, Box<dyn Error>> {

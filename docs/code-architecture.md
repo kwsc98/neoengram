@@ -10,7 +10,7 @@ NeoEngram 当前采用两个 crate：`neoengram-core` 定义内容模型与格�
 ```text
 crates/
 ├── neoengram-core/
-│   └── src/models/              # Chunk、File、Index、Tree、Commit、格式常量
+│   └── src/models/              # Chunk、Directory entry、File、Index、Commit、格式常量
 └── neoengram/
     ├── src/
     │   ├── cli/                 # Clap 参数解析、调用 app、渲染结果
@@ -18,7 +18,8 @@ crates/
     │   └── local/
     │       ├── repository/      # 仓库门面、布局配置、锁、历史与领域校验
     │       ├── worktree/        # import.rs 切块、输入快照、物化和恢复事务
-    │       ├── metadata/        # MetadataStore 契约、attached/direct HEAD、JSON/SQLite 后端
+    │       ├── metadata/        # SQLite MetadataStore、规范 ID、Directory/Manifest 分页
+    │       ├── mount/           # 固定 Commit FUSE namespace、Chunk cache、平台生命周期
     │       ├── objects/         # contract.rs 契约、loose.rs/未来 pack 本地后端
     │       └── fs/              # 持久写入、原子发布和安全路径原语
     └── tests/                   # CLI 端到端与跨模块集成测试
@@ -31,9 +32,11 @@ crates/
 - `cli` 只处理输入输出；业务流程由 `app` 编排，不能把数据库或对象路径暴露为命令语义。
 - `app` 负责编排 `local::repository` 与 `local::worktree`；worktree 可以使用 repository
   提供的仓库上下文，但具体存储后端不能反向依赖 repository、app 或 cli。
-- `local::metadata` 只表示本地 SQLite/JSON 持久化，未来不能把 PostgreSQL 或远端 API
-  作为新的 `MetadataStoreKind` 塞入同一枚举。
+- `local::metadata` 只表示本地 SQLite 持久化，未来不能把 PostgreSQL 或远端 API
+  塞入同一个本地 trait。
 - `local::objects` 表示客户端本地对象库和缓存；远端 S3 不作为本地 `ObjectStoreKind`。
+- `local::mount` 只消费 Repository 的 Directory/Manifest/ObjectStore 接口，不直接访问 SQL
+  或对象物理路径；FUSE 请求之间不得持有仓库写锁或 SQLite transaction。
 - checkout/rm 的工作区 journal 属于 `local::worktree`，不进入 MetadataStore 或 ObjectStore。
 
 ## 依赖方向
