@@ -1,13 +1,13 @@
 # 本地元数据存储
 
-NeoEngram format v5 只使用 SQLite 元数据后端。旧 JSON 后端、后端选择参数和旧仓库读取均已
+NeoEngram format v6 只使用 SQLite 元数据后端。旧 JSON 后端、后端选择参数和旧仓库读取均已
 删除；版本不匹配的仓库必须重新初始化。
 
 ## 边界
 
 `MetadataStore` 管理：
 
-- 可变的 `Index`、`HEAD` 和 `refs/...`；
+- 按 `workspace_id` 隔离的 `Index`、`HEAD`、base Commit，以及共享的 `refs/...`；
 - 不可变的 Manifest、Directory 和 Commit；
 - Index transaction 与 HEAD/ref compare-exchange；
 - 固定 SQLite read snapshot、名称点查和有界分页；
@@ -47,7 +47,8 @@ Directory 子项名称必须是规范 UTF-8 单组件，按字节严格递增，
 
 - 发布 staging：`manifest_sets`、`manifest_chunks`、`directory_sets`、`directory_entries`
 - 不可变对象：`manifests`、`directories`、`commits`
-- 可变状态：`index_state`、`index_files`、`head_state`、`refs`
+- 仓库状态：`repository_state`、`refs`
+- Workspace 状态：`workspaces`、`workspace_index_files`
 
 Manifest Chunk 同时按 ordinal 和 offset 索引，`scan_chunks_from_offset` 可从覆盖请求 offset 的
 Chunk 开始读取。Directory entry 同时保存 name 和 ordinal，分别支持点查与稳定 cookie 分页。
@@ -72,8 +73,8 @@ Reader 不因一次点查枚举完整对象集合。调用方必须拒绝超大�
 
 ## Index 与 Commit
 
-Index 只保存 `path/manifest_id/total_size/chunk_count`，不重复 Chunk Vec。Index transaction
-使用 opaque `IndexVersion` 做 CAS；A -> B -> A 仍产生新版本。
+Index 只保存 `workspace_id/path/manifest_id/total_size/chunk_count`，不重复 Chunk Vec。每个
+Workspace 的 Index transaction 使用独立 opaque `IndexVersion` 做 CAS；A -> B -> A 仍产生新版本。
 
 Commit 在仓库写锁内分页读取有序 Index。实现使用深度优先目录栈：路径前缀结束时先发布子
 Directory，再把其 ID 追加到父 writer；内存只保留当前深度、一个 Index 页和 writer 的有界
@@ -82,7 +83,7 @@ Directory，再把其 ID 追加到父 writer；内存只保留当前深度、一
 ## 完整性与 GC
 
 SQLite `integrity_check` 和元数据校验覆盖全部持久化行、规范 ID、引用类型和递归统计。fsck 与
-GC 的 Chunk 可达性从当前 Index 以及所有 Commit root Directory 出发，Directory/Manifest 均
+GC 的 Chunk 可达性从所有 Workspace Index 以及所有 Commit root Directory 出发，Directory/Manifest 均
 分页遍历。当前所有 Commit 都是 GC root；引入历史裁剪前必须先实现活动 mount lease/pin。
 
 不可达的 staging 或发布失败元数据不会成为 Chunk root。元数据对象本身目前不删除。

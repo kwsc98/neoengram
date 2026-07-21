@@ -593,25 +593,7 @@ fn derive_inode(commit_id: &str, path: &str, kind: NodeKind, salt: u64) -> u64 {
 }
 
 fn resolve_target(repository: &Repository, target: &str) -> Result<String> {
-    let target = target.trim();
-    ensure!(!target.is_empty(), "mount TARGET 不能为空");
-    if target.eq_ignore_ascii_case("HEAD") {
-        return repository
-            .current_head()?
-            .commit_id()
-            .map(str::to_owned)
-            .context("仓库还没有 Commit；请先运行 `neoengram commit`");
-    }
-    if target == "main" || target == "refs/heads/main" {
-        return repository
-            .default_branch_head()?
-            .commit_id()
-            .map(str::to_owned)
-            .context("分支 main 还没有 Commit；请先运行 `neoengram commit`");
-    }
-    repository.validate_commit_id(target)?;
-    repository.read_commit(target)?;
-    Ok(target.to_owned())
+    repository.resolve_target_id(target)
 }
 
 fn validate_mountpoint(repository: &Repository, requested: &Path) -> Result<PathBuf> {
@@ -637,12 +619,24 @@ fn validate_mountpoint(repository: &Repository, requested: &Path) -> Result<Path
         "FUSE 挂载点必须为空: {}",
         mountpoint.display()
     );
-    let repository_root = fs::canonicalize(repository.root())?;
+    let storage_root = fs::canonicalize(repository.repository_dir())?;
     ensure!(
-        !mountpoint.starts_with(&repository_root) && !repository_root.starts_with(&mountpoint),
+        !mountpoint.starts_with(&storage_root) && !storage_root.starts_with(&mountpoint),
         "FUSE 挂载点必须与仓库根目录完全分离: {}",
         mountpoint.display()
     );
+    let managed_mounts = fs::canonicalize(repository.container_root().join("mounts"))?;
+    let is_managed_mount = mountpoint != managed_mounts && mountpoint.starts_with(&managed_mounts);
+    if !is_managed_mount {
+        for workspace in repository.list_workspaces()? {
+            ensure!(
+                !mountpoint.starts_with(&workspace.root)
+                    && !workspace.root.starts_with(&mountpoint),
+                "FUSE 挂载点必须与仓库根目录完全分离: {}",
+                mountpoint.display()
+            );
+        }
+    }
     Ok(mountpoint)
 }
 

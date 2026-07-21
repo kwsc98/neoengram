@@ -18,11 +18,24 @@ fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error
 
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     assert!(temporary.path().join(".neoengram/objects").is_dir());
-    assert!(temporary.path().join(".neoengram/files").is_dir());
+    assert!(temporary
+        .path()
+        .join(".neoengram/cache/materialized")
+        .is_dir());
     assert!(temporary.path().join(".neoengram/staging").is_dir());
     assert!(temporary.path().join(".neoengram/transactions").is_dir());
+    assert!(temporary.path().join("workspaces").is_dir());
+    assert!(temporary.path().join("mounts").is_dir());
+    assert!(temporary.path().join("exports").is_dir());
     let repository_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(repository_config["format_version"], 5);
+    assert_eq!(repository_config["format_version"], 6);
+    assert_eq!(
+        repository_config["repository_id"]
+            .as_str()
+            .expect("repository id")
+            .len(),
+        64
+    );
     assert!(repository_config.get("metadata_store").is_none());
     assert_eq!(repository_config["object_store"], "loose");
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
@@ -56,7 +69,7 @@ fn init_creates_a_missing_nested_repository_root() -> Result<(), Box<dyn std::er
         .path()
         .join("nested/repository/.neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["format_version"], 5);
+    assert_eq!(config["format_version"], 6);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     Ok(())
 }
@@ -87,7 +100,7 @@ fn crashed_new_init_can_be_retried() -> Result<(), Box<dyn std::error::Error>> {
     );
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["format_version"], 5);
+    assert_eq!(config["format_version"], 6);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     let add = command(temporary.path()).args(["add", "."]).output()?;
     assert!(
@@ -125,7 +138,7 @@ fn concurrent_init_publishes_exactly_one_repository() -> Result<(), Box<dyn std:
 
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["format_version"], 5);
+    assert_eq!(config["format_version"], 6);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     Ok(())
 }
@@ -182,6 +195,24 @@ fn mount_without_feature_reports_the_required_build_option(
     Ok(())
 }
 
+#[cfg(not(feature = "fuse-mount"))]
+#[test]
+fn mount_accepts_a_managed_mountpoint_before_platform_startup(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_temporary, repository, _outside) = committed_mount_fixture()?;
+    let managed = repository.join("mounts/managed");
+    fs::create_dir(&managed)?;
+    let output = command(&repository)
+        .args(["mount", "HEAD"])
+        .arg(&managed)
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("未启用 FUSE"), "{stderr}");
+    assert!(!stderr.contains("仓库根目录完全分离"), "{stderr}");
+    Ok(())
+}
+
 #[test]
 fn init_rejects_an_incomplete_existing_repository() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
@@ -215,7 +246,7 @@ fn init_rejects_the_previous_repository_format() -> Result<(), Box<dyn std::erro
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
     assert!(stderr.contains("格式版本 4"));
-    assert!(stderr.contains("当前支持 5"));
+    assert!(stderr.contains("当前支持 6"));
     assert!(!temporary.path().join(".neoengram/objects").exists());
     Ok(())
 }
@@ -1141,7 +1172,7 @@ fn read_index(metadata_dir: &Path) -> Result<Index, Box<dyn std::error::Error>> 
     let connection = Connection::open(metadata_dir.join("metadata.sqlite3"))?;
     let mut statement = connection.prepare(
         "SELECT path, total_size, chunk_count, lower(hex(manifest_id)) \
-         FROM index_files ORDER BY path",
+         FROM workspace_index_files WHERE workspace_id = zeroblob(16) ORDER BY path",
     )?;
     let stored = statement
         .query_map([], |row| {
@@ -1291,7 +1322,7 @@ fn current_commit_id(metadata_dir: &Path) -> Result<String, Box<dyn std::error::
 fn read_head(metadata_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let connection = Connection::open(metadata_dir.join("metadata.sqlite3"))?;
     let (kind, target): (String, String) = connection.query_row(
-        "SELECT head_kind, head_target FROM store_state WHERE singleton = 1",
+        "SELECT head_kind, head_target FROM workspaces WHERE id = zeroblob(16)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;

@@ -102,21 +102,7 @@ pub(crate) fn materialize_read_only_snapshot(
 }
 
 fn resolve_target(repository: &Repository, target: &str) -> Result<(String, Tree)> {
-    let current_head = repository.current_head()?;
-    let current_id = current_head
-        .commit_id()
-        .context("仓库还没有 Commit；请先运行 `neoengram commit`")?;
-    let target_id = if target.eq_ignore_ascii_case("HEAD") {
-        current_id.to_owned()
-    } else if target == "main" || target == "refs/heads/main" {
-        repository
-            .default_branch_head()?
-            .commit_id()
-            .context("分支 main 还没有 Commit；请先运行 `neoengram commit`")?
-            .to_owned()
-    } else {
-        target.to_owned()
-    };
+    let target_id = repository.resolve_target_id(target)?;
     let commit = repository.read_commit(&target_id)?;
     let tree = repository.read_tree(&commit.tree_hash)?;
     Ok((target_id, tree))
@@ -230,15 +216,24 @@ fn validate_destination(repository: &Repository, requested: &Path) -> Result<Pat
     );
     ensure_no_symlink_ancestors(parent)?;
 
-    let repository_root = fs::canonicalize(repository.root())
-        .with_context(|| format!("无法解析仓库根目录: {}", repository.root().display()))?;
     let canonical_parent = fs::canonicalize(parent)
         .with_context(|| format!("无法解析只读快照目标父目录: {}", parent.display()))?;
+    let storage_root = fs::canonicalize(repository.repository_dir())?;
     ensure!(
-        !canonical_parent.starts_with(&repository_root),
+        !canonical_parent.starts_with(&storage_root),
         "只读快照目标不能位于当前 NeoEngram 工作区或内部目录: {}",
         normalized.display()
     );
+    let managed_exports = fs::canonicalize(repository.container_root().join("exports"))?;
+    if !canonical_parent.starts_with(&managed_exports) {
+        for workspace in repository.list_workspaces()? {
+            ensure!(
+                !canonical_parent.starts_with(&workspace.root),
+                "只读快照目标不能位于当前 NeoEngram 工作区或内部目录: {}",
+                normalized.display()
+            );
+        }
+    }
 
     match fs::symlink_metadata(&normalized) {
         Ok(_) => bail!(
@@ -315,7 +310,7 @@ fn ensure_supported_platform() -> Result<()> {
 
 #[cfg(not(unix))]
 fn ensure_supported_platform() -> Result<()> {
-    bail!("`checkout --read-only` 当前仅支持 Unix/macOS；当前平台不提供安全的只读权限发布")
+    bail!("`export` 当前仅支持 Unix/macOS；当前平台不提供安全的只读权限发布")
 }
 
 #[cfg(unix)]
@@ -350,7 +345,7 @@ fn set_read_only_tree(root: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_read_only_tree(_root: &Path) -> Result<()> {
-    bail!("`checkout --read-only` 当前仅支持 Unix/macOS；无法设置 0444/0555 权限")
+    bail!("`export` 当前仅支持 Unix/macOS；无法设置 0444/0555 权限")
 }
 
 #[cfg(unix)]

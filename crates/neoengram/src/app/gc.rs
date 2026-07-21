@@ -52,7 +52,7 @@ fn collect_and_reclaim(repository: &Repository, dry_run: bool) -> Result<GcRepor
 fn mark_referenced_chunks(repository: &Repository) -> Result<HashMap<String, u64>> {
     let mut referenced = HashMap::new();
     let mut manifests = HashSet::new();
-    repository.visit_index_files(|record| {
+    repository.visit_all_workspace_index_files(|record| {
         collect_manifest(
             repository,
             &record.manifest_id,

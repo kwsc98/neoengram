@@ -3,8 +3,8 @@
 > 本文是 NeoEngram 的唯一实现路线、能力状态和研究计划记录。代码、架构文档或
 > README 中出现的路线描述应与本文保持一致；如果出现冲突，以本文为准。
 
-最后更新：2026-07-20
-当前阶段：本地 format v5 与只读 FUSE 已实现，跨平台实挂基准待完成
+最后更新：2026-07-21
+当前阶段：本地 format v6、多 Workspace 与只读 FUSE 已实现，跨平台实挂基准待完成
 
 ## 1. 产品目标
 
@@ -22,11 +22,11 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 本项目只维护训练数据的文件、快照、分片和来源摘要，不建设训练调度、样本标注、特征工程、
 实验管理或训练 Run 平台。
 
-本地读取面已增加固定 Commit 的只读 FUSE。`checkout --read-only` 仍是一次性权限快照；
+本地读取面已增加固定 Commit 的只读 FUSE。`export` 提供一次性权限快照；
 FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端下载或可写 overlay。
 
-第一阶段继续保持线性历史，暂不实现 `branch`、`switch`、merge、rebase 和远端协作分支
-管理；这些功能不能阻塞中心元数据和对象同步主链路。
+第一阶段继续保持线性历史。Workspace 创建可以原子创建并独占分支，但暂不提供独立
+`branch`/`switch`、merge、rebase 和远端协作分支管理；这些功能不能阻塞中心元数据和对象同步主链路。
 
 当前已确认或采用的默认假设（远端能力尚未实现）：
 
@@ -68,7 +68,8 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 
 | 能力 | 状态 | 当前语义 |
 | --- | --- | --- |
-| `init` | 已完成 | 创建 format v5 SQLite 本地仓库，原子发布布局 |
+| `init` | 已完成 | 创建 format v6 SQLite 本地仓库、repository_id 和受管目录 |
+| `workspace create/list/remove` | 已完成 | 独立 HEAD/Index/base、分支独占、内外部 Workspace 与安全删除 |
 | `add` / `add -A` | 已完成 | FastCDC 切块、BLAKE3 去重、暂存新增/修改/删除 |
 | `rm` | 已完成 | 安全移除工作区或仅移除 index，支持持久事务和可验证回滚 |
 | `status` | 已完成 | 报告 staged、unstaged、deleted 和 untracked，并拒绝混合状态视图 |
@@ -77,13 +78,13 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | `commit` | 已完成 | 从分页 Index 流式发布 Manifest/Directory DAG/Commit，并 CAS 更新 HEAD/ref |
 | `log` / `show` | 已完成 | 查看线性历史和 Commit 文件清单 |
 | `checkout` | 已完成 | 物化 Commit，支持 detached HEAD 和 `main` 重新附着 |
-| `checkout --read-only DIR` | 已完成 | 在仓库外原子生成 Unix 只读快照，不改变当前仓库状态 |
+| `export TARGET DIR` | 已完成 | 原子生成 Unix 只读快照，不改变当前 Workspace 状态 |
 | `recover` | 已完成 | 恢复被中断的 checkout/rm 事务 |
-| `gc` | 已完成 | 从 Index 与全部 Commit roots 标记并回收 Chunk |
+| `gc` | 已完成 | 从全部 Workspace Index 与全部 Commit roots 标记并回收 Chunk |
 | `fsck` | 已完成 | 校验 refs、历史、Directory/Manifest、Chunk 和对象完整性 |
 | `mount` / `unmount` | 进行中 | FUSE 协议和生命周期已实现；Linux/macOS 实挂矩阵与百万文件基准待完成 |
 | `.neoengramignore` | 已完成 | `add` 与 `status` 共用根目录忽略规则 |
-| `branch` / `switch` | 暂缓 | 按当前产品约束不实现 |
+| 独立 `branch` / `switch` | 暂缓 | Workspace `--branch` 已有；不提供独立管理命令 |
 
 ### 3.2 本地存储与一致性
 
@@ -92,7 +93,7 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
   HEAD/ref CAS 契约。
 - SQLite 是唯一元数据后端；JSON 后端和旧格式兼容已删除。
 - `ObjectStore` 提供流式发布、校验读取、分页枚举、durability barrier 和协调删除。
-- 本地锁固定按 object -> worktree -> state 获取；工作区读操作共享、mutation 独占，冲突立即失败。
+- 本地锁固定按 object -> Workspace worktree -> state 获取；工作区读操作共享、mutation 独占，冲突立即失败。
 - `add` 基于最初的 `IndexVersion` 做最终 CAS；status/diff 在输出前复核实际依赖的 Index 与
   HEAD/main。
 - checkout/rm 在工作区 mutation 前原子发布并同步持久 journal；恢复会保留任何无法证明安全的事务。
@@ -293,7 +294,7 @@ ID 和完整引用图校验。
 - 固定 Commit 的 Linux FUSE3/macFUSE 只读视图已实现；Dokan、可写 overlay 和远端下载不在 v1。
 - 新格式保存 POSIX mode、符号链接和必要的节点类型。
 - 明确跨平台路径、ACL/xattr、sparse 文件和权限恢复策略。
-- 普通 `checkout --read-only` 仍是权限快照，不等价于内核只读挂载。
+- 普通 `export` 仍是权限快照，不等价于内核只读挂载。
 
 ## 7. 远端同步与读取不变量
 
@@ -397,7 +398,7 @@ sidecar 私密字段和数据内容不得进入审计或普通服务日志。
 重点防护恶意或失陷客户端、JWT 伪造/重放、越权 ref 更新、session 劫持、跨租户引用、对象存在性
 探测、Signed URL 权限放大、上传损坏、CAS 竞态、恶意大 Manifest、并发/带宽/quota 资源耗尽、
 票据出现在 Referer/代理日志/shell history/崩溃转储以及审计字段注入。明确不承诺抵御客户端
-root、外部 IdP/数据库/S3/KMS 管理员完全失陷，也不把 `checkout --read-only` 当作不可绕过的安全边界。
+root、外部 IdP/数据库/S3/KMS 管理员完全失陷，也不把 `export` 当作不可绕过的安全边界。
 
 ## 9. 训练数据 Snapshot、Shard 与生命周期
 

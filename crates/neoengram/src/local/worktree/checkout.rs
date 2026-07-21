@@ -12,18 +12,17 @@ use tempfile::{Builder, NamedTempFile};
 
 use crate::local::{
     fs::durable::{
-        create_dir_all_durable, publish_transaction_draft_observed, remove_dir_all_durable,
-        rename_noreplace_durable, sync_directory, sync_parent, write_bytes_atomic,
-        write_json_atomic, CHECKOUT_TRANSACTION_DRAFT_PREFIX,
+        create_dir_all_durable, ensure_or_create_directory, publish_transaction_draft_observed,
+        remove_dir_all_durable, rename_noreplace_durable, sync_directory, sync_parent,
+        write_bytes_atomic, write_json_atomic, CHECKOUT_TRANSACTION_DRAFT_PREFIX,
     },
-    metadata::HeadState,
+    metadata::{describe_manifest, HeadState},
     objects::ObjectSpec,
     repository::{Repository, RepositoryWriteLock},
 };
 
 use super::workspace::{file_matches_node, logical_join, safe_leaf_metadata, workspace_path};
 
-const FILE_HASH_DOMAIN: &[u8] = b"neoengram-file-v2";
 const JOURNAL_FORMAT_VERSION: u32 = 2;
 const JOURNAL_FILE_NAME: &str = "journal.json";
 const ORIGINAL_INDEX_FILE_NAME: &str = "index.before.json";
@@ -97,12 +96,15 @@ fn checkout_snapshot_locked(
 
     let (target_id, target_head) = if target.eq_ignore_ascii_case("HEAD") {
         (head_id.to_owned(), original_head.state().clone())
-    } else if target == "main" || target == "refs/heads/main" {
-        let branch_head = repository.default_branch_head()?;
-        let branch_id = branch_head
-            .commit_id()
-            .context("分支 main 还没有 Commit；请先运行 `neoengram commit`")?;
-        (branch_id.to_owned(), branch_head.state().clone())
+    } else if target.starts_with("refs/heads/") || target.len() != 64 {
+        let reference = if target.starts_with("refs/heads/") {
+            target.to_owned()
+        } else {
+            format!("refs/heads/{target}")
+        };
+        repository.ensure_branch_available(&reference)?;
+        let branch_id = repository.resolve_target_id(&reference)?;
+        (branch_id, HeadState::Attached { reference })
     } else {
         ensure!(!target.is_empty(), "Checkout TARGET 不能为空");
         (
@@ -431,7 +433,7 @@ fn prepare_file_caches(
         if !paths.contains(&file.path) {
             continue;
         }
-        let file_id = file_cache_id(file);
+        let file_id = file_cache_id(file)?;
         let cache_path = if let Some(existing) = cache_by_id.get(&file_id) {
             existing.clone()
         } else {
@@ -444,20 +446,17 @@ fn prepare_file_caches(
     Ok(cache_by_path)
 }
 
-fn file_cache_id(file: &FileNode) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(FILE_HASH_DOMAIN);
-    hasher.update(&[0]);
-    hasher.update(&file.total_size.to_le_bytes());
-    for chunk in &file.chunks {
-        hasher.update(chunk.hash.as_bytes());
-        hasher.update(&chunk.size.to_le_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
+fn file_cache_id(file: &FileNode) -> Result<String> {
+    Ok(describe_manifest(file.total_size, &file.chunks)?.id)
 }
 
 fn ensure_file_cache(repository: &Repository, file: &FileNode, file_id: &str) -> Result<PathBuf> {
-    let cache_path = repository.files_dir().join(file_id);
+    let shard = file_id
+        .get(..2)
+        .context("Manifest ID 太短，无法构造缓存分片")?;
+    let cache_dir = repository.files_dir().join(shard);
+    ensure_or_create_directory(&cache_dir)?;
+    let cache_path = cache_dir.join(file_id);
     match fs::symlink_metadata(&cache_path) {
         Ok(metadata) => {
             ensure!(
@@ -479,7 +478,7 @@ fn ensure_file_cache(repository: &Repository, file: &FileNode, file_id: &str) ->
     }
 
     let mut temporary =
-        NamedTempFile::new_in(repository.files_dir()).context("无法创建完整文件缓存临时文件")?;
+        NamedTempFile::new_in(&cache_dir).context("无法创建完整文件缓存临时文件")?;
     for chunk in &file.chunks {
         repository.object_store().copy_to(
             &ObjectSpec::new(chunk.hash.clone(), chunk.size)?,

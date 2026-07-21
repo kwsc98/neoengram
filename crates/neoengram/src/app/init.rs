@@ -83,7 +83,7 @@ fn initialize_new_repository(root: &Path) -> Result<()> {
     })?;
 
     let published = Repository::open_or_create(root.to_path_buf())?;
-    published.validate()
+    published.initialize_layout()
 }
 
 fn ensure_repository_root(path: &Path) -> Result<()> {

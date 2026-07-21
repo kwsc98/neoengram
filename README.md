@@ -59,15 +59,17 @@ neoengram status
 neoengram diff --staged
 neoengram commit -m "initial snapshot"
 neoengram log
-neoengram checkout HEAD --read-only ../model-snapshot
-mkdir ../model-mount
-neoengram mount HEAD ../model-mount
-# 另一个终端：neoengram unmount ../model-mount
+neoengram workspace create experiment --from HEAD
+neoengram workspace list
+neoengram export HEAD exports/model-snapshot
+mkdir mounts/model
+neoengram mount HEAD mounts/model
+# 另一个终端：neoengram unmount mounts/model
 neoengram gc --dry-run
 neoengram fsck
 ```
 
-format v5 固定使用 SQLite；`init --metadata-store` 已删除。旧格式不探测、不迁移，打开时会
+format v6 固定使用 SQLite；`init --metadata-store` 已删除。旧格式不迁移，打开时会
 明确要求重新初始化。
 
 Linux 使用 `fuser` 的无系统 libfuse FUSE3 路径，运行时需要内核 FUSE 和 `fusermount3`。
@@ -86,25 +88,28 @@ no-replace rename 原子发布为 `.neoengram`。进程在发布前退出只会�
 - `rm`、`restore --force` 和 `checkout --force` 会按请求修改工作区。虽然命令间使用 fail-fast
   锁和恢复事务，运行期间仍应避免让其他程序改写同一路径。
 - 常规本地工作流支持 Linux、macOS 和 Windows；FUSE 挂载支持 Linux FUSE3 与 macOS macFUSE。
-  `checkout --read-only` 仅依赖权限位，而 FUSE 视图由内核强制只读且仅挂载用户可访问。
+  `export` 仅依赖权限位，而 FUSE 视图由内核强制只读且仅挂载用户可访问。
 - 当前模型不保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。提交前应确认这些语义不会
   影响数据的可复现性。
 
 ## 本地布局
 
 ```text
-.neoengram/
-├── objects/                         # 不可变 CDC 数据块：objects/<blake3>
-│   └── .tmp/                        # 未发布临时对象
-├── files/                           # checkout 使用的完整文件缓存
-├── staging/                         # add 切块期间的稳定输入快照
-├── transactions/                    # checkout/rm journal、暂存文件和故障备份
-└── metadata/
-    ├── repository.json              # format v5 与对象后端
-    ├── write.lock                   # 按需创建的仓库写锁；文件可跨进程保留
-    ├── worktree.lock                # 工作区共享/独占 advisory lock
-    ├── objects.lock                 # add 与 gc 共享的对象发布/回收锁
-    └── metadata.sqlite3             # Index/HEAD/refs 与不可变元数据对象
+repository-root/                     # 默认 main Workspace
+├── .neoengram/
+│   ├── objects/                     # 不可变 CDC Chunk
+│   ├── cache/materialized/          # Manifest ID 分片的完整文件缓存
+│   ├── staging/                     # add 的稳定输入快照
+│   ├── transactions/                # main Workspace 恢复事务
+│   └── metadata/
+│       ├── repository.json          # format v6、repository_id、对象后端
+│       ├── objects.lock
+│       ├── write.lock
+│       └── metadata.sqlite3         # 共享对象、refs、Workspace-scoped HEAD/Index
+├── workspaces/<name>/               # 其他受管可写 Workspace
+│   └── .neoengram/{locks,transactions}/
+├── mounts/<name>/                   # 固定 Commit FUSE 挂载点
+└── exports/<name>/                  # 物化只读导出
 ```
 
 提交采用追加式发布顺序：先验证全部 Chunk 并完成 ObjectStore durability barrier，再写并同步
@@ -112,7 +117,7 @@ Manifest、Directory 和 Commit，最后通过 CAS 原子更新当前分支引�
 使用 `synchronous=FULL` 的 WAL 事务和发布 staging 表。
 
 本地并发协调使用三层 OS advisory lock，固定获取顺序为
-`objects.lock -> worktree.lock -> write.lock`。`add`、`status` 和 `diff` 共享工作区锁；checkout、
+`objects.lock -> workspace worktree.lock -> write.lock`。`add`、`status` 和 `diff` 共享工作区锁；checkout、
 rm、工作区 restore 和 recover 独占工作区锁；commit 与 `restore --staged` 只锁元数据状态；
 gc/fsck 先协调对象再锁状态。
 锁冲突会立即失败并要求重试。`add` 最终以最初读取的 `IndexVersion` 做 CAS，status/diff 在
@@ -135,13 +140,14 @@ barrier。Repository 和命令层都不再依赖对象物理路径。
 
 ```json
 {
-  "format_version": 5,
+  "format_version": 6,
+  "repository_id": "<64-char lowercase id>",
   "object_store": "loose"
 }
 ```
 
-完整文件缓存和 checkout/rm journal 不放进上述两个存储接口：它们分别是可淘汰派生数据和
-跨工作区 rename/元数据提交的恢复协议。逐项接口语义见
+完整文件缓存和 checkout/rm journal 不放进上述两个存储接口：缓存按 Manifest ID 共享，
+journal 位于各 Workspace 自身文件系统中。逐项接口语义见
 [`local/metadata/README.md`](crates/neoengram/src/local/metadata/README.md)，整体规模预算和迁移顺序
 见 [`docs/storage-architecture.md`](docs/storage-architecture.md)，源码职责与未来扩展落点见
 [`docs/code-architecture.md`](docs/code-architecture.md)；实现路线和研究记录见
@@ -210,6 +216,30 @@ neoengram restore --force path/to/data
 工作区 restore 在最终发布前会重新检查目标。没有 `--force` 时拒绝覆盖检查后出现或变化的内容；
 `--force` 也只替换已经观察到的普通文件，始终拒绝目录、符号链接和特殊文件。
 
+## 多 Workspace
+
+每个 Workspace 有独立 `base_commit_id`、HEAD、Index、worktree lock 和恢复事务，但共享外层
+`.neoengram` 的 Chunk、Manifest、Directory、Commit、refs 和物化缓存：
+
+```bash
+# Detached Workspace
+neoengram workspace create experiment --from HEAD
+
+# 创建并独占新分支
+neoengram workspace create feature --from main --branch feature/data
+
+# 注册仓库外目录；该目录通过 repository_id + workspace_id 指针发现仓库
+neoengram workspace create training --from HEAD --path /Volumes/Data/training
+
+neoengram workspace list
+neoengram workspace remove experiment
+neoengram workspace remove experiment --force
+```
+
+同一个分支最多绑定一个可写 Workspace；Detached Workspace 不受限制。`commit` 的不可变对象
+始终写入共享仓库，Attached Workspace 通过 CAS 同时推进分支和自己的 base Commit，其他
+Workspace 不会自动移动。GC/fsck 会遍历所有 Workspace Index。
+
 ## 恢复版本
 
 重新物化当前 HEAD，不改变 attached/detached 状态：
@@ -262,12 +292,13 @@ Checkout 只处理发生变化的文件，校验其 Chunk 后组装完整文件�
 把 TARGET 一次解析为固定 Commit 并前台挂载：
 
 ```bash
-mkdir /path/outside-repository/mountpoint
-neoengram mount <HEAD|main|COMMIT_ID> /path/outside-repository/mountpoint
-neoengram mount HEAD /path/outside-repository/mountpoint --cache-size-mib 1024
+mkdir mounts/model
+neoengram mount <HEAD|BRANCH|COMMIT_ID> mounts/model
+neoengram mount HEAD mounts/model --cache-size-mib 1024
 ```
 
-挂载点必须已存在、为空、没有符号链接祖先，并与仓库根目录互不包含。挂载后 HEAD/ref 移动
+挂载点必须已存在、为空且没有符号链接祖先。仓库受管的 `mounts/<name>` 可以直接使用；其他
+路径必须与仓库存储和全部 Workspace 互不包含。挂载后 HEAD/ref 移动
 不会改变视图。文件报告 `0444`，目录报告 `0555`；只支持普通文件，所有写入、删除、rename、
 truncate、chmod/chown、link/symlink 返回 `EROFS`，xattr 返回 `ENOTSUP`。随机读通过 Manifest
 offset 索引定位 Chunk，完整读取并校验后进入按字节计费的 single-flight LRU；损坏或缺失映射
@@ -276,7 +307,7 @@ offset 索引定位 Chunk，完整读取并校验后进入按字节计费的 sin
 `mount` 默认前台阻塞，`Ctrl-C`/`SIGTERM` 正常卸载。也可以从另一个终端执行：
 
 ```bash
-neoengram unmount /path/outside-repository/mountpoint
+neoengram unmount mounts/model
 ```
 
 `unmount` 会先验证 mount table 中的 NeoEngram 标识；Linux 调用 `fusermount3 -u`，macOS 调用
@@ -292,7 +323,7 @@ neoengram recover
 neoengram recover --abort
 ```
 
-checkout/rm 会先在 `transactions/.neoengram-tmp-{operation}-*` 构造并同步完整 draft，再以
+checkout/rm 会先在当前 Workspace 的 `.neoengram/transactions` 构造并同步完整 draft，再以
 no-replace rename 发布正式 journal 并同步事务目录；工作区第一次 mutation 只会发生在正式
 journal 持久化之后。recover 只恢复正式事务，并清理经过验证的遗留 draft。回滚只移除能按
 FileNode 验证为事务产物的文件，遇到用户后来创建或修改的未知内容会停止，不会递归删除；
@@ -315,7 +346,7 @@ neoengram gc
 `fsck` 校验全部 refs、Commit/Directory/Manifest 内容 ID、单父历史无环、路径规则、Chunk 引用大小，
 并复算对象库中每个 BLAKE3。它也检查不可达但仍保留在本地的元数据和 loose object。
 
-## Workspace
+## 源码 Workspace
 
 ```text
 .
@@ -356,7 +387,7 @@ cargo rustdoc -p neoengram-core --all-features -- -D warnings
 [`docs/implementation-plan.md`](docs/implementation-plan.md)。本文只保留面向用户的使用说明和
 当前存储边界。
 
-当前版本完成的是本地 format v5 与固定 Commit 只读 FUSE，不包含网络传输、PostgreSQL 控制面、S3、认证、多分支管理、
+当前版本完成的是本地 format v6、多 Workspace 与固定 Commit 只读 FUSE，不包含网络传输、PostgreSQL 控制面、S3、认证、merge/rebase、
 `push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、分层 Merkle Directory 和流式 Commit
 已经落地；部分非 FUSE 命令和 checkout/rm journal 仍会物化完整 Index，因此当前实现还不能
 宣称所有命令都适用于千万路径。

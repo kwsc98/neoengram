@@ -20,12 +20,13 @@ use super::{
     validate_reference_name, validate_reference_prefix, DirectoryHasher, DirectoryReader,
     DirectoryRef, DirectoryWriter, FileRecord, FileSetReader, HeadCas, HeadState, IndexReader,
     IndexTxn, IndexVersion, ManifestHasher, ManifestReader, ManifestRef, MetadataReader,
-    MetadataSnapshot, MetadataStore, Page, PageRequest, ReferenceCas, StoredReference,
+    MetadataSnapshot, MetadataStore, Page, PageRequest, ReferenceCas, StoredReference, WorkspaceId,
+    WorkspaceRecord, DEFAULT_WORKSPACE_ID,
 };
 
 const DATABASE_FILE_NAME: &str = "metadata.sqlite3";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f45;
-const SQLITE_SCHEMA_VERSION: i64 = 3;
+const SQLITE_SCHEMA_VERSION: i64 = 4;
 const WRITE_BATCH_SIZE: usize = 1_024;
 const WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -33,18 +34,40 @@ const INDEX_RECORD_HASH_DOMAIN: &[u8] = b"neoengram-sqlite-index-record-v1";
 const INDEX_VERSION_HASH_DOMAIN: &[u8] = b"neoengram-sqlite-index-version-v1";
 
 const SCHEMA_SQL: &str = r#"
-CREATE TABLE store_state (
+CREATE TABLE repository_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    default_head_reference TEXT NOT NULL CHECK (
+        default_head_reference <> ''
+            AND instr(default_head_reference, char(10)) = 0
+            AND instr(default_head_reference, char(13)) = 0
+    )
+) STRICT;
+
+CREATE TABLE workspaces (
+    id BLOB PRIMARY KEY CHECK (length(id) = 16),
+    name TEXT NOT NULL UNIQUE COLLATE BINARY CHECK (
+        name <> '' AND instr(name, '/') = 0 AND instr(name, char(92)) = 0
+    ),
+    root_path TEXT NOT NULL UNIQUE COLLATE BINARY CHECK (root_path <> ''),
     head_kind TEXT NOT NULL CHECK (head_kind IN ('attached', 'detached')),
     head_target TEXT NOT NULL CHECK (
         head_target <> '' AND instr(head_target, char(10)) = 0
             AND instr(head_target, char(13)) = 0
     ),
+    base_commit_id TEXT CHECK (
+        base_commit_id IS NULL OR (
+            length(base_commit_id) = 64
+                AND base_commit_id = lower(base_commit_id)
+        )
+    ),
     index_format INTEGER NOT NULL CHECK (index_format >= 0),
     index_revision INTEGER NOT NULL CHECK (index_revision >= 0),
     index_count INTEGER NOT NULL CHECK (index_count >= 0),
     index_accumulator BLOB NOT NULL CHECK (length(index_accumulator) = 32)
-) STRICT;
+) STRICT, WITHOUT ROWID;
+
+CREATE UNIQUE INDEX one_workspace_per_attached_ref
+    ON workspaces(head_target) WHERE head_kind = 'attached';
 
 CREATE TABLE manifest_sets (
     set_id BLOB PRIMARY KEY CHECK (length(set_id) = 16),
@@ -110,12 +133,15 @@ CREATE TABLE directories (
         REFERENCES directory_sets(set_id, entry_count, file_count, total_size) ON DELETE RESTRICT
 ) STRICT;
 
-CREATE TABLE index_files (
-    path TEXT PRIMARY KEY COLLATE BINARY,
+CREATE TABLE workspace_index_files (
+    workspace_id BLOB NOT NULL CHECK (length(workspace_id) = 16),
+    path TEXT NOT NULL COLLATE BINARY,
     total_size INTEGER NOT NULL CHECK (total_size >= 0),
     chunk_count INTEGER NOT NULL CHECK (chunk_count >= 0),
     manifest_id BLOB NOT NULL CHECK (length(manifest_id) = 32),
     record_digest BLOB NOT NULL CHECK (length(record_digest) = 32),
+    PRIMARY KEY (workspace_id, path),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
     FOREIGN KEY (manifest_id, total_size, chunk_count)
         REFERENCES manifests(id, total_size, chunk_count) ON DELETE RESTRICT
 ) STRICT, WITHOUT ROWID;
@@ -136,11 +162,17 @@ CREATE TABLE refs (
 #[derive(Debug)]
 pub(super) struct SqliteMetadataStore {
     root: PathBuf,
+    workspace_id: WorkspaceId,
 }
 
 impl SqliteMetadataStore {
+    #[cfg(test)]
     pub(super) fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self::for_workspace(root, DEFAULT_WORKSPACE_ID)
+    }
+
+    pub(super) fn for_workspace(root: PathBuf, workspace_id: WorkspaceId) -> Self {
+        Self { root, workspace_id }
     }
 
     fn open_existing(&self, query_only: bool) -> Result<Connection> {
@@ -164,8 +196,8 @@ impl SqliteMetadataStore {
         // BEGIN DEFERRED does not establish a snapshot until the first read.
         connection
             .query_row(
-                "SELECT singleton FROM store_state WHERE singleton = 1",
-                [],
+                "SELECT 1 FROM workspaces WHERE id = ?1",
+                params![self.workspace_id.as_slice()],
                 |_| Ok(()),
             )
             .context("无法固定 SQLite 元数据读视图")?;
@@ -498,12 +530,15 @@ fn index_version(format: u32, revision: u64, count: u64, accumulator: [u8; 32]) 
     IndexVersion::new(revision, *hasher.finalize().as_bytes())
 }
 
-fn read_index_state(connection: &Connection) -> Result<StoredIndexState> {
+fn read_index_state(
+    connection: &Connection,
+    workspace_id: &WorkspaceId,
+) -> Result<StoredIndexState> {
     let (format, revision, count, accumulator): (i64, i64, i64, Vec<u8>) = connection
         .query_row(
             "SELECT index_format, index_revision, index_count, index_accumulator \
-             FROM store_state WHERE singleton = 1",
-            [],
+             FROM workspaces WHERE id = ?1",
+            params![workspace_id.as_slice()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .context("无法读取 SQLite Index 状态")?;
@@ -624,16 +659,19 @@ fn directory_entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Directo
 fn get_file_from_table(
     connection: &Connection,
     table: &str,
-    set_id: Option<&[u8]>,
+    workspace_id: Option<&[u8]>,
     path: &str,
 ) -> Result<Option<FileRecord>> {
-    let (sql, values) = if let Some(set_id) = set_id {
+    let (sql, values) = if let Some(workspace_id) = workspace_id {
         (
             format!(
                 "SELECT path, total_size, chunk_count, manifest_id FROM {table} \
-                 WHERE set_id = ?1 AND path = ?2"
+                 WHERE workspace_id = ?1 AND path = ?2"
             ),
-            vec![Value::Blob(set_id.to_vec()), Value::Text(path.to_owned())],
+            vec![
+                Value::Blob(workspace_id.to_vec()),
+                Value::Text(path.to_owned()),
+            ],
         )
     } else {
         (
@@ -652,7 +690,7 @@ fn get_file_from_table(
 fn scan_files_from_table(
     connection: &Connection,
     table: &str,
-    set_id: Option<&[u8]>,
+    workspace_id: Option<&[u8]>,
     prefix: Option<&str>,
     request: &PageRequest,
 ) -> Result<Page<FileRecord>> {
@@ -661,9 +699,9 @@ fn scan_files_from_table(
     let mut sql =
         format!("SELECT path, total_size, chunk_count, manifest_id FROM {table} WHERE 1 = 1");
     let mut values = Vec::new();
-    if let Some(set_id) = set_id {
-        sql.push_str(" AND set_id = ?");
-        values.push(Value::Blob(set_id.to_vec()));
+    if let Some(workspace_id) = workspace_id {
+        sql.push_str(" AND workspace_id = ?");
+        values.push(Value::Blob(workspace_id.to_vec()));
     }
     if let Some(after) = &request.after {
         sql.push_str(" AND path > ?");
@@ -1058,19 +1096,25 @@ impl DirectoryReader for SqliteDirectoryReader {
 #[derive(Debug)]
 struct SqliteIndexReader {
     session: Rc<ReadSession>,
+    workspace_id: WorkspaceId,
     state: StoredIndexState,
 }
 
 impl FileSetReader for SqliteIndexReader {
     fn get_file(&self, path: &str) -> Result<Option<FileRecord>> {
-        get_file_from_table(&self.session.connection, "index_files", None, path)
+        get_file_from_table(
+            &self.session.connection,
+            "workspace_index_files",
+            Some(self.workspace_id.as_slice()),
+            path,
+        )
     }
 
     fn scan_files(&self, prefix: Option<&str>, request: &PageRequest) -> Result<Page<FileRecord>> {
         scan_files_from_table(
             &self.session.connection,
-            "index_files",
-            None,
+            "workspace_index_files",
+            Some(self.workspace_id.as_slice()),
             prefix,
             request,
         )
@@ -1146,8 +1190,8 @@ impl SqliteIndexTxn<'_> {
         loop {
             let page = scan_files_from_table(
                 self.base_connection()?,
-                "index_files",
-                None,
+                "workspace_index_files",
+                Some(self.store.workspace_id.as_slice()),
                 prefix,
                 &base_request,
             )?;
@@ -1199,7 +1243,12 @@ impl FileSetReader for SqliteIndexTxn<'_> {
         if self.base_file_deleted(path) {
             return Ok(None);
         }
-        get_file_from_table(self.base_connection()?, "index_files", None, path)
+        get_file_from_table(
+            self.base_connection()?,
+            "workspace_index_files",
+            Some(self.store.workspace_id.as_slice()),
+            path,
+        )
     }
 
     fn scan_files(&self, prefix: Option<&str>, request: &PageRequest) -> Result<Page<FileRecord>> {
@@ -1259,7 +1308,7 @@ impl IndexTxn for SqliteIndexTxn<'_> {
         drop(self.base_connection.take());
         let connection = self.store.open_existing(false)?;
         run_immediate(&connection, || {
-            let current = read_index_state(&connection)?;
+            let current = read_index_state(&connection, &self.store.workspace_id)?;
             ensure!(
                 current.version == self.state.version,
                 "Index 在事务执行期间被其他操作更新"
@@ -1268,10 +1317,22 @@ impl IndexTxn for SqliteIndexTxn<'_> {
             let mut accumulator = current.accumulator;
 
             for prefix in &self.deleted_prefixes {
-                apply_index_delete(&connection, prefix, &mut count, &mut accumulator)?;
+                apply_index_delete(
+                    &connection,
+                    &self.store.workspace_id,
+                    prefix,
+                    &mut count,
+                    &mut accumulator,
+                )?;
             }
             for file in self.upserts.values() {
-                apply_index_upsert(&connection, file, &mut count, &mut accumulator)?;
+                apply_index_upsert(
+                    &connection,
+                    &self.store.workspace_id,
+                    file,
+                    &mut count,
+                    &mut accumulator,
+                )?;
             }
 
             let revision = current
@@ -1279,12 +1340,13 @@ impl IndexTxn for SqliteIndexTxn<'_> {
                 .checked_add(1)
                 .context("Index revision 溢出")?;
             connection.execute(
-                "UPDATE store_state SET index_revision = ?1, index_count = ?2, \
-                 index_accumulator = ?3 WHERE singleton = 1",
+                "UPDATE workspaces SET index_revision = ?1, index_count = ?2, \
+                 index_accumulator = ?3 WHERE id = ?4",
                 params![
                     encode_u64(revision, "Index revision")?,
                     encode_u64(count, "Index 文件数量")?,
                     accumulator.as_slice(),
+                    self.store.workspace_id.as_slice(),
                 ],
             )?;
             Ok(index_version(current.format, revision, count, accumulator))
@@ -1294,24 +1356,28 @@ impl IndexTxn for SqliteIndexTxn<'_> {
 
 fn apply_index_delete(
     connection: &Connection,
+    workspace_id: &WorkspaceId,
     prefix: &str,
     count: &mut u64,
     accumulator: &mut [u8; 32],
 ) -> Result<()> {
     let (select_sql, delete_sql, values) = if prefix.is_empty() {
         (
-            "SELECT record_digest FROM index_files".to_owned(),
-            "DELETE FROM index_files".to_owned(),
-            Vec::new(),
+            "SELECT record_digest FROM workspace_index_files WHERE workspace_id = ?1".to_owned(),
+            "DELETE FROM workspace_index_files WHERE workspace_id = ?1".to_owned(),
+            vec![Value::Blob(workspace_id.to_vec())],
         )
     } else {
         let (descendant_start, descendant_end) = descendant_bounds(prefix);
         (
-            "SELECT record_digest FROM index_files \
-             WHERE path = ?1 OR (path >= ?2 AND path < ?3)"
+            "SELECT record_digest FROM workspace_index_files \
+             WHERE workspace_id = ?1 AND (path = ?2 OR (path >= ?3 AND path < ?4))"
                 .to_owned(),
-            "DELETE FROM index_files WHERE path = ?1 OR (path >= ?2 AND path < ?3)".to_owned(),
+            "DELETE FROM workspace_index_files WHERE workspace_id = ?1 \
+             AND (path = ?2 OR (path >= ?3 AND path < ?4))"
+                .to_owned(),
             vec![
+                Value::Blob(workspace_id.to_vec()),
                 Value::Text(prefix.to_owned()),
                 Value::Text(descendant_start),
                 Value::Text(descendant_end),
@@ -1335,6 +1401,7 @@ fn apply_index_delete(
 
 fn apply_index_upsert(
     connection: &Connection,
+    workspace_id: &WorkspaceId,
     file: &FileRecord,
     count: &mut u64,
     accumulator: &mut [u8; 32],
@@ -1342,8 +1409,9 @@ fn apply_index_upsert(
     validate_file_record(file)?;
     let old_digest = connection
         .query_row(
-            "SELECT record_digest FROM index_files WHERE path = ?1",
-            params![file.path],
+            "SELECT record_digest FROM workspace_index_files \
+             WHERE workspace_id = ?1 AND path = ?2",
+            params![workspace_id.as_slice(), file.path],
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()?;
@@ -1356,12 +1424,14 @@ fn apply_index_upsert(
     xor_digest(accumulator, &digest);
     let manifest_id = decode_id(&file.manifest_id)?;
     connection.execute(
-        "INSERT INTO index_files(path, total_size, chunk_count, manifest_id, record_digest) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(path) DO UPDATE SET total_size = excluded.total_size, \
+        "INSERT INTO workspace_index_files(\
+             workspace_id, path, total_size, chunk_count, manifest_id, record_digest\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(workspace_id, path) DO UPDATE SET total_size = excluded.total_size, \
          chunk_count = excluded.chunk_count, manifest_id = excluded.manifest_id, \
          record_digest = excluded.record_digest",
         params![
+            workspace_id.as_slice(),
             file.path,
             encode_u64(file.total_size, "Index 文件大小")?,
             encode_u64(file.chunk_count, "Index Chunk 数量")?,
@@ -1683,11 +1753,11 @@ fn cleanup_directory_set(store: &SqliteMetadataStore, set_id: &[u8]) -> Result<(
     })
 }
 
-fn read_head_state(connection: &Connection) -> Result<HeadState> {
+fn read_head_state(connection: &Connection, workspace_id: &WorkspaceId) -> Result<HeadState> {
     let (kind, target): (String, String) = connection
         .query_row(
-            "SELECT head_kind, head_target FROM store_state WHERE singleton = 1",
-            [],
+            "SELECT head_kind, head_target FROM workspaces WHERE id = ?1",
+            params![workspace_id.as_slice()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .context("无法读取 SQLite HEAD 状态")?;
@@ -1710,6 +1780,76 @@ fn encode_head_state(state: &HeadState) -> Result<(&'static str, &str)> {
         HeadState::Attached { reference } => ("attached", reference),
         HeadState::Detached { commit_id } => ("detached", commit_id),
     })
+}
+
+fn validate_workspace_name(name: &str) -> Result<&str> {
+    ensure!(name == name.trim(), "Workspace 名称不能包含首尾空白");
+    ensure!(!name.is_empty(), "Workspace 名称不能为空");
+    ensure!(name != "." && name != "..", "Workspace 名称无效: {name}");
+    ensure!(
+        !name
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\')),
+        "Workspace 名称包含非法字符: {name}"
+    );
+    Ok(name)
+}
+
+fn validate_workspace_root_path(path: &str) -> Result<&str> {
+    ensure!(path == path.trim(), "Workspace 路径不能包含首尾空白");
+    ensure!(!path.is_empty(), "Workspace 路径不能为空");
+    ensure!(
+        !path.chars().any(char::is_control),
+        "Workspace 路径包含控制字符"
+    );
+    Ok(path)
+}
+
+fn workspace_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    let id: Vec<u8> = row.get(0)?;
+    let id: WorkspaceId = id.try_into().map_err(|id: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            anyhow::anyhow!("Workspace ID 长度无效: {}", id.len()).into(),
+        )
+    })?;
+    let kind: String = row.get(3)?;
+    let target: String = row.get(4)?;
+    let head = match kind.as_str() {
+        "attached" => HeadState::Attached { reference: target },
+        "detached" => HeadState::Detached { commit_id: target },
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                anyhow::anyhow!("Workspace HEAD 类型无效: {kind}").into(),
+            ));
+        }
+    };
+    Ok(WorkspaceRecord {
+        id,
+        name: row.get(1)?,
+        root_path: row.get(2)?,
+        head,
+        base_commit_id: row.get(5)?,
+    })
+}
+
+fn validate_workspace_record(record: &WorkspaceRecord) -> Result<()> {
+    validate_workspace_name(&record.name)?;
+    validate_workspace_root_path(&record.root_path)?;
+    record.head.validate()?;
+    if let Some(base_commit_id) = &record.base_commit_id {
+        validate_metadata_object_id(base_commit_id)?;
+    }
+    if let HeadState::Detached { commit_id } = &record.head {
+        ensure!(
+            record.base_commit_id.as_deref() == Some(commit_id),
+            "Detached Workspace 的 HEAD 与 base Commit 不一致"
+        );
+    }
+    Ok(())
 }
 
 fn get_reference_from_connection(connection: &Connection, name: &str) -> Result<Option<String>> {
@@ -1819,7 +1959,7 @@ fn get_commit_from_connection(connection: &Connection, id: &str) -> Result<Optio
 impl MetadataReader for SqliteMetadataStore {
     fn read_head_state(&self) -> Result<HeadState> {
         let connection = self.open_existing(true)?;
-        read_head_state(&connection)
+        read_head_state(&connection, &self.workspace_id)
     }
 
     fn get_reference(&self, name: &str) -> Result<Option<String>> {
@@ -1844,11 +1984,12 @@ impl MetadataReader for SqliteMetadataStore {
 #[derive(Debug)]
 struct SqliteMetadataSnapshot {
     session: Rc<ReadSession>,
+    workspace_id: WorkspaceId,
 }
 
 impl MetadataReader for SqliteMetadataSnapshot {
     fn read_head_state(&self) -> Result<HeadState> {
-        read_head_state(&self.session.connection)
+        read_head_state(&self.session.connection, &self.workspace_id)
     }
 
     fn get_reference(&self, name: &str) -> Result<Option<String>> {
@@ -1933,13 +2074,20 @@ impl MetadataStore for SqliteMetadataStore {
                 connection.pragma_update(None, "application_id", SQLITE_APPLICATION_ID)?;
                 connection.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
                 connection.execute(
-                    "INSERT INTO store_state(singleton, head_kind, head_target, index_format, \
-                     index_revision, index_count, index_accumulator) \
-                     VALUES (1, 'attached', ?1, ?2, 0, 0, ?3)",
+                    "INSERT INTO repository_state(singleton, default_head_reference) \
+                     VALUES (1, ?1)",
+                    params![head_reference],
+                )?;
+                connection.execute(
+                    "INSERT INTO workspaces(\
+                         id, name, root_path, head_kind, head_target, base_commit_id,\
+                         index_format, index_revision, index_count, index_accumulator\
+                     ) VALUES (?1, 'main', '.', 'attached', ?2, NULL, ?3, 0, 0, ?4)",
                     params![
+                        DEFAULT_WORKSPACE_ID.as_slice(),
                         head_reference,
                         i64::from(INDEX_FORMAT_VERSION),
-                        [0_u8; 32].as_slice()
+                        [0_u8; 32].as_slice(),
                     ],
                 )?;
                 Ok(())
@@ -1964,14 +2112,21 @@ impl MetadataStore for SqliteMetadataStore {
         let connection = self.open_existing(true)?;
         let required_tables: i64 = connection.query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN ( \
-             'store_state', 'manifest_sets', 'manifest_chunks', 'manifests', 'directory_sets', \
-             'directory_entries', 'directories', 'index_files', 'commits', 'refs')",
+             'repository_state', 'workspaces', 'workspace_index_files', 'manifest_sets', \
+             'manifest_chunks', 'manifests', 'directory_sets', 'directory_entries', \
+             'directories', 'commits', 'refs')",
             [],
             |row| row.get(0),
         )?;
-        ensure!(required_tables == 10, "SQLite 元数据库缺少必要数据表");
-        read_index_state(&connection)?;
-        read_head_state(&connection)?;
+        ensure!(required_tables == 11, "SQLite 元数据库缺少必要数据表");
+        let default_reference: String = connection.query_row(
+            "SELECT default_head_reference FROM repository_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        validate_reference_name(&default_reference)?;
+        read_index_state(&connection, &self.workspace_id)?;
+        read_head_state(&connection, &self.workspace_id)?;
         Ok(())
     }
 
@@ -1991,7 +2146,25 @@ impl MetadataStore for SqliteMetadataStore {
             let mut rows = statement.query([])?;
             ensure!(rows.next()?.is_none(), "SQLite 元数据库外键损坏");
         }
-        verify_index(&session.connection)?;
+        let workspace_ids = {
+            let mut statement = session.connection.prepare(
+                "SELECT id, name, root_path, head_kind, head_target, base_commit_id \
+                 FROM workspaces ORDER BY name COLLATE BINARY",
+            )?;
+            let records = statement
+                .query_map([], workspace_record_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for record in &records {
+                validate_workspace_record(record)?;
+            }
+            records
+                .into_iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>()
+        };
+        for workspace_id in workspace_ids {
+            verify_index(&session.connection, &workspace_id)?;
+        }
         verify_published_manifests(Rc::clone(&session))?;
         verify_published_directories(Rc::clone(&session))?;
         verify_commits_and_references(Rc::clone(&session))?;
@@ -2000,8 +2173,12 @@ impl MetadataStore for SqliteMetadataStore {
 
     fn read_index(&self) -> Result<Box<dyn IndexReader + '_>> {
         let session = self.read_session()?;
-        let state = read_index_state(&session.connection)?;
-        Ok(Box::new(SqliteIndexReader { session, state }))
+        let state = read_index_state(&session.connection, &self.workspace_id)?;
+        Ok(Box::new(SqliteIndexReader {
+            session,
+            workspace_id: self.workspace_id,
+            state,
+        }))
     }
 
     fn begin_index_transaction(
@@ -2011,7 +2188,7 @@ impl MetadataStore for SqliteMetadataStore {
         let validation_connection = self.open_existing(true)?;
         let connection = self.open_existing(true)?;
         connection.execute_batch("BEGIN DEFERRED")?;
-        let state = read_index_state(&connection)?;
+        let state = read_index_state(&connection, &self.workspace_id)?;
         if let Some(expected) = expected {
             ensure!(
                 &state.version == expected,
@@ -2031,6 +2208,7 @@ impl MetadataStore for SqliteMetadataStore {
     fn snapshot(&self) -> Result<Box<dyn MetadataSnapshot + '_>> {
         Ok(Box::new(SqliteMetadataSnapshot {
             session: self.read_session()?,
+            workspace_id: self.workspace_id,
         }))
     }
 
@@ -2141,13 +2319,25 @@ impl MetadataStore for SqliteMetadataStore {
         let (new_kind, new_target) = encode_head_state(&new_state)?;
         let connection = self.open_existing(false)?;
         run_immediate(&connection, || {
-            let actual = normalize_head_state(&read_head_state(&connection)?);
+            let actual = normalize_head_state(&read_head_state(&connection, &self.workspace_id)?);
             if actual != expected {
                 return Ok(HeadCas::Mismatch { actual });
             }
+            let base_commit_id = match &new_state {
+                HeadState::Attached { reference } => {
+                    get_reference_from_connection(&connection, reference)?
+                }
+                HeadState::Detached { commit_id } => Some(commit_id.clone()),
+            };
             connection.execute(
-                "UPDATE store_state SET head_kind = ?1, head_target = ?2 WHERE singleton = 1",
-                params![new_kind, new_target],
+                "UPDATE workspaces SET head_kind = ?1, head_target = ?2, base_commit_id = ?3 \
+                 WHERE id = ?4",
+                params![
+                    new_kind,
+                    new_target,
+                    base_commit_id,
+                    self.workspace_id.as_slice(),
+                ],
             )?;
             Ok(HeadCas::Updated)
         })
@@ -2175,6 +2365,11 @@ impl MetadataStore for SqliteMetadataStore {
                          ON CONFLICT(name) DO UPDATE SET target = excluded.target",
                         params![name, target],
                     )?;
+                    connection.execute(
+                        "UPDATE workspaces SET base_commit_id = ?1 \
+                         WHERE id = ?2 AND head_kind = 'attached' AND head_target = ?3",
+                        params![target, self.workspace_id.as_slice(), name],
+                    )?;
                 }
                 None if actual.is_some() => {
                     connection.execute("DELETE FROM refs WHERE name = ?1", params![name])?;
@@ -2184,15 +2379,164 @@ impl MetadataStore for SqliteMetadataStore {
             Ok(ReferenceCas::Updated)
         })
     }
+
+    fn create_workspace(
+        &self,
+        name: &str,
+        root_path: &str,
+        commit_id: &str,
+    ) -> Result<WorkspaceRecord> {
+        validate_workspace_name(name)?;
+        validate_workspace_root_path(root_path)?;
+        validate_metadata_object_id(commit_id)?;
+        let connection = self.open_existing(false)?;
+        run_immediate(&connection, || {
+            ensure!(
+                get_commit_from_connection(&connection, commit_id)?.is_some(),
+                "Workspace base Commit 不存在: {commit_id}"
+            );
+            let id: WorkspaceId = connection
+                .query_row("SELECT randomblob(16)", [], |row| row.get::<_, Vec<u8>>(0))?
+                .try_into()
+                .map_err(|id: Vec<u8>| {
+                    anyhow::anyhow!("SQLite 生成的 Workspace ID 长度无效: {}", id.len())
+                })?;
+            connection
+                .execute(
+                    "INSERT INTO workspaces(\
+                     id, name, root_path, head_kind, head_target, base_commit_id,\
+                     index_format, index_revision, index_count, index_accumulator\
+                 ) VALUES (?1, ?2, ?3, 'detached', ?4, ?4, ?5, 0, 0, ?6)",
+                    params![
+                        id.as_slice(),
+                        name,
+                        root_path,
+                        commit_id,
+                        i64::from(INDEX_FORMAT_VERSION),
+                        [0_u8; 32].as_slice(),
+                    ],
+                )
+                .with_context(|| format!("无法注册 Workspace: {name}"))?;
+            Ok(WorkspaceRecord {
+                id,
+                name: name.to_owned(),
+                root_path: root_path.to_owned(),
+                head: HeadState::Detached {
+                    commit_id: commit_id.to_owned(),
+                },
+                base_commit_id: Some(commit_id.to_owned()),
+            })
+        })
+    }
+
+    fn attach_workspace_to_branch(
+        &self,
+        id: WorkspaceId,
+        expected_commit_id: &str,
+        reference: &str,
+    ) -> Result<()> {
+        validate_metadata_object_id(expected_commit_id)?;
+        validate_reference_name(reference)?;
+        let connection = self.open_existing(false)?;
+        run_immediate(&connection, || {
+            ensure!(
+                get_commit_from_connection(&connection, expected_commit_id)?.is_some(),
+                "Workspace base Commit 不存在: {expected_commit_id}"
+            );
+            let record = connection
+                .query_row(
+                    "SELECT id, name, root_path, head_kind, head_target, base_commit_id \
+                     FROM workspaces WHERE id = ?1",
+                    params![id.as_slice()],
+                    workspace_record_from_row,
+                )
+                .optional()?
+                .context("待激活的 Workspace 注册信息不存在")?;
+            validate_workspace_record(&record)?;
+            ensure!(
+                record.head
+                    == (HeadState::Detached {
+                        commit_id: expected_commit_id.to_owned(),
+                    })
+                    && record.base_commit_id.as_deref() == Some(expected_commit_id),
+                "Workspace 在分支激活前发生变化: {}",
+                record.name
+            );
+            ensure!(
+                get_reference_from_connection(&connection, reference)?.is_none(),
+                "分支已存在，不能作为新 Workspace 分支创建: {reference}"
+            );
+            let owner = connection
+                .query_row(
+                    "SELECT name FROM workspaces \
+                     WHERE head_kind = 'attached' AND head_target = ?1 AND id <> ?2",
+                    params![reference, id.as_slice()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(owner) = owner {
+                bail!("分支 {reference} 已被 Workspace {owner} 占用");
+            }
+            connection.execute(
+                "INSERT INTO refs(name, target) VALUES (?1, ?2)",
+                params![reference, expected_commit_id],
+            )?;
+            let updated = connection.execute(
+                "UPDATE workspaces SET head_kind = 'attached', head_target = ?1 \
+                 WHERE id = ?2 AND head_kind = 'detached' AND head_target = ?3 \
+                     AND base_commit_id = ?3",
+                params![reference, id.as_slice(), expected_commit_id],
+            )?;
+            ensure!(updated == 1, "Workspace 在分支激活期间发生变化");
+            Ok(())
+        })
+    }
+
+    fn get_workspace(&self, name: &str) -> Result<Option<WorkspaceRecord>> {
+        validate_workspace_name(name)?;
+        let connection = self.open_existing(true)?;
+        connection
+            .query_row(
+                "SELECT id, name, root_path, head_kind, head_target, base_commit_id \
+                 FROM workspaces WHERE name = ?1",
+                params![name],
+                workspace_record_from_row,
+            )
+            .optional()
+            .with_context(|| format!("无法读取 Workspace: {name}"))
+    }
+
+    fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>> {
+        let connection = self.open_existing(true)?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, root_path, head_kind, head_target, base_commit_id \
+             FROM workspaces ORDER BY name COLLATE BINARY",
+        )?;
+        let rows = statement.query_map([], workspace_record_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("无法读取 Workspace 列表")
+    }
+
+    fn remove_workspace(&self, id: WorkspaceId) -> Result<bool> {
+        ensure!(id != DEFAULT_WORKSPACE_ID, "不能删除默认 Workspace");
+        let connection = self.open_existing(false)?;
+        run_immediate(&connection, || {
+            let deleted = connection.execute(
+                "DELETE FROM workspaces WHERE id = ?1",
+                params![id.as_slice()],
+            )?;
+            Ok(deleted != 0)
+        })
+    }
 }
 
-fn verify_index(connection: &Connection) -> Result<()> {
-    let state = read_index_state(connection)?;
+fn verify_index(connection: &Connection, workspace_id: &WorkspaceId) -> Result<()> {
+    let state = read_index_state(connection, workspace_id)?;
     let mut statement = connection.prepare(
         "SELECT path, total_size, chunk_count, manifest_id, record_digest \
-         FROM index_files ORDER BY path COLLATE BINARY",
+         FROM workspace_index_files WHERE workspace_id = ?1 ORDER BY path COLLATE BINARY",
     )?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query(params![workspace_id.as_slice()])?;
     let mut count = 0_u64;
     let mut accumulator = [0_u8; 32];
     let mut previous: Option<String> = None;
@@ -2343,6 +2687,34 @@ fn verify_commits_and_references(session: Rc<ReadSession>) -> Result<()> {
             break;
         };
         reference_request.after = Some(next);
+    }
+
+    let mut statement = session.connection.prepare(
+        "SELECT id, name, root_path, head_kind, head_target, base_commit_id \
+         FROM workspaces ORDER BY name COLLATE BINARY",
+    )?;
+    let records = statement
+        .query_map([], workspace_record_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for record in records {
+        validate_workspace_record(&record)?;
+        if let Some(base_commit_id) = &record.base_commit_id {
+            ensure!(
+                get_commit_from_connection(&session.connection, base_commit_id)?.is_some(),
+                "Workspace {} 的 HEAD/base Commit 不存在: {base_commit_id}",
+                record.name
+            );
+        }
+        if let HeadState::Attached { reference } = &record.head {
+            let target = get_reference_from_connection(&session.connection, reference)?;
+            ensure!(
+                target == record.base_commit_id,
+                "Workspace {} 的 base Commit 与分支 {} 不一致",
+                record.name,
+                reference
+            );
+        }
     }
     Ok(())
 }

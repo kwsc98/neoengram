@@ -101,7 +101,12 @@ impl Repository {
         file_name: &str,
         operation: &str,
     ) -> Result<RepositoryWriteLock> {
-        let (file, path, existed) = self.open_lock_file(file_name)?;
+        let directory = if file_name == WORKTREE_LOCK_FILE_NAME {
+            self.workspace_locks_dir()
+        } else {
+            self.metadata_dir()
+        };
+        let (file, path, existed) = self.open_lock_file(&directory, file_name)?;
         if let Err(error) = FileExt::try_lock_exclusive(&file) {
             let diagnostic = lock_diagnostic(&path);
             bail!(
@@ -119,7 +124,7 @@ impl Repository {
     }
 
     fn acquire_shared_lock(&self, file_name: &str) -> Result<RepositoryWorktreeReadLock> {
-        let (file, path, existed) = self.open_lock_file(file_name)?;
+        let (file, path, existed) = self.open_lock_file(&self.workspace_locks_dir(), file_name)?;
         if let Err(error) = FileExt::try_lock_shared(&file) {
             let diagnostic = lock_diagnostic(&path);
             bail!(
@@ -134,8 +139,12 @@ impl Repository {
         Ok(RepositoryWorktreeReadLock { file })
     }
 
-    fn open_lock_file(&self, file_name: &str) -> Result<(fs::File, PathBuf, bool)> {
-        let path = self.metadata_dir().join(file_name);
+    fn open_lock_file(
+        &self,
+        directory: &std::path::Path,
+        file_name: &str,
+    ) -> Result<(fs::File, PathBuf, bool)> {
+        let path = directory.join(file_name);
         let existed = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 ensure!(

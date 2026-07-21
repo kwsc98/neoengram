@@ -75,8 +75,11 @@ struct StoredFileRecord {}
 
 fn read_index(repository: &Path) -> Result<StoredIndex, Box<dyn Error>> {
     let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
-    let count: i64 =
-        connection.query_row("SELECT COUNT(*) FROM index_files", [], |row| row.get(0))?;
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM workspace_index_files WHERE workspace_id = zeroblob(16)",
+        [],
+        |row| row.get(0),
+    )?;
     Ok(StoredIndex {
         files: (0..usize::try_from(count)?)
             .map(|_| StoredFileRecord {})

@@ -20,7 +20,7 @@ use walkdir::WalkDir;
 
 use crate::local::{
     metadata::{HeadState, IndexVersion},
-    repository::{is_neoengram_dir_name, Repository},
+    repository::{is_managed_container_dir_name, is_neoengram_dir_name, Repository},
     worktree::{lenient_leaf_metadata, workspace_path},
 };
 
@@ -445,10 +445,16 @@ fn read_worktree_snapshot(
     if let Some(tracked) = tracked_hint {
         paths.extend(tracked.iter().cloned());
     } else {
+        let managed_container = root.join(".neoengram/metadata/repository.json").is_file();
         let entries = WalkDir::new(root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|entry| !is_neoengram_dir_name(entry.file_name()));
+            .filter_entry(|entry| {
+                !is_neoengram_dir_name(entry.file_name())
+                    && !(managed_container
+                        && entry.depth() == 1
+                        && is_managed_container_dir_name(entry.file_name()))
+            });
         for entry in entries {
             let entry = entry.with_context(|| format!("遍历工作区失败: {}", root.display()))?;
             if entry.file_type().is_file() {
