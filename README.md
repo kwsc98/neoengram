@@ -14,12 +14,12 @@
 - `add` 不修改工作区文件，只把稳定输入快照按 FastCDC 分块并更新 index。
 - `add -A` 同时暂存指定路径范围内的新增、修改和删除。
 - 相同 Chunk 只保存一次；对象路径由 BLAKE3 Hash 决定。
-- Chunk 在复用和读取时都会校验大小与 BLAKE3；Tree 和 Commit 在读取时复算内容 ID。
+- Chunk 在复用和读取时都会校验大小与 BLAKE3；Manifest、Directory 和 Commit 使用规范二进制 ID。
 - `checkout <COMMIT_ID>` 会逐 Chunk 校验目标内容，再事务化更新工作区、index 和 detached HEAD。
-- `commit` 验证全部暂存 Chunk 后固化不可变 Tree，每个 Commit 最多只有一个父节点。
+- `commit` 分页读取 Index，深度优先发布不可变 Directory DAG，每个 Commit 最多只有一个父节点。
 - Detached HEAD 下的新 Commit 以当前 HEAD 为父节点且不移动 `main`；`checkout main` 重新附着。
 - `recover` 可以继续或回滚被 kill/断电打断的 checkout/rm 事务。
-- Tree、Commit 和分支引用保存在元数据控制面，文件分块保存在数据面。
+- Directory、Manifest、Commit 和分支引用保存在 SQLite，文件分块保存在数据面。
 
 ## 快速开始
 
@@ -28,7 +28,7 @@
 ```bash
 git clone https://github.com/kwsc98/synapse.git
 cd synapse
-cargo install --locked --path crates/neoengram
+cargo install --locked --path crates/neoengram --features fuse-mount
 cd ..
 ```
 
@@ -60,18 +60,19 @@ neoengram diff --staged
 neoengram commit -m "initial snapshot"
 neoengram log
 neoengram checkout HEAD --read-only ../model-snapshot
+mkdir ../model-mount
+neoengram mount HEAD ../model-mount
+# 另一个终端：neoengram unmount ../model-mount
 neoengram gc --dry-run
 neoengram fsck
 ```
 
-`init` 默认使用 SQLite 行式元数据后端。需要 JSON 元数据后端时可以显式选择：
+format v5 固定使用 SQLite；`init --metadata-store` 已删除。旧格式不探测、不迁移，打开时会
+明确要求重新初始化。
 
-```bash
-neoengram init --metadata-store json .
-```
-
-后端选择会写入仓库配置，后续命令会自动使用已记录的后端；在仓库根目录再次运行 `init` 也会
-沿用该后端。NeoEngram 不会自动在 JSON 和 SQLite 之间迁移已有仓库。
+Linux 使用 `fuser` 的无系统 libfuse FUSE3 路径，运行时需要内核 FUSE 和 `fusermount3`。
+macOS 构建和运行前必须安装并允许 macFUSE；NeoEngram 不自动安装或启用系统扩展。Windows
+可以构建常规命令，但 `mount`/`unmount` 返回 unsupported/未启用错误。
 
 新仓库会先在同一文件系统的 `.neoengram-tmp-*` 私有目录中完成初始化和校验，再以
 no-replace rename 原子发布为 `.neoengram`。进程在发布前退出只会留下未发布的临时目录，
@@ -84,8 +85,8 @@ no-replace rename 原子发布为 `.neoengram`。进程在发布前退出只会�
   重要数据的唯一副本。
 - `rm`、`restore --force` 和 `checkout --force` 会按请求修改工作区。虽然命令间使用 fail-fast
   锁和恢复事务，运行期间仍应避免让其他程序改写同一路径。
-- 常规本地工作流在 Linux、macOS 和 Windows CI 上测试；`checkout --read-only` 只在 Unix/macOS
-  可用。它依赖普通权限位，不是 mount、ACL、容器或 root 级安全边界。
+- 常规本地工作流支持 Linux、macOS 和 Windows；FUSE 挂载支持 Linux FUSE3 与 macOS macFUSE。
+  `checkout --read-only` 仅依赖权限位，而 FUSE 视图由内核强制只读且仅挂载用户可访问。
 - 当前模型不保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。提交前应确认这些语义不会
   影响数据的可复现性。
 
@@ -99,23 +100,16 @@ no-replace rename 原子发布为 `.neoengram`。进程在发布前退出只会�
 ├── staging/                         # add 切块期间的稳定输入快照
 ├── transactions/                    # checkout/rm journal、暂存文件和故障备份
 └── metadata/
-    ├── repository.json              # 仓库格式版本与后端选择
+    ├── repository.json              # format v5 与对象后端
     ├── write.lock                   # 按需创建的仓库写锁；文件可跨进程保留
     ├── worktree.lock                # 工作区共享/独占 advisory lock
     ├── objects.lock                 # add 与 gc 共享的对象发布/回收锁
-    ├── metadata.sqlite3             # SQLite 后端的行式元数据数据库（选择 SQLite 时）
-    ├── index.json                   # JSON 后端的完整暂存快照
-    ├── HEAD                         # JSON 后端：symbolic ref 或 detached Commit ID
-    ├── index.lock / refs.lock       # JSON 后端按需创建的事务与 CAS 锁
-    ├── refs/heads/main              # JSON 后端的当前 Commit ID（首次提交后创建）
-    ├── manifests/<manifest-hash>.json # JSON 后端的单文件 Chunk recipe
-    ├── trees/<tree-hash>.json       # JSON 后端的不可变目录快照
-    └── commits/<commit-hash>.json   # JSON 后端的不可变单父 Commit
+    └── metadata.sqlite3             # Index/HEAD/refs 与不可变元数据对象
 ```
 
 提交采用追加式发布顺序：先验证全部 Chunk 并完成 ObjectStore durability barrier，再写并同步
-Manifest、Tree 和 Commit，最后通过 CAS 原子更新当前分支引用或 direct HEAD。JSON 后端会
-同步引用的父目录；SQLite 后端通过 `synchronous=FULL` 的 WAL 事务提交。
+Manifest、Directory 和 Commit，最后通过 CAS 原子更新当前分支引用或 direct HEAD。SQLite
+使用 `synchronous=FULL` 的 WAL 事务和发布 staging 表。
 
 本地并发协调使用三层 OS advisory lock，固定获取顺序为
 `objects.lock -> worktree.lock -> write.lock`。`add`、`status` 和 `diff` 共享工作区锁；checkout、
@@ -131,18 +125,17 @@ gc/fsck 先协调对象再锁状态。
 ## 存储抽象
 
 元数据通过 `MetadataStore` 访问：文件和 Chunk 分页读取，Manifest 单次流式写入并返回
-内容 ID，Index 使用 expected-version 事务，Tree 通过追加 writer 发布，Tree/Commit/ref
+内容 ID，Index 使用 expected-version 事务，Directory 通过追加 writer 发布，元数据/ref
 使用一致读 snapshot 分页枚举，HEAD 和 ref 更新使用 compare-exchange。Chunk payload 由独立
 `ObjectStore` 管理，提供流式发布、单遍校验读取、批量状态检查、分页枚举和 durability
 barrier。Repository 和命令层都不再依赖对象物理路径。
 
-当前真实实现是 `JsonMetadataStore`、`SqliteMetadataStore` 和 `LooseObjectStore`。开发期仓库
-格式直接演进，不提供旧格式自动回退；`repository.json` 必须显式记录两个后端：
+当前真实实现是 `SqliteMetadataStore` 和 `LooseObjectStore`。开发期仓库格式直接演进，不提供
+旧格式自动回退；`repository.json` 为：
 
 ```json
 {
-  "format_version": 4,
-  "metadata_store": "sqlite",
+  "format_version": 5,
   "object_store": "loose"
 }
 ```
@@ -264,6 +257,31 @@ Checkout 只处理发生变化的文件，校验其 Chunk 后组装完整文件�
 并优先使用 Reflink 物化；文件系统不支持时自动退回普通复制。`--force` 支持文件和目录
 之间的类型转换，但仍拒绝跟随父级符号链接。
 
+## 只读 FUSE 挂载
+
+把 TARGET 一次解析为固定 Commit 并前台挂载：
+
+```bash
+mkdir /path/outside-repository/mountpoint
+neoengram mount <HEAD|main|COMMIT_ID> /path/outside-repository/mountpoint
+neoengram mount HEAD /path/outside-repository/mountpoint --cache-size-mib 1024
+```
+
+挂载点必须已存在、为空、没有符号链接祖先，并与仓库根目录互不包含。挂载后 HEAD/ref 移动
+不会改变视图。文件报告 `0444`，目录报告 `0555`；只支持普通文件，所有写入、删除、rename、
+truncate、chmod/chown、link/symlink 返回 `EROFS`，xattr 返回 `ENOTSUP`。随机读通过 Manifest
+offset 索引定位 Chunk，完整读取并校验后进入按字节计费的 single-flight LRU；损坏或缺失映射
+为 `EIO`。内核页缓存和只读 mmap 可用。
+
+`mount` 默认前台阻塞，`Ctrl-C`/`SIGTERM` 正常卸载。也可以从另一个终端执行：
+
+```bash
+neoengram unmount /path/outside-repository/mountpoint
+```
+
+`unmount` 会先验证 mount table 中的 NeoEngram 标识；Linux 调用 `fusermount3 -u`，macOS 调用
+`/sbin/umount`，不会卸载其他文件系统。v1 不支持 daemon、`allow_other`、远端下载或可写 overlay。
+
 如果进程在工作区 rename、index 或 HEAD 发布期间退出，后续写命令会拒绝继续并给出恢复提示：
 
 ```bash
@@ -286,15 +304,15 @@ FileNode 验证为事务产物的文件，遇到用户后来创建或修改的�
 neoengram fsck
 ```
 
-清理不再被当前 index 或任何已保存 Tree 引用的 Chunk payload。不可变 Manifest、Tree 和
-Commit 元数据不会被删除，因此 detached/不可达历史目前仍会保留其对象：
+清理不再被当前 Index 或任何 Commit root Directory 引用的 Chunk payload。不可变元数据目前
+不会删除，且所有 Commit 都是 GC root，因此 detached 历史仍会保留其对象：
 
 ```bash
 neoengram gc --dry-run
 neoengram gc
 ```
 
-`fsck` 校验全部 refs、Commit/Tree 内容 ID、单父历史无环、路径规则、Chunk 引用大小，
+`fsck` 校验全部 refs、Commit/Directory/Manifest 内容 ID、单父历史无环、路径规则、Chunk 引用大小，
 并复算对象库中每个 BLAKE3。它也检查不可达但仍保留在本地的元数据和 loose object。
 
 ## Workspace
@@ -311,7 +329,8 @@ neoengram gc
 │       │   └── local/
 │       │       ├── repository/      # 仓库门面、配置、锁与领域校验
 │       │       ├── worktree/        # 扫描、import 切块、物化与恢复事务
-│       │       ├── metadata/        # 元数据契约及 JSON/SQLite 后端
+│       │       ├── metadata/        # SQLite 元数据契约与规范 ID
+│       │       ├── mount/           # FUSE namespace、缓存与平台生命周期
 │       │       ├── objects/         # contract.rs 与 loose.rs 本地对象后端
 │       │       └── fs/              # crash-safe 文件系统原语
 │       └── tests/                   # CLI 与跨模块集成测试
@@ -337,13 +356,13 @@ cargo rustdoc -p neoengram-core --all-features -- -D warnings
 [`docs/implementation-plan.md`](docs/implementation-plan.md)。本文只保留面向用户的使用说明和
 当前存储边界。
 
-当前版本完成的是本地 Phase 1，不包含网络传输、PostgreSQL 控制面、S3、认证、多分支管理、
-`push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、SQLite 行式元数据和流式对象抽象已经
-落地，但 JSON 后端内部仍整份物化 index/Tree，部分命令仍把分页重新收集为完整快照，
-checkout/rm journal 也仍保存完整 Index；因此当前实现还不能宣称支持百 TB。
+当前版本完成的是本地 format v5 与固定 Commit 只读 FUSE，不包含网络传输、PostgreSQL 控制面、S3、认证、多分支管理、
+`push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、分层 Merkle Directory 和流式 Commit
+已经落地；部分非 FUSE 命令和 checkout/rm journal 仍会物化完整 Index，因此当前实现还不能
+宣称所有命令都适用于千万路径。
 
 下一步是对 SQLite 大规模工作负载做基准与调优、实现追加式恢复 journal、对象 fanout/pack，
-以及 PostgreSQL + S3 的缺块协商和 CAS push；是否增加 Merkle 索引由规模基准决定。目标是
+以及 PostgreSQL + S3 的缺块协商和 CAS push，并补齐百万文件跨平台实挂基准。目标是
 100 TB payload、千万路径和上亿 Chunk 引用下，命令内存由页大小与有界并发决定，而不是随
 仓库总量增长。
 

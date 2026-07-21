@@ -1,18 +1,19 @@
-use std::ffi::OsStr;
+use std::{collections::BTreeMap, ffi::OsStr};
 
 use anyhow::{ensure, Context, Result};
-use neoengram_core::{Commit, FileNode, Index, Tree, INDEX_FORMAT_VERSION};
-use serde::Serialize;
+use neoengram_core::{
+    Commit, DirectoryEntry, DirectoryEntryKind, FileNode, Index, Tree, INDEX_FORMAT_VERSION,
+};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::local::{
-    metadata::{describe_manifest, tree_records_id, FileRecord},
+    metadata::{describe_manifest, DirectoryHasher},
     STORAGE_TEMP_FILE_PREFIX,
 };
 
 use super::{Repository, NEOENGRAM_DIR_NAME};
 
-pub(super) const COMMIT_HASH_DOMAIN: &[u8] = b"neoengram-commit-v2";
+pub(super) const COMMIT_HASH_DOMAIN: &[u8] = b"neoengram-commit-v3";
 
 pub(crate) fn is_neoengram_dir_name(name: &OsStr) -> bool {
     name.to_str().is_some_and(|name| {
@@ -41,17 +42,12 @@ impl Repository {
 
     pub(crate) fn tree_id(&self, tree: &Tree) -> Result<String> {
         validate_files(&tree.files)?;
-        let records = tree
-            .files
-            .iter()
-            .map(file_record_from_node)
-            .collect::<Result<Vec<_>>>()?;
-        tree_records_id(&records)
+        directory_id_for_files(&tree.files)
     }
 
     pub(crate) fn commit_id(&self, commit: &Commit) -> Result<String> {
         validate_commit(commit)?;
-        typed_json_hash(COMMIT_HASH_DOMAIN, commit)
+        commit_content_id(commit)
     }
 
     pub(crate) fn validate_commit_id(&self, id: &str) -> Result<()> {
@@ -59,13 +55,86 @@ impl Repository {
     }
 }
 
-pub(super) fn file_record_from_node(file: &FileNode) -> Result<FileRecord> {
-    let manifest = describe_manifest(file.total_size, &file.chunks)?;
-    Ok(FileRecord::from_manifest(
-        file.path.clone(),
-        file.total_size,
-        &manifest,
-    ))
+#[derive(Default)]
+struct HashDirectory {
+    children: BTreeMap<String, HashNode>,
+}
+
+enum HashNode {
+    File {
+        manifest_id: String,
+        total_size: u64,
+    },
+    Directory(HashDirectory),
+}
+
+fn directory_id_for_files(files: &[FileNode]) -> Result<String> {
+    let mut root = HashDirectory::default();
+    for file in files {
+        let manifest = describe_manifest(file.total_size, &file.chunks)?;
+        insert_hash_file(&mut root, &file.path, manifest.id, file.total_size)?;
+    }
+    hash_directory(&root)
+}
+
+fn insert_hash_file(
+    directory: &mut HashDirectory,
+    path: &str,
+    manifest_id: String,
+    total_size: u64,
+) -> Result<()> {
+    let mut components = path.split('/').peekable();
+    let mut current = directory;
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            ensure!(
+                current
+                    .children
+                    .insert(
+                        component.to_owned(),
+                        HashNode::File {
+                            manifest_id,
+                            total_size,
+                        },
+                    )
+                    .is_none(),
+                "Tree 路径重复: {path}"
+            );
+            return Ok(());
+        }
+        let node = current
+            .children
+            .entry(component.to_owned())
+            .or_insert_with(|| HashNode::Directory(HashDirectory::default()));
+        let HashNode::Directory(child) = node else {
+            anyhow::bail!("Tree 同时包含文件及其子路径: {path}");
+        };
+        current = child;
+    }
+    anyhow::bail!("Tree 路径不能为空")
+}
+
+fn hash_directory(directory: &HashDirectory) -> Result<String> {
+    let mut hasher = DirectoryHasher::new();
+    for (ordinal, (name, node)) in directory.children.iter().enumerate() {
+        let (kind, target_id, total_size) = match node {
+            HashNode::File {
+                manifest_id,
+                total_size,
+            } => (DirectoryEntryKind::File, manifest_id.clone(), *total_size),
+            HashNode::Directory(child) => {
+                (DirectoryEntryKind::Directory, hash_directory(child)?, 0)
+            }
+        };
+        hasher.push(&DirectoryEntry {
+            ordinal: u64::try_from(ordinal).context("Directory ordinal 超出 u64")?,
+            name: name.clone(),
+            kind,
+            target_id,
+            total_size,
+        })?;
+    }
+    Ok(hasher.finish().0)
 }
 
 pub(super) fn validate_index(index: &Index) -> Result<()> {
@@ -209,7 +278,7 @@ fn validate_portable_component(component: &str, path: &str) -> Result<()> {
 }
 
 pub(super) fn validate_commit(commit: &Commit) -> Result<()> {
-    validate_hash(&commit.tree_hash, "Tree")?;
+    validate_hash(&commit.tree_hash, "根 Directory")?;
     if let Some(parent) = &commit.parent {
         validate_hash(parent, "父 Commit")?;
     }
@@ -243,15 +312,26 @@ pub(super) fn validate_sorted_ids(ids: &[String], kind: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn typed_json_hash<T: Serialize>(domain: &[u8], value: &T) -> Result<String> {
-    let mut json = serde_json::to_value(value).context("无法构造规范 JSON")?;
-    json.sort_all_objects();
-    let canonical = serde_json::to_vec(&json).context("无法序列化规范 JSON")?;
-
+pub(super) fn commit_content_id(commit: &Commit) -> Result<String> {
+    validate_commit(commit)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(domain);
-    hasher.update(&[0]);
-    hasher.update(&canonical);
+    hasher.update(&(COMMIT_HASH_DOMAIN.len() as u64).to_le_bytes());
+    hasher.update(COMMIT_HASH_DOMAIN);
+    hasher.update(&1_u32.to_le_bytes());
+    hasher.update(blake3::Hash::from_hex(&commit.tree_hash)?.as_bytes());
+    match &commit.parent {
+        Some(parent) => {
+            hasher.update(&[1]);
+            hasher.update(blake3::Hash::from_hex(parent)?.as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    let message = commit.message.as_bytes();
+    hasher.update(&(message.len() as u64).to_le_bytes());
+    hasher.update(message);
+    hasher.update(&commit.created_at_unix_ms.to_le_bytes());
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -304,7 +384,7 @@ mod tests {
         let tree_id = repository.tree_id(&tree)?;
         assert_eq!(
             tree_id,
-            "c729abf9a9ed307e4043f7e3e57ef8feb0f416e7c34da3b9873f49c14eeb8653"
+            "be674f5161f4ba55cc9028fdca4e8e219e8470191ee749afacb0bac8ab53be99"
         );
 
         let commit = Commit {
@@ -315,7 +395,15 @@ mod tests {
         };
         assert_eq!(
             repository.commit_id(&commit)?,
-            "3d4a818bfacc9c0f1119baf3af2b68792f8e2495f73ebb9e0ff7b59123e1516a"
+            "720575956eb8d66cc4b0bc4e038013b1df17f2e170a6ad844184efefcfe2aaf6"
+        );
+
+        let deep_tree = Tree {
+            files: vec![empty_node("a/b/c")],
+        };
+        assert_eq!(
+            repository.tree_id(&deep_tree)?,
+            "559d66308dd1c7769aaf180517f3562d5f89cd2c654ff8a982cf6e4dc86c2fb5"
         );
         Ok(())
     }

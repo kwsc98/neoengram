@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
     io::{BufRead, BufReader, BufWriter, Write},
     num::NonZeroUsize,
@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use neoengram_core::{Chunk, Commit, FileNode};
+use neoengram_core::{Chunk, Commit, DirectoryEntryKind};
 use tempfile::TempDir;
 
 use crate::local::{objects::ObjectSpec, repository::Repository};
@@ -21,8 +21,8 @@ pub(crate) async fn execute() -> Result<()> {
         .context("Fsck 任务异常终止")??;
 
     println!(
-        "Fsck OK: {} refs, {} commits, {} trees, {} objects",
-        report.refs, report.commits, report.trees, report.objects
+        "Fsck OK: {} refs, {} commits, {} directories, {} objects",
+        report.refs, report.commits, report.directories, report.objects
     );
     Ok(())
 }
@@ -30,7 +30,7 @@ pub(crate) async fn execute() -> Result<()> {
 struct FsckReport {
     refs: usize,
     commits: usize,
-    trees: usize,
+    directories: usize,
     objects: usize,
 }
 
@@ -41,10 +41,7 @@ fn check_repository(repository: &Repository) -> Result<FsckReport> {
     let _object_lock = repository.acquire_object_lock()?;
     let _lock = repository.acquire_write_lock()?;
     repository.verify_metadata_store_integrity()?;
-    let index = repository.read_index()?;
     let commits = read_all_commits(repository)?;
-    let tree_ids = repository.list_tree_ids()?;
-    let tree_set: HashSet<&str> = tree_ids.iter().map(String::as_str).collect();
     let refs = read_all_refs(repository, &commits)?;
     let head = repository.current_head()?;
     if let Some(commit_id) = head.commit_id() {
@@ -54,17 +51,40 @@ fn check_repository(repository: &Repository) -> Result<FsckReport> {
         );
     }
 
-    validate_commit_graph(&commits, &tree_set)?;
+    validate_commit_graph(&commits)?;
 
     // Chunk 引用可能达到数百万条。把每个文件的 Chunk ID 追加到有界的外部排序器，
-    // 避免 fsck 为了最后一次对象校验长期保留完整 HashMap。Tree 也只保留当前正在
-    // 校验的一棵，读完后立即释放其文件列表。
+    // Directory 和 Manifest 均分页遍历，不物化完整 Tree。
     let mut marks = ChunkMarkBuilder::new()?;
-    collect_file_chunks(&index.files, &mut marks)?;
-    drop(index);
-    for tree_id in &tree_ids {
-        let tree = repository.read_tree(tree_id)?;
-        collect_file_chunks(&tree.files, &mut marks)?;
+    let mut manifests = HashMap::new();
+    repository.visit_index_files(|record| {
+        collect_manifest_chunks(
+            repository,
+            &record.manifest_id,
+            record.total_size,
+            &mut manifests,
+            &mut marks,
+        )
+    })?;
+    let roots = commits
+        .values()
+        .map(|commit| commit.tree_hash.clone())
+        .collect::<Vec<_>>();
+    let directories = repository.visit_directory_dag(&roots, |entry| {
+        if entry.kind == DirectoryEntryKind::File {
+            collect_manifest_chunks(
+                repository,
+                &entry.target_id,
+                entry.total_size,
+                &mut manifests,
+                &mut marks,
+            )?;
+        }
+        Ok(())
+    })?;
+
+    for manifest_id in repository.list_manifest_ids()? {
+        drop(repository.open_manifest(&manifest_id)?);
     }
 
     let mut referenced = marks.finish()?.into_cursor()?;
@@ -76,7 +96,7 @@ fn check_repository(repository: &Repository) -> Result<FsckReport> {
     Ok(FsckReport {
         refs,
         commits: commits.len(),
-        trees: tree_ids.len(),
+        directories,
         objects,
     })
 }
@@ -123,16 +143,8 @@ fn read_all_refs(repository: &Repository, commits: &BTreeMap<String, CommitLink>
     Ok(references.len())
 }
 
-fn validate_commit_graph(
-    commits: &BTreeMap<String, CommitLink>,
-    trees: &HashSet<&str>,
-) -> Result<()> {
+fn validate_commit_graph(commits: &BTreeMap<String, CommitLink>) -> Result<()> {
     for (id, commit) in commits {
-        ensure!(
-            trees.contains(commit.tree_hash.as_str()),
-            "Commit {id} 引用了不存在的 Tree: {}",
-            commit.tree_hash
-        );
         if let Some(parent) = &commit.parent {
             ensure!(
                 commits.contains_key(parent),
@@ -169,12 +181,21 @@ fn validate_commit_graph(
     Ok(())
 }
 
-fn collect_file_chunks(files: &[FileNode], chunks: &mut ChunkMarkBuilder) -> Result<()> {
-    for file in files {
-        for chunk in &file.chunks {
-            chunks.push(chunk)?;
-        }
+fn collect_manifest_chunks(
+    repository: &Repository,
+    manifest_id: &str,
+    total_size: u64,
+    manifests: &mut HashMap<String, u64>,
+    chunks: &mut ChunkMarkBuilder,
+) -> Result<()> {
+    if let Some(previous_size) = manifests.insert(manifest_id.to_owned(), total_size) {
+        ensure!(
+            previous_size == total_size,
+            "Manifest {manifest_id} 被引用为冲突大小: {previous_size} 与 {total_size}"
+        );
+        return Ok(());
     }
+    repository.visit_manifest_chunks(manifest_id, total_size, |chunk| chunks.push(chunk))?;
     Ok(())
 }
 

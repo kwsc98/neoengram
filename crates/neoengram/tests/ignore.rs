@@ -1,11 +1,13 @@
 use std::{error::Error, fs, path::Path, process::Command};
 
+use rusqlite::Connection;
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
 fn ignore_rules_apply_consistently_to_add_and_status() -> TestResult {
     let repository = tempfile::tempdir()?;
-    run_success(repository.path(), &["init", "--metadata-store", "json"])?;
+    run_success(repository.path(), &["init"])?;
     fs::write(
         repository.path().join(".neoengramignore"),
         "*.bin\ncache/\n!important.bin\n!cache/README.txt\n",
@@ -38,7 +40,7 @@ fn ignore_rules_apply_consistently_to_add_and_status() -> TestResult {
 #[test]
 fn ignored_tracked_files_still_update_and_delete_with_add_all() -> TestResult {
     let repository = tempfile::tempdir()?;
-    run_success(repository.path(), &["init", "--metadata-store", "json"])?;
+    run_success(repository.path(), &["init"])?;
     let tracked = repository.path().join("model.bin");
     fs::write(&tracked, b"v1")?;
     run_success(repository.path(), &["add", "model.bin"])?;
@@ -75,20 +77,12 @@ fn ignore_rules_work_with_the_default_sqlite_backend() -> TestResult {
 }
 
 fn read_index_paths(repository: &Path) -> Result<Vec<String>, Box<dyn Error>> {
-    let index: serde_json::Value = serde_json::from_slice(&fs::read(
-        repository.join(".neoengram/metadata/index.json"),
-    )?)?;
-    Ok(index["files"]
-        .as_array()
-        .ok_or("index files is not an array")?
-        .iter()
-        .map(|file| {
-            file["path"]
-                .as_str()
-                .map(str::to_owned)
-                .ok_or("index path is not a string")
-        })
-        .collect::<Result<Vec<_>, _>>()?)
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    let mut statement = connection.prepare("SELECT path FROM index_files ORDER BY path")?;
+    let paths = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(paths)
 }
 
 fn run_success(

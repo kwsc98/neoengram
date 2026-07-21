@@ -8,7 +8,7 @@ use std::{
     process::{Command, Output},
 };
 
-use serde::Deserialize;
+use rusqlite::Connection;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -46,7 +46,7 @@ fn rm_preserves_data_when_source_directory_sync_fails_after_rename() -> TestResu
 }
 
 fn initialize(path: &Path) -> TestResult {
-    run_success(path, &["init", "--metadata-store", "json"])?;
+    run_success(path, &["init"])?;
     Ok(())
 }
 
@@ -67,18 +67,21 @@ fn command(current_dir: &Path) -> Command {
     command
 }
 
-#[derive(Deserialize)]
 struct StoredIndex {
     files: Vec<StoredFileRecord>,
 }
 
-#[derive(Deserialize)]
 struct StoredFileRecord {}
 
 fn read_index(repository: &Path) -> Result<StoredIndex, Box<dyn Error>> {
-    Ok(serde_json::from_slice(&fs::read(
-        repository.join(".neoengram/metadata/index.json"),
-    )?)?)
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    let count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM index_files", [], |row| row.get(0))?;
+    Ok(StoredIndex {
+        files: (0..usize::try_from(count)?)
+            .map(|_| StoredFileRecord {})
+            .collect(),
+    })
 }
 
 fn transaction_count(repository: &Path) -> Result<usize, Box<dyn Error>> {

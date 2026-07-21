@@ -2,6 +2,10 @@
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
+use rusqlite::Connection;
+
+type RepositoryState = (String, String, i64, Vec<u8>);
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
@@ -9,7 +13,7 @@ fn checkout_read_only_materializes_an_atomic_external_snapshot() -> TestResult {
     let outer = tempfile::tempdir()?;
     let repository = outer.path().join("repository");
     fs::create_dir(&repository)?;
-    run_success(&repository, &["init", "--metadata-store", "json"])?;
+    run_success(&repository, &["init"])?;
 
     fs::create_dir(repository.join("nested"))?;
     fs::write(repository.join("nested/model.bin"), b"model-v1")?;
@@ -17,8 +21,7 @@ fn checkout_read_only_materializes_an_atomic_external_snapshot() -> TestResult {
     run_success(&repository, &["add", "."])?;
     run_success(&repository, &["commit", "-m", "snapshot"])?;
 
-    let head_before = fs::read(repository.join(".neoengram/metadata/HEAD"))?;
-    let index_before = fs::read(repository.join(".neoengram/metadata/index.json"))?;
+    let state_before = repository_state(&repository)?;
     let worktree_before = fs::read(repository.join("nested/model.bin"))?;
     // macOS exposes `/var` as a symlink to `/private/var`; pass a canonical parent because the
     // command intentionally rejects symlinked destination ancestors.
@@ -32,14 +35,7 @@ fn checkout_read_only_materializes_an_atomic_external_snapshot() -> TestResult {
     assert!(String::from_utf8(output.stdout)?.contains("Materialized read-only snapshot"));
     assert_eq!(fs::read(destination.join("nested/model.bin"))?, b"model-v1");
     assert_eq!(fs::metadata(destination.join("empty.bin"))?.len(), 0);
-    assert_eq!(
-        fs::read(repository.join(".neoengram/metadata/HEAD"))?,
-        head_before
-    );
-    assert_eq!(
-        fs::read(repository.join(".neoengram/metadata/index.json"))?,
-        index_before
-    );
+    assert_eq!(repository_state(&repository)?, state_before);
     assert_eq!(
         fs::read(repository.join("nested/model.bin"))?,
         worktree_before
@@ -92,14 +88,14 @@ fn checkout_read_only_supports_main_and_explicit_commits_without_touching_head()
     let outer = tempfile::tempdir()?;
     let repository = outer.path().join("repository");
     fs::create_dir(&repository)?;
-    run_success(&repository, &["init", "--metadata-store", "json"])?;
+    run_success(&repository, &["init"])?;
 
     let model = repository.join("model.bin");
     fs::write(&model, b"v1")?;
     let first = commit(&repository, "first")?;
     fs::write(&model, b"v2")?;
     let second = commit(&repository, "second")?;
-    let head_before = fs::read(repository.join(".neoengram/metadata/HEAD"))?;
+    let head_before = repository_state(&repository)?;
 
     let first_destination = fs::canonicalize(outer.path())?.join("first-snapshot");
     run_success(
@@ -126,10 +122,7 @@ fn checkout_read_only_supports_main_and_explicit_commits_without_touching_head()
     assert_eq!(fs::read(main_destination.join("model.bin"))?, b"v2");
     assert_eq!(first.len(), 64);
     assert_eq!(second.len(), 64);
-    assert_eq!(
-        fs::read(repository.join(".neoengram/metadata/HEAD"))?,
-        head_before
-    );
+    assert_eq!(repository_state(&repository)?, head_before);
     Ok(())
 }
 
@@ -138,7 +131,7 @@ fn checkout_read_only_does_not_publish_a_partial_directory_on_corrupt_chunk() ->
     let outer = tempfile::tempdir()?;
     let repository = outer.path().join("repository");
     fs::create_dir(&repository)?;
-    run_success(&repository, &["init", "--metadata-store", "json"])?;
+    run_success(&repository, &["init"])?;
     fs::write(repository.join("model.bin"), b"payload")?;
     run_success(&repository, &["add", "."])?;
     commit(&repository, "base")?;
@@ -198,7 +191,7 @@ fn checkout_read_only_drops_staging_when_a_chunk_is_corrupt() -> TestResult {
     let outer = tempfile::tempdir()?;
     let repository = outer.path().join("repository");
     fs::create_dir(&repository)?;
-    run_success(&repository, &["init", "--metadata-store", "json"])?;
+    run_success(&repository, &["init"])?;
     fs::write(repository.join("model.bin"), b"model payload")?;
     run_success(&repository, &["add", "model.bin"])?;
     run_success(&repository, &["commit", "-m", "corrupt"])?;
@@ -246,6 +239,16 @@ fn run_success(
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(output)
+}
+
+fn repository_state(repository: &Path) -> Result<RepositoryState, Box<dyn std::error::Error>> {
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    Ok(connection.query_row(
+        "SELECT head_kind, head_target, index_revision, index_accumulator \
+         FROM store_state WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?)
 }
 
 fn run_command(path: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
