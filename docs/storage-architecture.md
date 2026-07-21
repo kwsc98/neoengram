@@ -1,16 +1,16 @@
-# format v5 存储架构
+# format v6 存储架构
 
-NeoEngram 当前仓库格式是 v5。它允许破坏性开发期升级，不读取或迁移旧格式。目标规模要求
+NeoEngram 当前仓库格式是 v6。它允许破坏性开发期升级，不读取或迁移旧格式。目标规模要求
 分页、Directory 构造和 FUSE namespace 的内存由页大小、目录深度、活动句柄和配置缓存决定。
 
 ## 内容图
 
 ```text
-refs / HEAD ──> Commit ──> root Directory
+refs / Workspace HEAD/base ──> Commit ──> root Directory
                             ├── File ──> Manifest ──> ordered Chunk payloads
                             └── Directory ──> child Directory
 
-Index ──> FileRecord(path, manifest_id, total_size, chunk_count)
+Workspace Index ──> FileRecord(path, manifest_id, total_size, chunk_count)
 ```
 
 Chunk ID 仍是原始 payload BLAKE3。Manifest、Directory 和 Commit 使用带 domain/version 的规范
@@ -19,11 +19,11 @@ Chunk ID 仍是原始 payload BLAKE3。Manifest、Directory 和 Commit 使用带
 
 ## SQLite MetadataStore
 
-format v5 只有 SQLite 后端。`MetadataStore` 提供：
+format v6 只有 SQLite 后端。`MetadataStore` 提供：
 
 - Manifest ordinal/offset 分页与 range 起点查询；
 - Directory 名称点查和持久 ordinal 分页；
-- Index keyset 分页与 expected-version transaction；
+- Workspace-scoped Index keyset 分页与 expected-version transaction；
 - 固定 metadata snapshot；
 - HEAD/ref CAS；
 - Manifest iterator 和 Directory staging writer 的不可变发布。
@@ -39,14 +39,14 @@ SQLite 使用 WAL、foreign key、`synchronous=FULL` 和即时写事务。Reader
 
 `LooseObjectStore` 通过 `put_from` 流式校验/不可变发布 Chunk，通过 `copy_to` 单遍复算大小与
 BLAKE3。元数据引用对象前必须完成 durability barrier。GC 在 object lock 和 state lock 下从
-Index 与全部 Commit roots 标记 Chunk，再删除未标记对象。
+全部 Workspace Index 与全部 Commit roots 标记 Chunk，再删除未标记对象。
 
 当前所有 Commit 都是 GC root。引入历史裁剪前，必须为活动 FUSE mount 增加 lease/pin，不能
 回收已挂载 Commit 的图。
 
 ## 一致性和锁
 
-锁顺序固定为 `objects.lock -> worktree.lock -> write.lock`。Index transaction 与 HEAD/ref CAS
+锁顺序固定为 `objects.lock -> Workspace worktree.lock -> write.lock`。Index transaction 与 HEAD/ref CAS
 提供线性化点；Commit 先发布 Chunk/Manifest/Directory/Commit，最后 CAS 更新 HEAD/ref。失败
 可以留下不可达不可变元数据，但不能发布缺失依赖的引用。
 

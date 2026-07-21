@@ -182,7 +182,10 @@ struct StoredFileRecord {
 
 fn read_index(repository: &Path) -> Result<StoredFileSet, Box<dyn Error>> {
     let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
-    let mut statement = connection.prepare("SELECT path FROM index_files ORDER BY path")?;
+    let mut statement = connection.prepare(
+        "SELECT path FROM workspace_index_files \
+         WHERE workspace_id = zeroblob(16) ORDER BY path",
+    )?;
     let files = statement
         .query_map([], |row| Ok(StoredFileRecord { path: row.get(0)? }))?
         .collect::<Result<Vec<_>, _>>()?;

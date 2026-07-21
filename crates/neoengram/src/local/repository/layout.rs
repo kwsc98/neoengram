@@ -11,7 +11,7 @@ use crate::local::{
         ensure_directory, ensure_or_create_directory, is_transaction_draft_name,
         publish_json_if_absent, remove_dir_all_durable,
     },
-    metadata::open_metadata_store,
+    metadata::{open_workspace_metadata_store, WorkspaceId, DEFAULT_WORKSPACE_ID},
     objects::{open_object_store, ObjectStore, ObjectStoreKind},
 };
 
@@ -21,11 +21,15 @@ use super::{
 };
 
 const OBJECTS_DIR_NAME: &str = "objects";
-const FILES_DIR_NAME: &str = "files";
+const CACHE_DIR_NAME: &str = "cache";
+const MATERIALIZED_DIR_NAME: &str = "materialized";
 const METADATA_DIR_NAME: &str = "metadata";
 const REPOSITORY_FILE_NAME: &str = "repository.json";
 const TRANSACTIONS_DIR_NAME: &str = "transactions";
 const STAGING_DIR_NAME: &str = "staging";
+pub(crate) const WORKSPACES_DIR_NAME: &str = "workspaces";
+pub(crate) const MOUNTS_DIR_NAME: &str = "mounts";
+pub(crate) const EXPORTS_DIR_NAME: &str = "exports";
 
 fn neoengram_dir_exists(root: &Path) -> Result<bool> {
     let path = root.join(NEOENGRAM_DIR_NAME);
@@ -47,7 +51,12 @@ fn neoengram_dir_exists(root: &Path) -> Result<bool> {
 
 impl Repository {
     pub(crate) fn at(root: PathBuf) -> Result<Self> {
-        Self::with_object_store(root, ObjectStoreKind::Loose)
+        Self::with_object_store(
+            root.clone(),
+            root,
+            DEFAULT_WORKSPACE_ID,
+            ObjectStoreKind::Loose,
+        )
     }
 
     pub(crate) fn open_or_create(root: PathBuf) -> Result<Self> {
@@ -64,7 +73,7 @@ impl Repository {
         }
     }
 
-    fn open(root: PathBuf) -> Result<Self> {
+    pub(super) fn open(root: PathBuf) -> Result<Self> {
         let metadata_dir = root.join(NEOENGRAM_DIR_NAME).join(METADATA_DIR_NAME);
         let repository_file = metadata_dir.join(REPOSITORY_FILE_NAME);
         let config = read_repository_config(&repository_file)?;
@@ -74,15 +83,31 @@ impl Repository {
             config.format_version,
             CURRENT_FORMAT_VERSION
         );
-        Self::with_object_store(root, config.object_store)
+        Self::with_object_store(
+            root.clone(),
+            root,
+            DEFAULT_WORKSPACE_ID,
+            config.object_store,
+        )
     }
 
-    fn with_object_store(root: PathBuf, object_kind: ObjectStoreKind) -> Result<Self> {
-        let metadata_dir = root.join(NEOENGRAM_DIR_NAME).join(METADATA_DIR_NAME);
-        let objects_dir = root.join(NEOENGRAM_DIR_NAME).join(OBJECTS_DIR_NAME);
+    fn with_object_store(
+        container_root: PathBuf,
+        workspace_root: PathBuf,
+        workspace_id: WorkspaceId,
+        object_kind: ObjectStoreKind,
+    ) -> Result<Self> {
+        let metadata_dir = container_root
+            .join(NEOENGRAM_DIR_NAME)
+            .join(METADATA_DIR_NAME);
+        let objects_dir = container_root
+            .join(NEOENGRAM_DIR_NAME)
+            .join(OBJECTS_DIR_NAME);
         Ok(Self {
-            root,
-            metadata_store: open_metadata_store(&metadata_dir),
+            container_root,
+            root: workspace_root,
+            workspace_id,
+            metadata_store: open_workspace_metadata_store(&metadata_dir, workspace_id),
             object_store: open_object_store(object_kind, &objects_dir),
             object_store_kind: object_kind,
         })
@@ -94,10 +119,19 @@ impl Repository {
             .with_context(|| format!("无法解析当前目录: {}", start.display()))?;
 
         for root in canonical_start.ancestors() {
-            if neoengram_dir_exists(root)? {
+            if let Some(repository) = Self::open_linked_workspace(root)? {
+                return Ok(repository);
+            }
+            if neoengram_dir_exists(root)?
+                && root
+                    .join(NEOENGRAM_DIR_NAME)
+                    .join(METADATA_DIR_NAME)
+                    .join(REPOSITORY_FILE_NAME)
+                    .is_file()
+            {
                 let repository = Self::open(root.to_path_buf())?;
                 repository.validate()?;
-                return Ok(repository);
+                return repository.select_workspace_for_path(&canonical_start);
             }
         }
 
@@ -109,7 +143,7 @@ impl Repository {
     }
 
     pub(crate) fn repository_dir(&self) -> PathBuf {
-        self.root.join(NEOENGRAM_DIR_NAME)
+        self.container_root.join(NEOENGRAM_DIR_NAME)
     }
 
     pub(crate) fn object_store(&self) -> Arc<dyn ObjectStore> {
@@ -121,7 +155,11 @@ impl Repository {
     }
 
     pub(crate) fn files_dir(&self) -> PathBuf {
-        self.repository_dir().join(FILES_DIR_NAME)
+        self.cache_dir().join(MATERIALIZED_DIR_NAME)
+    }
+
+    fn cache_dir(&self) -> PathBuf {
+        self.repository_dir().join(CACHE_DIR_NAME)
     }
 
     pub(super) fn metadata_dir(&self) -> PathBuf {
@@ -129,7 +167,15 @@ impl Repository {
     }
 
     pub(crate) fn transactions_dir(&self) -> PathBuf {
-        self.repository_dir().join(TRANSACTIONS_DIR_NAME)
+        self.workspace_admin_dir().join(TRANSACTIONS_DIR_NAME)
+    }
+
+    pub(crate) fn workspace_admin_dir(&self) -> PathBuf {
+        self.root.join(NEOENGRAM_DIR_NAME)
+    }
+
+    pub(crate) fn workspace_locks_dir(&self) -> PathBuf {
+        self.workspace_admin_dir().join("locks")
     }
 
     pub(crate) fn unfinished_transactions(&self) -> Result<Vec<PathBuf>> {
@@ -210,23 +256,34 @@ impl Repository {
     pub(crate) fn initialize_layout(&self) -> Result<()> {
         for directory in [
             self.repository_dir(),
+            self.cache_dir(),
             self.files_dir(),
-            self.transactions_dir(),
             self.staging_dir(),
             self.metadata_dir(),
+            self.workspace_locks_dir(),
+            self.transactions_dir(),
+        ] {
+            ensure_or_create_directory(&directory)?;
+        }
+        for directory in [
+            self.container_root.join(WORKSPACES_DIR_NAME),
+            self.container_root.join(MOUNTS_DIR_NAME),
+            self.container_root.join(EXPORTS_DIR_NAME),
         ] {
             ensure_or_create_directory(&directory)?;
         }
 
-        let current_config = RepositoryConfig::current(self.object_store_kind);
-        if self.repository_file().try_exists()? {
+        let repository_file_exists = self.repository_file().try_exists()?;
+        let config = if repository_file_exists {
             let config = read_repository_config(&self.repository_file())?;
             ensure!(
-                config == current_config,
-                "已有仓库使用不受支持的格式版本 {}",
-                config.format_version
+                config.object_store == self.object_store_kind,
+                "已有仓库的对象存储后端不匹配"
             );
-        }
+            config
+        } else {
+            RepositoryConfig::new(self.object_store_kind)?
+        };
 
         self.object_store.initialize()?;
         self.metadata_store.initialize(DEFAULT_HEAD_REFERENCE)?;
@@ -234,13 +291,9 @@ impl Repository {
         self.object_store.validate_layout()?;
         self.metadata_store.validate_layout()?;
 
-        publish_json_if_absent(&self.repository_file(), &current_config)?;
-        let config = read_repository_config(&self.repository_file())?;
-        ensure!(
-            config == current_config,
-            "已有仓库使用不受支持的格式版本 {}",
-            config.format_version
-        );
+        publish_json_if_absent(&self.repository_file(), &config)?;
+        let published_config = read_repository_config(&self.repository_file())?;
+        ensure!(published_config == config, "仓库配置在初始化期间被并发替换");
         self.validate()
     }
 
@@ -268,6 +321,10 @@ impl Repository {
         self.object_store.validate_layout()?;
         self.metadata_store.validate_layout()?;
         Ok(())
+    }
+
+    pub(crate) fn repository_id(&self) -> Result<String> {
+        Ok(read_repository_config(&self.repository_file())?.repository_id)
     }
 }
 

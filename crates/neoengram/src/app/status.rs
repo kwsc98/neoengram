@@ -8,7 +8,7 @@ use neoengram_core::FileNode;
 use walkdir::WalkDir;
 
 use crate::local::{
-    repository::{is_neoengram_dir_name, Repository},
+    repository::{is_managed_container_dir_name, is_neoengram_dir_name, Repository},
     worktree::{file_matches_node, lenient_leaf_metadata, workspace_path, IgnoreRules},
 };
 
@@ -140,6 +140,10 @@ fn build_report(repository: &Repository) -> Result<StatusReport> {
     })
 }
 
+pub(crate) fn is_workspace_clean(repository: &Repository) -> Result<bool> {
+    Ok(build_report(repository)?.is_clean())
+}
+
 fn compare_snapshots(base: &[FileNode], current: &[FileNode]) -> Vec<PathChange> {
     let base: BTreeMap<&str, &FileNode> =
         base.iter().map(|file| (file.path.as_str(), file)).collect();
@@ -174,11 +178,20 @@ fn collect_untracked_files(
     let tracked_directories = tracked_directory_prefixes(tracked);
     let filter_root = repository_root.to_path_buf();
     let filter_ignore_rules = ignore_rules.clone();
+    let managed_container = repository_root
+        .join(".neoengram/metadata/repository.json")
+        .is_file();
     let entries = WalkDir::new(repository_root)
         .follow_links(false)
         .into_iter()
         .filter_entry(move |entry| {
             if is_neoengram_dir_name(entry.file_name()) {
+                return false;
+            }
+            if managed_container
+                && entry.depth() == 1
+                && is_managed_container_dir_name(entry.file_name())
+            {
                 return false;
             }
             if !entry.file_type().is_dir() {

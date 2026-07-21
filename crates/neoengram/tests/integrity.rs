@@ -138,7 +138,8 @@ fn fsck_rejects_a_dangling_detached_head() -> TestResult {
     let dangling = "f".repeat(64);
     let connection = metadata_connection(repository.path())?;
     connection.execute(
-        "UPDATE store_state SET head_kind = 'detached', head_target = ?1 WHERE singleton = 1",
+        "UPDATE workspaces SET head_kind = 'detached', head_target = ?1, base_commit_id = ?1 \
+         WHERE id = zeroblob(16)",
         params![dangling],
     )?;
     let fsck = command(repository.path()).arg("fsck").output()?;
@@ -284,7 +285,7 @@ fn read_index(repository: &Path) -> Result<Index, Box<dyn Error>> {
     let connection = metadata_connection(repository)?;
     let mut statement = connection.prepare(
         "SELECT path, total_size, chunk_count, lower(hex(manifest_id)) \
-         FROM index_files ORDER BY path",
+         FROM workspace_index_files WHERE workspace_id = zeroblob(16) ORDER BY path",
     )?;
     let records = statement
         .query_map([], |row| {
@@ -373,7 +374,7 @@ fn current_commit_id(repository: &Path) -> Result<String, Box<dyn Error>> {
 fn read_head(repository: &Path) -> Result<(String, String), Box<dyn Error>> {
     let connection = metadata_connection(repository)?;
     Ok(connection.query_row(
-        "SELECT head_kind, head_target FROM store_state WHERE singleton = 1",
+        "SELECT head_kind, head_target FROM workspaces WHERE id = zeroblob(16)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?)

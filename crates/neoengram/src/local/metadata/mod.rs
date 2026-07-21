@@ -21,6 +21,18 @@ const MANIFEST_HASH_DOMAIN: &[u8] = b"neoengram-manifest-v3";
 const DIRECTORY_HASH_DOMAIN: &[u8] = b"neoengram-directory-v1";
 const CANONICAL_ENCODING_VERSION: u32 = 1;
 
+pub(crate) type WorkspaceId = [u8; 16];
+pub(crate) const DEFAULT_WORKSPACE_ID: WorkspaceId = [0; 16];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceRecord {
+    pub(crate) id: WorkspaceId,
+    pub(crate) name: String,
+    pub(crate) root_path: String,
+    pub(crate) head: HeadState,
+    pub(crate) base_commit_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PageRequest {
     pub(crate) after: Option<String>,
@@ -237,10 +249,32 @@ pub(crate) trait MetadataStore: MetadataReader + Send + Sync {
         expected: Option<&str>,
         new_target: Option<&str>,
     ) -> Result<ReferenceCas>;
+
+    fn create_workspace(
+        &self,
+        name: &str,
+        root_path: &str,
+        commit_id: &str,
+    ) -> Result<WorkspaceRecord>;
+    fn attach_workspace_to_branch(
+        &self,
+        id: WorkspaceId,
+        expected_commit_id: &str,
+        reference: &str,
+    ) -> Result<()>;
+    fn get_workspace(&self, name: &str) -> Result<Option<WorkspaceRecord>>;
+    fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
+    fn remove_workspace(&self, id: WorkspaceId) -> Result<bool>;
 }
 
-pub(crate) fn open_metadata_store(metadata_root: &Path) -> Arc<dyn MetadataStore> {
-    Arc::new(SqliteMetadataStore::new(metadata_root.to_path_buf()))
+pub(crate) fn open_workspace_metadata_store(
+    metadata_root: &Path,
+    workspace_id: WorkspaceId,
+) -> Arc<dyn MetadataStore> {
+    Arc::new(SqliteMetadataStore::for_workspace(
+        metadata_root.to_path_buf(),
+        workspace_id,
+    ))
 }
 
 pub(crate) fn validate_metadata_object_id(id: &str) -> Result<()> {

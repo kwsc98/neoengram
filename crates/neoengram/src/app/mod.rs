@@ -2,6 +2,7 @@ pub(crate) mod add;
 pub(crate) mod checkout;
 pub(crate) mod commit;
 pub(crate) mod diff;
+pub(crate) mod export;
 pub(crate) mod fsck;
 pub(crate) mod gc;
 pub(crate) mod init;
@@ -12,6 +13,7 @@ pub(crate) mod restore;
 pub(crate) mod rm;
 pub(crate) mod show;
 pub(crate) mod status;
+pub(crate) mod workspace;
 
 /// 集成测试使用的进程级故障点。默认环境下这段代码完全不生效；命中时直接退出，刻意
 /// 跳过 Rust Drop，以模拟进程被 kill 后 advisory lock 由内核释放、事务目录留在磁盘。

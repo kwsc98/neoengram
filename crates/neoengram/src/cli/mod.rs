@@ -17,6 +17,8 @@ struct Cli {
 enum Command {
     /// 创建一个新的本地 NeoEngram 仓库。
     Init(InitArgs),
+    /// 创建和查看共享同一对象仓库的可写 Workspace。
+    Workspace(WorkspaceArgs),
     /// 将文件内容切块并写入本地对象库。
     Add(AddArgs),
     /// 从暂存区移除已跟踪路径；默认同时移除工作区内容。
@@ -33,6 +35,8 @@ enum Command {
     Show(ShowArgs),
     /// 切换到分支或 Commit，并恢复对应的工作区和 index。
     Checkout(CheckoutArgs),
+    /// 将固定 Commit 物化为独立的只读目录。
+    Export(ExportArgs),
     /// 完成或回滚一次被中断的工作区事务。
     Recover(RecoverArgs),
     /// 从 HEAD 恢复 index，或从 index 恢复工作区文件。
@@ -45,6 +49,43 @@ enum Command {
     Mount(MountArgs),
     /// 卸载 NeoEngram FUSE 文件系统。
     Unmount(UnmountArgs),
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceArgs {
+    #[command(subcommand)]
+    command: WorkspaceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    /// 从固定 Commit 创建一个独立 Index 的可写 Workspace。
+    Create(WorkspaceCreateArgs),
+    /// 列出仓库注册的所有 Workspace。
+    List,
+    /// 删除一个非默认 Workspace；默认保护未提交内容。
+    Remove(WorkspaceRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceCreateArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(long, value_name = "TARGET", default_value = "HEAD")]
+    from: String,
+    #[arg(long, value_name = "PATH")]
+    path: Option<PathBuf>,
+    /// 创建并独占一个新分支；省略时创建 Detached Workspace。
+    #[arg(short, long, value_name = "BRANCH")]
+    branch: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceRemoveArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(short, long)]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -138,11 +179,16 @@ struct CheckoutArgs {
     #[arg(value_name = "TARGET", default_value = "HEAD")]
     target: String,
     /// 丢弃暂存修改、已跟踪修改以及冲突的叶子文件。
-    #[arg(long, conflicts_with = "read_only")]
+    #[arg(long)]
     force: bool,
-    /// 将 TARGET 物化到一个新的独立只读目录，不修改当前工作区、index 或 HEAD。
-    #[arg(long, value_name = "DIR", conflicts_with = "force")]
-    read_only: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    #[arg(value_name = "TARGET")]
+    target: String,
+    #[arg(value_name = "DIR")]
+    destination: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -175,6 +221,15 @@ struct UnmountArgs {
 pub(crate) async fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Init(arguments) => app::init::execute(arguments.path).await,
+        Command::Workspace(arguments) => match arguments.command {
+            WorkspaceCommand::Create(create) => {
+                app::workspace::create(create.name, create.from, create.path, create.branch).await
+            }
+            WorkspaceCommand::List => app::workspace::list().await,
+            WorkspaceCommand::Remove(remove) => {
+                app::workspace::remove(remove.name, remove.force).await
+            }
+        },
         Command::Add(arguments) => {
             if arguments.all {
                 app::add::execute_with_options(arguments.path, true).await
@@ -193,7 +248,10 @@ pub(crate) async fn run() -> Result<()> {
         Command::Log(arguments) => app::log::execute(arguments.max_count).await,
         Command::Show(arguments) => app::show::execute(arguments.target).await,
         Command::Checkout(arguments) => {
-            app::checkout::execute(arguments.target, arguments.force, arguments.read_only).await
+            app::checkout::execute(arguments.target, arguments.force).await
+        }
+        Command::Export(arguments) => {
+            app::export::execute(arguments.target, arguments.destination).await
         }
         Command::Recover(arguments) => app::recover::execute(arguments.abort).await,
         Command::Restore(arguments) => {

@@ -78,7 +78,10 @@ fn ignore_rules_work_with_the_default_sqlite_backend() -> TestResult {
 
 fn read_index_paths(repository: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
-    let mut statement = connection.prepare("SELECT path FROM index_files ORDER BY path")?;
+    let mut statement = connection.prepare(
+        "SELECT path FROM workspace_index_files \
+         WHERE workspace_id = zeroblob(16) ORDER BY path",
+    )?;
     let paths = statement
         .query_map([], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;

@@ -297,6 +297,20 @@ impl Repository {
         Ok(count)
     }
 
+    pub(crate) fn visit_all_workspace_index_files(
+        &self,
+        mut visitor: impl FnMut(&FileRecord) -> Result<()>,
+    ) -> Result<u64> {
+        let mut total = 0_u64;
+        for workspace in self.list_workspaces()? {
+            let repository = self.open_workspace(workspace.id)?;
+            total = total
+                .checked_add(repository.visit_index_files(&mut visitor)?)
+                .context("全部 Workspace 的 Index 文件数量溢出")?;
+        }
+        Ok(total)
+    }
+
     pub(crate) fn visit_manifest_chunks(
         &self,
         manifest_id: &str,
@@ -509,6 +523,34 @@ impl Repository {
         self.resolve_head_state(HeadState::Attached {
             reference: DEFAULT_HEAD_REFERENCE.to_owned(),
         })
+    }
+
+    pub(crate) fn resolve_target_id(&self, target: &str) -> Result<String> {
+        let target = target.trim();
+        ensure!(!target.is_empty(), "TARGET 不能为空");
+        if target.eq_ignore_ascii_case("HEAD") {
+            return self
+                .current_head()?
+                .commit_id()
+                .map(str::to_owned)
+                .context("当前 Workspace 还没有 Commit");
+        }
+        let reference = if target.starts_with("refs/") {
+            Some(target.to_owned())
+        } else if target.len() != 64 {
+            Some(format!("refs/heads/{target}"))
+        } else {
+            None
+        };
+        if let Some(reference) = reference {
+            return self
+                .metadata_store
+                .get_reference(&reference)?
+                .with_context(|| format!("引用不存在或尚未提交: {reference}"));
+        }
+        validate_hash(target, "Commit")?;
+        self.read_commit(target)?;
+        Ok(target.to_owned())
     }
 
     pub(crate) fn advance_head(&self, expected: &RepositoryHead, id: &str) -> Result<()> {

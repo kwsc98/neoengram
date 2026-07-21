@@ -57,7 +57,7 @@ fn check_repository(repository: &Repository) -> Result<FsckReport> {
     // Directory 和 Manifest 均分页遍历，不物化完整 Tree。
     let mut marks = ChunkMarkBuilder::new()?;
     let mut manifests = HashMap::new();
-    repository.visit_index_files(|record| {
+    repository.visit_all_workspace_index_files(|record| {
         collect_manifest_chunks(
             repository,
             &record.manifest_id,

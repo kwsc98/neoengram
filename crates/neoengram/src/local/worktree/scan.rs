@@ -7,7 +7,10 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use walkdir::WalkDir;
 
-use crate::local::{repository::is_neoengram_dir_name, worktree::ignore::IgnoreRules};
+use crate::local::{
+    repository::{is_managed_container_dir_name, is_neoengram_dir_name},
+    worktree::ignore::IgnoreRules,
+};
 
 pub(crate) struct InputFile {
     disk_path: PathBuf,
@@ -106,12 +109,21 @@ pub(crate) fn collect_files_with_ignore(
     } else {
         let tracked_directories = tracked_directory_prefixes(tracked_paths);
         let filter_root = repository_root.to_path_buf();
+        let managed_container = repository_root
+            .join(".neoengram/metadata/repository.json")
+            .is_file();
         let filter_ignore_rules = ignore_rules.clone();
         let entries = WalkDir::new(&canonical_path)
             .follow_links(false)
             .into_iter()
             .filter_entry(move |entry| {
                 if is_neoengram_dir_name(entry.file_name()) {
+                    return false;
+                }
+                if managed_container
+                    && entry.depth() == 1
+                    && is_managed_container_dir_name(entry.file_name())
+                {
                     return false;
                 }
                 if !entry.file_type().is_dir() {
@@ -195,6 +207,15 @@ fn repository_path(path: &Path, repository_root: &Path, allow_root: bool) -> Res
             .to_str()
             .with_context(|| format!("文件路径不是有效 UTF-8: {}", path.display()))?;
         components.push(name);
+    }
+    if repository_root
+        .join(".neoengram/metadata/repository.json")
+        .is_file()
+        && components
+            .first()
+            .is_some_and(|name| is_managed_container_dir_name(std::ffi::OsStr::new(name)))
+    {
+        bail!("不能添加 NeoEngram 受管目录: {}", path.display());
     }
     ensure!(
         allow_root || !components.is_empty(),

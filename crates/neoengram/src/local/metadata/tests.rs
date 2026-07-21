@@ -316,3 +316,65 @@ fn head_state_round_trips_through_sqlite() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn workspaces_have_independent_head_and_index_state() -> Result<()> {
+    let (temporary, main) = initialized_store()?;
+    let directory = main.begin_directory_write()?.finish()?;
+    let commit_id = "c".repeat(64);
+    main.put_commit(
+        &commit_id,
+        &Commit {
+            tree_hash: directory.id,
+            parent: None,
+            message: "workspace base".to_owned(),
+            created_at_unix_ms: 1,
+        },
+    )?;
+    let experiment = main.create_workspace("experiment", "workspaces/experiment", &commit_id)?;
+    let experiment_store =
+        SqliteMetadataStore::for_workspace(temporary.path().join("metadata"), experiment.id);
+    assert_eq!(
+        experiment_store.read_head_state()?,
+        HeadState::Detached {
+            commit_id: commit_id.clone(),
+        }
+    );
+    assert!(main.get_reference("refs/heads/experiment")?.is_none());
+    main.attach_workspace_to_branch(experiment.id, &commit_id, "refs/heads/experiment")?;
+    assert_eq!(
+        main.get_reference("refs/heads/experiment")?.as_deref(),
+        Some(commit_id.as_str())
+    );
+
+    let manifest = main.put_manifest(0, &mut std::iter::empty())?;
+    let main_file = FileRecord::from_manifest("main.bin".to_owned(), 0, &manifest);
+    let main_version = main.read_index()?.version().clone();
+    let mut main_txn = main.begin_index_transaction(Some(&main_version))?;
+    main_txn.upsert_file(&main_file)?;
+    main_txn.commit()?;
+
+    assert!(experiment_store
+        .read_index()?
+        .get_file("main.bin")?
+        .is_none());
+    let experiment_file = FileRecord::from_manifest("experiment.bin".to_owned(), 0, &manifest);
+    let experiment_version = experiment_store.read_index()?.version().clone();
+    let mut experiment_txn = experiment_store.begin_index_transaction(Some(&experiment_version))?;
+    experiment_txn.upsert_file(&experiment_file)?;
+    experiment_txn.commit()?;
+
+    assert!(main.read_index()?.get_file("experiment.bin")?.is_none());
+    assert_eq!(
+        experiment_store.read_head_state()?,
+        HeadState::Attached {
+            reference: "refs/heads/experiment".to_owned(),
+        }
+    );
+    let duplicate =
+        main.create_workspace("duplicate-main", "workspaces/duplicate-main", &commit_id)?;
+    assert!(main
+        .attach_workspace_to_branch(duplicate.id, &commit_id, "refs/heads/main")
+        .is_err());
+    Ok(())
+}
