@@ -11,17 +11,23 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use neoengram_core::{FileNode, Tree};
+use neoengram_core::{ChunkingStrategy, FileNode, Tree};
 use tempfile::{Builder, NamedTempFile};
 use walkdir::WalkDir;
 
 use crate::local::{
     fs::durable::{create_dir_all_durable, rename_noreplace_durable, sync_directory},
-    objects::ObjectSpec,
+    objects::{HardLinkOutcome, ObjectSpec},
     repository::{is_neoengram_dir_name, Repository},
 };
 
 use super::workspace::logical_join;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExportMode {
+    Copy,
+    HardLink,
+}
 
 /// Result returned after a snapshot has been atomically published.
 #[derive(Debug, Clone)]
@@ -50,6 +56,7 @@ pub(crate) fn materialize_read_only_snapshot(
     repository: &Repository,
     target: &str,
     destination: &Path,
+    mode: ExportMode,
 ) -> Result<ReadOnlySnapshotOutcome> {
     ensure_supported_platform()?;
     ensure!(!target.trim().is_empty(), "Checkout TARGET 不能为空");
@@ -57,6 +64,7 @@ pub(crate) fn materialize_read_only_snapshot(
 
     // A snapshot reads immutable metadata and objects for potentially a long time.  Serialize it
     // with add/commit/checkout/gc so GC cannot remove a Chunk after the Tree has been resolved.
+    let _object_lock = repository.acquire_object_lock()?;
     let mut lock = repository.acquire_write_lock()?;
     lock.set_operation("read-only-snapshot", None)?;
     let destination = validate_destination(repository, destination)?;
@@ -71,12 +79,12 @@ pub(crate) fn materialize_read_only_snapshot(
         .tempdir_in(&parent)
         .with_context(|| format!("无法创建只读快照临时目录: {}", parent.display()))?;
 
-    if let Err(error) = materialize_tree(repository, &tree, temporary.path()) {
-        cleanup_staging(temporary.path());
+    if let Err(error) = materialize_tree(repository, &tree, temporary.path(), mode) {
+        cleanup_staging(temporary.path(), mode);
         return Err(error);
     }
-    if let Err(error) = set_read_only_tree(temporary.path()) {
-        cleanup_staging(temporary.path());
+    if let Err(error) = set_read_only_tree(temporary.path(), mode) {
+        cleanup_staging(temporary.path(), mode);
         return Err(error);
     }
 
@@ -85,7 +93,7 @@ pub(crate) fn materialize_read_only_snapshot(
     // read-only directory modes otherwise prevent cleanup on Unix.
     let staging = temporary.keep();
     if let Err(error) = rename_noreplace_durable(&staging, &destination) {
-        cleanup_staging(&staging);
+        cleanup_staging(&staging, mode);
         return Err(error).with_context(|| {
             format!(
                 "无法以 no-replace 方式发布只读快照 {}",
@@ -108,21 +116,66 @@ fn resolve_target(repository: &Repository, target: &str) -> Result<(String, Tree
     Ok((target_id, tree))
 }
 
-fn materialize_tree(repository: &Repository, tree: &Tree, staging_root: &Path) -> Result<()> {
+fn materialize_tree(
+    repository: &Repository,
+    tree: &Tree,
+    staging_root: &Path,
+    mode: ExportMode,
+) -> Result<()> {
+    if mode == ExportMode::HardLink {
+        ensure!(
+            repository.object_store().supports_hard_links(),
+            "当前对象后端不支持 WholeFile 硬链接导出"
+        );
+        for file in &tree.files {
+            ensure!(
+                file.chunking == ChunkingStrategy::WholeFile,
+                "硬链接导出仅支持 WholeFile 文件: {}",
+                file.path
+            );
+        }
+    }
     for file in &tree.files {
         repository.validate_logical_path(&file.path)?;
-        materialize_file(repository, file, staging_root)?;
+        materialize_file(repository, file, staging_root, mode)?;
     }
     Ok(())
 }
 
-fn materialize_file(repository: &Repository, file: &FileNode, staging_root: &Path) -> Result<()> {
+fn materialize_file(
+    repository: &Repository,
+    file: &FileNode,
+    staging_root: &Path,
+    mode: ExportMode,
+) -> Result<()> {
     let destination = logical_join(staging_root, &file.path);
     let parent = destination
         .parent()
         .with_context(|| format!("只读快照文件没有父目录: {}", file.path))?;
     create_dir_all_durable(parent)?;
     ensure_snapshot_parent(staging_root, parent)?;
+
+    if mode == ExportMode::HardLink && file.total_size > 0 {
+        let chunk = file
+            .chunks
+            .first()
+            .with_context(|| format!("WholeFile 文件缺少完整对象: {}", file.path))?;
+        ensure!(
+            file.chunks.len() == 1 && chunk.offset == 0 && chunk.size == file.total_size,
+            "WholeFile 文件 recipe 无效: {}",
+            file.path
+        );
+        let spec = ObjectSpec::new(chunk.hash.clone(), chunk.size)?;
+        match repository
+            .object_store()
+            .hard_link_to(&spec, &destination)?
+        {
+            HardLinkOutcome::Linked => return Ok(()),
+            HardLinkOutcome::Unsupported => {
+                bail!("当前对象后端不支持 WholeFile 硬链接导出: {}", file.path)
+            }
+        }
+    }
 
     let mut temporary = NamedTempFile::new_in(parent)
         .with_context(|| format!("无法创建只读快照临时文件: {}", parent.display()))?;
@@ -314,7 +367,7 @@ fn ensure_supported_platform() -> Result<()> {
 }
 
 #[cfg(unix)]
-fn set_read_only_tree(root: &Path) -> Result<()> {
+fn set_read_only_tree(root: &Path, mode: ExportMode) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut directories = Vec::new();
@@ -328,7 +381,14 @@ fn set_read_only_tree(root: &Path) -> Result<()> {
         if entry.file_type().is_dir() {
             directories.push(entry.into_path());
         } else if entry.file_type().is_file() {
-            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o444))
+            let file_mode = match mode {
+                ExportMode::Copy => 0o444,
+                ExportMode::HardLink => {
+                    let current = entry.metadata()?.permissions().mode();
+                    (current & 0o555) | 0o400
+                }
+            };
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(file_mode))
                 .with_context(|| format!("无法设置只读快照文件权限: {}", entry.path().display()))?;
         } else {
             bail!("只读快照包含不支持的文件类型: {}", entry.path().display());
@@ -344,12 +404,12 @@ fn set_read_only_tree(root: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_read_only_tree(_root: &Path) -> Result<()> {
+fn set_read_only_tree(_root: &Path, _mode: ExportMode) -> Result<()> {
     bail!("`export` 当前仅支持 Unix/macOS；无法设置 0444/0555 权限")
 }
 
 #[cfg(unix)]
-fn cleanup_staging(root: &Path) {
+fn cleanup_staging(root: &Path, mode: ExportMode) {
     use std::os::unix::fs::PermissionsExt;
 
     if !root.exists() {
@@ -366,7 +426,7 @@ fn cleanup_staging(root: &Path) {
         for entry in entries {
             if entry.file_type().is_dir() {
                 directories.push(entry.into_path());
-            } else if !entry.file_type().is_symlink() {
+            } else if mode == ExportMode::Copy && !entry.file_type().is_symlink() {
                 let _ = fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o600));
             }
         }
@@ -378,6 +438,6 @@ fn cleanup_staging(root: &Path) {
 }
 
 #[cfg(not(unix))]
-fn cleanup_staging(root: &Path) {
+fn cleanup_staging(root: &Path, _mode: ExportMode) {
     let _ = fs::remove_dir_all(root);
 }

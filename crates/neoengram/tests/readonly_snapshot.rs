@@ -1,6 +1,11 @@
 #![cfg(unix)]
 
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use rusqlite::Connection;
 
@@ -217,6 +222,273 @@ fn export_accepts_the_managed_exports_directory() -> TestResult {
     let status = String::from_utf8(run_success(repository.path(), &["status"])?.stdout)?;
     assert!(status.contains("working tree clean"));
     Ok(())
+}
+
+#[test]
+fn hardlink_export_shares_the_verified_whole_file_inode_and_detects_corruption() -> TestResult {
+    let outer = tempfile::tempdir()?;
+    let repository = outer.path().join("repository");
+    fs::create_dir(&repository)?;
+    run_success(&repository, &["init", "--chunking", "whole-file"])?;
+    let contents = b"immutable whole-file model";
+    fs::write(repository.join("model.bin"), contents)?;
+    fs::write(repository.join("empty.bin"), [])?;
+    run_success(&repository, &["add", "."])?;
+    run_success(&repository, &["commit", "-m", "whole-file"])?;
+
+    let object = loose_object(&repository)?;
+    let copy_destination = fs::canonicalize(outer.path())?.join("copied");
+    run_success(
+        &repository,
+        &[
+            "export",
+            "--mode",
+            "copy",
+            "HEAD",
+            copy_destination.to_str().unwrap(),
+        ],
+    )?;
+    let copied_metadata = fs::metadata(copy_destination.join("model.bin"))?;
+    let object_before_link = fs::metadata(&object)?;
+    assert!(
+        copied_metadata.dev() != object_before_link.dev()
+            || copied_metadata.ino() != object_before_link.ino()
+    );
+
+    let destination = fs::canonicalize(outer.path())?.join("linked");
+    let output = run_success(
+        &repository,
+        &[
+            "export",
+            "--mode",
+            "hardlink",
+            "HEAD",
+            destination.to_str().unwrap(),
+        ],
+    )?;
+    assert!(String::from_utf8(output.stdout)?.contains("hard-linked read-only view"));
+    assert!(String::from_utf8(output.stderr)?.contains("share content and permissions"));
+
+    let object_metadata = fs::metadata(&object)?;
+    let linked = destination.join("model.bin");
+    let linked_metadata = fs::metadata(&linked)?;
+    assert_eq!(object_metadata.dev(), linked_metadata.dev());
+    assert_eq!(object_metadata.ino(), linked_metadata.ino());
+    assert_eq!(object_metadata.permissions().mode() & 0o222, 0);
+    assert_eq!(linked_metadata.permissions().mode() & 0o222, 0);
+    assert_eq!(fs::metadata(destination.join("empty.bin"))?.len(), 0);
+    run_success(&repository, &["fsck"])?;
+
+    fs::set_permissions(&linked, fs::Permissions::from_mode(0o600))?;
+    fs::write(&linked, vec![b'x'; contents.len()])?;
+    let fsck = run_command(&repository, &["fsck"])?;
+    assert!(!fsck.status.success());
+    assert!(String::from_utf8_lossy(&fsck.stderr).contains("Hash 损坏"));
+
+    let second = fs::canonicalize(outer.path())?.join("linked-again");
+    let export = run_command(
+        &repository,
+        &[
+            "export",
+            "--mode",
+            "hardlink",
+            "HEAD",
+            second.to_str().unwrap(),
+        ],
+    )?;
+    assert!(!export.status.success());
+    assert!(!second.exists());
+
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))?;
+    fs::remove_file(linked)?;
+    fs::remove_file(destination.join("empty.bin"))?;
+    fs::remove_dir(destination)?;
+    Ok(())
+}
+
+#[test]
+fn hardlink_failure_cleanup_preserves_existing_object_permissions() -> TestResult {
+    let outer = tempfile::tempdir()?;
+    let repository = outer.path().join("repository");
+    fs::create_dir(&repository)?;
+    run_success(&repository, &["init", "--chunking", "whole-file"])?;
+    let first_contents = b"first whole-file object";
+    let second_contents = b"second whole-file object";
+    fs::write(repository.join("a.bin"), first_contents)?;
+    fs::write(repository.join("b.bin"), second_contents)?;
+    run_success(&repository, &["add", "."])?;
+    run_success(&repository, &["commit", "-m", "cleanup"])?;
+
+    let first_object = indexed_object_path(&repository, "a.bin")?;
+    let second_object = indexed_object_path(&repository, "b.bin")?;
+    fs::set_permissions(&first_object, fs::Permissions::from_mode(0o400))?;
+    fs::write(&second_object, vec![b'x'; second_contents.len()])?;
+
+    let destination = fs::canonicalize(outer.path())?.join("failed-linked");
+    let output = run_command(
+        &repository,
+        &[
+            "export",
+            "--mode",
+            "hardlink",
+            "HEAD",
+            destination.to_str().unwrap(),
+        ],
+    )?;
+    assert!(!output.status.success());
+    assert!(!destination.exists());
+    assert_eq!(fs::read(&first_object)?, first_contents);
+    assert_eq!(
+        fs::metadata(&first_object)?.permissions().mode() & 0o777,
+        0o400
+    );
+    assert!(!fs::read_dir(outer.path())?.any(|entry| {
+        entry.ok().is_some_and(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".neoengram-read-only-")
+        })
+    }));
+    Ok(())
+}
+
+#[test]
+fn hardlink_export_rejects_mixed_chunking_without_publishing() -> TestResult {
+    let outer = tempfile::tempdir()?;
+    let repository = outer.path().join("repository");
+    fs::create_dir(&repository)?;
+    run_success(&repository, &["init", "--chunking", "mixed"])?;
+    fs::write(repository.join("cdc.bin"), b"cdc")?;
+    fs::write(repository.join("whole.bin"), b"whole")?;
+    run_success(&repository, &["add", "cdc.bin"])?;
+    run_success(
+        &repository,
+        &["add", "--chunking", "whole-file", "whole.bin"],
+    )?;
+    run_success(&repository, &["commit", "-m", "mixed"])?;
+
+    let destination = fs::canonicalize(outer.path())?.join("mixed-linked");
+    let output = run_command(
+        &repository,
+        &[
+            "export",
+            "--mode",
+            "hardlink",
+            "HEAD",
+            destination.to_str().unwrap(),
+        ],
+    )?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("仅支持 WholeFile"));
+    assert!(!destination.exists());
+    assert!(!fs::read_dir(outer.path())?.any(|entry| {
+        entry.ok().is_some_and(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".neoengram-read-only-")
+        })
+    }));
+    Ok(())
+}
+
+#[test]
+fn explicit_strategy_switch_changes_manifest_and_reports_reused_object() -> TestResult {
+    let repository = tempfile::tempdir()?;
+    run_success(repository.path(), &["init", "--chunking", "mixed"])?;
+    fs::write(repository.path().join("model.bin"), b"same payload")?;
+    run_success(repository.path(), &["add", "model.bin"])?;
+    run_success(repository.path(), &["commit", "-m", "fastcdc"])?;
+    let (fastcdc_manifest, fastcdc_strategy) = indexed_manifest(repository.path(), "model.bin")?;
+    assert_eq!(fastcdc_strategy, 1);
+
+    run_success(
+        repository.path(),
+        &["add", "--chunking", "whole-file", "model.bin"],
+    )?;
+    let (whole_file_manifest, whole_file_strategy) =
+        indexed_manifest(repository.path(), "model.bin")?;
+    assert_eq!(whole_file_strategy, 2);
+    assert_ne!(fastcdc_manifest, whole_file_manifest);
+
+    let status = String::from_utf8(run_success(repository.path(), &["status"])?.stdout)?;
+    assert!(status.contains("Changes to be committed:"));
+    assert!(status.contains("modified: model.bin"));
+    assert!(!status.contains("Changes not staged for commit:"));
+
+    let staged = String::from_utf8(run_success(repository.path(), &["diff", "--staged"])?.stdout)?;
+    assert!(staged.contains("chunks reused 1, new 0, removed 0, +0 bytes"));
+    let worktree = String::from_utf8(run_success(repository.path(), &["diff"])?.stdout)?;
+    assert!(worktree.contains("no differences"));
+    Ok(())
+}
+
+#[test]
+fn add_without_override_preserves_the_tracked_whole_file_strategy() -> TestResult {
+    let repository = tempfile::tempdir()?;
+    run_success(repository.path(), &["init", "--chunking", "mixed"])?;
+    let model = repository.path().join("model.bin");
+    fs::write(&model, b"whole-v1")?;
+    run_success(
+        repository.path(),
+        &["add", "--chunking", "whole-file", "model.bin"],
+    )?;
+    assert_eq!(indexed_chunking(repository.path(), "model.bin")?, 2);
+
+    fs::write(&model, b"whole-v2-with-new-size")?;
+    run_success(repository.path(), &["add", "model.bin"])?;
+    assert_eq!(indexed_chunking(repository.path(), "model.bin")?, 2);
+    Ok(())
+}
+
+fn loose_object(repository: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(fs::read_dir(repository.join(".neoengram/objects"))?
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.len() == 64)
+        })
+        .ok_or("missing loose object")?
+        .path())
+}
+
+fn indexed_chunking(repository: &Path, path: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(indexed_manifest(repository, path)?.1)
+}
+
+fn indexed_manifest(
+    repository: &Path,
+    path: &str,
+) -> Result<(String, i64), Box<dyn std::error::Error>> {
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    Ok(connection.query_row(
+        "SELECT lower(hex(manifests.id)), manifests.chunking FROM workspace_index_files \
+         JOIN manifests ON manifests.id = workspace_index_files.manifest_id \
+         WHERE workspace_index_files.workspace_id = zeroblob(16) \
+           AND workspace_index_files.path = ?1",
+        [path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
+}
+
+fn indexed_object_path(
+    repository: &Path,
+    path: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let connection = Connection::open(repository.join(".neoengram/metadata/metadata.sqlite3"))?;
+    let id: String = connection.query_row(
+        "SELECT lower(hex(manifest_chunks.object_id)) FROM workspace_index_files \
+         JOIN manifests ON manifests.id = workspace_index_files.manifest_id \
+         JOIN manifest_chunks ON manifest_chunks.set_id = manifests.set_id \
+         WHERE workspace_index_files.workspace_id = zeroblob(16) \
+           AND workspace_index_files.path = ?1 AND manifest_chunks.ordinal = 0",
+        [path],
+        |row| row.get(0),
+    )?;
+    Ok(repository.join(".neoengram/objects").join(id))
 }
 
 fn run_success(

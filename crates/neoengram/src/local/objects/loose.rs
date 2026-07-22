@@ -12,8 +12,8 @@ use anyhow::{ensure, Context, Result};
 use tempfile::NamedTempFile;
 
 use super::contract::{
-    validate_object_id, validate_object_spec, ObjectCheck, ObjectMeta, ObjectPage, ObjectSpec,
-    ObjectStore, PutOutcome, MAX_OBJECT_CHECK_BATCH, MAX_OBJECT_LIST_PAGE_SIZE,
+    validate_object_id, validate_object_spec, HardLinkOutcome, ObjectCheck, ObjectMeta, ObjectPage,
+    ObjectSpec, ObjectStore, PutOutcome, MAX_OBJECT_CHECK_BATCH, MAX_OBJECT_LIST_PAGE_SIZE,
 };
 
 const IO_BUFFER_SIZE: usize = 64 * 1024;
@@ -144,6 +144,94 @@ impl ObjectStore for LooseObjectStore {
             object_path.display()
         );
         copy_and_hash_exact(&mut input, target, expected, "读取 Chunk 对象")
+    }
+
+    fn supports_hard_links(&self) -> bool {
+        cfg!(unix)
+    }
+
+    fn hard_link_to(&self, expected: &ObjectSpec, target: &Path) -> Result<HardLinkOutcome> {
+        #[cfg(not(unix))]
+        {
+            let _ = (expected, target);
+            return Ok(HardLinkOutcome::Unsupported);
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            validate_object_spec(expected)?;
+            self.validate_layout()?;
+            let object_path = self.object_path(&expected.id)?;
+            let path_before = fs::symlink_metadata(&object_path).with_context(|| {
+                format!(
+                    "缺少 WholeFile 对象 {}: {}",
+                    expected.id,
+                    object_path.display()
+                )
+            })?;
+            ensure!(
+                path_before.is_file()
+                    && !path_before.file_type().is_symlink()
+                    && path_before.len() == expected.size,
+                "WholeFile 对象路径无效或大小损坏: {}",
+                object_path.display()
+            );
+
+            let mut opened = File::open(&object_path)
+                .with_context(|| format!("无法打开 WholeFile 对象: {}", object_path.display()))?;
+            let opened_before = opened.metadata()?;
+            ensure!(
+                opened_before.dev() == path_before.dev()
+                    && opened_before.ino() == path_before.ino()
+                    && opened_before.len() == expected.size,
+                "WholeFile 对象在打开期间发生变化: {}",
+                object_path.display()
+            );
+            copy_and_hash_exact(
+                &mut opened,
+                &mut io::sink(),
+                expected,
+                "验证 WholeFile 硬链接源",
+            )?;
+
+            let path_after = fs::symlink_metadata(&object_path)?;
+            let opened_after = opened.metadata()?;
+            ensure!(
+                path_after.is_file()
+                    && !path_after.file_type().is_symlink()
+                    && path_after.dev() == opened_after.dev()
+                    && path_after.ino() == opened_after.ino()
+                    && path_after.len() == expected.size,
+                "WholeFile 对象在验证期间发生变化: {}",
+                object_path.display()
+            );
+
+            fs::hard_link(&object_path, target).with_context(|| {
+                format!(
+                    "无法创建 WholeFile 硬链接（源和目标必须位于同一文件系统）: {} -> {}",
+                    object_path.display(),
+                    target.display()
+                )
+            })?;
+            let linked = fs::symlink_metadata(target)
+                .with_context(|| format!("无法检查 WholeFile 硬链接: {}", target.display()))?;
+            ensure!(
+                linked.is_file()
+                    && !linked.file_type().is_symlink()
+                    && linked.dev() == opened_after.dev()
+                    && linked.ino() == opened_after.ino()
+                    && linked.len() == expected.size,
+                "WholeFile 硬链接未指向已验证对象: {}",
+                target.display()
+            );
+            let parent = target
+                .parent()
+                .with_context(|| format!("WholeFile 硬链接没有父目录: {}", target.display()))?;
+            sync_directory(parent)?;
+            Ok(HardLinkOutcome::Linked)
+        }
     }
 
     fn stat(&self, id: &str) -> Result<Option<ObjectMeta>> {

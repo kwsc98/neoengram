@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use neoengram_core::ChunkingStrategy;
 
-use crate::app;
+use crate::{app, local::repository::ChunkingPolicy};
 
 /// 面向 AI 数据集和模型权重的内容寻址版本控制系统。
 #[derive(Debug, Parser)]
@@ -93,6 +94,28 @@ struct InitArgs {
     /// 要初始化为 NeoEngram 仓库的目录。
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
+    /// 固定仓库分块策略；mixed 仓库允许 add 按文件选择策略。
+    #[arg(long, value_enum)]
+    chunking: Option<RepositoryChunkingArg>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RepositoryChunkingArg {
+    #[value(name = "fastcdc")]
+    FastCdc,
+    #[value(name = "whole-file")]
+    WholeFile,
+    Mixed,
+}
+
+impl From<RepositoryChunkingArg> for ChunkingPolicy {
+    fn from(value: RepositoryChunkingArg) -> Self {
+        match value {
+            RepositoryChunkingArg::FastCdc => Self::FastCdc,
+            RepositoryChunkingArg::WholeFile => Self::WholeFile,
+            RepositoryChunkingArg::Mixed => Self::Mixed,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -103,6 +126,26 @@ struct AddArgs {
     /// 让指定范围的 index 与工作区一致，包括暂存已删除路径。
     #[arg(short = 'A', long)]
     all: bool,
+    /// mixed 仓库中覆盖目标文件的分块策略；固定策略仓库不接受此参数。
+    #[arg(long, value_enum)]
+    chunking: Option<ChunkingArg>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ChunkingArg {
+    #[value(name = "fastcdc")]
+    FastCdc,
+    #[value(name = "whole-file")]
+    WholeFile,
+}
+
+impl From<ChunkingArg> for ChunkingStrategy {
+    fn from(value: ChunkingArg) -> Self {
+        match value {
+            ChunkingArg::FastCdc => Self::FastCdc,
+            ChunkingArg::WholeFile => Self::WholeFile,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -189,6 +232,24 @@ struct ExportArgs {
     target: String,
     #[arg(value_name = "DIR")]
     destination: PathBuf,
+    /// 导出物化方式；hardlink 仅支持同文件系统中的 WholeFile loose 对象。
+    #[arg(long, value_enum, default_value_t = ExportModeArg::Copy)]
+    mode: ExportModeArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExportModeArg {
+    Copy,
+    Hardlink,
+}
+
+impl From<ExportModeArg> for app::export::ExportMode {
+    fn from(value: ExportModeArg) -> Self {
+        match value {
+            ExportModeArg::Copy => Self::Copy,
+            ExportModeArg::Hardlink => Self::HardLink,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -220,7 +281,9 @@ struct UnmountArgs {
 
 pub(crate) async fn run() -> Result<()> {
     match Cli::parse().command {
-        Command::Init(arguments) => app::init::execute(arguments.path).await,
+        Command::Init(arguments) => {
+            app::init::execute(arguments.path, arguments.chunking.map(Into::into)).await
+        }
         Command::Workspace(arguments) => match arguments.command {
             WorkspaceCommand::Create(create) => {
                 app::workspace::create(create.name, create.from, create.path, create.branch).await
@@ -231,10 +294,11 @@ pub(crate) async fn run() -> Result<()> {
             }
         },
         Command::Add(arguments) => {
+            let chunking = arguments.chunking.map(ChunkingStrategy::from);
             if arguments.all {
-                app::add::execute_with_options(arguments.path, true).await
+                app::add::execute_with_options(arguments.path, true, chunking).await
             } else {
-                app::add::execute(arguments.path).await
+                app::add::execute(arguments.path, chunking).await
             }
         }
         Command::Rm(arguments) => {
@@ -251,7 +315,12 @@ pub(crate) async fn run() -> Result<()> {
             app::checkout::execute(arguments.target, arguments.force).await
         }
         Command::Export(arguments) => {
-            app::export::execute(arguments.target, arguments.destination).await
+            app::export::execute(
+                arguments.target,
+                arguments.destination,
+                arguments.mode.into(),
+            )
+            .await
         }
         Command::Recover(arguments) => app::recover::execute(arguments.abort).await,
         Command::Restore(arguments) => {

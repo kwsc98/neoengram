@@ -3,18 +3,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use tempfile::Builder;
 
 use crate::local::{
     fs::durable::{create_dir_all_durable, rename_noreplace_durable},
-    repository::{Repository, NEOENGRAM_DIR_NAME},
+    repository::{ChunkingPolicy, Repository, NEOENGRAM_DIR_NAME},
     STORAGE_TEMP_FILE_PREFIX,
 };
 
-pub(crate) async fn execute(path: PathBuf) -> Result<()> {
+pub(crate) async fn execute(path: PathBuf, chunking: Option<ChunkingPolicy>) -> Result<()> {
     let task_path = path.clone();
-    let outcome = tokio::task::spawn_blocking(move || initialize(&task_path))
+    let outcome = tokio::task::spawn_blocking(move || initialize(&task_path, chunking))
         .await
         .with_context(|| format!("仓库初始化任务异常终止: {}", path.display()))??;
 
@@ -37,7 +37,7 @@ struct InitOutcome {
     reinitialized: bool,
 }
 
-fn initialize(path: &Path) -> Result<InitOutcome> {
+fn initialize(path: &Path, chunking: Option<ChunkingPolicy>) -> Result<InitOutcome> {
     ensure_repository_root(path)?;
     let root =
         fs::canonicalize(path).with_context(|| format!("无法解析仓库目录: {}", path.display()))?;
@@ -52,9 +52,17 @@ fn initialize(path: &Path) -> Result<InitOutcome> {
     };
     if reinitialized {
         let repository = Repository::open_or_create(root)?;
+        if let Some(requested) = chunking {
+            ensure!(
+                repository.chunking_policy() == requested,
+                "已有仓库使用 {} 分块策略，不能改为 {}；请新建仓库",
+                repository.chunking_policy().as_str(),
+                requested.as_str()
+            );
+        }
         repository.initialize_layout()?;
     } else {
-        initialize_new_repository(&root)?;
+        initialize_new_repository(&root, chunking.unwrap_or_default())?;
     }
     Ok(InitOutcome {
         repository_dir,
@@ -62,13 +70,13 @@ fn initialize(path: &Path) -> Result<InitOutcome> {
     })
 }
 
-fn initialize_new_repository(root: &Path) -> Result<()> {
+fn initialize_new_repository(root: &Path, chunking: ChunkingPolicy) -> Result<()> {
     let temporary = Builder::new()
         .prefix(STORAGE_TEMP_FILE_PREFIX)
         .tempdir_in(root)
         .with_context(|| format!("无法创建仓库初始化临时目录: {}", root.display()))?;
     let staging_root = temporary.path().to_path_buf();
-    let repository = Repository::open_or_create(staging_root.clone())?;
+    let repository = Repository::at_with_chunking(staging_root.clone(), chunking)?;
     repository.initialize_layout()?;
     super::test_crash_at("init-before-publish");
 

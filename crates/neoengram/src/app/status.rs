@@ -311,7 +311,7 @@ mod tests {
 
     use super::{compare_snapshots, ChangeKind, PathChange};
     use crate::local::worktree::lenient_leaf_metadata;
-    use neoengram_core::{Chunk, FileNode};
+    use neoengram_core::{Chunk, ChunkingStrategy, FileNode};
 
     #[test]
     fn snapshot_diff_is_sorted_and_classifies_changes() {
@@ -350,6 +350,7 @@ mod tests {
         FileNode {
             path: path.to_owned(),
             total_size: 1,
+            chunking: ChunkingStrategy::FastCdc,
             chunks: vec![Chunk {
                 hash: hash.to_owned(),
                 offset: 0,

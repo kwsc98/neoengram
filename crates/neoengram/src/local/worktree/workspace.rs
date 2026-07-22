@@ -145,7 +145,7 @@ mod tests {
     use std::fs;
 
     use super::{file_matches_node, lenient_leaf_metadata, safe_leaf_metadata};
-    use neoengram_core::{Chunk, FileNode};
+    use neoengram_core::{Chunk, ChunkingStrategy, FileNode};
 
     #[test]
     fn file_ancestor_is_missing_for_lenient_and_an_error_for_strict(
@@ -168,6 +168,7 @@ mod tests {
         let node = FileNode {
             path: "payload".to_owned(),
             total_size: contents.len() as u64,
+            chunking: ChunkingStrategy::FastCdc,
             chunks: vec![Chunk {
                 hash: blake3::hash(contents).to_hex().to_string(),
                 offset: 0,

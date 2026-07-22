@@ -15,7 +15,7 @@ pub(crate) use import::chunk_file;
 pub(crate) use recovery::{recover_repository, RecoveryReport};
 pub(crate) use remove::{remove_tracked_path, repository_scope, RemovalRecovery};
 pub(crate) use scan::{collect_files_with_ignore, validate_input_path};
-pub(crate) use snapshot::{materialize_read_only_snapshot, ReadOnlySnapshotOutcome};
+pub(crate) use snapshot::{materialize_read_only_snapshot, ExportMode, ReadOnlySnapshotOutcome};
 pub(crate) use workspace::{
     file_matches_node, lenient_leaf_metadata, safe_leaf_metadata, workspace_path,
 };

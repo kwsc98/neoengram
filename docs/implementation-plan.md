@@ -3,8 +3,8 @@
 > 本文是 NeoEngram 的唯一实现路线、能力状态和研究计划记录。代码、架构文档或
 > README 中出现的路线描述应与本文保持一致；如果出现冲突，以本文为准。
 
-最后更新：2026-07-21
-当前阶段：本地 format v6、多 Workspace 与只读 FUSE 已实现，跨平台实挂基准待完成
+最后更新：2026-07-22
+当前阶段：本地 format v7、多 Workspace、WholeFile 硬链接导出与只读 FUSE 已实现，跨平台实挂基准待完成
 
 ## 1. 产品目标
 
@@ -22,7 +22,8 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 本项目只维护训练数据的文件、快照、分片和来源摘要，不建设训练调度、样本标注、特征工程、
 实验管理或训练 Run 平台。
 
-本地读取面已增加固定 Commit 的只读 FUSE。`export` 提供一次性权限快照；
+本地读取面已增加固定 Commit 的只读 FUSE。`export` 提供 copy 权限快照和可信本地环境下的
+WholeFile hardlink 只读视图；
 FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端下载或可写 overlay。
 
 第一阶段继续保持线性历史。Workspace 创建可以原子创建并独占分支，但暂不提供独立
@@ -68,9 +69,9 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 
 | 能力 | 状态 | 当前语义 |
 | --- | --- | --- |
-| `init` | 已完成 | 创建 format v6 SQLite 本地仓库、repository_id 和受管目录 |
+| `init` | 已完成 | 创建 format v7 SQLite 仓库，并不可变绑定 fastcdc/whole-file/mixed 策略 |
 | `workspace create/list/remove` | 已完成 | 独立 HEAD/Index/base、分支独占、内外部 Workspace 与安全删除 |
-| `add` / `add -A` | 已完成 | FastCDC 切块、BLAKE3 去重、暂存新增/修改/删除 |
+| `add` / `add -A` | 已完成 | 固定仓库强制既定策略；mixed 可逐文件选择，支持 BLAKE3 去重和删除暂存 |
 | `rm` | 已完成 | 安全移除工作区或仅移除 index，支持持久事务和可验证回滚 |
 | `status` | 已完成 | 报告 staged、unstaged、deleted 和 untracked，并拒绝混合状态视图 |
 | `diff` | 已完成 | 比较工作区、index 和 Commit，并在输出前复核 Index/HEAD |
@@ -78,7 +79,7 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | `commit` | 已完成 | 从分页 Index 流式发布 Manifest/Directory DAG/Commit，并 CAS 更新 HEAD/ref |
 | `log` / `show` | 已完成 | 查看线性历史和 Commit 文件清单 |
 | `checkout` | 已完成 | 物化 Commit，支持 detached HEAD 和 `main` 重新附着 |
-| `export TARGET DIR` | 已完成 | 原子生成 Unix 只读快照，不改变当前 Workspace 状态 |
+| `export TARGET DIR` | 已完成 | 原子生成 copy 权限快照，或严格的 WholeFile/Loose 同文件系统硬链接视图 |
 | `recover` | 已完成 | 恢复被中断的 checkout/rm 事务 |
 | `gc` | 已完成 | 从全部 Workspace Index 与全部 Commit roots 标记并回收 Chunk |
 | `fsck` | 已完成 | 校验 refs、历史、Directory/Manifest、Chunk 和对象完整性 |
@@ -92,7 +93,8 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 - `MetadataStore` 已有分页、固定 snapshot、Manifest reader/writer、Index transaction 和
   HEAD/ref CAS 契约。
 - SQLite 是唯一元数据后端；JSON 后端和旧格式兼容已删除。
-- `ObjectStore` 提供流式发布、校验读取、分页枚举、durability barrier 和协调删除。
+- `repository.json` 持久化不可变分块策略；Repository 在 Index、Tree、Commit 和 fsck 路径强制校验。
+- `ObjectStore` 提供流式发布、校验读取、分页枚举、durability barrier、协调删除和可选硬链接能力。
 - 本地锁固定按 object -> Workspace worktree -> state 获取；工作区读操作共享、mutation 独占，冲突立即失败。
 - `add` 基于最初的 `IndexVersion` 做最终 CAS；status/diff 在输出前复核实际依赖的 Index 与
   HEAD/main。
@@ -110,7 +112,7 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 
 | 能力层 | 当前能力（已完成） | 下一步/未来能力 |
 | --- | --- | --- |
-| 客户端数据面 | 工作区、Index、FastCDC Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
+| 客户端数据面 | 工作区、Index、FastCDC/WholeFile Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
 | 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | 中心 PostgreSQL、租户/项目/仓库/ref、远端 CAS |
 | 远端数据面 | 尚未实现 | S3-compatible Chunk/Pack、幂等上传、Signed PUT/GET、对象生命周期 |
 | 读取面 | checkout、权限快照和固定 Commit FUSE | Dataset Snapshot、Shard 分页、mount lease、训练读取票据 |
@@ -129,8 +131,8 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 4. **规模热点仍存在**：add、status、commit、rm、checkout、gc 仍可能物化完整索引或引用集；
    loose object 目录仍是平铺扫描，完整文件缓存没有 quota/lease；远端分页、租约和 GC 尚未实现。
 5. **历史能力有限**：只有单父线性历史，没有命名分支、merge、rebase、tag 和 reflog。
-6. **只读快照不是安全边界**：`0444/0555` 可被拥有权限的用户或 root 修改，且当前拒绝符号链
-   父级路径。
+6. **只读快照不是安全边界**：`0444/0555` 可被拥有权限的用户或 root 修改；hardlink 视图还与
+   Loose 对象共享 inode 和权限，写入会污染所有引用该对象的快照。损坏必须从可信副本恢复。
 7. **没有训练读取语义**：当前不存在固定 Dataset Snapshot、ShardSet、schema/source 摘要或
    训练期间的 lease/retention root。
 8. **没有远端安全治理**：尚无 JWT 验证、RBAC、租户 RLS、Signed URL、审计、KMS/密钥轮换或

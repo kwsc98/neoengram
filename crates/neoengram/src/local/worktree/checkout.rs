@@ -447,7 +447,7 @@ fn prepare_file_caches(
 }
 
 fn file_cache_id(file: &FileNode) -> Result<String> {
-    Ok(describe_manifest(file.total_size, &file.chunks)?.id)
+    Ok(describe_manifest(file.total_size, file.chunking, &file.chunks)?.id)
 }
 
 fn ensure_file_cache(repository: &Repository, file: &FileNode, file_id: &str) -> Result<PathBuf> {

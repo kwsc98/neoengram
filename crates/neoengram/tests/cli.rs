@@ -4,7 +4,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use neoengram_core::{Chunk, Commit, FileNode, Index, Tree, INDEX_FORMAT_VERSION};
+use neoengram_core::{
+    Chunk, ChunkingStrategy, Commit, FileNode, Index, Tree, INDEX_FORMAT_VERSION,
+};
 use rusqlite::{params, Connection};
 use serde::de::DeserializeOwned;
 
@@ -28,7 +30,7 @@ fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error
     assert!(temporary.path().join("mounts").is_dir());
     assert!(temporary.path().join("exports").is_dir());
     let repository_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(repository_config["format_version"], 6);
+    assert_eq!(repository_config["format_version"], 7);
     assert_eq!(
         repository_config["repository_id"]
             .as_str()
@@ -38,6 +40,7 @@ fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error
     );
     assert!(repository_config.get("metadata_store").is_none());
     assert_eq!(repository_config["object_store"], "loose");
+    assert_eq!(repository_config["chunking"], "fastcdc");
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     assert!(!metadata_dir.join("index.json").exists());
 
@@ -50,6 +53,53 @@ fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error
     assert!(reopened_config.get("metadata_store").is_none());
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     assert!(!metadata_dir.join("index.json").exists());
+
+    let override_attempt = command(temporary.path())
+        .args(["add", "--chunking", "whole-file", "."])
+        .output()?;
+    assert!(!override_attempt.status.success());
+    assert!(String::from_utf8_lossy(&override_attempt.stderr).contains("固定 fastcdc 仓库"));
+    Ok(())
+}
+
+#[test]
+fn whole_file_policy_is_persisted_and_cannot_be_changed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let initialized = command(temporary.path())
+        .args(["init", "--chunking", "whole-file"])
+        .output()?;
+    assert!(
+        initialized.status.success(),
+        "whole-file init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+
+    let metadata_dir = temporary.path().join(".neoengram/metadata");
+    let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
+    assert_eq!(config["chunking"], "whole-file");
+
+    fs::write(temporary.path().join("model.bin"), b"whole model")?;
+    let add = command(temporary.path())
+        .args(["add", "model.bin"])
+        .output()?;
+    assert!(add.status.success());
+    let index = read_index(&metadata_dir)?;
+    assert_eq!(index.files[0].chunking, ChunkingStrategy::WholeFile);
+
+    let override_attempt = command(temporary.path())
+        .args(["add", "--chunking", "fastcdc", "model.bin"])
+        .output()?;
+    assert!(!override_attempt.status.success());
+    assert!(String::from_utf8_lossy(&override_attempt.stderr).contains("固定 whole-file 仓库"));
+
+    let reinitialized = command(temporary.path()).arg("init").output()?;
+    assert!(reinitialized.status.success());
+    let changed = command(temporary.path())
+        .args(["init", "--chunking", "fastcdc"])
+        .output()?;
+    assert!(!changed.status.success());
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("不能改为 fastcdc"));
     Ok(())
 }
 
@@ -69,7 +119,7 @@ fn init_creates_a_missing_nested_repository_root() -> Result<(), Box<dyn std::er
         .path()
         .join("nested/repository/.neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["format_version"], 6);
+    assert_eq!(config["format_version"], 7);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     Ok(())
 }
@@ -100,7 +150,7 @@ fn crashed_new_init_can_be_retried() -> Result<(), Box<dyn std::error::Error>> {
     );
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["format_version"], 6);
+    assert_eq!(config["format_version"], 7);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     let add = command(temporary.path()).args(["add", "."]).output()?;
     assert!(
@@ -138,7 +188,7 @@ fn concurrent_init_publishes_exactly_one_repository() -> Result<(), Box<dyn std:
 
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["format_version"], 6);
+    assert_eq!(config["format_version"], 7);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     Ok(())
 }
@@ -238,15 +288,15 @@ fn init_rejects_the_previous_repository_format() -> Result<(), Box<dyn std::erro
     fs::create_dir_all(&metadata_dir)?;
     fs::write(
         metadata_dir.join("repository.json"),
-        br#"{"format_version":4,"object_store":"loose"}"#,
+        br#"{"format_version":6,"object_store":"loose"}"#,
     )?;
 
     let output = command(temporary.path()).arg("init").output()?;
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("格式版本 4"));
-    assert!(stderr.contains("当前支持 6"));
+    assert!(stderr.contains("格式版本 6"));
+    assert!(stderr.contains("当前支持 7"));
     assert!(!temporary.path().join(".neoengram/objects").exists());
     Ok(())
 }
@@ -1171,8 +1221,13 @@ fn command(current_dir: &Path) -> Command {
 fn read_index(metadata_dir: &Path) -> Result<Index, Box<dyn std::error::Error>> {
     let connection = Connection::open(metadata_dir.join("metadata.sqlite3"))?;
     let mut statement = connection.prepare(
-        "SELECT path, total_size, chunk_count, lower(hex(manifest_id)) \
-         FROM workspace_index_files WHERE workspace_id = zeroblob(16) ORDER BY path",
+        "SELECT workspace_index_files.path, workspace_index_files.total_size, \
+                workspace_index_files.chunk_count, lower(hex(workspace_index_files.manifest_id)), \
+                manifests.chunking \
+         FROM workspace_index_files \
+         JOIN manifests ON manifests.id = workspace_index_files.manifest_id \
+         WHERE workspace_index_files.workspace_id = zeroblob(16) \
+         ORDER BY workspace_index_files.path",
     )?;
     let stored = statement
         .query_map([], |row| {
@@ -1181,16 +1236,18 @@ fn read_index(metadata_dir: &Path) -> Result<Index, Box<dyn std::error::Error>> 
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut files = Vec::with_capacity(stored.len());
-    for (path, total_size, chunk_count, manifest_id) in stored {
+    for (path, total_size, chunk_count, manifest_id, chunking) in stored {
         let chunks = read_manifest(&connection, &manifest_id)?;
         assert_eq!(u64::try_from(chunks.len())?, u64::try_from(chunk_count)?);
         files.push(FileNode {
             path,
             total_size: u64::try_from(total_size)?,
+            chunking: decode_chunking(chunking)?,
             chunks,
         });
     }
@@ -1240,9 +1297,16 @@ fn read_directory(
             format!("{prefix}/{name}")
         };
         if kind == 1 {
+            let target = blake3::Hash::from_hex(&target_id)?;
+            let chunking: i64 = connection.query_row(
+                "SELECT chunking FROM manifests WHERE id = ?1",
+                params![target.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
             files.push(FileNode {
                 path,
                 total_size: u64::try_from(total_size)?,
+                chunking: decode_chunking(chunking)?,
                 chunks: read_manifest(connection, &target_id)?,
             });
         } else {
@@ -1250,6 +1314,14 @@ fn read_directory(
         }
     }
     Ok(())
+}
+
+fn decode_chunking(value: i64) -> Result<ChunkingStrategy, Box<dyn std::error::Error>> {
+    match value {
+        1 => Ok(ChunkingStrategy::FastCdc),
+        2 => Ok(ChunkingStrategy::WholeFile),
+        _ => Err(format!("unknown chunking value: {value}").into()),
+    }
 }
 
 fn read_manifest(

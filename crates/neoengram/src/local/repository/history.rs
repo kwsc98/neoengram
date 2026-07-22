@@ -10,8 +10,7 @@ use crate::local::metadata::{
 
 use super::{
     validation::{
-        commit_content_id, validate_commit, validate_files, validate_hash, validate_index,
-        validate_sorted_ids,
+        commit_content_id, validate_commit, validate_files, validate_hash, validate_sorted_ids,
     },
     Repository, DEFAULT_HEAD_REFERENCE,
 };
@@ -82,7 +81,7 @@ impl Repository {
             format_version: reader.format_version(),
             files: collect_file_set(self.metadata_store.as_ref(), reader.as_ref())?,
         };
-        validate_index(&index)?;
+        self.validate_index_snapshot(&index)?;
         let version = reader.version().clone();
         Ok(VersionedIndex { index, version })
     }
@@ -108,13 +107,13 @@ impl Repository {
         index: &Index,
         expected: &IndexVersion,
     ) -> Result<IndexVersion> {
-        validate_index(index)?;
+        self.validate_index_snapshot(index)?;
         let mut records = Vec::with_capacity(index.files.len());
         for file in &index.files {
             let mut chunks = file.chunks.iter().cloned().map(Ok);
-            let manifest = self
-                .metadata_store
-                .put_manifest(file.total_size, &mut chunks)?;
+            let manifest =
+                self.metadata_store
+                    .put_manifest(file.total_size, file.chunking, &mut chunks)?;
             let record = FileRecord::from_manifest(file.path.clone(), file.total_size, &manifest);
             records.push(record);
         }
@@ -131,12 +130,13 @@ impl Repository {
     #[cfg(test)]
     pub(crate) fn store_tree(&self, tree: &Tree) -> Result<String> {
         validate_files(&tree.files)?;
+        self.validate_chunking_files(&tree.files)?;
         let mut builder = DirectoryDagBuilder::new(self.metadata_store.as_ref())?;
         for file in &tree.files {
             let mut chunks = file.chunks.iter().cloned().map(Ok);
-            let manifest = self
-                .metadata_store
-                .put_manifest(file.total_size, &mut chunks)?;
+            let manifest =
+                self.metadata_store
+                    .put_manifest(file.total_size, file.chunking, &mut chunks)?;
             let record = FileRecord::from_manifest(file.path.clone(), file.total_size, &manifest);
             builder.push(record)?;
         }
@@ -199,6 +199,8 @@ impl Repository {
             "Index 文件 {} 的 Chunk 数量与 Manifest 不一致",
             record.path
         );
+        self.validate_chunking_strategy(manifest.chunking())
+            .with_context(|| format!("Index 文件分块策略不符合仓库配置: {}", record.path))?;
         let mut request = PageRequest::first(STORAGE_SCAN_PAGE_SIZE)?;
         let mut chunk_count = 0_u64;
         loop {
@@ -318,6 +320,8 @@ impl Repository {
         mut visitor: impl FnMut(&neoengram_core::Chunk) -> Result<()>,
     ) -> Result<u64> {
         let reader = self.open_manifest(manifest_id)?;
+        self.validate_chunking_strategy(reader.chunking())
+            .with_context(|| format!("Manifest 分块策略不符合仓库配置: {manifest_id}"))?;
         ensure!(
             reader.total_size() == expected_size,
             "Manifest {manifest_id} 的逻辑大小与引用不一致"
@@ -451,6 +455,7 @@ impl Repository {
                         "Directory 文件大小与 Manifest 不一致: {path}"
                     );
                     let chunk_count = manifest.chunk_count();
+                    let chunking = manifest.chunking();
                     let chunks = collect_pages(|request| manifest.scan_chunks(request))?;
                     ensure!(
                         u64::try_from(chunks.len()).context("Chunk 数量超出 u64")? == chunk_count,
@@ -460,6 +465,7 @@ impl Repository {
                     files.push(FileNode {
                         path,
                         total_size: entry.total_size,
+                        chunking,
                         chunks,
                     });
                 }
@@ -824,6 +830,7 @@ fn collect_file_set<R: MetadataReader + ?Sized>(
             record.path
         );
         let chunks = collect_pages(|request| manifest.scan_chunks(request))?;
+        let chunking = manifest.chunking();
         ensure!(
             u64::try_from(chunks.len()).context("Chunk 数量超出 u64")? == record.chunk_count,
             "文件 {} 的 Chunk 数量与存储记录不一致",
@@ -832,6 +839,7 @@ fn collect_file_set<R: MetadataReader + ?Sized>(
         files.push(FileNode {
             path: record.path,
             total_size: record.total_size,
+            chunking,
             chunks,
         });
     }
@@ -865,7 +873,7 @@ mod tests {
     use std::fs;
 
     use anyhow::Result;
-    use neoengram_core::{FileNode, Index};
+    use neoengram_core::{ChunkingStrategy, FileNode, Index};
 
     use super::Repository;
 
@@ -885,6 +893,7 @@ mod tests {
             files: vec![FileNode {
                 path: "stale.bin".to_owned(),
                 total_size: 0,
+                chunking: ChunkingStrategy::FastCdc,
                 chunks: Vec::new(),
             }],
         };
@@ -907,11 +916,13 @@ mod tests {
                 FileNode {
                     path: "left/file".to_owned(),
                     total_size: 0,
+                    chunking: ChunkingStrategy::FastCdc,
                     chunks: Vec::new(),
                 },
                 FileNode {
                     path: "right/file".to_owned(),
                     total_size: 0,
+                    chunking: ChunkingStrategy::FastCdc,
                     chunks: Vec::new(),
                 },
             ],
