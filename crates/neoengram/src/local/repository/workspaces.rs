@@ -157,6 +157,7 @@ impl Repository {
             metadata_store,
             object_store: self.object_store.clone(),
             object_store_kind: self.object_store_kind,
+            chunking_policy: self.chunking_policy,
         })
     }
 

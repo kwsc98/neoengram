@@ -9,7 +9,7 @@ mod tree;
 pub use chunk::Chunk;
 pub use commit::Commit;
 pub use directory::{DirectoryEntry, DirectoryEntryKind};
-pub use file::FileNode;
+pub use file::{ChunkingStrategy, FileNode};
 pub use format::INDEX_FORMAT_VERSION;
 pub use index::Index;
 pub use tree::Tree;

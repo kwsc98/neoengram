@@ -10,7 +10,9 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use neoengram_core::{Chunk, Commit, DirectoryEntry, DirectoryEntryKind, INDEX_FORMAT_VERSION};
+use neoengram_core::{
+    Chunk, ChunkingStrategy, Commit, DirectoryEntry, DirectoryEntryKind, INDEX_FORMAT_VERSION,
+};
 use rusqlite::{params, params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension};
 
 use crate::local::fs::durable::{ensure_or_create_directory, sync_parent};
@@ -26,7 +28,7 @@ use super::{
 
 const DATABASE_FILE_NAME: &str = "metadata.sqlite3";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f45;
-const SQLITE_SCHEMA_VERSION: i64 = 4;
+const SQLITE_SCHEMA_VERSION: i64 = 5;
 const WRITE_BATCH_SIZE: usize = 1_024;
 const WRITE_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -72,9 +74,10 @@ CREATE UNIQUE INDEX one_workspace_per_attached_ref
 CREATE TABLE manifest_sets (
     set_id BLOB PRIMARY KEY CHECK (length(set_id) = 16),
     total_size INTEGER NOT NULL CHECK (total_size >= 0),
+    chunking INTEGER NOT NULL CHECK (chunking IN (1, 2)),
     chunk_count INTEGER CHECK (chunk_count IS NULL OR chunk_count >= 0),
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
-    UNIQUE (set_id, total_size, chunk_count)
+    UNIQUE (set_id, total_size, chunking, chunk_count)
 ) STRICT;
 
 CREATE TABLE manifest_chunks (
@@ -93,10 +96,12 @@ CREATE TABLE manifests (
     id BLOB PRIMARY KEY CHECK (length(id) = 32),
     set_id BLOB NOT NULL UNIQUE,
     total_size INTEGER NOT NULL CHECK (total_size >= 0),
+    chunking INTEGER NOT NULL CHECK (chunking IN (1, 2)),
     chunk_count INTEGER NOT NULL CHECK (chunk_count >= 0),
+    UNIQUE (id, total_size, chunking, chunk_count),
     UNIQUE (id, total_size, chunk_count),
-    FOREIGN KEY (set_id, total_size, chunk_count)
-        REFERENCES manifest_sets(set_id, total_size, chunk_count) ON DELETE RESTRICT
+    FOREIGN KEY (set_id, total_size, chunking, chunk_count)
+        REFERENCES manifest_sets(set_id, total_size, chunking, chunk_count) ON DELETE RESTRICT
 ) STRICT;
 
 CREATE TABLE directory_sets (
@@ -204,17 +209,18 @@ impl SqliteMetadataStore {
         Ok(Rc::new(ReadSession { connection }))
     }
 
-    fn create_manifest_set(&self, total_size: u64) -> Result<Vec<u8>> {
+    fn create_manifest_set(&self, total_size: u64, chunking: ChunkingStrategy) -> Result<Vec<u8>> {
         let connection = self.open_existing(false)?;
         let set_id = random_set_id(&connection)?;
         let now = current_unix_ms()?;
         run_immediate(&connection, || {
             connection.execute(
-                "INSERT INTO manifest_sets(set_id, total_size, chunk_count, created_at_ms) \
-                 VALUES (?1, ?2, NULL, ?3)",
+                "INSERT INTO manifest_sets(set_id, total_size, chunking, chunk_count, created_at_ms) \
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
                 params![
                     set_id.as_slice(),
                     encode_u64(total_size, "Manifest 文件大小")?,
+                    encode_chunking(chunking),
                     now
                 ],
             )?;
@@ -483,6 +489,21 @@ fn encode_u64(value: u64, kind: &str) -> Result<i64> {
 
 fn decode_u64(value: i64, kind: &str) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("{kind}包含负数: {value}"))
+}
+
+const fn encode_chunking(chunking: ChunkingStrategy) -> i64 {
+    match chunking {
+        ChunkingStrategy::FastCdc => 1,
+        ChunkingStrategy::WholeFile => 2,
+    }
+}
+
+fn decode_chunking(value: i64) -> Result<ChunkingStrategy> {
+    match value {
+        1 => Ok(ChunkingStrategy::FastCdc),
+        2 => Ok(ChunkingStrategy::WholeFile),
+        _ => bail!("Manifest 分块策略无效: {value}"),
+    }
 }
 
 fn decode_id(id: &str) -> Result<[u8; 32]> {
@@ -841,6 +862,7 @@ struct SqliteManifestReader {
     set_id: Vec<u8>,
     total_size: u64,
     chunk_count: u64,
+    chunking: ChunkingStrategy,
 }
 
 impl ManifestReader for SqliteManifestReader {
@@ -850,6 +872,10 @@ impl ManifestReader for SqliteManifestReader {
 
     fn chunk_count(&self) -> u64 {
         self.chunk_count
+    }
+
+    fn chunking(&self) -> ChunkingStrategy {
+        self.chunking
     }
 
     fn scan_chunks(&self, request: &PageRequest) -> Result<Page<Chunk>> {
@@ -1580,20 +1606,22 @@ fn publish_manifest_set(
 
         let existing = connection
             .query_row(
-                "SELECT set_id, total_size, chunk_count FROM manifests WHERE id = ?1",
+                "SELECT set_id, total_size, chunking, chunk_count FROM manifests WHERE id = ?1",
                 params![id.as_slice()],
                 |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((existing_set, existing_size, existing_count)) = existing {
+        if let Some((existing_set, existing_size, existing_chunking, existing_count)) = existing {
             ensure!(
                 decode_u64(existing_size, "已有 Manifest 文件大小")? == total_size
+                    && decode_chunking(existing_chunking)? == manifest.chunking
                     && decode_u64(existing_count, "已有 Manifest Chunk 数量")?
                         == manifest.chunk_count
                     && manifest_sets_equal(&connection, &existing_set, set_id)?,
@@ -1604,11 +1632,13 @@ fn publish_manifest_set(
         }
 
         connection.execute(
-            "INSERT INTO manifests(id, set_id, total_size, chunk_count) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO manifests(id, set_id, total_size, chunking, chunk_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 id.as_slice(),
                 set_id,
                 encode_u64(total_size, "Manifest 文件大小")?,
+                encode_chunking(manifest.chunking),
                 encode_u64(manifest.chunk_count, "Manifest Chunk 数量")?,
             ],
         )?;
@@ -1880,25 +1910,27 @@ fn open_manifest_in_session(
     let stored = session
         .connection
         .query_row(
-            "SELECT set_id, total_size, chunk_count FROM manifests WHERE id = ?1",
+            "SELECT set_id, total_size, chunking, chunk_count FROM manifests WHERE id = ?1",
             params![id_bytes.as_slice()],
             |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
         .optional()
         .with_context(|| format!("无法打开 SQLite Manifest: {id}"))?;
     stored
-        .map(|(set_id, total_size, chunk_count)| {
+        .map(|(set_id, total_size, chunking, chunk_count)| {
             Ok(Box::new(SqliteManifestReader {
                 session,
                 set_id,
                 total_size: decode_u64(total_size, "Manifest 文件大小")?,
                 chunk_count: decode_u64(chunk_count, "Manifest Chunk 数量")?,
+                chunking: decode_chunking(chunking)?,
             }) as Box<dyn ManifestReader>)
         })
         .transpose()
@@ -2215,12 +2247,13 @@ impl MetadataStore for SqliteMetadataStore {
     fn put_manifest(
         &self,
         total_size: u64,
+        chunking: ChunkingStrategy,
         chunks: &mut dyn Iterator<Item = Result<Chunk>>,
     ) -> Result<ManifestRef> {
         encode_u64(total_size, "Manifest 文件大小")?;
-        let set_id = self.create_manifest_set(total_size)?;
+        let set_id = self.create_manifest_set(total_size, chunking)?;
         let result = (|| {
-            let mut hasher = ManifestHasher::new(total_size);
+            let mut hasher = ManifestHasher::new(total_size, chunking);
             let mut batch = Vec::with_capacity(WRITE_BATCH_SIZE);
             let mut written = 0_u64;
             for chunk in chunks {
@@ -2571,7 +2604,7 @@ fn verify_published_manifests(session: Rc<ReadSession>) -> Result<()> {
         for id in &id_page.items {
             let reader = open_manifest_in_session(Rc::clone(&session), id)?
                 .with_context(|| format!("Manifest 在完整性检查期间消失: {id}"))?;
-            let mut hasher = ManifestHasher::new(reader.total_size());
+            let mut hasher = ManifestHasher::new(reader.total_size(), reader.chunking());
             let mut chunk_request = PageRequest::first(4_096)?;
             let mut count = 0_u64;
             loop {
@@ -2587,7 +2620,9 @@ fn verify_published_manifests(session: Rc<ReadSession>) -> Result<()> {
             }
             let calculated = hasher.finish()?;
             ensure!(
-                calculated.id == *id && calculated.chunk_count == reader.chunk_count(),
+                calculated.id == *id
+                    && calculated.chunk_count == reader.chunk_count()
+                    && calculated.chunking == reader.chunking(),
                 "Manifest 内容与其 ID 或 header 不匹配: {id}"
             );
             ensure!(

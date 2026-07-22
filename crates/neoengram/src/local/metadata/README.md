@@ -1,6 +1,6 @@
 # 本地元数据存储
 
-NeoEngram format v6 只使用 SQLite 元数据后端。旧 JSON 后端、后端选择参数和旧仓库读取均已
+NeoEngram format v7 只使用 SQLite 元数据后端。旧 JSON 后端、后端选择参数和旧仓库读取均已
 删除；版本不匹配的仓库必须重新初始化。
 
 ## 边界
@@ -25,7 +25,7 @@ FUSE inode/cache 均不属于本模块。
 | 对象 | 内容 | ID 语义 |
 | --- | --- | --- |
 | Chunk | 原始 payload | payload 的 BLAKE3，沿用原格式 |
-| Manifest | `total_size + ordered chunks` | `neoengram-manifest-v3` 规范编码 |
+| Manifest | `chunking + total_size + ordered chunks` | `neoengram-manifest-v4` 规范编码 |
 | Directory | 按名称排序的直接子项 | `neoengram-directory-v1` 规范编码 |
 | Commit | 根 Directory、父 Commit、消息、时间 | `neoengram-commit-v3` 规范编码 |
 
@@ -33,7 +33,11 @@ FUSE inode/cache 均不属于本模块。
 固定枚举值。ID 不依赖 JSON、SQLite 行布局或 Rust 序列化细节。Directory 的递归文件数和逻辑
 字节数是校验/查询统计，不参与 ID。
 
-Manifest Chunk 必须从 offset 0 连续覆盖 `total_size`；空 Manifest 只能表示空文件。
+Manifest Chunk 必须从 offset 0 连续覆盖 `total_size`；空 Manifest 只能表示空文件。WholeFile
+非空 Manifest 必须恰有一个 `offset=0,size=total_size` 的对象，空文件必须为零对象。策略参与
+Manifest ID，因此两种策略即使产生相同单 Chunk recipe，ID 也不同。
+仓库级 `fastcdc`/`whole-file`/`mixed` 策略由 Repository 配置和校验；MetadataStore 仍保存实际
+Manifest 策略，不把仓库策略隐式编码进 SQLite 后端。
 Directory 只保存直接子项：
 
 - File：`name + manifest_id + total_size`
@@ -73,8 +77,9 @@ Reader 不因一次点查枚举完整对象集合。调用方必须拒绝超大�
 
 ## Index 与 Commit
 
-Index 只保存 `workspace_id/path/manifest_id/total_size/chunk_count`，不重复 Chunk Vec。每个
-Workspace 的 Index transaction 使用独立 opaque `IndexVersion` 做 CAS；A -> B -> A 仍产生新版本。
+Index 只保存 `workspace_id/path/manifest_id/total_size/chunk_count`，不重复 Chunk Vec 或分块策略；
+策略由 `manifest_id` 指向的 Manifest 恢复，并通过该 ID 进入 Index digest。每个 Workspace 的
+Index transaction 使用独立 opaque `IndexVersion` 做 CAS；A -> B -> A 仍产生新版本。
 
 Commit 在仓库写锁内分页读取有序 Index。实现使用深度优先目录栈：路径前缀结束时先发布子
 Directory，再把其 ID 追加到父 writer；内存只保留当前深度、一个 Index 页和 writer 的有界

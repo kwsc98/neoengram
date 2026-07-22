@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use neoengram_core::{Commit, Tree};
+use neoengram_core::{ChunkingStrategy, Commit, Tree};
 
 use crate::local::repository::Repository;
 
@@ -24,9 +24,13 @@ pub(crate) async fn execute(target: String) -> Result<()> {
     println!("Files ({}):", shown.tree.files.len());
     for file in &shown.tree.files {
         println!(
-            "{:>12} bytes  {:>6} chunks  {}",
+            "{:>12} bytes  {:>6} chunks  {:>10}  {}",
             file.total_size,
             file.chunks.len(),
+            match file.chunking {
+                ChunkingStrategy::FastCdc => "fastcdc",
+                ChunkingStrategy::WholeFile => "whole-file",
+            },
             file.path
         );
     }

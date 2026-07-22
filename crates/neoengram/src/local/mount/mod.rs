@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use neoengram_core::{DirectoryEntry, DirectoryEntryKind};
+use neoengram_core::{ChunkingStrategy, DirectoryEntry, DirectoryEntryKind};
 
 use crate::local::{objects::ObjectSpec, repository::Repository};
 
@@ -164,7 +164,10 @@ impl VerifiedChunkCache {
 
         let loaded = (|| {
             let capacity = usize::try_from(spec.size).context("当前平台无法分配 Chunk 缓存")?;
-            let mut bytes = Vec::with_capacity(capacity);
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(capacity)
+                .map_err(|error| anyhow::anyhow!("无法分配 Chunk 缓存: {error}"))?;
             repository
                 .object_store()
                 .copy_to(spec, &mut bytes)
@@ -434,6 +437,7 @@ impl ReadOnlyMount {
             manifest.total_size() == open.size,
             "Manifest 文件大小发生变化"
         );
+        let whole_file = manifest.chunking() == ChunkingStrategy::WholeFile;
         let mut result = Vec::with_capacity(usize::try_from(end - offset)?);
         let mut cursor = offset;
         let mut range_offset = offset;
@@ -453,6 +457,12 @@ impl ReadOnlyMount {
                 ensure!(
                     chunk.offset <= cursor && chunk_end > cursor,
                     "Manifest range 存在空洞"
+                );
+                ensure!(
+                    !whole_file || chunk.size <= self.cache.capacity,
+                    "WholeFile 对象 {} bytes 超过 FUSE Chunk 缓存上限 {} bytes；请增大 --cache-size-mib 或使用 export --mode hardlink",
+                    chunk.size,
+                    self.cache.capacity
                 );
                 let bytes = self
                     .cache
@@ -701,7 +711,7 @@ mod tests {
     use std::{fs, io::Cursor};
 
     use anyhow::Result;
-    use neoengram_core::{Chunk, Commit, FileNode, Tree};
+    use neoengram_core::{Chunk, ChunkingStrategy, Commit, FileNode, Tree};
 
     use crate::local::{objects::ObjectSpec, repository::Repository};
 
@@ -741,11 +751,13 @@ mod tests {
                 FileNode {
                     path: "empty".to_owned(),
                     total_size: 0,
+                    chunking: ChunkingStrategy::FastCdc,
                     chunks: Vec::new(),
                 },
                 FileNode {
                     path: "nested/file.bin".to_owned(),
                     total_size: offset,
+                    chunking: ChunkingStrategy::FastCdc,
                     chunks,
                 },
             ],
@@ -868,6 +880,67 @@ mod tests {
     }
 
     #[test]
+    fn oversized_whole_file_is_rejected_before_cache_allocation() -> Result<()> {
+        let temporary = tempfile::tempdir_in(std::env::current_dir()?)?;
+        let repository_root = temporary.path().join("repository");
+        let mountpoint = temporary.path().join("mount");
+        fs::create_dir(&repository_root)?;
+        fs::create_dir(&mountpoint)?;
+        let repository = Repository::at_with_chunking(
+            repository_root,
+            crate::local::repository::ChunkingPolicy::WholeFile,
+        )?;
+        repository.initialize_layout()?;
+        let payload = b"whole file exceeds cache";
+        let id = blake3::hash(payload).to_hex().to_string();
+        repository.object_store().put_from(
+            &ObjectSpec::new(id.clone(), payload.len() as u64)?,
+            &mut Cursor::new(payload),
+        )?;
+        let root = repository.store_tree(&Tree {
+            files: vec![FileNode {
+                path: "model.bin".to_owned(),
+                total_size: payload.len() as u64,
+                chunking: ChunkingStrategy::WholeFile,
+                chunks: vec![Chunk {
+                    hash: id,
+                    offset: 0,
+                    size: payload.len() as u64,
+                }],
+            }],
+        })?;
+        let commit = repository.store_commit(&Commit {
+            tree_hash: root,
+            parent: None,
+            message: "whole file".to_owned(),
+            created_at_unix_ms: 1,
+        })?;
+        let mut readable = ReadOnlyMount::prepare(
+            repository.clone(),
+            &commit,
+            &mountpoint,
+            payload.len() as u64,
+        )?;
+        let readable_file = readable
+            .lookup(ROOT_INODE, "model.bin")?
+            .expect("readable model file");
+        let readable_handle = readable.open_file(readable_file.inode)?;
+        assert_eq!(
+            readable.read_file(readable_handle, 0, payload.len() as u32)?,
+            payload
+        );
+
+        let mut mount = ReadOnlyMount::prepare(repository, &commit, &mountpoint, 4)?;
+        let file = mount.lookup(ROOT_INODE, "model.bin")?.expect("model file");
+        let handle = mount.open_file(file.inode)?;
+        let error = mount
+            .read_file(handle, 0, 1)
+            .expect_err("oversized WholeFile was loaded");
+        assert!(format!("{error:#}").contains("超过 FUSE Chunk 缓存上限"));
+        Ok(())
+    }
+
+    #[test]
     fn cache_is_byte_bounded_and_evicts_least_recently_used_chunk() -> Result<()> {
         let mut fixture = create_test_mount(5)?;
         let nested = fixture
@@ -920,6 +993,7 @@ mod tests {
                 .map(|index| FileNode {
                     path: format!("files/{index:04}"),
                     total_size: 0,
+                    chunking: ChunkingStrategy::FastCdc,
                     chunks: Vec::new(),
                 })
                 .collect(),
@@ -959,6 +1033,7 @@ mod tests {
             files: vec![FileNode {
                 path: "first".to_owned(),
                 total_size: 0,
+                chunking: ChunkingStrategy::FastCdc,
                 chunks: Vec::new(),
             }],
         })?;
@@ -976,6 +1051,7 @@ mod tests {
             files: vec![FileNode {
                 path: "second".to_owned(),
                 total_size: 0,
+                chunking: ChunkingStrategy::FastCdc,
                 chunks: Vec::new(),
             }],
         })?;

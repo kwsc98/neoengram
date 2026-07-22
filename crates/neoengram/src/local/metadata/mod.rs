@@ -7,7 +7,7 @@
 use std::{fmt::Debug, num::NonZeroU32, path::Path, sync::Arc};
 
 use anyhow::{ensure, Context, Result};
-use neoengram_core::{Chunk, Commit, DirectoryEntry, DirectoryEntryKind};
+use neoengram_core::{Chunk, ChunkingStrategy, Commit, DirectoryEntry, DirectoryEntryKind};
 use serde::{Deserialize, Serialize};
 
 use crate::local::STORAGE_TEMP_FILE_PREFIX;
@@ -17,7 +17,7 @@ mod sqlite;
 use sqlite::SqliteMetadataStore;
 
 const MAX_PAGE_SIZE: u32 = 4_096;
-const MANIFEST_HASH_DOMAIN: &[u8] = b"neoengram-manifest-v3";
+const MANIFEST_HASH_DOMAIN: &[u8] = b"neoengram-manifest-v4";
 const DIRECTORY_HASH_DOMAIN: &[u8] = b"neoengram-directory-v1";
 const CANONICAL_ENCODING_VERSION: u32 = 1;
 
@@ -88,6 +88,7 @@ impl IndexVersion {
 pub(crate) struct ManifestRef {
     pub(crate) id: String,
     pub(crate) chunk_count: u64,
+    pub(crate) chunking: ChunkingStrategy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +122,7 @@ impl FileRecord {
 pub(crate) trait ManifestReader: Debug {
     fn total_size(&self) -> u64;
     fn chunk_count(&self) -> u64;
+    fn chunking(&self) -> ChunkingStrategy;
     fn scan_chunks(&self, request: &PageRequest) -> Result<Page<Chunk>>;
 
     /// Returns chunks beginning with the Chunk covering `offset`, or the first Chunk after it.
@@ -236,6 +238,7 @@ pub(crate) trait MetadataStore: MetadataReader + Send + Sync {
     fn put_manifest(
         &self,
         total_size: u64,
+        chunking: ChunkingStrategy,
         chunks: &mut dyn Iterator<Item = Result<Chunk>>,
     ) -> Result<ManifestRef>;
     fn begin_directory_write(&self) -> Result<Box<dyn DirectoryWriter + '_>>;
@@ -294,8 +297,12 @@ fn decode_id(id: &str) -> Result<[u8; 32]> {
     Ok(*hash.as_bytes())
 }
 
-pub(crate) fn describe_manifest(total_size: u64, chunks: &[Chunk]) -> Result<ManifestRef> {
-    let mut hasher = ManifestHasher::new(total_size);
+pub(crate) fn describe_manifest(
+    total_size: u64,
+    chunking: ChunkingStrategy,
+    chunks: &[Chunk],
+) -> Result<ManifestRef> {
+    let mut hasher = ManifestHasher::new(total_size, chunking);
     for chunk in chunks {
         hasher.push(chunk)?;
     }
@@ -305,17 +312,23 @@ pub(crate) fn describe_manifest(total_size: u64, chunks: &[Chunk]) -> Result<Man
 pub(crate) struct ManifestHasher {
     hasher: blake3::Hasher,
     total_size: u64,
+    chunking: ChunkingStrategy,
     next_offset: u64,
     chunk_count: u64,
 }
 
 impl ManifestHasher {
-    pub(crate) fn new(total_size: u64) -> Self {
+    pub(crate) fn new(total_size: u64, chunking: ChunkingStrategy) -> Self {
         let mut hasher = canonical_hasher(MANIFEST_HASH_DOMAIN);
+        hasher.update(&[match chunking {
+            ChunkingStrategy::FastCdc => 1,
+            ChunkingStrategy::WholeFile => 2,
+        }]);
         hasher.update(&total_size.to_le_bytes());
         Self {
             hasher,
             total_size,
+            chunking,
             next_offset: 0,
             chunk_count: 0,
         }
@@ -349,9 +362,18 @@ impl ManifestHasher {
             "Manifest Chunk 总大小与文件大小不一致"
         );
         self.hasher.update(&self.chunk_count.to_le_bytes());
+        match self.chunking {
+            ChunkingStrategy::FastCdc => {}
+            ChunkingStrategy::WholeFile => ensure!(
+                (self.total_size == 0 && self.chunk_count == 0)
+                    || (self.total_size > 0 && self.chunk_count == 1),
+                "WholeFile Manifest 必须由零个空文件 Chunk 或一个完整文件 Chunk 组成"
+            ),
+        }
         Ok(ManifestRef {
             id: self.hasher.finalize().to_hex().to_string(),
             chunk_count: self.chunk_count,
+            chunking: self.chunking,
         })
     }
 }

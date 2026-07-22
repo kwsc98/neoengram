@@ -6,5 +6,6 @@
 pub mod models;
 
 pub use models::{
-    Chunk, Commit, DirectoryEntry, DirectoryEntryKind, FileNode, Index, Tree, INDEX_FORMAT_VERSION,
+    Chunk, ChunkingStrategy, Commit, DirectoryEntry, DirectoryEntryKind, FileNode, Index, Tree,
+    INDEX_FORMAT_VERSION,
 };

@@ -1,7 +1,7 @@
 use std::{fs, num::NonZeroU32};
 
 use anyhow::{anyhow, Result};
-use neoengram_core::{Chunk, Commit, DirectoryEntry, DirectoryEntryKind};
+use neoengram_core::{Chunk, ChunkingStrategy, Commit, DirectoryEntry, DirectoryEntryKind};
 use rusqlite::Connection;
 
 use super::{
@@ -18,10 +18,10 @@ fn initialized_store() -> Result<(tempfile::TempDir, SqliteMetadataStore)> {
 
 #[test]
 fn canonical_ids_are_stable() -> Result<()> {
-    let empty = describe_manifest(0, &[])?;
+    let empty = describe_manifest(0, ChunkingStrategy::FastCdc, &[])?;
     assert_eq!(
         empty.id,
-        "9eff55768acf310e3bb2537318fad275e4436d05b8ed2200efba65c4699cff04"
+        "6d7f506996a38fa34522281302731a4ff1b3b1ac21b74d22a2d07134e5f54fb1"
     );
 
     let chunks = vec![Chunk {
@@ -29,10 +29,10 @@ fn canonical_ids_are_stable() -> Result<()> {
         offset: 0,
         size: 3,
     }];
-    let manifest = describe_manifest(3, &chunks)?;
+    let manifest = describe_manifest(3, ChunkingStrategy::FastCdc, &chunks)?;
     assert_eq!(
         manifest.id,
-        "44d8d8d722506be91dee47bd6830686cd2dc77b335b0f5bafbd0cb0277bec6ae"
+        "6fa68822b099d8087dd775d6e482d0cecbae85f6d905cdc7592ceb092cbad7de"
     );
 
     let mut hasher = DirectoryHasher::new();
@@ -45,14 +45,31 @@ fn canonical_ids_are_stable() -> Result<()> {
     })?;
     assert_eq!(
         hasher.finish().0,
-        "1c71f3be7c6ea6f3b80bd7817e4297d33b6277cf02323f0468e31e8ed81f95fd"
+        "816bf224efcd6eba9a93a7c04bf59b9728cb09cd4f2c123233743ffc46a6df22"
     );
     Ok(())
 }
 
 #[test]
+fn chunking_strategy_is_part_of_the_manifest_identity() -> Result<()> {
+    let payload = b"single chunk";
+    let chunks = vec![Chunk {
+        hash: blake3::hash(payload).to_hex().to_string(),
+        offset: 0,
+        size: payload.len() as u64,
+    }];
+    let fastcdc = describe_manifest(payload.len() as u64, ChunkingStrategy::FastCdc, &chunks)?;
+    let whole_file = describe_manifest(payload.len() as u64, ChunkingStrategy::WholeFile, &chunks)?;
+
+    assert_ne!(fastcdc.id, whole_file.id);
+    assert_eq!(fastcdc.chunking, ChunkingStrategy::FastCdc);
+    assert_eq!(whole_file.chunking, ChunkingStrategy::WholeFile);
+    Ok(())
+}
+
+#[test]
 fn directory_names_must_be_strictly_sorted() -> Result<()> {
-    let target = describe_manifest(0, &[])?.id;
+    let target = describe_manifest(0, ChunkingStrategy::FastCdc, &[])?.id;
     let mut hasher = DirectoryHasher::new();
     hasher.push(&DirectoryEntry {
         ordinal: 0,
@@ -86,7 +103,11 @@ fn sqlite_directory_and_manifest_ranges_are_paged() -> Result<()> {
         offset: 3,
         size: 3,
     };
-    let manifest = store.put_manifest(6, &mut vec![Ok(first), Ok(second.clone())].into_iter())?;
+    let manifest = store.put_manifest(
+        6,
+        ChunkingStrategy::FastCdc,
+        &mut vec![Ok(first), Ok(second.clone())].into_iter(),
+    )?;
     let reader = store.open_manifest(&manifest.id)?.expect("manifest");
     let page = reader.scan_chunks_from_offset(4, NonZeroU32::new(1).expect("nonzero"))?;
     assert_eq!(page.items, vec![second]);
@@ -147,7 +168,9 @@ fn duplicate_directory_publication_is_idempotent_and_cleans_staging() -> Result<
 fn manifest_iterator_failure_rolls_back_staging() -> Result<()> {
     let (temporary, store) = initialized_store()?;
     let mut chunks = vec![Err(anyhow!("injected iterator failure"))].into_iter();
-    assert!(store.put_manifest(1, &mut chunks).is_err());
+    assert!(store
+        .put_manifest(1, ChunkingStrategy::FastCdc, &mut chunks)
+        .is_err());
 
     let connection = Connection::open(temporary.path().join("metadata/metadata.sqlite3"))?;
     let sets: i64 =
@@ -161,7 +184,7 @@ fn manifest_iterator_failure_rolls_back_staging() -> Result<()> {
 #[test]
 fn index_transaction_drop_rolls_back_and_stale_cas_is_rejected() -> Result<()> {
     let (_temporary, store) = initialized_store()?;
-    let manifest = store.put_manifest(0, &mut std::iter::empty())?;
+    let manifest = store.put_manifest(0, ChunkingStrategy::FastCdc, &mut std::iter::empty())?;
     let file = FileRecord::from_manifest("empty".to_owned(), 0, &manifest);
     let initial = store.read_index()?;
     let initial_version = initial.version().clone();
@@ -206,7 +229,7 @@ fn metadata_snapshot_keeps_a_fixed_reference_view() -> Result<()> {
 #[test]
 fn directory_lookup_and_ordinal_paging_are_consistent() -> Result<()> {
     let (_temporary, store) = initialized_store()?;
-    let manifest = store.put_manifest(0, &mut std::iter::empty())?;
+    let manifest = store.put_manifest(0, ChunkingStrategy::FastCdc, &mut std::iter::empty())?;
     let mut writer = store.begin_directory_write()?;
     for (ordinal, name) in ["a", "b", "c"].into_iter().enumerate() {
         writer.append_entry(&DirectoryEntry {
@@ -347,7 +370,7 @@ fn workspaces_have_independent_head_and_index_state() -> Result<()> {
         Some(commit_id.as_str())
     );
 
-    let manifest = main.put_manifest(0, &mut std::iter::empty())?;
+    let manifest = main.put_manifest(0, ChunkingStrategy::FastCdc, &mut std::iter::empty())?;
     let main_file = FileRecord::from_manifest("main.bin".to_owned(), 0, &manifest);
     let main_version = main.read_index()?.version().clone();
     let mut main_txn = main.begin_index_transaction(Some(&main_version))?;

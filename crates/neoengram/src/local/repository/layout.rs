@@ -17,7 +17,7 @@ use crate::local::{
 
 use super::{
     config::{read_repository_config, RepositoryConfig, CURRENT_FORMAT_VERSION},
-    Repository, DEFAULT_HEAD_REFERENCE, NEOENGRAM_DIR_NAME,
+    ChunkingPolicy, Repository, DEFAULT_HEAD_REFERENCE, NEOENGRAM_DIR_NAME,
 };
 
 const OBJECTS_DIR_NAME: &str = "objects";
@@ -51,11 +51,16 @@ fn neoengram_dir_exists(root: &Path) -> Result<bool> {
 
 impl Repository {
     pub(crate) fn at(root: PathBuf) -> Result<Self> {
+        Self::at_with_chunking(root, ChunkingPolicy::FastCdc)
+    }
+
+    pub(crate) fn at_with_chunking(root: PathBuf, chunking_policy: ChunkingPolicy) -> Result<Self> {
         Self::with_object_store(
             root.clone(),
             root,
             DEFAULT_WORKSPACE_ID,
             ObjectStoreKind::Loose,
+            chunking_policy,
         )
     }
 
@@ -88,6 +93,7 @@ impl Repository {
             root,
             DEFAULT_WORKSPACE_ID,
             config.object_store,
+            config.chunking,
         )
     }
 
@@ -96,6 +102,7 @@ impl Repository {
         workspace_root: PathBuf,
         workspace_id: WorkspaceId,
         object_kind: ObjectStoreKind,
+        chunking_policy: ChunkingPolicy,
     ) -> Result<Self> {
         let metadata_dir = container_root
             .join(NEOENGRAM_DIR_NAME)
@@ -110,6 +117,7 @@ impl Repository {
             metadata_store: open_workspace_metadata_store(&metadata_dir, workspace_id),
             object_store: open_object_store(object_kind, &objects_dir),
             object_store_kind: object_kind,
+            chunking_policy,
         })
     }
 
@@ -280,9 +288,15 @@ impl Repository {
                 config.object_store == self.object_store_kind,
                 "已有仓库的对象存储后端不匹配"
             );
+            ensure!(
+                config.chunking == self.chunking_policy,
+                "已有仓库的分块策略与初始化请求不匹配: {} != {}",
+                config.chunking.as_str(),
+                self.chunking_policy.as_str()
+            );
             config
         } else {
-            RepositoryConfig::new(self.object_store_kind)?
+            RepositoryConfig::new(self.object_store_kind, self.chunking_policy)?
         };
 
         self.object_store.initialize()?;
@@ -317,6 +331,10 @@ impl Repository {
         ensure!(
             config.object_store == self.object_store_kind,
             "仓库对象后端配置与已打开后端不一致"
+        );
+        ensure!(
+            config.chunking == self.chunking_policy,
+            "仓库分块策略配置与已打开策略不一致"
         );
         self.object_store.validate_layout()?;
         self.metadata_store.validate_layout()?;

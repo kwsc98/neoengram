@@ -1,4 +1,4 @@
-use neoengram_core::{Chunk, FileNode, Tree};
+use neoengram_core::{Chunk, ChunkingStrategy, FileNode, Tree};
 
 #[test]
 fn models_round_trip_through_json() -> Result<(), Box<dyn std::error::Error>> {
@@ -6,6 +6,7 @@ fn models_round_trip_through_json() -> Result<(), Box<dyn std::error::Error>> {
         files: vec![FileNode {
             path: "models/weights.pt".to_owned(),
             total_size: 4,
+            chunking: ChunkingStrategy::FastCdc,
             chunks: vec![Chunk {
                 hash: "abcd".to_owned(),
                 offset: 0,

@@ -2,7 +2,8 @@ use std::{collections::BTreeMap, ffi::OsStr};
 
 use anyhow::{ensure, Context, Result};
 use neoengram_core::{
-    Commit, DirectoryEntry, DirectoryEntryKind, FileNode, Index, Tree, INDEX_FORMAT_VERSION,
+    ChunkingStrategy, Commit, DirectoryEntry, DirectoryEntryKind, FileNode, Index, Tree,
+    INDEX_FORMAT_VERSION,
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -11,7 +12,7 @@ use crate::local::{
     STORAGE_TEMP_FILE_PREFIX,
 };
 
-use super::{Repository, NEOENGRAM_DIR_NAME};
+use super::{ChunkingPolicy, Repository, NEOENGRAM_DIR_NAME};
 
 pub(super) const COMMIT_HASH_DOMAIN: &[u8] = b"neoengram-commit-v3";
 
@@ -29,11 +30,13 @@ pub(crate) fn is_neoengram_dir_name(name: &OsStr) -> bool {
 
 impl Repository {
     pub(crate) fn validate_index_snapshot(&self, index: &Index) -> Result<()> {
-        validate_index(index)
+        validate_index(index)?;
+        self.validate_chunking_files(&index.files)
     }
 
     pub(crate) fn validate_file_snapshot(&self, file: &FileNode) -> Result<()> {
-        validate_files(std::slice::from_ref(file))
+        validate_files(std::slice::from_ref(file))?;
+        self.validate_chunking_files(std::slice::from_ref(file))
     }
 
     pub(crate) fn validate_logical_path(&self, path: &str) -> Result<()> {
@@ -42,6 +45,7 @@ impl Repository {
 
     pub(crate) fn tree_id(&self, tree: &Tree) -> Result<String> {
         validate_files(&tree.files)?;
+        self.validate_chunking_files(&tree.files)?;
         directory_id_for_files(&tree.files)
     }
 
@@ -52,6 +56,28 @@ impl Repository {
 
     pub(crate) fn validate_commit_id(&self, id: &str) -> Result<()> {
         validate_hash(id, "Commit")
+    }
+
+    pub(crate) fn validate_chunking_strategy(&self, strategy: ChunkingStrategy) -> Result<()> {
+        match self.chunking_policy() {
+            ChunkingPolicy::Mixed => Ok(()),
+            policy => {
+                ensure!(
+                    policy.fixed_strategy() == Some(strategy),
+                    "Manifest 分块策略与仓库固定策略 {} 不一致",
+                    policy.as_str()
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn validate_chunking_files(&self, files: &[FileNode]) -> Result<()> {
+        for file in files {
+            self.validate_chunking_strategy(file.chunking)
+                .with_context(|| format!("文件分块策略不符合仓库配置: {}", file.path))?;
+        }
+        Ok(())
     }
 }
 
@@ -71,7 +97,7 @@ enum HashNode {
 fn directory_id_for_files(files: &[FileNode]) -> Result<String> {
     let mut root = HashDirectory::default();
     for file in files {
-        let manifest = describe_manifest(file.total_size, &file.chunks)?;
+        let manifest = describe_manifest(file.total_size, file.chunking, &file.chunks)?;
         insert_hash_file(&mut root, &file.path, manifest.id, file.total_size)?;
     }
     hash_directory(&root)
@@ -205,6 +231,17 @@ pub(super) fn validate_files(files: &[FileNode]) -> Result<()> {
             "文件 {} 的 Chunk 总大小与文件大小不一致",
             file.path
         );
+        if file.chunking == neoengram_core::ChunkingStrategy::WholeFile {
+            ensure!(
+                (file.total_size == 0 && file.chunks.is_empty())
+                    || (file.total_size > 0
+                        && file.chunks.len() == 1
+                        && file.chunks[0].offset == 0
+                        && file.chunks[0].size == file.total_size),
+                "WholeFile 文件 {} 必须由单个完整文件 Chunk 组成",
+                file.path
+            );
+        }
     }
     Ok(())
 }
@@ -338,10 +375,10 @@ pub(super) fn commit_content_id(commit: &Commit) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use neoengram_core::{Commit, FileNode, Tree};
+    use neoengram_core::{ChunkingStrategy, Commit, FileNode, Tree};
 
     use super::{validate_files, validate_repository_path};
-    use crate::local::repository::Repository;
+    use crate::local::repository::{ChunkingPolicy, Repository};
 
     #[test]
     fn rejects_non_portable_repository_paths() {
@@ -403,8 +440,29 @@ mod tests {
         };
         assert_eq!(
             repository.tree_id(&deep_tree)?,
-            "559d66308dd1c7769aaf180517f3562d5f89cd2c654ff8a982cf6e4dc86c2fb5"
+            "4e22a9c603e89d0b5eb266538981992f79985339e0e66333bdfc0ffb59c449e4"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn repository_policy_rejects_mismatched_tree_strategy() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let tree = Tree {
+            files: vec![empty_node("model.bin")],
+        };
+        let whole_file = Repository::at_with_chunking(
+            temporary.path().join("whole"),
+            ChunkingPolicy::WholeFile,
+        )?;
+        let error = whole_file
+            .tree_id(&tree)
+            .expect_err("fixed whole-file policy accepted FastCDC");
+        assert!(format!("{error:#}").contains("whole-file"));
+
+        let mixed =
+            Repository::at_with_chunking(temporary.path().join("mixed"), ChunkingPolicy::Mixed)?;
+        mixed.tree_id(&tree)?;
         Ok(())
     }
 
@@ -412,6 +470,7 @@ mod tests {
         FileNode {
             path: path.to_owned(),
             total_size: 0,
+            chunking: ChunkingStrategy::FastCdc,
             chunks: Vec::new(),
         }
     }

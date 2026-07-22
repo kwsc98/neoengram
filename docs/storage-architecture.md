@@ -1,25 +1,30 @@
-# format v6 存储架构
+# format v7 存储架构
 
-NeoEngram 当前仓库格式是 v6。它允许破坏性开发期升级，不读取或迁移旧格式。目标规模要求
+NeoEngram 当前仓库格式是 v7。它允许破坏性开发期升级，不读取或迁移旧格式。目标规模要求
 分页、Directory 构造和 FUSE namespace 的内存由页大小、目录深度、活动句柄和配置缓存决定。
 
 ## 内容图
 
 ```text
 refs / Workspace HEAD/base ──> Commit ──> root Directory
-                            ├── File ──> Manifest ──> ordered Chunk payloads
+                            ├── File ──> Manifest(strategy) ──> ordered Chunk payloads
                             └── Directory ──> child Directory
 
 Workspace Index ──> FileRecord(path, manifest_id, total_size, chunk_count)
 ```
 
-Chunk ID 仍是原始 payload BLAKE3。Manifest、Directory 和 Commit 使用带 domain/version 的规范
+Chunk ID 仍是原始 payload BLAKE3。Manifest 将 `FastCdc`/`WholeFile` 策略纳入规范编码和 ID，
+因此相同字节使用不同策略时仍是不同 Manifest。Manifest、Directory 和 Commit 使用带 domain/version 的规范
 二进制编码；整数是 LE，字符串带 u64 长度，引用是原始 32-byte ID。Directory 只包含直接子项，
 递归统计不参与 ID。
 
+`repository.json` 持久化不可变的 `fastcdc`、`whole-file` 或 `mixed` 仓库策略。前两种要求所有
+Index 和历史 Manifest 使用对应策略；`mixed` 才允许逐文件选择。Repository 在 Index 发布、
+Directory 构造/读取、Commit 发布和 fsck 遍历时重复检查该约束。
+
 ## SQLite MetadataStore
 
-format v6 只有 SQLite 后端。`MetadataStore` 提供：
+format v7 只有 SQLite 后端。`MetadataStore` 提供：
 
 - Manifest ordinal/offset 分页与 range 起点查询；
 - Directory 名称点查和持久 ordinal 分页；
@@ -38,7 +43,8 @@ SQLite 使用 WAL、foreign key、`synchronous=FULL` 和即时写事务。Reader
 ## ObjectStore
 
 `LooseObjectStore` 通过 `put_from` 流式校验/不可变发布 Chunk，通过 `copy_to` 单遍复算大小与
-BLAKE3。元数据引用对象前必须完成 durability barrier。GC 在 object lock 和 state lock 下从
+BLAKE3，并实现校验后 no-replace 的 WholeFile 硬链接能力；其他 ObjectStore 默认返回 unsupported，
+上层不访问对象物理路径。元数据引用对象前必须完成 durability barrier。GC 在 object lock 和 state lock 下从
 全部 Workspace Index 与全部 Commit roots 标记 Chunk，再删除未标记对象。
 
 当前所有 Commit 都是 GC root。引入历史裁剪前，必须为活动 FUSE mount 增加 lease/pin，不能
@@ -52,6 +58,12 @@ BLAKE3。元数据引用对象前必须完成 durability barrier。GC 在 object
 
 checkout/rm 的 journal 与完整文件缓存不属于 MetadataStore/ObjectStore。它们继续使用同父目录
 原子 rename、fsync 和可恢复事务。
+
+`export --mode hardlink` 在 object lock -> write lock 下验证整个 Commit 仅含 WholeFile，完整复算
+对象大小和 BLAKE3，并验证源、已打开文件及目标链接的设备号/inode。目标必须与 LooseObjectStore
+同文件系统；任何失败都清理同父目录 staging 后原子失败，不回退 copy。文件权限与仓库对象共享，
+因此该视图只适用于可信本地用户，不构成不可变安全边界。whole-file 仓库保证策略兼容；mixed
+仓库不保证任意 Commit 可硬链接导出。
 
 ## FUSE 读取路径
 
@@ -67,7 +79,8 @@ root inode 为 1；其他 inode 从 Commit ID、逻辑路径、kind 和 salt 派
 检测碰撞，lookup/forget/open/release 控制生命周期。readdir 不递归扫描，不激活全部子项。
 
 Chunk cache 按实际字节计费、线程安全、single-flight，默认 512 MiB。读取缺失、大小冲突、Hash
-损坏和 recipe 空洞都映射为 `EIO`。不可变文件使用 `FOPEN_KEEP_CACHE` 支持内核页缓存和 mmap。
+损坏和 recipe 空洞都映射为 `EIO`。超过缓存上限的 WholeFile 在分配前失败，小 WholeFile 仍按
+完整对象校验读取。不可变文件使用 `FOPEN_KEEP_CACHE` 支持内核页缓存和 mmap。
 
 ## 平台生命周期
 

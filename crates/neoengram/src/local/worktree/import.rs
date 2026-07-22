@@ -14,7 +14,7 @@ use std::os::windows::fs::MetadataExt as WindowsMetadataExt;
 use anyhow::{ensure, Context, Result};
 use fastcdc::v2020::FastCDC;
 use memmap2::{Mmap, MmapOptions};
-use neoengram_core::{Chunk, FileNode};
+use neoengram_core::{Chunk, ChunkingStrategy, FileNode};
 use tempfile::{Builder, TempDir};
 
 use crate::local::objects::{ObjectSpec, ObjectStore};
@@ -41,10 +41,11 @@ pub(crate) async fn chunk_file(
     path: PathBuf,
     object_store: Arc<dyn ObjectStore>,
     staging_dir: PathBuf,
+    chunking: ChunkingStrategy,
 ) -> Result<FileNode> {
     let task_path = path.clone();
     tokio::task::spawn_blocking(move || {
-        chunk_file_with_store_blocking(&task_path, object_store.as_ref(), &staging_dir)
+        chunk_file_with_store_blocking(&task_path, object_store.as_ref(), &staging_dir, chunking)
     })
     .await
     .with_context(|| format!("文件处理任务异常终止: {}", path.display()))?
@@ -54,6 +55,7 @@ fn chunk_file_with_store_blocking(
     path: &Path,
     object_store: &dyn ObjectStore,
     staging_dir: &Path,
+    chunking: ChunkingStrategy,
 ) -> Result<FileNode> {
     let snapshot_path = metadata_path(path)?;
     object_store.initialize()?;
@@ -70,40 +72,18 @@ fn chunk_file_with_store_blocking(
         return Ok(FileNode {
             path: snapshot_path,
             total_size,
+            chunking,
             chunks: Vec::new(),
         });
     }
 
-    let mapped = map_read_only(&stable_snapshot.file, &stable_snapshot.path)?;
-    let mapped_size = u64::try_from(mapped.len()).context("当前平台无法表示映射文件的大小")?;
-    ensure!(
-        mapped_size == total_size,
-        "文件在映射期间发生了大小变化: {}",
-        path.display()
-    );
-
-    let mut chunks = Vec::new();
-    let mut chunked_size = 0_u64;
-    for chunk in FastCDC::new(&mapped, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE) {
-        let end = chunk
-            .offset
-            .checked_add(chunk.length)
-            .context("FastCDC 返回的数据块范围溢出")?;
-        let bytes = mapped
-            .get(chunk.offset..end)
-            .context("FastCDC 返回的数据块超出文件范围")?;
-        let hash = blake3::hash(bytes).to_hex().to_string();
-        let offset = u64::try_from(chunk.offset).context("数据块偏移量超出 u64 范围")?;
-        let size = u64::try_from(chunk.length).context("数据块大小超出 u64 范围")?;
-        let spec = ObjectSpec::new(hash.clone(), size)?;
-        let mut source = Cursor::new(bytes);
-        object_store.put_from(&spec, &mut source)?;
-
-        chunked_size = chunked_size
-            .checked_add(size)
-            .context("累计数据块大小溢出")?;
-        chunks.push(Chunk { hash, offset, size });
-    }
+    let chunks = match chunking {
+        ChunkingStrategy::FastCdc => chunk_fast_cdc(&stable_snapshot, object_store, path)?,
+        ChunkingStrategy::WholeFile => chunk_whole_file(&stable_snapshot, object_store, path)?,
+    };
+    let chunked_size = chunks.iter().try_fold(0_u64, |total, chunk| {
+        total.checked_add(chunk.size).context("累计数据块大小溢出")
+    })?;
 
     ensure!(
         chunked_size == total_size,
@@ -118,8 +98,66 @@ fn chunk_file_with_store_blocking(
     Ok(FileNode {
         path: snapshot_path,
         total_size,
+        chunking,
         chunks,
     })
+}
+
+fn chunk_fast_cdc(
+    stable_snapshot: &StableSnapshot,
+    object_store: &dyn ObjectStore,
+    source_path: &Path,
+) -> Result<Vec<Chunk>> {
+    let mapped = map_read_only(&stable_snapshot.file, &stable_snapshot.path)?;
+    let mapped_size = u64::try_from(mapped.len()).context("当前平台无法表示映射文件的大小")?;
+    ensure!(
+        mapped_size == stable_snapshot.total_size,
+        "文件在映射期间发生了大小变化: {}",
+        source_path.display()
+    );
+
+    let mut chunks = Vec::new();
+    for chunk in FastCDC::new(&mapped, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE) {
+        let end = chunk
+            .offset
+            .checked_add(chunk.length)
+            .context("FastCDC 返回的数据块范围溢出")?;
+        let bytes = mapped
+            .get(chunk.offset..end)
+            .context("FastCDC 返回的数据块超出文件范围")?;
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let offset = u64::try_from(chunk.offset).context("数据块偏移量超出 u64 范围")?;
+        let size = u64::try_from(chunk.length).context("数据块大小超出 u64 范围")?;
+        object_store.put_from(
+            &ObjectSpec::new(hash.clone(), size)?,
+            &mut Cursor::new(bytes),
+        )?;
+        chunks.push(Chunk { hash, offset, size });
+    }
+    Ok(chunks)
+}
+
+fn chunk_whole_file(
+    stable_snapshot: &StableSnapshot,
+    object_store: &dyn ObjectStore,
+    source_path: &Path,
+) -> Result<Vec<Chunk>> {
+    let mut hash_source = File::open(&stable_snapshot.path)
+        .with_context(|| format!("无法打开 WholeFile 稳定快照: {}", source_path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher
+        .update_reader(&mut hash_source)
+        .with_context(|| format!("无法计算 WholeFile Hash: {}", source_path.display()))?;
+    let hash = hasher.finalize().to_hex().to_string();
+    let spec = ObjectSpec::new(hash.clone(), stable_snapshot.total_size)?;
+    let mut payload_source = File::open(&stable_snapshot.path)
+        .with_context(|| format!("无法重新打开 WholeFile 稳定快照: {}", source_path.display()))?;
+    object_store.put_from(&spec, &mut payload_source)?;
+    Ok(vec![Chunk {
+        hash,
+        offset: 0,
+        size: stable_snapshot.total_size,
+    }])
 }
 
 fn ensure_staging_directory(staging_dir: &Path) -> Result<()> {
@@ -151,7 +189,12 @@ fn ensure_staging_directory(staging_dir: &Path) -> Result<()> {
 #[cfg(test)]
 fn chunk_file_blocking(path: &Path, objects_dir: &Path) -> Result<FileNode> {
     let store = LooseObjectStore::new(objects_dir.to_path_buf());
-    chunk_file_with_store_blocking(path, &store, &objects_dir.join(TEMPORARY_DIR_NAME))
+    chunk_file_with_store_blocking(
+        path,
+        &store,
+        &objects_dir.join(TEMPORARY_DIR_NAME),
+        ChunkingStrategy::FastCdc,
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -343,6 +386,7 @@ mod tests {
     use std::{fs, io::Read, sync::Arc};
 
     use anyhow::{Context, Result};
+    use neoengram_core::ChunkingStrategy;
 
     use super::{chunk_file, chunk_file_blocking, StableSnapshot, TEMPORARY_DIR_NAME};
     use crate::local::objects::{LooseObjectStore, ObjectSpec, ObjectStore};
@@ -397,8 +441,20 @@ mod tests {
         fs::write(&first_path, contents)?;
         fs::write(&second_path, contents)?;
 
-        let first = chunk_file(first_path, Arc::clone(&store), staging_dir.clone()).await?;
-        let second = chunk_file(second_path, Arc::clone(&store), staging_dir).await?;
+        let first = chunk_file(
+            first_path,
+            Arc::clone(&store),
+            staging_dir.clone(),
+            ChunkingStrategy::FastCdc,
+        )
+        .await?;
+        let second = chunk_file(
+            second_path,
+            Arc::clone(&store),
+            staging_dir,
+            ChunkingStrategy::FastCdc,
+        )
+        .await?;
 
         assert_eq!(first.total_size, u64::try_from(contents.len())?);
         assert_eq!(first.chunks.len(), 1);
@@ -424,6 +480,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whole_file_strategy_streams_one_complete_object() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("large-model.bin");
+        let objects_dir = temporary.path().join("objects");
+        let staging_dir = temporary.path().join("staging");
+        let store: Arc<dyn ObjectStore> = Arc::new(LooseObjectStore::new(objects_dir.clone()));
+        let contents = vec![0x5a; 5 * 1024 * 1024 + 17];
+        fs::write(&source, &contents)?;
+
+        let file = chunk_file(source, store, staging_dir, ChunkingStrategy::WholeFile).await?;
+
+        assert_eq!(file.chunking, ChunkingStrategy::WholeFile);
+        assert_eq!(file.chunks.len(), 1);
+        assert_eq!(file.chunks[0].offset, 0);
+        assert_eq!(file.chunks[0].size, contents.len() as u64);
+        assert_eq!(
+            file.chunks[0].hash,
+            blake3::hash(&contents).to_hex().to_string()
+        );
+        assert_eq!(fs::read(objects_dir.join(&file.chunks[0].hash))?, contents);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn empty_file_has_no_payload_chunks() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let source = temporary.path().join("empty.bin");
@@ -432,7 +512,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(LooseObjectStore::new(objects_dir.clone()));
         fs::write(&source, [])?;
 
-        let file_node = chunk_file(source, store, staging_dir).await?;
+        let file_node = chunk_file(source, store, staging_dir, ChunkingStrategy::FastCdc).await?;
 
         assert_eq!(file_node.total_size, 0);
         assert!(file_node.chunks.is_empty());
@@ -459,11 +539,17 @@ mod tests {
         let contents = b"original model payload";
         fs::write(&source, contents)?;
 
-        let first = chunk_file(source.clone(), Arc::clone(&store), staging_dir.clone()).await?;
+        let first = chunk_file(
+            source.clone(),
+            Arc::clone(&store),
+            staging_dir.clone(),
+            ChunkingStrategy::FastCdc,
+        )
+        .await?;
         let chunk = first.chunks.first().context("missing chunk")?;
         fs::write(objects_dir.join(&chunk.hash), vec![b'x'; contents.len()])?;
 
-        let error = chunk_file(source, store, staging_dir)
+        let error = chunk_file(source, store, staging_dir, ChunkingStrategy::FastCdc)
             .await
             .expect_err("same-size corrupt object was accepted");
         assert!(format!("{error:#}").contains("Hash 损坏"));
@@ -480,7 +566,13 @@ mod tests {
         fs::write(&source, contents)?;
 
         let store: Arc<dyn ObjectStore> = Arc::new(LooseObjectStore::new(objects));
-        let file = chunk_file(source, Arc::clone(&store), staging.clone()).await?;
+        let file = chunk_file(
+            source,
+            Arc::clone(&store),
+            staging.clone(),
+            ChunkingStrategy::FastCdc,
+        )
+        .await?;
 
         assert_eq!(file.total_size, u64::try_from(contents.len())?);
         assert!(staging.is_dir());

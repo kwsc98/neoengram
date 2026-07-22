@@ -5,7 +5,7 @@ use std::{
     process::{Command, Output},
 };
 
-use neoengram_core::{Chunk, FileNode, Index, INDEX_FORMAT_VERSION};
+use neoengram_core::{Chunk, ChunkingStrategy, FileNode, Index, INDEX_FORMAT_VERSION};
 use rusqlite::{params, Connection};
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -334,6 +334,7 @@ fn read_index(repository: &Path) -> Result<Index, Box<dyn Error>> {
         files.push(FileNode {
             path,
             total_size: u64::try_from(total_size)?,
+            chunking: ChunkingStrategy::FastCdc,
             chunks,
         });
     }

@@ -5,29 +5,50 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use futures::{stream, StreamExt};
-use neoengram_core::{FileNode, Index};
+use neoengram_core::{ChunkingStrategy, FileNode, Index};
 
 use crate::local::{
     metadata::IndexVersion,
-    repository::Repository,
+    repository::{ChunkingPolicy, Repository},
     worktree::{chunk_file, collect_files_with_ignore, validate_input_path, IgnoreRules},
 };
 
-pub(crate) async fn execute(path: PathBuf) -> Result<()> {
-    execute_with_options(path, false).await
+pub(crate) async fn execute(path: PathBuf, chunking: Option<ChunkingStrategy>) -> Result<()> {
+    execute_with_options(path, false, chunking).await
 }
 
 /// 执行 add，并可选择让 index 与指定路径范围内的工作区保持一致。
 ///
 /// `all` 对应 CLI 的 `-A/--all`。普通 add 只更新仍存在的文件；开启 `all` 后，已在
 /// index 中但本次遍历没有发现的路径也会被移除，从而可靠地暂存文件和目录删除。
-pub(crate) async fn execute_with_options(path: PathBuf, all: bool) -> Result<()> {
+pub(crate) async fn execute_with_options(
+    path: PathBuf,
+    all: bool,
+    chunking: Option<ChunkingStrategy>,
+) -> Result<()> {
     validate_input_path(&path)?;
 
     let current_dir = std::env::current_dir().context("无法确定当前工作目录")?;
     let repository = Repository::discover(&current_dir)?;
+    let chunking = match repository.chunking_policy() {
+        ChunkingPolicy::FastCdc => {
+            ensure!(
+                chunking.is_none(),
+                "固定 fastcdc 仓库不接受 `add --chunking`；只有 mixed 仓库允许逐次选择"
+            );
+            Some(ChunkingStrategy::FastCdc)
+        }
+        ChunkingPolicy::WholeFile => {
+            ensure!(
+                chunking.is_none(),
+                "固定 whole-file 仓库不接受 `add --chunking`；只有 mixed 仓库允许逐次选择"
+            );
+            Some(ChunkingStrategy::WholeFile)
+        }
+        ChunkingPolicy::Mixed => chunking,
+    };
     // Lock order is fixed repository-wide: objects -> worktree -> write. Object publication is
     // serialized with GC for the whole add operation, while the shared worktree guard prevents
     // checkout/rm/restore from changing bytes during traversal and chunking.
@@ -35,6 +56,14 @@ pub(crate) async fn execute_with_options(path: PathBuf, all: bool) -> Result<()>
     let _worktree_lock = repository.acquire_worktree_shared_lock()?;
     let initial_index = repository.read_index_versioned()?;
     let ignore_rules = IgnoreRules::load(repository.root())?;
+    let tracked_chunking: Arc<BTreeMap<String, ChunkingStrategy>> = Arc::new(
+        initial_index
+            .index()
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.chunking))
+            .collect(),
+    );
     let tracked_paths: BTreeSet<String> = initial_index
         .index()
         .files
@@ -75,12 +104,24 @@ pub(crate) async fn execute_with_options(path: PathBuf, all: bool) -> Result<()>
     let tasks = input_files.into_iter().map(|input| {
         let task_object_store = Arc::clone(&object_store);
         let task_staging_dir = staging_dir.clone();
+        let task_tracked_chunking = Arc::clone(&tracked_chunking);
 
         async move {
             let (disk_path, repository_path) = input.into_parts();
-            let mut file_node = chunk_file(disk_path.clone(), task_object_store, task_staging_dir)
-                .await
-                .with_context(|| format!("无法处理文件: {}", disk_path.display()))?;
+            let selected_chunking = chunking.unwrap_or_else(|| {
+                task_tracked_chunking
+                    .get(&repository_path)
+                    .copied()
+                    .unwrap_or_default()
+            });
+            let mut file_node = chunk_file(
+                disk_path.clone(),
+                task_object_store,
+                task_staging_dir,
+                selected_chunking,
+            )
+            .await
+            .with_context(|| format!("无法处理文件: {}", disk_path.display()))?;
             file_node.path = repository_path;
             print_progress(&file_node);
             Ok::<FileNode, anyhow::Error>(file_node)

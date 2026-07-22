@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 mod contract;
 mod loose;
 
-pub(crate) use contract::{ObjectSpec, ObjectStore};
+pub(crate) use contract::{HardLinkOutcome, ObjectSpec, ObjectStore};
 pub(crate) use loose::LooseObjectStore;
 
 #[cfg(test)]

@@ -8,6 +8,11 @@
 
 ### Added
 
+- 新增持久化 `FastCdc`/`WholeFile` Manifest 策略，以及不可变的仓库级
+  `init --chunking fastcdc|whole-file|mixed` 策略。固定仓库强制既定策略；mixed 仓库允许
+  `add --chunking`，已跟踪文件默认沿用原策略，新文件默认 FastCDC。
+- 新增严格的 `export --mode hardlink`：仅支持同文件系统的 WholeFile Loose 对象，完整校验后
+  原子发布共享 inode 的只读视图，不支持时不回退复制。
 - 初始化 Cargo Workspace、多模块核心库和命令行程序。
 - 增加测试、持续集成与开源协作模板。
 - 增加 `rm`、`status`、`log`、`show`、`recover` 和 `fsck` 本地命令。
@@ -21,7 +26,7 @@
 - 元数据契约、JSON/SQLite 后端、契约测试和逐操作文档集中到独立 `local/metadata` 模块。
 - 增加流式 `ObjectStore`、真实 `LooseObjectStore`、抽象切块入口及对象后端契约测试。
 - `add` 与 `gc` 增加独立对象发布锁，避免对象在 index 发布前被并发回收。
-- `checkout --read-only DIR` 可将 Commit 原子导出到仓库外的 Unix 只读快照目录；新增
+- `export TARGET DIR` 可将 Commit 原子导出到仓库外的 Unix 只读快照目录；新增
   `.neoengramignore` 并让 `add`/`status` 共享忽略规则。
 - `fsck` 使用有界外部 Chunk 标记归并，避免为对象完整性检查长期保留完整 Chunk Hash 集合。
 - 新增 [`docs/implementation-plan.md`](docs/implementation-plan.md)，集中维护当前能力、分布式
@@ -35,6 +40,10 @@
 
 ### Changed
 
+- 仓库格式升级为 v7、SQLite schema 升级为 5、Index 格式升级为 4、Manifest 规范编码升级为
+  `neoengram-manifest-v4` 并将分块策略纳入内容 ID；开发期不迁移 v6 仓库。
+- FUSE 对超过 Chunk cache 上限的 WholeFile 在分配前明确失败；对象损坏在 fsck、commit、
+  checkout 和 export 中继续硬失败，不进行自动修复。
 - Workspace 源码统一收拢到 `crates/`：核心库迁入 `crates/neoengram-core`，命令行 crate
   改为 `crates/neoengram`，并按 `cli`、`app`、`local/{repository,worktree,metadata,objects,fs}`
   划分职责。

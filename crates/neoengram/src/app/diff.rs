@@ -3,19 +3,20 @@
 //! `diff` deliberately does not produce a line-oriented patch.  NeoEngram stores files as
 //! content-addressed CDC chunks, so the useful unit for a large model or dataset is a path,
 //! its byte/chunk counts, and the amount of chunk content that can be reused.  The worktree
-//! scanner uses the streaming FastCDC implementation and keeps the payload bounded to one CDC
-//! buffer (the small per-file recipe is retained for comparison); it never publishes objects as a
-//! side effect of a read-only diff.
+//! scanner uses the saved strategy: streaming FastCDC keeps payload memory bounded to one CDC
+//! buffer, while WholeFile streams a single BLAKE3 digest. The small per-file recipe is retained
+//! for comparison, and a read-only diff never publishes objects.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
+    io::Seek,
     path::{Component, Path},
 };
 
 use anyhow::{bail, ensure, Context, Result};
 use fastcdc::v2020::StreamCDC;
-use neoengram_core::{Chunk, FileNode, Index};
+use neoengram_core::{Chunk, ChunkingStrategy, FileNode, Index};
 use walkdir::WalkDir;
 
 use crate::local::{
@@ -207,8 +208,8 @@ pub(crate) fn build_report(
     let (left_label, right_label, left, right) = match (staged, targets) {
         (false, []) => {
             let index = read_observed_index(repository, &mut observed_index_version)?;
-            let tracked_paths = snapshot_paths(&index.files);
-            let worktree = read_worktree_snapshot(repository, Some(&tracked_paths))?;
+            let tracked = snapshot_chunking(&index.files);
+            let worktree = read_worktree_snapshot(repository, Some(&tracked))?;
             (
                 "index".to_owned(),
                 "worktree".to_owned(),
@@ -229,9 +230,9 @@ pub(crate) fn build_report(
             // the Commit, so use the union of the target and current index paths as the worktree
             // comparison scope.  Untracked paths still remain outside this Git-like diff.
             let index = read_observed_index(repository, &mut observed_index_version)?;
-            let mut tracked_paths = snapshot_paths(&commit_files);
-            tracked_paths.extend(index.files.iter().map(|file| file.path.clone()));
-            let worktree = read_worktree_snapshot(repository, Some(&tracked_paths))?;
+            let mut tracked = snapshot_chunking(&commit_files);
+            tracked.extend(snapshot_chunking(&index.files));
+            let worktree = read_worktree_snapshot(repository, Some(&tracked))?;
             (label, "worktree".to_owned(), commit_files, worktree)
         }
         (true, [target]) => {
@@ -438,12 +439,12 @@ fn chunk_delta(before: Option<&FileNode>, after: Option<&FileNode>) -> ChunkDelt
 /// `None` is retained for callers that explicitly want a complete worktree snapshot.
 fn read_worktree_snapshot(
     repository: &Repository,
-    tracked_hint: Option<&BTreeSet<String>>,
+    tracked_hint: Option<&BTreeMap<String, ChunkingStrategy>>,
 ) -> Result<Vec<FileNode>> {
     let root = repository.root();
     let mut paths = BTreeSet::new();
     if let Some(tracked) = tracked_hint {
-        paths.extend(tracked.iter().cloned());
+        paths.extend(tracked.keys().cloned());
     } else {
         let managed_container = root.join(".neoengram/metadata/repository.json").is_file();
         let entries = WalkDir::new(root)
@@ -466,7 +467,10 @@ fn read_worktree_snapshot(
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
         let disk_path = workspace_path(root, &path);
-        if let Some(file) = read_worktree_file(root, &disk_path, &path)? {
+        let chunking = tracked_hint
+            .and_then(|tracked| tracked.get(&path).copied())
+            .unwrap_or_default();
+        if let Some(file) = read_worktree_file(root, &disk_path, &path, chunking)? {
             files.push(file);
         }
     }
@@ -474,14 +478,18 @@ fn read_worktree_snapshot(
     Ok(files)
 }
 
-fn snapshot_paths(files: &[FileNode]) -> BTreeSet<String> {
-    files.iter().map(|file| file.path.clone()).collect()
+fn snapshot_chunking(files: &[FileNode]) -> BTreeMap<String, ChunkingStrategy> {
+    files
+        .iter()
+        .map(|file| (file.path.clone(), file.chunking))
+        .collect()
 }
 
 fn read_worktree_file(
     repository_root: &Path,
     path: &Path,
     logical_path: &str,
+    chunking: ChunkingStrategy,
 ) -> Result<Option<FileNode>> {
     let Some(metadata) = lenient_leaf_metadata(repository_root, logical_path)? else {
         return Ok(None);
@@ -494,23 +502,47 @@ fn read_worktree_file(
     let mut source =
         File::open(path).with_context(|| format!("无法打开工作区文件: {}", path.display()))?;
     let mut chunks = Vec::new();
-    let mut streamed_size = 0_u64;
-    let chunker = StreamCDC::new(&mut source, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE);
-    for chunk in chunker {
-        let chunk = chunk.with_context(|| format!("无法读取工作区文件: {}", path.display()))?;
-        let size = u64::try_from(chunk.length).context("Chunk 大小超出 u64 范围")?;
-        let offset = chunk.offset;
-        ensure!(
-            offset == streamed_size,
-            "工作区 Chunk 偏移不连续: {}",
-            path.display()
-        );
-        let hash = blake3::hash(&chunk.data).to_hex().to_string();
-        streamed_size = streamed_size
-            .checked_add(size)
-            .context("工作区文件大小溢出")?;
-        chunks.push(Chunk { hash, offset, size });
-    }
+    let streamed_size = match chunking {
+        ChunkingStrategy::FastCdc => {
+            let mut streamed_size = 0_u64;
+            let chunker =
+                StreamCDC::new(&mut source, MIN_CHUNK_SIZE, AVG_CHUNK_SIZE, MAX_CHUNK_SIZE);
+            for chunk in chunker {
+                let chunk =
+                    chunk.with_context(|| format!("无法读取工作区文件: {}", path.display()))?;
+                let size = u64::try_from(chunk.length).context("Chunk 大小超出 u64 范围")?;
+                let offset = chunk.offset;
+                ensure!(
+                    offset == streamed_size,
+                    "工作区 Chunk 偏移不连续: {}",
+                    path.display()
+                );
+                let hash = blake3::hash(&chunk.data).to_hex().to_string();
+                streamed_size = streamed_size
+                    .checked_add(size)
+                    .context("工作区文件大小溢出")?;
+                chunks.push(Chunk { hash, offset, size });
+            }
+            streamed_size
+        }
+        ChunkingStrategy::WholeFile => {
+            let mut hasher = blake3::Hasher::new();
+            hasher
+                .update_reader(&mut source)
+                .with_context(|| format!("无法读取工作区 WholeFile: {}", path.display()))?;
+            let streamed_size = source
+                .stream_position()
+                .with_context(|| format!("无法确认工作区 WholeFile 大小: {}", path.display()))?;
+            if total_size > 0 {
+                chunks.push(Chunk {
+                    hash: hasher.finalize().to_hex().to_string(),
+                    offset: 0,
+                    size: total_size,
+                });
+            }
+            streamed_size
+        }
+    };
     ensure!(
         streamed_size == total_size,
         "工作区文件在读取期间发生变化: {}",
@@ -528,6 +560,7 @@ fn read_worktree_file(
     Ok(Some(FileNode {
         path: logical_path.to_owned(),
         total_size,
+        chunking,
         chunks,
     }))
 }
@@ -611,7 +644,7 @@ mod tests {
     use std::fs;
 
     use super::{chunk_delta, compare_snapshots, read_worktree_file, ChangeKind};
-    use neoengram_core::{Chunk, FileNode};
+    use neoengram_core::{Chunk, ChunkingStrategy, FileNode};
 
     fn node(path: &str, chunks: &[(&str, u64)]) -> FileNode {
         let mut offset = 0;
@@ -630,6 +663,7 @@ mod tests {
         FileNode {
             path: path.to_owned(),
             total_size: offset,
+            chunking: ChunkingStrategy::FastCdc,
             chunks,
         }
     }
@@ -670,13 +704,17 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let empty = temporary.path().join("empty");
         fs::write(&empty, [])?;
-        let node = read_worktree_file(temporary.path(), &empty, "empty")?.expect("empty file");
+        let node =
+            read_worktree_file(temporary.path(), &empty, "empty", ChunkingStrategy::FastCdc)?
+                .expect("empty file");
         assert_eq!(node.total_size, 0);
         assert!(node.chunks.is_empty());
 
         let small = temporary.path().join("small");
         fs::write(&small, b"small payload")?;
-        let node = read_worktree_file(temporary.path(), &small, "small")?.expect("small file");
+        let node =
+            read_worktree_file(temporary.path(), &small, "small", ChunkingStrategy::FastCdc)?
+                .expect("small file");
         assert_eq!(node.total_size, 13);
         assert_eq!(node.chunks.len(), 1);
         assert_eq!(

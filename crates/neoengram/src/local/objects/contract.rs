@@ -9,6 +9,7 @@ use std::{
     fmt::Debug,
     io::{self, Read, Write},
     num::NonZeroUsize,
+    path::Path,
 };
 
 use anyhow::{ensure, Context, Result};
@@ -71,6 +72,13 @@ pub(crate) enum PutOutcome {
     AlreadyPresent,
 }
 
+/// Outcome of requesting a backend-native hard link to an object payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardLinkOutcome {
+    Linked,
+    Unsupported,
+}
+
 /// Local storage boundary for immutable chunk payloads.
 ///
 /// Implementations must never replace an object at an existing ID. `put_from` verifies both the
@@ -94,6 +102,18 @@ pub(crate) trait ObjectStore: Debug + Send + Sync {
 
     /// Streams one complete object to `target`, checking exact size and BLAKE3 along the way.
     fn copy_to(&self, expected: &ObjectSpec, target: &mut dyn Write) -> Result<()>;
+
+    /// Reports whether this backend can expose verified objects through native hard links.
+    fn supports_hard_links(&self) -> bool {
+        false
+    }
+
+    /// Creates a no-replace hard link after fully verifying the source object.
+    ///
+    /// Backends without a stable local loose-file representation return `Unsupported`.
+    fn hard_link_to(&self, _expected: &ObjectSpec, _target: &Path) -> Result<HardLinkOutcome> {
+        Ok(HardLinkOutcome::Unsupported)
+    }
 
     /// Reads and verifies one complete object without retaining its bytes.
     fn verify(&self, expected: &ObjectSpec) -> Result<()> {

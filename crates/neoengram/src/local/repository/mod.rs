@@ -16,6 +16,7 @@ use crate::local::{
     objects::{ObjectStore, ObjectStoreKind},
 };
 
+pub(crate) use config::ChunkingPolicy;
 pub(crate) use layout::{EXPORTS_DIR_NAME, MOUNTS_DIR_NAME, WORKSPACES_DIR_NAME};
 pub(crate) use lock::RepositoryWriteLock;
 pub(crate) use validation::is_neoengram_dir_name;
@@ -40,6 +41,7 @@ pub(crate) struct Repository {
     metadata_store: Arc<dyn MetadataStore>,
     object_store: Arc<dyn ObjectStore>,
     object_store_kind: ObjectStoreKind,
+    chunking_policy: ChunkingPolicy,
 }
 
 impl Repository {
@@ -49,5 +51,9 @@ impl Repository {
 
     pub(crate) fn container_root(&self) -> &Path {
         &self.container_root
+    }
+
+    pub(crate) fn chunking_policy(&self) -> ChunkingPolicy {
+        self.chunking_policy
     }
 }
