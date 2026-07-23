@@ -180,6 +180,11 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 - v1 的远端对象单元是独立 Chunk；Pack、hash fanout 和可验证 Pack range 是 P5 的存储优化，
   不得被 P2 的 Chunk 上传接口隐含承诺。
 
+节点侧 Agent、多租户中心、CPU/NFS 计算存储解耦、多 Agent Workspace、中心驱动异步 Job、
+StorageVolume Gateway 和跨卷数据传输仍处设计阶段，详细草案见
+[`agent-central-control.md`](agent-central-control.md)。该文档不代表当前已经存在远程 Agent、
+中心 PostgreSQL MetadataStore、Agent 分租户本地数据库、IndexVersion/lease 协调或 Gateway 能力。
+
 ## 6. 分阶段实现计划
 
 ### P0：冻结对象、协议与安全边界（下一步）
