@@ -1,0 +1,1294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>数据物流空间 · 多集群运行可观测</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-soft: hsl(210 40% 98%);
+    --panel: #ffffff;
+    --panel-2: hsl(210 40% 96%);
+    --border: hsl(214 32% 91%);
+    --border-soft: hsl(210 40% 95%);
+    --text: hsl(222 47% 11%);
+    --text-soft: hsl(215 25% 27%);
+    --text-dim: hsl(215 16% 47%);
+    --accent: hsl(173 91% 30%);
+    --accent-2: hsl(171 87% 38%);
+    --accent-soft: hsl(165 93% 90%);
+    --blue: hsl(211 72% 50%);
+    --blue-soft: hsl(211 75% 94%);
+    --violet: hsl(262 60% 55%);
+    --violet-soft: hsl(262 72% 95%);
+    --ok: hsl(152 55% 42%);
+    --ok-soft: hsl(152 58% 94%);
+    --warn: hsl(36 90% 50%);
+    --warn-soft: hsl(38 95% 94%);
+    --err: hsl(0 75% 52%);
+    --err-soft: hsl(0 78% 96%);
+    --unknown: hsl(215 16% 55%);
+    --shadow: 0 6px 20px rgba(15,23,42,.08);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    color: var(--text);
+    background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+    font-size: 13px;
+    overflow: hidden;
+  }
+  button, input, select { font: inherit; }
+  button { letter-spacing: 0; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: hsl(214 25% 85%); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: hsl(214 25% 78%); }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  .console {
+    display: grid;
+    grid-template-columns: 232px minmax(0, 1fr);
+    height: 100vh;
+    background: var(--bg);
+  }
+  .sidebar {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 16px 12px 12px;
+    overflow-y: auto;
+    background: var(--bg-soft);
+    border-right: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 16px; }
+  .brand-logo {
+    width: 30px;
+    height: 30px;
+    flex: 0 0 auto;
+    border-radius: 8px;
+    background: conic-gradient(from 210deg, hsl(173 91% 30%), hsl(171 87% 45%), hsl(176 80% 38%), hsl(173 91% 30%));
+    box-shadow: 0 0 12px hsla(173 91% 30% / .35);
+  }
+  .brand-name { font-size: 14px; font-weight: 700; }
+  .brand-sub { margin-top: -2px; color: var(--text-dim); font-size: 10px; }
+  .platform-action {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    width: 100%;
+    margin-bottom: 18px;
+    padding: 9px 12px;
+    border: 0;
+    border-radius: 8px;
+    color: #fff;
+    background: var(--accent);
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .platform-action:hover { filter: brightness(1.08); }
+  .platform-group { padding: 10px 10px 6px; color: var(--text-dim); font-size: 11px; font-weight: 600; }
+  .platform-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 36px;
+    margin-bottom: 2px;
+    padding: 9px 10px;
+    border-radius: 8px;
+    color: var(--text-soft);
+    cursor: pointer;
+    user-select: none;
+    transition: .12s;
+  }
+  .platform-item:hover { color: var(--text); background: var(--panel-2); }
+  .platform-item.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+  .platform-icon { width: 16px; height: 16px; flex: 0 0 auto; opacity: .85; }
+  .sidebar-spacer { flex: 1; min-height: 20px; }
+  .central-state {
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+  }
+  .central-state-title { display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 600; }
+  .online-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 7px var(--ok); }
+  .central-state-meta { margin-top: 6px; color: var(--text-dim); font-size: 10px; line-height: 1.55; }
+
+  .workspace { display: flex; min-width: 0; min-height: 0; flex-direction: column; }
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 58px;
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    flex-wrap: wrap;
+    z-index: 10;
+  }
+  .crumb { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
+  .crumb strong { color: var(--text); font-size: 13px; }
+  .topbar-spacer { flex: 1; }
+  .scope-select, .filter-input, .filter-select {
+    min-height: 32px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    outline: 0;
+    color: var(--text-soft);
+    background: var(--panel);
+    font-size: 12px;
+  }
+  .scope-select:hover, .filter-input:hover, .filter-select:hover { border-color: hsl(173 55% 65%); }
+  .scope-select:focus, .filter-input:focus, .filter-select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px hsla(173 91% 30% / .10); }
+  .scope-select { max-width: 180px; }
+  .range-control { display: inline-flex; padding: 2px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-soft); }
+  .range-control button {
+    min-width: 34px;
+    height: 26px;
+    padding: 0 7px;
+    border: 0;
+    border-radius: 6px;
+    color: var(--text-dim);
+    background: transparent;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  .range-control button.active { color: var(--accent); background: var(--panel); box-shadow: 0 1px 4px rgba(15,23,42,.08); font-weight: 600; }
+  .auto-label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 11px; white-space: nowrap; }
+  .auto-label input { accent-color: var(--accent); }
+  .clock { color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-soft);
+    background: var(--panel);
+    cursor: pointer;
+    font-size: 16px;
+  }
+  .icon-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .icon-btn.loading { animation: spin .65s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .detail-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    padding-top: 8px;
+    margin-top: 2px;
+    overflow-x: auto;
+    border-top: 1px solid var(--border-soft);
+  }
+  .detail-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 32px;
+    padding: 7px 11px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--text-soft);
+    background: transparent;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+    transition: .12s;
+  }
+  .detail-tab:hover { color: var(--text); background: var(--panel-2); }
+  .detail-tab.active { color: var(--accent); border-color: hsl(169 84% 70%); background: var(--accent-soft); font-weight: 600; }
+  .tab-icon { width: 14px; height: 14px; flex: 0 0 auto; }
+  .tab-count { padding: 1px 6px; border-radius: 8px; color: var(--text-dim); background: var(--panel-2); font-size: 10px; }
+  .detail-tab.active .tab-count { color: var(--accent); background: hsl(165 93% 94%); }
+
+  .content { min-height: 0; padding: 20px 22px 32px; overflow: auto; }
+  .view { display: none; }
+  .view.active { display: block; }
+  .page-head { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 16px; }
+  .page-head h1 { margin: 0; font-size: 20px; font-weight: 700; }
+  .page-head p { margin: 5px 0 0; color: var(--text-dim); font-size: 12px; }
+  .page-head .actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: 32px;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-soft);
+    background: var(--panel);
+    cursor: pointer;
+    font-size: 12px;
+    transition: .12s;
+  }
+  .button:hover { color: var(--accent); border-color: var(--accent); }
+  .button.primary { color: #fff; border-color: var(--accent); background: var(--accent); font-weight: 600; }
+  .button.primary:hover { filter: brightness(1.06); }
+  .button.small { min-height: 26px; padding: 3px 9px; font-size: 11px; }
+  .button.active { color: var(--accent); border-color: hsl(169 84% 70%); background: var(--accent-soft); }
+
+  .kpi-strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .kpi {
+    position: relative;
+    min-width: 0;
+    padding: 14px 16px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+  }
+  .kpi::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--accent); }
+  .kpi.blue::before { background: var(--blue); }
+  .kpi.green::before { background: var(--ok); }
+  .kpi.orange::before { background: var(--warn); }
+  .kpi.violet::before { background: var(--violet); }
+  .kpi .label { color: var(--text-dim); font-size: 11px; letter-spacing: 0; }
+  .kpi .value { margin-top: 4px; font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi .delta { margin-top: 2px; color: var(--text-soft); font-size: 11px; white-space: normal; }
+  .kpi .delta.ok { color: var(--ok); }
+  .kpi .delta.warn { color: hsl(31 85% 42%); }
+  .kpi .delta.bad { color: var(--err); }
+
+  .panel {
+    min-width: 0;
+    margin-bottom: 18px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    box-shadow: var(--shadow);
+  }
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 48px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-soft);
+    background: var(--panel-2);
+  }
+  .panel-head h2 { margin: 0; font-size: 13px; font-weight: 600; }
+  .panel-head .sub { color: var(--text-dim); font-size: 11px; }
+  .panel-head .spacer { flex: 1; }
+  .panel-body { padding: 16px; }
+  .panel-body.no-pad { padding: 0; }
+  .grid-main { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, .7fr); gap: 18px; }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .filter-input { width: 220px; }
+
+  .state {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .state::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .s-ready, .s-succeeded, .s-rw { color: var(--ok); background: var(--ok-soft); }
+  .s-running { color: var(--accent); background: var(--accent-soft); }
+  .s-degraded, .s-warning, .s-waiting, .s-queued { color: hsl(31 85% 42%); background: var(--warn-soft); }
+  .s-critical, .s-failed, .s-conflicted { color: var(--err); background: var(--err-soft); }
+  .s-unknown { color: var(--unknown); background: hsl(214 26% 94%); }
+  .s-prepared, .s-recovering, .s-ro { color: var(--violet); background: var(--violet-soft); }
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border: 1px solid hsl(169 55% 78%);
+    border-radius: 10px;
+    color: var(--accent);
+    background: var(--accent-soft);
+    font-size: 10px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .tag.blue { color: var(--blue); border-color: hsl(211 65% 82%); background: var(--blue-soft); }
+  .tag.violet { color: var(--violet); border-color: hsl(262 55% 84%); background: var(--violet-soft); }
+  .mono { font-family: "SF Mono", "JetBrains Mono", Consolas, monospace; font-size: 11px; }
+  .dim { color: var(--text-dim); }
+  .strong { color: var(--text); font-weight: 600; }
+  .cell-main { color: var(--text); font-weight: 600; }
+  .cell-sub { margin-top: 2px; color: var(--text-dim); font-size: 10px; line-height: 1.35; }
+
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 9px 14px; border-bottom: 1px solid var(--border-soft); text-align: left; font-size: 12px; vertical-align: middle; }
+  th { color: var(--text-dim); background: var(--panel-2); font-size: 11px; font-weight: 500; letter-spacing: 0; white-space: nowrap; }
+  tbody tr { cursor: pointer; transition: .12s; }
+  tbody tr:hover { background: hsla(173 91% 30% / .06); }
+  tbody tr:last-child td { border-bottom: 0; }
+
+  .incident-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .incident {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    padding: 10px 12px;
+    border: 1px solid hsl(38 84% 80%);
+    border-left: 3px solid var(--warn);
+    border-radius: 8px;
+    background: var(--warn-soft);
+  }
+  .incident.critical { border-color: hsl(0 72% 84%); border-left-color: var(--err); background: var(--err-soft); }
+  .incident-body { min-width: 0; flex: 1; }
+  .incident-title { overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+  .incident-meta { margin-top: 2px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .topology { position: relative; height: 520px; overflow: hidden; background: linear-gradient(0deg, hsla(210 40% 96% / .75), transparent); }
+  .topology svg { display: block; width: 100%; height: 100%; }
+  .topo-legend { display: flex; flex-wrap: wrap; gap: 14px; padding: 10px 16px; border-top: 1px solid var(--border-soft); color: var(--text-soft); background: var(--panel-2); font-size: 10px; }
+  .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+  .legend-line { width: 20px; height: 2px; background: var(--accent); }
+  .legend-line.control { height: 0; border-top: 2px dashed var(--blue); background: none; }
+  .legend-line.transfer { height: 0; border-top: 2px dashed var(--violet); background: none; }
+  .legend-box { width: 10px; height: 10px; border: 1px solid var(--accent); border-radius: 2px; background: var(--accent-soft); }
+
+  .feed { max-height: 568px; overflow-y: auto; }
+  .feed-item { display: grid; grid-template-columns: 62px 1fr; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--border-soft); }
+  .feed-item:last-child { border-bottom: 0; }
+  .feed-item:hover { background: hsla(173 91% 30% / .04); }
+  .feed-time { color: var(--text-dim); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .feed-title { font-size: 12px; line-height: 1.4; }
+  .feed-meta { margin-top: 3px; color: var(--text-dim); font-size: 10px; line-height: 1.4; }
+  .live { display: inline-flex; align-items: center; gap: 5px; color: var(--ok); font-size: 10px; }
+  .live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 6px var(--ok); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+
+  .signal-row { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(100px, 1.4fr) 70px; gap: 12px; align-items: center; padding: 11px 16px; border-bottom: 1px solid var(--border-soft); }
+  .signal-row:last-child { border-bottom: 0; }
+  .signal-name { font-size: 12px; font-weight: 600; }
+  .signal-meta { margin-top: 2px; color: var(--text-dim); font-size: 10px; }
+  .bar { height: 7px; overflow: hidden; border-radius: 4px; background: hsl(214 28% 90%); }
+  .bar span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  .bar.warn span { background: linear-gradient(90deg, var(--warn), hsl(24 86% 52%)); }
+  .signal-value { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+
+  .artifact-tree { min-height: 290px; padding: 22px; overflow-x: auto; }
+  .tree-canvas { position: relative; min-width: 560px; height: 250px; }
+  .tree-line { position: absolute; height: 2px; transform-origin: left center; background: hsl(173 45% 72%); }
+  .commit-node {
+    position: absolute;
+    width: 112px;
+    padding: 9px 10px;
+    border: 1px solid hsl(169 50% 68%);
+    border-radius: 8px;
+    background: var(--panel);
+    box-shadow: 0 3px 10px rgba(15,23,42,.06);
+  }
+  .commit-node.current { border-color: var(--accent); box-shadow: 0 0 0 2px hsla(173 91% 30% / .12); }
+  .commit-id { color: var(--accent); font-weight: 700; }
+  .commit-name { margin-top: 3px; color: var(--text-dim); font-size: 10px; }
+  .playground-list { padding: 0; }
+  .playground-row { display: grid; grid-template-columns: minmax(140px, 1.1fr) minmax(120px, 1fr) 120px 110px 90px; gap: 10px; align-items: center; padding: 11px 14px; border-bottom: 1px solid var(--border-soft); }
+  .playground-row:last-child { border-bottom: 0; }
+
+  .cluster-tabs { display: flex; gap: 8px; padding: 12px 16px; overflow-x: auto; border-bottom: 1px solid var(--border-soft); }
+  .cluster-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 11px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-soft);
+    background: var(--panel);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .cluster-chip.active { color: var(--accent); border-color: hsl(169 70% 65%); background: var(--accent-soft); font-weight: 600; }
+  .zones { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; padding: 18px; }
+  .zone { position: relative; min-height: 230px; padding: 15px; border: 1px solid var(--border); background: var(--panel); }
+  .zone:first-child { border-radius: 10px 0 0 10px; }
+  .zone:last-child { border-radius: 0 10px 10px 0; }
+  .zone + .zone { border-left: 0; }
+  .zone.nfs { background: hsl(165 70% 97%); box-shadow: inset 0 3px 0 var(--accent); }
+  .zone.system { box-shadow: inset 0 3px 0 var(--blue); }
+  .zone.pod { box-shadow: inset 0 3px 0 var(--violet); }
+  .zone-title { color: var(--text-dim); font-size: 10px; font-weight: 700; }
+  .zone-value { margin: 9px 0 14px; font-size: 17px; font-weight: 700; }
+  .zone-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; border-top: 1px dashed var(--border); font-size: 11px; }
+  .zone-row span:first-child { color: var(--text-dim); }
+  .zone-flow { margin-top: 12px; padding: 8px 10px; border-radius: 6px; color: var(--text-soft); background: var(--bg-soft); font-size: 10px; line-height: 1.5; }
+
+  .capacity { min-width: 150px; }
+  .capacity-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 4px; color: var(--text-dim); font-size: 10px; }
+  .path { max-width: 260px; overflow-wrap: anywhere; }
+  .notice { padding: 10px 12px; border-left: 3px solid var(--accent); border-radius: 6px; color: var(--text-soft); background: var(--accent-soft); font-size: 11px; line-height: 1.55; }
+  .io-list { padding: 0; }
+  .io-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) 50px; gap: 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); }
+  .io-row:last-child { border-bottom: 0; }
+  .io-label { color: var(--text-dim); font-size: 11px; }
+
+  .pipeline { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); margin-bottom: 18px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
+  .pipeline-step { position: relative; padding: 11px 13px; border-right: 1px solid var(--border-soft); }
+  .pipeline-step:last-child { border-right: 0; }
+  .pipeline-label { color: var(--text-dim); font-size: 10px; }
+  .pipeline-value { margin-top: 3px; font-size: 18px; font-weight: 700; }
+
+  .transfer-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .transfer-card { padding: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); cursor: pointer; transition: .12s; }
+  .transfer-card:hover { border-color: var(--accent); box-shadow: 0 4px 14px rgba(15,23,42,.07); }
+  .transfer-head { display: flex; align-items: center; gap: 8px; }
+  .transfer-head .spacer { flex: 1; }
+  .transfer-route { display: grid; grid-template-columns: 1fr 34px 1fr; align-items: center; margin: 14px 0; }
+  .route-end:last-child { text-align: right; }
+  .route-arrow { color: var(--accent); text-align: center; font-size: 18px; }
+  .progress { height: 7px; overflow: hidden; border-radius: 4px; background: var(--panel-2); }
+  .progress span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  .transfer-foot { display: flex; justify-content: space-between; gap: 12px; margin-top: 7px; color: var(--text-dim); font-size: 10px; }
+
+  .drawer-backdrop { position: fixed; inset: 0; z-index: 90; display: none; background: rgba(15,23,42,.18); }
+  .drawer-backdrop.open { display: block; }
+  .drawer {
+    position: fixed;
+    z-index: 100;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(440px, 92vw);
+    display: flex;
+    flex-direction: column;
+    transform: translateX(102%);
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    box-shadow: -12px 0 36px rgba(15,23,42,.16);
+    transition: transform .2s ease;
+  }
+  .drawer.open { transform: translateX(0); }
+  .drawer-head { display: flex; align-items: flex-start; gap: 10px; padding: 17px 18px; border-bottom: 1px solid var(--border); }
+  .drawer-head h2 { margin: 0; font-size: 16px; }
+  .drawer-sub { margin-top: 3px; color: var(--text-dim); font-size: 11px; }
+  .drawer-head .spacer { flex: 1; }
+  .drawer-body { padding: 16px 18px 28px; overflow: auto; }
+  .detail-grid { display: grid; grid-template-columns: 125px minmax(0, 1fr); margin: 0; }
+  .detail-grid dt, .detail-grid dd { margin: 0; padding: 9px 0; border-bottom: 1px dashed var(--border-soft); font-size: 11px; }
+  .detail-grid dt { color: var(--text-dim); }
+  .detail-grid dd { color: var(--text); overflow-wrap: anywhere; }
+  .timeline { margin-top: 18px; padding-left: 15px; border-left: 2px solid var(--border); }
+  .timeline-item { position: relative; display: grid; grid-template-columns: 62px 1fr; gap: 8px; padding: 0 0 14px 8px; }
+  .timeline-item::before { content: ""; position: absolute; left: -20px; top: 3px; width: 7px; height: 7px; border: 2px solid var(--panel); border-radius: 50%; background: var(--accent); }
+  .timeline-time { color: var(--text-dim); font-size: 10px; }
+  .timeline-event { font-size: 11px; line-height: 1.45; }
+  .toast-host { position: fixed; z-index: 200; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; }
+  .toast { min-width: 260px; padding: 11px 13px; border: 1px solid hsl(169 45% 75%); border-radius: 8px; color: var(--text-soft); background: var(--panel); box-shadow: var(--shadow); animation: toastIn .18s ease; }
+  @keyframes toastIn { from { opacity: 0; transform: translateX(14px); } }
+  .footer-note { padding: 8px 0 0; color: var(--text-dim); font-size: 10px; text-align: center; }
+
+  @media (max-width: 1180px) {
+    .console { grid-template-columns: 205px minmax(0, 1fr); }
+    .kpi-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-main, .grid-2 { grid-template-columns: 1fr; }
+    .incident-strip { grid-template-columns: 1fr; }
+    .topbar .scope-select:nth-of-type(2), .auto-label { display: none; }
+  }
+  @media (max-width: 820px) {
+    .console { grid-template-columns: 176px minmax(0, 1fr); }
+    .sidebar { padding-inline: 8px; }
+    .brand-sub, .central-state-meta { display: none; }
+    .content { padding: 16px 14px 28px; }
+    .topbar { padding-inline: 14px; flex-wrap: wrap; }
+    .topbar .scope-select { max-width: 150px; }
+    .clock { display: none; }
+    .kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .zones, .grid-3 { grid-template-columns: 1fr; }
+    .zone:first-child, .zone:last-child { border-radius: 0; }
+    .zone + .zone { border-left: 1px solid var(--border); border-top: 0; }
+    .transfer-list { grid-template-columns: 1fr; }
+    .pipeline { grid-template-columns: repeat(4, minmax(100px, 1fr)); overflow-x: auto; }
+  }
+</style>
+</head>
+<body>
+<div class="console">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo" aria-hidden="true"></div>
+      <div>
+        <div class="brand-name">共绩算力</div>
+        <div class="brand-sub">Serverless 控制台</div>
+      </div>
+    </div>
+
+    <button class="platform-action" id="new-deploy-btn" type="button">
+      <span aria-hidden="true">＋</span>新增部署任务
+    </button>
+
+    <div class="platform-group">资源管理</div>
+    <div class="platform-item">
+      <svg class="platform-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/></svg>
+      镜像仓库
+    </div>
+    <div class="platform-item">
+      <svg class="platform-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 16V4a2 2 0 0 1 2-2h11"/><path d="M22 18H11a2 2 0 0 0 0 4h10.5a.5.5 0 0 0 .5-.5v-15a.5.5 0 0 0-.5-.5H11a2 2 0 0 0-2 2v12"/></svg>
+      镜像预热
+    </div>
+    <div class="platform-item">
+      <svg class="platform-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>
+      NAS 文件存储
+    </div>
+    <div class="platform-item">
+      <svg class="platform-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m16 6-4-4-4 4"/><path d="M12 2v8"/><rect width="20" height="8" x="2" y="14" rx="2"/></svg>
+      共享存储卷
+    </div>
+    <div class="platform-item">
+      <svg class="platform-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 16.326A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 .5 8.973"/><path d="m13 12-3 5h4l-3 5"/></svg>
+      对象存储加速
+    </div>
+    <div class="platform-item active">
+      <svg class="platform-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+      数据物流空间
+    </div>
+    <div class="platform-group">套餐</div>
+    <div class="platform-item">
+      <svg class="platform-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 16h6v-2c0-1.1-.9-2-2-2h-1.34a4 4 0 0 0-2.66-1"/><path d="M2 16h6v-2c0-1.1-.9-2-2-2H4.66a4 4 0 0 0-2.66-1"/><path d="M12 12V8"/><circle cx="12" cy="5" r="2"/></svg>
+      预留套餐
+    </div>
+
+    <div class="sidebar-spacer"></div>
+    <div class="central-state">
+      <div class="central-state-title"><span class="online-dot"></span>平台服务正常</div>
+      <div class="central-state-meta">华东区域<br>企业版租户<br>控制台版本 2.8.1</div>
+    </div>
+  </aside>
+
+  <div class="workspace">
+    <header class="topbar">
+      <div class="crumb">数据物流空间 / <strong id="current-title">可观测性总览</strong></div>
+      <div class="topbar-spacer"></div>
+      <select class="scope-select" id="tenant-scope" aria-label="租户范围">
+        <option>视觉算法团队</option>
+        <option>机器人团队</option>
+        <option>平台系统范围</option>
+      </select>
+      <select class="scope-select" id="cluster-scope" aria-label="集群范围">
+        <option value="">全部 EdgeCluster</option>
+        <option value="edge-a">华东边缘集群</option>
+        <option value="edge-b">华北训练集群</option>
+        <option value="edge-c">华南灾备集群</option>
+      </select>
+      <div class="range-control" aria-label="时间范围">
+        <button type="button" data-range="15m">15分</button>
+        <button type="button" data-range="1h" class="active">1时</button>
+        <button type="button" data-range="6h">6时</button>
+        <button type="button" data-range="24h">24时</button>
+      </div>
+      <label class="auto-label"><input type="checkbox" id="auto-refresh" checked>自动刷新</label>
+      <span class="clock" id="clock">--:--:--</span>
+      <button class="icon-btn" id="refresh-btn" type="button" title="立即刷新" aria-label="立即刷新">↻</button>
+      <nav class="detail-tabs" aria-label="数据物流空间功能导航">
+        <button class="detail-tab active" type="button" data-view="overview" data-title="可观测性总览">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+          总览<span class="tab-count">实时</span>
+        </button>
+        <button class="detail-tab" type="button" data-view="artifacts" data-title="制品与工作区">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+          制品与工作区<span class="tab-count">12</span>
+        </button>
+        <button class="detail-tab" type="button" data-view="clusters" data-title="集群与 Agent">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="9" width="6" height="6"/><rect x="9" y="9" width="6" height="6"/><rect x="16" y="9" width="6" height="6"/><path d="M5 9V5M12 9V5M19 9V5"/></svg>
+          集群与 Agent<span class="tab-count">3</span>
+        </button>
+        <button class="detail-tab" type="button" data-view="storage" data-title="NFS 与挂载">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+          NFS 与挂载<span class="tab-count">5</span>
+        </button>
+        <button class="detail-tab" type="button" data-view="jobs" data-title="任务与发布">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          任务与发布<span class="tab-count">9</span>
+        </button>
+        <button class="detail-tab" type="button" data-view="transfers" data-title="跨集群传输">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 7h11l-3-3M17 17H6l3 3"/><path d="M18 7l-3 3M6 17l3-3"/></svg>
+          跨集群传输<span class="tab-count">4</span>
+        </button>
+        <button class="detail-tab" type="button" data-view="alerts" data-title="告警与审计">
+          <svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+          告警与审计<span class="tab-count" id="alert-count">3</span>
+        </button>
+      </nav>
+    </header>
+
+    <main class="content">
+      <section class="view active" id="view-overview">
+        <div class="page-head">
+          <div><h1>可观测性总览</h1><p>中心权威状态、边缘实际状态与跨集群执行链路</p></div>
+          <div class="actions"><span class="tag">中心视角</span><button class="button" id="diagnose-btn" type="button">发起运行诊断</button></div>
+        </div>
+        <div class="incident-strip" id="incident-strip"></div>
+        <div class="kpi-strip" id="overview-kpis"></div>
+
+        <div class="grid-main">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>中心控制与跨集群数据路径</h2>
+              <span class="sub">控制指令统一进入中心；文件数据不经过中心</span>
+              <span class="spacer"></span>
+              <span class="tag">当前运行态</span>
+            </div>
+            <div class="panel-body no-pad">
+              <div class="topology">
+                <svg viewBox="0 0 1100 600" role="img" aria-label="中心控制面与两个边缘集群的系统组件区、NFS 区和业务 Pod 区">
+                  <defs>
+                    <marker id="arrow-control" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="hsl(211 72% 50%)"/></marker>
+                    <marker id="arrow-io" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="hsl(173 91% 30%)"/></marker>
+                    <marker id="arrow-transfer" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="hsl(262 60% 55%)"/></marker>
+                  </defs>
+                  <g opacity=".22" stroke="hsl(214 32% 85%)">
+                    <path d="M0 50H1100M0 100H1100M0 150H1100M0 200H1100M0 250H1100M0 300H1100M0 350H1100M0 400H1100M0 450H1100M0 500H1100M0 550H1100"/>
+                    <path d="M50 0V600M100 0V600M150 0V600M200 0V600M250 0V600M300 0V600M350 0V600M400 0V600M450 0V600M500 0V600M550 0V600M600 0V600M650 0V600M700 0V600M750 0V600M800 0V600M850 0V600M900 0V600M950 0V600M1000 0V600M1050 0V600"/>
+                  </g>
+                  <g>
+                    <rect x="330" y="18" width="440" height="92" rx="12" fill="#fff" stroke="hsl(173 91% 30%)" stroke-width="2"/>
+                    <rect x="330" y="18" width="5" height="92" rx="3" fill="hsl(173 91% 30%)"/>
+                    <text x="350" y="46" fill="hsl(222 47% 11%)" font-size="15" font-weight="700">中心控制面</text>
+                    <text x="350" y="68" fill="hsl(215 16% 47%)" font-size="11">API · 调度器 · 任务存储 · Lease/Fence · 审计</text>
+                    <rect x="600" y="38" width="145" height="47" rx="8" fill="hsl(165 93% 96%)" stroke="hsl(173 55% 70%)"/>
+                    <text x="672" y="58" text-anchor="middle" fill="hsl(173 91% 30%)" font-size="11" font-weight="700">PostgreSQL</text>
+                    <text x="672" y="74" text-anchor="middle" fill="hsl(215 16% 47%)" font-size="9">唯一权威元数据</text>
+                  </g>
+                  <path d="M430 110C400 138 330 145 260 178" fill="none" stroke="hsl(211 72% 50%)" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow-control)"/>
+                  <path d="M670 110C700 138 770 145 840 178" fill="none" stroke="hsl(211 72% 50%)" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow-control)"/>
+                  <text x="550" y="133" text-anchor="middle" fill="hsl(211 72% 50%)" font-size="10">Agent 主动建立 mTLS H2/H3 JSON 双向流</text>
+
+                  <g>
+                    <rect x="18" y="148" width="512" height="426" rx="14" fill="hsla(210 40% 99% / .96)" stroke="hsl(214 32% 84%)" stroke-width="1.5"/>
+                    <text x="38" y="174" fill="hsl(222 47% 11%)" font-size="14" font-weight="700">华东边缘集群</text>
+                    <text x="165" y="174" fill="hsl(215 16% 47%)" font-size="10">edge-a · 独立网络故障域</text>
+                    <rect x="38" y="190" width="472" height="100" rx="9" fill="hsl(211 75% 97%)" stroke="hsl(211 55% 78%)"/>
+                    <text x="52" y="210" fill="hsl(211 72% 44%)" font-size="10" font-weight="700">系统组件区</text>
+                    <rect x="54" y="222" width="190" height="50" rx="7" fill="#fff" stroke="hsl(211 55% 78%)"/>
+                    <text x="69" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Agent A · RW Owner</text>
+                    <text x="69" y="260" fill="hsl(215 16% 47%)" font-size="9">会话 gen 29 · 心跳 4 秒</text>
+                    <rect x="290" y="222" width="190" height="50" rx="7" fill="#fff" stroke="hsl(262 45% 80%)"/>
+                    <text x="305" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">S3 Gateway A</text>
+                    <text x="305" y="260" fill="hsl(215 16% 47%)" font-size="9">只读对象根 · 凭证 gen 18</text>
+
+                    <rect x="38" y="320" width="472" height="100" rx="9" fill="hsl(165 70% 96%)" stroke="hsl(169 60% 66%)"/>
+                    <text x="52" y="341" fill="hsl(173 91% 30%)" font-size="10" font-weight="700">NFS 区（物理卷）</text>
+                    <text x="54" y="366" fill="hsl(222 47% 11%)" font-size="12" font-weight="700">vol-a1 · 10.8 / 16 TiB</text>
+                    <text x="54" y="386" fill="hsl(215 16% 47%)" font-size="10">受管根 / 对象根 / Playground 与 Snapshot 视图目录</text>
+                    <text x="54" y="404" fill="hsl(173 91% 30%)" font-size="9">owner gen 17 · mount gen 42 · NFS p95 12.4ms</text>
+
+                    <rect x="38" y="450" width="472" height="100" rx="9" fill="hsl(262 72% 97%)" stroke="hsl(262 45% 82%)"/>
+                    <text x="52" y="471" fill="hsl(262 60% 55%)" font-size="10" font-weight="700">业务 Pod 区</text>
+                    <text x="54" y="497" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">12 个已登记挂载</text>
+                    <text x="54" y="516" fill="hsl(215 16% 47%)" font-size="10">Pod → 节点 NFS/CSI → 精确视图目录</text>
+                    <text x="54" y="534" fill="hsl(262 60% 55%)" font-size="9">PodMountBinding：8 个只读 · 4 个读写</text>
+                  </g>
+
+                  <g>
+                    <rect x="570" y="148" width="512" height="426" rx="14" fill="hsla(210 40% 99% / .96)" stroke="hsl(214 32% 84%)" stroke-width="1.5"/>
+                    <text x="590" y="174" fill="hsl(222 47% 11%)" font-size="14" font-weight="700">华北训练集群</text>
+                    <text x="717" y="174" fill="hsl(215 16% 47%)" font-size="10">edge-b · 独立网络故障域</text>
+                    <rect x="590" y="190" width="472" height="100" rx="9" fill="hsl(211 75% 97%)" stroke="hsl(211 55% 78%)"/>
+                    <text x="604" y="210" fill="hsl(211 72% 44%)" font-size="10" font-weight="700">系统组件区</text>
+                    <rect x="606" y="222" width="190" height="50" rx="7" fill="#fff" stroke="hsl(211 55% 78%)"/>
+                    <text x="621" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Agent B · RW Owner</text>
+                    <text x="621" y="260" fill="hsl(215 16% 47%)" font-size="9">会话 gen 42 · 心跳 6 秒</text>
+                    <rect x="842" y="222" width="190" height="50" rx="7" fill="#fff" stroke="hsl(262 45% 80%)"/>
+                    <text x="857" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">S3 Gateway B</text>
+                    <text x="857" y="260" fill="hsl(215 16% 47%)" font-size="9">只读对象根 · 凭证 gen 12</text>
+
+                    <rect x="590" y="320" width="472" height="100" rx="9" fill="hsl(165 70% 96%)" stroke="hsl(169 60% 66%)"/>
+                    <text x="604" y="341" fill="hsl(173 91% 30%)" font-size="10" font-weight="700">NFS 区（物理卷）</text>
+                    <text x="606" y="366" fill="hsl(222 47% 11%)" font-size="12" font-weight="700">vol-b1 · 18.6 / 24 TiB</text>
+                    <text x="606" y="386" fill="hsl(215 16% 47%)" font-size="10">受管根 / 对象根 / Playground 与 Snapshot 视图目录</text>
+                    <text x="606" y="404" fill="hsl(0 75% 52%)" font-size="9">owner gen 23 · mount gen 66 · NFS p95 184ms</text>
+
+                    <rect x="590" y="450" width="472" height="100" rx="9" fill="hsl(262 72% 97%)" stroke="hsl(262 45% 82%)"/>
+                    <text x="604" y="471" fill="hsl(262 60% 55%)" font-size="10" font-weight="700">业务 Pod 区</text>
+                    <text x="606" y="497" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">8 个已登记挂载</text>
+                    <text x="606" y="516" fill="hsl(215 16% 47%)" font-size="10">Pod → 节点 NFS/CSI → 精确视图目录</text>
+                    <text x="606" y="534" fill="hsl(262 60% 55%)" font-size="9">PodMountBinding：7 个只读 · 1 个读写</text>
+                  </g>
+
+                  <path d="M150 272V320" fill="none" stroke="hsl(173 91% 30%)" stroke-width="2" marker-end="url(#arrow-io)"/>
+                  <path d="M385 272V320" fill="none" stroke="hsl(173 91% 30%)" stroke-width="2" marker-end="url(#arrow-io)"/>
+                  <path d="M150 450V420" fill="none" stroke="hsl(173 91% 30%)" stroke-width="2" marker-end="url(#arrow-io)"/>
+                  <path d="M702 272V320" fill="none" stroke="hsl(173 91% 30%)" stroke-width="2" marker-end="url(#arrow-io)"/>
+                  <path d="M937 272V320" fill="none" stroke="hsl(173 91% 30%)" stroke-width="2" marker-end="url(#arrow-io)"/>
+                  <path d="M702 450V420" fill="none" stroke="hsl(173 91% 30%)" stroke-width="2" marker-end="url(#arrow-io)"/>
+                  <path d="M480 238C525 205 565 205 606 238" fill="none" stroke="hsl(262 60% 55%)" stroke-width="2.4" stroke-dasharray="8 5" marker-end="url(#arrow-transfer)"/>
+                  <text x="548" y="198" text-anchor="middle" fill="hsl(262 60% 55%)" font-size="9" font-weight="700">S3 GET + TransferTicket</text>
+                </svg>
+              </div>
+              <div class="topo-legend">
+                <span class="legend-item"><span class="legend-line control"></span>控制消息：中心与 Agent 双向流</span>
+                <span class="legend-item"><span class="legend-line"></span>本集群 NFS I/O</span>
+                <span class="legend-item"><span class="legend-line transfer"></span>跨集群对象传输</span>
+                <span class="legend-item"><span class="legend-box"></span>中心权威元数据</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head"><h2>实时活动</h2><span class="sub">状态变化与发布决策</span><span class="spacer"></span><span class="live">实时</span></div>
+            <div class="panel-body no-pad"><div class="feed" id="activity-feed"></div></div>
+          </section>
+        </div>
+
+        <div class="grid-2">
+          <section class="panel">
+            <div class="panel-head"><h2>资源健康分层</h2><span class="sub">节点、Agent、NFS、工作区和 Gateway 分别判定</span></div>
+            <div class="panel-body no-pad table-wrap">
+              <table><thead><tr><th>EdgeCluster</th><th>计算节点</th><th>Agent 会话</th><th>NFS / 挂载</th><th>工作区观测</th><th>Gateway / 路由</th></tr></thead><tbody id="health-table"></tbody></table>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2>中心控制面信号</h2><span class="sub">API、调度与事务发布</span></div>
+            <div class="panel-body no-pad" id="control-signals"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-artifacts">
+        <div class="page-head">
+          <div><h1>制品与工作区</h1><p>Artifact 是版本化抽象文件系统；Commit 构成树，Playground 可读写，Snapshot 只读</p></div>
+          <div class="actions"><button class="button" id="artifact-anomaly" type="button">仅看异常</button></div>
+        </div>
+        <div class="kpi-strip" id="artifact-kpis"></div>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Artifact 目录</h2><span class="sub">中心权威元数据</span><span class="spacer"></span>
+            <input class="filter-input" id="artifact-search" placeholder="搜索 Artifact / 租户 / Commit" aria-label="搜索 Artifact">
+          </div>
+          <div class="panel-body no-pad table-wrap">
+            <table><thead><tr><th>Artifact</th><th>Commit 树</th><th>当前引用</th><th>Playground</th><th>Snapshot</th><th>Placement</th><th>最近发布</th><th>状态</th></tr></thead><tbody id="artifact-table"></tbody></table>
+          </div>
+        </section>
+        <div class="grid-2">
+          <section class="panel">
+            <div class="panel-head"><h2>Commit 树</h2><span class="sub">artifact-X · 不可变版本</span><span class="spacer"></span><span class="tag">main / cmt-8f71</span></div>
+            <div class="artifact-tree">
+              <div class="tree-canvas">
+                <div class="tree-line" style="left:104px;top:121px;width:105px"></div>
+                <div class="tree-line" style="left:274px;top:121px;width:105px"></div>
+                <div class="tree-line" style="left:444px;top:121px;width:105px"></div>
+                <div class="tree-line" style="left:274px;top:121px;width:116px;transform:rotate(-47deg)"></div>
+                <div class="tree-line" style="left:454px;top:38px;width:105px;transform:rotate(47deg)"></div>
+                <div class="commit-node" style="left:0;top:92px"><div class="commit-id mono">cmt-011a</div><div class="commit-name">初始导入</div></div>
+                <div class="commit-node" style="left:170px;top:92px"><div class="commit-id mono">cmt-31c0</div><div class="commit-name">清洗数据</div></div>
+                <div class="commit-node" style="left:340px;top:92px"><div class="commit-id mono">cmt-65bb</div><div class="commit-name">训练集 v2</div></div>
+                <div class="commit-node" style="left:340px;top:8px"><div class="commit-id mono">cmt-55a1</div><div class="commit-name">实验分支</div></div>
+                <div class="commit-node current" style="left:510px;top:92px"><div class="commit-id mono">cmt-8f71</div><div class="commit-name">main 当前版本</div></div>
+              </div>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2>Playground 观测</h2><span class="sub">缓存可重建，IndexVersion 以中心为准</span></div>
+            <div class="playground-list" id="playground-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-clusters">
+        <div class="page-head">
+          <div><h1>集群与 Agent</h1><p>EdgeCluster 是独立网络、凭证、调度和故障域</p></div>
+          <div class="actions"><button class="button" id="agent-anomaly" type="button">仅看异常</button></div>
+        </div>
+        <section class="panel">
+          <div class="panel-head"><h2>集群运行分区</h2><span class="sub">系统组件区 · NFS 区 · 业务 Pod 区</span></div>
+          <div class="cluster-tabs" id="cluster-tabs"></div>
+          <div class="zones" id="cluster-zones"></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Agent 会话</h2><span class="sub">由 Agent 主动连接中心</span><span class="spacer"></span>
+            <div class="filters">
+              <input class="filter-input" id="agent-search" placeholder="搜索 Agent / 节点 / 集群" aria-label="搜索 Agent">
+              <select class="filter-select" id="agent-state"><option value="">全部状态</option><option value="ready">正常</option><option value="degraded">降级</option><option value="unknown">未知</option></select>
+            </div>
+          </div>
+          <div class="panel-body no-pad table-wrap">
+            <table><thead><tr><th>Agent</th><th>集群 / 节点</th><th>连接协议</th><th>会话代次</th><th>最近心跳</th><th>AgentMount</th><th>运行任务</th><th>版本</th><th>状态</th></tr></thead><tbody id="agent-table"></tbody></table>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="view-storage">
+        <div class="page-head">
+          <div><h1>NFS 与挂载</h1><p>物理卷身份、单一读写 Owner、挂载代次与业务 Pod 精确目录</p></div>
+          <div class="actions"><button class="button" id="storage-anomaly" type="button">仅看异常</button></div>
+        </div>
+        <div class="kpi-strip" id="storage-kpis"></div>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>StorageVolume</h2><span class="sub">同一物理 NFS 身份只允许一个活跃读写 Agent</span><span class="spacer"></span>
+            <input class="filter-input" id="volume-search" placeholder="搜索 Volume / 集群 / Owner" aria-label="搜索 StorageVolume">
+          </div>
+          <div class="panel-body no-pad table-wrap">
+            <table><thead><tr><th>Volume</th><th>EdgeCluster</th><th>后端身份</th><th>活跃 RW Owner</th><th>Owner / Mount 代次</th><th>容量</th><th>NFS p95</th><th>状态</th></tr></thead><tbody id="volume-table"></tbody></table>
+          </div>
+        </section>
+        <div class="grid-2">
+          <section class="panel">
+            <div class="panel-head"><h2>当前挂载关系</h2><span class="sub">AgentMount 与 PodMountBinding 分开观测</span></div>
+            <div class="panel-body no-pad table-wrap">
+              <table><thead><tr><th>消费者</th><th>类型</th><th>Volume</th><th>可见根目录</th><th>模式</th><th>代次</th></tr></thead><tbody id="mount-table"></tbody></table>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2>文件 I/O 路径</h2><span class="sub">控制面只登记与协调</span></div>
+            <div class="panel-body no-pad">
+              <div class="io-list">
+                <div class="io-row"><div class="io-label">Agent 受管根</div><div class="mono">Agent → 本机 NFS 客户端 → Volume 受管根</div><span class="state s-rw">读写</span></div>
+                <div class="io-row"><div class="io-label">Gateway 对象根</div><div class="mono">Gateway → NFS objects/</div><span class="state s-ro">只读</span></div>
+                <div class="io-row"><div class="io-label">业务 Pod 视图</div><div class="mono">Pod → 节点 NFS/CSI → 精确视图根目录</div><span class="state s-rw">按绑定</span></div>
+              </div>
+              <div style="padding:14px 16px"><div class="notice">Pod 文件流量直接到本集群 NFS，不经过 Agent 或中心 API；PodMountBinding 只记录已有挂载关系。</div></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-jobs">
+        <div class="page-head">
+          <div><h1>任务与发布</h1><p>命令统一提交中心，由调度器创建 Assignment 并通过 Agent 会话下发</p></div>
+          <div class="actions"><button class="button primary" id="recover-jobs" type="button">重试可恢复任务</button></div>
+        </div>
+        <div class="pipeline" id="job-pipeline"></div>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>任务存储</h2><span class="sub">未知不等于失败；副作用未确认时进入恢复任务</span><span class="spacer"></span>
+            <div class="filters">
+              <input class="filter-input" id="job-search" placeholder="搜索任务 / Artifact / Playground" aria-label="搜索任务">
+              <select class="filter-select" id="job-state"><option value="">全部状态</option><option value="running">运行中</option><option value="queued">排队</option><option value="prepared">待发布</option><option value="recovering">恢复中</option><option value="unknown">未知</option><option value="conflicted">冲突</option></select>
+            </div>
+          </div>
+          <div class="panel-body no-pad table-wrap">
+            <table><thead><tr><th>任务</th><th>操作</th><th>Artifact / Playground</th><th>Assignment</th><th>IndexVersion</th><th>Lease / Fence</th><th>当前阶段</th><th>耗时</th><th>状态</th></tr></thead><tbody id="job-table"></tbody></table>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="view-transfers">
+        <div class="page-head">
+          <div><h1>跨集群传输</h1><p>目标 Agent 通过源集群 S3-compatible Gateway 拉取固定 Commit 对象</p></div>
+          <div class="actions"><button class="button" id="transfer-anomaly" type="button">仅看异常</button></div>
+        </div>
+        <div class="kpi-strip" id="transfer-kpis"></div>
+        <section class="panel">
+          <div class="panel-head"><h2>活动传输</h2><span class="sub">源 Gateway → 目标 Agent → 目标 StorageVolume</span></div>
+          <div class="panel-body"><div class="transfer-list" id="transfer-list"></div></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h2>TransferRoute</h2><span class="sub">路由就绪后中心才签发短期 TransferTicket</span></div>
+          <div class="panel-body no-pad table-wrap">
+            <table><thead><tr><th>路由</th><th>源 Gateway</th><th>目标集群</th><th>Endpoint</th><th>p95</th><th>吞吐</th><th>凭证代次</th><th>状态</th></tr></thead><tbody id="route-table"></tbody></table>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="view-alerts">
+        <div class="page-head">
+          <div><h1>告警与审计</h1><p>保留稳定错误码、资源选择结果、Trace 与 Job 关联字段</p></div>
+          <div class="actions"><button class="button" id="ack-warnings" type="button">确认全部警告</button></div>
+        </div>
+        <section class="panel">
+          <div class="panel-head"><h2>活动告警</h2><span class="sub">按原始资源层级保留故障语义</span></div>
+          <div class="panel-body no-pad table-wrap">
+            <table><thead><tr><th>级别</th><th>告警</th><th>资源</th><th>稳定错误码</th><th>持续时间</th><th>状态</th><th></th></tr></thead><tbody id="alert-table"></tbody></table>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>审计事件</h2><span class="sub">不记录鉴权头、Signed URL、NFS/KMS 密钥或数据内容</span><span class="spacer"></span>
+            <input class="filter-input" id="audit-search" placeholder="搜索动作 / 资源 / Trace" aria-label="搜索审计事件">
+          </div>
+          <div class="panel-body no-pad table-wrap">
+            <table><thead><tr><th>时间</th><th>主体</th><th>动作</th><th>资源</th><th>决策</th><th>原因</th><th>Trace / Job</th></tr></thead><tbody id="audit-table"></tbody></table>
+          </div>
+        </section>
+      </section>
+
+      <div class="footer-note">产品交互原型 · 演示数据 · 中心 PostgreSQL 为唯一权威元数据源</div>
+    </main>
+  </div>
+</div>
+
+<div class="drawer-backdrop" id="drawer-backdrop"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <div><h2 id="drawer-title">详情</h2><div class="drawer-sub" id="drawer-subtitle"></div></div>
+    <div class="spacer"></div>
+    <button class="icon-btn" id="drawer-close" type="button" title="关闭" aria-label="关闭">×</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+<div class="toast-host" id="toast-host"></div>
+
+<script>
+  const clusters = [
+    { id:"edge-a", name:"华东边缘集群", region:"cn-east-1", state:"ready", nodes:["8 / 8","ready"], agents:["2 / 2","ready"], nfs:["2 / 2","ready","12.4ms"], playground:["11 / 11 新鲜","ready"], gateway:["正常 · 2 条路由","ready"], jobs:7, pods:12, volume:"vol-a1 / vol-a2", gatewayId:"gw-a-01" },
+    { id:"edge-b", name:"华北训练集群", region:"cn-north-2", state:"degraded", nodes:["15 / 16","degraded"], agents:["2 / 2","degraded"], nfs:["1 / 2","degraded","184ms"], playground:["8 新鲜 · 2 过期","degraded"], gateway:["正常 · 2 条路由","ready"], jobs:11, pods:8, volume:"vol-b1 / vol-b2", gatewayId:"gw-b-01" },
+    { id:"edge-c", name:"华南灾备集群", region:"cn-south-1", state:"unknown", nodes:["4 / 5","unknown"], agents:["1 / 2","unknown"], nfs:["0 / 1","unknown","未知"], playground:["最近观测 12 分钟前","unknown"], gateway:["路由不可达","degraded"], jobs:2, pods:4, volume:"vol-c1", gatewayId:"gw-c-01" }
+  ];
+
+  const agents = [
+    { id:"agent-a-01", cluster:"edge-a", node:"cpu-a-01", protocol:"H3", generation:"29", heartbeat:"4 秒", mounts:"2 / 2", jobs:4, version:"0.9.0", state:"ready", reason:"当前会话" },
+    { id:"agent-a-02", cluster:"edge-a", node:"cpu-a-02", protocol:"H2", generation:"18", heartbeat:"7 秒", mounts:"1 / 1", jobs:3, version:"0.9.0", state:"ready", reason:"H3 回退到 H2" },
+    { id:"agent-b-01", cluster:"edge-b", node:"cpu-b-01", protocol:"H3", generation:"42", heartbeat:"6 秒", mounts:"2 / 2", jobs:8, version:"0.9.0", state:"ready", reason:"vol-b1 当前 RW Owner" },
+    { id:"agent-b-02", cluster:"edge-b", node:"cpu-b-02", protocol:"H2", generation:"13", heartbeat:"9 秒", mounts:"1 / 1", jobs:3, version:"0.8.7", state:"degraded", reason:"版本偏差" },
+    { id:"agent-c-01", cluster:"edge-c", node:"cpu-c-01", protocol:"H2", generation:"7", heartbeat:"12 秒", mounts:"1 / 1", jobs:2, version:"0.9.0", state:"ready", reason:"灾备集群待命" },
+    { id:"agent-c-02", cluster:"edge-c", node:"cpu-c-02", protocol:"-", generation:"6", heartbeat:"3 分钟", mounts:"0 / 1", jobs:0, version:"0.9.0", state:"unknown", reason:"心跳过期" }
+  ];
+
+  const artifacts = [
+    { id:"artifact-X", tenant:"视觉算法团队", commits:5, ref:"main / cmt-8f71", playgrounds:2, snapshots:3, placement:"edge-a / vol-a1", published:"8 分钟前", state:"ready" },
+    { id:"artifact-Q", tenant:"视觉算法团队", commits:18, ref:"main / cmt-521a", playgrounds:3, snapshots:6, placement:"edge-b / vol-b1", published:"24 分钟前", state:"ready" },
+    { id:"artifact-Y", tenant:"视觉算法团队", commits:9, ref:"main / cmt-33bb", playgrounds:2, snapshots:4, placement:"edge-a / vol-a2", published:"1 小时前", state:"degraded" },
+    { id:"artifact-C", tenant:"机器人团队", commits:7, ref:"main / cmt-17ca", playgrounds:1, snapshots:2, placement:"edge-c / vol-c1", published:"4 小时前", state:"unknown" }
+  ];
+
+  const playgrounds = [
+    { id:"pg-22", artifact:"artifact-X", version:"index-42", cluster:"edge-b", observed:"18 秒前", state:"ready" },
+    { id:"pg-52", artifact:"artifact-Q", version:"index-18", cluster:"edge-b", observed:"41 秒前", state:"ready" },
+    { id:"pg-09", artifact:"artifact-Y", version:"index-33", cluster:"edge-a", observed:"2 分钟前", state:"degraded" },
+    { id:"pg-31", artifact:"artifact-C", version:"index-7", cluster:"edge-c", observed:"12 分钟前", state:"unknown" }
+  ];
+
+  const volumes = [
+    { id:"vol-a1", cluster:"edge-a", backend:"nfs-a.internal:/tenant-a", fsid:"fsid 9f2a:11", owner:"agent-a-01", ownerGen:"17", mountGen:"42", used:"10.8 / 16 TiB", capacity:68, p95:"12.4ms", state:"ready", detail:"所有挂载观测一致" },
+    { id:"vol-a2", cluster:"edge-a", backend:"nfs-a2.internal:/tenant-a", fsid:"fsid c817:04", owner:"agent-a-02", ownerGen:"8", mountGen:"19", used:"4.6 / 8 TiB", capacity:58, p95:"16.1ms", state:"ready", detail:"所有挂载观测一致" },
+    { id:"vol-b1", cluster:"edge-b", backend:"nfs-b.internal:/tenant-a", fsid:"fsid 0ab4:91", owner:"agent-b-01", ownerGen:"23", mountGen:"66", used:"18.6 / 24 TiB", capacity:78, p95:"184ms", state:"degraded", detail:"检测到 stale handle 峰值" },
+    { id:"vol-b2", cluster:"edge-b", backend:"nfs-b2.internal:/tenant-a", fsid:"fsid b211:70", owner:"agent-b-02", ownerGen:"6", mountGen:"11", used:"5.4 / 8 TiB", capacity:67, p95:"24.8ms", state:"ready", detail:"Owner 版本落后一版" },
+    { id:"vol-c1", cluster:"edge-c", backend:"nfs-c.internal:/tenant-a", fsid:"最近观测未知", owner:"待确认", ownerGen:"4", mountGen:"9", used:"1.4 / 8 TiB", capacity:18, p95:"未知", state:"unknown", detail:"Owner 会话丢失，等待接管" }
+  ];
+
+  const mounts = [
+    { consumer:"agent-a-01", type:"Volume 读写 Owner", volume:"vol-a1", root:"/tenants/t-a/managed", mode:"rw", generation:"42" },
+    { consumer:"gw-a-01", type:"S3 Gateway", volume:"vol-a1", root:"/tenants/t-a/objects", mode:"ro", generation:"18" },
+    { consumer:"train-pod-7d9", type:"PodMountBinding", volume:"vol-a1", root:"/views/snapshots/snp-88", mode:"ro", generation:"k8s rv 9912" },
+    { consumer:"label-pod-3a2", type:"PodMountBinding", volume:"vol-a1", root:"/views/playgrounds/pg-18", mode:"rw", generation:"k8s rv 9918" },
+    { consumer:"agent-b-01", type:"Volume 读写 Owner", volume:"vol-b1", root:"/tenants/t-a/managed", mode:"rw", generation:"66" }
+  ];
+
+  const jobs = [
+    { id:"job-9e2f", op:"checkout", artifact:"artifact-X", playground:"pg-22", cluster:"edge-b", agent:"agent-b-01", expected:"index-42", observed:"index-42", lease:"lease-701", fence:"107", phase:"目标端物化", duration:"3 分 18 秒", state:"running", trace:"tr-718c", batch:"-", reason:"1.8 / 3.1 TiB" },
+    { id:"job-77ac", op:"add", artifact:"artifact-X", playground:"pg-22", cluster:"edge-b", agent:"agent-b-01", expected:"index-42", observed:"index-42", lease:"lease-r18", fence:"-", phase:"上传批次 8 / 12", duration:"1 分 44 秒", state:"running", trace:"tr-23ad", batch:"batch-884", reason:"候选数据 4.2 GiB" },
+    { id:"job-2c80", op:"commit", artifact:"artifact-Q", playground:"pg-52", cluster:"edge-b", agent:"agent-b-01", expected:"index-18", observed:"index-18", lease:"lease-118", fence:"21", phase:"等待中心 CAS", duration:"48 秒", state:"prepared", trace:"tr-c914", batch:"batch-118", reason:"元数据批次已验证" },
+    { id:"job-41b2", op:"status", artifact:"artifact-Y", playground:"pg-09", cluster:"edge-a", agent:"agent-a-02", expected:"index-33", observed:"index-33", lease:"lease-r32", fence:"-", phase:"租户公平队列", duration:"12 秒", state:"queued", trace:"tr-12ee", batch:"-", reason:"前方 2 个任务" },
+    { id:"job-4db0", op:"recover", artifact:"artifact-C", playground:"pg-31", cluster:"edge-c", agent:"agent-c-02", expected:"index-7", observed:"未知", lease:"lease-901", fence:"9", phase:"Agent 状态未知", duration:"4 分 02 秒", state:"unknown", trace:"tr-9aa1", batch:"-", reason:"副作用尚未确认" },
+    { id:"job-f100", op:"add", artifact:"artifact-Z", playground:"pg-28", cluster:"edge-a", agent:"agent-a-01", expected:"index-54", observed:"index-55", lease:"lease-330", fence:"42", phase:"CAS 被拒绝", duration:"2 分 51 秒", state:"conflicted", trace:"tr-34d0", batch:"batch-330", reason:"INDEX_VERSION_CONFLICT" },
+    { id:"job-bb81", op:"recover", artifact:"artifact-C", playground:"pg-31", cluster:"edge-c", agent:"agent-c-01", expected:"index-7", observed:"index-7", lease:"lease-905", fence:"10", phase:"重放 journal", duration:"1 分 09 秒", state:"recovering", trace:"tr-774e", batch:"-", reason:"替代 Owner 候选" },
+    { id:"job-18a6", op:"fsck", artifact:"artifact-R", playground:"-", cluster:"edge-b", agent:"agent-b-02", expected:"commit-88", observed:"commit-88", lease:"-", fence:"-", phase:"对象校验", duration:"6 分 44 秒", state:"running", trace:"tr-3e8a", batch:"-", reason:"110 万 / 240 万对象" },
+    { id:"job-873a", op:"commit", artifact:"artifact-Y", playground:"pg-09", cluster:"edge-a", agent:"agent-a-02", expected:"index-32", observed:"index-32", lease:"lease-774", fence:"8", phase:"已完成", duration:"54 秒", state:"succeeded", trace:"tr-daa2", batch:"batch-774", reason:"commit cmt-a0b9" }
+  ];
+
+  const transfers = [
+    { id:"xfer-21a9", source:"edge-a", gateway:"gw-a-01", destination:"edge-b", agent:"agent-b-01", volume:"vol-b1", artifact:"artifact-X", commit:"cmt-8f71", bytes:"1.8 / 3.1 TiB", progress:58, rate:"4.7 GiB/s", retry:1, ttl:"7 分 42 秒", state:"running", trace:"tr-718c" },
+    { id:"xfer-812c", source:"edge-b", gateway:"gw-b-01", destination:"edge-a", agent:"agent-a-01", volume:"vol-a1", artifact:"artifact-Q", commit:"cmt-521a", bytes:"614 / 820 GiB", progress:75, rate:"3.1 GiB/s", retry:0, ttl:"3 分 18 秒", state:"running", trace:"tr-811c" },
+    { id:"xfer-1d77", source:"edge-a", gateway:"gw-a-01", destination:"edge-c", agent:"agent-c-01", volume:"vol-c1", artifact:"artifact-Y", commit:"cmt-33bb", bytes:"92 / 540 GiB", progress:17, rate:"0 B/s", retry:4, ttl:"已过期", state:"waiting", trace:"tr-55b1" },
+    { id:"xfer-92ee", source:"edge-b", gateway:"gw-b-01", destination:"edge-a", agent:"agent-a-02", volume:"vol-a2", artifact:"artifact-R", commit:"cmt-88e0", bytes:"校验失败", progress:100, rate:"-", retry:2, ttl:"已关闭", state:"failed", trace:"tr-3e8a", reason:"OBJECT_HASH_MISMATCH" }
+  ];
+
+  const routes = [
+    { id:"route-a-b", source:"edge-a / gw-a-01", destination:"edge-b", endpoint:"s3-gw-a.dmz.internal", p95:"42ms", throughput:"8.1 GiB/s", generation:"18", state:"ready" },
+    { id:"route-b-a", source:"edge-b / gw-b-01", destination:"edge-a", endpoint:"s3-gw-b.dmz.internal", p95:"51ms", throughput:"5.8 GiB/s", generation:"12", state:"ready" },
+    { id:"route-a-c", source:"edge-a / gw-a-01", destination:"edge-c", endpoint:"s3-gw-a.dmz.internal", p95:"1.4s", throughput:"0 B/s", generation:"5", state:"degraded" }
+  ];
+
+  let alerts = [
+    { id:"alert-nfs-b1", severity:"critical", title:"NFS 延迟升高且 stale handle 激增", resource:"edge-b / vol-b1", code:"NFS_STALE_HANDLE", since:"12 分钟", acknowledged:false },
+    { id:"alert-agent-c02", severity:"warning", title:"Agent 心跳已过期", resource:"edge-c / agent-c-02", code:"AGENT_HEARTBEAT_STALE", since:"3 分钟", acknowledged:false },
+    { id:"alert-route-ac", severity:"warning", title:"跨集群传输路由不可达", resource:"route-a-c", code:"TRANSFER_ROUTE_UNREACHABLE", since:"7 分钟", acknowledged:false }
+  ];
+
+  const audits = [
+    { time:"14:28:41", principal:"service:scheduler", action:"job.assign", resource:"job-9e2f", decision:"allow", reason:"PLACEMENT_AND_OWNER_MATCH", trace:"tr-718c / job-9e2f" },
+    { time:"14:28:38", principal:"agent:agent-b-01", action:"lease.renew", resource:"lease-701", decision:"allow", reason:"FENCE_CURRENT", trace:"tr-718c / job-9e2f" },
+    { time:"14:27:19", principal:"service:scheduler", action:"job.assign", resource:"job-f100", decision:"deny", reason:"INDEX_VERSION_CONFLICT", trace:"tr-34d0 / job-f100" },
+    { time:"14:26:02", principal:"agent:agent-c-02", action:"job.status", resource:"job-4db0", decision:"deny", reason:"SESSION_GENERATION_STALE", trace:"tr-9aa1 / job-4db0" },
+    { time:"14:25:44", principal:"user:ops-17", action:"volume.read", resource:"vol-b1", decision:"allow", reason:"TENANT_OPERATOR", trace:"tr-e81a / -" },
+    { time:"14:24:13", principal:"gateway:gw-b-01", action:"object.get", resource:"artifact-R/cmt-88e0", decision:"deny", reason:"OBJECT_HASH_MISMATCH", trace:"tr-3e8a / job-18a6" }
+  ];
+
+  const activity = [
+    ["14:28:46","vol-b1 进入降级状态","NFS_STALE_HANDLE · p95 184ms"],
+    ["14:27:31","agent-c-02 会话变为未知","最后心跳 3 分钟前 · 会话 gen 6"],
+    ["14:26:58","job-f100 发布冲突","IndexVersion index-54 → index-55"],
+    ["14:25:14","route-a-c 路由降级","Gateway endpoint 连接超时"],
+    ["14:23:09","job-873a 发布成功","中心 CAS 完成并收到 finalize 确认"],
+    ["14:19:33","pg-22 观测恢复新鲜","扫描耗时 18.4 秒"]
+  ];
+
+  const labels = {
+    ready:"正常", degraded:"降级", unknown:"未知", critical:"严重", warning:"警告",
+    running:"运行中", waiting:"等待", queued:"排队", prepared:"待发布",
+    recovering:"恢复中", conflicted:"冲突", failed:"失败", succeeded:"成功",
+    rw:"读写", ro:"只读", allow:"允许", deny:"拒绝"
+  };
+  let selectedCluster = "edge-b";
+  let currentRange = "1h";
+  const anomaly = { artifacts:false, agents:false, storage:false, transfers:false };
+
+  function escapeText(value) {
+    return String(value).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#039;" })[c]);
+  }
+  function state(value, text) {
+    const safe = ["ready","degraded","unknown","critical","warning","running","waiting","queued","prepared","recovering","conflicted","failed","succeeded","rw","ro"].includes(value) ? value : "unknown";
+    return '<span class="state s-' + safe + '">' + escapeText(text || labels[value] || value) + '</span>';
+  }
+  function kpis(target, rows) {
+    document.getElementById(target).innerHTML = rows.map(r => '<div class="kpi ' + r[2] + '"><div class="label">' + r[0] + '</div><div class="value">' + r[1] + '</div><div class="delta ' + (r[3] || "") + '">' + r[4] + '</div></div>').join("");
+  }
+  function detailRows(rows) {
+    return '<dl class="detail-grid">' + rows.map(r => '<dt>' + r[0] + '</dt><dd>' + r[1] + '</dd>').join("") + '</dl>';
+  }
+  function timeline(rows) {
+    return '<div class="timeline">' + rows.map(r => '<div class="timeline-item"><div class="timeline-time mono">' + r[0] + '</div><div class="timeline-event">' + r[1] + '</div></div>').join("") + '</div>';
+  }
+
+  function renderIncidents() {
+    const active = alerts.filter(a => !a.acknowledged);
+    document.getElementById("incident-strip").innerHTML = active.length ? active.slice(0,3).map(a =>
+      '<div class="incident ' + (a.severity === "critical" ? "critical" : "") + '"><div class="incident-body"><div class="incident-title">' + escapeText(a.title) + '</div><div class="incident-meta mono">' + a.resource + ' · ' + a.code + ' · ' + a.since + '</div></div><button class="button small" type="button" data-ack="' + a.id + '">确认</button></div>'
+    ).join("") : '<div class="notice" style="grid-column:1/-1">当前范围没有未确认告警。</div>';
+    document.getElementById("alert-count").textContent = String(active.length);
+  }
+  function renderOverview() {
+    const scope = document.getElementById("cluster-scope").value;
+    const scopedAgents = agents.filter(a => !scope || a.cluster === scope);
+    const scopedVolumes = volumes.filter(v => !scope || v.cluster === scope);
+    const scopedJobs = jobs.filter(j => !scope || j.cluster === scope);
+    const scopedClusters = clusters.filter(c => !scope || c.id === scope);
+    const onlineAgents = scopedAgents.filter(a => a.state !== "unknown").length;
+    const healthyVolumes = scopedVolumes.filter(v => v.state === "ready").length;
+    const activeJobs = scopedJobs.filter(j => !["succeeded","failed","conflicted"].includes(j.state)).length;
+    kpis("overview-kpis", [
+      ["中心控制面可用性","99.97%","green","ok","高于 99.9% SLO"],
+      ["Agent 在线会话",onlineAgents + " / " + scopedAgents.length,"blue",onlineAgents === scopedAgents.length ? "ok" : "warn",(scopedAgents.length - onlineAgents) + " 个心跳过期"],
+      ["健康 StorageVolume",healthyVolumes + " / " + scopedVolumes.length,"orange",healthyVolumes === scopedVolumes.length ? "ok" : "warn",(scopedVolumes.length - healthyVolumes) + " 个需要关注"],
+      ["运行中任务",String(activeJobs),"violet","",scope ? "当前集群范围" : "全部集群范围"],
+      ["调度延迟 p95","1.8 秒","","ok","预算小于 3 秒"]
+    ]);
+    document.getElementById("activity-feed").innerHTML = activity.map(a => '<div class="feed-item"><div class="feed-time mono">' + a[0] + '</div><div><div class="feed-title">' + a[1] + '</div><div class="feed-meta mono">' + a[2] + '</div></div></div>').join("");
+    document.getElementById("health-table").innerHTML = scopedClusters.map(c => '<tr data-detail="cluster" data-id="' + c.id + '"><td><div class="cell-main">' + c.name + '</div><div class="cell-sub mono">' + c.id + ' · ' + c.region + '</div></td><td>' + state(c.nodes[1],c.nodes[0]) + '</td><td>' + state(c.agents[1],c.agents[0]) + '</td><td>' + state(c.nfs[1],c.nfs[0]) + '</td><td>' + state(c.playground[1],c.playground[0]) + '</td><td>' + state(c.gateway[1],c.gateway[0]) + '</td></tr>').join("");
+    const signals = [
+      ["API 请求成功率","最近 1 小时","99.97%",99,""],
+      ["调度器队列","23 个等待 · p95 1.8 秒","72%",72,""],
+      ["Lease 续租成功率","1 小时内重试 2 次","99.92%",98,""],
+      ["IndexVersion CAS","1 小时内冲突 8 次","96.4%",88,"warn"],
+      ["MetadataBatch 暂存","42 GiB · 最老 4 分钟","61%",61,""]
+    ];
+    document.getElementById("control-signals").innerHTML = signals.map(s => '<div class="signal-row"><div><div class="signal-name">' + s[0] + '</div><div class="signal-meta">' + s[1] + '</div></div><div class="bar ' + s[4] + '"><span style="width:' + s[3] + '%"></span></div><div class="signal-value">' + s[2] + '</div></div>').join("");
+  }
+  function renderArtifacts() {
+    kpis("artifact-kpis", [
+      ["Artifact","12","green","","跨 3 个 EdgeCluster"],
+      ["不可变 Commit","147","blue","","今天新增 18 个"],
+      ["活跃 Playground","8","violet","warn","2 个观测过期"],
+      ["只读 Snapshot","31","","ok","固定 Commit"],
+      ["发布冲突","8","orange","warn","最近 1 小时"]
+    ]);
+    const q = document.getElementById("artifact-search").value.trim().toLowerCase();
+    const scope = document.getElementById("cluster-scope").value;
+    const tenant = document.getElementById("tenant-scope").value;
+    const rows = artifacts.filter(a => (!q || Object.values(a).join(" ").toLowerCase().includes(q)) && (!scope || a.placement.includes(scope)) && (tenant === "平台系统范围" || a.tenant === tenant) && (!anomaly.artifacts || a.state !== "ready"));
+    document.getElementById("artifact-table").innerHTML = rows.map(a => '<tr data-detail="artifact" data-id="' + a.id + '"><td><div class="cell-main mono">' + a.id + '</div><div class="cell-sub">' + a.tenant + '</div></td><td>' + a.commits + ' 个 Commit</td><td class="mono">' + a.ref + '</td><td>' + a.playgrounds + '</td><td>' + a.snapshots + '</td><td class="mono">' + a.placement + '</td><td>' + a.published + '</td><td>' + state(a.state) + '</td></tr>').join("") || '<tr><td colspan="8" class="dim">没有匹配的 Artifact。</td></tr>';
+    document.getElementById("playground-list").innerHTML = playgrounds.map(p => '<div class="playground-row" data-detail="playground" data-id="' + p.id + '"><div><div class="cell-main mono">' + p.id + '</div><div class="cell-sub mono">' + p.artifact + '</div></div><div class="mono">' + p.version + '</div><div>' + p.cluster + '</div><div>' + p.observed + '</div><div>' + state(p.state) + '</div></div>').join("");
+  }
+  function renderClusters() {
+    document.getElementById("cluster-tabs").innerHTML = clusters.map(c => '<button class="cluster-chip ' + (c.id === selectedCluster ? "active" : "") + '" type="button" data-cluster="' + c.id + '">' + c.name + ' · ' + labels[c.state] + '</button>').join("");
+    const c = clusters.find(x => x.id === selectedCluster);
+    document.getElementById("cluster-zones").innerHTML =
+      '<div class="zone system"><div class="zone-title">系统组件区</div><div class="zone-value">' + c.agents[0] + ' 个 Agent 会话</div><div class="zone-row"><span>Agent 健康</span>' + state(c.agents[1],c.agents[0]) + '</div><div class="zone-row"><span>S3 Gateway</span><span class="mono">' + c.gatewayId + '</span></div><div class="zone-row"><span>控制协议</span><span>H2/H3 JSON 流</span></div><div class="zone-row"><span>运行任务</span><strong>' + c.jobs + '</strong></div><div class="zone-flow">Agent 与 Gateway 都在系统组件区；Agent 主动连接中心。</div></div>' +
+      '<div class="zone nfs"><div class="zone-title">NFS 区</div><div class="zone-value mono">' + c.volume + '</div><div class="zone-row"><span>挂载健康</span>' + state(c.nfs[1],c.nfs[0]) + '</div><div class="zone-row"><span>I/O p95</span><span class="mono">' + c.nfs[2] + '</span></div><div class="zone-row"><span>Owner 约束</span><span>代次隔离</span></div><div class="zone-row"><span>可见目录</span><span>受管根 / 视图根</span></div><div class="zone-flow">一个 Artifact 在同一集群固定到一个 NFS；一个 NFS 可承载同租户多个 Artifact。</div></div>' +
+      '<div class="zone pod"><div class="zone-title">业务 Pod 区</div><div class="zone-value">' + c.pods + ' 个已登记挂载</div><div class="zone-row"><span>视图类型</span><span>Playground / Snapshot</span></div><div class="zone-row"><span>观测新鲜度</span>' + state(c.playground[1],c.playground[0]) + '</div><div class="zone-row"><span>文件 I/O</span><span>Pod 直达本地 NFS</span></div><div class="zone-row"><span>中心职责</span><span>登记绑定关系</span></div><div class="zone-flow">中心不负责创建 Pod、PV、PVC 或 NAS，只观测已有 PodMountBinding。</div></div>';
+    const q = document.getElementById("agent-search").value.trim().toLowerCase();
+    const filterState = document.getElementById("agent-state").value;
+    const scope = document.getElementById("cluster-scope").value;
+    const rows = agents.filter(a => (!q || Object.values(a).join(" ").toLowerCase().includes(q)) && (!filterState || a.state === filterState) && (!scope || a.cluster === scope) && (!anomaly.agents || a.state !== "ready"));
+    document.getElementById("agent-table").innerHTML = rows.map(a => '<tr data-detail="agent" data-id="' + a.id + '"><td><div class="cell-main mono">' + a.id + '</div><div class="cell-sub">' + a.reason + '</div></td><td><div>' + a.cluster + '</div><div class="cell-sub mono">' + a.node + '</div></td><td><span class="tag blue">' + a.protocol + '</span><div class="cell-sub mono">application/json-seq</div></td><td class="mono">' + a.generation + '</td><td>' + a.heartbeat + '</td><td>' + a.mounts + '</td><td>' + a.jobs + '</td><td class="mono">' + a.version + '</td><td>' + state(a.state) + '</td></tr>').join("") || '<tr><td colspan="9" class="dim">没有匹配的 Agent。</td></tr>';
+  }
+  function renderStorage() {
+    kpis("storage-kpis", [
+      ["已登记物理卷","5","green","","5 个 NFS 后端"],
+      ["健康挂载","3 / 5","orange","warn","1 个降级 · 1 个未知"],
+      ["容量使用率","65%","","","40.8 / 64 TiB"],
+      ["NFS I/O p95","18.7ms","blue","warn","vol-b1 为 184ms"],
+      ["活跃 RW Owner","4 / 5","violet","warn","vol-c1 待确认"]
+    ]);
+    const q = document.getElementById("volume-search").value.trim().toLowerCase();
+    const scope = document.getElementById("cluster-scope").value;
+    const rows = volumes.filter(v => (!q || Object.values(v).join(" ").toLowerCase().includes(q)) && (!scope || v.cluster === scope) && (!anomaly.storage || v.state !== "ready"));
+    document.getElementById("volume-table").innerHTML = rows.map(v => '<tr data-detail="volume" data-id="' + v.id + '"><td><div class="cell-main mono">' + v.id + '</div><div class="cell-sub">' + v.detail + '</div></td><td>' + v.cluster + '</td><td><div class="mono">' + v.backend + '</div><div class="cell-sub mono">' + v.fsid + '</div></td><td class="mono">' + v.owner + '</td><td><div class="mono">owner ' + v.ownerGen + '</div><div class="cell-sub mono">mount ' + v.mountGen + '</div></td><td class="capacity"><div class="capacity-head"><span>' + v.used + '</span><span>' + v.capacity + '%</span></div><div class="bar ' + (v.capacity > 80 ? "warn" : "") + '"><span style="width:' + v.capacity + '%"></span></div></td><td class="mono">' + v.p95 + '</td><td>' + state(v.state) + '</td></tr>').join("") || '<tr><td colspan="8" class="dim">没有匹配的 Volume。</td></tr>';
+    const visibleVolumes = new Set(volumes.filter(v => !scope || v.cluster === scope).map(v => v.id));
+    document.getElementById("mount-table").innerHTML = mounts.filter(m => visibleVolumes.has(m.volume)).map(m => '<tr><td class="mono cell-main">' + m.consumer + '</td><td>' + m.type + '</td><td class="mono">' + m.volume + '</td><td class="mono path">' + m.root + '</td><td>' + state(m.mode) + '</td><td class="mono">' + m.generation + '</td></tr>').join("") || '<tr><td colspan="6" class="dim">当前集群没有已登记挂载。</td></tr>';
+  }
+  function renderJobs() {
+    const order = [["queued","排队"],["running","执行中"],["prepared","待发布"],["recovering","恢复中"],["unknown","未知"],["conflicted","冲突"],["succeeded","成功"]];
+    const scope = document.getElementById("cluster-scope").value;
+    const scopedJobs = jobs.filter(j => !scope || j.cluster === scope);
+    document.getElementById("job-pipeline").innerHTML = order.map(o => '<div class="pipeline-step"><div class="pipeline-label">' + o[1] + '</div><div class="pipeline-value">' + scopedJobs.filter(j => j.state === o[0]).length + '</div></div>').join("");
+    const q = document.getElementById("job-search").value.trim().toLowerCase();
+    const filterState = document.getElementById("job-state").value;
+    const rows = jobs.filter(j => (!q || Object.values(j).join(" ").toLowerCase().includes(q)) && (!filterState || j.state === filterState) && (!scope || j.cluster === scope));
+    document.getElementById("job-table").innerHTML = rows.map(j => '<tr data-detail="job" data-id="' + j.id + '"><td class="mono cell-main">' + j.id + '</td><td><span class="tag">' + j.op + '</span></td><td><div class="mono">' + j.artifact + '</div><div class="cell-sub mono">' + j.playground + '</div></td><td><div>' + j.cluster + '</div><div class="cell-sub mono">' + j.agent + '</div></td><td><div class="mono">期望 ' + j.expected + '</div><div class="cell-sub mono">观测 ' + j.observed + '</div></td><td><div class="mono">' + j.lease + '</div><div class="cell-sub mono">fence ' + j.fence + '</div></td><td><div>' + j.phase + '</div><div class="cell-sub">' + j.reason + '</div></td><td>' + j.duration + '</td><td>' + state(j.state) + '</td></tr>').join("") || '<tr><td colspan="9" class="dim">没有匹配的任务。</td></tr>';
+  }
+  function renderTransfers() {
+    kpis("transfer-kpis", [
+      ["可用传输路由","2 / 3","green","warn","route-a-c 降级"],
+      ["Gateway GET","8.9 GiB/s","blue","","当前聚合速率"],
+      ["活动 Ticket","14","violet","","短期且范围受限"],
+      ["目标端已校验对象","9870 万","","ok","BLAKE3 完整性校验"],
+      ["完整性失败","1","orange","bad","OBJECT_HASH_MISMATCH"]
+    ]);
+    const scope = document.getElementById("cluster-scope").value;
+    const rows = transfers.filter(t => (!scope || t.source === scope || t.destination === scope) && (!anomaly.transfers || !["running","succeeded"].includes(t.state)));
+    document.getElementById("transfer-list").innerHTML = rows.map(t => '<article class="transfer-card" data-detail="transfer" data-id="' + t.id + '" tabindex="0"><div class="transfer-head"><span class="mono strong">' + t.id + '</span>' + state(t.state) + '<span class="spacer"></span><span class="mono dim">' + t.artifact + ' / ' + t.commit + '</span></div><div class="transfer-route"><div class="route-end"><strong>' + t.source + '</strong><div class="cell-sub mono">' + t.gateway + '</div></div><div class="route-arrow">→</div><div class="route-end"><strong>' + t.destination + '</strong><div class="cell-sub mono">' + t.agent + ' / ' + t.volume + '</div></div></div><div class="progress"><span style="width:' + t.progress + '%"></span></div><div class="transfer-foot"><span>' + t.bytes + ' · ' + t.progress + '%</span><span>' + t.rate + ' · 重试 ' + t.retry + ' · TTL ' + t.ttl + '</span></div></article>').join("") || '<div class="dim">没有匹配的传输。</div>';
+    document.getElementById("route-table").innerHTML = routes.filter(r => !scope || r.source.includes(scope) || r.destination === scope).map(r => '<tr data-detail="route" data-id="' + r.id + '"><td class="mono cell-main">' + r.id + '</td><td>' + r.source + '</td><td>' + r.destination + '</td><td class="mono">' + r.endpoint + '</td><td class="mono">' + r.p95 + '</td><td class="mono">' + r.throughput + '</td><td class="mono">' + r.generation + '</td><td>' + state(r.state) + '</td></tr>').join("") || '<tr><td colspan="8" class="dim">当前集群没有传输路由。</td></tr>';
+  }
+  function renderAlerts() {
+    document.getElementById("alert-table").innerHTML = alerts.map(a => '<tr><td>' + state(a.severity,a.severity === "critical" ? "严重" : "警告") + '</td><td class="cell-main">' + a.title + '</td><td class="mono">' + a.resource + '</td><td class="mono">' + a.code + '</td><td>' + a.since + '</td><td>' + (a.acknowledged ? state("unknown","已确认") : state(a.severity,"触发中")) + '</td><td>' + (a.acknowledged ? "" : '<button class="button small" type="button" data-ack="' + a.id + '">确认</button>') + '</td></tr>').join("");
+    const q = document.getElementById("audit-search").value.trim().toLowerCase();
+    const rows = audits.filter(a => !q || Object.values(a).join(" ").toLowerCase().includes(q));
+    document.getElementById("audit-table").innerHTML = rows.map(a => '<tr><td class="mono dim">' + a.time + '</td><td class="mono">' + a.principal + '</td><td class="mono cell-main">' + a.action + '</td><td class="mono">' + a.resource + '</td><td>' + state(a.decision === "allow" ? "ready" : "critical",labels[a.decision]) + '</td><td class="mono">' + a.reason + '</td><td class="mono dim">' + a.trace + '</td></tr>').join("");
+  }
+  function renderAll() {
+    renderIncidents();
+    renderOverview();
+    renderArtifacts();
+    renderClusters();
+    renderStorage();
+    renderJobs();
+    renderTransfers();
+    renderAlerts();
+    updateClock();
+  }
+
+  function openDrawer(type,id) {
+    let title = id, subtitle = "", body = "";
+    if (type === "cluster") {
+      const c = clusters.find(x => x.id === id);
+      title = c.name; subtitle = c.id + " / " + c.region;
+      body = detailRows([["集群状态",state(c.state)],["计算节点",c.nodes[0]],["Agent 会话",c.agents[0]],["StorageVolume",c.nfs[0]],["工作区新鲜度",c.playground[0]],["Gateway / 路由",c.gateway[0]],["运行任务",String(c.jobs)],["业务 Pod",String(c.pods)]]);
+    } else if (type === "agent") {
+      const a = agents.find(x => x.id === id);
+      title = a.id; subtitle = a.cluster + " / " + a.node;
+      body = detailRows([["状态",state(a.state)],["原因",a.reason],["协议",a.protocol + " · application/json-seq"],["会话代次",'<span class="mono">' + a.generation + '</span>'],["最近心跳",a.heartbeat],["AgentMount",a.mounts],["运行任务",String(a.jobs)],["版本",'<span class="mono">' + a.version + '</span>']]) + timeline([["现在","实际状态已写入中心"],["-6 秒","中心接受 agent.heartbeat"],["-18 秒","Lease 续租批次已确认"],["-4 分钟","当前会话代次激活"]]);
+    } else if (type === "volume") {
+      const v = volumes.find(x => x.id === id);
+      title = v.id; subtitle = v.cluster + " / StorageVolume";
+      body = detailRows([["状态",state(v.state)],["后端",'<span class="mono">' + v.backend + '</span>'],["观测 fsid",'<span class="mono">' + v.fsid + '</span>'],["活跃 RW Owner",'<span class="mono">' + v.owner + '</span>'],["Owner 代次",v.ownerGen],["Mount 代次",v.mountGen],["容量",v.used + "（" + v.capacity + "%）"],["NFS p95",v.p95],["最近观测",v.detail]]);
+    } else if (type === "artifact") {
+      const a = artifacts.find(x => x.id === id);
+      title = a.id; subtitle = "版本化抽象文件系统";
+      body = detailRows([["状态",state(a.state)],["租户",a.tenant],["Commit 数量",String(a.commits)],["当前引用",'<span class="mono">' + a.ref + '</span>'],["Playground",String(a.playgrounds)],["Snapshot",String(a.snapshots)],["Placement",'<span class="mono">' + a.placement + '</span>'],["最近发布",a.published]]);
+    } else if (type === "playground") {
+      const p = playgrounds.find(x => x.id === id);
+      title = p.id; subtitle = p.artifact + " / 可读写工作区";
+      body = detailRows([["状态",state(p.state)],["Artifact",p.artifact],["IndexVersion",'<span class="mono">' + p.version + '</span>'],["集群",p.cluster],["最近观测",p.observed],["元数据权威","中心 PostgreSQL"],["Agent 本地缓存","可删除并重建"]]);
+    } else if (type === "job") {
+      const j = jobs.find(x => x.id === id);
+      title = j.id; subtitle = j.op + " / " + labels[j.state];
+      body = detailRows([["状态",state(j.state)],["Artifact",j.artifact],["Playground",j.playground],["Assignment",'<span class="mono">' + j.cluster + " / " + j.agent + '</span>'],["IndexVersion",'<span class="mono">' + j.expected + " → " + j.observed + '</span>'],["Lease / Fence",'<span class="mono">' + j.lease + " / " + j.fence + '</span>'],["MetadataBatch",'<span class="mono">' + j.batch + '</span>'],["Trace",'<span class="mono">' + j.trace + '</span>'],["当前阶段",j.phase + " · " + j.reason]]) + timeline([["现在",j.phase + " · " + j.reason],["-18 秒","进度报告已持久化"],["-42 秒","Agent 接受 Assignment 并写入本地 Ledger"],["-47 秒","调度器选择当前 Volume Owner"]]);
+    } else if (type === "transfer") {
+      const t = transfers.find(x => x.id === id);
+      title = t.id; subtitle = t.source + " → " + t.destination;
+      body = detailRows([["状态",state(t.state)],["固定源",'<span class="mono">' + t.artifact + " / " + t.commit + '</span>'],["源 Gateway",t.gateway],["目标 Agent / Volume",t.agent + " / " + t.volume],["进度",t.bytes + "（" + t.progress + "%）"],["吞吐",t.rate],["重试",String(t.retry)],["Ticket TTL",t.ttl],["Trace",t.trace]]) + timeline([["现在","目标端执行 BLAKE3 校验"],["-24 秒","从已验证边界续传 GET range"],["-3 分钟","中心签发 TransferTicket"],["-3 分钟","源 ObjectLocation 保留 Lease 生效"]]);
+    } else if (type === "route") {
+      const r = routes.find(x => x.id === id);
+      title = r.id; subtitle = r.source + " → " + r.destination;
+      body = detailRows([["状态",state(r.state)],["Gateway 端点",r.endpoint],["延迟 p95",r.p95],["吞吐",r.throughput],["凭证代次",r.generation],["策略","仅允许 Ticket 约束的 HEAD / GET"]]);
+    }
+    document.getElementById("drawer-title").textContent = title;
+    document.getElementById("drawer-subtitle").textContent = subtitle;
+    document.getElementById("drawer-body").innerHTML = body;
+    document.getElementById("drawer").classList.add("open");
+    document.getElementById("drawer").setAttribute("aria-hidden","false");
+    document.getElementById("drawer-backdrop").classList.add("open");
+  }
+  function closeDrawer() {
+    document.getElementById("drawer").classList.remove("open");
+    document.getElementById("drawer").setAttribute("aria-hidden","true");
+    document.getElementById("drawer-backdrop").classList.remove("open");
+  }
+  function showToast(message) {
+    const el = document.createElement("div");
+    el.className = "toast";
+    el.textContent = message;
+    document.getElementById("toast-host").appendChild(el);
+    setTimeout(() => el.remove(),2600);
+  }
+  function updateClock() {
+    const now = new Date();
+    document.getElementById("clock").textContent = "更新于 " + now.toLocaleTimeString("zh-CN",{hour12:false});
+  }
+  function acknowledge(id) {
+    const item = alerts.find(a => a.id === id);
+    if (item) item.acknowledged = true;
+    renderIncidents();
+    renderAlerts();
+    showToast("告警已确认：" + id);
+  }
+
+  document.addEventListener("click", event => {
+    const nav = event.target.closest(".detail-tab[data-view]");
+    if (nav) {
+      document.querySelectorAll(".detail-tab").forEach(x => x.classList.toggle("active",x === nav));
+      document.querySelectorAll(".view").forEach(x => x.classList.toggle("active",x.id === "view-" + nav.dataset.view));
+      document.getElementById("current-title").textContent = nav.dataset.title;
+      document.querySelector(".content").scrollTop = 0;
+      closeDrawer();
+      return;
+    }
+    const chip = event.target.closest("[data-cluster]");
+    if (chip) { selectedCluster = chip.dataset.cluster; renderClusters(); return; }
+    const ack = event.target.closest("[data-ack]");
+    if (ack) { acknowledge(ack.dataset.ack); return; }
+    const detail = event.target.closest("[data-detail]");
+    if (detail) { openDrawer(detail.dataset.detail,detail.dataset.id); return; }
+    const range = event.target.closest("[data-range]");
+    if (range) {
+      currentRange = range.dataset.range;
+      document.querySelectorAll("[data-range]").forEach(x => x.classList.toggle("active",x === range));
+      showToast("时间范围已切换为最近 " + range.textContent);
+    }
+  });
+
+  document.getElementById("artifact-search").addEventListener("input",renderArtifacts);
+  document.getElementById("agent-search").addEventListener("input",renderClusters);
+  document.getElementById("agent-state").addEventListener("change",renderClusters);
+  document.getElementById("volume-search").addEventListener("input",renderStorage);
+  document.getElementById("job-search").addEventListener("input",renderJobs);
+  document.getElementById("job-state").addEventListener("change",renderJobs);
+  document.getElementById("audit-search").addEventListener("input",renderAlerts);
+  document.getElementById("cluster-scope").addEventListener("change",event => { if (event.target.value) selectedCluster = event.target.value; renderOverview(); renderArtifacts(); renderClusters(); renderStorage(); renderJobs(); renderTransfers(); showToast("集群范围已更新"); });
+  document.getElementById("tenant-scope").addEventListener("change",() => { renderArtifacts(); showToast("租户范围已更新"); });
+  document.getElementById("artifact-anomaly").addEventListener("click",event => { anomaly.artifacts = !anomaly.artifacts; event.currentTarget.classList.toggle("active",anomaly.artifacts); renderArtifacts(); });
+  document.getElementById("agent-anomaly").addEventListener("click",event => { anomaly.agents = !anomaly.agents; event.currentTarget.classList.toggle("active",anomaly.agents); renderClusters(); });
+  document.getElementById("storage-anomaly").addEventListener("click",event => { anomaly.storage = !anomaly.storage; event.currentTarget.classList.toggle("active",anomaly.storage); renderStorage(); });
+  document.getElementById("transfer-anomaly").addEventListener("click",event => { anomaly.transfers = !anomaly.transfers; event.currentTarget.classList.toggle("active",anomaly.transfers); renderTransfers(); });
+  document.getElementById("ack-warnings").addEventListener("click",() => { alerts.forEach(a => { if (a.severity === "warning") a.acknowledged = true; }); renderIncidents(); renderAlerts(); showToast("全部警告已确认"); });
+  document.getElementById("recover-jobs").addEventListener("click",() => showToast("已向中心提交可恢复任务重试请求"));
+  document.getElementById("diagnose-btn").addEventListener("click",() => showToast("运行诊断已提交，中心正在采集各层状态"));
+  document.getElementById("new-deploy-btn").addEventListener("click",() => showToast("已打开新增部署任务入口"));
+  document.getElementById("refresh-btn").addEventListener("click",event => {
+    event.currentTarget.classList.add("loading");
+    setTimeout(() => { renderAll(); event.currentTarget.classList.remove("loading"); showToast("运行状态已刷新"); },450);
+  });
+  document.getElementById("drawer-close").addEventListener("click",closeDrawer);
+  document.getElementById("drawer-backdrop").addEventListener("click",closeDrawer);
+  document.addEventListener("keydown",event => { if (event.key === "Escape") closeDrawer(); });
+  setInterval(() => { if (document.getElementById("auto-refresh").checked) updateClock(); },5000);
+
+  renderAll();
+</script>
+</body>
+</html>
