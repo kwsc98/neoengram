@@ -175,6 +175,7 @@
       color: #353a42;
       font-size: 14px;
       line-height: 1.65;
+      overflow-wrap: anywhere;
     }
 
     .summary-fact dt {
@@ -242,7 +243,16 @@
     .swatch.control { color: var(--blue); background: var(--blue-soft); }
     .swatch.authority { color: var(--green); background: var(--green-soft); }
     .swatch.agent { color: var(--amber); background: var(--amber-soft); }
+    .swatch.workload { color: #64748b; background: #ffffff; }
     .swatch.storage { color: var(--cyan); background: var(--cyan-soft); }
+    .swatch.cluster-a { color: #b7791f; background: #fff8e8; }
+    .swatch.cluster-b { color: #0e7490; background: #eefafd; }
+
+    .transfer-swatch {
+      width: 20px;
+      height: 0;
+      border-top: 3px solid #0f766e;
+    }
 
     .segmented {
       display: inline-flex;
@@ -332,8 +342,57 @@
     }
 
     .band.control-band { fill: #f3f7ff; stroke: #9bb9f4; }
-    .band.compute-band { fill: #fffbef; stroke: #e3bf76; }
-    .band.data-band { fill: #effbfc; stroke: #78bdc9; }
+    .band.cluster-a-band { fill: #fffbf2; stroke: #d6a74d; stroke-width: 2.5; }
+    .band.cluster-b-band { fill: #f0fafc; stroke: #4b9aaa; stroke-width: 2.5; }
+
+    .cluster-header-rule {
+      stroke-width: 1.5;
+    }
+
+    .cluster-header-rule.cluster-a { stroke: #e2c27f; }
+    .cluster-header-rule.cluster-b { stroke: #8ac3cf; }
+
+    .cluster-zone {
+      fill: #ffffff;
+      fill-opacity: 0.62;
+      stroke: #cbd5df;
+      stroke-width: 1;
+      stroke-dasharray: 4 4;
+      pointer-events: none;
+    }
+
+    .cluster-zone-title {
+      font-size: 11px;
+      font-weight: 800;
+      fill: #414954;
+      pointer-events: none;
+    }
+
+    .cluster-badge rect {
+      stroke-width: 1;
+    }
+
+    .cluster-badge.source rect { fill: #fff1c7; stroke: #cf941f; }
+    .cluster-badge.destination rect { fill: #dff5f8; stroke: #278699; }
+
+    .cluster-badge text {
+      font-size: 10px;
+      font-weight: 800;
+      fill: #3f4650;
+    }
+
+    .isolation-boundary {
+      fill: none;
+      stroke: #7c8794;
+      stroke-width: 2;
+      stroke-dasharray: 5 7;
+    }
+
+    .isolation-label {
+      font-size: 10px;
+      font-weight: 800;
+      fill: #59616c;
+    }
 
     .band-title {
       font-size: 15px;
@@ -368,6 +427,7 @@
     .control-node rect { fill: var(--blue-soft); stroke: var(--blue); }
     .authority-node rect { fill: var(--green-soft); stroke: var(--green); }
     .agent-node rect { fill: var(--amber-soft); stroke: var(--amber); }
+    .workload-node rect { fill: #ffffff; stroke: #64748b; }
     .local-node rect { fill: #f4f4f5; stroke: #71717a; stroke-dasharray: 5 4; }
     .storage-node rect { fill: var(--cyan-soft); stroke: var(--cyan); }
     .entry-node rect { fill: #ffffff; stroke: #52525b; }
@@ -412,6 +472,25 @@
       marker-end: url(#arrow-cyan);
     }
 
+    .cross-cluster-flow {
+      stroke: #0f766e;
+      stroke-width: 4;
+      marker-start: url(#arrow-transfer-start);
+      marker-end: url(#arrow-transfer);
+    }
+
+    .cross-cluster-label-bg {
+      fill: #ecfdf5;
+      stroke: #0f766e;
+      stroke-width: 1.5;
+    }
+
+    .cross-cluster-label {
+      font-size: 11px;
+      font-weight: 800;
+      fill: #115e59;
+    }
+
     .edge-label-bg {
       fill: #ffffff;
       stroke: #d7dce2;
@@ -426,7 +505,9 @@
 
     .architecture-svg[data-mode="control"] .data-flow,
     .architecture-svg[data-mode="control"] .storage-node,
-    .architecture-svg[data-mode="control"] .data-band {
+    .architecture-svg[data-mode="control"] .data-consumer-node,
+    .architecture-svg[data-mode="control"] .cross-cluster-label-bg,
+    .architecture-svg[data-mode="control"] .cross-cluster-label {
       opacity: 0.16;
     }
 
@@ -666,6 +747,10 @@
         position: static;
       }
 
+      .topbar .doc-link {
+        display: none;
+      }
+
       h1 {
         font-size: 20px;
       }
@@ -690,7 +775,12 @@
 
       .view-controls {
         width: 100%;
+        flex-wrap: wrap;
         justify-content: space-between;
+      }
+
+      .zoom-controls {
+        margin-left: auto;
       }
 
       .canvas-viewport {
@@ -756,30 +846,34 @@
     <section class="summary-band" aria-label="架构摘要">
       <div class="summary-lead">
         <p>
-          中心决定谁能在什么 IndexVersion 和 Ref 上执行操作；Agent 在 CPU 节点运行任务；
-          StorageVolume 保存真实文件和对象。控制请求由中心发起，大对象数据不经过中心服务。
+          Artifact 是版本化抽象文件系统，Commit 构成版本树；Playground 是读写工作区，Snapshot 是固定
+          Commit 的只读快照。所有命令只进入 neoengramd，跨集群对象只通过 S3 Gateway 传输。
         </p>
       </div>
       <dl class="summary-fact">
-        <dt>权威元数据</dt>
-        <dd>中心 PostgreSQL</dd>
+        <dt>领域根</dt>
+        <dd>Artifact / Commit Tree</dd>
       </dl>
       <dl class="summary-fact">
-        <dt>Workspace 并发</dt>
-        <dd>多读、单写</dd>
+        <dt>读写视图</dt>
+        <dd>Playground</dd>
       </dl>
       <dl class="summary-fact">
-        <dt>资源关系（均为多对多）</dt>
-        <dd>Tenant / Workspace ↔ Agent</dd>
+        <dt>只读视图</dt>
+        <dd>Snapshot</dd>
       </dl>
     </section>
 
     <section class="diagram-section" aria-labelledby="diagram-title">
       <div class="diagram-toolbar">
         <div class="legend" aria-label="图例">
+          <span class="legend-item"><span class="swatch cluster-a"></span>源集群 A</span>
+          <span class="legend-item"><span class="swatch cluster-b"></span>目标集群 B</span>
+          <span class="legend-item"><span class="transfer-swatch"></span>跨集群 S3</span>
           <span class="legend-item"><span class="swatch control"></span>中心控制</span>
           <span class="legend-item"><span class="swatch authority"></span>权威元数据</span>
           <span class="legend-item"><span class="swatch agent"></span>Agent 执行</span>
+          <span class="legend-item"><span class="swatch workload"></span>现有用户 Pod</span>
           <span class="legend-item"><span class="swatch storage"></span>数据存储</span>
         </div>
         <div class="view-controls">
@@ -802,14 +896,15 @@
           class="architecture-svg"
           id="architecture"
           data-mode="all"
-          viewBox="0 0 1440 1040"
+          viewBox="0 0 1440 1170"
           role="img"
           aria-labelledby="diagram-title diagram-description"
         >
           <title id="diagram-title">NeoEngram 中心化 Agent 总体架构</title>
           <desc id="diagram-description">
-            图中展示中心 PostgreSQL、neoengramd、两个计算节点 Agent、Agent 本地 SQLite、NFS、
-            S3-compatible Gateway 及其控制流和数据流。
+            图中展示中心 PostgreSQL、neoengramd、网络隔离的 EdgeCluster A 和 EdgeCluster B、各集群的
+            系统组件区、居中的 NFS 区和业务 Pod 区，以及唯一跨集群 S3 数据通路和 Pod 到本集群 NFS
+            子目录的直接挂载路径。
           </desc>
           <defs>
             <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
@@ -827,19 +922,52 @@
             <marker id="arrow-cyan-start" markerWidth="10" markerHeight="10" refX="2" refY="5" orient="auto-start-reverse" markerUnits="strokeWidth">
               <path d="M 0 0 L 10 5 L 0 10 z" fill="#0e7490"></path>
             </marker>
+            <marker id="arrow-transfer" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"></path>
+            </marker>
+            <marker id="arrow-transfer-start" markerWidth="10" markerHeight="10" refX="2" refY="5" orient="auto-start-reverse" markerUnits="strokeWidth">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"></path>
+            </marker>
           </defs>
 
           <rect class="band control-band" x="30" y="130" width="1380" height="310" rx="6"></rect>
           <text class="band-title" x="56" y="163">中心控制面</text>
-          <text class="band-caption" x="160" y="163">多租户、唯一元数据权威、中心主动调用 Agent</text>
+          <text class="band-caption" x="160" y="163">唯一命令入口与元数据权威；保存 Desired State 并统一调度</text>
 
-          <rect class="band compute-band" x="30" y="470" width="1380" height="250" rx="6"></rect>
-          <text class="band-title" x="56" y="503">CPU / 计算节点</text>
-          <text class="band-caption" x="190" y="503">受控执行，本地状态可恢复但不具备业务权威</text>
+          <rect class="band cluster-a-band" x="30" y="470" width="660" height="660" rx="6"></rect>
+          <text class="band-title" x="56" y="503">EdgeCluster A</text>
+          <text class="band-caption" x="56" y="526">源集群 · 独立网络 / 凭证 / 调度 / 故障域</text>
+          <path class="cluster-header-rule cluster-a" d="M50 545 H670"></path>
+          <g class="cluster-badge source">
+            <rect x="535" y="487" width="125" height="27" rx="4"></rect>
+            <text x="597" y="505" text-anchor="middle">SOURCE CLUSTER</text>
+          </g>
 
-          <rect class="band data-band" x="30" y="750" width="1380" height="250" rx="6"></rect>
-          <text class="band-title" x="56" y="783">StorageVolume / 数据面</text>
-          <text class="band-caption" x="250" y="783">保存 Workspace、对象和恢复日志；payload 不经过中心</text>
+          <rect class="band cluster-b-band" x="750" y="470" width="660" height="660" rx="6"></rect>
+          <text class="band-title" x="776" y="503">EdgeCluster B</text>
+          <text class="band-caption" x="776" y="526">目标集群 · 独立网络 / 凭证 / 调度 / 故障域</text>
+          <path class="cluster-header-rule cluster-b" d="M770 545 H1390"></path>
+          <g class="cluster-badge destination">
+            <rect x="1225" y="487" width="155" height="27" rx="4"></rect>
+            <text x="1302" y="505" text-anchor="middle">DESTINATION CLUSTER</text>
+          </g>
+
+          <rect class="cluster-zone" x="50" y="550" width="620" height="255" rx="4"></rect>
+          <text class="cluster-zone-title" x="65" y="570">系统组件区</text>
+          <rect class="cluster-zone" x="50" y="815" width="620" height="150" rx="4"></rect>
+          <text class="cluster-zone-title" x="65" y="835">NFS 区</text>
+          <rect class="cluster-zone" x="50" y="975" width="620" height="145" rx="4"></rect>
+          <text class="cluster-zone-title" x="65" y="995">业务 Pod 区</text>
+
+          <rect class="cluster-zone" x="770" y="550" width="620" height="255" rx="4"></rect>
+          <text class="cluster-zone-title" x="785" y="570">系统组件区</text>
+          <rect class="cluster-zone" x="770" y="815" width="620" height="150" rx="4"></rect>
+          <text class="cluster-zone-title" x="785" y="835">NFS 区</text>
+          <rect class="cluster-zone" x="770" y="975" width="620" height="145" rx="4"></rect>
+          <text class="cluster-zone-title" x="785" y="995">业务 Pod 区</text>
+
+          <path class="isolation-boundary" d="M720 485 V700 M720 780 V1115"></path>
+          <text class="isolation-label" x="720" y="693" text-anchor="middle">网络隔离</text>
 
           <path class="flow control-flow" d="M720 100 V190 H190 V210"></path>
           <path class="flow control-flow" d="M310 265 H365"></path>
@@ -847,16 +975,21 @@
           <path class="flow authority-flow" d="M870 265 H925"></path>
           <path class="flow authority-flow" d="M1210 265 H1250"></path>
 
-          <path class="flow control-flow" d="M758 320 V488 H230 V550"></path>
-          <path class="flow control-flow" d="M782 320 V488 H900 V550"></path>
-          <path class="flow response-flow" d="M270 550 V518 H725 V320"></path>
-          <path class="flow response-flow" d="M940 550 V518 H805 V320"></path>
+          <path class="flow control-flow" d="M745 320 V535 H200 V580"></path>
+          <path class="flow control-flow" d="M780 320 V535 H920 V580"></path>
+          <path class="flow response-flow" d="M240 580 V552 H715 V320"></path>
+          <path class="flow response-flow" d="M960 580 V552 H805 V320"></path>
 
-          <path class="flow data-flow" d="M230 655 V810 H270 V840"></path>
-          <path class="flow data-flow" d="M900 655 V790 H420 V840"></path>
-          <path class="flow data-flow" d="M980 655 V805 H720 V840"></path>
-          <path class="flow bi-flow" d="M450 900 H555"></path>
-          <path class="flow data-flow" d="M885 900 H1000"></path>
+          <path class="flow data-flow" d="M200 685 V805 H300 V835"></path>
+          <path class="flow data-flow" d="M920 685 V805 H1020 V835"></path>
+          <path class="flow data-flow bi-flow" d="M360 995 V955"></path>
+          <path class="flow data-flow bi-flow" d="M1080 995 V955"></path>
+          <path class="flow data-flow bi-flow" d="M360 800 V835"></path>
+          <path class="flow data-flow bi-flow" d="M1080 800 V835"></path>
+          <path class="flow data-flow bi-flow cross-cluster-flow" d="M790 632 H720 V750 H490"></path>
+
+          <rect class="cross-cluster-label-bg" x="548" y="705" width="344" height="30" rx="4"></rect>
+          <text class="cross-cluster-label" x="720" y="725" text-anchor="middle">唯一跨集群数据通道 · S3 GET + TransferTicket</text>
 
           <path class="flow authority-flow" d="M1060 340 V405 H757 V320"></path>
 
@@ -864,7 +997,7 @@
           <text class="edge-label" x="720" y="127" text-anchor="middle">tenant-scoped API</text>
 
           <rect class="edge-label-bg" x="430" y="454" width="580" height="28" rx="4"></rect>
-          <text class="edge-label" x="720" y="473" text-anchor="middle">mTLS：Job / Lease / Input pages；响应返回 Status / Artifact pages</text>
+          <text class="edge-label" x="720" y="473" text-anchor="middle">Agent 发起 mTLS H2/H3 JSON 双向流</text>
 
           <rect class="edge-label-bg" x="780" y="388" width="300" height="28" rx="4"></rect>
           <text class="edge-label" x="930" y="407" text-anchor="middle">固定 IndexView / Checkout Plan</text>
@@ -885,23 +1018,23 @@
           <g class="node control-node" data-node="registry" tabindex="0" role="button" aria-label="资源注册表">
             <rect x="365" y="210" width="225" height="110" rx="6"></rect>
             <text class="node-title" x="477" y="242" text-anchor="middle">Resource Registry</text>
-            <text class="node-subtitle" x="477" y="267" text-anchor="middle">Tenant ↔ Agent：多对多</text>
-            <text class="node-subtitle" x="477" y="289" text-anchor="middle">Workspace ↔ Agent：多对多</text>
+            <text class="node-subtitle" x="477" y="267" text-anchor="middle">Placement / Volume Owner</text>
+            <text class="node-subtitle" x="477" y="289" text-anchor="middle">Tenant ↔ Agent：多对多</text>
           </g>
 
           <g class="node control-node bridge-node" data-node="jobs" tabindex="0" role="button" aria-label="作业、租约和 fencing 调度">
             <rect x="645" y="210" width="225" height="110" rx="6"></rect>
             <text class="node-title" x="757" y="242" text-anchor="middle">Scheduler / Job Store</text>
-            <text class="node-subtitle" x="757" y="267" text-anchor="middle">WorkspaceLease / Fencing</text>
-            <text class="node-subtitle" x="757" y="289" text-anchor="middle">probe / poll / finalize</text>
+            <text class="node-subtitle" x="757" y="267" text-anchor="middle">PlaygroundLease / Fencing</text>
+            <text class="node-subtitle" x="757" y="289" text-anchor="middle">Desired / Assign / Finalize</text>
           </g>
 
           <g class="node authority-node" data-node="metadata" tabindex="0" role="button" aria-label="中心元数据服务">
             <rect x="925" y="190" width="285" height="150" rx="6"></rect>
             <text class="node-title" x="1067" y="220" text-anchor="middle">Central MetadataStore</text>
-            <text class="node-subtitle" x="1067" y="246" text-anchor="middle">Workspace Index / IndexVersion</text>
-            <text class="node-subtitle" x="1067" y="268" text-anchor="middle">Commit / Directory / Manifest / Ref</text>
-            <text class="node-subtitle" x="1067" y="290" text-anchor="middle">ObjectLocation / staging</text>
+            <text class="node-subtitle" x="1067" y="246" text-anchor="middle">Artifact / Commit Tree / Snapshot</text>
+            <text class="node-subtitle" x="1067" y="268" text-anchor="middle">Playground Index / IndexVersion / Ref</text>
+            <text class="node-subtitle" x="1067" y="290" text-anchor="middle">Directory / Manifest / ObjectLocation</text>
             <text class="authority-note" x="1067" y="317" text-anchor="middle">唯一业务权威</text>
           </g>
 
@@ -912,62 +1045,84 @@
             <text class="authority-note" x="1312" y="299" text-anchor="middle">Authoritative</text>
           </g>
 
-          <g class="node agent-node bridge-node" data-node="agent" tabindex="0" role="button" aria-label="计算节点 A 上的 Agent">
-            <rect x="100" y="550" width="260" height="105" rx="6"></rect>
-            <text class="node-title" x="230" y="582" text-anchor="middle">neoengram-agent A</text>
-            <text class="node-subtitle" x="230" y="607" text-anchor="middle">Engine / Job Executor</text>
-            <text class="node-subtitle" x="230" y="629" text-anchor="middle">当前可持有 WorkspaceLease</text>
+          <g class="node agent-node bridge-node" data-node="agent-a" tabindex="0" role="button" aria-label="EdgeCluster A 上的 Agent">
+            <rect x="70" y="580" width="260" height="105" rx="6"></rect>
+            <text class="node-title" x="200" y="612" text-anchor="middle">Agent A</text>
+            <text class="node-subtitle" x="200" y="637" text-anchor="middle">Outbound Watch / Job Executor</text>
+            <text class="node-subtitle" x="200" y="659" text-anchor="middle">Volume A active RW Owner</text>
           </g>
 
-          <g class="node local-node" data-node="localdb" tabindex="0" role="button" aria-label="Agent A 本地 SQLite">
-            <rect x="390" y="550" width="240" height="105" rx="6"></rect>
-            <text class="node-title" x="510" y="579" text-anchor="middle">节点本地 SQLite</text>
-            <text class="node-subtitle" x="510" y="603" text-anchor="middle">system + per-Tenant ledger</text>
-            <text class="node-subtitle" x="510" y="625" text-anchor="middle">optional cache / candidate</text>
-            <text class="node-subtitle" x="510" y="644" text-anchor="middle">非权威，可重建</text>
+          <g class="node local-node" data-node="localdb-a" tabindex="0" role="button" aria-label="Agent A 本地 SQLite">
+            <rect x="380" y="580" width="270" height="105" rx="6"></rect>
+            <text class="node-title" x="515" y="609" text-anchor="middle">Agent A 本地 SQLite</text>
+            <text class="node-subtitle" x="515" y="633" text-anchor="middle">system + per-Tenant ledger</text>
+            <text class="node-subtitle" x="515" y="655" text-anchor="middle">cache / candidate · 非权威</text>
           </g>
 
-          <path class="flow response-flow" d="M360 603 H390"></path>
+          <path class="flow response-flow" d="M330 633 H380"></path>
 
-          <g class="node agent-node bridge-node" data-node="agent" tabindex="0" role="button" aria-label="计算节点 B 上的 Agent">
-            <rect x="770" y="550" width="260" height="105" rx="6"></rect>
-            <text class="node-title" x="900" y="582" text-anchor="middle">neoengram-agent B</text>
-            <text class="node-subtitle" x="900" y="607" text-anchor="middle">Engine / Job Executor</text>
-            <text class="node-subtitle" x="900" y="629" text-anchor="middle">共享读或故障接管</text>
+          <g class="node agent-node bridge-node" data-node="agent-b" tabindex="0" role="button" aria-label="EdgeCluster B 上的 Agent">
+            <rect x="790" y="580" width="260" height="105" rx="6"></rect>
+            <text class="node-title" x="920" y="612" text-anchor="middle">Agent B</text>
+            <text class="node-subtitle" x="920" y="637" text-anchor="middle">Outbound Watch / Job Executor</text>
+            <text class="node-subtitle" x="920" y="659" text-anchor="middle">Volume B active RW Owner</text>
           </g>
 
-          <g class="node local-node" data-node="localdb" tabindex="0" role="button" aria-label="Agent B 本地 SQLite">
-            <rect x="1060" y="550" width="240" height="105" rx="6"></rect>
-            <text class="node-title" x="1180" y="579" text-anchor="middle">节点本地 SQLite</text>
-            <text class="node-subtitle" x="1180" y="603" text-anchor="middle">system + per-Tenant ledger</text>
-            <text class="node-subtitle" x="1180" y="625" text-anchor="middle">optional cache / candidate</text>
-            <text class="node-subtitle" x="1180" y="644" text-anchor="middle">非权威，可重建</text>
+          <g class="node local-node" data-node="localdb-b" tabindex="0" role="button" aria-label="Agent B 本地 SQLite">
+            <rect x="1100" y="580" width="270" height="105" rx="6"></rect>
+            <text class="node-title" x="1235" y="609" text-anchor="middle">Agent B 本地 SQLite</text>
+            <text class="node-subtitle" x="1235" y="633" text-anchor="middle">system + per-Tenant ledger</text>
+            <text class="node-subtitle" x="1235" y="655" text-anchor="middle">cache / candidate · 非权威</text>
           </g>
 
-          <path class="flow response-flow" d="M1030 603 H1060"></path>
+          <path class="flow response-flow" d="M1050 633 H1100"></path>
 
-          <g class="node storage-node" data-node="nfs" tabindex="0" role="button" aria-label="NFS StorageVolume">
-            <rect x="90" y="840" width="360" height="120" rx="6"></rect>
-            <text class="node-title" x="270" y="872" text-anchor="middle">NFS / POSIX StorageVolume</text>
-            <text class="node-subtitle" x="270" y="898" text-anchor="middle">Workspace 文件 / Recovery Journal</text>
-            <text class="node-subtitle" x="270" y="920" text-anchor="middle">Chunk / WholeFile Objects</text>
-            <text class="node-subtitle" x="270" y="942" text-anchor="middle">不保存托管 SQLite MetadataStore</text>
+          <g class="node workload-node data-consumer-node" data-node="user-pod-a" tabindex="0" role="button" aria-label="EdgeCluster A 用户 Pod 的 NFS 目录挂载">
+            <rect x="225" y="995" width="270" height="115" rx="6"></rect>
+            <text class="node-title" x="360" y="1025" text-anchor="middle">User / Training Pod A</text>
+            <text class="node-subtitle" x="360" y="1051" text-anchor="middle">/workspace → Playground pg-17</text>
+            <text class="node-subtitle" x="360" y="1073" text-anchor="middle">backend: artifacts/X/.../data</text>
+            <text class="node-subtitle" x="360" y="1095" text-anchor="middle">direct NFS I/O · RO/RW policy</text>
           </g>
 
-          <g class="node storage-node" data-node="gateway" tabindex="0" role="button" aria-label="S3-compatible Gateway">
-            <rect x="555" y="840" width="330" height="120" rx="6"></rect>
-            <text class="node-title" x="720" y="872" text-anchor="middle">S3-compatible Gateway</text>
-            <text class="node-subtitle" x="720" y="898" text-anchor="middle">候选实现：VersityGW</text>
-            <text class="node-subtitle" x="720" y="920" text-anchor="middle">tenant-scoped HEAD / GET</text>
-            <text class="node-subtitle" x="720" y="942" text-anchor="middle">绑定 StorageVolume，不绑定所有 Agent</text>
+          <g class="node workload-node data-consumer-node" data-node="user-pod-b" tabindex="0" role="button" aria-label="EdgeCluster B 用户 Pod 的 NFS 目录挂载">
+            <rect x="945" y="995" width="270" height="115" rx="6"></rect>
+            <text class="node-title" x="1080" y="1025" text-anchor="middle">User / Training Pod B</text>
+            <text class="node-subtitle" x="1080" y="1051" text-anchor="middle">/workspace → Playground pg-22</text>
+            <text class="node-subtitle" x="1080" y="1073" text-anchor="middle">backend: artifacts/X/.../data</text>
+            <text class="node-subtitle" x="1080" y="1095" text-anchor="middle">direct NFS I/O · RO/RW policy</text>
           </g>
 
-          <g class="node storage-node" data-node="transfer" tabindex="0" role="button" aria-label="其他节点和跨卷传输">
-            <rect x="1000" y="840" width="350" height="120" rx="6"></rect>
-            <text class="node-title" x="1175" y="872" text-anchor="middle">其他节点 / StorageVolume</text>
-            <text class="node-subtitle" x="1175" y="898" text-anchor="middle">目标 Agent 主动拉取对象</text>
-            <text class="node-subtitle" x="1175" y="920" text-anchor="middle">复算 size + BLAKE3</text>
-            <text class="node-subtitle" x="1175" y="942" text-anchor="middle">验证完成后原子发布</text>
+          <g class="node storage-node" data-node="storage-a" tabindex="0" role="button" aria-label="Cluster A NFS StorageVolume">
+            <rect x="230" y="835" width="260" height="120" rx="6"></rect>
+            <text class="node-title" x="360" y="867" text-anchor="middle">StorageVolume A / NFS</text>
+            <text class="node-subtitle" x="360" y="893" text-anchor="middle">nfs-a:/tenant-a/volume-a1</text>
+            <text class="node-subtitle" x="360" y="915" text-anchor="middle">Artifacts X/Y · Objects/Playgrounds</text>
+            <text class="node-subtitle" x="360" y="937" text-anchor="middle">Agent root RW · Pod exact dir</text>
+          </g>
+
+          <g class="node storage-node" data-node="gateway-a" tabindex="0" role="button" aria-label="EdgeCluster A S3-compatible Gateway">
+            <rect x="230" y="700" width="260" height="100" rx="6"></rect>
+            <text class="node-title" x="360" y="726" text-anchor="middle">S3 Gateway A</text>
+            <text class="node-subtitle" x="360" y="748" text-anchor="middle">源对象受控出口</text>
+            <text class="node-subtitle" x="360" y="768" text-anchor="middle">tenant-scoped HEAD / GET</text>
+            <text class="node-subtitle" x="360" y="788" text-anchor="middle">Volume A objects-only RO</text>
+          </g>
+
+          <g class="node storage-node" data-node="storage-b" tabindex="0" role="button" aria-label="Cluster B 目标 StorageVolume">
+            <rect x="950" y="835" width="260" height="120" rx="6"></rect>
+            <text class="node-title" x="1080" y="867" text-anchor="middle">StorageVolume B / NFS</text>
+            <text class="node-subtitle" x="1080" y="893" text-anchor="middle">nfs-b:/tenant-a/volume-b1</text>
+            <text class="node-subtitle" x="1080" y="915" text-anchor="middle">Artifacts X/Z · Objects/Playgrounds</text>
+            <text class="node-subtitle" x="1080" y="937" text-anchor="middle">Agent root RW · Pod exact dir</text>
+          </g>
+
+          <g class="node storage-node" data-node="gateway-b" tabindex="0" role="button" aria-label="EdgeCluster B S3-compatible Gateway">
+            <rect x="950" y="700" width="260" height="100" rx="6"></rect>
+            <text class="node-title" x="1080" y="726" text-anchor="middle">S3 Gateway B</text>
+            <text class="node-subtitle" x="1080" y="748" text-anchor="middle">B 作为源集群时启用</text>
+            <text class="node-subtitle" x="1080" y="768" text-anchor="middle">tenant-scoped HEAD / GET</text>
+            <text class="node-subtitle" x="1080" y="788" text-anchor="middle">Volume B objects-only RO</text>
           </g>
         </svg>
       </div>
@@ -975,16 +1130,16 @@
       <div class="inspector" aria-live="polite">
         <div>
           <p class="inspector-label">当前节点</p>
-          <h2 id="detail-title">Central MetadataStore</h2>
-          <div class="inspector-tags" id="detail-tags"></div>
+          <h2 id="detail-title" data-detail-title>Central MetadataStore</h2>
+          <div class="inspector-tags" id="detail-tags" data-detail-tags></div>
         </div>
         <div>
           <p class="inspector-label">职责</p>
-          <p id="detail-description"></p>
+          <p id="detail-description" data-detail-description></p>
         </div>
         <div>
           <p class="inspector-label">关键边界</p>
-          <p id="detail-boundary"></p>
+          <p id="detail-boundary" data-detail-boundary></p>
         </div>
       </div>
     </section>
@@ -998,44 +1153,60 @@
         <li>
           <span class="step-number">1</span>
           <h3>固定基线</h3>
-          <p>中心读取当前 IndexVersion，创建 Job、共享读租约并选择可访问 Workspace 的 Agent。</p>
+          <p>用户向中心提交命令；中心读取 IndexVersion，创建 Job/租约并调度到目标 Agent 的 Assignment。</p>
         </li>
         <li>
           <span class="step-number">2</span>
           <h3>扫描与发布对象</h3>
-          <p>Agent 稳定读取 NFS 文件，按仓库策略切块并发布经过 BLAKE3 验证的对象。</p>
+          <p>Agent watch 到 Assignment 后先写 Ledger，再稳定读取 NFS、切块并发布经过 BLAKE3 验证的对象。</p>
         </li>
         <li>
           <span class="step-number">3</span>
-          <h3>生成 Artifact</h3>
+          <h3>生成 MetadataBatch</h3>
           <p>Agent 生成结构化 IndexDelta 与 ObjectReceipt；本地 candidate 只用于分页和恢复。</p>
         </li>
         <li>
           <span class="step-number">4</span>
           <h3>中心完整校验</h3>
-          <p>中心主动拉取所有页面，验证 digest、路径、对象依赖和租户边界，再导入 staging。</p>
+          <p>Agent 幂等上传所有页面；中心验证 digest、路径、对象依赖和租户边界，再导入 staging。</p>
         </li>
         <li>
           <span class="step-number">5</span>
           <h3>CAS 发布</h3>
-          <p>PostgreSQL 事务推进 IndexVersion；中心幂等 finalize Agent 并释放租约。</p>
+          <p>PostgreSQL 事务推进 IndexVersion；Agent watch 到 finalize decision 后确认并清理本地候选。</p>
         </li>
       </ol>
 
       <table class="rules">
-        <caption>四条不可跨越的边界</caption>
+        <caption>八条不可跨越的边界</caption>
         <tbody>
+          <tr>
+            <th>命令入口</th>
+            <td>用户、CLI、UI 和自动化系统只调用 neoengramd。Agent 不接受绕过中心的业务命令或入站管理调用。</td>
+          </tr>
           <tr>
             <th>元数据权威</th>
             <td>托管模式只有中心 PostgreSQL 权威。Agent 不直连数据库，也不上传 SQLite 数据库文件。</td>
           </tr>
           <tr>
-            <th>Workspace 写入</th>
-            <td>多个 Agent 可以读；同一时刻只有持有排他 WorkspaceLease 和最新 fencing token 的 Agent 能写。</td>
+            <th>存储布局</th>
+            <td>一个 Volume 可放同租户多个 Artifact；一个 Artifact 每集群最多一个活动 placement。每个 Volume 只有一个 active RW Owner。</td>
+          </tr>
+          <tr>
+            <th>Playground 写入</th>
+            <td>多个 Agent 可以读；只有 Volume Owner 且持有排他 PlaygroundLease 和最新 fencing token 的 Agent 能写。</td>
+          </tr>
+          <tr>
+            <th>Snapshot 读取</th>
+            <td>Snapshot 固定 Artifact 的一个 Commit，只读且不跟随 Ref；任何修改必须进入新的 Playground。</td>
+          </tr>
+          <tr>
+            <th>Pod 目录挂载</th>
+            <td>PodMountBinding 只描述已有 Pod 到单个视图精确根的关系；I/O 经节点 NFS/CSI 客户端直达本集群 NFS，不负责创建 Pod、NAS、PV 或 PVC。</td>
           </tr>
           <tr>
             <th>对象传输</th>
-            <td>目标 Agent 直接从 NFS/Gateway 拉取，中心只签发任务和票据，不代理大对象 payload。</td>
+            <td>集群间不直连 Agent/NFS。Gateway 只读挂载对象根；目标 Agent 拉取固定 Commit 对象，中心只签发任务和票据。</td>
           </tr>
           <tr>
             <th>本地数据库</th>
@@ -1063,21 +1234,21 @@
         },
         registry: {
           title: "Resource Registry",
-          tags: ["M:N", "Assignment", "Attachment", "Mount"],
-          description: "保存 ComputeNode、Agent、StorageVolume、AgentMount、TenantAssignment 和 WorkspaceAttachment。",
-          boundary: "一个 Agent 可服务多个明确分配的 Tenant；一个 Workspace 也可绑定多个 Agent，但能力绑定不等于写租约。"
+          tags: ["Placement", "Volume Owner", "Attachment", "Mount"],
+          description: "保存 ArtifactPlacement、EdgeCluster、Agent、StorageVolume、Volume Owner、Gateway、TransferRoute、TenantAssignment、PlaygroundAttachment 和已有 PodMountBinding。",
+          boundary: "一个 Artifact 每个 EdgeCluster 最多一个 active placement；一个 Volume 可放同租户多个 Artifact，但其受管根必须唯一且不重叠。"
         },
         jobs: {
           title: "Scheduler / Job Store",
           tags: ["Job", "Lease", "Fencing", "Idempotency"],
-          description: "中心选择具备正确挂载和能力的 Agent，主动提交、查询、续租并 finalize Job。",
+          description: "中心选择具备正确挂载和能力的 Agent，持久化 Assignment、租约和 finalize decision；Agent 通过出站 watch 领取并确认。",
           boundary: "Agent 失联不等于 Job 失败；未知副作用必须进入 RecoverJob，不能直接在另一节点重放写任务。"
         },
         metadata: {
           title: "Central MetadataStore",
-          tags: ["Authoritative", "IndexVersion", "Ref CAS", "Staging"],
-          description: "权威保存 Workspace Index、Commit 图、Ref、ObjectLocation、Job、租约和审计；结构化 Artifact 先完整进入 staging。",
-          boundary: "只有中心事务能推进 IndexVersion 或 Ref。Agent candidate、Ledger 和对象回执都不能直接成为已发布状态。"
+          tags: ["Artifact", "Commit Tree", "Snapshot", "Authoritative"],
+          description: "权威保存 Artifact、Commit 版本树、Snapshot、Playground Index、Ref、ObjectLocation、Job、租约和审计。",
+          boundary: "Snapshot 固定 Commit 且只读；只有中心事务能从 Playground 发布新 Commit，或推进 IndexVersion/Ref。"
         },
         postgres: {
           title: "PostgreSQL",
@@ -1085,44 +1256,70 @@
           description: "中心托管模式的唯一元数据数据库，通过 RLS、复合租户外键和 expected-value CAS 保持隔离与并发正确性。",
           boundary: "Agent 永远不获得连接串；中心也不接受 Agent 提供的 SQL、表名或数据库文件。"
         },
-        agent: {
-          title: "neoengram-agent",
-          tags: ["Executor", "mTLS", "NFS", "Recovery"],
-          description: "运行在 CPU 节点，执行稳定扫描、Hash、对象发布、checkout、传输和 journal recovery。",
-          boundary: "Agent 是受控执行器，不拥有 Tenant、Repository、Workspace 或全局 Job 的最终状态。"
+        "agent-a": {
+          title: "EdgeCluster A / Agent A",
+          tags: ["Source cluster", "Volume Owner", "mTLS", "Recovery"],
+          description: "作为 Volume A 当前 RW Owner 执行该卷全部 Artifact/Playground 的可变任务，主动建立到中心的 H2/H3 JSON 双向流。",
+          boundary: "Owner generation 失效后不能继续写；Agent A 不向目标 Agent 主动推送对象。"
         },
-        localdb: {
-          title: "Agent 本地 SQLite",
-          tags: ["Non-authoritative", "WAL local only", "Per Tenant"],
-          description: "system.sqlite3 保存节点状态；每 Tenant Ledger 保存 Job 恢复信息；Workspace cache 和 Job candidate 按需创建。",
-          boundary: "SQLite/WAL/SHM 只在 CPU 节点本地。不能放到 NFS 共享打开，也不能成为 Ref 或 IndexVersion 的唯一记录。"
+        "agent-b": {
+          title: "EdgeCluster B / Agent B",
+          tags: ["Destination cluster", "Volume Owner", "S3 pull", "mTLS"],
+          description: "作为 Volume B 当前 RW Owner 领取 Checkout Assignment，经 TransferRoute 从 Gateway A 拉取缺失对象并物化目标 Playground。",
+          boundary: "Agent B 不能直连 Agent A 或 StorageVolume A；写入必须匹配 Volume B 的 owner generation。"
         },
-        nfs: {
-          title: "NFS / POSIX StorageVolume",
-          tags: ["Workspace", "Objects", "Journal"],
-          description: "持久化实时 Workspace 文件、Chunk/WholeFile 对象和可跨 Agent 恢复的工作区 journal。",
-          boundary: "托管 MetadataStore 不放在 NFS。可变 Workspace 操作必须受租约、fencing 和 journal 保护。"
+        "localdb-a": {
+          title: "Agent A 本地 SQLite",
+          tags: ["EdgeCluster A", "Non-authoritative", "WAL local only"],
+          description: "保存 Agent A 的 system state、每 Tenant Ledger，以及按需创建的 Playground cache 和 Job candidate。",
+          boundary: "数据库只留在 A 集群当前 CPU 节点本地，不与 B 集群同步，也不作为业务权威。"
         },
-        gateway: {
-          title: "S3-compatible Gateway",
-          tags: ["StorageVolume bound", "GET / HEAD", "VersityGW candidate"],
-          description: "把受控对象根暴露为租户隔离的 S3-compatible 数据面，用于跨 StorageVolume 传输。",
-          boundary: "Gateway 绑定 StorageVolume/ObjectStore，不天然绑定某个 Agent；默认不暴露 Workspace、SQLite、锁和 secret。"
+        "localdb-b": {
+          title: "Agent B 本地 SQLite",
+          tags: ["EdgeCluster B", "Non-authoritative", "WAL local only"],
+          description: "保存 Agent B 的 system state、TransferJob 进度、每 Tenant Ledger 和可恢复候选。",
+          boundary: "数据库只留在 B 集群当前 CPU 节点本地；跨集群传输只复制验证过的不可变对象。"
         },
-        transfer: {
-          title: "目标节点 / StorageVolume",
-          tags: ["Pull", "BLAKE3", "No replace"],
-          description: "目标 Agent 使用短期 Ticket 主动 GET 缺失对象，复算 size 与 BLAKE3 后原子发布。",
-          boundary: "普通传输不能跨租户；ETag、文件名和源 Agent 声明都不能替代内容完整性验证。"
+        "user-pod-a": {
+          title: "EdgeCluster A / User Pod A",
+          tags: ["Existing Pod", "/workspace", "Exact subdirectory", "Direct NFS I/O"],
+          description: "把 Volume A 中 Playground pg-17 的 data 子目录挂到容器 /workspace；文件流量由 Pod 直接访问本集群 NFS。",
+          boundary: "Pod 只看到绑定的 Playground/Snapshot 根，不经过 Agent 转发，也不能看到 sibling Artifact、objects 或 journals。"
+        },
+        "user-pod-b": {
+          title: "EdgeCluster B / User Pod B",
+          tags: ["Existing Pod", "/workspace", "Exact subdirectory", "Direct NFS I/O"],
+          description: "把 Volume B 中 Playground pg-22 的 data 子目录挂到容器 /workspace；挂载不跨 EdgeCluster。",
+          boundary: "Snapshot 强制 RO；Playground 是否 RW 由挂载策略决定，受管发布仍只能由 Volume Owner Agent 完成。"
+        },
+        "storage-a": {
+          title: "EdgeCluster A / StorageVolume A",
+          tags: ["Physical NFS export", "Tenant A", "Artifacts X/Y", "One RW owner"],
+          description: "逻辑 StorageVolume A 映射到物理 NFS export nfs-a:/tenant-a/volume-a1；Agent 挂受管根，用户 Pod 挂其中的精确视图目录。",
+          boundary: "Pod/NFS 路径不成为资源身份；一个 Artifact 在 A 最多一个 active placement，跨 Artifact hardlink 和 NFS 别名 Owner 被禁止。"
+        },
+        "gateway-a": {
+          title: "EdgeCluster A / S3 Gateway A",
+          tags: ["System component", "Source endpoint", "GET / HEAD", "Objects-only RO"],
+          description: "位于系统组件区，只读挂载中间 NFS Volume A 的 Artifact object roots，并把 Ticket 允许的对象暴露给目标 Agent B。",
+          boundary: "不挂载或暴露 Playground、SQLite、锁、journal、secret 或整个 NFS export，也不参与 RW ownership。"
+        },
+        "storage-b": {
+          title: "EdgeCluster B / StorageVolume B",
+          tags: ["Physical NFS export", "Tenant A", "Artifacts X/Z", "One RW owner"],
+          description: "逻辑 StorageVolume B 映射到物理 NFS export nfs-b:/tenant-a/volume-b1；Pod 只挂目标 Artifact 下的视图目录。",
+          boundary: "Pod 不能直连 Volume A；改变 Artifact 所在 NFS 必须执行 freeze/copy/verify/CAS/drain 迁移。"
+        },
+        "gateway-b": {
+          title: "EdgeCluster B / S3 Gateway B",
+          tags: ["System component", "Cluster-local", "GET / HEAD", "Objects-only RO"],
+          description: "位于系统组件区，只读挂载中间 NFS Volume B 的 Artifact object roots；当 B 作为源集群时提供受控对象出口。",
+          boundary: "Gateway 是集群内只读数据出口，不是 RW Agent，也不是所有集群共享的全局 Gateway。"
         }
       };
 
       const svg = document.getElementById("architecture");
       const viewport = document.getElementById("canvas-viewport");
-      const title = document.getElementById("detail-title");
-      const description = document.getElementById("detail-description");
-      const boundary = document.getElementById("detail-boundary");
-      const tags = document.getElementById("detail-tags");
       const zoomValue = document.getElementById("zoom-value");
       const modeButtons = document.querySelectorAll(".segmented button[data-mode]");
       const nodes = document.querySelectorAll(".node[data-node]");
@@ -1132,7 +1329,16 @@
         const detail = details[node.dataset.node];
         if (!detail) return;
 
-        nodes.forEach((item) => item.classList.toggle("is-selected", item === node));
+        const section = node.closest("section");
+        const inspector = section.querySelector(".inspector");
+        const title = inspector.querySelector("[data-detail-title]");
+        const description = inspector.querySelector("[data-detail-description]");
+        const boundary = inspector.querySelector("[data-detail-boundary]");
+        const tags = inspector.querySelector("[data-detail-tags]");
+
+        section.querySelectorAll(".node[data-node]").forEach((item) => {
+          item.classList.toggle("is-selected", item === node);
+        });
         title.textContent = detail.title;
         description.textContent = detail.description;
         boundary.textContent = detail.boundary;
