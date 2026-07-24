@@ -3,8 +3,8 @@
 > 本文是 NeoEngram 的唯一实现路线、能力状态和研究计划记录。代码、架构文档或
 > README 中出现的路线描述应与本文保持一致；如果出现冲突，以本文为准。
 
-最后更新：2026-07-22
-当前阶段：本地 format v7、多 Workspace、WholeFile 硬链接导出与只读 FUSE 已实现，跨平台实挂基准待完成
+最后更新：2026-07-24
+当前阶段：本地 format v7、多 Playground、WholeFile 硬链接导出与只读 FUSE 已实现，跨平台实挂基准待完成
 
 ## 1. 产品目标
 
@@ -12,10 +12,10 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 训练数据的可复现维护、发布和读取，而不是完整的 AI 训练平台：
 
 - 客户端负责工作区、切块、校验、本地缓存和离线提交；
-- 中心控制面负责 tenant/project/repository/ref、Commit/Directory/Manifest、并发提交、权限、
+- 中心控制面负责 tenant/project/artifact/ref、Commit/Directory/Manifest、并发提交、权限、
   会话和审计；
 - 数据面使用 S3-compatible 对象存储保存 Chunk/Pack payload，客户端保留本地缓存；
-- 读取面以固定的 Dataset Snapshot、Shard 分页和租约向训练任务提供一致数据；
+- 读取面以固定的 Snapshot、Shard 分页和租约向训练任务提供一致数据；
 - 所有不可变对象通过内容 ID 校验，ref 更新通过条件 CAS 线性化；
 - 系统应支持断点续传、失败重试、幂等 push/fetch，以及大规模数据集。
 
@@ -26,8 +26,22 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 WholeFile hardlink 只读视图；
 FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端下载或可写 overlay。
 
-第一阶段继续保持线性历史。Workspace 创建可以原子创建并独占分支，但暂不提供独立
+第一阶段继续保持线性历史。Playground 创建可以原子创建并独占分支，但暂不提供独立
 `branch`/`switch`、merge、rebase 和远端协作分支管理；这些功能不能阻塞中心元数据和对象同步主链路。
+
+### 1.1 规范术语
+
+| 术语 | 规范定义 |
+| --- | --- |
+| `Artifact` | 一个版本化抽象文件系统，是 Commit、Ref、Playground、Snapshot 和对象归属的领域根 |
+| `Commit` | Artifact 的不可变版本节点；v1 单 parent，形成可分支的 Commit 历史树 |
+| `Playground` | 基于某个 Commit 的可读写工作区，拥有独立 IndexVersion，能够发布新 Commit |
+| `Snapshot` | 固定 `artifact_id + commit_id` 的只读快照；Ref 移动不能改变其内容 |
+| `MetadataBatch` | Agent 向中心分页上传的 IndexDelta/ObjectReceipt 临时批次，不是 Artifact |
+
+当前 format v7 和 CLI 中已经存在的 `repository`、`workspace` 是实现兼容名称：在目标领域模型中分别
+映射为 `Artifact`、`Playground`。迁移完成前保留 `repository.json` 和 `workspace` 命令，不得因此在新
+API、数据库 schema 或协议中继续引入第二套概念名称。
 
 当前已确认或采用的默认假设（远端能力尚未实现）：
 
@@ -47,9 +61,9 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | API 传输 | 版本化 HTTP/HTTPS API | 默认方案，P0 验证 |
 | 一致性模型 | metadata/ref 强一致 CAS，payload 最终可见但发布前必须校验 | 默认方案，P0 验证 |
 | 身份认证 | `Authenticator` 抽象；v1 外部 OIDC/JWKS + Bearer JWT | 已确定设计，待实现 |
-| 授权范围 | tenant → project → repository → ref；服务端 RBAC，默认拒绝 | 已确定设计，待实现 |
+| 授权范围 | tenant → project → artifact → ref；服务端 RBAC，默认拒绝 | 已确定设计，待实现 |
 | 对象访问 | 中心 API 鉴权后签发短期、对象/会话范围的 Signed URL | 已确定设计，待实现 |
-| 训练快照 | `repository_id + commit_id` 的固定 Dataset Snapshot；可选 sidecar 描述 | 已确定设计，待实现 |
+| 训练快照 | `artifact_id + commit_id` 的固定 Snapshot；可选 sidecar 描述 | 已确定设计，待实现 |
 | 历史保留 | ref、pin/hold、active lease/session/有效 ObjectTicket 作为 GC roots；隔离期后再回收 | 已确定设计，待实现 |
 | 规模与可靠性 | 千万文件、上亿 Chunk、PB 级 payload；99.9%、RPO 0、RTO 1 小时 | P0 基准验证 |
 
@@ -70,7 +84,7 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | 能力 | 状态 | 当前语义 |
 | --- | --- | --- |
 | `init` | 已完成 | 创建 format v7 SQLite 仓库，并不可变绑定 fastcdc/whole-file/mixed 策略 |
-| `workspace create/list/remove` | 已完成 | 独立 HEAD/Index/base、分支独占、内外部 Workspace 与安全删除 |
+| `workspace create/list/remove` | 已完成 | 独立 HEAD/Index/base、分支独占、内外部 Playground 与安全删除 |
 | `add` / `add -A` | 已完成 | 固定仓库强制既定策略；mixed 可逐文件选择，支持 BLAKE3 去重和删除暂存 |
 | `rm` | 已完成 | 安全移除工作区或仅移除 index，支持持久事务和可验证回滚 |
 | `status` | 已完成 | 报告 staged、unstaged、deleted 和 untracked，并拒绝混合状态视图 |
@@ -81,11 +95,11 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | `checkout` | 已完成 | 物化 Commit，支持 detached HEAD 和 `main` 重新附着 |
 | `export TARGET DIR` | 已完成 | 原子生成 copy 权限快照，或严格的 WholeFile/Loose 同文件系统硬链接视图 |
 | `recover` | 已完成 | 恢复被中断的 checkout/rm 事务 |
-| `gc` | 已完成 | 从全部 Workspace Index 与全部 Commit roots 标记并回收 Chunk |
+| `gc` | 已完成 | 从全部 Playground Index 与全部 Commit roots 标记并回收 Chunk |
 | `fsck` | 已完成 | 校验 refs、历史、Directory/Manifest、Chunk 和对象完整性 |
 | `mount` / `unmount` | 进行中 | FUSE 协议和生命周期已实现；Linux/macOS 实挂矩阵与百万文件基准待完成 |
 | `.neoengramignore` | 已完成 | `add` 与 `status` 共用根目录忽略规则 |
-| 独立 `branch` / `switch` | 暂缓 | Workspace `--branch` 已有；不提供独立管理命令 |
+| 独立 `branch` / `switch` | 暂缓 | Playground `--branch` 已有；不提供独立管理命令 |
 
 ### 3.2 本地存储与一致性
 
@@ -93,9 +107,9 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 - `MetadataStore` 已有分页、固定 snapshot、Manifest reader/writer、Index transaction 和
   HEAD/ref CAS 契约。
 - SQLite 是唯一元数据后端；JSON 后端和旧格式兼容已删除。
-- `repository.json` 持久化不可变分块策略；Repository 在 Index、Tree、Commit 和 fsck 路径强制校验。
+- `repository.json` 持久化不可变分块策略；Artifact 在 Index、Tree、Commit 和 fsck 路径强制校验。
 - `ObjectStore` 提供流式发布、校验读取、分页枚举、durability barrier、协调删除和可选硬链接能力。
-- 本地锁固定按 object -> Workspace worktree -> state 获取；工作区读操作共享、mutation 独占，冲突立即失败。
+- 本地锁固定按 object -> Playground worktree -> state 获取；工作区读操作共享、mutation 独占，冲突立即失败。
 - `add` 基于最初的 `IndexVersion` 做最终 CAS；status/diff 在输出前复核实际依赖的 Index 与
   HEAD/main。
 - checkout/rm 在工作区 mutation 前原子发布并同步持久 journal；恢复会保留任何无法证明安全的事务。
@@ -115,7 +129,7 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | 客户端数据面 | 工作区、Index、FastCDC/WholeFile Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
 | 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | 中心 PostgreSQL、租户/项目/仓库/ref、远端 CAS |
 | 远端数据面 | 尚未实现 | S3-compatible Chunk/Pack、幂等上传、Signed PUT/GET、对象生命周期 |
-| 读取面 | checkout、权限快照和固定 Commit FUSE | Dataset Snapshot、Shard 分页、mount lease、训练读取票据 |
+| 读取面 | checkout、权限快照和固定 Commit FUSE | Snapshot、Shard 分页、mount lease、训练读取票据 |
 | 安全治理 | 本地路径安全和普通 Unix 权限 | JWT、RBAC、RLS、租户隔离、审计、密钥轮换和威胁模型 |
 | 训练数据语义 | 普通文件版本控制 | 可选 dataset sidecar、schema/source 摘要、确定性文件级 ShardSet |
 
@@ -133,7 +147,7 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 5. **历史能力有限**：只有单父线性历史，没有命名分支、merge、rebase、tag 和 reflog。
 6. **只读快照不是安全边界**：`0444/0555` 可被拥有权限的用户或 root 修改；hardlink 视图还与
    Loose 对象共享 inode 和权限，写入会污染所有引用该对象的快照。损坏必须从可信副本恢复。
-7. **没有训练读取语义**：当前不存在固定 Dataset Snapshot、ShardSet、schema/source 摘要或
+7. **没有训练读取语义**：当前不存在固定 Snapshot、ShardSet、schema/source 摘要或
    训练期间的 lease/retention root。
 8. **没有远端安全治理**：尚无 JWT 验证、RBAC、租户 RLS、Signed URL、审计、KMS/密钥轮换或
    跨租户隔离实现。
@@ -145,7 +159,7 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 ┌──────────────────────┐       versioned API       ┌────────────────────────────┐
 │ worktree / index     │ ───────────────────────▶ │ 控制面                     │
 │ SQLite metadata      │                          │ Authenticator / Authorizer │
-│ local object cache   │ ◀─────────────────────── │ tenant/project/repository  │
+│ local object cache   │ ◀─────────────────────── │ tenant/project/artifact  │
 │ Snapshot reader      │      metadata + tickets  │ ref CAS / sessions / audit │
 └──────────┬───────────┘                          └─────────────┬──────────────┘
            │                                                   │
@@ -180,10 +194,21 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 - v1 的远端对象单元是独立 Chunk；Pack、hash fanout 和可验证 Pack range 是 P5 的存储优化，
   不得被 P2 的 Chunk 上传接口隐含承诺。
 
-节点侧 Agent、多租户中心、CPU/NFS 计算存储解耦、多 Agent Workspace、中心驱动异步 Job、
-StorageVolume Gateway 和跨卷数据传输仍处设计阶段，详细草案见
+节点侧 Agent、多租户/多 EdgeCluster 中心、CPU/NFS 计算存储解耦、多 Agent Playground、中心驱动
+异步 Job、StorageVolume Gateway 和网络隔离集群之间的跨卷 checkout 仍处设计阶段，详细草案见
 [`agent-central-control.md`](agent-central-control.md)。该文档不代表当前已经存在远程 Agent、
 中心 PostgreSQL MetadataStore、Agent 分租户本地数据库、IndexVersion/lease 协调或 Gateway 能力。
+
+远程 Agent 设计已冻结以下存储约束：一个 Tenant 每个 EdgeCluster 可有多个 StorageVolume，一个
+Volume 可承载该 Tenant 的多个 Artifact，一个 Artifact 每集群最多一个 active `ArtifactPlacement`；
+StorageVolume 是 RW ownership/fencing 单元，每个 owner generation 只有一个活动 RW Agent，Gateway
+只读挂载 object roots。Artifact 根必须唯一且不重叠，禁止跨 Artifact hardlink；更换 NFS 必须经过
+freeze/copy/verify/CAS/drain/cleanup 迁移状态机。
+
+Kubernetes 用户 Pod 只挂载本集群 NFS 上单个 Playground/Snapshot 的精确视图目录。中心通过
+`PodMountBinding` 描述和校验已有 Pod 的容器路径、StorageVolume、视图目录与 RO/RW 模式；Pod 的
+实际 I/O 经节点 NFS/CSI 客户端直达 NFS，不经过 Agent。Pod、NAS、PV、PVC 和 CSI volume 的创建、
+下发与回收不在本设计范围内；Snapshot 强制 RO，Playground RW 由部署策略协调。
 
 ## 6. 分阶段实现计划
 
@@ -198,8 +223,12 @@ StorageVolume Gateway 和跨卷数据传输仍处设计阶段，详细草案见
   SQLite、S3、CLI 或具体 HTTP 框架。
 - 固定 `PrincipalContext`、`Authenticator`、`Authorizer`、Action/ResourceScope、租户上下文、
   401/403/404/409 错误和幂等请求主体绑定。
-- 定义 `SnapshotHandle`、`SnapshotState::{ContentReady,Ready,Rejected}`、`ShardSetSpec`、`SnapshotLease`、`Pin`、
+- 定义 `SnapshotHandle`、`DatasetProfileState::{Ready,Rejected}`、`ShardSetSpec`、`SnapshotLease`、`Pin`、
   `RetentionHold`、`ObjectTicket`、push/fetch session 和 ref CAS 请求。
+- 为远程 Agent 契约定义 `ArtifactPlacement`、StorageVolume Owner/owner generation，以及同租户、
+  每 Artifact/EdgeCluster 单 active placement 和非重叠 Artifact root 约束。
+- 定义 `PodMountBinding`，校验已有 Pod 容器路径到同一 EdgeCluster 精确 Playground/Snapshot 目录的
+  映射，以及 Snapshot RO/Playground RO-RW policy；不实现 Pod/NAS/PV/PVC 生命周期。
 - 固定 JWT issuer allowlist、audience、JWKS、算法和时钟校验规则；设计签名 PUT/GET 票据约束。
 - 对千万文件、上亿 Chunk、PB 级 payload 建立可重复基准，测量分页、CAS、RSS、吞吐、写放大和
   恢复时间。
@@ -214,19 +243,19 @@ StorageVolume Gateway 和跨卷数据传输仍处设计阶段，详细草案见
 交付：
 
 - 新建 `services/neoengramd` 模块化单体和 PostgreSQL migration。
-- 表覆盖 tenants、projects、repositories、refs、commits、trees、manifests、chunk catalog、
+- 表覆盖 tenants、projects、artifacts、refs、commits、trees、manifests、chunk catalog、
   role bindings、sessions、snapshots、leases/holds 和 append-only audit。
 - 实现外部 OIDC/JWKS Bearer JWT 验证、User/Service principal、RBAC、tenant context 和 PostgreSQL
   RLS；数据库运行角色不得拥有 `BYPASSRLS`。
-- 提供 repository 创建、读取 ref、固定 ref→Commit 的 Snapshot resolve、读取 Commit/Directory/Manifest、
-  `ContentReady`/`Ready` 状态校验、lease acquire/renew/release、pin/hold 和 ref CAS API；P1 只实现
+- 提供 artifact 创建、读取 ref、固定 ref→Commit 的 Snapshot resolve、读取 Commit/Directory/Manifest、
+  完整引用图校验、DatasetProfile 状态、lease acquire/renew/release、pin/hold 和 ref CAS API；P1 只实现
   元数据和 API 契约，不宣称远端对象已经可供训练读取。
 - 校验可选 `.neoengram-dataset.json`；解析 schema/source/lineage/shard 摘要但不建设样本级平台。
 - 建立审计字段脱敏、TLS、SSE-KMS/workload identity，以及 JWKS/双凭证无中断轮换能力；P4 再做
   定期轮换、应急吊销和泄漏演练。
 
 验收：两个客户端同时更新同一 ref 时最多一个成功；无效或过期 JWT、越权请求和跨租户查询默认
-拒绝；服务重启不丢失已提交 metadata、Ready Snapshot、lease、pin 或 audit；返回对象均通过内容
+拒绝；服务重启不丢失已提交 metadata、Snapshot、DatasetProfile、lease、pin 或 audit；返回对象均通过内容
 ID 和完整引用图校验。
 
 ### P2：授权 Push 纵切
@@ -235,14 +264,15 @@ ID 和完整引用图校验。
 
 交付：
 
-- 客户端 `remote add` 和 `push` 初版，创建绑定 tenant、repository、principal 和幂等键的上传
+- 客户端 `remote add` 和 `push` 初版，创建绑定 tenant、artifact、principal 和幂等键的上传
   session。
 - 服务端返回缺失的 Commit/Directory/Manifest/Chunk inventory；对象存在性、缺块结果和 CAS 当前值不
-  泄漏给无权 tenant/project/repository/ref，已授权调用者才可看到冲突的当前 ref。
+  泄漏给无权 tenant/project/artifact/ref，已授权调用者才可看到冲突的当前 ref。
 - 通过短期 Signed PUT/multipart ticket 上传到 tenant-scoped S3；上传前后验证 hash、size、
   checksum 和 KMS/存储策略。
-- 只有对象和 metadata 完整发布、sidecar 校验通过且 finalize 时重新鉴权后，才执行 expected-ref
-  CAS 并生成 Ready Snapshot。
+- 只有对象和 metadata 完整发布且 finalize 时重新鉴权后，才执行 expected-ref CAS 并使 Snapshot
+  可读取；sidecar 独立校验，合法时发布 `DatasetProfileState::Ready`，非法时拒绝训练 profile，
+  但不改变普通 Snapshot 的只读有效性。
 - 支持 quota、失败重试、幂等 session、ACL 撤销、session 过期清理和中断后继续。
 
 验收：Commit 可从空远端完整推送；并发 push 不覆盖他人 ref；权限撤销后不能 finalize 或续签新票据；
@@ -254,7 +284,7 @@ ID 和完整引用图校验。
 
 交付：
 
-- `fetch` 获取经授权的 refs、固定 Commit 图和缺失对象；`clone` 初始化本地 SQLite 仓库并恢复
+- `fetch` 获取经授权的 refs、固定 Commit tree 和缺失对象；`clone` 初始化本地 SQLite 仓库并恢复
   目标 Commit。
 - 提供固定 Snapshot 的 Manifest/Shard 分页、确定性文件级 ShardSet、lease 和续租 API。
 - 通过短期 Signed GET 读取完整 Chunk；v1 拒绝普通 Chunk 的 Range GET。Pack/range 只有在 P5
@@ -307,18 +337,18 @@ ID 和完整引用图校验。
 
 任何远端实现都必须保持以下顺序和不变量：
 
-1. 不可变对象先写入并校验，不能先发布 ref 或 `SnapshotState::Ready`。
+1. 不可变对象先写入并校验，不能先发布 ref 或暴露可读取 Snapshot。
 2. 服务端 metadata 只引用已存在且内容 ID、大小和完整引用图均正确的对象。
 3. ref/HEAD 更新必须带 expected value、幂等键和授权 session，并在服务端事务中完成。
 4. 客户端本地 ref 只在下载对象持久化、校验和 durability barrier 成功后更新。
-5. 重试同一个 session 的结果必须与首次成功结果相同；session 必须绑定 tenant、repository、
+5. 重试同一个 session 的结果必须与首次成功结果相同；session 必须绑定 tenant、artifact、
    principal 和操作范围，不能跨租户或跨主体重放。
 6. 客户端和服务端都不能信任对方提供的物理路径，只接受逻辑 ID、大小、checksum 和受限 cursor。
 7. 除存活/就绪探针外，所有 inventory、metadata、ticket、lease、ref 和 Snapshot API 先认证再授权；上传 finalize、
    ref CAS 和 lease renew 必须再次检查当前权限。
 8. ref 只在读取开始时解析为固定 Commit ID；后续 ref 移动不得改变该 Snapshot 的 Manifest、Shard
    或对象可见性。
-9. 对象读取必须带 repository + 固定 Snapshot/Commit 上下文；知道 Chunk ID 不能单独获得读取权限。
+9. 对象读取必须带 artifact + 固定 Snapshot/Commit 上下文；知道 Chunk ID 不能单独获得读取权限。
 10. lease、pin/hold、ref、活跃 push/fetch session 和有效 ObjectTicket 都是 GC roots；租约或票据有效
     期间不得删除 Snapshot 可达的 metadata 或 Chunk。
 11. 缺失、损坏、大小不符或 hash 不符的 Chunk 必须硬失败，禁止静默跳过、替换或返回部分成功。
@@ -352,25 +382,25 @@ ID 和完整引用图校验。
 | 资源范围 | 代表性 action |
 | --- | --- |
 | Tenant | `tenant.read`、`tenant.manage`、`member.manage`、`audit.read`、`retention.manage` |
-| Project | `project.read`、`project.manage`、`repository.create` |
-| Repository | `metadata.read`、`object.read`、`object.write`、`commit.publish`、`snapshot.read`、`snapshot.lease`、`repository.manage`、`retention.manage` |
+| Project | `project.read`、`project.manage`、`artifact.create` |
+| Artifact | `metadata.read`、`object.read`、`object.write`、`commit.publish`、`snapshot.read`、`snapshot.lease`、`artifact.manage`、`retention.manage` |
 | Ref | `ref.read`、`ref.update` |
 
-内置角色为 `TenantAdmin`、`ProjectAdmin`、`RepositoryReader`、`RepositoryWriter` 和
-`RepositoryMaintainer`。最小 action 映射如下；角色可绑定在 tenant、project、repository 或具体
+内置角色为 `TenantAdmin`、`ProjectAdmin`、`ArtifactReader`、`ArtifactWriter` 和
+`ArtifactMaintainer`。最小 action 映射如下；角色可绑定在 tenant、project、artifact 或具体
 ref，并按表中规则向下生效：
 
 | 角色 | 允许的最小 action | 绑定/继承规则 |
 | --- | --- | --- |
-| `TenantAdmin` | tenant/member/project/repository/audit/retention 管理，以及其租户内全部仓库 action | tenant 绑定向下继承；不跨 tenant |
-| `ProjectAdmin` | project 管理、`repository.create/manage`、项目审计读取 | project 绑定只管理该项目；数据读写和 ref 更新仍需仓库角色 |
-| `RepositoryReader` | `metadata.read`、`object.read`、`snapshot.read`、`snapshot.lease`、`ref.read` | repository 绑定覆盖其 refs；ref 绑定只覆盖该 ref |
-| `RepositoryWriter` | Reader 全部 action，加 `object.write`、`commit.publish`、`ref.update` | repository 绑定可更新其全部 refs；ref 绑定只能更新该 ref |
-| `RepositoryMaintainer` | Writer 全部 action，加 `repository.manage`、`retention.manage` | 不能因此获得 tenant/member 管理权 |
+| `TenantAdmin` | tenant/member/project/artifact/audit/retention 管理，以及其租户内全部仓库 action | tenant 绑定向下继承；不跨 tenant |
+| `ProjectAdmin` | project 管理、`artifact.create/manage`、项目审计读取 | project 绑定只管理该项目；数据读写和 ref 更新仍需仓库角色 |
+| `ArtifactReader` | `metadata.read`、`object.read`、`snapshot.read`、`snapshot.lease`、`ref.read` | artifact 绑定覆盖其 refs；ref 绑定只覆盖该 ref |
+| `ArtifactWriter` | Reader 全部 action，加 `object.write`、`commit.publish`、`ref.update` | artifact 绑定可更新其全部 refs；ref 绑定只能更新该 ref |
+| `ArtifactMaintainer` | Writer 全部 action，加 `artifact.manage`、`retention.manage` | 不能因此获得 tenant/member 管理权 |
 
 角色绑定采用 allow-only 语义；低层级绑定不能绕过上层 tenant/project 隔离，v1 不做路径级、
 单文件级或样本级 ACL。绑定的创建、撤销和 bootstrap 只允许 TenantAdmin 或受控 operator，并
-必须记录审计；ProjectAdmin 只能管理其 project 内的 repository 绑定。`snapshot.lease` 不隐式
+必须记录审计；ProjectAdmin 只能管理其 project 内的 artifact 绑定。`snapshot.lease` 不隐式
 授予 `object.read`，权限撤销后不能续租或签发新票据。
 
 ### 8.3 租户隔离、对象票据与密钥
@@ -384,7 +414,7 @@ ref，并按表中规则向下生效：
   暴露其他租户或无权仓库的对象是否存在；共享客户端缓存的索引必须包含 tenant，缓存命中不能
   绕过在线授权。
 - 客户端只能通过中心 API 获得短期 `ObjectTicket`。Signed URL 默认 TTL 10 分钟、硬上限 15
-  分钟，精确绑定 tenant、repository、object key、HTTP method、session、size 和 checksum；
+  分钟，精确绑定 tenant、artifact、object key、HTTP method、session、size 和 checksum；
   禁止 list、delete、任意 prefix 或永久凭证。
 - v1 只允许单对象完整 GET/PUT/multipart part；普通 Chunk 的 Range GET 必须拒绝。Pack/range
   只能在 P5 定义可验证 receipt 后通过 capability 开启，数据进入验证缓存前仍需完成完整 Chunk
@@ -411,36 +441,34 @@ root、外部 IdP/数据库/S3/KMS 管理员完全失陷，也不把 `export` �
 
 ### 9.1 Snapshot 身份与描述
 
-- `DatasetSnapshot` 的稳定身份是 `tenant_id + project_id + repository_id + commit_id`；Directory ID
+- `Snapshot` 的稳定身份是 `tenant_id + project_id + artifact_id + commit_id`；Directory ID
   只表示文件内容指纹，不另复制一套文件图。
 - ref（例如 `main`）只在训练开始时解析一次；训练、恢复、重试和审计始终记录完整 Commit ID。
-- 只有 Commit → Directory → Manifest → Chunk 全图已持久化并校验后才进入 `ContentReady`。普通文件
-  读取可以使用 `ContentReady`，但训练数据 API 只接受 `Ready`。
-- `Ready` 表示 `ContentReady` 且 sidecar 存在并通过 schema/source/ShardSet 校验；只有 `Ready`
-  Snapshot 可获取训练 lease 和读取票据。sidecar 缺失的快照仍是合法的普通文件快照，但不能被
-  宣布为可训练 Dataset Snapshot；sidecar 无效进入 `Rejected/Quarantined`，不得部分发布。
+- 只有 Commit → Directory → Manifest → Chunk 全图已持久化并校验后，Snapshot 才可读取；Snapshot
+  一旦可读取便始终固定该 Commit，不再使用训练状态改变它的只读文件语义。
+- sidecar 存在并通过 schema/source/ShardSet 校验时，独立的 `DatasetProfileState` 进入 `Ready`，训练
+  API 只接受具有 Ready profile 的 Snapshot。sidecar 缺失时 Snapshot 仍是合法普通文件快照，但
+  显示为未声明训练 profile；sidecar 无效时 profile 进入 `Rejected`，Snapshot 本身不失效。
 - 根目录可有 `.neoengram-dataset.json`，作为普通版本文件进入 Directory，记录 schema digest、直接
-  source locator/version/digest、上游 `repository_id + commit_id`、transform recipe digest 和
+  source locator/version/digest、上游 `artifact_id + commit_id`、transform recipe digest 和
  ShardSet 参数。它不得包含当前 Commit/Directory ID、凭证或签名 URL；默认不进入训练文件选择集。
 - source lineage v1 只记录直接来源和稳定 digest/版本；locator 必须移除凭证、签名参数和其他秘密，
   不执行或编排数据转换。
-- lineage 引用是不可自动展开的不透明摘要；读取上游 repository/Commit 的详细 metadata 仍需单独
-  通过上游资源的 `metadata.read` 授权，错误信息不得泄露上游租户或仓库是否存在。
-- sidecar 缺失时普通文件快照仍合法并显示为“未声明”；sidecar 存在但格式、路径、digest 或
-  参数无效时不能发布为可训练 Snapshot。
+- lineage 引用是不可自动展开的不透明摘要；读取上游 artifact/Commit 的详细 metadata 仍需单独
+  通过上游资源的 `metadata.read` 授权，错误信息不得泄露上游租户或 Artifact 是否存在。
 
 ### 9.2 Shard 与读取一致性
 
 - Shard 是训练逻辑分片，不等同于存储 Chunk。v1 使用版本化、确定性的 path-hash 对完整文件
   分片，参数包括算法版本、seed、shard count 和 include roots。
 - 纳入选择集的文件恰好属于一个 shard，允许空 shard；不承诺样本、行、压缩包内部或任意
-  byte-range 分片。Manifest/Shard 分页 cursor 必须绑定 tenant、repository、Commit 和查询参数。
+  byte-range 分片。Manifest/Shard 分页 cursor 必须绑定 tenant、artifact、Commit 和查询参数。
 - `SnapshotHandle` 固定 Commit、Directory、状态和查询上下文；ref 后续移动不影响已经打开的 Snapshot。
 - 客户端暴露训练数据前必须完成 Chunk hash/receipt 校验；缺失、损坏或大小不符必须硬失败。
 
 ### 9.3 Lease、保留和 GC
 
-- `SnapshotLease` 至少记录 `lease_id`、tenant、repository、Snapshot/Commit、service principal、
+- `SnapshotLease` 至少记录 `lease_id`、tenant、artifact、Snapshot/Commit、service principal、
   workload/job ID、TTL、renew token 和撤销原因；默认 TTL 60 分钟，客户端每 20 分钟续租。lease
   只阻止 GC，不隐式授予读取权限；获取、续租、撤销主体和结果都进入审计。
 - ref 可达历史、显式 `Pin`/`RetentionHold`、活跃 Snapshot lease 和活跃 push/fetch session 都是
@@ -457,7 +485,7 @@ root、外部 IdP/数据库/S3/KMS 管理员完全失陷，也不把 `export` �
 
 - `PrincipalContext`、`Authenticator`、`Authorizer`、`Action`、`ResourceScope`、`AuthorizationDecision`；
 - `PushSession`、`FetchSession`、`ObjectTicket` 和租户/主体绑定的幂等请求；
-- `SnapshotHandle`、`SnapshotState::{ContentReady,Ready,Rejected}`、`ShardSetSpec`、opaque 分页 cursor；
+- `SnapshotHandle`、`DatasetProfileState::{Ready,Rejected}`、`ShardSetSpec`、opaque 分页 cursor；
 - `SnapshotLease`、`Pin`、`RetentionHold`；
 - ref CAS 请求必须携带 expected/current/new、幂等键和授权 session 身份；
 - 401 表示认证失败，403 表示已认证但无权限，404 用于隐藏不可见资源，409 表示 CAS 或 session 冲突。
@@ -483,7 +511,7 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 
 | 主题 | 要回答的问题 | 输出 |
 | --- | --- | --- |
-| PostgreSQL schema/RLS | tenant/project/repository/ref 如何分页、索引并保证跨租户约束？ | migration + 查询/隔离基准 |
+| PostgreSQL schema/RLS | tenant/project/artifact/ref 如何分页、索引并保证跨租户约束？ | migration + 查询/隔离基准 |
 | JWT/JWKS | issuer、audience、算法拒绝、未知 kid 和无中断轮换如何验证？ | verifier contract + failpoint 测试 |
 | RBAC/审计 | role × scope × action、404 隐藏和审计保留如何控制写放大？ | 授权矩阵 + audit schema |
 | ObjectTicket | Signed URL 的对象范围、TTL、checksum、撤销窗口和 KMS 条件如何落地？ | ticket adapter 原型 |
@@ -494,6 +522,7 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | GC/生命周期 | 如何处理并发 push、lease、pin/hold、保留策略和 detached 历史？ | generation/cutoff 方案 |
 | 大规模性能/SLO | 千万路径、上亿 Chunk 和 PB payload 下 RSS、延迟、吞吐和 RPO/RTO 是否达标？ | 可重复 benchmark + 容量报告 |
 | 文件语义 | mode、symlink、sparse 在各平台如何表达？ | 格式扩展决策 |
+| NFS placement/owner | export/fsid 别名、重叠根、单 RW Owner 和全卷 failover 如何强制？ | registry 约束 + fencing/迁移状态机 + 故障注入 |
 
 研究项在没有“问题、实验、结论、后续动作”四项内容前，不得标记为已完成。
 
@@ -511,16 +540,20 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 - 授权测试：User/Service principal 的 role × scope × action 矩阵、默认拒绝、ref 级绑定、ACL 撤销
   与 finalize/renew 竞态。
 - 租户隔离：相同仓库名、Commit ID、Chunk hash 下的跨租户枚举、引用、下载、cursor/session 重放
-  和伪造 tenant context；同租户无权 project/repository/ref 也不能枚举，RLS 必须拒绝越权；受控
+  和伪造 tenant context；同租户无权 project/artifact/ref 也不能枚举，RLS 必须拒绝越权；受控
   worker 不得用普通 runtime role 绕过 RLS。
 - 对象票据：method/key/session/TTL/size/checksum 限制、有效 ticket 作为 GC root、Signed URL 撤销
   窗口、KMS 条件和完整 URL 不进入日志；普通 Chunk Range GET 必须拒绝。
-- Snapshot/Shard：ContentReady/Ready/Rejected 状态矩阵、ref 移动后读取稳定、sidecar 无效硬失败、
+- Snapshot/Shard：Snapshot 固定性与 DatasetProfile Ready/Rejected 状态矩阵、ref 移动后读取稳定、sidecar 无效硬失败、
   分片无遗漏/重复、lease/pin 在重启后保持、有效 ticket/lease 下 GC 不删对象。
 - 资源耗尽：恶意大 Manifest、上传/multipart、分页 cursor、并发 lease、带宽和 quota 绕过必须触发
   限流或硬失败，且不会留下不可回收 session。
 - 服务集成：PostgreSQL migration、S3 兼容存储、push/fetch/clone、quota 和全链路审计。
 - 故障注入：网络中断、进程终止、重复请求、对象损坏、数据库故障、密钥轮换、并发 CAS 和 GC。
+- Agent 存储布局：每 Artifact/EdgeCluster 单 active placement、同租户多 Artifact/Volume、根路径非重叠、
+  NFS 别名拒绝、单 Volume RW Owner、全卷 failover、跨 Artifact hardlink 拒绝和显式 placement 迁移。
+- Kubernetes 挂载：已有 Pod 的容器路径到本集群物理 NFS、StorageVolume、ArtifactPlacement 和
+  `PodMountBinding` 精确视图目录的映射，以及 sibling/objects/journal/Volume root 逃逸拒绝。
 - 规模基准：路径数、Chunk 数、Manifest/Shard 大小、峰值 RSS、吞吐、写放大、恢复时间和 SLO。
 - 发布门槛：fmt、Clippy `-D warnings`、rustdoc、全量测试、三平台 CI，以及两个 `.crate` 的 README、
   MIT/Apache-2.0 许可证和 metadata 检查；远端阶段另需 migration dry-run、灾备演练和安全审计。
@@ -545,7 +578,11 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-19 | 明确目标为“中心化元数据 + 分布式对象存储”的文件版本管理系统 | 用户目标确认；本地 Phase 1 作为客户端数据面基础 |
 | 2026-07-19 | 完成只读快照、忽略规则和 fsck 有界 Chunk 标记 | 单机核心能力和安全基线完成 |
 | 2026-07-19 | 将路线扩展为控制面/数据面/读取面，并纳入 Snapshot、Shard、Lineage、lease 和生命周期语义 | 面向 AI 训练数据维护的可复现读取需求 |
-| 2026-07-19 | 确定 Authenticator + 外部 JWT/JWKS、tenant→project→repository→ref RBAC、短期 ObjectTicket 和租户隔离基线 | 鉴权、认证、审计与跨租户安全要求 |
+| 2026-07-19 | 确定 Authenticator + 外部 JWT/JWKS、tenant→project→artifact→ref RBAC、短期 ObjectTicket 和租户隔离基线 | 鉴权、认证、审计与跨租户安全要求 |
 | 2026-07-19 | 将基础安全从 P4 前移到 P0/P1，P4 保留安全强化、灾备、GC 和运营 | 分布式控制面上线前必须具备默认拒绝和可审计边界 |
 | 2026-07-19 | 增加 worktree 读写锁、Index CAS 复核和先发布 journal 的本地事务协议 | 消除并发覆盖、检查后覆盖和 post-rename 同步失败导致的数据风险 |
 | 2026-07-19 | 补齐 crates.io metadata、包内双许可证及归档 CI gate | 让源码安装和未来发布产物具备可审计的开源材料；当前未创建 release 或 tag |
+| 2026-07-24 | 明确多 EdgeCluster 是网络隔离边界，跨集群 checkout 通过源 S3 Gateway 传输固定 Commit 对象 | 集群间 Agent/NFS 不互通，中心只协调 TransferRoute/Ticket 且不代理 payload |
+| 2026-07-24 | 冻结 Artifact、Commit、Playground、Snapshot 术语，并将 Agent 临时上传结果改称 MetadataBatch | Artifact 只表示版本化抽象文件系统，避免与 Job 输出重名；读写和只读视图具有明确边界 |
+| 2026-07-24 | 冻结 ArtifactPlacement、同租户多 Artifact/Volume 和单 Volume RW Owner 约束 | 避免同一 NFS 上多 Agent 写入与 hardlink/根目录重叠；更换 NFS 必须走可恢复迁移状态机 |
+| 2026-07-24 | 在跨集群总图中把每个集群分为系统组件、居中 NFS、业务 Pod 三区，并补充 PodMountBinding | Agent/SQLite/Gateway 属于系统区；NFS 居中承接受管根、对象根和 Pod 精确视图挂载，Pod/NAS/PV/PVC 生命周期不属于中心设计 |
