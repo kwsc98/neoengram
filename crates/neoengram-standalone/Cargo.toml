@@ -1,0 +1,45 @@
+[package]
+name = "neoengram-standalone"
+description = "Standalone repository application for NeoEngram"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+fuse-mount = ["dep:fuser"]
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+fastcdc.workspace = true
+fs2.workspace = true
+futures.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+neoengram-core.workspace = true
+neoengram-engine.workspace = true
+neoengram-fs.workspace = true
+reflink-copy.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+unicode-normalization.workspace = true
+walkdir.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { workspace = true, optional = true, features = ["abi-7-31"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { workspace = true, optional = true, features = ["libfuse", "abi-7-19"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

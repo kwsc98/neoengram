@@ -1,0 +1,712 @@
+use std::{
+    collections::BTreeSet,
+    fs, io,
+    path::{Component, Path, PathBuf},
+};
+
+use anyhow::{bail, ensure, Context, Result};
+use neoengram_core::LogicalPath;
+use neoengram_engine::{MutationAction, ProgressSink};
+use serde::{Deserialize, Serialize};
+use tempfile::Builder;
+
+use crate::local::{
+    engine_mutation,
+    fs::durable::{
+        create_dir_all_durable, publish_transaction_draft, read_json, remove_dir_all_durable,
+        rename_durable_observed, rename_noreplace_durable, sync_directory, write_bytes_atomic,
+        write_json_atomic, RM_TRANSACTION_DRAFT_PREFIX,
+    },
+    model::{FileNode, Index},
+    repository::{is_neoengram_dir_name, Repository},
+};
+
+use super::workspace::{file_matches_node, logical_join, safe_leaf_metadata, workspace_path};
+
+const TRANSACTION_FORMAT_VERSION: u32 = 2;
+const PREPARED_STATE: &str = "PREPARED";
+const INDEX_COMMITTED_STATE: &str = "INDEX_COMMITTED";
+const ENTRY_PLANNED: &str = "planned";
+const ENTRY_OBSERVED_ABSENT: &str = "observed_absent";
+const ENTRY_MOVE_INTENT: &str = "move_intent";
+
+/// 从暂存区移除一个文件或目录范围。
+///
+/// 默认行为与 `git rm` 一致：同时移除工作区中的已跟踪文件和 index 项。`cached`
+/// 只修改 index；除非显式传入 `force`，两种模式都会拒绝丢弃与 index 不一致的文件。
+pub(crate) fn remove_tracked_path(
+    repository: &Repository,
+    current_dir: &Path,
+    requested_path: &Path,
+    cached: bool,
+    force: bool,
+    progress: &dyn ProgressSink,
+) -> Result<Vec<String>> {
+    let scope = repository_scope(requested_path, current_dir, repository.root())?;
+    let _worktree_lock = repository.acquire_worktree_lock()?;
+    let _lock = repository.acquire_write_lock()?;
+
+    let versioned_index = repository.read_index_versioned()?;
+    let (index, index_version) = versioned_index.into_parts();
+    let mut removed_nodes = Vec::new();
+    let mut retained_nodes = Vec::with_capacity(index.files.len());
+    for file in &index.files {
+        if path_is_in_scope(&file.path, &scope) {
+            removed_nodes.push(file.clone());
+        } else {
+            retained_nodes.push(file.clone());
+        }
+    }
+    ensure!(
+        !removed_nodes.is_empty(),
+        "路径没有已跟踪文件: {}",
+        requested_path.display()
+    );
+
+    // 即使是 --cached，也默认检查工作区是否与 index 一致。这样一次拼写错误不会静默
+    // 丢弃已经 add 但尚未 commit 的版本；用户可以用 --force 明确接受该结果。
+    if !force {
+        for file in &removed_nodes {
+            ensure_workspace_is_clean(repository.root(), file)?;
+        }
+    }
+
+    let next_index = Index {
+        format_version: index.format_version,
+        files: retained_nodes,
+    };
+
+    if cached {
+        repository.write_index(&next_index)?;
+    } else {
+        remove_workspace_and_update_index(
+            repository,
+            &removed_nodes,
+            &index,
+            &next_index,
+            index_version,
+            force,
+            progress,
+        )?;
+    }
+
+    Ok(removed_nodes.into_iter().map(|file| file.path).collect())
+}
+
+fn remove_workspace_and_update_index(
+    repository: &Repository,
+    removed_nodes: &[FileNode],
+    previous_index: &Index,
+    next_index: &Index,
+    expected_index_version: neoengram_core::IndexVersion,
+    force: bool,
+    progress: &dyn ProgressSink,
+) -> Result<()> {
+    let transaction =
+        RemovalTransaction::create(repository, removed_nodes, previous_index, next_index)?;
+    let plan_id = transaction.id().to_owned();
+    let journal_directory = transaction.engine_journal_directory();
+    let actions = removed_nodes
+        .iter()
+        .map(|file| {
+            Ok(MutationAction::RemoveFile {
+                path: LogicalPath::parse(&file.path)?,
+            })
+        })
+        .collect::<neoengram_core::ValidationResult<Vec<_>>>()?;
+    let plan = engine_mutation::build_plan(
+        repository,
+        format!("rm-{plan_id}"),
+        expected_index_version,
+        actions,
+    )?;
+    let mut executed = engine_mutation::execute(
+        repository,
+        plan,
+        &journal_directory,
+        format!("rm:{plan_id}").into_bytes(),
+        progress,
+        move |_| {
+            let mut transaction = transaction;
+            for file in removed_nodes {
+                if let Err(error) = transaction.move_workspace_file(repository.root(), file, force)
+                {
+                    rollback_operation(&mut transaction, error)?;
+                }
+            }
+            Ok(transaction)
+        },
+    )?;
+    executed.publish_and_finalize(|transaction| {
+        if let Err(error) = repository.write_index_if_version(next_index, &expected_index_version) {
+            return match repository.read_index() {
+                Ok(current) if current == *previous_index => rollback_operation(transaction, error),
+                Ok(current) if current == *next_index => Err(error.context(format!(
+                    "index 已发布但耐久性确认失败；工作区保持删除状态，请运行 recover: {}",
+                    transaction.root.display()
+                ))),
+                Ok(_) => Err(error.context(format!(
+                    "index CAS 失败且当前状态既不匹配 before 也不匹配 after；事务保留在 {}",
+                    transaction.root.display()
+                ))),
+                Err(read_error) => Err(error.context(format!(
+                    "index CAS 失败且无法确认当前状态: {read_error:#}；事务保留在 {}",
+                    transaction.root.display()
+                ))),
+            };
+        }
+        super::test_crash_at("rm-after-index");
+
+        // Index CAS 已生效后绝不能回滚工作区；后续失败由 recover 完成收尾。
+        transaction.mark_index_committed().with_context(|| {
+            format!(
+                "index 已更新，但无法标记 rm 事务完成；请运行 recover: {}",
+                transaction.root.display()
+            )
+        })
+    })?;
+    let transaction = executed.take_value();
+    transaction.finish()
+}
+
+fn rollback_operation(transaction: &mut RemovalTransaction, error: anyhow::Error) -> Result<()> {
+    match transaction.rollback() {
+        Ok(()) => Err(error),
+        Err(rollback_error) => Err(error.context(format!(
+            "rm 回滚失败: {rollback_error:#}；备份保留在 {}",
+            transaction.root.display()
+        ))),
+    }
+}
+
+fn ensure_workspace_is_clean(repository_root: &Path, file: &FileNode) -> Result<()> {
+    let path = workspace_path(repository_root, &file.path);
+    let Some(metadata) = safe_leaf_metadata(repository_root, &file.path)? else {
+        // 工作区文件已经被用户删除，此时 rm 只是把该删除记录到 index。
+        return Ok(());
+    };
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "工作区文件类型已改变，使用 `--force` 明确移除: {}",
+        file.path
+    );
+    ensure!(
+        file_matches_node(&path, file)?,
+        "工作区文件包含未暂存修改，使用 `--force` 明确移除: {}",
+        file.path
+    );
+    Ok(())
+}
+
+struct MovedFile {
+    logical_path: String,
+    original: PathBuf,
+    backup: PathBuf,
+}
+
+/// rm 先把工作区文件原子移动到仓库内部，再更新 index。任何进程内错误都会按逆序恢复
+/// 已移动文件；进程崩溃时事务目录也会保留原始内容，避免数据被直接 unlink。
+struct RemovalTransaction {
+    root: PathBuf,
+    repository_root: PathBuf,
+    manifest: RemovalManifest,
+    moved_files: Vec<MovedFile>,
+}
+
+impl RemovalTransaction {
+    fn create(
+        repository: &Repository,
+        removed_nodes: &[FileNode],
+        previous_index: &Index,
+        next_index: &Index,
+    ) -> Result<Self> {
+        let temporary = Builder::new()
+            .prefix(RM_TRANSACTION_DRAFT_PREFIX)
+            .tempdir_in(repository.transactions_dir())
+            .with_context(|| {
+                format!(
+                    "无法创建 rm 事务: {}",
+                    repository.transactions_dir().display()
+                )
+            })?;
+        let root = temporary.path().to_path_buf();
+        fs::create_dir(root.join("backup"))
+            .with_context(|| format!("无法创建 rm 备份目录: {}", root.display()))?;
+        write_bytes_atomic(&root.join("OPERATION"), b"rm\n")?;
+        write_json_atomic(&root.join("index.before.json"), previous_index)?;
+        write_json_atomic(&root.join("index.after.json"), next_index)?;
+        let manifest = RemovalManifest {
+            format_version: TRANSACTION_FORMAT_VERSION,
+            entries: removed_nodes
+                .iter()
+                .map(|file| RemovalManifestEntry {
+                    logical_path: file.path.clone(),
+                    state: ENTRY_PLANNED.to_owned(),
+                })
+                .collect(),
+        };
+        // manifest、前后 index 和 PREPARED 状态全部持久化之后，才允许第一次 rename。
+        // recover 因而总能判定每个 backup 应恢复到哪个逻辑路径。
+        write_json_atomic(&root.join("manifest.json"), &manifest)?;
+        write_bytes_atomic(
+            &root.join("STATE"),
+            format!("{PREPARED_STATE}\n").as_bytes(),
+        )?;
+        sync_directory(&root.join("backup"))?;
+        sync_directory(&root)?;
+        super::test_crash_at("rm-before-transaction-publish");
+        let draft = temporary.keep();
+        let root = publish_transaction_draft(&draft, "rm")?;
+        super::test_crash_at("rm-after-transaction-publish");
+        Ok(Self {
+            root,
+            repository_root: repository.root().to_path_buf(),
+            manifest,
+            moved_files: Vec::new(),
+        })
+    }
+
+    fn id(&self) -> &str {
+        self.root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("rm-transaction")
+    }
+
+    fn engine_journal_directory(&self) -> PathBuf {
+        self.root.join("engine-journal")
+    }
+
+    fn move_workspace_file(
+        &mut self,
+        repository_root: &Path,
+        file: &FileNode,
+        force: bool,
+    ) -> Result<()> {
+        let original = workspace_path(repository_root, &file.path);
+        let Some(metadata) = safe_leaf_metadata(repository_root, &file.path)? else {
+            self.set_entry_state(&file.path, ENTRY_OBSERVED_ABSENT)?;
+            return Ok(());
+        };
+        ensure!(
+            metadata.is_file() || metadata.file_type().is_symlink(),
+            "拒绝用 rm 递归删除替代已跟踪文件的目录或特殊文件: {}",
+            file.path
+        );
+        if !force {
+            // 在真正 rename 前再次核对内容，缩小预检与修改工作区之间的竞态窗口。
+            ensure!(
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && file_matches_node(&original, file)?,
+                "工作区文件在 rm 执行期间发生变化: {}",
+                file.path
+            );
+        }
+        self.set_entry_state(&file.path, ENTRY_MOVE_INTENT)?;
+
+        let backup = logical_join(&self.root.join("backup"), &file.path);
+        let parent = backup
+            .parent()
+            .with_context(|| format!("备份路径没有父目录: {}", backup.display()))?;
+        create_dir_all_durable(parent)?;
+        let moved_original = original.clone();
+        let moved_backup = backup.clone();
+        rename_durable_observed(&original, &backup, || {
+            self.moved_files.push(MovedFile {
+                logical_path: file.path.clone(),
+                original: moved_original,
+                backup: moved_backup,
+            })
+        })
+        .with_context(|| format!("无法把工作区文件移动到 rm 事务: {}", original.display()))?;
+        super::test_crash_at("rm-after-backup");
+        Ok(())
+    }
+
+    fn set_entry_state(&mut self, logical_path: &str, state: &str) -> Result<()> {
+        let entry = self
+            .manifest
+            .entries
+            .iter_mut()
+            .find(|entry| entry.logical_path == logical_path)
+            .with_context(|| format!("rm manifest 缺少路径: {logical_path}"))?;
+        ensure!(
+            entry.state == ENTRY_PLANNED,
+            "rm manifest 路径状态不能从 {} 更新为 {state}: {logical_path}",
+            entry.state
+        );
+        entry.state = state.to_owned();
+        write_json_atomic(&self.root.join("manifest.json"), &self.manifest)
+    }
+
+    fn mark_index_committed(&self) -> Result<()> {
+        write_bytes_atomic(
+            &self.root.join("STATE"),
+            format!("{INDEX_COMMITTED_STATE}\n").as_bytes(),
+        )
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        for moved in self.moved_files.iter().rev() {
+            restore_observed_move(
+                &self.repository_root,
+                &moved.logical_path,
+                &moved.original,
+                &moved.backup,
+            )?;
+        }
+        remove_dir_all_durable(&self.root)
+            .with_context(|| format!("无法清理已回滚的 rm 事务: {}", self.root.display()))?;
+        self.moved_files.clear();
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        remove_dir_all_durable(&self.root)
+            .with_context(|| format!("无法清理已完成的 rm 事务: {}", self.root.display()))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemovalManifest {
+    format_version: u32,
+    entries: Vec<RemovalManifestEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemovalManifestEntry {
+    logical_path: String,
+    state: String,
+}
+
+/// rm 事务恢复的实际结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemovalRecovery {
+    /// index 已经发布，恢复只完成了事务收尾，删除保持生效。
+    Completed,
+    /// index 尚未发布，备份文件已恢复到工作区，等同于回到事务开始前。
+    RolledBack,
+}
+
+/// 恢复单个遗留的 rm 事务。
+///
+/// 调用方必须已经持有全仓库 recovery 锁；这里不能再获取普通写锁，因为普通写锁会把
+/// transactions 中的遗留项视为需要人工处理的异常。`abort` 只允许回滚尚未发布 index
+/// 的事务，绝不会把已经提交的新 index 反向改写。
+///
+/// 与 checkout 的“回滚后重放”不同，rm 没有续完路径：index 尚未发布（`PREPARED`）时，
+/// 无论是否 `abort` 都会恢复备份并回到事务开始前。原因是事务不记录 `--force` 标志，
+/// 崩溃后无法安全重放工作区一致性检查；需要删除时重新执行 `rm` 即可。
+pub(super) fn recover_transaction(
+    repository: &Repository,
+    transaction_root: &Path,
+    abort: bool,
+) -> Result<RemovalRecovery> {
+    validate_transaction_root(repository, transaction_root)?;
+    let operation =
+        fs::read_to_string(transaction_root.join("OPERATION")).context("无法读取 rm 事务类型")?;
+    ensure!(operation.trim() == "rm", "事务类型不是 rm");
+
+    let state =
+        fs::read_to_string(transaction_root.join("STATE")).context("无法读取 rm 事务状态")?;
+    let state = state.trim();
+    ensure!(
+        state == PREPARED_STATE || state == INDEX_COMMITTED_STATE,
+        "未知的 rm 事务状态: {state}"
+    );
+
+    let before: Index = read_json(&transaction_root.join("index.before.json"))?;
+    let after: Index = read_json(&transaction_root.join("index.after.json"))?;
+    repository.validate_index_snapshot(&before)?;
+    repository.validate_index_snapshot(&after)?;
+    let manifest: RemovalManifest = read_json(&transaction_root.join("manifest.json"))?;
+    validate_manifest(repository, &manifest, &before, &after)?;
+    let current = repository.read_index()?;
+
+    if current == after {
+        ensure!(
+            !abort,
+            "rm 的 index 已经提交，不能 abort；请执行普通 recover 完成清理"
+        );
+        remove_dir_all_durable(transaction_root)
+            .with_context(|| format!("无法清理已提交的 rm 事务: {}", transaction_root.display()))?;
+        return Ok(RemovalRecovery::Completed);
+    }
+
+    ensure!(
+        current == before,
+        "当前 index 既不匹配 rm 事务的 before，也不匹配 after；拒绝自动恢复"
+    );
+    ensure!(
+        state == PREPARED_STATE,
+        "rm 标记为 INDEX_COMMITTED，但当前 index 仍是 before；拒绝删除备份"
+    );
+
+    restore_manifest_backups(repository, transaction_root, &manifest)?;
+    remove_dir_all_durable(transaction_root)
+        .with_context(|| format!("无法清理已回滚的 rm 事务: {}", transaction_root.display()))?;
+    Ok(RemovalRecovery::RolledBack)
+}
+
+fn validate_transaction_root(repository: &Repository, transaction_root: &Path) -> Result<()> {
+    ensure!(
+        transaction_root.parent() == Some(repository.transactions_dir().as_path()),
+        "rm 事务不在当前仓库的 transactions 目录中: {}",
+        transaction_root.display()
+    );
+    let metadata = fs::symlink_metadata(transaction_root)
+        .with_context(|| format!("无法检查 rm 事务目录: {}", transaction_root.display()))?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "rm 事务路径不是普通目录: {}",
+        transaction_root.display()
+    );
+    Ok(())
+}
+
+fn validate_manifest(
+    repository: &Repository,
+    manifest: &RemovalManifest,
+    before: &Index,
+    after: &Index,
+) -> Result<()> {
+    ensure!(
+        manifest.format_version == TRANSACTION_FORMAT_VERSION,
+        "不支持的 rm 事务格式版本 {}",
+        manifest.format_version
+    );
+    let mut paths = BTreeSet::new();
+    for entry in &manifest.entries {
+        ensure!(
+            matches!(
+                entry.state.as_str(),
+                ENTRY_PLANNED | ENTRY_OBSERVED_ABSENT | ENTRY_MOVE_INTENT
+            ),
+            "未知的 rm manifest entry 状态: {}",
+            entry.state
+        );
+        repository.validate_logical_path(&entry.logical_path)?;
+        ensure!(
+            paths.insert(entry.logical_path.as_str()),
+            "rm manifest 包含重复路径: {}",
+            entry.logical_path
+        );
+    }
+
+    let before_files: std::collections::BTreeMap<&str, &FileNode> = before
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    let after_files: std::collections::BTreeMap<&str, &FileNode> = after
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    for (path, file) in &after_files {
+        ensure!(
+            before_files
+                .get(path)
+                .is_some_and(|before| *before == *file),
+            "rm index.after 新增或修改了路径: {path}"
+        );
+    }
+    let expected_paths: BTreeSet<&str> = before_files
+        .keys()
+        .filter(|path| !after_files.contains_key(**path))
+        .copied()
+        .collect();
+    ensure!(
+        paths == expected_paths,
+        "rm manifest 路径集合与 index.before - index.after 不一致"
+    );
+    Ok(())
+}
+
+fn restore_manifest_backups(
+    repository: &Repository,
+    transaction_root: &Path,
+    manifest: &RemovalManifest,
+) -> Result<()> {
+    for entry in manifest.entries.iter().rev() {
+        let backup = logical_join(&transaction_root.join("backup"), &entry.logical_path);
+        let destination = workspace_path(repository.root(), &entry.logical_path);
+        match entry.state.as_str() {
+            ENTRY_PLANNED | ENTRY_OBSERVED_ABSENT => {
+                ensure!(
+                    inspect_removal_path(&backup, "rm 备份")?.is_none(),
+                    "rm 尚未记录移动意图，但备份已经存在: {}",
+                    backup.display()
+                );
+            }
+            ENTRY_MOVE_INTENT => restore_observed_move(
+                repository.root(),
+                &entry.logical_path,
+                &destination,
+                &backup,
+            )?,
+            _ => bail!("未知的 rm manifest entry 状态: {}", entry.state),
+        }
+    }
+    Ok(())
+}
+
+fn restore_observed_move(
+    repository_root: &Path,
+    logical_path: &str,
+    original: &Path,
+    backup: &Path,
+) -> Result<()> {
+    let original_metadata = inspect_removal_path(original, "rm 工作区恢复目标")?;
+    let backup_metadata = inspect_removal_path(backup, "rm 备份")?;
+    match (original_metadata, backup_metadata) {
+        (None, Some(backup_metadata)) => {
+            ensure!(
+                backup_metadata.is_file() || backup_metadata.file_type().is_symlink(),
+                "rm 备份不是普通文件或符号链接: {}",
+                backup.display()
+            );
+            ensure_safe_parent_directories(repository_root, logical_path)?;
+            super::test_pause_at("rm-before-backup-restore");
+            rename_noreplace_durable(backup, original)
+                .with_context(|| format!("回滚时无法恢复工作区文件: {}", original.display()))
+        }
+        (Some(original_metadata), None) => {
+            ensure!(
+                original_metadata.is_file() || original_metadata.file_type().is_symlink(),
+                "rm 恢复目标不是普通文件或符号链接: {}",
+                original.display()
+            );
+            Ok(())
+        }
+        (Some(_), Some(_)) => bail!(
+            "rm 回滚状态不明确：工作区路径和备份同时存在；事务将保留: {} / {}",
+            original.display(),
+            backup.display()
+        ),
+        (None, None) => bail!(
+            "rm 回滚无法恢复：工作区路径和备份同时缺失；事务将保留: {} / {}",
+            original.display(),
+            backup.display()
+        ),
+    }
+}
+
+fn inspect_removal_path(path: &Path, kind: &str) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("无法检查{kind}: {}", path.display())),
+    }
+}
+
+pub(crate) fn repository_scope(
+    path: &Path,
+    current_dir: &Path,
+    repository_root: &Path,
+) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir.join(path)
+    };
+    let normalized = normalize_absolute_path(&absolute)?;
+    ensure!(
+        normalized.starts_with(repository_root),
+        "不能移除仓库之外的路径: {}",
+        path.display()
+    );
+
+    let relative = normalized
+        .strip_prefix(repository_root)
+        .context("无法计算 rm 路径的仓库相对位置")?;
+    let mut names = Vec::new();
+    let components: Vec<_> = relative.components().collect();
+    let mut current = repository_root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            bail!("rm 路径未规范化: {}", path.display());
+        };
+        let name = name
+            .to_str()
+            .with_context(|| format!("rm 路径不是有效 UTF-8: {}", path.display()))?;
+        ensure!(
+            !is_neoengram_dir_name(std::ffi::OsStr::new(name)),
+            "不能移除 NeoEngram 内部路径: {}",
+            path.display()
+        );
+        names.push(name);
+
+        // leaf 可以是 symlink，force 模式只会移动该链接本身；任何祖先 symlink 都会
+        // 改变路径解析边界，因此无条件拒绝。
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if index + 1 < components.len() => ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "rm 路径祖先不是普通目录: {}",
+                current.display()
+            ),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("无法检查 rm 路径: {}", current.display()));
+            }
+        }
+    }
+    Ok(names.join("/"))
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
+    ensure!(path.is_absolute(), "内部错误：rm 路径不是绝对路径");
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ensure!(
+                    normalized.pop(),
+                    "rm 路径越过文件系统根目录: {}",
+                    path.display()
+                );
+            }
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    Ok(normalized)
+}
+
+fn path_is_in_scope(path: &str, scope: &str) -> bool {
+    scope.is_empty()
+        || path == scope
+        || path
+            .strip_prefix(scope)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn ensure_safe_parent_directories(repository_root: &Path, logical_path: &str) -> Result<()> {
+    let components: Vec<&str> = logical_path.split('/').collect();
+    let mut current = repository_root.to_path_buf();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "rm 恢复路径祖先不是普通目录: {}",
+                current.display()
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                create_dir_all_durable(&current)
+                    .with_context(|| format!("无法创建 rm 恢复目录: {}", current.display()))?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("无法检查 rm 恢复目录: {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}

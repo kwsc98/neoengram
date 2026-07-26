@@ -4,11 +4,14 @@ use std::{
     process::{Command, Stdio},
 };
 
-use neoengram_core::{
-    Chunk, ChunkingStrategy, Commit, FileNode, Index, Tree, INDEX_FORMAT_VERSION,
-};
 use rusqlite::{params, Connection};
 use serde::de::DeserializeOwned;
+
+mod support;
+
+use support::models::{
+    Chunk, ChunkingStrategy, Commit, FileNode, Index, Tree, INDEX_FORMAT_VERSION,
+};
 
 #[test]
 fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +33,7 @@ fn default_init_uses_sqlite_and_is_idempotent() -> Result<(), Box<dyn std::error
     assert!(temporary.path().join("mounts").is_dir());
     assert!(temporary.path().join("exports").is_dir());
     let repository_config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(repository_config["format_version"], 7);
+    assert_eq!(repository_config["format_version"], 8);
     assert_eq!(
         repository_config["repository_id"]
             .as_str()
@@ -119,7 +122,7 @@ fn init_creates_a_missing_nested_repository_root() -> Result<(), Box<dyn std::er
         .path()
         .join("nested/repository/.neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["format_version"], 7);
+    assert_eq!(config["format_version"], 8);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     Ok(())
 }
@@ -150,7 +153,7 @@ fn crashed_new_init_can_be_retried() -> Result<(), Box<dyn std::error::Error>> {
     );
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["format_version"], 7);
+    assert_eq!(config["format_version"], 8);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     let add = command(temporary.path()).args(["add", "."]).output()?;
     assert!(
@@ -188,7 +191,7 @@ fn concurrent_init_publishes_exactly_one_repository() -> Result<(), Box<dyn std:
 
     let metadata_dir = temporary.path().join(".neoengram/metadata");
     let config: serde_json::Value = read_json(&metadata_dir.join("repository.json"))?;
-    assert_eq!(config["format_version"], 7);
+    assert_eq!(config["format_version"], 8);
     assert!(metadata_dir.join("metadata.sqlite3").is_file());
     Ok(())
 }
@@ -288,15 +291,15 @@ fn init_rejects_the_previous_repository_format() -> Result<(), Box<dyn std::erro
     fs::create_dir_all(&metadata_dir)?;
     fs::write(
         metadata_dir.join("repository.json"),
-        br#"{"format_version":6,"object_store":"loose"}"#,
+        br#"{"format_version":7,"object_store":"loose"}"#,
     )?;
 
     let output = command(temporary.path()).arg("init").output()?;
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("格式版本 6"));
-    assert!(stderr.contains("当前支持 7"));
+    assert!(stderr.contains("格式版本 7"));
+    assert!(stderr.contains("当前支持 8"));
     assert!(!temporary.path().join(".neoengram/objects").exists());
     Ok(())
 }
@@ -411,7 +414,7 @@ fn creates_linear_single_parent_commits() -> Result<(), Box<dyn std::error::Erro
     let first = read_commit(&metadata_dir, &first_id)?;
     assert_eq!(first.parent, None);
     assert_eq!(first.message, "initial dataset");
-    let first_tree = read_tree(&metadata_dir, &first.tree_hash)?;
+    let first_tree = read_tree(&metadata_dir, &first.root_directory_id)?;
     let index = read_index(&metadata_dir)?;
     assert_eq!(first_tree.files, index.files);
     assert_eq!(first_tree.files.len(), 2);
@@ -438,7 +441,7 @@ fn creates_linear_single_parent_commits() -> Result<(), Box<dyn std::error::Erro
     assert_ne!(second_id, first_id);
     let second = read_commit(&metadata_dir, &second_id)?;
     assert_eq!(second.parent.as_deref(), Some(first_id.as_str()));
-    let second_tree = read_tree(&metadata_dir, &second.tree_hash)?;
+    let second_tree = read_tree(&metadata_dir, &second.root_directory_id)?;
     let second_paths: Vec<&str> = second_tree
         .files
         .iter()
@@ -469,7 +472,7 @@ fn detached_checkout_commits_from_the_target_and_can_reattach_main(
         .success());
     let first_id = current_commit_id(&metadata_dir)?;
     let first = read_commit(&metadata_dir, &first_id)?;
-    let first_tree = read_tree(&metadata_dir, &first.tree_hash)?;
+    let first_tree = read_tree(&metadata_dir, &first.root_directory_id)?;
 
     fs::write(temporary.path().join("a.pt"), b"version two")?;
     fs::write(temporary.path().join("b.pt"), b"new in v2")?;
@@ -485,7 +488,7 @@ fn detached_checkout_commits_from_the_target_and_can_reattach_main(
         .success());
     let second_id = current_commit_id(&metadata_dir)?;
     let second = read_commit(&metadata_dir, &second_id)?;
-    let second_tree = read_tree(&metadata_dir, &second.tree_hash)?;
+    let second_tree = read_tree(&metadata_dir, &second.root_directory_id)?;
     fs::write(temporary.path().join("keep.local"), b"untracked")?;
 
     let checkout = command(temporary.path())
@@ -536,7 +539,7 @@ fn detached_checkout_commits_from_the_target_and_can_reattach_main(
     assert_eq!(current_commit_id(&metadata_dir)?, second_id);
     let detached = read_commit(&metadata_dir, &detached_id)?;
     assert_eq!(detached.parent.as_deref(), Some(first_id.as_str()));
-    assert_ne!(detached.tree_hash, first.tree_hash);
+    assert_ne!(detached.root_directory_id, first.root_directory_id);
 
     let detached_log = command(temporary.path()).arg("log").output()?;
     assert!(detached_log.status.success());
@@ -751,7 +754,7 @@ fn checkout_requires_force_for_staged_or_missing_tracked_files(
 
     let head = read_commit(&metadata_dir, &current_commit_id(&metadata_dir)?)?;
     let index = read_index(&metadata_dir)?;
-    let tree = read_tree(&metadata_dir, &head.tree_hash)?;
+    let tree = read_tree(&metadata_dir, &head.root_directory_id)?;
     assert_eq!(index.files, tree.files);
     Ok(())
 }
@@ -777,7 +780,7 @@ fn checkout_detects_chunk_corruption_before_mutating_workspace(
         .success());
     let head_id = current_commit_id(&metadata_dir)?;
     let head = read_commit(&metadata_dir, &head_id)?;
-    let tree = read_tree(&metadata_dir, &head.tree_hash)?;
+    let tree = read_tree(&metadata_dir, &head.root_directory_id)?;
 
     fs::write(temporary.path().join("a.pt"), b"staged-a")?;
     fs::write(temporary.path().join("z.pt"), b"staged-z")?;

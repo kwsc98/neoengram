@@ -26,16 +26,22 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check architecture boundaries
+        run: bash .github/check-architecture.sh
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Check documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
-      - name: Build publishable crate archives
+      - name: Package and verify neoengram-core
+        run: cargo package --locked -p neoengram-core
+      - name: Assemble neoengram CLI archive only
         run: |
-          cargo package --locked --no-verify -p neoengram-core
-          cargo package --locked --no-verify -p neoengram
+          # The CLI composes publish=false workspace crates. This checks archive
+          # assembly/content only; it intentionally does not claim that crates.io
+          # can resolve those private dependencies or install the CLI.
+          cargo package --locked --no-verify --exclude-lockfile -p neoengram
       - name: Verify package documentation and licenses
         shell: bash
         run: |
@@ -84,7 +90,20 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.0
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
-      - name: Run tests
+      - name: Run default-feature tests
+        run: cargo test --workspace --all-targets --locked
+
+  test-all-features:
+    name: Test all features (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@1.97.0
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+      - name: Run all-feature tests
         run: cargo test --workspace --all-targets --all-features --locked
 
   msrv:

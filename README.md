@@ -6,7 +6,8 @@
 被可靠地暂存、提交、校验与恢复。
 
 项目当前聚焦单机仓库与本地工作流，已经提供 SQLite 元数据、事务化 checkout 和故障恢复
-能力；分布式对象存储、远程同步与协作能力属于后续阶段。整体产品目标、当前能力清单和
+能力。`0.2.0` 同时完成了中心化架构所需的 crate/protocol/无网络状态机骨架；真实网络、数据库、
+对象存储和协作能力仍属于后续阶段。整体产品目标、当前能力清单和
 分布式实现路线统一维护在 [`docs/implementation-plan.md`](docs/implementation-plan.md)。完整
 状态模型、命令行为和命令差异见 [`docs/technical-reference.md`](docs/technical-reference.md)。
 
@@ -19,7 +20,7 @@
 - `checkout <COMMIT_ID>` 会逐 Chunk 校验目标内容，再事务化更新工作区、index 和 detached HEAD。
 - `commit` 分页读取 Index，深度优先发布不可变 Directory DAG，每个 Commit 最多只有一个父节点。
 - Detached HEAD 下的新 Commit 以当前 HEAD 为父节点且不移动 `main`；`checkout main` 重新附着。
-- `recover` 可以继续或回滚被 kill/断电打断的 checkout/rm 事务。
+- `recover` 可以继续或回滚被 kill/断电打断的 checkout/rm/restore 事务。
 - Directory、Manifest、Commit 和分支引用保存在 SQLite，文件分块保存在数据面。
 
 ## 快速开始
@@ -70,7 +71,7 @@ neoengram gc --dry-run
 neoengram fsck
 ```
 
-format v7 固定使用 SQLite；`init --metadata-store` 已删除。新仓库默认绑定 fastcdc，也可以
+format v8 固定使用 SQLite；`init --metadata-store` 已删除。新仓库默认绑定 fastcdc，也可以
 在初始化时选择 whole-file 或 mixed。仓库策略不可通过重新初始化修改，旧格式不迁移，打开时会
 明确要求重新初始化。
 
@@ -105,7 +106,7 @@ repository-root/                     # 默认 main Workspace
 │   ├── staging/                     # add 的稳定输入快照
 │   ├── transactions/                # main Workspace 恢复事务
 │   └── metadata/
-│       ├── repository.json          # format v7、repository_id、对象后端、分块策略
+│       ├── repository.json          # format v8、repository_id、对象后端、分块策略
 │       ├── objects.lock
 │       ├── write.lock
 │       └── metadata.sqlite3         # 共享对象、refs、Workspace-scoped HEAD/Index
@@ -132,27 +133,26 @@ gc/fsck 先协调对象再锁状态。
 
 ## 存储抽象
 
-元数据通过 `MetadataStore` 访问：文件和 Chunk 分页读取，Manifest 单次流式写入并返回
-内容 ID，Index 使用 expected-version 事务，Directory 通过追加 writer 发布，元数据/ref
-使用一致读 snapshot 分页枚举，HEAD 和 ref 更新使用 compare-exchange。Chunk payload 由独立
-`ObjectStore` 管理，提供流式发布、单遍校验读取、批量状态检查、分页枚举和 durability
-barrier。Repository 和命令层都不再依赖对象物理路径。
+元数据职责拆为 immutable catalog、workspace index、ref 和 workspace registry；文件和 Chunk
+分页读取，Index 使用 expected-version 事务，Directory 通过追加 writer 发布，HEAD/ref 使用
+compare-exchange。Chunk payload 由独立 `ObjectStore` 管理，提供流式发布、校验读取、分页枚举和
+durability barrier。Repository 和命令层都不依赖对象物理路径。
 
-当前真实实现是 `SqliteMetadataStore` 和 `LooseObjectStore`。开发期仓库格式直接演进，不提供
+当前 Standalone 实现使用 SQLite 和 `LooseObjectStore`。开发期仓库格式直接演进，不提供
 旧格式自动回退；`repository.json` 为：
 
 ```json
 {
-  "format_version": 7,
+  "format_version": 8,
   "repository_id": "<64-char lowercase id>",
   "object_store": "loose",
   "chunking": "fastcdc"
 }
 ```
 
-完整文件缓存和 checkout/rm journal 不放进上述两个存储接口：缓存按 Manifest ID 共享，
+完整文件缓存和工作区 mutation journal 不放进上述两个存储接口：缓存按 Manifest ID 共享，
 journal 位于各 Workspace 自身文件系统中。逐项接口语义见
-[`local/metadata/README.md`](crates/neoengram/src/local/metadata/README.md)，整体规模预算和迁移顺序
+[`local/metadata/README.md`](crates/neoengram-standalone/src/local/metadata/README.md)，整体规模预算和迁移顺序
 见 [`docs/storage-architecture.md`](docs/storage-architecture.md)，源码职责与未来扩展落点见
 [`docs/code-architecture.md`](docs/code-architecture.md)；实现路线和研究记录见
 [`docs/implementation-plan.md`](docs/implementation-plan.md)。
@@ -355,18 +355,20 @@ neoengram unmount mounts/model
 如果进程在工作区 rename、index 或 HEAD 发布期间退出，后续写命令会拒绝继续并给出恢复提示：
 
 ```bash
-# 验证目标后继续原 checkout，或完成/回滚 rm 的安全状态
+# 验证目标后继续 checkout，或完成/回滚 rm/restore 的安全状态
 neoengram recover
 
 # 回到事务开始前；已经提交 index 的 rm 不允许反向 abort
 neoengram recover --abort
 ```
 
-checkout/rm 会先在当前 Workspace 的 `.neoengram/transactions` 构造并同步完整 draft，再以
-no-replace rename 发布正式 journal 并同步事务目录；工作区第一次 mutation 只会发生在正式
-journal 持久化之后。recover 只恢复正式事务，并清理经过验证的遗留 draft。回滚只移除能按
-FileNode 验证为事务产物的文件，遇到用户后来创建或修改的未知内容会停止，不会递归删除；
-原路径与备份都缺失等不可恢复状态会保留事务并报错。
+checkout/rm/restore 会先在当前 Workspace 的 `.neoengram/transactions` 构造并同步本地事务 draft，
+再以 no-replace rename 发布正式 journal；Engine journal 也必须在第一次工作区 mutation 前进入
+durable 状态。事务返回 `WorktreeReceipt` 后，checkout/rm 先完成 SQLite expected-version CAS 再
+finalize；worktree restore 不发布 Index，`restore --staged` 则独立更新 SQLite Index。recover 恢复
+正式本地事务、清理经过验证的遗留 draft/stale lock，
+并收尾相应 Engine journals。回滚只移除能按 journal fingerprint 和预期内容证明为事务产物的文件；
+遇到用户后来创建或修改的未知内容、原路径与备份同时缺失等歧义时会停止并保留事务。
 
 ## 完整性检查
 
@@ -394,35 +396,42 @@ neoengram gc
 ```text
 .
 ├── crates/
-│   ├── neoengram-core/              # 纯领域模型与格式常量
-│   │   └── src/models/
-│   └── neoengram/                   # neoengram 命令行程序与本地仓库引擎
-│       ├── src/
-│       │   ├── cli/                 # 参数解析与终端输出
-│       │   ├── app/                 # init/add/commit 等用例编排
-│       │   └── local/
-│       │       ├── repository/      # 仓库门面、配置、锁与领域校验
-│       │       ├── worktree/        # 扫描、import 切块、物化与恢复事务
-│       │       ├── metadata/        # SQLite 元数据契约与规范 ID
-│       │       ├── mount/           # FUSE namespace、缓存与平台生命周期
-│       │       ├── objects/         # contract.rs 与 loose.rs 本地对象后端
-│       │       └── fs/              # crash-safe 文件系统原语
-│       └── tests/                   # CLI 与跨模块集成测试
+│   ├── neoengram-core/              # 强类型领域模型、规范 digest 与路径校验
+│   ├── neoengram-engine/            # 结构化用例与执行 ports
+│   ├── neoengram-fs/                # worktree/object/journal/lock 适配器
+│   ├── neoengram-protocol/          # v1 DTO、Schema、JCS digest 与限额
+│   ├── neoengram-standalone/        # SQLite、Repository、FUSE 与本地编排
+│   ├── neoengram-agent/             # 无网络 Agent 状态机与测试适配器
+│   └── neoengram/                   # Clap、cwd 输入和唯一终端渲染入口
+├── services/
+│   └── neoengramd/                  # 无网络中心状态机与内存适配器
 └── docs/                            # 代码与存储架构说明
 ```
 
-依赖保持单向：`cli -> app -> local -> neoengram-core`。远端同步、协议 crate 和服务端只定义了
-未来落点，当前源码树不创建空模块；完整约束见
+生产依赖主要保持单向：`CLI -> standalone -> engine <- agent`，Standalone 同时依赖 fs；protocol
+只依赖 core，`neoengramd` 只依赖 protocol/core。该简图不枚举 CLI 对 core/engine 的直接类型导入；
+Agent 到 `neoengramd` 的依赖仅存在于 dev/test 组合测试。CLI 之外不渲染终端输出；完整约束见
 [`docs/code-architecture.md`](docs/code-architecture.md)。
 
 ## 质量检查
 
 ```bash
 cargo fmt --all -- --check
-cargo test --workspace --all-targets --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo rustdoc -p neoengram-core --all-features -- -D warnings
+bash .github/check-architecture.sh
+cargo run -p neoengram-protocol --example generate_schemas --offline
+cargo test --workspace --all-targets --offline
+cargo clippy --workspace --all-targets --offline -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --offline
+cargo package --locked --allow-dirty -p neoengram-core
+cargo package --locked --allow-dirty --no-verify --exclude-lockfile -p neoengram
 ```
+
+Schema 命令确定性重建已提交的 `crates/neoengram-protocol/schemas/v1`。这组本地命令使用默认
+feature，因而不要求 macOS 已安装 macFUSE SDK/runtime。CI 在 Linux 运行 `--all-features` 测试、
+Clippy、rustdoc 和 MSRV check，并在 Linux、macOS 和 Windows 运行默认 feature 的 workspace 测试。
+最后两个命令分别验证可发布的 core crate 和 CLI `.crate` 归档；CLI 使用 workspace-private 的
+engine/standalone 依赖，因此 `--exclude-lockfile` 只验证归档组装和内容，不证明这些依赖可从
+crates.io 解析或 CLI 可从 registry 安装。
 
 ## 当前范围
 
@@ -430,13 +439,21 @@ cargo rustdoc -p neoengram-core --all-features -- -D warnings
 [`docs/implementation-plan.md`](docs/implementation-plan.md)。本文只保留面向用户的使用说明和
 当前存储边界。
 
-当前版本完成的是本地 format v7、多 Workspace 与固定 Commit 只读 FUSE，不包含网络传输、PostgreSQL 控制面、S3、认证、merge/rebase、
-`push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、分层 Merkle Directory 和流式 Commit
-已经落地；部分非 FUSE 命令和 checkout/rm journal 仍会物化完整 Index，因此当前实现还不能
-宣称所有命令都适用于千万路径。
+当前可运行产品完成的是本地 format v8、多 Workspace 与固定 Commit 只读 FUSE；P0 另提供 protocol、
+Agent 和中心控制面的 library/内存状态机。它不包含 HTTP、PostgreSQL、mTLS、真实 S3、daemon、
+认证、merge/rebase、`push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、分层 Merkle Directory 和流式 Commit
+已经落地；CLI 通过结构化 Request/typed Result facade 调用 Standalone，并拥有全部成功文本与
+错误/结果渲染，Standalone 不再暴露通用 `CommandResult`。
+`commit` 已接入 Engine canonical graph builder/publisher；`checkout`、工作区 `restore` 和工作区 `rm`
+已经接入 `MutationPlan -> durable journal -> WorktreeReceipt`，其中 checkout/rm 在 SQLite expected
+`IndexVersion` CAS 后才 finalize，`recover` 会恢复本地事务并清理 Engine journals。`add`、`commit`、
+`mount`、`checkout`、`rm`、`restore` 和 `recover` 的 Engine `ProgressEvent` 已通过 caller-owned
+`ProgressSink` 透传到 CLI。
+部分非 FUSE compatibility view 和 mutation journal 仍会物化完整 Index，因此当前实现还不能宣称
+所有命令都适用于千万路径。
 
-下一步是对 SQLite 大规模工作负载做基准与调优、实现追加式恢复 journal、对象 fanout/pack，
-以及 PostgreSQL + S3 的缺块协商和 CAS push，并补齐百万文件跨平台实挂基准。目标是
+下一步是继续把 Standalone 过渡物化 view 收敛到 engine 分页 ports，对 SQLite 大规模工作负载做
+基准与调优，并实现 PostgreSQL/HTTP/mTLS/真实 S3 adapters 和 CAS push。目标是
 100 TB payload、千万路径和上亿 Chunk 引用下，命令内存由页大小与有界并发决定，而不是随
 仓库总量增长。
 

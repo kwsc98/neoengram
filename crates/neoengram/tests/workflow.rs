@@ -5,8 +5,11 @@ use std::{
     process::{Command, Output},
 };
 
-use neoengram_core::Commit;
 use rusqlite::{params, Connection};
+
+mod support;
+
+use support::models::Commit;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -203,7 +206,7 @@ fn head_tree(repository: &Path) -> Result<StoredFileSet, Box<dyn Error>> {
     )?;
     let commit: Commit = serde_json::from_slice(&payload)?;
     let mut files = Vec::new();
-    collect_directory_paths(&connection, &commit.tree_hash, "", &mut files)?;
+    collect_directory_paths(&connection, &commit.root_directory_id, "", &mut files)?;
     Ok(StoredFileSet { files })
 }
 

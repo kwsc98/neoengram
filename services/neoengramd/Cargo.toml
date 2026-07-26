@@ -1,0 +1,17 @@
+[package]
+name = "neoengramd"
+description = "Central control-plane state machines for NeoEngram"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+neoengram-core.workspace = true
+neoengram-protocol = { path = "../../crates/neoengram-protocol" }
+
+[lints]
+workspace = true

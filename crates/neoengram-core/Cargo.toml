@@ -14,7 +14,10 @@ keywords.workspace = true
 categories = ["data-structures", "development-tools"]
 
 [dependencies]
+blake3.workspace = true
 serde.workspace = true
+unicode-casefold.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "neoengram-engine"
+description = "Runtime-neutral execution contracts for NeoEngram"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blake3.workspace = true
+fastcdc.workspace = true
+neoengram-core.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

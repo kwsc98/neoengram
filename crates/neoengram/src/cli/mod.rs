@@ -1,10 +1,67 @@
-use std::path::PathBuf;
+use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use neoengram_core::ChunkingStrategy;
+use neoengram_engine::{
+    EngineError, EngineResult, ErrorCode, FailureInjector, FailurePoint, ProgressEvent,
+    ProgressPhase, ProgressSink, ProgressUnit,
+};
+use neoengram_standalone::commands::{
+    self, AddResult, CheckoutHead, CheckoutRecoveryStatus, CheckoutResult, CommitResult,
+    DiagnosticSink, DiffEndpoint, DiffEntry, DiffResult, DiffSummary, ExportMode, ExportResult,
+    FileChangeKind, FileStats, FsckResult, GcResult, HeadPosition, InitResult, LogResult,
+    MountResult, MutationRecoveryStatus, OutputChannel, OutputEvent, PathChange, RecoverResult,
+    RecoveryOutcome, RemoveResult, RepositoryChunking, RestoreResult, ShowResult, StatusResult,
+    UnmountResult, WorkspaceCreateResult, WorkspaceListResult, WorkspaceRemoveResult,
+};
 
-use crate::{app, local::repository::ChunkingPolicy};
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CommandResult {
+    events: Vec<RenderEvent>,
+}
+
+impl CommandResult {
+    fn stdout(message: impl Into<String>) -> Self {
+        let mut result = Self::default();
+        result.push_stdout(message);
+        result
+    }
+
+    fn push_stdout(&mut self, message: impl Into<String>) {
+        self.events.push(RenderEvent {
+            channel: OutputChannel::Stdout,
+            message: message.into(),
+        });
+    }
+
+    fn push_stderr(&mut self, message: impl Into<String>) {
+        self.events.push(RenderEvent {
+            channel: OutputChannel::Stderr,
+            message: message.into(),
+        });
+    }
+
+    fn events(&self) -> &[RenderEvent] {
+        &self.events
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderEvent {
+    channel: OutputChannel,
+    message: String,
+}
+
+impl RenderEvent {
+    const fn channel(&self) -> OutputChannel {
+        self.channel
+    }
+
+    fn message(&self) -> &str {
+        &self.message
+    }
+}
 
 /// 面向 AI 数据集和模型权重的内容寻址版本控制系统。
 #[derive(Debug, Parser)]
@@ -108,7 +165,7 @@ enum RepositoryChunkingArg {
     Mixed,
 }
 
-impl From<RepositoryChunkingArg> for ChunkingPolicy {
+impl From<RepositoryChunkingArg> for RepositoryChunking {
     fn from(value: RepositoryChunkingArg) -> Self {
         match value {
             RepositoryChunkingArg::FastCdc => Self::FastCdc,
@@ -243,7 +300,7 @@ enum ExportModeArg {
     Hardlink,
 }
 
-impl From<ExportModeArg> for app::export::ExportMode {
+impl From<ExportModeArg> for ExportMode {
     fn from(value: ExportModeArg) -> Self {
         match value {
             ExportModeArg::Copy => Self::Copy,
@@ -279,63 +336,677 @@ struct UnmountArgs {
     mountpoint: PathBuf,
 }
 
-pub(crate) async fn run() -> Result<()> {
+pub(crate) async fn run() -> Result<CommandResult> {
+    let terminal = Arc::new(TerminalSink);
+    let _ = neoengram_standalone::install_diagnostic_sink(terminal.clone());
+    let _ = neoengram_standalone::install_failure_injector(Arc::new(
+        EnvironmentFailureInjector::from_env(),
+    ));
+    let cwd = std::env::current_dir().context("无法确定当前工作目录")?;
     match Cli::parse().command {
-        Command::Init(arguments) => {
-            app::init::execute(arguments.path, arguments.chunking.map(Into::into)).await
-        }
+        Command::Init(arguments) => commands::init(commands::InitRequest {
+            cwd,
+            path: arguments.path,
+            chunking: arguments.chunking.map(Into::into),
+        })
+        .await
+        .map(|result| render_init(&result)),
         Command::Workspace(arguments) => match arguments.command {
             WorkspaceCommand::Create(create) => {
-                app::workspace::create(create.name, create.from, create.path, create.branch).await
+                commands::workspace_create(commands::WorkspaceCreateRequest {
+                    cwd,
+                    name: create.name,
+                    from: create.from,
+                    path: create.path,
+                    branch: create.branch,
+                })
+                .await
+                .map(|result| render_workspace_create(&result))
             }
-            WorkspaceCommand::List => app::workspace::list().await,
+            WorkspaceCommand::List => {
+                commands::workspace_list(commands::WorkspaceListRequest { cwd })
+                    .await
+                    .map(|result| render_workspace_list(&result))
+            }
             WorkspaceCommand::Remove(remove) => {
-                app::workspace::remove(remove.name, remove.force).await
+                commands::workspace_remove(commands::WorkspaceRemoveRequest {
+                    cwd,
+                    name: remove.name,
+                    force: remove.force,
+                })
+                .await
+                .map(|result| render_workspace_remove(&result))
             }
         },
         Command::Add(arguments) => {
             let chunking = arguments.chunking.map(ChunkingStrategy::from);
-            if arguments.all {
-                app::add::execute_with_options(arguments.path, true, chunking).await
-            } else {
-                app::add::execute(arguments.path, chunking).await
-            }
+            commands::add(
+                commands::AddRequest {
+                    cwd,
+                    path: arguments.path,
+                    all: arguments.all,
+                    chunking,
+                },
+                terminal.clone(),
+            )
+            .await
+            .map(|result| render_add(&result))
         }
-        Command::Rm(arguments) => {
-            app::rm::execute(arguments.path, arguments.cached, arguments.force).await
-        }
-        Command::Status => app::status::execute().await,
+        Command::Rm(arguments) => commands::remove(
+            commands::RemoveRequest {
+                cwd,
+                path: arguments.path,
+                cached: arguments.cached,
+                force: arguments.force,
+            },
+            terminal.clone(),
+        )
+        .await
+        .map(|result| render_remove(&result)),
+        Command::Status => commands::status(commands::StatusRequest { cwd })
+            .await
+            .map(|result| render_status(&result)),
         Command::Diff(arguments) => {
-            app::diff::execute(arguments.staged, arguments.targets, arguments.stat).await
-        }
-        Command::Commit(arguments) => app::commit::execute(arguments.message).await,
-        Command::Log(arguments) => app::log::execute(arguments.max_count).await,
-        Command::Show(arguments) => app::show::execute(arguments.target).await,
-        Command::Checkout(arguments) => {
-            app::checkout::execute(arguments.target, arguments.force).await
-        }
-        Command::Export(arguments) => {
-            app::export::execute(
-                arguments.target,
-                arguments.destination,
-                arguments.mode.into(),
-            )
+            let stat_only = arguments.stat;
+            commands::diff(commands::DiffRequest {
+                cwd,
+                staged: arguments.staged,
+                targets: arguments.targets,
+            })
             .await
+            .map(|result| render_diff(&result, stat_only))
         }
-        Command::Recover(arguments) => app::recover::execute(arguments.abort).await,
-        Command::Restore(arguments) => {
-            app::restore::execute(arguments.paths, arguments.staged, arguments.force).await
-        }
-        Command::Gc(arguments) => app::gc::execute(arguments.dry_run).await,
-        Command::Fsck => app::fsck::execute().await,
-        Command::Mount(arguments) => {
-            app::mount::execute(
-                arguments.target,
-                arguments.mountpoint,
-                arguments.cache_size_mib,
-            )
+        Command::Commit(arguments) => commands::commit(
+            commands::CommitRequest {
+                cwd,
+                message: arguments.message,
+            },
+            terminal.clone(),
+        )
+        .await
+        .map(|result| render_commit(&result)),
+        Command::Log(arguments) => commands::log(commands::LogRequest {
+            cwd,
+            max_count: arguments.max_count,
+        })
+        .await
+        .map(|result| render_log(&result)),
+        Command::Show(arguments) => commands::show(commands::ShowRequest {
+            cwd,
+            target: arguments.target,
+        })
+        .await
+        .map(|result| render_show(&result)),
+        Command::Checkout(arguments) => commands::checkout(
+            commands::CheckoutRequest {
+                cwd,
+                target: arguments.target,
+                force: arguments.force,
+            },
+            terminal.clone(),
+        )
+        .await
+        .map(|result| render_checkout(&result)),
+        Command::Export(arguments) => commands::export(commands::ExportRequest {
+            cwd,
+            target: arguments.target,
+            destination: arguments.destination,
+            mode: arguments.mode.into(),
+        })
+        .await
+        .map(|result| render_export(&result)),
+        Command::Recover(arguments) => commands::recover(
+            commands::RecoverRequest {
+                cwd,
+                abort: arguments.abort,
+            },
+            terminal.clone(),
+        )
+        .await
+        .map(|result| render_recover(&result)),
+        Command::Restore(arguments) => commands::restore(
+            commands::RestoreRequest {
+                cwd,
+                paths: arguments.paths,
+                staged: arguments.staged,
+                force: arguments.force,
+            },
+            terminal.clone(),
+        )
+        .await
+        .map(|result| render_restore(&result)),
+        Command::Gc(arguments) => commands::gc(commands::GcRequest {
+            cwd,
+            dry_run: arguments.dry_run,
+        })
+        .await
+        .map(|result| render_gc(&result)),
+        Command::Fsck => commands::fsck(commands::FsckRequest { cwd })
             .await
+            .map(|result| render_fsck(&result)),
+        Command::Mount(arguments) => commands::mount(
+            commands::MountRequest {
+                cwd,
+                target: arguments.target,
+                mountpoint: arguments.mountpoint,
+                cache_size_mib: arguments.cache_size_mib,
+            },
+            terminal,
+        )
+        .await
+        .map(|result| render_mount(&result)),
+        Command::Unmount(arguments) => commands::unmount(commands::UnmountRequest {
+            cwd,
+            mountpoint: arguments.mountpoint,
+        })
+        .await
+        .map(|result| render_unmount(&result)),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalSink;
+
+#[derive(Debug)]
+struct EnvironmentFailureInjector {
+    crash_at: Option<String>,
+    pause_at: Option<String>,
+    fail_after_rename: Option<String>,
+}
+
+impl EnvironmentFailureInjector {
+    fn from_env() -> Self {
+        Self {
+            crash_at: std::env::var("NEOENGRAM_TEST_CRASH_AT").ok(),
+            pause_at: std::env::var("NEOENGRAM_TEST_PAUSE_AT").ok(),
+            fail_after_rename: std::env::var("NEOENGRAM_TEST_FAIL_AFTER_RENAME").ok(),
         }
-        Command::Unmount(arguments) => app::mount::unmount(arguments.mountpoint).await,
+    }
+}
+
+impl FailureInjector for EnvironmentFailureInjector {
+    fn check(&self, point: FailurePoint) -> EngineResult<()> {
+        let FailurePoint::Named(name) = point else {
+            return Ok(());
+        };
+        let rename_failure = name == "rename-after-publish-before-sync"
+            && self.fail_after_rename.as_deref() == Some("before-sync");
+        if self.crash_at.as_deref() == Some(name)
+            || self.pause_at.as_deref() == Some(name)
+            || rename_failure
+        {
+            Err(EngineError::new(
+                ErrorCode::InjectedFailure,
+                format!("debug failure point reached: {name}"),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl DiagnosticSink for TerminalSink {
+    fn emit(&self, event: OutputEvent) {
+        render_event(event.channel(), event.message());
+    }
+}
+
+impl ProgressSink for TerminalSink {
+    fn emit(&self, event: &ProgressEvent) -> EngineResult<()> {
+        // Progress is an interactive concern. Suppressing it for redirected stderr also keeps
+        // command-result streams and the debug failure-marker protocol deterministic.
+        if std::io::stderr().is_terminal() {
+            eprintln!("{}", format_progress(event));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn render(result: &CommandResult) {
+    for event in result.events() {
+        render_event(event.channel(), event.message());
+    }
+}
+
+fn render_init(init: &InitResult) -> CommandResult {
+    let action = if init.reinitialized {
+        "Reinitialized existing"
+    } else {
+        "Initialized empty"
+    };
+    CommandResult::stdout(format!(
+        "{action} NeoEngram repository in {}",
+        init.repository_dir.display()
+    ))
+}
+
+fn render_workspace_create(workspace: &WorkspaceCreateResult) -> CommandResult {
+    let position = match &workspace.head {
+        HeadPosition::Branch(reference) => reference.clone(),
+        HeadPosition::Detached(commit_id) => format!("detached {commit_id}"),
+    };
+    CommandResult::stdout(format!(
+        "Created workspace {} at {} ({position})",
+        workspace.name,
+        workspace.root.display()
+    ))
+}
+
+fn render_workspace_list(list: &WorkspaceListResult) -> CommandResult {
+    let mut result = CommandResult::default();
+    for workspace in &list.workspaces {
+        let marker = if workspace.current { "*" } else { " " };
+        let position = match &workspace.head {
+            HeadPosition::Branch(reference) => reference.clone(),
+            HeadPosition::Detached(commit_id) => format!("detached {commit_id}"),
+        };
+        result.push_stdout(format!(
+            "{marker} {}\t{}\t{position}",
+            workspace.name,
+            workspace.root.display()
+        ));
+    }
+    result
+}
+
+fn render_workspace_remove(workspace: &WorkspaceRemoveResult) -> CommandResult {
+    CommandResult::stdout(format!("Removed workspace {}", workspace.name))
+}
+
+fn render_export(export: &ExportResult) -> CommandResult {
+    let mut result = match export.mode {
+        ExportMode::Copy => CommandResult::stdout(format!(
+            "Exported read-only snapshot of {} ({} files) at {}",
+            export.commit_id,
+            export.file_count,
+            export.destination.display()
+        )),
+        ExportMode::HardLink => CommandResult::stdout(format!(
+            "Exported hard-linked read-only view of {} ({} files) at {}",
+            export.commit_id,
+            export.file_count,
+            export.destination.display()
+        )),
+    };
+    if export.mode == ExportMode::HardLink {
+        result.push_stderr(
+            "Warning: hard-linked files share content and permissions with repository objects; modifying the view corrupts every snapshot that references those objects.",
+        );
+    }
+    result
+}
+
+fn render_mount(_mount: &MountResult) -> CommandResult {
+    CommandResult::default()
+}
+
+fn render_unmount(unmount: &UnmountResult) -> CommandResult {
+    CommandResult::stdout(format!("Unmounted {}", unmount.mountpoint.display()))
+}
+
+fn render_status(status: &StatusResult) -> CommandResult {
+    let mut result = CommandResult::default();
+    match &status.head {
+        HeadPosition::Branch(branch) => result.push_stdout(format!("On branch {branch}")),
+        HeadPosition::Detached(commit_id) => {
+            result.push_stdout(format!("HEAD detached at {commit_id}"));
+        }
+    }
+    if status.is_clean() {
+        result.push_stdout("nothing to commit, working tree clean");
+        return result;
+    }
+
+    render_status_changes(&mut result, "Changes to be committed:", &status.staged);
+    render_status_changes(
+        &mut result,
+        "Changes not staged for commit:",
+        &status.unstaged,
+    );
+    if !status.untracked.is_empty() {
+        result.push_stdout("Untracked files:");
+        for path in &status.untracked {
+            result.push_stdout(format!("  {path}"));
+        }
+    }
+    result
+}
+
+fn render_add(add: &AddResult) -> CommandResult {
+    let mut result = CommandResult::default();
+    for file in &add.files {
+        result.push_stdout(format!(
+            "Processed: {}, {} chunks created",
+            file.path, file.chunk_count
+        ));
+    }
+    result
+}
+
+fn render_remove(remove: &RemoveResult) -> CommandResult {
+    let mut result = CommandResult::default();
+    for path in &remove.removed_paths {
+        result.push_stdout(format!("Removed: {path}"));
+    }
+    result
+}
+
+fn render_checkout(checkout: &CheckoutResult) -> CommandResult {
+    let mut result = CommandResult::stdout(format!(
+        "Checked out {} ({} files, {} removed)",
+        checkout.commit_id, checkout.file_count, checkout.removed_count
+    ));
+    match &checkout.head {
+        CheckoutHead::Branch(branch) => {
+            result.push_stdout(format!("HEAD is now on branch {branch}"));
+        }
+        CheckoutHead::Detached(commit_id) => {
+            result.push_stdout(format!("HEAD is now detached at {commit_id}"));
+        }
+    }
+    result
+}
+
+fn render_restore(restore: &RestoreResult) -> CommandResult {
+    let mut result = CommandResult::default();
+    for path in &restore.paths {
+        result.push_stdout(format!("Restored: {path}"));
+    }
+    result
+}
+
+fn render_recover(recover: &RecoverResult) -> CommandResult {
+    let mut result = CommandResult::default();
+    match &recover.outcome {
+        RecoveryOutcome::Nothing => result.push_stdout("No unfinished transaction"),
+        RecoveryOutcome::Checkout { target, status } => match status {
+            CheckoutRecoveryStatus::Aborted => {
+                result.push_stdout(format!("Aborted checkout transaction for {target}"));
+            }
+            CheckoutRecoveryStatus::Recovered => {
+                result.push_stdout(format!("Recovered checkout transaction to {target}"));
+                result.push_stdout(
+                    "Note: recovery replayed checkout with --force semantics; \
+                     conflicting local changes may have been discarded",
+                );
+            }
+        },
+        RecoveryOutcome::Removal {
+            transaction_id,
+            status,
+        } => match status {
+            MutationRecoveryStatus::Completed => {
+                result.push_stdout(format!("Completed rm transaction {transaction_id}"));
+            }
+            MutationRecoveryStatus::RolledBack => {
+                result.push_stdout(format!("Rolled back rm transaction {transaction_id}"));
+                result.push_stdout("Re-run `neoengram rm` if you still want to remove those paths");
+            }
+        },
+        RecoveryOutcome::Restore {
+            transaction_id,
+            status,
+        } => match status {
+            MutationRecoveryStatus::Completed => {
+                result.push_stdout(format!("Completed restore transaction {transaction_id}"));
+            }
+            MutationRecoveryStatus::RolledBack => {
+                result.push_stdout(format!("Rolled back restore transaction {transaction_id}"));
+                result.push_stdout("Re-run `neoengram restore` to restore those paths");
+            }
+        },
+    }
+    result
+}
+
+fn render_commit(commit: &CommitResult) -> CommandResult {
+    let mut result = CommandResult::default();
+    result.push_stdout(format!("Committed {}", commit.commit_id));
+    result.push_stdout(format!(
+        "Directory: {} ({} files)",
+        commit.root_directory_id, commit.file_count
+    ));
+    if commit.detached {
+        result.push_stdout(format!("HEAD is now detached at {}", commit.commit_id));
+    }
+    result
+}
+
+fn render_gc(gc: &GcResult) -> CommandResult {
+    if gc.dry_run {
+        CommandResult::stdout(format!(
+            "GC dry-run: {} unreferenced objects, {} bytes reclaimable",
+            gc.unreferenced_objects, gc.reclaimable_bytes
+        ))
+    } else {
+        CommandResult::stdout(format!(
+            "GC complete: {} objects removed, {} bytes reclaimed",
+            gc.removed_objects, gc.reclaimed_bytes
+        ))
+    }
+}
+
+fn render_status_changes(result: &mut CommandResult, title: &str, changes: &[PathChange]) {
+    if changes.is_empty() {
+        return;
+    }
+    result.push_stdout(title);
+    for change in changes {
+        let kind = match change.kind {
+            FileChangeKind::Added => "added",
+            FileChangeKind::Modified => "modified",
+            FileChangeKind::Deleted => "deleted",
+        };
+        result.push_stdout(format!("  {kind}: {}", change.path));
+    }
+}
+
+fn render_diff(diff: &DiffResult, stat_only: bool) -> CommandResult {
+    let mut result = CommandResult::stdout(format!(
+        "Comparing {} -> {}",
+        diff_endpoint_label(&diff.left),
+        diff_endpoint_label(&diff.right)
+    ));
+    if !stat_only {
+        for entry in &diff.entries {
+            result.push_stdout(render_diff_entry(entry));
+        }
+    }
+    if diff.entries.is_empty() {
+        result.push_stdout("no differences");
+    }
+    result.push_stdout(render_diff_summary(&diff.summary));
+    result
+}
+
+fn diff_endpoint_label(endpoint: &DiffEndpoint) -> &str {
+    match endpoint {
+        DiffEndpoint::Head => "HEAD",
+        DiffEndpoint::Index => "index",
+        DiffEndpoint::Worktree => "worktree",
+        DiffEndpoint::Commit { target, .. } => target,
+    }
+}
+
+fn render_diff_entry(entry: &DiffEntry) -> String {
+    let kind = match entry.kind {
+        FileChangeKind::Added => "added",
+        FileChangeKind::Modified => "modified",
+        FileChangeKind::Deleted => "deleted",
+    };
+    format!(
+        "{kind}: {} ({} -> {}; chunks reused {}, new {}, removed {}, +{} bytes)",
+        entry.path,
+        format_file_stats(entry.before),
+        format_file_stats(entry.after),
+        entry.chunks.reused,
+        entry.chunks.added,
+        entry.chunks.removed,
+        entry.chunks.added_bytes
+    )
+}
+
+fn format_file_stats(stats: Option<FileStats>) -> String {
+    match stats {
+        Some(stats) => format!("{} bytes/{} chunks", stats.bytes, stats.chunks),
+        None => "<absent>".to_owned(),
+    }
+}
+
+fn render_diff_summary(summary: &DiffSummary) -> String {
+    format!(
+        "Summary: {} added, {} modified, {} deleted; {} -> {} bytes; {} reused chunks, {} new chunks, {} removed chunks; estimated new storage {} bytes",
+        summary.added_files,
+        summary.modified_files,
+        summary.deleted_files,
+        summary.removed_bytes,
+        summary.added_bytes,
+        summary.reused_chunks,
+        summary.added_chunks,
+        summary.removed_chunks,
+        summary.estimated_added_bytes
+    )
+}
+
+fn render_log(log: &LogResult) -> CommandResult {
+    let mut result = CommandResult::default();
+    for (position, entry) in log.entries.iter().enumerate() {
+        if position > 0 {
+            result.push_stdout("");
+        }
+        result.push_stdout(format!("commit {}", entry.id));
+        result.push_stdout(format!("Directory: {}", entry.commit.root_directory_id));
+        result.push_stdout(format!("Time:   {}", entry.commit.created_at_unix_ms));
+        result.push_stdout("");
+        result.push_stdout(format!("    {}", entry.commit.message));
+    }
+    result
+}
+
+fn render_show(show: &ShowResult) -> CommandResult {
+    let mut result = CommandResult::default();
+    result.push_stdout(format!("commit {}", show.record.id));
+    result.push_stdout(format!(
+        "Directory: {}",
+        show.record.commit.root_directory_id
+    ));
+    let parent = show
+        .record
+        .commit
+        .parent
+        .map_or_else(|| "<root>".to_owned(), |parent| parent.to_string());
+    result.push_stdout(format!("Parent: {parent}"));
+    result.push_stdout(format!("Time:   {}", show.record.commit.created_at_unix_ms));
+    result.push_stdout("");
+    result.push_stdout(format!("    {}", show.record.commit.message));
+    result.push_stdout("");
+    result.push_stdout(format!("Files ({}):", show.files.len()));
+    for file in &show.files {
+        let chunking = match file.chunking {
+            ChunkingStrategy::FastCdc => "fastcdc",
+            ChunkingStrategy::WholeFile => "whole-file",
+        };
+        result.push_stdout(format!(
+            "{:>12} bytes  {:>6} chunks  {:>10}  {}",
+            file.total_size, file.chunk_count, chunking, file.path
+        ));
+    }
+    result
+}
+
+fn render_fsck(fsck: &FsckResult) -> CommandResult {
+    CommandResult::stdout(format!(
+        "Fsck OK: {} refs, {} commits, {} directories, {} objects",
+        fsck.refs, fsck.commits, fsck.directories, fsck.objects
+    ))
+}
+
+fn render_event(channel: OutputChannel, message: &str) {
+    match channel {
+        OutputChannel::Stdout => println!("{message}"),
+        OutputChannel::Stderr => eprintln!("{message}"),
+    }
+}
+
+fn format_progress(event: &ProgressEvent) -> String {
+    let phase = match event.phase {
+        ProgressPhase::Preparing => "Preparing",
+        ProgressPhase::Scanning => "Scanning",
+        ProgressPhase::Snapshotting => "Snapshotting",
+        ProgressPhase::Chunking => "Chunking",
+        ProgressPhase::PublishingObjects => "Publishing objects",
+        ProgressPhase::BuildingCandidate => "Building candidate",
+        ProgressPhase::Prepared => "Prepared",
+        ProgressPhase::Journaling => "Journaling",
+        ProgressPhase::ApplyingMutation => "Applying mutation",
+        ProgressPhase::Verifying => "Verifying",
+        ProgressPhase::Recovering => "Recovering",
+        ProgressPhase::Completed => "Completed",
+        _ => "Working",
+    };
+    let amount = event.total.map_or_else(
+        || event.completed.to_string(),
+        |total| format!("{}/{total}", event.completed),
+    );
+    let unit = match (event.unit, event.completed == 1 && event.total.is_none()) {
+        (ProgressUnit::Items, true) => "item",
+        (ProgressUnit::Items, false) => "items",
+        (ProgressUnit::Files, true) => "file",
+        (ProgressUnit::Files, false) => "files",
+        (ProgressUnit::Objects, true) => "object",
+        (ProgressUnit::Objects, false) => "objects",
+        (ProgressUnit::Bytes, _) => "bytes",
+        (ProgressUnit::Actions, true) => "action",
+        (ProgressUnit::Actions, false) => "actions",
+        _ => "units",
+    };
+    event.logical_path.as_ref().map_or_else(
+        || format!("{phase}: {amount} {unit}"),
+        |path| format!("{phase}: {amount} {unit} ({path})"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_progress, render_export};
+    use neoengram_core::{CommitId, LogicalPath};
+    use neoengram_engine::{ProgressEvent, ProgressPhase, ProgressUnit};
+    use neoengram_standalone::commands::{ExportMode, ExportResult, OutputChannel};
+
+    #[test]
+    fn formats_engine_progress_only_at_the_cli_boundary() {
+        let event = ProgressEvent::new(ProgressPhase::Chunking, ProgressUnit::Files, 2)
+            .with_total(3)
+            .at_path(
+                "models/weights.bin"
+                    .parse::<LogicalPath>()
+                    .expect("valid path"),
+            );
+
+        assert_eq!(
+            format_progress(&event),
+            "Chunking: 2/3 files (models/weights.bin)"
+        );
+    }
+
+    #[test]
+    fn renders_hardlink_warning_only_at_the_cli_boundary() {
+        let result = render_export(&ExportResult {
+            commit_id: CommitId::from_bytes([7; 32]),
+            destination: "/tmp/neoengram-export".into(),
+            file_count: 3,
+            mode: ExportMode::HardLink,
+        });
+
+        assert_eq!(result.events().len(), 2);
+        assert_eq!(result.events()[0].channel(), OutputChannel::Stdout);
+        assert!(result.events()[0]
+            .message()
+            .starts_with("Exported hard-linked read-only view"));
+        assert_eq!(result.events()[1].channel(), OutputChannel::Stderr);
+        assert_eq!(
+            result.events()[1].message(),
+            "Warning: hard-linked files share content and permissions with repository objects; modifying the view corrupts every snapshot that references those objects."
+        );
     }
 }

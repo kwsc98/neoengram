@@ -1,0 +1,439 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "S3ProtocolSchema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/MissingObjectsRequest"
+    },
+    {
+      "$ref": "#/$defs/MissingObjectsResponse"
+    },
+    {
+      "$ref": "#/$defs/S3ObjectTicket"
+    },
+    {
+      "$ref": "#/$defs/S3TransferCompletion"
+    },
+    {
+      "$ref": "#/$defs/ObjectDurabilityReceipt"
+    }
+  ],
+  "$defs": {
+    "ArtifactId": {
+      "description": "A validated artifact ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "DecimalU64": {
+      "description": "A unsigned integer encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "DurabilityState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "durable"
+            },
+            "storage_version": {
+              "type": "string",
+              "maxLength": 1024,
+              "minLength": 1
+            },
+            "verified_digest": {
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 64,
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "status",
+            "verified_digest",
+            "storage_version"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "maxLength": 96,
+              "minLength": 1
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 4096,
+              "minLength": 1
+            },
+            "status": {
+              "type": "string",
+              "const": "rejected"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "status",
+            "code",
+            "message"
+          ]
+        }
+      ]
+    },
+    "JobId": {
+      "description": "A validated job ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "MissingObjectsRequest": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "objects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WireObjectSpec"
+          },
+          "maxItems": 4096
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "request_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "tenant_id",
+        "project_id",
+        "artifact_id",
+        "session_id",
+        "job_id",
+        "objects",
+        "request_digest"
+      ]
+    },
+    "MissingObjectsResponse": {
+      "type": "object",
+      "properties": {
+        "already_durable": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WireObjectSpec"
+          },
+          "maxItems": 4096
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "missing": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/WireObjectSpec"
+          },
+          "maxItems": 4096
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "request_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "tenant_id",
+        "project_id",
+        "artifact_id",
+        "session_id",
+        "job_id",
+        "request_digest",
+        "missing",
+        "already_durable"
+      ]
+    },
+    "ObjectDurabilityReceipt": {
+      "description": "Authoritative storage-side result returned before metadata may reference an uploaded object.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "checked_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "object": {
+          "$ref": "#/$defs/WireObjectSpec"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "state": {
+          "$ref": "#/$defs/DurabilityState"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "tenant_id",
+        "artifact_id",
+        "session_id",
+        "job_id",
+        "object",
+        "state",
+        "checked_at_unix_ms"
+      ]
+    },
+    "ObjectTicketId": {
+      "description": "A validated object ticket ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ObjectTicketMethod": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "PUT"
+      ]
+    },
+    "ProjectId": {
+      "description": "A validated project ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "S3ObjectTicket": {
+      "description": "A short-lived, exact-object S3-compatible data-plane capability.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "expires_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "issued_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "method": {
+          "$ref": "#/$defs/ObjectTicketMethod"
+        },
+        "object": {
+          "$ref": "#/$defs/WireObjectSpec"
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "required_headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "maxProperties": 64
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "signed_url": {
+          "type": "string",
+          "maxLength": 16384,
+          "minLength": 1
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "ticket_id": {
+          "$ref": "#/$defs/ObjectTicketId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "ticket_id",
+        "tenant_id",
+        "project_id",
+        "artifact_id",
+        "session_id",
+        "job_id",
+        "object",
+        "method",
+        "signed_url",
+        "issued_at_unix_ms",
+        "expires_at_unix_ms"
+      ]
+    },
+    "S3TransferCompletion": {
+      "description": "Agent/client evidence that one ticket transfer finished and was content-verified locally.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "completed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "method": {
+          "$ref": "#/$defs/ObjectTicketMethod"
+        },
+        "object": {
+          "$ref": "#/$defs/WireObjectSpec"
+        },
+        "observed_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "storage_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StorageVersionSchema"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "ticket_id": {
+          "$ref": "#/$defs/ObjectTicketId"
+        },
+        "transferred_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "ticket_id",
+        "tenant_id",
+        "project_id",
+        "artifact_id",
+        "session_id",
+        "job_id",
+        "method",
+        "object",
+        "transferred_bytes",
+        "observed_digest",
+        "completed_at_unix_ms"
+      ]
+    },
+    "SessionId": {
+      "description": "A validated session ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "StorageVersionSchema": {
+      "type": "string",
+      "maxLength": 1024,
+      "minLength": 1
+    },
+    "TenantId": {
+      "description": "A validated tenant ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "UnixMillis": {
+      "description": "A Unix millisecond timestamp encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "WireObjectSpec": {
+      "description": "Object identity and byte length without a physical storage path.",
+      "type": "object",
+      "properties": {
+        "object_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size": {
+          "$ref": "#/$defs/DecimalU64"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "object_id",
+        "size"
+      ]
+    }
+  }
+}
