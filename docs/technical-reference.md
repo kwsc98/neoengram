@@ -1,7 +1,7 @@
 # NeoEngram 技术参考
 
 本文描述 NeoEngram 当前实现的状态模型、仓库策略、全部 CLI 命令、命令之间的区别、
-一致性保证和已知边界。它以当前 format v7 代码为准，面向需要操作仓库、集成命令行或排查
+一致性保证和已知边界。它以当前 `0.2.0`/format v8 代码为准，面向需要操作仓库、集成命令行或排查
 故障的使用者。
 
 源码模块职责见 [`code-architecture.md`](code-architecture.md)，磁盘布局、内容图和锁协议见
@@ -97,7 +97,7 @@ mixed 仓库未显式指定时，已跟踪文件继承原策略，新文件默�
 
 | 命令 | 读取 | 修改 | 核心用途 |
 | --- | --- | --- | --- |
-| `init` | 仓库配置 | 仓库布局 | 创建 format v7 仓库 |
+| `init` | 仓库配置 | 仓库布局 | 创建 format v8 仓库 |
 | `workspace create/list/remove` | Commit、注册表 | Workspace 注册和目录 | 管理共享对象库的可写工作区 |
 | `add` | 工作区 | ObjectStore、Index | 暂存新增或修改 |
 | `add -A` | 工作区 | ObjectStore、Index | 暂存新增、修改和删除 |
@@ -124,7 +124,7 @@ neoengram init [--chunking POLICY] [PATH]
 
 `PATH` 默认是当前目录，不存在时会创建。新仓库先在同一父目录的私有临时目录中完成初始化，
 再以 no-replace rename 发布 `.neoengram`。已有完整仓库可以幂等重新初始化，但旧格式、半成品
-仓库或策略冲突会明确失败。format v7 只使用 SQLite 元数据和 Loose 对象后端，不迁移 v6。
+仓库或策略冲突会明确失败。format v8 只使用 SQLite 元数据和 Loose 对象后端，不迁移 v7 或更旧格式。
 
 ### `workspace create`
 
@@ -379,15 +379,19 @@ NeoEngram 标识，拒绝卸载其他文件系统。
 neoengram recover [--abort]
 ```
 
-只处理当前 Workspace 的正式 checkout/rm journal。没有未完成事务时安全返回。
+只处理当前 Workspace 的正式 checkout/rm/restore transaction，并同步收尾关联的 Engine mutation
+journal。没有未完成事务时安全返回。
 
 - checkout + `recover`：先回滚到可验证起点，再以 force 语义重放原目标；冲突的本地修改可能被丢弃；
 - checkout + `recover --abort`：尝试恢复事务开始前的工作区、Index 和 HEAD；
 - rm 尚未提交 Index：无论是否 `--abort` 都恢复备份并回到开始前；
-- rm 已提交 Index：`recover` 完成清理，`recover --abort` 拒绝逆向回滚。
+- rm 已提交 Index：`recover` 完成清理，`recover --abort` 拒绝逆向回滚；
+- restore 已完整应用：`recover` 完成清理；`recover --abort` 在能够证明原内容时回滚；尚未完整应用的
+  restore 回到开始前。
 
-恢复只删除或替换能够用 journal 和 FileNode 证明身份的事务产物。用户在崩溃后创建或改写的未知
-内容、原文件和备份同时缺失等歧义会导致恢复停止并保留事务，等待人工处理。
+恢复只删除或替换能够用 journal fingerprint 和预期内容证明身份的事务产物。用户在崩溃后创建或改写的未知
+内容、原文件和备份同时缺失等歧义会导致恢复停止并保留事务，等待人工处理。完成恢复后会清理
+active/finalized Engine journals 和可证明过期的 operation lock。
 
 ### `fsck`
 
@@ -440,7 +444,7 @@ restore/recover 独占工作区锁；commit 和 `restore --staged` 只修改元�
 
 不可变数据先发布，HEAD/ref 最后 CAS。工作区文件使用同父目录临时文件、fsync 和原子 rename；
 可能覆盖用户路径的地方会在最终发布点重新检查。进程崩溃会由 OS 释放 advisory lock，磁盘上的
-lock 文件不是永久锁；checkout/rm 的 journal 才是需要 `recover` 处理的持久状态。
+lock 文件不是永久锁；checkout/rm/restore 的 mutation journal 才是需要 `recover` 处理的持久状态。
 
 对象每次关键读取都会核对期望大小和 BLAKE3，包括对象复用、commit 发布、checkout、restore、
 export、FUSE cache miss、fsck 和 GC 删除前验证。损坏会 fail closed，不会用工作区或硬链接内容
@@ -452,9 +456,9 @@ export、FUSE cache miss、fsck 和 GC 删除前验证。损坏会 fail closed�
 
 | 层 | 版本 |
 | --- | --- |
-| Repository format | v7 |
+| Repository format | v8 |
 | Manifest | v4 |
-| Index | v4 |
+| Index | v8 |
 | SQLite schema | v5 |
 
 `repository.json` 保存 format、repository ID、ObjectStore 类型和不可变分块策略。SQLite 保存

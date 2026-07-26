@@ -1,11 +1,21 @@
-//! NeoEngram 的内容模型核心库。
+//! Environment-independent domain models and canonical encoders for NeoEngram.
 //!
-//! 该 crate 只定义与运行环境无关、可序列化的内容模型与格式常量。文件系统、对象存储、
-//! 工作区导入和网络传输由上层组件实现。
+//! This crate owns portable logical paths, strongly typed content identities, immutable metadata
+//! models, paged Index deltas, and their canonical BLAKE3 encodings. It deliberately contains no
+//! filesystem, database, network, process, or terminal integration.
 
+pub mod canonical;
+mod error;
+mod ids;
 pub mod models;
+mod path;
 
+pub use error::{ValidationError, ValidationErrorKind, ValidationResult};
+pub use ids::{CommitId, ContentDigest, DirectoryId, ManifestId, ObjectId};
 pub use models::{
-    Chunk, ChunkingStrategy, Commit, DirectoryEntry, DirectoryEntryKind, FileNode, Index, Tree,
-    INDEX_FORMAT_VERSION,
+    validate_index_mutation_paths, validate_index_snapshot, ChunkRef, ChunkingStrategy, Commit,
+    Directory, DirectoryEntry, DirectoryEntryKind, DirectoryEntryTarget, FileRecord, IndexDelta,
+    IndexDeltaPage, IndexMutation, IndexVersion, Manifest, ObjectSpec, INDEX_FORMAT_VERSION,
+    MAX_INDEX_MUTATIONS_PER_PAGE,
 };
+pub use path::{validate_path_set, LogicalPath, PathComponent};

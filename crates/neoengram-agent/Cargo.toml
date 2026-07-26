@@ -1,0 +1,23 @@
+[package]
+name = "neoengram-agent"
+description = "Durable, transport-independent NeoEngram agent state machine"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+neoengram-core = { path = "../neoengram-core" }
+neoengram-engine = { path = "../neoengram-engine" }
+neoengram-protocol = { path = "../neoengram-protocol" }
+serde.workspace = true
+
+[dev-dependencies]
+neoengramd = { path = "../../services/neoengramd" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

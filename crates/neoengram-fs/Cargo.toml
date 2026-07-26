@@ -1,0 +1,28 @@
+[package]
+name = "neoengram-fs"
+description = "Filesystem and local storage adapters for the NeoEngram engine"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+blake3.workspace = true
+fs2.workspace = true
+neoengram-core.workspace = true
+neoengram-engine = { path = "../neoengram-engine" }
+rustix.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

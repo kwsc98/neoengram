@@ -1,0 +1,1308 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ControlEnvelope",
+  "description": "One control-stream frame. `message.type` is flattened to the top-level JSON object.",
+  "type": "object",
+  "properties": {
+    "message_id": {
+      "$ref": "#/$defs/MessageId"
+    },
+    "protocol_version": {
+      "$ref": "#/$defs/ProtocolVersion",
+      "const": 1
+    },
+    "request_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RequestId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "resource_version": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResourceVersion"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sent_at_unix_ms": {
+      "$ref": "#/$defs/UnixMillis"
+    },
+    "session_generation": {
+      "$ref": "#/$defs/SessionGeneration"
+    },
+    "trace_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TraceId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/AgentHello"
+        },
+        "type": {
+          "type": "string",
+          "const": "agent.hello"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/AgentHeartbeat"
+        },
+        "type": {
+          "type": "string",
+          "const": "agent.heartbeat"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/JobAssignment"
+        },
+        "type": {
+          "type": "string",
+          "const": "job.assignment"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/JobAccepted"
+        },
+        "type": {
+          "type": "string",
+          "const": "job.accepted"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/JobProgress"
+        },
+        "type": {
+          "type": "string",
+          "const": "job.progress"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/JobPrepared"
+        },
+        "type": {
+          "type": "string",
+          "const": "job.prepared"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/JobFailed"
+        },
+        "type": {
+          "type": "string",
+          "const": "job.failed"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/JobDecision"
+        },
+        "type": {
+          "type": "string",
+          "const": "job.decision"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/JobFinalized"
+        },
+        "type": {
+          "type": "string",
+          "const": "job.finalized"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/ControlError"
+        },
+        "type": {
+          "type": "string",
+          "const": "protocol.error"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    }
+  ],
+  "required": [
+    "protocol_version",
+    "message_id",
+    "session_generation",
+    "sent_at_unix_ms"
+  ],
+  "unevaluatedProperties": true,
+  "$defs": {
+    "AddAssignment": {
+      "description": "Complete immutable scope required to execute one managed `add` assignment.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "agent_mount_id": {
+          "$ref": "#/$defs/AgentMountId"
+        },
+        "all": {
+          "type": "boolean"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "artifact_placement_id": {
+          "$ref": "#/$defs/ArtifactPlacementId"
+        },
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "edge_cluster_id": {
+          "$ref": "#/$defs/EdgeClusterId"
+        },
+        "expected_index_version": {
+          "$ref": "#/$defs/WireIndexVersion"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "lease": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LeaseGrant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "owner_generation": {
+          "$ref": "#/$defs/OwnerGeneration"
+        },
+        "paths": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 4096
+        },
+        "placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "playground_id": {
+          "$ref": "#/$defs/PlaygroundId"
+        },
+        "principal": {
+          "$ref": "#/$defs/PrincipalRef"
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "request_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "agent_id",
+        "principal",
+        "tenant_id",
+        "project_id",
+        "artifact_id",
+        "playground_id",
+        "edge_cluster_id",
+        "storage_volume_id",
+        "artifact_placement_id",
+        "placement_generation",
+        "agent_mount_id",
+        "mount_generation",
+        "owner_generation",
+        "expected_index_version",
+        "request_digest",
+        "deadline_unix_ms",
+        "all"
+      ]
+    },
+    "AgentHeartbeat": {
+      "type": "object",
+      "properties": {
+        "acknowledged_resource_version": {
+          "$ref": "#/$defs/ResourceVersion"
+        },
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "mount_observations": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MountObservation"
+          },
+          "maxItems": 4096
+        },
+        "observed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "running_jobs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RunningJobObservation"
+          },
+          "maxItems": 4096
+        },
+        "sequence": {
+          "$ref": "#/$defs/SequenceNumber"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "agent_id",
+        "observed_at_unix_ms",
+        "acknowledged_resource_version",
+        "sequence"
+      ]
+    },
+    "AgentHello": {
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "agent_version": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "uniqueItems": true
+        },
+        "compute_node_id": {
+          "$ref": "#/$defs/ComputeNodeId"
+        },
+        "edge_cluster_id": {
+          "$ref": "#/$defs/EdgeClusterId"
+        },
+        "supported_protocol_versions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProtocolVersion"
+          },
+          "maxItems": 256
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "agent_id",
+        "edge_cluster_id",
+        "compute_node_id",
+        "agent_version",
+        "supported_protocol_versions"
+      ]
+    },
+    "AgentId": {
+      "description": "A validated agent ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AgentMountId": {
+      "description": "A validated agent mount ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ArtifactId": {
+      "description": "A validated artifact ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ArtifactPlacementId": {
+      "description": "A validated artifact placement ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AssignmentGeneration": {
+      "description": "A assignment generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "AssignmentId": {
+      "description": "A validated assignment ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AssignmentOperation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/AddAssignment"
+            },
+            "operation": {
+              "type": "string",
+              "const": "add"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "operation",
+            "input"
+          ]
+        }
+      ]
+    },
+    "ComputeNodeId": {
+      "description": "A validated compute node ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ControlError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "retry_after_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecimalU64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "DecimalU64": {
+      "description": "A unsigned integer encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "DecisionGeneration": {
+      "description": "A decision generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "EdgeClusterId": {
+      "description": "A validated edge cluster ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ErrorCode": {
+      "type": "string",
+      "maxLength": 96,
+      "minLength": 1,
+      "pattern": "^[A-Z][A-Z0-9_]{0,95}$"
+    },
+    "FencingToken": {
+      "description": "A fencing token encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "IndexRevision": {
+      "description": "A index revision encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "JobAccepted": {
+      "type": "object",
+      "properties": {
+        "accepted_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "request_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "accepted_at_unix_ms",
+        "request_digest"
+      ]
+    },
+    "JobAssignment": {
+      "type": "object",
+      "properties": {
+        "assignment": {
+          "$ref": "#/$defs/AssignmentOperation"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "assignment"
+      ]
+    },
+    "JobDecision": {
+      "type": "object",
+      "properties": {
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "decision": {
+          "$ref": "#/$defs/PublishDecision"
+        },
+        "decision_generation": {
+          "$ref": "#/$defs/DecisionGeneration"
+        },
+        "final_state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "decision_generation",
+        "decision",
+        "final_state"
+      ]
+    },
+    "JobFailed": {
+      "description": "Job-bound execution failure reported by an Agent.\n\nThis is distinct from [`ControlError`], which remains the payload of the generic\n`protocol.error` message for failures that are not bound to an assigned job.",
+      "type": "object",
+      "properties": {
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "error": {
+          "$ref": "#/$defs/ControlError"
+        },
+        "failed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "final_state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "stage": {
+          "$ref": "#/$defs/JobFailureStage"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "tenant_id",
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "final_state",
+        "failed_at_unix_ms",
+        "stage",
+        "error"
+      ]
+    },
+    "JobFailureStage": {
+      "type": "string",
+      "enum": [
+        "execution",
+        "object_transfer",
+        "reporting",
+        "finalization"
+      ]
+    },
+    "JobFinalized": {
+      "type": "object",
+      "properties": {
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "decision_generation": {
+          "$ref": "#/$defs/DecisionGeneration"
+        },
+        "final_state": {
+          "$ref": "#/$defs/JobState"
+        },
+        "finalized_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "decision_generation",
+        "final_state",
+        "finalized_at_unix_ms"
+      ]
+    },
+    "JobId": {
+      "description": "A validated job ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "JobPrepared": {
+      "type": "object",
+      "properties": {
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "base_index_version": {
+          "$ref": "#/$defs/WireIndexVersion"
+        },
+        "candidate_digest": {
+          "description": "Digest of this exact report, including publication identity and ordered descriptors.",
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "metadata_batches": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MetadataBatchDescriptor"
+          },
+          "maxItems": 4096
+        },
+        "publication_digest": {
+          "description": "Backend-independent digest of scope, IndexDelta, Manifests, and ObjectSpecs.",
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "result_index_digest": {
+          "description": "Canonical digest expected for the complete Index snapshot after this delta is applied.",
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "base_index_version",
+        "result_index_digest",
+        "publication_digest",
+        "candidate_digest"
+      ]
+    },
+    "JobProgress": {
+      "type": "object",
+      "properties": {
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "bytes_completed": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "files_completed": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "phase": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "retry_after_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecimalU64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "state",
+        "phase",
+        "files_completed",
+        "bytes_completed"
+      ]
+    },
+    "JobState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "assigned",
+        "accepted",
+        "running",
+        "prepared",
+        "publishing",
+        "cancel_requested",
+        "succeeded",
+        "conflicted",
+        "rejected",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "recovery_required",
+        "unknown"
+      ]
+    },
+    "LeaseGrant": {
+      "type": "object",
+      "properties": {
+        "expires_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "fencing_token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FencingToken"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lease_id": {
+          "$ref": "#/$defs/LeaseId"
+        },
+        "mode": {
+          "$ref": "#/$defs/LeaseMode"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "lease_id",
+        "mode",
+        "expires_at_unix_ms"
+      ]
+    },
+    "LeaseId": {
+      "description": "A validated lease ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "LeaseMode": {
+      "type": "string",
+      "enum": [
+        "shared_read",
+        "exclusive_write"
+      ]
+    },
+    "MessageId": {
+      "description": "A validated message ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "MetadataBatchDescriptor": {
+      "description": "Immutable declaration uploaded before any page is accepted into staging.",
+      "type": "object",
+      "properties": {
+        "batch_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "batch_id": {
+          "$ref": "#/$defs/MetadataBatchId"
+        },
+        "encoded_bytes": {
+          "description": "Sum of the canonical JSON byte lengths declared by `pages`.",
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "kind": {
+          "$ref": "#/$defs/MetadataBatchKind"
+        },
+        "page_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "pages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MetadataPageDescriptor"
+          }
+        },
+        "record_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "const": 1,
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "scope": {
+          "$ref": "#/$defs/MetadataBatchScope"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "batch_id",
+        "scope",
+        "kind",
+        "schema_version",
+        "page_count",
+        "record_count",
+        "encoded_bytes",
+        "pages",
+        "batch_digest"
+      ]
+    },
+    "MetadataBatchId": {
+      "description": "A validated metadata batch ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "MetadataBatchKind": {
+      "type": "string",
+      "enum": [
+        "manifest",
+        "index_delta",
+        "object_receipt"
+      ]
+    },
+    "MetadataBatchScope": {
+      "description": "Full authority and CAS scope shared by a descriptor and every page in its batch.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "base_index_version": {
+          "$ref": "#/$defs/WireIndexVersion"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "playground_id": {
+          "$ref": "#/$defs/PlaygroundId"
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "tenant_id",
+        "project_id",
+        "artifact_id",
+        "playground_id",
+        "job_id",
+        "base_index_version"
+      ]
+    },
+    "MetadataPageDescriptor": {
+      "description": "Ordered integrity entry for one page. `encoded_bytes` is the RFC 8785 JCS byte length.",
+      "type": "object",
+      "properties": {
+        "encoded_bytes": {
+          "description": "Byte length of this page's complete RFC 8785 canonical JSON representation.",
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "page_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "page_number": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "record_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "page_number",
+        "record_count",
+        "encoded_bytes",
+        "page_digest"
+      ]
+    },
+    "MountAccessMode": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "read_write"
+      ]
+    },
+    "MountGeneration": {
+      "description": "A mount generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "MountObservation": {
+      "type": "object",
+      "properties": {
+        "access_mode": {
+          "$ref": "#/$defs/MountAccessMode"
+        },
+        "agent_mount_id": {
+          "$ref": "#/$defs/AgentMountId"
+        },
+        "health": {
+          "$ref": "#/$defs/ResourceHealth"
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "agent_mount_id",
+        "storage_volume_id",
+        "mount_generation",
+        "access_mode",
+        "health"
+      ]
+    },
+    "OwnerGeneration": {
+      "description": "A owner generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "PlacementGeneration": {
+      "description": "A placement generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "PlaygroundId": {
+      "description": "A validated playground ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "PrincipalId": {
+      "description": "A validated principal ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "service",
+        "system"
+      ]
+    },
+    "PrincipalRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "kind",
+        "id"
+      ]
+    },
+    "ProjectId": {
+      "description": "A validated project ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ProtocolVersion": {
+      "description": "A numeric protocol revision carried in control envelopes and capability negotiation.\n\nUnlike generations and counters, protocol versions remain JSON numbers because they are small,\nclosed discriminants rather than potentially large monotonic values.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "PublishDecision": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "const": "publish"
+            },
+            "published_index_version": {
+              "$ref": "#/$defs/WireIndexVersion"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "outcome",
+            "published_index_version"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "current_index_version": {
+              "$ref": "#/$defs/WireIndexVersion"
+            },
+            "outcome": {
+              "type": "string",
+              "const": "conflict"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "outcome",
+            "current_index_version"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/ControlError"
+            },
+            "outcome": {
+              "type": "string",
+              "const": "reject"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "outcome",
+            "error"
+          ]
+        }
+      ]
+    },
+    "RequestId": {
+      "description": "A validated request ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ResourceHealth": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "degraded",
+        "unavailable",
+        "unknown"
+      ]
+    },
+    "ResourceVersion": {
+      "description": "A resource version encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "RunningJobObservation": {
+      "type": "object",
+      "properties": {
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "state": {
+          "$ref": "#/$defs/JobState"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "state"
+      ]
+    },
+    "SequenceNumber": {
+      "description": "A sequence number encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "SessionGeneration": {
+      "description": "A session generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "StorageVolumeId": {
+      "description": "A validated storage volume ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TenantId": {
+      "description": "A validated tenant ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TraceId": {
+      "description": "A validated trace ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "UnixMillis": {
+      "description": "A Unix millisecond timestamp encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "WireIndexVersion": {
+      "description": "An IndexVersion adapted to the wire's decimal-string integer rule.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "revision": {
+          "$ref": "#/$defs/IndexRevision"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "revision",
+        "digest"
+      ]
+    }
+  }
+}

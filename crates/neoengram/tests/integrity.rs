@@ -5,8 +5,11 @@ use std::{
     process::{Command, Output},
 };
 
-use neoengram_core::{Chunk, ChunkingStrategy, FileNode, Index, INDEX_FORMAT_VERSION};
 use rusqlite::{params, Connection};
+
+mod support;
+
+use support::models::{Chunk, ChunkingStrategy, FileNode, Index, INDEX_FORMAT_VERSION};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
