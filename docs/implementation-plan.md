@@ -3,8 +3,8 @@
 > 本文是 NeoEngram 的唯一实现路线、能力状态和研究计划记录。代码、架构文档或
 > README 中出现的路线描述应与本文保持一致；如果出现冲突，以本文为准。
 
-最后更新：2026-07-26
-当前阶段：`0.2.0` P0 项目结构、format v8、核心规范类型、协议 v1 及 Agent/中心无网络状态机已实现；生产 transport 与存储适配器待实现
+最后更新：2026-07-27
+当前阶段：`0.2.0` P0 与中心 `AuthorityStore`/SQLite 默认后端已实现；生产 transport、PG/MySQL 与对象存储适配器待实现
 
 ## 1. 产品目标
 
@@ -45,7 +45,8 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 
 当前已确认的边界（远端生产适配器尚未实现）：
 
-- 中心服务采用模块化单体，PostgreSQL 保存元数据，S3-compatible 存储保存 Chunk payload；
+- 中心服务采用模块化单体，逻辑权威经 `AuthorityStore` 与数据库解耦；SQLite 是单进程默认后端，
+  PostgreSQL 是多实例/HA/RLS 目标，S3-compatible 存储保存 Chunk payload；
 - 客户端通过版本化 HTTP API 访问中心服务，不直接访问数据库；
 - 第一版远端同步只围绕 `main`/detached Commit，暂不解决多分支合并；
 - 服务端保存不可变历史，ref/对象的保留和 GC 由中心策略统一管理；
@@ -60,6 +61,7 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 | Chunk payload 位置 | 中心 S3-compatible 存储是 Managed 耐久权威；NFS 仅放 Playground/journal/cache | P0 边界已冻结，真实 SDK 待实现 |
 | API 传输 | protocol 与 transport 分离；后续评估版本化 HTTP/HTTPS | P0 不实现 transport |
 | 一致性模型 | metadata/ref 强一致 CAS；对象经中心确认 Durable 后才能发布 | P0 状态机已实现 |
+| 中心权威存储 | `AuthorityStore` + 默认 SQLite；PG/MySQL 独立实现相同行为契约 | SQLite 单节点已完成，HA/RLS 待实现 |
 | 身份认证 | `Authenticator` 抽象；v1 外部 OIDC/JWKS + Bearer JWT | 已确定设计，待实现 |
 | 授权范围 | tenant → project → artifact → ref；服务端 RBAC，默认拒绝 | 已确定设计，待实现 |
 | 对象访问 | 中心 API 鉴权后签发短期、对象/会话范围的 Signed URL | 已确定设计，待实现 |
@@ -137,9 +139,12 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
   校验完整 canonical ID。
 - Agent 已有 ledger-first 幂等 Assignment 状态机；durable `TransferReceipt` 保存 exact descriptors/pages，
   Prepared 报告在 metadata staging 前由中心持久化，响应丢失时从 Prepared 幂等重放；失败报告统一为
-  protocol `JobFailed`。`neoengramd` 已有 Create/Assign/Report/Stage/Finalize 状态机和内存 CAS。
+  protocol `JobFailed`。`neoengramd` 已有 Create/Assign/Report/Stage/Finalize 状态机、异步
+  `AuthorityStore`、InMemory 契约后端和默认 SQLite 持久 CAS。
   `JobPrepared.candidate_digest` 绑定 assignment identity、base IndexVersion、descriptors 和 extensions。
-  两者都是 library-only，不包含网络或生产持久化。
+  两者都是 library-only，不包含网络；SQLite authority 支持单进程生产持久化，不支持 HA/RLS。
+- SQLite authority 独立使用 `authority.sqlite3`/`authority.lock`，不复用 Standalone format v8；只接受
+  当前 `application_id`、`user_version` 和 record format，不迁移、双读或回退旧格式。
 
 ### 3.3 质量基线
 
@@ -170,7 +175,7 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 | --- | --- | --- |
 | 客户端数据面 | 工作区、Index、FastCDC/WholeFile Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
 | 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | SQLite adapter 继续收敛到 engine 分页 ports |
-| 中心/Agent | protocol v1、Ledger、Job/Assignment/Batch/Finalize 内存状态机 | HTTP/mTLS、PostgreSQL、授权、调度与生产 daemon |
+| 中心/Agent | protocol v1、Ledger、异步 AuthorityStore、中心状态机与 SQLite 单节点权威 | HTTP/mTLS、PostgreSQL HA/RLS、授权、调度与生产 daemon |
 | 远端数据面 | 缺块协商、短期票据、receipt/durability DTO 与 ports | 真实 S3、幂等上传、Signed PUT/GET、对象生命周期 |
 | 读取面 | checkout、权限快照和固定 Commit FUSE | Snapshot、Shard 分页、mount lease、训练读取票据 |
 | 安全治理 | 本地路径安全和普通 Unix 权限 | JWT、RBAC、RLS、租户隔离、审计、密钥轮换和威胁模型 |
@@ -182,8 +187,8 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 
 这些限制不能在分布式服务上线前被忽略：
 
-1. **没有生产远端控制面**：已有版本化 protocol 和内存状态机，但尚无 HTTP、mTLS、PostgreSQL、
-   认证、授权、生产调度或可运行 daemon。
+1. **没有可联网生产控制面**：已有版本化 protocol、状态机和 SQLite 单进程权威，但尚无 HTTP、
+   mTLS、PostgreSQL HA/RLS、认证、授权、生产调度或可运行 daemon。
 2. **没有真实对象同步**：已有缺块/票据/完成/durability DTO，但尚无 S3 SDK、multipart、断点续传、
    fetch/clone/push/pull。
 3. **文件语义不完整**：当前模型未保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。
@@ -212,9 +217,10 @@ neoengram CLI -> standalone -> engine <- agent
 该简图不枚举 CLI 对 core/engine 的直接类型导入；Agent 对 `neoengramd` 的 `dev-dependency` 只用于
 内存端到端组合测试，不属于生产依赖方向。
 
-Managed 运行时的目标数据流是用户 API 进入 `neoengramd`，中心持久化 Job/Assignment 并通过未来
+Managed 运行时的目标数据流是用户 API 进入 `neoengramd`，中心经 `AuthorityStore` 持久化
+Job/Assignment 并通过未来
 transport 交给 Agent；Agent 访问 Playground/NFS 和中心 S3 数据面，结构化结果返回中心做最终 CAS。
-P0 只实现其中与 transport/storage 无关的 protocol、ports 和内存状态机。
+当前已实现 protocol、异步 ports、状态机和 SQLite 单进程 authority；transport 与真实 S3 尚未实现。
 
 边界规则：
 
@@ -277,7 +283,8 @@ Kubernetes 用户 Pod 只挂载本集群 NFS 上单个 Playground/Snapshot 的�
 
 交付：
 
-- 为现有 `services/neoengramd` library 增加 transport、生产配置和 PostgreSQL adapter/migration。
+- 为现有 `services/neoengramd` library 增加 transport、生产配置和独立 PostgreSQL adapter/migration；
+  不共享 SQLite SQL、migration 或物理 schema。
 - 表覆盖 tenants、projects、artifacts、refs、commits、directories、manifests、object catalog、
   role bindings、sessions、snapshots、leases/holds 和 append-only audit。
 - 实现外部 OIDC/JWKS Bearer JWT 验证、User/Service principal、RBAC、tenant context 和 PostgreSQL
@@ -634,3 +641,4 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-24 | 在跨集群总图中把每个集群分为系统组件、居中 NFS、业务 Pod 三区，并补充 PodMountBinding | 保留 Pod 精确视图挂载与基础设施边界；当时的 NFS object-root/Gateway 假设已被 2026-07-26 中心 S3 权威决策取代 |
 | 2026-07-26 | 完成 `0.2.0` P0 crate/protocol/state-machine 改造并升级 format v8 | core 统一 typed IDs/canonical digest；CLI/Standalone/engine/fs 分层；Agent/中心提供无网络内存组合测试 |
 | 2026-07-26 | 将 Managed 对象 durability authority 固定为中心 S3，NFS 仅放 Playground/journal/cache | Finalize 必须经过 missing upload、中心 durability、MetadataBatch 完整性和 IndexVersion CAS；避免把 NFS/cache/receipt 当成权威 |
+| 2026-07-27 | 合并 R1.1/R1.2，完成 `AuthorityStore` 与默认 SQLite 中心权威后端 | 全部中心端口可跨重开恢复并运行同一后端契约；SQLite 限单进程且无 RLS/HA，PG/MySQL 后端保持独立 schema/migration |

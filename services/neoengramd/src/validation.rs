@@ -200,7 +200,7 @@ pub(crate) fn validate_terminal_state(state: JobState) -> CentralResult<()> {
     }
 }
 
-pub(crate) fn validate_staged_metadata(
+pub(crate) async fn validate_staged_metadata(
     job: &JobRecord,
     stager: &dyn MetadataBatchStager,
     catalog: &dyn ObjectCatalog,
@@ -227,7 +227,8 @@ pub(crate) fn validate_staged_metadata(
 
     for declared in &prepared.metadata_batches {
         let staged = stager
-            .get(&assignment.tenant_id, &declared.batch_id)?
+            .get(&assignment.tenant_id, &declared.batch_id)
+            .await?
             .ok_or_else(|| {
                 invalid(
                     CentralErrorCode::BatchIncomplete,
@@ -375,7 +376,8 @@ pub(crate) fn validate_staged_metadata(
 
     for (object_id, expected_size) in manifest_objects {
         let durable = catalog
-            .durable_object(&assignment.tenant_id, &assignment.artifact_id, object_id)?
+            .durable_object(&assignment.tenant_id, &assignment.artifact_id, object_id)
+            .await?
             .ok_or_else(|| {
                 invalid(
                     CentralErrorCode::ObjectNotDurable,

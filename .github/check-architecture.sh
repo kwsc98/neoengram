@@ -129,10 +129,19 @@ assert_manifest_excludes \
   'neoengram-(engine|fs|standalone|agent)|rusqlite|reqwest|hyper|axum|sqlx|diesel|aws-sdk'
 assert_manifest_excludes \
   crates/neoengram-agent/Cargo.toml \
-  'neoengram-standalone'
+  'neoengram-standalone|rusqlite|sqlx|diesel'
 assert_manifest_excludes \
   services/neoengramd/Cargo.toml \
-  'neoengram-(engine|fs|standalone)|rusqlite|reqwest|hyper|axum|sqlx|diesel|aws-sdk'
+  'neoengram-(engine|fs|standalone)|rusqlite|reqwest|hyper|axum|diesel|aws-sdk'
+for manifest in \
+  crates/neoengram-core/Cargo.toml \
+  crates/neoengram-engine/Cargo.toml \
+  crates/neoengram-fs/Cargo.toml \
+  crates/neoengram-standalone/Cargo.toml; do
+  assert_manifest_excludes "$manifest" 'sqlx|diesel'
+done
+rg -q '^sqlx = \{ workspace = true, optional = true \}$' services/neoengramd/Cargo.toml || \
+  fail "SQLx must remain an optional neoengramd authority adapter dependency"
 rg -q '^neoengram-engine\.workspace = true$' crates/neoengram-standalone/Cargo.toml || \
   fail "Standalone must compose the execution engine"
 rg -q '^neoengram-fs\.workspace = true$' crates/neoengram-standalone/Cargo.toml || \

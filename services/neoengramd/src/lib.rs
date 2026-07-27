@@ -1,14 +1,16 @@
 //! Transport- and storage-independent NeoEngram central control plane.
 //!
-//! This crate deliberately contains no daemon binary, HTTP stack, database driver, execution
-//! engine, or filesystem adapter. It owns the authoritative managed-Add state machine and ports
-//! that production infrastructure can implement later.
+//! This crate contains no daemon binary, HTTP stack, execution engine, or filesystem adapter. It
+//! owns the authoritative managed-Add state machine, backend-neutral storage ports, and the
+//! default single-process SQLite authority adapter.
 
 mod control_plane;
 mod error;
 mod memory;
 mod model;
 mod ports;
+#[cfg(feature = "authority-sqlite")]
+mod sqlite;
 mod validation;
 
 pub use control_plane::ControlPlane;
@@ -20,3 +22,5 @@ pub use memory::{
 };
 pub use model::*;
 pub use ports::*;
+#[cfg(feature = "authority-sqlite")]
+pub use sqlite::{open_sqlite_authority, SqliteAuthority, SqliteAuthorityConfig};
