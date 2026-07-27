@@ -1,8 +1,9 @@
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Barrier,
+    Arc,
 };
 
+use async_trait::async_trait;
 use neoengram_core::{
     ChunkRef, ChunkingStrategy, ContentDigest, FileRecord, IndexVersion, LogicalPath, Manifest,
     ObjectId,
@@ -20,14 +21,15 @@ use neoengram_protocol::{
 };
 use neoengramd::{
     Action, Actor, AddJobSpec, AgentReport, AssignJobRequest, AssignmentOutbox,
-    AssignmentPublishOutcome, AssignmentReserveOutcome, AssignmentTarget, AuthorizationRequest,
-    Authorizer, CentralError, CentralErrorCode, CentralResult, ControlPlane, CreateAddJobRequest,
-    ExpireAddJobRequest, FinalizeAddRequest, InMemoryAssignmentOutbox, InMemoryComponents,
-    InMemoryJobRepository, IndexKey, IndexPublishOutcome, IndexPublishRequest, IndexPublisher,
-    JobInsertOutcome, JobKey, JobRecord, JobRepository, MetadataBatchStager,
-    MetadataBatchSubmission, ObjectCatalog, ReceiveReportRequest, ResumePublicationRequest,
-    StageMetadataBatchRequest,
+    AssignmentPublishOutcome, AssignmentReserveOutcome, AssignmentTarget, AuthorityCapabilities,
+    AuthorityStore, AuthorizationRequest, Authorizer, CentralError, CentralErrorCode,
+    CentralResult, ControlPlane, CreateAddJobRequest, ExpireAddJobRequest, FinalizeAddRequest,
+    InMemoryAssignmentOutbox, InMemoryComponents, InMemoryJobRepository, IndexKey,
+    IndexPublishOutcome, IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobKey, JobRecord,
+    JobRepository, MetadataBatchStager, MetadataBatchSubmission, ObjectCatalog,
+    ReceiveReportRequest, ResumePublicationRequest, StageMetadataBatchRequest,
 };
+use tokio::sync::Barrier;
 
 struct Scenario {
     components: InMemoryComponents,
@@ -45,7 +47,7 @@ struct Scenario {
 }
 
 impl Scenario {
-    fn stage_all(&self) {
+    async fn stage_all(&self) {
         for descriptor in &self.descriptors {
             let first = self
                 .control
@@ -55,6 +57,7 @@ impl Scenario {
                     agent_id: self.target.agent_id.clone(),
                     submission: MetadataBatchSubmission::Descriptor(descriptor.clone()),
                 })
+                .await
                 .unwrap();
             assert!(!first.replayed);
             self.components.clock.advance(1).unwrap();
@@ -66,6 +69,7 @@ impl Scenario {
                     agent_id: self.target.agent_id.clone(),
                     submission: MetadataBatchSubmission::Descriptor(descriptor.clone()),
                 })
+                .await
                 .unwrap();
             assert!(replay.replayed);
         }
@@ -78,6 +82,7 @@ impl Scenario {
                     agent_id: self.target.agent_id.clone(),
                     submission: MetadataBatchSubmission::Page(page.clone()),
                 })
+                .await
                 .unwrap();
             assert!(!first.replayed);
             assert_eq!(first.complete, page.page_number + 1 == page.page_count);
@@ -90,12 +95,13 @@ impl Scenario {
                     agent_id: self.target.agent_id.clone(),
                     submission: MetadataBatchSubmission::Page(page.clone()),
                 })
+                .await
                 .unwrap();
             assert!(replay.replayed);
         }
     }
 
-    fn mark_object_durable(&self) {
+    async fn mark_object_durable(&self) {
         let objects = self
             .pages
             .iter()
@@ -115,15 +121,22 @@ impl Scenario {
                     storage_version: "s3-version-1".to_owned(),
                     extensions: Extensions::new(),
                 },
-            );
+            )
+            .await;
         }
     }
 
-    fn observe_object(&self, state: DurabilityState) {
-        self.observe_object_spec(self.object_id, self.object_size, state);
+    async fn observe_object(&self, state: DurabilityState) {
+        self.observe_object_spec(self.object_id, self.object_size, state)
+            .await;
     }
 
-    fn observe_object_spec(&self, object_id: ObjectId, object_size: u64, state: DurabilityState) {
+    async fn observe_object_spec(
+        &self,
+        object_id: ObjectId,
+        object_size: u64,
+        state: DurabilityState,
+    ) {
         self.components
             .objects
             .record_durability(&ObjectDurabilityReceipt {
@@ -140,6 +153,7 @@ impl Scenario {
                 checked_at_unix_ms: UnixMillis::new(400),
                 extensions: Extensions::new(),
             })
+            .await
             .unwrap();
     }
 
@@ -160,51 +174,59 @@ impl Scenario {
     }
 }
 
-#[test]
-fn create_rejects_a_request_digest_that_does_not_bind_the_operation() {
+#[tokio::test]
+async fn create_rejects_a_request_digest_that_does_not_bind_the_operation() {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
-    let (actor, mut spec, _) = inputs(&components);
+    let (actor, mut spec, _) = inputs(&components).await;
     spec.paths = vec![LogicalPath::parse("dataset/tampered.bin").unwrap()];
 
     let error = control
         .create_add_job(CreateAddJobRequest { actor, spec })
+        .await
         .unwrap_err();
 
     assert_eq!(error.code(), CentralErrorCode::MetadataInvalid);
     assert!(components.jobs.all().unwrap().is_empty());
 }
 
-#[test]
-fn concurrent_identical_create_is_insert_once_and_replay_elsewhere() {
+#[tokio::test]
+async fn concurrent_identical_create_is_insert_once_and_replay_elsewhere() {
     const CALLERS: usize = 8;
 
     let components = InMemoryComponents::new(100);
     let jobs = Arc::new(CreateRaceRepository::new(components.jobs.clone(), CALLERS));
     let control = Arc::new(ControlPlane::new(
         components.authorizer.clone(),
-        jobs,
-        components.outbox.clone(),
-        components.metadata.clone(),
-        components.objects.clone(),
-        components.publisher.clone(),
-        components.audit.clone(),
+        AuthorityStore::from_parts(
+            jobs,
+            components.outbox.clone(),
+            components.metadata.clone(),
+            components.objects.clone(),
+            components.publisher.clone(),
+            components.audit.clone(),
+            AuthorityCapabilities::IN_MEMORY,
+        ),
         components.clock.clone(),
     ));
-    let (actor, spec, _) = inputs(&components);
+    let (actor, spec, _) = inputs(&components).await;
 
     let handles = (0..CALLERS)
         .map(|_| {
             let control = control.clone();
             let actor = actor.clone();
             let spec = spec.clone();
-            std::thread::spawn(move || control.create_add_job(CreateAddJobRequest { actor, spec }))
+            tokio::spawn(async move {
+                control
+                    .create_add_job(CreateAddJobRequest { actor, spec })
+                    .await
+            })
         })
         .collect::<Vec<_>>();
-    let results = handles
-        .into_iter()
-        .map(|handle| handle.join().unwrap().unwrap())
-        .collect::<Vec<_>>();
+    let mut results = Vec::with_capacity(CALLERS);
+    for handle in handles {
+        results.push(handle.await.unwrap().unwrap());
+    }
 
     assert_eq!(results.iter().filter(|result| !result.replayed).count(), 1);
     assert_eq!(
@@ -215,21 +237,24 @@ fn concurrent_identical_create_is_insert_once_and_replay_elsewhere() {
     assert_eq!(components.jobs.all().unwrap().len(), 1);
 }
 
-#[test]
-fn concurrent_create_with_another_spec_is_a_stable_job_id_conflict() {
+#[tokio::test]
+async fn concurrent_create_with_another_spec_is_a_stable_job_id_conflict() {
     let components = InMemoryComponents::new(100);
     let jobs = Arc::new(CreateRaceRepository::new(components.jobs.clone(), 2));
     let control = Arc::new(ControlPlane::new(
         components.authorizer.clone(),
-        jobs,
-        components.outbox.clone(),
-        components.metadata.clone(),
-        components.objects.clone(),
-        components.publisher.clone(),
-        components.audit.clone(),
+        AuthorityStore::from_parts(
+            jobs,
+            components.outbox.clone(),
+            components.metadata.clone(),
+            components.objects.clone(),
+            components.publisher.clone(),
+            components.audit.clone(),
+            AuthorityCapabilities::IN_MEMORY,
+        ),
         components.clock.clone(),
     ));
-    let (actor, first_spec, _) = inputs(&components);
+    let (actor, first_spec, _) = inputs(&components).await;
     let mut second_spec = first_spec.clone();
     second_spec.paths = vec![LogicalPath::parse("dataset/other.bin").unwrap()];
     second_spec.request_digest = second_spec.computed_request_digest().unwrap();
@@ -237,9 +262,14 @@ fn concurrent_create_with_another_spec_is_a_stable_job_id_conflict() {
     let handles = [first_spec.clone(), second_spec.clone()].map(|spec| {
         let control = control.clone();
         let actor = actor.clone();
-        std::thread::spawn(move || control.create_add_job(CreateAddJobRequest { actor, spec }))
+        tokio::spawn(async move {
+            control
+                .create_add_job(CreateAddJobRequest { actor, spec })
+                .await
+        })
     });
-    let results = handles.map(|handle| handle.join().unwrap());
+    let [first, second] = handles;
+    let results = [first.await.unwrap(), second.await.unwrap()];
     let winner = results
         .iter()
         .find_map(|result| result.as_ref().ok())
@@ -263,15 +293,16 @@ fn concurrent_create_with_another_spec_is_a_stable_job_id_conflict() {
             actor,
             spec: losing_spec,
         })
+        .await
         .unwrap_err();
     assert_eq!(repeated.code(), CentralErrorCode::JobIdReused);
 }
 
-#[test]
-fn assignment_id_conflict_leaves_job_queued_and_a_new_id_recovers() {
+#[tokio::test]
+async fn assignment_id_conflict_leaves_job_queued_and_a_new_id_recovers() {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
-    let (actor, first_spec, target) = inputs(&components);
+    let (actor, first_spec, target) = inputs(&components).await;
     let mut second_spec = first_spec.clone();
     second_spec.job_id = neoengram_protocol::JobId::new("job-b").unwrap();
     second_spec.request_digest = second_spec.computed_request_digest().unwrap();
@@ -282,6 +313,7 @@ fn assignment_id_conflict_leaves_job_queued_and_a_new_id_recovers() {
                 actor: actor.clone(),
                 spec: spec.clone(),
             })
+            .await
             .unwrap();
     }
     control
@@ -291,6 +323,7 @@ fn assignment_id_conflict_leaves_job_queued_and_a_new_id_recovers() {
             job_id: first_spec.job_id.clone(),
             target: target.clone(),
         })
+        .await
         .unwrap();
 
     let conflict = control
@@ -300,6 +333,7 @@ fn assignment_id_conflict_leaves_job_queued_and_a_new_id_recovers() {
             job_id: second_spec.job_id.clone(),
             target: target.clone(),
         })
+        .await
         .unwrap_err();
     assert_eq!(conflict.code(), CentralErrorCode::JobIdReused);
     let still_queued = components
@@ -308,6 +342,7 @@ fn assignment_id_conflict_leaves_job_queued_and_a_new_id_recovers() {
             second_spec.tenant_id.clone(),
             second_spec.job_id.clone(),
         ))
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(still_queued.state, JobState::Queued);
@@ -323,32 +358,37 @@ fn assignment_id_conflict_leaves_job_queued_and_a_new_id_recovers() {
             job_id: second_spec.job_id,
             target: retry_target,
         })
+        .await
         .unwrap();
     assert!(!recovered.replayed);
     assert_eq!(recovered.job.state, JobState::Assigned);
     assert_eq!(components.outbox.messages().unwrap().len(), 2);
 }
 
-#[test]
-fn concurrent_identical_assignment_converges_to_one_delivery() {
+#[tokio::test]
+async fn concurrent_identical_assignment_converges_to_one_delivery() {
     let components = InMemoryComponents::new(100);
-    let (actor, spec, target) = inputs(&components);
+    let (actor, spec, target) = inputs(&components).await;
     components
         .control_plane()
         .create_add_job(CreateAddJobRequest {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
     let jobs = Arc::new(AssignmentRaceRepository::new(components.jobs.clone(), 2));
     let control = Arc::new(ControlPlane::new(
         components.authorizer.clone(),
-        jobs,
-        components.outbox.clone(),
-        components.metadata.clone(),
-        components.objects.clone(),
-        components.publisher.clone(),
-        components.audit.clone(),
+        AuthorityStore::from_parts(
+            jobs,
+            components.outbox.clone(),
+            components.metadata.clone(),
+            components.objects.clone(),
+            components.publisher.clone(),
+            components.audit.clone(),
+            AuthorityCapabilities::IN_MEMORY,
+        ),
         components.clock.clone(),
     ));
 
@@ -361,13 +401,13 @@ fn concurrent_identical_assignment_converges_to_one_delivery() {
                 job_id: spec.job_id.clone(),
                 target: target.clone(),
             };
-            std::thread::spawn(move || control.assign_job(request))
+            tokio::spawn(async move { control.assign_job(request).await })
         })
         .collect::<Vec<_>>();
-    let results = handles
-        .into_iter()
-        .map(|handle| handle.join().unwrap().unwrap())
-        .collect::<Vec<_>>();
+    let mut results = Vec::with_capacity(2);
+    for handle in handles {
+        results.push(handle.await.unwrap().unwrap());
+    }
 
     assert_eq!(results.iter().filter(|result| !result.replayed).count(), 1);
     assert_eq!(results.iter().filter(|result| result.replayed).count(), 1);
@@ -377,26 +417,30 @@ fn concurrent_identical_assignment_converges_to_one_delivery() {
     assert_eq!(components.outbox.messages().unwrap().len(), 1);
 }
 
-#[test]
-fn reserved_assignment_is_invisible_until_the_job_write_succeeds() {
+#[tokio::test]
+async fn reserved_assignment_is_invisible_until_the_job_write_succeeds() {
     let components = InMemoryComponents::new(100);
     let jobs = Arc::new(FailAssignmentWriteOnce::new(components.jobs.clone()));
     let control = ControlPlane::new(
         components.authorizer.clone(),
-        jobs,
-        components.outbox.clone(),
-        components.metadata.clone(),
-        components.objects.clone(),
-        components.publisher.clone(),
-        components.audit.clone(),
+        AuthorityStore::from_parts(
+            jobs,
+            components.outbox.clone(),
+            components.metadata.clone(),
+            components.objects.clone(),
+            components.publisher.clone(),
+            components.audit.clone(),
+            AuthorityCapabilities::IN_MEMORY,
+        ),
         components.clock.clone(),
     );
-    let (actor, spec, mut target) = inputs(&components);
+    let (actor, spec, mut target) = inputs(&components).await;
     control
         .create_add_job(CreateAddJobRequest {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
 
     let error = control
@@ -406,12 +450,14 @@ fn reserved_assignment_is_invisible_until_the_job_write_succeeds() {
             job_id: spec.job_id.clone(),
             target: target.clone(),
         })
+        .await
         .unwrap_err();
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
     assert!(components.outbox.messages().unwrap().is_empty());
     let queued = components
         .jobs
         .get(&JobKey::new(spec.tenant_id.clone(), spec.job_id.clone()))
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(queued.state, JobState::Queued);
@@ -425,6 +471,7 @@ fn reserved_assignment_is_invisible_until_the_job_write_succeeds() {
             job_id: spec.job_id,
             target,
         })
+        .await
         .unwrap();
     assert_eq!(assigned.job.state, JobState::Assigned);
     assert_eq!(
@@ -433,11 +480,11 @@ fn reserved_assignment_is_invisible_until_the_job_write_succeeds() {
     );
 }
 
-#[test]
-fn create_and_assign_preserve_digest_bound_operation_extensions() {
+#[tokio::test]
+async fn create_and_assign_preserve_digest_bound_operation_extensions() {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
-    let (actor, mut spec, target) = inputs(&components);
+    let (actor, mut spec, target) = inputs(&components).await;
     spec.extensions
         .insert("future_add_mode".to_owned(), "strict".into());
     spec.request_digest = spec.computed_request_digest().unwrap();
@@ -447,6 +494,7 @@ fn create_and_assign_preserve_digest_bound_operation_extensions() {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
     let assigned = control
         .assign_job(AssignJobRequest {
@@ -455,6 +503,7 @@ fn create_and_assign_preserve_digest_bound_operation_extensions() {
             job_id: spec.job_id,
             target,
         })
+        .await
         .unwrap();
     let neoengram_protocol::AssignmentOperation::Add { input, .. } = assigned.assignment.assignment;
 
@@ -468,8 +517,8 @@ fn create_and_assign_preserve_digest_bound_operation_extensions() {
     input.validate().unwrap();
 }
 
-#[test]
-fn metadata_staging_scopes_reused_batch_ids_by_tenant() {
+#[tokio::test]
+async fn metadata_staging_scopes_reused_batch_ids_by_tenant() {
     let stager = neoengramd::InMemoryMetadataBatchStager::default();
     let batch_id = MetadataBatchId::new("shared-batch-id").unwrap();
     for tenant in ["tenant-a", "tenant-b"] {
@@ -502,22 +551,24 @@ fn metadata_staging_scopes_reused_batch_ids_by_tenant() {
             Extensions::new(),
         )
         .unwrap();
-        assert!(!stager.stage_descriptor(descriptor).unwrap());
+        assert!(!stager.stage_descriptor(descriptor).await.unwrap());
     }
 
     assert!(stager
         .get(&TenantId::new("tenant-a").unwrap(), &batch_id)
+        .await
         .unwrap()
         .is_some());
     assert!(stager
         .get(&TenantId::new("tenant-b").unwrap(), &batch_id)
+        .await
         .unwrap()
         .is_some());
 }
 
-#[test]
-fn complete_managed_add_is_idempotent_at_every_boundary() {
-    let scenario = scenario();
+#[tokio::test]
+async fn complete_managed_add_is_idempotent_at_every_boundary() {
+    let scenario = scenario().await;
 
     let create_replay = scenario
         .control
@@ -525,6 +576,7 @@ fn complete_managed_add_is_idempotent_at_every_boundary() {
             actor: scenario.actor.clone(),
             spec: scenario.spec.clone(),
         })
+        .await
         .unwrap();
     assert!(create_replay.replayed);
 
@@ -536,6 +588,7 @@ fn complete_managed_add_is_idempotent_at_every_boundary() {
             job_id: scenario.spec.job_id.clone(),
             target: scenario.target.clone(),
         })
+        .await
         .unwrap();
     assert!(assign_replay.replayed);
     assert_eq!(scenario.components.outbox.messages().unwrap().len(), 1);
@@ -548,6 +601,7 @@ fn complete_managed_add_is_idempotent_at_every_boundary() {
                 agent_id: scenario.target.agent_id.clone(),
                 report: AgentReport::Accepted(scenario.accepted.clone()),
             })
+            .await
             .unwrap()
             .replayed
     );
@@ -559,6 +613,7 @@ fn complete_managed_add_is_idempotent_at_every_boundary() {
                 agent_id: scenario.target.agent_id.clone(),
                 report: AgentReport::Progress(scenario.progress.clone()),
             })
+            .await
             .unwrap()
             .replayed
     );
@@ -570,15 +625,17 @@ fn complete_managed_add_is_idempotent_at_every_boundary() {
                 agent_id: scenario.target.agent_id.clone(),
                 report: AgentReport::Prepared(scenario.prepared.clone()),
             })
+            .await
             .unwrap()
             .replayed
     );
 
-    scenario.stage_all();
-    scenario.mark_object_durable();
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
     let result = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
     assert_eq!(result.job.state, JobState::Succeeded);
     assert!(!result.replayed);
@@ -615,6 +672,7 @@ fn complete_managed_add_is_idempotent_at_every_boundary() {
     let finalize_replay = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
     assert!(finalize_replay.replayed);
     assert_eq!(finalize_replay.decision, result.decision);
@@ -627,6 +685,7 @@ fn complete_managed_add_is_idempotent_at_every_boundary() {
             agent_id: scenario.target.agent_id.clone(),
             report: AgentReport::Finalized(result.finalized.clone()),
         })
+        .await
         .unwrap();
     assert!(!first_ack.replayed);
     let second_ack = scenario
@@ -636,13 +695,14 @@ fn complete_managed_add_is_idempotent_at_every_boundary() {
             agent_id: scenario.target.agent_id.clone(),
             report: AgentReport::Finalized(result.finalized),
         })
+        .await
         .unwrap();
     assert!(second_ack.replayed);
 }
 
-#[test]
-fn finalize_reassembles_manifest_fragments_across_metadata_pages() {
-    let scenario = scenario_with_fragmented_manifest();
+#[tokio::test]
+async fn finalize_reassembles_manifest_fragments_across_metadata_pages() {
+    let scenario = scenario_with_fragmented_manifest().await;
     let manifest_pages = scenario
         .pages
         .iter()
@@ -650,11 +710,12 @@ fn finalize_reassembles_manifest_fragments_across_metadata_pages() {
         .count();
     assert_eq!(manifest_pages, 2);
 
-    scenario.stage_all();
-    scenario.mark_object_durable();
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
     let result = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
 
     assert_eq!(result.job.state, JobState::Succeeded);
@@ -668,15 +729,16 @@ fn finalize_reassembles_manifest_fragments_across_metadata_pages() {
     assert_eq!(snapshot.records[0].chunk_count, 2);
 }
 
-#[test]
-fn finalize_rejects_an_expired_assignment_lease_before_cas() {
-    let scenario = scenario_with_expiring_lease();
-    scenario.stage_all();
-    scenario.mark_object_durable();
+#[tokio::test]
+async fn finalize_rejects_an_expired_assignment_lease_before_cas() {
+    let scenario = scenario_with_expiring_lease().await;
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
     let version_before = scenario
         .components
         .publisher
         .current_version(&scenario.index_key())
+        .await
         .unwrap();
     let lease_expiry = scenario.target.lease.as_ref().unwrap().expires_at_unix_ms;
     scenario.components.clock.set(lease_expiry.get());
@@ -684,6 +746,7 @@ fn finalize_rejects_an_expired_assignment_lease_before_cas() {
     let error = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap_err();
 
     assert_eq!(error.code(), CentralErrorCode::DeadlineExceeded);
@@ -692,6 +755,7 @@ fn finalize_rejects_an_expired_assignment_lease_before_cas() {
             .components
             .publisher
             .current_version(&scenario.index_key())
+            .await
             .unwrap(),
         version_before
     );
@@ -703,6 +767,7 @@ fn finalize_rejects_an_expired_assignment_lease_before_cas() {
                 scenario.spec.tenant_id.clone(),
                 scenario.spec.job_id.clone(),
             ))
+            .await
             .unwrap()
             .unwrap()
             .state,
@@ -710,8 +775,8 @@ fn finalize_rejects_an_expired_assignment_lease_before_cas() {
     );
 }
 
-#[test]
-fn finalize_rechecks_the_lease_after_metadata_validation() {
+#[tokio::test]
+async fn finalize_rechecks_the_lease_after_metadata_validation() {
     let components = InMemoryComponents::new(100);
     let lease_expiry = 200;
     let expiring_objects = Arc::new(ExpireLeaseOnObjectRead {
@@ -722,12 +787,15 @@ fn finalize_rechecks_the_lease_after_metadata_validation() {
     });
     let control = ControlPlane::new(
         components.authorizer.clone(),
-        components.jobs.clone(),
-        components.outbox.clone(),
-        components.metadata.clone(),
-        expiring_objects,
-        components.publisher.clone(),
-        components.audit.clone(),
+        AuthorityStore::from_parts(
+            components.jobs.clone(),
+            components.outbox.clone(),
+            components.metadata.clone(),
+            expiring_objects,
+            components.publisher.clone(),
+            components.audit.clone(),
+            AuthorityCapabilities::IN_MEMORY,
+        ),
         components.clock.clone(),
     );
     let scenario = build_scenario_with_options(
@@ -743,18 +811,21 @@ fn finalize_rechecks_the_lease_after_metadata_validation() {
             expires_at_unix_ms: UnixMillis::new(lease_expiry),
             extensions: Extensions::new(),
         }),
-    );
-    scenario.stage_all();
-    scenario.mark_object_durable();
+    )
+    .await;
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
     let version_before = scenario
         .components
         .publisher
         .current_version(&scenario.index_key())
+        .await
         .unwrap();
 
     let error = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap_err();
 
     assert_eq!(error.code(), CentralErrorCode::DeadlineExceeded);
@@ -763,6 +834,7 @@ fn finalize_rechecks_the_lease_after_metadata_validation() {
             .components
             .publisher
             .current_version(&scenario.index_key())
+            .await
             .unwrap(),
         version_before
     );
@@ -774,6 +846,7 @@ fn finalize_rechecks_the_lease_after_metadata_validation() {
                 scenario.spec.tenant_id.clone(),
                 scenario.spec.job_id.clone(),
             ))
+            .await
             .unwrap()
             .unwrap()
             .state,
@@ -781,37 +854,40 @@ fn finalize_rechecks_the_lease_after_metadata_validation() {
     );
 }
 
-#[test]
-fn persisted_job_can_be_replayed_after_its_deadline() {
+#[tokio::test]
+async fn persisted_job_can_be_replayed_after_its_deadline() {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
-    let (actor, spec, _) = inputs(&components);
+    let (actor, spec, _) = inputs(&components).await;
     control
         .create_add_job(CreateAddJobRequest {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
     components.clock.set(spec.deadline_unix_ms.get() + 1);
 
     let replay = control
         .create_add_job(CreateAddJobRequest { actor, spec })
+        .await
         .unwrap();
 
     assert!(replay.replayed);
     assert_eq!(replay.job.state, JobState::Queued);
 }
 
-#[test]
-fn queued_job_expires_without_an_assignment_decision() {
+#[tokio::test]
+async fn queued_job_expires_without_an_assignment_decision() {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
-    let (actor, spec, _) = inputs(&components);
+    let (actor, spec, _) = inputs(&components).await;
     control
         .create_add_job(CreateAddJobRequest {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
     components.clock.set(spec.deadline_unix_ms.get());
 
@@ -821,6 +897,7 @@ fn queued_job_expires_without_an_assignment_decision() {
             tenant_id: spec.tenant_id,
             job_id: spec.job_id,
         })
+        .await
         .unwrap();
 
     assert!(!expired.replayed);
@@ -830,16 +907,17 @@ fn queued_job_expires_without_an_assignment_decision() {
     assert!(expired.finalized.is_none());
 }
 
-#[test]
-fn assigned_job_timeout_decision_replays_exactly() {
+#[tokio::test]
+async fn assigned_job_timeout_decision_replays_exactly() {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
-    let (actor, spec, target) = inputs(&components);
+    let (actor, spec, target) = inputs(&components).await;
     control
         .create_add_job(CreateAddJobRequest {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
     control
         .assign_job(AssignJobRequest {
@@ -848,6 +926,7 @@ fn assigned_job_timeout_decision_replays_exactly() {
             job_id: spec.job_id.clone(),
             target,
         })
+        .await
         .unwrap();
     components.clock.set(spec.deadline_unix_ms.get() + 1);
     let request = ExpireAddJobRequest {
@@ -856,7 +935,7 @@ fn assigned_job_timeout_decision_replays_exactly() {
         job_id: spec.job_id,
     };
 
-    let expired = control.expire_add_job(request.clone()).unwrap();
+    let expired = control.expire_add_job(request.clone()).await.unwrap();
 
     assert!(!expired.replayed);
     assert_eq!(expired.job.state, JobState::TimedOut);
@@ -871,16 +950,16 @@ fn assigned_job_timeout_decision_replays_exactly() {
         JobState::TimedOut
     );
 
-    let replay = control.expire_add_job(request).unwrap();
+    let replay = control.expire_add_job(request).await.unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.job, expired.job);
     assert_eq!(replay.decision, expired.decision);
     assert_eq!(replay.finalized, expired.finalized);
 }
 
-#[test]
-fn prepared_with_many_same_kind_batches_is_rejected_without_overflow() {
-    let scenario = scenario();
+#[tokio::test]
+async fn prepared_with_many_same_kind_batches_is_rejected_without_overflow() {
+    let scenario = scenario().await;
     let manifest = scenario
         .descriptors
         .iter()
@@ -906,15 +985,16 @@ fn prepared_with_many_same_kind_batches_is_rejected_without_overflow() {
             agent_id: scenario.target.agent_id.clone(),
             report: AgentReport::Prepared(prepared),
         })
+        .await
         .unwrap_err();
 
     assert_eq!(error.stable_code(), "METADATA_INVALID");
     assert!(error.message().contains("same kind"));
 }
 
-#[test]
-fn prepared_candidate_digest_rejects_a_replaced_valid_descriptor() {
-    let scenario = scenario();
+#[tokio::test]
+async fn prepared_candidate_digest_rejects_a_replaced_valid_descriptor() {
+    let scenario = scenario().await;
     let mut prepared = scenario.prepared.clone();
     let mut replacement = prepared.metadata_batches[0].clone();
     replacement.batch_id = MetadataBatchId::new("replacement-valid-batch").unwrap();
@@ -929,15 +1009,16 @@ fn prepared_candidate_digest_rejects_a_replaced_valid_descriptor() {
             agent_id: scenario.target.agent_id.clone(),
             report: AgentReport::Prepared(prepared),
         })
+        .await
         .unwrap_err();
 
     assert_eq!(error.stable_code(), "METADATA_BATCH_TAMPERED");
     assert!(error.message().contains("candidate digest mismatch"));
 }
 
-#[test]
-fn failed_report_rejects_invalid_generation_state_and_tenant_scope() {
-    let scenario = scenario();
+#[tokio::test]
+async fn failed_report_rejects_invalid_generation_state_and_tenant_scope() {
+    let scenario = scenario().await;
     let failure = JobFailed {
         tenant_id: scenario.spec.tenant_id.clone(),
         job_id: scenario.spec.job_id.clone(),
@@ -965,6 +1046,7 @@ fn failed_report_rejects_invalid_generation_state_and_tenant_scope() {
             agent_id: scenario.target.agent_id.clone(),
             report: AgentReport::Failed(zero_generation),
         })
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "PROTOCOL_INVALID");
 
@@ -977,6 +1059,7 @@ fn failed_report_rejects_invalid_generation_state_and_tenant_scope() {
             agent_id: scenario.target.agent_id.clone(),
             report: AgentReport::Failed(invalid_terminal),
         })
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "PROTOCOL_INVALID");
 
@@ -989,18 +1072,20 @@ fn failed_report_rejects_invalid_generation_state_and_tenant_scope() {
             agent_id: scenario.target.agent_id.clone(),
             report: AgentReport::Failed(wrong_tenant),
         })
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "ASSIGNMENT_MISMATCH");
 }
 
-#[test]
-fn finalize_is_blocked_until_every_declared_object_is_centrally_durable() {
-    let scenario = scenario();
-    scenario.stage_all();
+#[tokio::test]
+async fn finalize_is_blocked_until_every_declared_object_is_centrally_durable() {
+    let scenario = scenario().await;
+    scenario.stage_all().await;
 
     let error = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "OBJECT_NOT_DURABLE");
     assert_eq!(
@@ -1011,6 +1096,7 @@ fn finalize_is_blocked_until_every_declared_object_is_centrally_durable() {
                 scenario.spec.tenant_id.clone(),
                 scenario.spec.job_id.clone()
             ))
+            .await
             .unwrap()
             .unwrap()
             .state,
@@ -1018,19 +1104,23 @@ fn finalize_is_blocked_until_every_declared_object_is_centrally_durable() {
     );
 }
 
-#[test]
-fn pending_and_rejected_observations_do_not_downgrade_a_durable_object() {
-    let scenario = scenario();
-    scenario.stage_all();
-    scenario.mark_object_durable();
-    scenario.observe_object(DurabilityState::Pending {
-        extensions: Extensions::new(),
-    });
-    scenario.observe_object(DurabilityState::Rejected {
-        code: "UPLOAD_REJECTED".to_owned(),
-        message: "a later upload attempt was rejected".to_owned(),
-        extensions: Extensions::new(),
-    });
+#[tokio::test]
+async fn pending_and_rejected_observations_do_not_downgrade_a_durable_object() {
+    let scenario = scenario().await;
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
+    scenario
+        .observe_object(DurabilityState::Pending {
+            extensions: Extensions::new(),
+        })
+        .await;
+    scenario
+        .observe_object(DurabilityState::Rejected {
+            code: "UPLOAD_REJECTED".to_owned(),
+            message: "a later upload attempt was rejected".to_owned(),
+            extensions: Extensions::new(),
+        })
+        .await;
 
     let durable = scenario
         .components
@@ -1040,6 +1130,7 @@ fn pending_and_rejected_observations_do_not_downgrade_a_durable_object() {
             &scenario.spec.artifact_id,
             scenario.object_id,
         )
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(durable.object_id, scenario.object_id);
@@ -1048,6 +1139,7 @@ fn pending_and_rejected_observations_do_not_downgrade_a_durable_object() {
         scenario
             .control
             .finalize_add(scenario.finalize_request())
+            .await
             .unwrap()
             .job
             .state,
@@ -1055,9 +1147,9 @@ fn pending_and_rejected_observations_do_not_downgrade_a_durable_object() {
     );
 }
 
-#[test]
-fn finalize_rejects_incomplete_and_tampered_batches() {
-    let incomplete = scenario();
+#[tokio::test]
+async fn finalize_rejects_incomplete_and_tampered_batches() {
+    let incomplete = scenario().await;
     for descriptor in &incomplete.descriptors {
         incomplete
             .control
@@ -1067,6 +1159,7 @@ fn finalize_rejects_incomplete_and_tampered_batches() {
                 agent_id: incomplete.target.agent_id.clone(),
                 submission: MetadataBatchSubmission::Descriptor(descriptor.clone()),
             })
+            .await
             .unwrap();
     }
     for page in incomplete.pages.iter().take(2) {
@@ -1078,16 +1171,18 @@ fn finalize_rejects_incomplete_and_tampered_batches() {
                 agent_id: incomplete.target.agent_id.clone(),
                 submission: MetadataBatchSubmission::Page(page.clone()),
             })
+            .await
             .unwrap();
     }
-    incomplete.mark_object_durable();
+    incomplete.mark_object_durable().await;
     let error = incomplete
         .control
         .finalize_add(incomplete.finalize_request())
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "METADATA_BATCH_INCOMPLETE");
 
-    let tampered = scenario();
+    let tampered = scenario().await;
     let descriptor = tampered.descriptors[0].clone();
     tampered
         .control
@@ -1097,6 +1192,7 @@ fn finalize_rejects_incomplete_and_tampered_batches() {
             agent_id: tampered.target.agent_id.clone(),
             submission: MetadataBatchSubmission::Descriptor(descriptor),
         })
+        .await
         .unwrap();
     let mut page = tampered.pages[0].clone();
     page.page_digest = ContentDigest::hash(b"tampered");
@@ -1108,19 +1204,21 @@ fn finalize_rejects_incomplete_and_tampered_batches() {
             agent_id: tampered.target.agent_id.clone(),
             submission: MetadataBatchSubmission::Page(page),
         })
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "METADATA_BATCH_TAMPERED");
 }
 
-#[test]
-fn finalize_rejects_metadata_not_referenced_by_the_index_delta() {
-    let scenario = scenario_with_unreferenced_manifest();
-    scenario.stage_all();
-    scenario.mark_object_durable();
+#[tokio::test]
+async fn finalize_rejects_metadata_not_referenced_by_the_index_delta() {
+    let scenario = scenario_with_unreferenced_manifest().await;
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
 
     let error = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "METADATA_INVALID");
     assert!(error
@@ -1134,6 +1232,7 @@ fn finalize_rejects_metadata_not_referenced_by_the_index_delta() {
                 scenario.spec.tenant_id.clone(),
                 scenario.spec.job_id.clone()
             ))
+            .await
             .unwrap()
             .unwrap()
             .state,
@@ -1141,15 +1240,16 @@ fn finalize_rejects_metadata_not_referenced_by_the_index_delta() {
     );
 }
 
-#[test]
-fn finalize_rejects_index_mutations_outside_the_assignment_scope() {
-    let scenario = scenario_with_out_of_scope_mutation();
-    scenario.stage_all();
-    scenario.mark_object_durable();
+#[tokio::test]
+async fn finalize_rejects_index_mutations_outside_the_assignment_scope() {
+    let scenario = scenario_with_out_of_scope_mutation().await;
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
 
     let error = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap_err();
 
     assert_eq!(error.stable_code(), "METADATA_INVALID");
@@ -1162,6 +1262,7 @@ fn finalize_rejects_index_mutations_outside_the_assignment_scope() {
                 scenario.spec.tenant_id.clone(),
                 scenario.spec.job_id.clone()
             ))
+            .await
             .unwrap()
             .unwrap()
             .state,
@@ -1169,9 +1270,9 @@ fn finalize_rejects_index_mutations_outside_the_assignment_scope() {
     );
 }
 
-#[test]
-fn finalize_rejects_a_different_internally_valid_publication() {
-    let original_publication_digest = scenario().prepared.publication_digest;
+#[tokio::test]
+async fn finalize_rejects_a_different_internally_valid_publication() {
+    let original_publication_digest = scenario().await.prepared.publication_digest;
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
     let substituted = build_scenario_with_candidate_overrides(
@@ -1186,7 +1287,8 @@ fn finalize_rejects_a_different_internally_valid_publication() {
             payload: Some(b"substituted-payload".to_vec()),
             ..CandidateOverrides::default()
         },
-    );
+    )
+    .await;
     assert_ne!(
         substituted.prepared.publication_digest,
         MetadataPublication::from_pages(&substituted.pages)
@@ -1198,16 +1300,18 @@ fn finalize_rejects_a_different_internally_valid_publication() {
             })
             .unwrap()
     );
-    substituted.stage_all();
-    substituted.mark_object_durable();
+    substituted.stage_all().await;
+    substituted.mark_object_durable().await;
 
     let first = substituted
         .control
         .finalize_add(substituted.finalize_request())
+        .await
         .unwrap_err();
     let replay = substituted
         .control
         .finalize_add(substituted.finalize_request())
+        .await
         .unwrap_err();
 
     assert_eq!(first.stable_code(), "METADATA_INVALID");
@@ -1224,6 +1328,7 @@ fn finalize_rejects_a_different_internally_valid_publication() {
             substituted.spec.tenant_id.clone(),
             substituted.spec.job_id.clone(),
         ))
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(job.state, JobState::Prepared);
@@ -1236,8 +1341,8 @@ fn finalize_rejects_a_different_internally_valid_publication() {
     assert!(snapshot.records.is_empty());
 }
 
-#[test]
-fn wrong_result_digest_becomes_a_stable_failed_decision() {
+#[tokio::test]
+async fn wrong_result_digest_becomes_a_stable_failed_decision() {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
     let wrong_result_digest = ContentDigest::from_bytes([0x99; 32]);
@@ -1252,17 +1357,20 @@ fn wrong_result_digest_becomes_a_stable_failed_decision() {
             result_index_digest: Some(wrong_result_digest),
             ..CandidateOverrides::default()
         },
-    );
-    scenario.stage_all();
-    scenario.mark_object_durable();
+    )
+    .await;
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
 
     let first = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
     let replay = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
 
     assert_eq!(first.job.state, JobState::Failed);
@@ -1283,8 +1391,8 @@ fn wrong_result_digest_becomes_a_stable_failed_decision() {
     assert!(snapshot.records.is_empty());
 }
 
-#[test]
-fn invalid_resulting_snapshot_becomes_a_stable_failed_decision() {
+#[tokio::test]
+async fn invalid_resulting_snapshot_becomes_a_stable_failed_decision() {
     let components = InMemoryComponents::new(100);
     let key = IndexKey {
         tenant_id: TenantId::new("tenant-a").unwrap(),
@@ -1306,18 +1414,20 @@ fn invalid_resulting_snapshot_becomes_a_stable_failed_decision() {
         .seed(key.clone(), 7, vec![prefix.clone()])
         .unwrap();
     let control = components.control_plane();
-    let scenario = build_scenario(components, control);
+    let scenario = build_scenario(components, control).await;
     assert_eq!(scenario.spec.expected_index_version, base_version);
-    scenario.stage_all();
-    scenario.mark_object_durable();
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
 
     let first = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
     let replay = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
 
     assert_eq!(first.job.state, JobState::Failed);
@@ -1333,11 +1443,11 @@ fn invalid_resulting_snapshot_becomes_a_stable_failed_decision() {
     assert_eq!(snapshot.records, vec![prefix]);
 }
 
-#[test]
-fn cas_mismatch_becomes_a_stable_conflicted_decision_and_replays() {
-    let scenario = scenario();
-    scenario.stage_all();
-    scenario.mark_object_durable();
+#[tokio::test]
+async fn cas_mismatch_becomes_a_stable_conflicted_decision_and_replays() {
+    let scenario = scenario().await;
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
     scenario
         .components
         .publisher
@@ -1355,39 +1465,45 @@ fn cas_mismatch_becomes_a_stable_conflicted_decision_and_replays() {
     let result = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
     assert_eq!(result.job.state, JobState::Conflicted);
     assert_eq!(result.finalized.final_state, JobState::Conflicted);
     let replay = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.decision, result.decision);
 }
 
-#[test]
-fn publishing_replay_converges_after_terminal_persist_failure_and_deadline() {
+#[tokio::test]
+async fn publishing_replay_converges_after_terminal_persist_failure_and_deadline() {
     let components = InMemoryComponents::new(100);
     let jobs = Arc::new(FailTerminalOnce::new(components.jobs.clone()));
     let control = ControlPlane::new(
         components.authorizer.clone(),
-        jobs.clone(),
-        components.outbox.clone(),
-        components.metadata.clone(),
-        components.objects.clone(),
-        components.publisher.clone(),
-        components.audit.clone(),
+        AuthorityStore::from_parts(
+            jobs.clone(),
+            components.outbox.clone(),
+            components.metadata.clone(),
+            components.objects.clone(),
+            components.publisher.clone(),
+            components.audit.clone(),
+            AuthorityCapabilities::IN_MEMORY,
+        ),
         components.clock.clone(),
     );
-    let scenario = build_scenario(components, control);
-    scenario.stage_all();
-    scenario.mark_object_durable();
+    let scenario = build_scenario(components, control).await;
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
     jobs.arm();
 
     let error = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "STORAGE_FAILURE");
     let key = JobKey::new(
@@ -1395,7 +1511,14 @@ fn publishing_replay_converges_after_terminal_persist_failure_and_deadline() {
         scenario.spec.job_id.clone(),
     );
     assert_eq!(
-        scenario.components.jobs.get(&key).unwrap().unwrap().state,
+        scenario
+            .components
+            .jobs
+            .get(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
         JobState::Publishing
     );
     assert_eq!(
@@ -1422,10 +1545,18 @@ fn publishing_replay_converges_after_terminal_persist_failure_and_deadline() {
             tenant_id: scenario.spec.tenant_id.clone(),
             job_id: scenario.spec.job_id.clone(),
         })
+        .await
         .unwrap_err();
     assert_eq!(timeout_error.stable_code(), "JOB_INVALID_STATE");
     assert_eq!(
-        scenario.components.jobs.get(&key).unwrap().unwrap().state,
+        scenario
+            .components
+            .jobs
+            .get(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
         JobState::Publishing
     );
 
@@ -1452,16 +1583,25 @@ fn publishing_replay_converges_after_terminal_persist_failure_and_deadline() {
                 extensions: Extensions::new(),
             }),
         })
+        .await
         .unwrap_err();
     assert_eq!(terminal_error.stable_code(), "JOB_INVALID_STATE");
     assert_eq!(
-        scenario.components.jobs.get(&key).unwrap().unwrap().state,
+        scenario
+            .components
+            .jobs
+            .get(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
         JobState::Publishing
     );
 
     let recovered = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap();
     assert!(recovered.replayed);
     assert_eq!(recovered.job.state, JobState::Succeeded);
@@ -1478,35 +1618,39 @@ fn publishing_replay_converges_after_terminal_persist_failure_and_deadline() {
     );
 }
 
-#[test]
-fn publishing_recovery_uses_the_frozen_candidate_after_staging_gc_and_revocation() {
+#[tokio::test]
+async fn publishing_recovery_uses_the_frozen_candidate_after_staging_gc_and_revocation() {
     let components = InMemoryComponents::new(100);
     let authorizer = Arc::new(RevocableAuthorizer::default());
     let publisher = Arc::new(FailPublisherOnce::new(components.publisher.clone()));
     let control = ControlPlane::new(
         authorizer.clone(),
-        components.jobs.clone(),
-        components.outbox.clone(),
-        components.metadata.clone(),
-        components.objects.clone(),
-        publisher,
-        components.audit.clone(),
+        AuthorityStore::from_parts(
+            components.jobs.clone(),
+            components.outbox.clone(),
+            components.metadata.clone(),
+            components.objects.clone(),
+            publisher,
+            components.audit.clone(),
+            AuthorityCapabilities::IN_MEMORY,
+        ),
         components.clock.clone(),
     );
-    let scenario = build_scenario(components, control);
-    scenario.stage_all();
-    scenario.mark_object_durable();
+    let scenario = build_scenario(components, control).await;
+    scenario.stage_all().await;
+    scenario.mark_object_durable().await;
 
     let error = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "STORAGE_FAILURE");
     let key = JobKey::new(
         scenario.spec.tenant_id.clone(),
         scenario.spec.job_id.clone(),
     );
-    let publishing = scenario.components.jobs.get(&key).unwrap().unwrap();
+    let publishing = scenario.components.jobs.get(&key).await.unwrap().unwrap();
     assert_eq!(publishing.state, JobState::Publishing);
     assert!(publishing.publication_candidate.is_some());
     assert_eq!(
@@ -1524,6 +1668,7 @@ fn publishing_recovery_uses_the_frozen_candidate_after_staging_gc_and_revocation
     let wrong_actor = scenario
         .control
         .finalize_add(wrong_actor_request)
+        .await
         .unwrap_err();
     assert_eq!(wrong_actor.stable_code(), "AUTHORIZATION_DENIED");
 
@@ -1537,6 +1682,7 @@ fn publishing_recovery_uses_the_frozen_candidate_after_staging_gc_and_revocation
     let revoked = scenario
         .control
         .finalize_add(scenario.finalize_request())
+        .await
         .unwrap_err();
     assert_eq!(revoked.stable_code(), "AUTHORIZATION_DENIED");
     let recovered = scenario
@@ -1545,6 +1691,7 @@ fn publishing_recovery_uses_the_frozen_candidate_after_staging_gc_and_revocation
             tenant_id: scenario.spec.tenant_id.clone(),
             job_id: scenario.spec.job_id.clone(),
         })
+        .await
         .unwrap();
     assert!(recovered.replayed);
     assert_eq!(recovered.job.state, JobState::Succeeded);
@@ -1561,26 +1708,30 @@ fn publishing_recovery_uses_the_frozen_candidate_after_staging_gc_and_revocation
     );
 }
 
-#[test]
-fn persisted_assignment_can_be_reenqueued_after_its_deadline() {
+#[tokio::test]
+async fn persisted_assignment_can_be_reenqueued_after_its_deadline() {
     let components = InMemoryComponents::new(100);
     let outbox = Arc::new(FlakyOutbox::default());
     let control = ControlPlane::new(
         components.authorizer.clone(),
-        components.jobs.clone(),
-        outbox.clone(),
-        components.metadata.clone(),
-        components.objects.clone(),
-        components.publisher.clone(),
-        components.audit.clone(),
+        AuthorityStore::from_parts(
+            components.jobs.clone(),
+            outbox.clone(),
+            components.metadata.clone(),
+            components.objects.clone(),
+            components.publisher.clone(),
+            components.audit.clone(),
+            AuthorityCapabilities::IN_MEMORY,
+        ),
         components.clock.clone(),
     );
-    let (actor, spec, target) = inputs(&components);
+    let (actor, spec, target) = inputs(&components).await;
     control
         .create_add_job(CreateAddJobRequest {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
     let error = control
         .assign_job(AssignJobRequest {
@@ -1589,11 +1740,13 @@ fn persisted_assignment_can_be_reenqueued_after_its_deadline() {
             job_id: spec.job_id.clone(),
             target: target.clone(),
         })
+        .await
         .unwrap_err();
     assert_eq!(error.stable_code(), "STORAGE_FAILURE");
     let persisted = components
         .jobs
         .get(&JobKey::new(spec.tenant_id.clone(), spec.job_id.clone()))
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(persisted.state, JobState::Assigned);
@@ -1608,6 +1761,7 @@ fn persisted_assignment_can_be_reenqueued_after_its_deadline() {
             job_id: spec.job_id,
             target,
         })
+        .await
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(outbox.delivered.messages().unwrap().len(), 1);
@@ -1627,8 +1781,13 @@ struct ExpireLeaseOnObjectRead {
     armed: AtomicBool,
 }
 
+#[async_trait]
 impl ObjectCatalog for ExpireLeaseOnObjectRead {
-    fn durable_object(
+    async fn record_durability(&self, receipt: &ObjectDurabilityReceipt) -> CentralResult<()> {
+        self.inner.record_durability(receipt).await
+    }
+
+    async fn durable_object(
         &self,
         tenant_id: &TenantId,
         artifact_id: &ArtifactId,
@@ -1636,7 +1795,8 @@ impl ObjectCatalog for ExpireLeaseOnObjectRead {
     ) -> CentralResult<Option<neoengramd::DurableObject>> {
         let object = self
             .inner
-            .durable_object(tenant_id, artifact_id, object_id)?;
+            .durable_object(tenant_id, artifact_id, object_id)
+            .await?;
         if self.armed.swap(false, Ordering::SeqCst) {
             self.clock.set(self.lease_expiry);
         }
@@ -1655,21 +1815,22 @@ impl CreateRaceRepository {
     }
 }
 
+#[async_trait]
 impl JobRepository for CreateRaceRepository {
-    fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
-        let result = self.inner.get(key)?;
+    async fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
+        let result = self.inner.get(key).await?;
         if self.get_calls.fetch_add(1, Ordering::SeqCst) < self.initial_reads {
-            self.initial_read_barrier.wait();
+            self.initial_read_barrier.wait().await;
         }
         Ok(result)
     }
 
-    fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
-        self.inner.insert_or_load(job)
+    async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
+        self.inner.insert_or_load(job).await
     }
 
-    fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
-        self.inner.replace(expected, job)
+    async fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
+        self.inner.replace(expected, job).await
     }
 }
 
@@ -1691,22 +1852,23 @@ impl AssignmentRaceRepository {
     }
 }
 
+#[async_trait]
 impl JobRepository for AssignmentRaceRepository {
-    fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
-        self.inner.get(key)
+    async fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
+        self.inner.get(key).await
     }
 
-    fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
-        self.inner.insert_or_load(job)
+    async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
+        self.inner.insert_or_load(job).await
     }
 
-    fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
+    async fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
         if job.state == JobState::Assigned
             && self.replace_calls.fetch_add(1, Ordering::SeqCst) < self.participants
         {
-            self.replace_barrier.wait();
+            self.replace_barrier.wait().await;
         }
-        self.inner.replace(expected, job)
+        self.inner.replace(expected, job).await
     }
 }
 
@@ -1724,23 +1886,24 @@ impl FailAssignmentWriteOnce {
     }
 }
 
+#[async_trait]
 impl JobRepository for FailAssignmentWriteOnce {
-    fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
-        self.inner.get(key)
+    async fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
+        self.inner.get(key).await
     }
 
-    fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
-        self.inner.insert_or_load(job)
+    async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
+        self.inner.insert_or_load(job).await
     }
 
-    fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
+    async fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
         if job.state == JobState::Assigned && self.armed.swap(false, Ordering::SeqCst) {
             return Err(CentralError::new(
                 CentralErrorCode::StorageFailure,
                 "injected assignment JobRepository write failure",
             ));
         }
-        self.inner.replace(expected, job)
+        self.inner.replace(expected, job).await
     }
 }
 
@@ -1760,8 +1923,9 @@ impl RevocableAuthorizer {
     }
 }
 
+#[async_trait]
 impl Authorizer for RevocableAuthorizer {
-    fn authorize(&self, request: &AuthorizationRequest) -> CentralResult<()> {
+    async fn authorize(&self, request: &AuthorizationRequest) -> CentralResult<()> {
         if request.action != Action::FinalizeAdd {
             return Ok(());
         }
@@ -1795,19 +1959,23 @@ impl FailPublisherOnce {
     }
 }
 
+#[async_trait]
 impl IndexPublisher for FailPublisherOnce {
-    fn compare_and_swap(&self, request: IndexPublishRequest) -> CentralResult<IndexPublishOutcome> {
+    async fn compare_and_swap(
+        &self,
+        request: IndexPublishRequest,
+    ) -> CentralResult<IndexPublishOutcome> {
         if self.armed.swap(false, Ordering::SeqCst) {
             return Err(CentralError::new(
                 CentralErrorCode::StorageFailure,
                 "injected publication failure before CAS",
             ));
         }
-        self.inner.compare_and_swap(request)
+        self.inner.compare_and_swap(request).await
     }
 
-    fn current_version(&self, key: &IndexKey) -> CentralResult<WireIndexVersion> {
-        self.inner.current_version(key)
+    async fn current_version(&self, key: &IndexKey) -> CentralResult<WireIndexVersion> {
+        self.inner.current_version(key).await
     }
 }
 
@@ -1824,23 +1992,24 @@ impl FailTerminalOnce {
     }
 }
 
+#[async_trait]
 impl JobRepository for FailTerminalOnce {
-    fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
-        self.inner.get(key)
+    async fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
+        self.inner.get(key).await
     }
 
-    fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
-        self.inner.insert_or_load(job)
+    async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
+        self.inner.insert_or_load(job).await
     }
 
-    fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
+    async fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
         if job.state.is_terminal() && self.armed.swap(false, Ordering::SeqCst) {
             return Err(CentralError::new(
                 CentralErrorCode::StorageFailure,
                 "injected terminal JobRepository write failure",
             ));
         }
-        self.inner.replace(expected, job)
+        self.inner.replace(expected, job).await
     }
 }
 
@@ -1864,15 +2033,16 @@ impl FlakyOutbox {
     }
 }
 
+#[async_trait]
 impl AssignmentOutbox for FlakyOutbox {
-    fn reserve(
+    async fn reserve(
         &self,
         assignment: neoengram_protocol::JobAssignment,
     ) -> CentralResult<AssignmentReserveOutcome> {
-        self.delivered.reserve(assignment)
+        self.delivered.reserve(assignment).await
     }
 
-    fn publish(
+    async fn publish(
         &self,
         assignment: neoengram_protocol::JobAssignment,
     ) -> CentralResult<AssignmentPublishOutcome> {
@@ -1882,17 +2052,17 @@ impl AssignmentOutbox for FlakyOutbox {
                 "injected outbox delivery failure",
             ));
         }
-        self.delivered.publish(assignment)
+        self.delivered.publish(assignment).await
     }
 }
 
-fn scenario() -> Scenario {
+async fn scenario() -> Scenario {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
-    build_scenario(components, control)
+    build_scenario(components, control).await
 }
 
-fn scenario_with_expiring_lease() -> Scenario {
+async fn scenario_with_expiring_lease() -> Scenario {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
     build_scenario_with_options(
@@ -1909,15 +2079,16 @@ fn scenario_with_expiring_lease() -> Scenario {
             extensions: Extensions::new(),
         }),
     )
+    .await
 }
 
-fn scenario_with_unreferenced_manifest() -> Scenario {
+async fn scenario_with_unreferenced_manifest() -> Scenario {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
-    build_scenario_with_options(components, control, true, "dataset/file.bin", false, None)
+    build_scenario_with_options(components, control, true, "dataset/file.bin", false, None).await
 }
 
-fn scenario_with_out_of_scope_mutation() -> Scenario {
+async fn scenario_with_out_of_scope_mutation() -> Scenario {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
     build_scenario_with_options(
@@ -1928,19 +2099,20 @@ fn scenario_with_out_of_scope_mutation() -> Scenario {
         false,
         None,
     )
+    .await
 }
 
-fn scenario_with_fragmented_manifest() -> Scenario {
+async fn scenario_with_fragmented_manifest() -> Scenario {
     let components = InMemoryComponents::new(100);
     let control = components.control_plane();
-    build_scenario_with_options(components, control, false, "dataset/file.bin", true, None)
+    build_scenario_with_options(components, control, false, "dataset/file.bin", true, None).await
 }
 
-fn build_scenario(components: InMemoryComponents, control: ControlPlane) -> Scenario {
-    build_scenario_with_options(components, control, false, "dataset/file.bin", false, None)
+async fn build_scenario(components: InMemoryComponents, control: ControlPlane) -> Scenario {
+    build_scenario_with_options(components, control, false, "dataset/file.bin", false, None).await
 }
 
-fn build_scenario_with_options(
+async fn build_scenario_with_options(
     components: InMemoryComponents,
     control: ControlPlane,
     include_unreferenced_manifest: bool,
@@ -1957,6 +2129,7 @@ fn build_scenario_with_options(
         lease,
         CandidateOverrides::default(),
     )
+    .await
 }
 
 #[derive(Debug, Default)]
@@ -1967,7 +2140,7 @@ struct CandidateOverrides {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_scenario_with_candidate_overrides(
+async fn build_scenario_with_candidate_overrides(
     components: InMemoryComponents,
     control: ControlPlane,
     include_unreferenced_manifest: bool,
@@ -1976,13 +2149,14 @@ fn build_scenario_with_candidate_overrides(
     lease: Option<LeaseGrant>,
     overrides: CandidateOverrides,
 ) -> Scenario {
-    let (actor, spec, mut target) = inputs(&components);
+    let (actor, spec, mut target) = inputs(&components).await;
     target.lease = lease;
     control
         .create_add_job(CreateAddJobRequest {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
     control
         .assign_job(AssignJobRequest {
@@ -1991,6 +2165,7 @@ fn build_scenario_with_candidate_overrides(
             job_id: spec.job_id.clone(),
             target: target.clone(),
         })
+        .await
         .unwrap();
 
     let accepted = JobAccepted {
@@ -2007,6 +2182,7 @@ fn build_scenario_with_candidate_overrides(
             agent_id: target.agent_id.clone(),
             report: AgentReport::Accepted(accepted.clone()),
         })
+        .await
         .unwrap();
     let progress = JobProgress {
         job_id: spec.job_id.clone(),
@@ -2025,6 +2201,7 @@ fn build_scenario_with_candidate_overrides(
             agent_id: target.agent_id.clone(),
             report: AgentReport::Progress(progress.clone()),
         })
+        .await
         .unwrap();
 
     let payloads = if fragment_manifest {
@@ -2255,6 +2432,7 @@ fn build_scenario_with_candidate_overrides(
             agent_id: target.agent_id.clone(),
             report: AgentReport::Prepared(prepared.clone()),
         })
+        .await
         .unwrap();
 
     Scenario {
@@ -2273,7 +2451,7 @@ fn build_scenario_with_candidate_overrides(
     }
 }
 
-fn inputs(components: &InMemoryComponents) -> (PrincipalRef, AddJobSpec, AssignmentTarget) {
+async fn inputs(components: &InMemoryComponents) -> (PrincipalRef, AddJobSpec, AssignmentTarget) {
     let actor = PrincipalRef {
         kind: PrincipalKind::User,
         id: PrincipalId::new("user-a").unwrap(),
@@ -2289,6 +2467,7 @@ fn inputs(components: &InMemoryComponents) -> (PrincipalRef, AddJobSpec, Assignm
             artifact_id: artifact_id.clone(),
             playground_id: playground_id.clone(),
         })
+        .await
         .unwrap();
     let mut spec = AddJobSpec {
         job_id: neoengram_protocol::JobId::new("job-a").unwrap(),

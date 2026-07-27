@@ -65,8 +65,8 @@ fn result_digest(records: &[FileRecord]) -> ContentDigest {
         .digest
 }
 
-#[test]
-fn publisher_applies_file_directory_transitions_in_canonical_path_order() {
+#[tokio::test]
+async fn publisher_applies_file_directory_transitions_in_canonical_path_order() {
     let publisher = InMemoryIndexPublisher::default();
     let key = index_key();
     let file_version = publisher
@@ -82,6 +82,7 @@ fn publisher_applies_file_directory_transitions_in_canonical_path_order() {
             manifests: vec![manifest()],
             mutations: vec![delete("a"), upsert("a/b")],
         })
+        .await
         .expect("publish file-to-directory transition");
     let IndexPublishOutcome::Published(directory_version) = expanded else {
         panic!("seeded version must satisfy expansion CAS");
@@ -104,18 +105,20 @@ fn publisher_applies_file_directory_transitions_in_canonical_path_order() {
             manifests: vec![manifest()],
             mutations: vec![upsert("a"), delete("a/b")],
         })
+        .await
         .expect("publish directory-to-file transition");
     assert!(matches!(collapsed, IndexPublishOutcome::Published(_)));
     let file_snapshot = publisher.snapshot(&key).expect("read collapsed snapshot");
     assert_eq!(file_snapshot.records, vec![file_record("a")]);
 }
 
-#[test]
-fn publisher_rejects_a_prefix_conflict_in_the_resulting_snapshot_atomically() {
+#[tokio::test]
+async fn publisher_rejects_a_prefix_conflict_in_the_resulting_snapshot_atomically() {
     let publisher = InMemoryIndexPublisher::default();
     let key = index_key();
     let initial_version = publisher
         .current_version(&key)
+        .await
         .expect("read initial Index version");
 
     let first = publisher
@@ -127,6 +130,7 @@ fn publisher_rejects_a_prefix_conflict_in_the_resulting_snapshot_atomically() {
             manifests: vec![manifest()],
             mutations: vec![upsert("a"), upsert("a/b")],
         })
+        .await
         .expect("invalid final snapshot is a stable publication outcome");
     assert!(matches!(
         first,
@@ -142,12 +146,13 @@ fn publisher_rejects_a_prefix_conflict_in_the_resulting_snapshot_atomically() {
         .is_none());
 }
 
-#[test]
-fn publisher_rejects_an_unexpected_result_digest_atomically() {
+#[tokio::test]
+async fn publisher_rejects_an_unexpected_result_digest_atomically() {
     let publisher = InMemoryIndexPublisher::default();
     let key = index_key();
     let initial_version = publisher
         .current_version(&key)
+        .await
         .expect("read initial Index version");
     let request = IndexPublishRequest {
         job_key: job_key("job-wrong-result-digest"),
@@ -160,9 +165,11 @@ fn publisher_rejects_an_unexpected_result_digest_atomically() {
 
     let first = publisher
         .compare_and_swap(request.clone())
+        .await
         .expect("result mismatch is a stable publication outcome");
     let replay = publisher
         .compare_and_swap(request)
+        .await
         .expect("result mismatch replays idempotently");
 
     assert!(matches!(
@@ -179,12 +186,13 @@ fn publisher_rejects_an_unexpected_result_digest_atomically() {
         .is_none());
 }
 
-#[test]
-fn publisher_rejects_an_open_manifest_set_atomically() {
+#[tokio::test]
+async fn publisher_rejects_an_open_manifest_set_atomically() {
     let publisher = InMemoryIndexPublisher::default();
     let key = index_key();
     let initial_version = publisher
         .current_version(&key)
+        .await
         .expect("read initial Index version");
     let request = IndexPublishRequest {
         job_key: job_key("job-open-manifest-set"),
@@ -197,9 +205,11 @@ fn publisher_rejects_an_open_manifest_set_atomically() {
 
     let first = publisher
         .compare_and_swap(request.clone())
+        .await
         .expect("open publication is a stable rejection");
     let replay = publisher
         .compare_and_swap(request)
+        .await
         .expect("open publication rejection replays");
 
     assert!(matches!(
@@ -216,12 +226,13 @@ fn publisher_rejects_an_open_manifest_set_atomically() {
         .is_none());
 }
 
-#[test]
-fn publisher_rejects_index_metadata_that_disagrees_with_its_manifest() {
+#[tokio::test]
+async fn publisher_rejects_index_metadata_that_disagrees_with_its_manifest() {
     let publisher = InMemoryIndexPublisher::default();
     let key = index_key();
     let initial_version = publisher
         .current_version(&key)
+        .await
         .expect("read initial Index version");
     let inconsistent_record =
         FileRecord::new(LogicalPath::parse("a").unwrap(), manifest_id(), 1, 1).unwrap();
@@ -242,6 +253,7 @@ fn publisher_rejects_index_metadata_that_disagrees_with_its_manifest() {
 
     let outcome = publisher
         .compare_and_swap(request)
+        .await
         .expect("inconsistent metadata is a stable rejection");
 
     assert!(matches!(
@@ -257,8 +269,8 @@ fn publisher_rejects_index_metadata_that_disagrees_with_its_manifest() {
         .is_none());
 }
 
-#[test]
-fn publisher_replays_revision_exhaustion_without_mutating_the_index() {
+#[tokio::test]
+async fn publisher_replays_revision_exhaustion_without_mutating_the_index() {
     let publisher = InMemoryIndexPublisher::default();
     let key = index_key();
     let exhausted_version = publisher
@@ -275,9 +287,11 @@ fn publisher_replays_revision_exhaustion_without_mutating_the_index() {
 
     let first = publisher
         .compare_and_swap(request.clone())
+        .await
         .expect("revision exhaustion is a stable publication outcome");
     let replay = publisher
         .compare_and_swap(request)
+        .await
         .expect("revision exhaustion replays idempotently");
 
     assert_eq!(

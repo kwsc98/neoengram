@@ -9,9 +9,22 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["authority-sqlite"]
+authority-sqlite = ["dep:fs2", "dep:sqlx"]
+
 [dependencies]
+async-trait.workspace = true
+fs2 = { workspace = true, optional = true }
 neoengram-core.workspace = true
 neoengram-protocol = { path = "../../crates/neoengram-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

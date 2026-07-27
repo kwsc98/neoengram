@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use async_trait::async_trait;
 use neoengram_core::{FileRecord, IndexVersion, LogicalPath, Manifest, ManifestId, ObjectId};
 use neoengram_protocol::{
     ArtifactId, AssignmentOperation, JobAssignment, MetadataBatchDescriptor, MetadataBatchId,
@@ -15,17 +16,19 @@ use neoengram_protocol::{
 use crate::{
     validation::{durable_from_receipt, invalid, same_index_version},
     AssignmentOutbox, AssignmentPublishOutcome, AssignmentReserveOutcome, AuditEvent, AuditSink,
-    AuthorizationRequest, Authorizer, CentralErrorCode, CentralResult, Clock, ControlPlane,
-    DurableObject, IndexKey, IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest,
-    IndexPublisher, JobInsertOutcome, JobKey, JobRecord, JobRepository, MetadataBatchStager,
-    ObjectCatalog, PublishedIndex, StagedMetadataBatch,
+    AuthorityCapabilities, AuthorityStore, AuthorizationRequest, Authorizer, CentralErrorCode,
+    CentralResult, Clock, ControlPlane, DurableObject, IndexKey, IndexPublishOutcome,
+    IndexPublishRejection, IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobKey,
+    JobRecord, JobRepository, MetadataBatchStager, ObjectCatalog, PublishedIndex,
+    StagedMetadataBatch,
 };
 
 #[derive(Debug, Default)]
 pub struct AllowAllAuthorizer;
 
+#[async_trait]
 impl Authorizer for AllowAllAuthorizer {
-    fn authorize(&self, _request: &AuthorizationRequest) -> CentralResult<()> {
+    async fn authorize(&self, _request: &AuthorizationRequest) -> CentralResult<()> {
         Ok(())
     }
 }
@@ -33,8 +36,9 @@ impl Authorizer for AllowAllAuthorizer {
 #[derive(Debug, Default)]
 pub struct DenyAllAuthorizer;
 
+#[async_trait]
 impl Authorizer for DenyAllAuthorizer {
-    fn authorize(&self, _request: &AuthorizationRequest) -> CentralResult<()> {
+    async fn authorize(&self, _request: &AuthorizationRequest) -> CentralResult<()> {
         Err(invalid(
             CentralErrorCode::Unauthorized,
             "the actor is not authorized for this managed Add operation",
@@ -53,12 +57,13 @@ impl InMemoryJobRepository {
     }
 }
 
+#[async_trait]
 impl JobRepository for InMemoryJobRepository {
-    fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
+    async fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
         Ok(lock(&self.jobs)?.get(key).cloned())
     }
 
-    fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
+    async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
         let key = job.key();
         let mut jobs = lock(&self.jobs)?;
         if let Some(existing) = jobs.get(&key) {
@@ -68,7 +73,7 @@ impl JobRepository for InMemoryJobRepository {
         Ok(JobInsertOutcome::Inserted(job))
     }
 
-    fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
+    async fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord> {
         let key = job.key();
         let mut jobs = lock(&self.jobs)?;
         let persisted = jobs.get(&key).ok_or_else(|| {
@@ -113,8 +118,9 @@ impl InMemoryAssignmentOutbox {
     }
 }
 
+#[async_trait]
 impl AssignmentOutbox for InMemoryAssignmentOutbox {
-    fn reserve(&self, assignment: JobAssignment) -> CentralResult<AssignmentReserveOutcome> {
+    async fn reserve(&self, assignment: JobAssignment) -> CentralResult<AssignmentReserveOutcome> {
         let AssignmentOperation::Add { input: add, .. } = &assignment.assignment;
         let mut assignments = lock(&self.assignments)?;
         let key = (add.tenant_id.clone(), add.assignment_id.clone());
@@ -140,7 +146,7 @@ impl AssignmentOutbox for InMemoryAssignmentOutbox {
         Ok(AssignmentReserveOutcome::Reserved)
     }
 
-    fn publish(&self, assignment: JobAssignment) -> CentralResult<AssignmentPublishOutcome> {
+    async fn publish(&self, assignment: JobAssignment) -> CentralResult<AssignmentPublishOutcome> {
         let AssignmentOperation::Add { input: add, .. } = &assignment.assignment;
         let mut assignments = lock(&self.assignments)?;
         let key = (add.tenant_id.clone(), add.assignment_id.clone());
@@ -187,8 +193,9 @@ impl InMemoryMetadataBatchStager {
     }
 }
 
+#[async_trait]
 impl MetadataBatchStager for InMemoryMetadataBatchStager {
-    fn stage_descriptor(&self, descriptor: MetadataBatchDescriptor) -> CentralResult<bool> {
+    async fn stage_descriptor(&self, descriptor: MetadataBatchDescriptor) -> CentralResult<bool> {
         descriptor.validate()?;
         let mut batches = lock(&self.batches)?;
         let key = (
@@ -214,7 +221,7 @@ impl MetadataBatchStager for InMemoryMetadataBatchStager {
         Ok(false)
     }
 
-    fn stage_page(
+    async fn stage_page(
         &self,
         descriptor: &MetadataBatchDescriptor,
         page: MetadataBatchPage,
@@ -259,7 +266,7 @@ impl MetadataBatchStager for InMemoryMetadataBatchStager {
         Ok(false)
     }
 
-    fn get(
+    async fn get(
         &self,
         tenant_id: &TenantId,
         batch_id: &MetadataBatchId,
@@ -278,7 +285,7 @@ pub struct InMemoryObjectCatalog {
 }
 
 impl InMemoryObjectCatalog {
-    pub fn record_durability(&self, receipt: &ObjectDurabilityReceipt) -> CentralResult<()> {
+    fn record_durability_inner(&self, receipt: &ObjectDurabilityReceipt) -> CentralResult<()> {
         let key = (
             receipt.tenant_id.clone(),
             receipt.artifact_id.clone(),
@@ -305,8 +312,13 @@ impl InMemoryObjectCatalog {
     }
 }
 
+#[async_trait]
 impl ObjectCatalog for InMemoryObjectCatalog {
-    fn durable_object(
+    async fn record_durability(&self, receipt: &ObjectDurabilityReceipt) -> CentralResult<()> {
+        self.record_durability_inner(receipt)
+    }
+
+    async fn durable_object(
         &self,
         tenant_id: &TenantId,
         artifact_id: &ArtifactId,
@@ -399,8 +411,18 @@ impl InMemoryIndexPublisher {
     }
 }
 
+#[async_trait]
 impl IndexPublisher for InMemoryIndexPublisher {
-    fn compare_and_swap(&self, request: IndexPublishRequest) -> CentralResult<IndexPublishOutcome> {
+    async fn compare_and_swap(
+        &self,
+        request: IndexPublishRequest,
+    ) -> CentralResult<IndexPublishOutcome> {
+        if request.job_key.tenant_id != request.index_key.tenant_id {
+            return Err(invalid(
+                CentralErrorCode::MetadataInvalid,
+                "Index publication Job and Index tenants differ",
+            ));
+        }
         let mut state = lock(&self.state)?;
         if let Some((existing_request, outcome)) = state.publications.get(&request.job_key) {
             if existing_request == &request {
@@ -605,7 +627,7 @@ impl IndexPublisher for InMemoryIndexPublisher {
         Ok(outcome)
     }
 
-    fn current_version(&self, key: &IndexKey) -> CentralResult<WireIndexVersion> {
+    async fn current_version(&self, key: &IndexKey) -> CentralResult<WireIndexVersion> {
         Ok(lock(&self.state)?
             .indexes
             .get(key)
@@ -616,7 +638,7 @@ impl IndexPublisher for InMemoryIndexPublisher {
 
 #[derive(Debug, Default)]
 pub struct InMemoryAuditSink {
-    events: Mutex<BTreeMap<String, AuditEvent>>,
+    events: Mutex<BTreeMap<(TenantId, String), AuditEvent>>,
 }
 
 impl InMemoryAuditSink {
@@ -625,10 +647,12 @@ impl InMemoryAuditSink {
     }
 }
 
+#[async_trait]
 impl AuditSink for InMemoryAuditSink {
-    fn record(&self, event: AuditEvent) -> CentralResult<bool> {
+    async fn record(&self, event: AuditEvent) -> CentralResult<bool> {
         let mut events = lock(&self.events)?;
-        if let Some(existing) = events.get(&event.event_id) {
+        let key = (event.job_key.tenant_id.clone(), event.event_id.clone());
+        if let Some(existing) = events.get(&key) {
             if existing.kind == event.kind
                 && existing.job_key == event.job_key
                 && existing.state == event.state
@@ -640,7 +664,7 @@ impl AuditSink for InMemoryAuditSink {
                 format!("audit event ID {} was reused", event.event_id),
             ));
         }
-        events.insert(event.event_id.clone(), event);
+        events.insert(key, event);
         Ok(false)
     }
 }
@@ -715,13 +739,21 @@ impl InMemoryComponents {
     pub fn control_plane(&self) -> ControlPlane {
         ControlPlane::new(
             self.authorizer.clone(),
+            self.authority_store(),
+            self.clock.clone(),
+        )
+    }
+
+    #[must_use]
+    pub fn authority_store(&self) -> AuthorityStore {
+        AuthorityStore::from_parts(
             self.jobs.clone(),
             self.outbox.clone(),
             self.metadata.clone(),
             self.objects.clone(),
             self.publisher.clone(),
             self.audit.clone(),
-            self.clock.clone(),
+            AuthorityCapabilities::IN_MEMORY,
         )
     }
 }

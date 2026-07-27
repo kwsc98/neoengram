@@ -2,8 +2,9 @@
 
 NeoEngram `0.2.0` 已完成 P0 crate 边界改造：本地 CLI、可复用领域模型、执行端口、文件系统
 适配器、Standalone 应用、wire protocol、Agent 和中心控制状态机分别拥有独立 crate。当前仍以
-本地 format v8 工作流为可运行产品；Agent 与中心只提供无网络的 library 和内存适配器，不代表
-HTTP、PostgreSQL、mTLS、真实 S3 或 daemon 已经实现。能力状态和后续路线统一见
+本地 format v8 工作流为可运行产品；Agent 与中心仍是无网络 library，中心已提供后端无关
+`AuthorityStore` 和默认 SQLite 单节点权威后端。这不代表 HTTP、PostgreSQL、mTLS、真实 S3 或
+daemon 已经实现。能力状态和后续路线统一见
 [`implementation-plan.md`](implementation-plan.md)。
 
 ## Workspace 与职责
@@ -18,7 +19,7 @@ crates/
 ├── neoengram-agent/       # 无网络 Agent 状态机、ports、Ledger 和测试适配器
 └── neoengram/             # Clap、cwd 输入、typed Result/progress/diagnostic 的唯一终端渲染入口
 services/
-└── neoengramd/            # 无网络中心 Job/Assignment/Batch/Finalize 状态机与内存适配器
+└── neoengramd/            # 无网络中心状态机、AuthorityStore、InMemory/SQLite 权威后端
 ```
 
 除 `neoengram-core` 和 `neoengram` 外，P0 新增 package 均为 workspace-private。Agent 和
@@ -91,7 +92,7 @@ Commit 同样分为 canonical graph builder 与最终 publisher。这样 core/en
 Standalone 和中心复用，而 SQLite 或未来 PostgreSQL 的权威事务不会渗入计算层。format v8 的
 Standalone `commit` 已调用 Engine graph builder，并由独立 SQLite publisher 执行最终 HEAD/ref CAS。
 
-当前 P0 已实现 Agent Ledger/Assignment 和中心 Create/Assign/Report/Stage/Finalize 的无网络状态机；
+当前已实现 Agent Ledger/Assignment 和中心 Create/Assign/Report/Stage/Finalize 的无网络状态机；
 Agent 在持久化 `running` 后通过 `ReportSink` 发出结构化 progress，PreparedAdd 的 IndexDelta、Manifest
 与 ObjectSpec 必须组成闭合引用集。对象传输完成后，Agent 把 exact MetadataBatch descriptors/pages
 写入 durable `TransferReceipt`，持久化 Prepared，再发送 descriptor-bound `JobPrepared`；只有中心先
@@ -101,7 +102,9 @@ Prepared 并从 Ledger 重放。Core 是 publication digest 的唯一 canonical 
 assignment identity、result/publication digest、descriptors 和 extensions。Agent 只接受 digest 等于
 Prepared 结果且 revision 为 base + 1 的 Publish decision。失败上报统一使用 protocol `JobFailed`。
 Manifest record 以 `chunk_start` 分片跨页，中心重组完整 Chunk 序列后重新校验 canonical Manifest ID。
-内存适配器覆盖这些边界的幂等与 CAS 组合测试。HTTP/2、HTTP/3、mTLS、OIDC、PostgreSQL、真实 S3、
+InMemory 与 SQLite 运行同一行为契约。SQLite 是显式路径、单进程、单连接的默认中心权威后端，
+不提供 HA 或数据库级 RLS；PG/MySQL 后端将独立实现 SQL/schema/migration，只复用 ports 与契约测试。
+HTTP/2、HTTP/3、mTLS、OIDC、PostgreSQL、真实 S3、
 NFS fencing 和 daemon 属于后续 adapter/部署阶段，不能放进上述稳定 crate 以伪装成已实现能力。
 
 本地磁盘布局及事务语义见 [`storage-architecture.md`](storage-architecture.md)；中心与 Agent 的详细

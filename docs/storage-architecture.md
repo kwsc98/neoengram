@@ -51,6 +51,21 @@ SQLite 使用 WAL、foreign key、`synchronous=FULL` 和即时写事务。Manife
 的 staging 批次受条数和字节上限约束；Commit 分页读取 Index 并维护目录路径栈，结束一个目录时
 发布其 ID，再追加到父 writer，不创建公共扁平 Tree。Reader 不跨 FUSE 请求长期持有 transaction。
 
+## Managed AuthorityStore
+
+Managed 中心的逻辑权威通过异步 `AuthorityStore` 组合 `JobRepository`、`AssignmentOutbox`、
+`MetadataBatchStager`、`ObjectCatalog`、`IndexPublisher` 和 `AuditSink`，不绑定具体数据库。
+默认后端是单节点生产可用的 SQLite：显式目录内固定创建独立 `authority.sqlite3` 和生命周期独占
+`authority.lock`，连接池固定单连接，并启用 WAL、foreign keys、`synchronous=FULL` 和 busy timeout。
+
+该数据库不属于 Standalone format v8，也不得与 Standalone 共用文件。它只接受当前
+`application_id`/`user_version` 和当前 JSON record format；旧格式、错误 schema 和未知非空数据库
+直接拒绝，不提供 migration、双读、字段别名或回退。所有租户查询和复合键都包含 tenant ID，但
+SQLite 仍是应用层隔离，不伪装成数据库级 RLS、HA 或多进程后端。
+
+未来 PostgreSQL/MySQL 适配器只共享 ports、capabilities 和行为契约；SQL、migration、物理 schema、
+JSON、锁、CAS 与 RLS 设计均由各后端独立拥有。PostgreSQL 仍是多实例、HA 和数据库级 RLS 的目标。
+
 ## ObjectStore 与耐久权威
 
 Standalone 的 `LooseObjectStore` 通过流式写入校验并不可变发布对象，通过单遍读取复算大小与

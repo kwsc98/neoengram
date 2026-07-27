@@ -9,9 +9,10 @@ use neoengram_protocol::{
     PlacementGeneration, PlaygroundId, PrincipalRef, ProjectId, ResourceVersion, StorageVolumeId,
     TenantId, UnixMillis, WireIndexVersion,
 };
+use serde::{Deserialize, Serialize};
 
 /// Immutable tenant/artifact/workspace authority scope for one managed Add job.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AddJobSpec {
     pub job_id: JobId,
     pub principal: PrincipalRef,
@@ -51,7 +52,7 @@ impl AddJobSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct JobKey {
     pub tenant_id: TenantId,
     pub job_id: JobId,
@@ -64,7 +65,7 @@ impl JobKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct IndexKey {
     pub tenant_id: TenantId,
     pub artifact_id: ArtifactId,
@@ -72,7 +73,7 @@ pub struct IndexKey {
 }
 
 /// Server-selected execution placement and all generations required to fence stale agents.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssignmentTarget {
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
@@ -88,7 +89,7 @@ pub struct AssignmentTarget {
 }
 
 /// Durable authoritative record. Assignment and prepared metadata are persisted before side effects.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRecord {
     pub spec: AddJobSpec,
     pub state: JobState,
@@ -108,7 +109,7 @@ pub struct JobRecord {
 ///
 /// Publishing recovery must use this record rather than transient metadata staging or current
 /// object-durability observations.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublicationCandidate {
     pub expected_index_version: WireIndexVersion,
     pub result_index_digest: ContentDigest,
@@ -133,13 +134,13 @@ impl JobRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Actor {
     Principal(PrincipalRef),
     Agent(AgentId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     CreateAddJob,
     AssignJob,
@@ -149,7 +150,7 @@ pub enum Action {
     FinalizeAdd,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthorizationRequest {
     pub actor: Actor,
     pub action: Action,
@@ -288,7 +289,7 @@ pub struct FinalizeAddResult {
     pub replayed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StagedMetadataBatch {
     pub descriptor: MetadataBatchDescriptor,
     pub pages: BTreeMap<u32, MetadataBatchPage>,
@@ -301,7 +302,7 @@ impl StagedMetadataBatch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableObject {
     pub object_id: ObjectId,
     pub size: u64,
@@ -309,7 +310,7 @@ pub struct DurableObject {
     pub storage_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexPublishRequest {
     pub job_key: JobKey,
     pub index_key: IndexKey,
@@ -319,7 +320,7 @@ pub struct IndexPublishRequest {
     pub mutations: Vec<neoengram_protocol::IndexDeltaRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexPublishRejection {
     InvalidMetadata {
         message: String,
@@ -331,14 +332,14 @@ pub enum IndexPublishRejection {
     RevisionExhausted,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IndexPublishOutcome {
     Published(WireIndexVersion),
     Conflict(WireIndexVersion),
     Rejected(IndexPublishRejection),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AuditKind {
     JobCreated,
     AssignmentQueued,
@@ -348,7 +349,7 @@ pub enum AuditKind {
     AddFinalized,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub event_id: String,
     pub kind: AuditKind,
@@ -363,7 +364,7 @@ pub(crate) struct ValidatedMetadata {
     pub mutations: Vec<neoengram_protocol::IndexDeltaRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublishedIndex {
     pub version: WireIndexVersion,
     pub records: Vec<FileRecord>,

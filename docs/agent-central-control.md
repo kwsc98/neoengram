@@ -1,12 +1,12 @@
 # 中心化多租户控制面与 Agent 架构
 
-> 状态：P0 protocol、Agent 与中心无网络状态机已实现；生产控制面仍为设计。
+> 状态：P0 protocol、Agent/中心无网络状态机和 SQLite 单节点中心权威后端已实现；网络生产控制面仍为设计。
 >
-> 最后更新：2026-07-26。
+> 最后更新：2026-07-27。
 >
 > 本文统一描述 `neoengramd`、`neoengram-agent`、多租户/多 EdgeCluster 边界、CPU 计算节点、NFS
 > 存储、多 Agent Playground 和中心 S3 的目标架构。当前 `0.2.0`/format v8 只实现 transport- and
-> storage-independent library、协议与内存适配器；文中 HTTP、PostgreSQL、mTLS、OIDC、真实 S3、
+> storage-independent library、协议、内存适配器与中心 SQLite authority；文中 HTTP、PostgreSQL、mTLS、OIDC、真实 S3、
 > NFS fencing、Gateway 和 daemon 均是后续实现目标，不是当前可运行能力。
 
 P0 的 production/runtime 源码依赖主方向已经固定：
@@ -45,8 +45,9 @@ library-only。协议和状态机不假设某一种 HTTP 框架、数据库 driv
   `TenantAssignment`，绝不默认管理全部租户；
 - Playground 与 Agent 也是多对多关系。多个 Agent 可以同时读取和计算，但只有所在 Volume 的活动
   RW Owner Agent 能执行可变任务，同一 Playground 同一时刻最多一个写者；
-- 托管模式的 Artifact/Playground 权威元数据由中心管理，生产目标适配器是 PostgreSQL；Agent 不
-  维护可迁移的 Artifact SQLite，也不在 NFS 上保存 SQLite 数据库快照；P0 目前使用内存 repository；
+- 托管模式的 Artifact/Playground 逻辑权威由中心管理；当前默认 SQLite 支持单进程部署，
+  PostgreSQL 是多实例、HA 和数据库级 RLS 的目标。Agent 不维护可迁移的 Artifact SQLite，也不在
+  NFS 上保存 SQLite 数据库快照；
 - Agent 基于中心 `IndexVersion` 产生结构化 IndexDelta/ObjectReceipt，中心通过 staging + CAS
   只发布一个候选；
 - Agent 本地 SQLite 按职责拆分为 Agent system DB、每租户 Ledger、可选 Playground cache 和每 Job
@@ -92,7 +93,7 @@ StorageVolume 负责“Playground 字节和恢复 journal 在哪里”。
 | Agent 与 Tenant | 已确认 | 多对多；Agent 只管理明确 TenantAssignment |
 | Playground 与 Agent | 已确认 | 多对多；多读、多计算，单写、单发布 |
 | 数据传输方向 | 已确认 | Agent 使用短期 ticket 直传/读取中心 S3；中心 API 不代理 payload |
-| 托管 MetadataStore | P0 内存实现 | 中心是 Artifact/Playground 元数据权威；PostgreSQL adapter 待实现，Agent 不直连数据库 |
+| 托管 MetadataStore | SQLite 单节点已实现 | 中心逻辑权威经 `AuthorityStore` 解耦；InMemory 仅用于测试，PostgreSQL HA/RLS adapter 待实现，Agent 不直连数据库 |
 | SQLite on NFS | 已确认 | 托管模式不在 NFS 打开或同步 SQLite；本地 CLI 的 SQLite 行为保持不变 |
 | Playground Index 权威 | 已确认 | 中心保存 Index 行/分页结构和 IndexVersion；Agent 只生成结构化 Delta |
 | Commit/Ref 权威 | 目标决定 | 中心保存租户级已发布图并执行最终 Ref CAS |
@@ -203,7 +204,7 @@ EdgeCluster A ──x── EdgeCluster B       # 无 Agent/NFS 直连假设
 | `AgentMount` | Agent 对 StorageVolume 的一次挂载观测；包含本地映射和只读/可写能力 |
 | `ArtifactPlacement` | Artifact 在某 EdgeCluster 的唯一活动存储位置；绑定 StorageVolume、相对根、generation 和迁移状态 |
 | `PlaygroundAttachment` | 某 Agent 能否访问某 Playground，以及观测到的挂载 generation |
-| `PlaygroundIndex` | 中心权威 store 中的当前已暂存文件状态和 IndexVersion；P0 为内存，生产目标为 PostgreSQL |
+| `PlaygroundIndex` | 中心权威 store 中的当前已暂存文件状态和 IndexVersion；SQLite 单节点已实现，PostgreSQL 是 HA/RLS 目标 |
 | `IndexUpdateSession` | Agent 产生/上传、中心校验并原子发布 IndexDelta 的幂等会话 |
 | `MetadataBatch` | Manifest/IndexDelta/ObjectReceipt 的临时分页传输工件，不是权威 MetadataStore |
 | `PlaygroundLease` | Playground 共享读/排他写 holder、Job、fencing token、过期时间和状态 |
@@ -1037,27 +1038,31 @@ Worker 不能各自更新 Index。外部进程在扫描期间修改 NFS Playgrou
 
 ### 10.1 Standalone 与 Managed 是两种运行模式
 
-当前 format v8 的本地 CLI 使用 Standalone SQLite stores；托管 Agent 模式使用中心 authority，
-P0 为内存 repository，生产目标为 PostgreSQL。二者复用 core 规范模型和 engine 业务规则，但不共享
+当前 format v8 的本地 CLI 使用 Standalone SQLite stores；托管 Agent 模式使用中心 `AuthorityStore`，
+默认后端为单进程 SQLite，多实例生产目标为 PostgreSQL。二者复用 core 规范模型和 engine 业务规则，但不共享
 数据库文件：
 
 ```text
 Standalone CLI -> neoengram-standalone -> format v8 SQLite stores
-Managed Agent  -> protocol -> neoengramd ports -> memory (P0) / PostgreSQL (future)
+Managed Agent  -> protocol -> neoengramd AuthorityStore -> SQLite (default) / PostgreSQL (future)
 ```
 
 - Standalone 适合单机/单管理域，SQLite、WAL、锁和 `.neoengram` 目录使用 format v8；不迁移 v7；
-- Managed 适合多租户、多 Agent 和 NFS 数据卷，中心是唯一 metadata authority；生产 adapter 目标为 PostgreSQL；
+- Managed 中心是唯一 metadata authority；SQLite 仅支持单个 `neoengramd` 进程，PostgreSQL 目标支持多实例、HA 与 RLS；
 - Agent 不在 NFS 打开 Artifact SQLite，不上传或下载 SQLite 数据库快照，也不把本地数据库同步给
   其他 Agent；
 - 不能把 Managed 简化为把 `.neoengram/metadata` symlink 到本地盘。Engine 必须接收结构化
   Request/Result、执行 ports 和逻辑 Playground 身份；
 - 从 Standalone 纳管到 Managed、或反向导出，是显式 import/export 流程，不是两个 MetadataStore
   的双向复制。
+- Managed SQLite 使用独立 `authority.sqlite3`/`authority.lock`，绝不复用 format v8 数据库；当前
+  格式不提供旧 schema 探测、迁移、回退或双读。
 
 ### 10.2 中心权威范围与未来 PostgreSQL
 
-中心至少权威保存以下数据；P0 由内存 ports/adapters 表达，生产阶段再映射到 PostgreSQL：
+中心至少权威保存以下数据。当前 Job/outbox/MetadataBatch/Durable object/Playground Index/Manifest/
+publication outcome/audit 已由 InMemory 与 SQLite 共同契约覆盖；未来 PostgreSQL/MySQL 后端独立实现
+各自 SQL、migration 和物理 schema：
 
 | 数据 | 关键并发/完整性规则 |
 | --- | --- |
@@ -1947,8 +1952,10 @@ active placement，Artifact roots 不重叠；mount source/fsid 漂移立即停�
 
 ### A2：中心 MetadataStore 与 Agent 本地数据库
 
-- 建立 PostgreSQL Playground Index/IndexVersion、staging、Commit/Directory graph、Ref、ObjectLocation、Job 和
-  Audit schema，启用 RLS 和 tenant-scoped 复合约束；
+- 已完成中心 `AuthorityStore`、SQLite Job/outbox/MetadataBatch/ObjectCatalog/IndexPublisher/Audit 持久化、
+  tenant-scoped 约束、原子 publication 和重开恢复；
+- 后续独立建立 PostgreSQL Playground Index/IndexVersion、staging、Commit/Directory graph、Ref、
+  ObjectLocation、Job 和 Audit schema，启用 RLS 和 tenant-scoped 复合约束；
 - 将 P0 内存 Ledger 替换为 system DB、每 Tenant Ledger、可选 Playground cache/Job candidate 及
   `database_identity` 验证；
 - 将已冻结的 IndexDelta/ObjectReceipt/MetadataBatch schema、分页、digest 和限制映射到数据库 staging；
@@ -2063,7 +2070,8 @@ active placement，Artifact roots 不重叠；mount source/fsid 漂移立即停�
 当前代码已经具有本地 format v8、SQLite WAL stores、内容寻址对象、Engine/fs ports 与
 mutation executor/adapters、接入 Engine lifecycle 的 checkout/rm/restore durable transactions、
 recover、WholeFile/FastCDC、copy/hardlink export 和只读 FUSE；同时已经具有 protocol v1、Agent Ledger
-状态机、中心 Job/Assignment/Batch/Finalize 状态机和内存 adapters。相关契约见：
+状态机、中心 Job/Assignment/Batch/Finalize 状态机、`AuthorityStore` 及 InMemory/SQLite adapters。
+相关契约见：
 
 - [`storage-architecture.md`](storage-architecture.md)
 - [`technical-reference.md`](technical-reference.md)
@@ -2076,12 +2084,13 @@ recover、WholeFile/FastCDC、copy/hardlink export 和只读 FUSE；同时已经
 - PostgreSQL、真实 S3、OIDC/RBAC/RLS、EdgeCluster/ComputeNode/StorageVolume/Mount registry adapters；
 - NFS capability 认证和 storage-side fencing；
 - PlaygroundAttachment 多 Agent 调度；
-- 中心 Playground Index 的 PostgreSQL publisher、Agent 持久 Ledger/cache 和真实 MetadataBatch 上传；
+- 中心 Playground Index 的 PostgreSQL publisher、Agent 持久 Ledger/cache 和经 transport 的真实 MetadataBatch 上传；
 - GatewayInstance、可运行 TransferRoute、真实短期 Ticket 和跨 EdgeCluster/StorageVolume Transfer；
 - 分布式 lease、ObjectLocation、远端 GC 和自动故障接管。
 
-现有内存组合测试证明状态机/幂等边界，不证明网络、数据库、S3 或 NFS 故障语义；`fs2` 锁、SQLite
-WAL 和本地 journal 也只是构建块，不是已经完成的分布式协调机制。
+现有 InMemory/SQLite 契约测试证明状态机、幂等、租户作用域、SQLite 事务与重开恢复边界；它们不
+证明网络、PostgreSQL/MySQL、S3 或 NFS 故障语义。`fs2` 锁、SQLite WAL 和本地 journal 也只是
+单节点构建块，不是已经完成的分布式协调机制。
 
 ## 22. 实现前未决问题
 

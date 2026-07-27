@@ -12,13 +12,13 @@ use crate::{
         validate_terminal_state,
     },
     Action, Actor, AddJobSpec, AgentReport, AssignJobRequest, AssignJobResult, AssignmentOutbox,
-    AuditEvent, AuditKind, AuditSink, AuthorizationRequest, Authorizer, CentralErrorCode,
-    CentralResult, Clock, CreateAddJobRequest, CreateAddJobResult, ExpireAddJobRequest,
-    ExpireAddJobResult, FinalizeAddRequest, FinalizeAddResult, IndexPublishOutcome,
-    IndexPublishRejection, IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobRecord,
-    JobRepository, MetadataBatchStager, MetadataBatchSubmission, ObjectCatalog,
-    PublicationCandidate, ReceiveReportRequest, ReceiveReportResult, ResumePublicationRequest,
-    StageMetadataBatchRequest, StageMetadataBatchResult,
+    AuditEvent, AuditKind, AuditSink, AuthorityStore, AuthorizationRequest, Authorizer,
+    CentralErrorCode, CentralResult, Clock, CreateAddJobRequest, CreateAddJobResult,
+    ExpireAddJobRequest, ExpireAddJobResult, FinalizeAddRequest, FinalizeAddResult,
+    IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, IndexPublisher,
+    JobInsertOutcome, JobRecord, JobRepository, MetadataBatchStager, MetadataBatchSubmission,
+    ObjectCatalog, PublicationCandidate, ReceiveReportRequest, ReceiveReportResult,
+    ResumePublicationRequest, StageMetadataBatchRequest, StageMetadataBatchResult,
 };
 
 const CONTROL_ERROR_MESSAGE_LIMIT: usize = 4096;
@@ -40,28 +40,23 @@ impl ControlPlane {
     #[must_use]
     pub fn new(
         authorizer: Arc<dyn Authorizer>,
-        jobs: Arc<dyn JobRepository>,
-        outbox: Arc<dyn AssignmentOutbox>,
-        metadata: Arc<dyn MetadataBatchStager>,
-        objects: Arc<dyn ObjectCatalog>,
-        publisher: Arc<dyn IndexPublisher>,
-        audit: Arc<dyn AuditSink>,
+        authority: AuthorityStore,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             authorizer,
-            jobs,
-            outbox,
-            metadata,
-            objects,
-            publisher,
-            audit,
+            jobs: authority.jobs(),
+            outbox: authority.outbox(),
+            metadata: authority.metadata(),
+            objects: authority.objects(),
+            publisher: authority.publisher(),
+            audit: authority.audit(),
             clock,
         }
     }
 
     /// Creates the authoritative queued job. Reusing a JobId with another digest/spec is rejected.
-    pub fn create_add_job(
+    pub async fn create_add_job(
         &self,
         request: CreateAddJobRequest,
     ) -> CentralResult<CreateAddJobResult> {
@@ -69,16 +64,18 @@ impl ControlPlane {
             Actor::Principal(request.actor),
             Action::CreateAddJob,
             &request.spec,
-        )?;
+        )
+        .await?;
         let key = crate::JobKey::new(request.spec.tenant_id.clone(), request.spec.job_id.clone());
-        if let Some(existing) = self.jobs.get(&key)? {
+        if let Some(existing) = self.jobs.get(&key).await? {
             if existing.spec != request.spec {
                 return Err(invalid(
                     CentralErrorCode::JobIdReused,
                     "JobId already belongs to a different managed Add request",
                 ));
             }
-            self.audit(&existing, AuditKind::JobCreated, "create")?;
+            self.audit(&existing, AuditKind::JobCreated, "create")
+                .await?;
             return Ok(CreateAddJobResult {
                 job: existing,
                 replayed: true,
@@ -100,7 +97,7 @@ impl ControlPlane {
             finalized_ack: None,
             failure: None,
         };
-        let (job, replayed) = match self.jobs.insert_or_load(job)? {
+        let (job, replayed) = match self.jobs.insert_or_load(job).await? {
             JobInsertOutcome::Inserted(job) => (job, false),
             JobInsertOutcome::Existing(existing) => {
                 if existing.spec != request.spec {
@@ -112,18 +109,19 @@ impl ControlPlane {
                 (existing, true)
             }
         };
-        self.audit(&job, AuditKind::JobCreated, "create")?;
+        self.audit(&job, AuditKind::JobCreated, "create").await?;
         Ok(CreateAddJobResult { job, replayed })
     }
 
     /// Reserves its delivery identity, persists the assignment, then exposes it in the outbox.
-    pub fn assign_job(&self, request: AssignJobRequest) -> CentralResult<AssignJobResult> {
-        let mut job = self.load(&request.tenant_id, &request.job_id)?;
+    pub async fn assign_job(&self, request: AssignJobRequest) -> CentralResult<AssignJobResult> {
+        let mut job = self.load(&request.tenant_id, &request.job_id).await?;
         self.authorize(
             Actor::Principal(request.actor),
             Action::AssignJob,
             &job.spec,
-        )?;
+        )
+        .await?;
         let assignment = neoengram_protocol::AddAssignment {
             job_id: job.spec.job_id.clone(),
             assignment_id: request.target.assignment_id.clone(),
@@ -164,9 +162,10 @@ impl ControlPlane {
                     "job already has a different persisted assignment",
                 ));
             }
-            let _ = self.outbox.reserve(envelope.clone())?;
-            let _ = self.outbox.publish(envelope.clone())?;
-            self.audit(&job, AuditKind::AssignmentQueued, "assignment")?;
+            let _ = self.outbox.reserve(envelope.clone()).await?;
+            let _ = self.outbox.publish(envelope.clone()).await?;
+            self.audit(&job, AuditKind::AssignmentQueued, "assignment")
+                .await?;
             return Ok(AssignJobResult {
                 job,
                 assignment: envelope,
@@ -189,20 +188,21 @@ impl ControlPlane {
 
         // Reserve first so a tenant-scoped AssignmentId conflict cannot mutate the job. The
         // reservation remains delivery-invisible until the authoritative assignment is durable.
-        let _ = self.outbox.reserve(envelope.clone())?;
+        let _ = self.outbox.reserve(envelope.clone()).await?;
         let previous = job.resource_version.get();
         job.assignment = Some(assignment.clone());
         job.state = JobState::Assigned;
-        job = match self.replace(previous, job) {
+        job = match self.replace(previous, job).await {
             Ok(job) => job,
             Err(error) if error.code() == CentralErrorCode::ConcurrentUpdate => {
-                let persisted = self.load(&request.tenant_id, &request.job_id)?;
+                let persisted = self.load(&request.tenant_id, &request.job_id).await?;
                 if persisted.assignment.as_ref() != Some(&assignment) {
                     return Err(error);
                 }
-                let _ = self.outbox.reserve(envelope.clone())?;
-                let _ = self.outbox.publish(envelope.clone())?;
-                self.audit(&persisted, AuditKind::AssignmentQueued, "assignment")?;
+                let _ = self.outbox.reserve(envelope.clone()).await?;
+                let _ = self.outbox.publish(envelope.clone()).await?;
+                self.audit(&persisted, AuditKind::AssignmentQueued, "assignment")
+                    .await?;
                 return Ok(AssignJobResult {
                     job: persisted,
                     assignment: envelope,
@@ -212,8 +212,9 @@ impl ControlPlane {
             Err(error) => return Err(error),
         };
 
-        let _ = self.outbox.publish(envelope.clone())?;
-        self.audit(&job, AuditKind::AssignmentQueued, "assignment")?;
+        let _ = self.outbox.publish(envelope.clone()).await?;
+        self.audit(&job, AuditKind::AssignmentQueued, "assignment")
+            .await?;
         Ok(AssignJobResult {
             job,
             assignment: envelope,
@@ -222,16 +223,19 @@ impl ControlPlane {
     }
 
     /// Applies one idempotent agent report to the persisted state machine.
-    pub fn receive_report(
+    pub async fn receive_report(
         &self,
         request: ReceiveReportRequest,
     ) -> CentralResult<ReceiveReportResult> {
-        let mut job = self.load(&request.tenant_id, request.report.job_id())?;
+        let mut job = self
+            .load(&request.tenant_id, request.report.job_id())
+            .await?;
         self.authorize(
             Actor::Agent(request.agent_id.clone()),
             Action::ReceiveReport,
             &job.spec,
-        )?;
+        )
+        .await?;
         let assignment = job.assignment.as_ref().ok_or_else(|| {
             invalid(
                 CentralErrorCode::InvalidState,
@@ -440,23 +444,25 @@ impl ControlPlane {
         };
 
         if !replayed {
-            job = self.replace(previous, job)?;
+            job = self.replace(previous, job).await?;
         }
-        self.audit(&job, AuditKind::ReportReceived, "report")?;
+        self.audit(&job, AuditKind::ReportReceived, "report")
+            .await?;
         Ok(ReceiveReportResult { job, replayed })
     }
 
     /// Stages an exact prepared descriptor or page after validating assignment and batch scope.
-    pub fn stage_metadata_batch(
+    pub async fn stage_metadata_batch(
         &self,
         request: StageMetadataBatchRequest,
     ) -> CentralResult<StageMetadataBatchResult> {
-        let job = self.load(&request.tenant_id, &request.job_id)?;
+        let job = self.load(&request.tenant_id, &request.job_id).await?;
         self.authorize(
             Actor::Agent(request.agent_id.clone()),
             Action::StageMetadataBatch,
             &job.spec,
-        )?;
+        )
+        .await?;
         if !matches!(
             job.state,
             JobState::Prepared | JobState::Publishing | JobState::Succeeded | JobState::Conflicted
@@ -506,18 +512,20 @@ impl ControlPlane {
                         "staged descriptor differs from JobPrepared",
                     ));
                 }
-                self.metadata.stage_descriptor(descriptor)?
+                self.metadata.stage_descriptor(descriptor).await?
             }
             MetadataBatchSubmission::Page(page) => {
                 declared.validate_page(&page)?;
-                self.metadata.stage_page(declared, page)?
+                self.metadata.stage_page(declared, page).await?
             }
         };
         let complete = self
             .metadata
-            .get(&assignment.tenant_id, &batch_id)?
+            .get(&assignment.tenant_id, &batch_id)
+            .await?
             .is_some_and(|batch| batch.is_complete());
-        self.audit(&job, AuditKind::MetadataStaged, &audit_suffix)?;
+        self.audit(&job, AuditKind::MetadataStaged, &audit_suffix)
+            .await?;
         Ok(StageMetadataBatchResult {
             batch_id,
             complete,
@@ -527,16 +535,17 @@ impl ControlPlane {
 
     /// Atomically marks an elapsed managed Add as TimedOut and creates a terminal decision when
     /// the job already has an assignment.
-    pub fn expire_add_job(
+    pub async fn expire_add_job(
         &self,
         request: ExpireAddJobRequest,
     ) -> CentralResult<ExpireAddJobResult> {
-        let mut job = self.load(&request.tenant_id, &request.job_id)?;
+        let mut job = self.load(&request.tenant_id, &request.job_id).await?;
         self.authorize(
             Actor::Principal(request.actor),
             Action::ExpireAddJob,
             &job.spec,
-        )?;
+        )
+        .await?;
 
         if job.state == JobState::TimedOut {
             let decision = job.decision.clone();
@@ -573,7 +582,7 @@ impl ControlPlane {
                     ));
                 }
             }
-            self.audit(&job, AuditKind::AddExpired, "expire")?;
+            self.audit(&job, AuditKind::AddExpired, "expire").await?;
             return Ok(ExpireAddJobResult {
                 job,
                 decision,
@@ -661,8 +670,8 @@ impl ControlPlane {
         job.state = JobState::TimedOut;
         job.decision.clone_from(&decision);
         job.finalized.clone_from(&finalized);
-        job = self.replace(previous, job)?;
-        self.audit(&job, AuditKind::AddExpired, "expire")?;
+        job = self.replace(previous, job).await?;
+        self.audit(&job, AuditKind::AddExpired, "expire").await?;
         Ok(ExpireAddJobResult {
             job,
             decision,
@@ -672,40 +681,45 @@ impl ControlPlane {
     }
 
     /// Validates complete staged metadata and central object durability, then performs one CAS.
-    pub fn finalize_add(&self, request: FinalizeAddRequest) -> CentralResult<FinalizeAddResult> {
-        let job = self.load(&request.tenant_id, &request.job_id)?;
+    pub async fn finalize_add(
+        &self,
+        request: FinalizeAddRequest,
+    ) -> CentralResult<FinalizeAddResult> {
+        let job = self.load(&request.tenant_id, &request.job_id).await?;
         self.authorize(
             Actor::Principal(request.actor),
             Action::FinalizeAdd,
             &job.spec,
-        )?;
-        self.finalize_loaded(job)
+        )
+        .await?;
+        self.finalize_loaded(job).await
     }
 
     /// Resumes only a previously frozen Publishing job without re-entering mutable user policy.
     /// Transport adapters must keep this internal and expose [`Self::finalize_add`] to users.
-    pub fn resume_publication(
+    pub async fn resume_publication(
         &self,
         request: ResumePublicationRequest,
     ) -> CentralResult<FinalizeAddResult> {
-        let job = self.load(&request.tenant_id, &request.job_id)?;
+        let job = self.load(&request.tenant_id, &request.job_id).await?;
         if job.state != JobState::Publishing {
             return Err(invalid(
                 CentralErrorCode::InvalidState,
                 format!("cannot resume publication in state {:?}", job.state),
             ));
         }
-        self.finalize_loaded(job)
+        self.finalize_loaded(job).await
     }
 
-    fn finalize_loaded(&self, mut job: JobRecord) -> CentralResult<FinalizeAddResult> {
+    async fn finalize_loaded(&self, mut job: JobRecord) -> CentralResult<FinalizeAddResult> {
         let resumed_publication = job.state == JobState::Publishing;
         if let (Some(decision), Some(finalized)) = (&job.decision, &job.finalized) {
             if matches!(
                 job.state,
                 JobState::Succeeded | JobState::Conflicted | JobState::Failed
             ) {
-                self.audit(&job, AuditKind::AddFinalized, "finalize")?;
+                self.audit(&job, AuditKind::AddFinalized, "finalize")
+                    .await?;
                 return Ok(FinalizeAddResult {
                     job: job.clone(),
                     decision: decision.clone(),
@@ -743,7 +757,8 @@ impl ControlPlane {
                 ));
             }
             let metadata =
-                validate_staged_metadata(&job, self.metadata.as_ref(), self.objects.as_ref())?;
+                validate_staged_metadata(&job, self.metadata.as_ref(), self.objects.as_ref())
+                    .await?;
             // This is the last authority gate before Publishing becomes durable. Once that state
             // and its canonical candidate are persisted, recovery must converge a possibly
             // completed CAS without consulting mutable authority or transient staging again.
@@ -781,19 +796,22 @@ impl ControlPlane {
             let previous = job.resource_version.get();
             job.state = JobState::Publishing;
             job.publication_candidate = Some(candidate.clone());
-            job = self.replace(previous, job)?;
+            job = self.replace(previous, job).await?;
             candidate
         };
 
         let prepared_result_digest = publication_candidate.result_index_digest;
-        let publish = self.publisher.compare_and_swap(IndexPublishRequest {
-            job_key: job.key(),
-            index_key: job.index_key(),
-            expected_index_version: publication_candidate.expected_index_version,
-            expected_result_digest: prepared_result_digest,
-            manifests: publication_candidate.manifests,
-            mutations: publication_candidate.mutations,
-        })?;
+        let publish = self
+            .publisher
+            .compare_and_swap(IndexPublishRequest {
+                job_key: job.key(),
+                index_key: job.index_key(),
+                expected_index_version: publication_candidate.expected_index_version,
+                expected_result_digest: prepared_result_digest,
+                manifests: publication_candidate.manifests,
+                mutations: publication_candidate.mutations,
+            })
+            .await?;
         let decision_generation = DecisionGeneration::new(1);
         let (state, outcome) = match publish {
             IndexPublishOutcome::Published(version) => (
@@ -881,8 +899,9 @@ impl ControlPlane {
         job.state = state;
         job.decision = Some(decision.clone());
         job.finalized = Some(finalized.clone());
-        job = self.replace(previous, job)?;
-        self.audit(&job, AuditKind::AddFinalized, "finalize")?;
+        job = self.replace(previous, job).await?;
+        self.audit(&job, AuditKind::AddFinalized, "finalize")
+            .await?;
         Ok(FinalizeAddResult {
             job,
             decision,
@@ -891,13 +910,13 @@ impl ControlPlane {
         })
     }
 
-    fn load(
+    async fn load(
         &self,
         tenant_id: &neoengram_protocol::TenantId,
         job_id: &neoengram_protocol::JobId,
     ) -> CentralResult<JobRecord> {
         let key = crate::JobKey::new(tenant_id.clone(), job_id.clone());
-        self.jobs.get(&key)?.ok_or_else(|| {
+        self.jobs.get(&key).await?.ok_or_else(|| {
             invalid(
                 CentralErrorCode::JobNotFound,
                 format!("managed Add job {job_id} was not found"),
@@ -905,26 +924,33 @@ impl ControlPlane {
         })
     }
 
-    fn replace(&self, expected: u64, mut job: JobRecord) -> CentralResult<JobRecord> {
+    async fn replace(&self, expected: u64, mut job: JobRecord) -> CentralResult<JobRecord> {
         let next = expected
             .checked_add(1)
             .ok_or_else(|| invalid(CentralErrorCode::Internal, "job ResourceVersion overflow"))?;
         job.resource_version = ResourceVersion::new(next);
-        self.jobs.replace(expected, job)
+        self.jobs.replace(expected, job).await
     }
 
-    fn authorize(&self, actor: Actor, action: Action, spec: &AddJobSpec) -> CentralResult<()> {
-        self.authorizer.authorize(&AuthorizationRequest {
-            actor,
-            action,
-            tenant_id: spec.tenant_id.clone(),
-            artifact_id: spec.artifact_id.clone(),
-            playground_id: spec.playground_id.clone(),
-            job_id: spec.job_id.clone(),
-        })
+    async fn authorize(
+        &self,
+        actor: Actor,
+        action: Action,
+        spec: &AddJobSpec,
+    ) -> CentralResult<()> {
+        self.authorizer
+            .authorize(&AuthorizationRequest {
+                actor,
+                action,
+                tenant_id: spec.tenant_id.clone(),
+                artifact_id: spec.artifact_id.clone(),
+                playground_id: spec.playground_id.clone(),
+                job_id: spec.job_id.clone(),
+            })
+            .await
     }
 
-    fn audit(&self, job: &JobRecord, kind: AuditKind, suffix: &str) -> CentralResult<()> {
+    async fn audit(&self, job: &JobRecord, kind: AuditKind, suffix: &str) -> CentralResult<()> {
         let event = AuditEvent {
             event_id: format!(
                 "{}:{}:{}:{suffix}",
@@ -935,7 +961,7 @@ impl ControlPlane {
             state: job.state,
             occurred_at_unix_ms: self.clock.now(),
         };
-        let _ = self.audit.record(event)?;
+        let _ = self.audit.record(event).await?;
         Ok(())
     }
 }

@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use futures::executor::block_on;
 use neoengram_agent::{
     Agent, AgentAssignmentState, AgentError, AgentErrorCode, AgentReport as LocalReport,
     AgentResult, AssignmentKey, BasicAssignmentValidator, ClaimDisposition, FakeAddExecutor,
@@ -28,14 +29,14 @@ use neoengram_protocol::{
 use neoengramd::{
     AddJobSpec, AgentReport as CentralReport, AssignJobRequest, AssignmentTarget, ControlPlane,
     CreateAddJobRequest, FinalizeAddRequest, InMemoryComponents, InMemoryObjectCatalog, IndexKey,
-    IndexPublisher, MetadataBatchSubmission, ReceiveReportRequest, ReceiveReportResult,
-    StageMetadataBatchRequest, StageMetadataBatchResult,
+    IndexPublisher, MetadataBatchSubmission, ObjectCatalog, ReceiveReportRequest,
+    ReceiveReportResult, StageMetadataBatchRequest, StageMetadataBatchResult,
 };
 
 const NOW: u64 = 1_000;
 
-#[test]
-fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries() {
+#[tokio::test]
+async fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries() {
     let central = InMemoryComponents::new(NOW);
     let control = Arc::new(central.control_plane());
     let actor = principal();
@@ -47,7 +48,7 @@ fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries() {
         artifact_id: artifact_id.clone(),
         playground_id: playground_id.clone(),
     };
-    let expected = central.publisher.current_version(&index_key).unwrap();
+    let expected = central.publisher.current_version(&index_key).await.unwrap();
     let mut spec = AddJobSpec {
         job_id: neoengram_protocol::JobId::new("job-e2e").unwrap(),
         principal: actor.clone(),
@@ -68,6 +69,7 @@ fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries() {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
     let target = assignment_target();
     let assigned = control
@@ -77,6 +79,7 @@ fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries() {
             job_id: spec.job_id.clone(),
             target: target.clone(),
         })
+        .await
         .unwrap();
     let AssignmentOperation::Add {
         input: assignment, ..
@@ -171,6 +174,7 @@ fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries() {
             tenant_id: tenant_id.clone(),
             job_id: assignment.job_id.clone(),
         })
+        .await
         .unwrap();
     assert_eq!(published.job.state, JobState::Succeeded);
 
@@ -194,8 +198,8 @@ fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries() {
     assert_eq!(snapshot.records[0].path.as_str(), "dataset/value.bin");
 }
 
-#[test]
-fn agent_failure_round_trips_over_wire_into_the_control_plane() {
+#[tokio::test]
+async fn agent_failure_round_trips_over_wire_into_the_control_plane() {
     let central = InMemoryComponents::new(NOW);
     let control = Arc::new(central.control_plane());
     let actor = principal();
@@ -209,6 +213,7 @@ fn agent_failure_round_trips_over_wire_into_the_control_plane() {
             artifact_id: artifact_id.clone(),
             playground_id: playground_id.clone(),
         })
+        .await
         .unwrap();
     let mut spec = AddJobSpec {
         job_id: neoengram_protocol::JobId::new("job-failure-e2e").unwrap(),
@@ -230,6 +235,7 @@ fn agent_failure_round_trips_over_wire_into_the_control_plane() {
             actor: actor.clone(),
             spec: spec.clone(),
         })
+        .await
         .unwrap();
     let target = assignment_target();
     let assigned = control
@@ -239,6 +245,7 @@ fn agent_failure_round_trips_over_wire_into_the_control_plane() {
             job_id: spec.job_id.clone(),
             target: target.clone(),
         })
+        .await
         .unwrap();
     let AssignmentOperation::Add {
         input: assignment, ..
@@ -338,14 +345,12 @@ impl ReportSink for CentralReportSink {
                 ));
             }
         };
-        let result = self
-            .control
-            .receive_report(ReceiveReportRequest {
-                tenant_id: self.tenant_id.clone(),
-                agent_id: self.agent_id.clone(),
-                report,
-            })
-            .map_err(|error| AgentError::new(AgentErrorCode::ReportFailed, error.to_string()))?;
+        let result = block_on(self.control.receive_report(ReceiveReportRequest {
+            tenant_id: self.tenant_id.clone(),
+            agent_id: self.agent_id.clone(),
+            report,
+        }))
+        .map_err(|error| AgentError::new(AgentErrorCode::ReportFailed, error.to_string()))?;
         self.results
             .lock()
             .map_err(|_| agent_internal("central report result lock poisoned"))?
@@ -419,26 +424,25 @@ impl ObjectTransfer for CentralObjectTransfer {
     ) -> AgentResult<TransferReceipt> {
         let receipt = self.inner.transfer(assignment, prepared)?;
         for object in &prepared.object_specs {
-            self.objects
-                .record_durability(&ObjectDurabilityReceipt {
-                    tenant_id: assignment.tenant_id.clone(),
-                    artifact_id: assignment.artifact_id.clone(),
-                    session_id: SessionId::new("session-e2e").unwrap(),
-                    job_id: assignment.job_id.clone(),
-                    object: WireObjectSpec {
-                        object_id: object.id,
-                        size: DecimalU64::new(object.size),
-                        extensions: Extensions::new(),
-                    },
-                    state: DurabilityState::Durable {
-                        verified_digest: object.id.digest(),
-                        storage_version: "s3-e2e-version".to_owned(),
-                        extensions: Extensions::new(),
-                    },
-                    checked_at_unix_ms: UnixMillis::new(NOW + 10),
+            block_on(self.objects.record_durability(&ObjectDurabilityReceipt {
+                tenant_id: assignment.tenant_id.clone(),
+                artifact_id: assignment.artifact_id.clone(),
+                session_id: SessionId::new("session-e2e").unwrap(),
+                job_id: assignment.job_id.clone(),
+                object: WireObjectSpec {
+                    object_id: object.id,
+                    size: DecimalU64::new(object.size),
                     extensions: Extensions::new(),
-                })
-                .map_err(transfer_error)?;
+                },
+                state: DurabilityState::Durable {
+                    verified_digest: object.id.digest(),
+                    storage_version: "s3-e2e-version".to_owned(),
+                    extensions: Extensions::new(),
+                },
+                checked_at_unix_ms: UnixMillis::new(NOW + 10),
+                extensions: Extensions::new(),
+            }))
+            .map_err(transfer_error)?;
         }
         Ok(receipt)
     }
@@ -472,15 +476,16 @@ impl ObjectTransfer for CentralObjectTransfer {
                     .map(MetadataBatchSubmission::Page),
             );
         for (index, submission) in submissions.enumerate() {
-            let result = self
-                .control
-                .stage_metadata_batch(StageMetadataBatchRequest {
-                    tenant_id: assignment.tenant_id.clone(),
-                    job_id: assignment.job_id.clone(),
-                    agent_id: assignment.agent_id.clone(),
-                    submission,
-                })
-                .map_err(transfer_error)?;
+            let result = block_on(
+                self.control
+                    .stage_metadata_batch(StageMetadataBatchRequest {
+                        tenant_id: assignment.tenant_id.clone(),
+                        job_id: assignment.job_id.clone(),
+                        agent_id: assignment.agent_id.clone(),
+                        submission,
+                    }),
+            )
+            .map_err(transfer_error)?;
             self.staging_results
                 .lock()
                 .map_err(|_| agent_internal("staging result lock poisoned"))?
