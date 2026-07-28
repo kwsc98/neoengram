@@ -61,6 +61,9 @@ const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
           <span>逻辑大小</span><strong>{{ formatBytes(snapshot.logical_size_bytes) }}</strong>
         </div>
         <div>
+          <span>Region</span><strong>{{ snapshot.region }}</strong>
+        </div>
+        <div>
           <span>创建时间</span><strong>{{ formatTime(snapshot.created_at_unix_ms) }}</strong>
         </div>
       </section>
@@ -101,6 +104,12 @@ const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
             <dt>Commit</dt>
             <dd>
               <code>{{ snapshot.commit_id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>StorageVolume</dt>
+            <dd>
+              <code>{{ snapshot.storage_volume_id }}</code>
             </dd>
           </div>
           <div class="definition-grid__wide">

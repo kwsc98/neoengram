@@ -10,6 +10,16 @@ async function expectHealthyLayout(page: Page) {
   expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth + 1);
 }
 
+async function navigateFromSidebar(page: Page, label: string) {
+  const mobileMenu = page.getByRole('button', { name: '打开导航' });
+  if (await mobileMenu.isVisible()) {
+    await mobileMenu.click();
+    await page.locator('.mobile-drawer').getByRole('button', { name: label, exact: true }).click();
+    return;
+  }
+  await page.locator('.sidebar').getByRole('button', { name: label, exact: true }).click();
+}
+
 test.beforeEach(({ page }) => {
   const errors: string[] = [];
   page.on('console', (message) => {
@@ -62,6 +72,13 @@ test('browses Artifact Commit graph and related resources', async ({ page }, tes
   await expect(page).toHaveURL(/tab=commits/);
   await expect(page.getByText('补充夜间道路场景', { exact: true })).toBeVisible();
   await expect(page.getByText(/experiment/).first()).toBeVisible();
+  const latestCommit = page.locator('.commit-node').filter({ hasText: '补充夜间道路场景' });
+  await latestCommit.getByRole('button', { name: '详情与 Diff' }).click();
+  const commitDrawer = page.getByRole('dialog', { name: 'Commit 详情' });
+  await expect(commitDrawer.getByText('完成首轮质量复核', { exact: true })).toBeVisible();
+  await expect(commitDrawer.getByText('dataset/index.json', { exact: true })).toBeVisible();
+  await expect(commitDrawer.getByText('tag:v1.0', { exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
 
   await page.getByRole('tab', { name: 'Playgrounds' }).click();
   await page.getByText('标注工作区', { exact: true }).click();
@@ -73,6 +90,81 @@ test('browses Artifact Commit graph and related resources', async ({ page }, tes
     animations: 'disabled',
     fullPage: true,
   });
+});
+
+test('creates an Artifact, Playground, Commit and Snapshot from resource pages', async ({
+  page,
+}, testInfo) => {
+  const suffix = testInfo.project.name;
+  const storageVolumeId = `volume-${suffix}`;
+  const artifactId = `evaluation-${suffix}`;
+  const playgroundId = `review-${suffix}`;
+
+  await page.goto('/tenants/tenant-a/storage-volumes');
+  await page.getByRole('button', { name: '登记 StorageVolume' }).click();
+  const storageDialog = page.getByRole('dialog', { name: '登记 StorageVolume' });
+  await storageDialog.getByLabel('StorageVolume ID').fill(storageVolumeId);
+  await storageDialog.getByLabel('名称').fill('自动化评测 PVC');
+  await storageDialog.getByLabel('EdgeCluster ID').fill('cluster-cn-south-1');
+  await storageDialog.getByLabel('Region').fill('cn-guangzhou');
+  await storageDialog.getByLabel('PVC Namespace').fill('neoengram-e2e');
+  await storageDialog.getByLabel('PVC Claim name').fill(`evaluation-${suffix}`);
+  await storageDialog.getByRole('button', { name: '登记 StorageVolume' }).click();
+  await expect(
+    page.locator('code:visible').filter({ hasText: storageVolumeId }).first(),
+  ).toBeVisible();
+
+  await navigateFromSidebar(page, 'Artifacts');
+  await page.getByRole('button', { name: '创建 Artifact' }).click();
+  const artifactDialog = page.getByRole('dialog', { name: '创建 Artifact' });
+  await artifactDialog.getByRole('combobox', { name: 'Project 筛选' }).click();
+  await page.getByRole('option', { name: /视觉数据/ }).click();
+  await artifactDialog.getByLabel('Artifact ID').fill(artifactId);
+  await artifactDialog.getByRole('combobox', { name: 'StorageVolume 选择' }).click();
+  await page.getByRole('option', { name: /自动化评测 PVC/ }).click();
+  await artifactDialog.getByLabel('名称').fill('自动驾驶评测集');
+  await artifactDialog.getByLabel('描述').fill('从资源页创建的端到端测试数据集');
+  await artifactDialog.getByRole('button', { name: '创建 Artifact' }).click();
+  await expect(page).toHaveURL(new RegExp(`/artifacts/${artifactId}$`));
+  await expect(page.getByRole('heading', { name: '自动驾驶评测集' })).toBeVisible();
+
+  await page.getByRole('button', { name: '创建 Playground' }).click();
+  const playgroundDialog = page.getByRole('dialog', { name: '创建 Playground' });
+  await playgroundDialog.getByLabel('Playground ID').fill(playgroundId);
+  await playgroundDialog.getByLabel('名称').fill('提交前复核');
+  await expect(playgroundDialog.getByText('自动化评测 PVC · cn-guangzhou')).toBeVisible();
+  await playgroundDialog.getByRole('button', { name: '创建 Playground' }).click();
+  await expect(page).toHaveURL(new RegExp(`/playgrounds/${playgroundId}$`));
+
+  await page.getByRole('button', { name: 'Commit', exact: true }).click();
+  const commitDialog = page.getByRole('dialog', { name: 'Commit Playground' });
+  await commitDialog.getByLabel('Commit message').fill('建立自动驾驶评测基线');
+  await commitDialog.getByLabel('详细描述').fill('记录自动驾驶评测集的初始导入和检查范围');
+  await commitDialog.getByLabel('Tags').fill(`baseline-${suffix}`);
+  await commitDialog.getByLabel('Tags').press('Enter');
+  await commitDialog.getByRole('button', { name: '创建 Commit' }).click();
+  await expect(page.getByText(/Commit commit-/)).toBeVisible();
+  await expect(page.getByText(/^commit-/).last()).toBeVisible();
+
+  await page.getByRole('button', { name: '查看 Head Commit' }).click();
+  const createdCommitDrawer = page.getByRole('dialog', { name: 'Commit 详情' });
+  await expect(
+    createdCommitDrawer.getByText('记录自动驾驶评测集的初始导入和检查范围'),
+  ).toBeVisible();
+  await expect(
+    createdCommitDrawer.getByText(`tag:baseline-${suffix}`, { exact: true }),
+  ).toBeVisible();
+  await expect(createdCommitDrawer.getByText('根 Commit，无父版本')).toBeVisible();
+  await expect(createdCommitDrawer.getByText(/dataset\/commits\/commit-/).first()).toBeVisible();
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: '创建 Snapshot' }).click();
+  const snapshotDialog = page.getByRole('dialog', { name: '创建 Snapshot' });
+  await expect(snapshotDialog.getByText('自动化评测 PVC · cn-guangzhou')).toBeVisible();
+  await snapshotDialog.getByRole('button', { name: '创建 Snapshot' }).click();
+  await expect(page).toHaveURL(/\/snapshots\/commit-/);
+  await expect(page.getByRole('heading', { name: '建立自动驾驶评测基线' })).toBeVisible();
+  await expect(page.getByText('cn-guangzhou', { exact: true }).first()).toBeVisible();
+  await expectHealthyLayout(page);
 });
 
 test('browses Tenant-wide Playground and Snapshot details', async ({ page }) => {

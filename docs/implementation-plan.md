@@ -3,7 +3,7 @@
 > 本文是 NeoEngram 的唯一实现路线、能力状态和研究计划记录。代码、架构文档或
 > README 中出现的路线描述应与本文保持一致；如果出现冲突，以本文为准。
 
-最后更新：2026-07-27
+最后更新：2026-07-28
 当前阶段：`0.2.0` P0 与中心 `AuthorityStore`/SQLite 默认后端已实现；生产 transport、PG/MySQL 与对象存储适配器待实现
 
 ## 1. 产品目标
@@ -49,8 +49,9 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
   PostgreSQL 是多实例/HA/RLS 目标，S3-compatible 存储保存 Chunk payload；
 - 客户端通过 header-versioned、模块/动作式 HTTP JSON API 访问中心服务，不直接访问数据库；
 - Vue 3 Web 控制台作为独立 `apps/neoengram-web` npm 应用，只消费公开 OpenAPI；首版 MSW 可运行，
-  已覆盖租户切换/创建、Project 筛选、Artifact/Commit/Playground/Snapshot 只读浏览和 Managed Add
-  Job；真实联网依赖后续 HTTP/OIDC adapter；
+  已覆盖租户切换/创建、StorageVolume 登记与放置选择、Project 筛选、Artifact/Playground/Snapshot
+  创建、带描述和 Tag Ref 的 Playground Commit、父版本文件 Diff、资源浏览和 Managed Add Job；
+  真实联网依赖后续 HTTP/OIDC adapter；
 - 第一版远端同步只围绕 `main`/detached Commit，暂不解决多分支合并；
 - 服务端保存不可变历史，ref/对象的保留和 GC 由中心策略统一管理；
 - 默认部署边界是企业内部多租户；首版认证抽象使用外部 OIDC/JWKS 签发的 Bearer JWT；

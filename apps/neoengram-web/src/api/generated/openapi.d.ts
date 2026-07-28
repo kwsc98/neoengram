@@ -87,6 +87,68 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/storage/volume/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询租户内 StorageVolume
+         * @description 分页返回租户登记的逻辑存储卷。返回值不包含挂载路径、凭据、Agent ownership
+         *     或 fencing 信息；region 和 EdgeCluster 用于创建资源时选择放置位置。
+         */
+        post: operations["queryStorageVolumeList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/storage/volume/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询单个 StorageVolume
+         * @description 按 tenant 和稳定逻辑存储 ID 返回可用于资源放置选择的公开视图。
+         */
+        post: operations["queryStorageVolume"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/storage/volume/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 登记 StorageVolume
+         * @description 在租户内登记已有 PVC 或 NFS 后端，不创建 Kubernetes PV/PVC 或 NFS 资源。
+         *     region 由 StorageVolume 固定，后续资源创建只提交 storage_volume_id。
+         */
+        post: operations["createStorageVolume"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/project/list/query": {
         parameters: {
             query?: never;
@@ -147,6 +209,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/artifact/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建 Artifact
+         * @description 在指定 Tenant/Project 下创建空 Artifact；资源身份使相同请求可幂等重放。
+         */
+        post: operations["createArtifact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/artifact/commit/graph/query": {
         parameters: {
             query?: never;
@@ -162,6 +244,28 @@ export interface paths {
          *     公开节点不包含 root directory、Manifest、Chunk 或存储信息。
          */
         post: operations["queryArtifactCommitGraph"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/artifact/commit/diff/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Commit 文件差异
+         * @description 比较目标 Commit 与指定 base Commit；未提供 `base_commit_id` 时使用目标 Commit 的单一
+         *     parent，根 Commit 则与空基线比较。结果只返回公开路径、变更类型和逻辑大小统计，
+         *     不暴露 Directory、Manifest、Chunk、digest 或物理对象位置。
+         */
+        post: operations["queryArtifactCommitDiff"];
         delete?: never;
         options?: never;
         head?: never;
@@ -208,6 +312,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/playground/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建 Playground
+         * @description 在 Artifact 下创建受管可写 Playground，并可固定初始 base Commit。
+         */
+        post: operations["createPlayground"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/playground/commit/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 提交 Playground
+         * @description 从 Playground 当前 IndexVersion 创建不可变 Commit，并以 `commit_request_id` 提供稳定的
+         *     mutation identity。服务端必须对 expected IndexVersion 和目标 Ref 执行 CAS。
+         */
+        post: operations["commitPlayground"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/snapshot/list/query": {
         parameters: {
             query?: never;
@@ -242,6 +387,26 @@ export interface paths {
          * @description 使用 tenant、project、artifact、commit 复合身份查询只读 Snapshot。
          */
         post: operations["querySnapshot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/snapshot/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建 Snapshot
+         * @description 为指定 Artifact Commit 创建或幂等返回固定只读 Snapshot。
+         */
+        post: operations["createSnapshot"];
         delete?: never;
         options?: never;
         head?: never;
@@ -405,6 +570,75 @@ export interface components {
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
             permissions: components["schemas"]["PermissionName"][];
         };
+        QueryStorageVolumeListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            region?: components["schemas"]["RegionName"];
+            backend_type?: components["schemas"]["StorageBackendType"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
+            query?: components["schemas"]["SearchQuery"];
+        };
+        QueryStorageVolumeListResponse: {
+            items: components["schemas"]["StorageVolumeView"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        QueryStorageVolumeRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+        };
+        QueryStorageVolumeResponse: {
+            storage_volume: components["schemas"]["StorageVolumeView"];
+        };
+        CreateStorageVolumeRequest: ({
+            tenant_id: components["schemas"]["TenantId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            display_name: components["schemas"]["DisplayName"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            region: components["schemas"]["RegionName"];
+            backend_type: components["schemas"]["StorageBackendType"];
+            access_mode: components["schemas"]["StorageAccessMode"];
+            pvc_reference?: components["schemas"]["PvcReference"];
+            nfs_reference?: components["schemas"]["NfsReference"];
+        } & {
+            [key: string]: unknown;
+        }) & ({
+            /** @constant */
+            backend_type?: "pvc";
+        } | {
+            /** @constant */
+            backend_type?: "nfs";
+        });
+        CreateStorageVolumeResponse: {
+            storage_volume: components["schemas"]["StorageVolumeView"];
+            replayed: boolean;
+        };
+        /**
+         * @description 租户登记的稳定逻辑存储身份。PVC namespace/claim 可以公开用于运维识别；NFS
+         *     server、export path、凭据、中心挂载路径和 Agent ownership 不属于公开视图。
+         */
+        StorageVolumeView: {
+            tenant_id: components["schemas"]["TenantId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            display_name: components["schemas"]["DisplayName"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            region: components["schemas"]["RegionName"];
+            backend_type: components["schemas"]["StorageBackendType"];
+            access_mode: components["schemas"]["StorageAccessMode"];
+            pvc_reference?: components["schemas"]["PvcReference"];
+            state: components["schemas"]["StorageVolumeState"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        PvcReference: {
+            namespace: string;
+            claim_name: string;
+        };
+        /** @description 仅在登记请求中使用；服务端不得在公开 StorageVolumeView 中回显。 */
+        NfsReference: {
+            server: string;
+            export_path: string;
+        };
         QueryProjectListRequest: {
             tenant_id: components["schemas"]["TenantId"];
             cursor?: components["schemas"]["PageCursor"];
@@ -441,11 +675,32 @@ export interface components {
         QueryArtifactResponse: {
             artifact: components["schemas"]["ArtifactView"];
         };
-        /** @description 不暴露 placement、Agent、Manifest 或 authority 存储位置的 Artifact 视图。 */
+        CreateArtifactRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            display_name: components["schemas"]["DisplayName"];
+            description?: components["schemas"]["Description"];
+            /** @default refs/heads/main */
+            default_ref: components["schemas"]["RefName"];
+        } & {
+            [key: string]: unknown;
+        };
+        CreateArtifactResponse: {
+            artifact: components["schemas"]["ArtifactView"];
+            replayed: boolean;
+        };
+        /**
+         * @description 暴露用户选择的 StorageVolume ID 和派生 region，但不暴露内部 ArtifactPlacement、Agent、
+         *     Manifest、挂载路径或 authority 存储位置。
+         */
         ArtifactView: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            region: components["schemas"]["RegionName"];
             display_name: components["schemas"]["DisplayName"];
             description?: components["schemas"]["Description"];
             default_ref: components["schemas"]["RefName"];
@@ -478,8 +733,42 @@ export interface components {
             commit_id: components["schemas"]["CommitId"];
             parent_commit_id?: components["schemas"]["CommitId"];
             message: string;
+            description?: components["schemas"]["Description"];
             ref_names: components["schemas"]["RefName"][];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        QueryArtifactCommitDiffRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            commit_id: components["schemas"]["CommitId"];
+            base_commit_id?: components["schemas"]["CommitId"];
+        };
+        QueryArtifactCommitDiffResponse: {
+            diff: components["schemas"]["CommitDiffView"];
+        };
+        /** @description 目标 Commit 与显式 base 或其单一 parent 的公开文件级差异。 */
+        CommitDiffView: {
+            base_commit?: components["schemas"]["CommitNode"];
+            target_commit: components["schemas"]["CommitNode"];
+            summary: components["schemas"]["CommitDiffSummary"];
+            changes: components["schemas"]["CommitDiffEntry"][];
+        };
+        CommitDiffSummary: {
+            files_added: components["schemas"]["CanonicalU64"];
+            files_modified: components["schemas"]["CanonicalU64"];
+            files_deleted: components["schemas"]["CanonicalU64"];
+            files_renamed: components["schemas"]["CanonicalU64"];
+            bytes_added: components["schemas"]["CanonicalU64"];
+            bytes_removed: components["schemas"]["CanonicalU64"];
+        };
+        CommitDiffEntry: {
+            /** @enum {string} */
+            change_type: "added" | "modified" | "deleted" | "renamed";
+            path: string;
+            previous_path?: string;
+            old_size_bytes?: components["schemas"]["CanonicalU64"];
+            new_size_bytes?: components["schemas"]["CanonicalU64"];
         };
         QueryPlaygroundListRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -502,12 +791,32 @@ export interface components {
         QueryPlaygroundResponse: {
             playground: components["schemas"]["PlaygroundView"];
         };
-        /** @description 不暴露 attachment、lease、fencing、Agent 或文件系统位置的 Playground 视图。 */
+        CreatePlaygroundRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            playground_id: components["schemas"]["PlaygroundId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            display_name: components["schemas"]["DisplayName"];
+            base_commit_id?: components["schemas"]["CommitId"];
+        } & {
+            [key: string]: unknown;
+        };
+        CreatePlaygroundResponse: {
+            playground: components["schemas"]["PlaygroundView"];
+            replayed: boolean;
+        };
+        /**
+         * @description 暴露用户选择的 StorageVolume ID 和派生 region，但不暴露 attachment、lease、fencing、
+         *     Agent 或文件系统位置。
+         */
         PlaygroundView: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
             playground_id: components["schemas"]["PlaygroundId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            region: components["schemas"]["RegionName"];
             display_name: components["schemas"]["DisplayName"];
             base_commit_id?: components["schemas"]["CommitId"];
             head_commit_id?: components["schemas"]["CommitId"];
@@ -516,6 +825,24 @@ export interface components {
             state: "ready" | "scanning" | "unavailable";
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        CommitPlaygroundRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            playground_id: components["schemas"]["PlaygroundId"];
+            commit_request_id: components["schemas"]["ResourceId"];
+            expected_index_version: components["schemas"]["IndexVersion"];
+            message: string;
+            description?: components["schemas"]["Description"];
+            tag_names?: components["schemas"]["TagName"][];
+        } & {
+            [key: string]: unknown;
+        };
+        CommitPlaygroundResponse: {
+            commit: components["schemas"]["CommitNode"];
+            playground: components["schemas"]["PlaygroundView"];
+            replayed: boolean;
         };
         QuerySnapshotListRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -537,12 +864,27 @@ export interface components {
         QuerySnapshotResponse: {
             snapshot: components["schemas"]["SnapshotView"];
         };
+        CreateSnapshotRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            commit_id: components["schemas"]["CommitId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+        } & {
+            [key: string]: unknown;
+        };
+        CreateSnapshotResponse: {
+            snapshot: components["schemas"]["SnapshotView"];
+            replayed: boolean;
+        };
         /** @description 由 tenant、project、artifact、commit 复合身份确定的只读 Snapshot。 */
         SnapshotView: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
             commit_id: components["schemas"]["CommitId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            region: components["schemas"]["RegionName"];
             message: string;
             ref_names: components["schemas"]["RefName"][];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
@@ -704,6 +1046,8 @@ export interface components {
             status: "ok";
         };
         TenantId: components["schemas"]["ResourceId"];
+        StorageVolumeId: components["schemas"]["ResourceId"];
+        EdgeClusterId: components["schemas"]["ResourceId"];
         ProjectId: components["schemas"]["ResourceId"];
         ArtifactId: components["schemas"]["ResourceId"];
         PlaygroundId: components["schemas"]["ResourceId"];
@@ -714,8 +1058,16 @@ export interface components {
         ErrorCode: string;
         DisplayName: string;
         Description: string;
+        RegionName: string;
+        /** @enum {string} */
+        StorageBackendType: "pvc" | "nfs";
+        /** @enum {string} */
+        StorageAccessMode: "read_write_many" | "read_write_once" | "read_only_many";
+        /** @enum {string} */
+        StorageVolumeState: "ready" | "degraded" | "unavailable";
         PermissionName: string;
         RefName: string;
+        TagName: string;
         /** @description 服务端生成、与资源 scope、筛选条件和排序绑定的不透明分页 token。 */
         PageCursor: string;
         /** @default 50 */
@@ -831,6 +1183,28 @@ export interface components {
                  *       "detail": "The Tenant ID already belongs to a different create request",
                  *       "instance": "/api/tenant/create",
                  *       "code": "TENANT_ID_REUSED",
+                 *       "request_id": "req-20260727-001",
+                 *       "retryable": false
+                 *     }
+                 */
+                "application/problem+json": components["schemas"]["ProblemDetails"];
+            };
+        };
+        /** @description 资源 identity 已绑定另一创建内容，或 expected version 不再匹配 */
+        MutationConflictProblem: {
+            headers: {
+                "X-Request-ID": components["headers"]["RequestId"];
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "type": "urn:neoengram:problem:resource-conflict",
+                 *       "title": "Resource mutation conflict",
+                 *       "status": 409,
+                 *       "detail": "The resource identity or expected version conflicts with current state",
+                 *       "instance": "/api/playground/commit/create",
+                 *       "code": "RESOURCE_CONFLICT",
                  *       "request_id": "req-20260727-001",
                  *       "retryable": false
                  *     }
@@ -1257,6 +1631,173 @@ export interface operations {
             503: components["responses"]["ServiceUnavailableProblem"];
         };
     };
+    queryStorageVolumeList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "page_size": 50
+                 *     }
+                 */
+                "application/json": components["schemas"]["QueryStorageVolumeListRequest"];
+            };
+        };
+        responses: {
+            /** @description StorageVolume 页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryStorageVolumeListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["CursorConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryStorageVolume: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryStorageVolumeRequest"];
+            };
+        };
+        responses: {
+            /** @description StorageVolume 当前公开视图 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryStorageVolumeResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createStorageVolume: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "storage_volume_id": "volume-vision",
+                 *       "display_name": "视觉数据 PVC",
+                 *       "edge_cluster_id": "cluster-cn-east-1",
+                 *       "region": "cn-shanghai",
+                 *       "backend_type": "pvc",
+                 *       "access_mode": "read_write_many",
+                 *       "pvc_reference": {
+                 *         "namespace": "neoengram-data",
+                 *         "claim_name": "vision-data"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["CreateStorageVolumeRequest"];
+            };
+        };
+        responses: {
+            /** @description StorageVolume 已登记或相同请求被重放 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateStorageVolumeResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
     queryProjectList: {
         parameters: {
             query?: never;
@@ -1374,6 +1915,8 @@ export interface operations {
                      *           "tenant_id": "tenant-a",
                      *           "project_id": "project-vision",
                      *           "artifact_id": "road-scenes",
+                     *           "storage_volume_id": "volume-shanghai-vision",
+                     *           "region": "cn-shanghai",
                      *           "display_name": "道路场景数据集",
                      *           "description": "训练与回归评估数据",
                      *           "default_ref": "refs/heads/main",
@@ -1445,6 +1988,8 @@ export interface operations {
                      *         "tenant_id": "tenant-a",
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
+                     *         "storage_volume_id": "volume-shanghai-vision",
+                     *         "region": "cn-shanghai",
                      *         "display_name": "道路场景数据集",
                      *         "description": "训练与回归评估数据",
                      *         "default_ref": "refs/heads/main",
@@ -1460,6 +2005,65 @@ export interface operations {
             401: components["responses"]["AuthenticationProblem"];
             403: components["responses"]["AuthorizationProblem"];
             404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createArtifact: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "evaluation-set",
+                 *       "storage_volume_id": "volume-shanghai-vision",
+                 *       "display_name": "评测数据集",
+                 *       "default_ref": "refs/heads/main"
+                 *     }
+                 */
+                "application/json": components["schemas"]["CreateArtifactRequest"];
+            };
+        };
+        responses: {
+            /** @description 已创建或幂等返回的 Artifact */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateArtifactResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];
@@ -1560,6 +2164,109 @@ export interface operations {
             503: components["responses"]["ServiceUnavailableProblem"];
         };
     };
+    queryArtifactCommitDiff: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "road-scenes",
+                 *       "commit_id": "commit-main-3"
+                 *     }
+                 */
+                "application/json": components["schemas"]["QueryArtifactCommitDiffRequest"];
+            };
+        };
+        responses: {
+            /** @description 目标 Commit 与 base/parent Commit 的文件级差异 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "diff": {
+                     *         "base_commit": {
+                     *           "commit_id": "commit-main-2",
+                     *           "parent_commit_id": "commit-root-1",
+                     *           "message": "完成首轮质量复核",
+                     *           "description": "完成白天场景的质量抽检和标签修订。",
+                     *           "ref_names": [
+                     *             "refs/tags/v1.0"
+                     *           ],
+                     *           "created_at_unix_ms": "1785067400000"
+                     *         },
+                     *         "target_commit": {
+                     *           "commit_id": "commit-main-3",
+                     *           "parent_commit_id": "commit-main-2",
+                     *           "message": "补充夜间道路场景",
+                     *           "description": "增加夜间和低照度样本，并更新场景索引。",
+                     *           "ref_names": [
+                     *             "refs/heads/main"
+                     *           ],
+                     *           "created_at_unix_ms": "1785167600000"
+                     *         },
+                     *         "summary": {
+                     *           "files_added": "1",
+                     *           "files_modified": "1",
+                     *           "files_deleted": "0",
+                     *           "files_renamed": "0",
+                     *           "bytes_added": "6144",
+                     *           "bytes_removed": "2048"
+                     *         },
+                     *         "changes": [
+                     *           {
+                     *             "change_type": "modified",
+                     *             "path": "dataset/index.json",
+                     *             "old_size_bytes": "2048",
+                     *             "new_size_bytes": "3072"
+                     *           },
+                     *           {
+                     *             "change_type": "added",
+                     *             "path": "dataset/night/manifest.jsonl",
+                     *             "new_size_bytes": "5120"
+                     *           }
+                     *         ]
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QueryArtifactCommitDiffResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
     queryPlaygroundList: {
         parameters: {
             query?: never;
@@ -1612,6 +2319,8 @@ export interface operations {
                      *           "project_id": "project-vision",
                      *           "artifact_id": "road-scenes",
                      *           "playground_id": "labeling",
+                     *           "storage_volume_id": "volume-shanghai-vision",
+                     *           "region": "cn-shanghai",
                      *           "display_name": "标注工作区",
                      *           "base_commit_id": "commit-main-2",
                      *           "head_commit_id": "commit-main-3",
@@ -1690,6 +2399,8 @@ export interface operations {
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
                      *         "playground_id": "labeling",
+                     *         "storage_volume_id": "volume-shanghai-vision",
+                     *         "region": "cn-shanghai",
                      *         "display_name": "标注工作区",
                      *         "base_commit_id": "commit-main-2",
                      *         "head_commit_id": "commit-main-3",
@@ -1709,6 +2420,129 @@ export interface operations {
             401: components["responses"]["AuthenticationProblem"];
             403: components["responses"]["AuthorizationProblem"];
             404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createPlayground: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "road-scenes",
+                 *       "playground_id": "review-july",
+                 *       "storage_volume_id": "volume-shanghai-vision",
+                 *       "display_name": "七月复核",
+                 *       "base_commit_id": "commit-main-3"
+                 *     }
+                 */
+                "application/json": components["schemas"]["CreatePlaygroundRequest"];
+            };
+        };
+        responses: {
+            /** @description 已创建或幂等返回的 Playground */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreatePlaygroundResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    commitPlayground: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "road-scenes",
+                 *       "playground_id": "labeling",
+                 *       "commit_request_id": "commit-request-july-labels",
+                 *       "expected_index_version": {
+                 *         "revision": "31",
+                 *         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                 *       },
+                 *       "message": "完成七月标注复核"
+                 *     }
+                 */
+                "application/json": components["schemas"]["CommitPlaygroundRequest"];
+            };
+        };
+        responses: {
+            /** @description 已创建或幂等返回的 Commit */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommitPlaygroundResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];
@@ -1767,6 +2601,8 @@ export interface operations {
                      *           "project_id": "project-vision",
                      *           "artifact_id": "road-scenes",
                      *           "commit_id": "commit-main-3",
+                     *           "storage_volume_id": "volume-shanghai-archive",
+                     *           "region": "cn-shanghai",
                      *           "message": "补充夜间道路场景",
                      *           "ref_names": [
                      *             "refs/heads/main"
@@ -1842,6 +2678,8 @@ export interface operations {
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
                      *         "commit_id": "commit-main-3",
+                     *         "storage_volume_id": "volume-shanghai-archive",
+                     *         "region": "cn-shanghai",
                      *         "message": "补充夜间道路场景",
                      *         "ref_names": [
                      *           "refs/heads/main"
@@ -1858,6 +2696,64 @@ export interface operations {
             401: components["responses"]["AuthenticationProblem"];
             403: components["responses"]["AuthorizationProblem"];
             404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createSnapshot: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "road-scenes",
+                 *       "commit_id": "commit-main-3",
+                 *       "storage_volume_id": "volume-shanghai-archive"
+                 *     }
+                 */
+                "application/json": components["schemas"]["CreateSnapshotRequest"];
+            };
+        };
+        responses: {
+            /** @description 已创建或幂等返回的 Snapshot */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateSnapshotResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];

@@ -3,8 +3,9 @@
 NeoEngram `0.2.0` 已完成 P0 crate 边界改造：本地 CLI、可复用领域模型、执行端口、文件系统
 适配器、Standalone 应用、wire protocol、Agent 和中心控制状态机分别拥有独立 crate。当前仍以
 本地 format v8 工作流为可运行产品；Agent 与中心仍是无网络 library，中心已提供后端无关
-`AuthorityStore` 和默认 SQLite 单节点权威后端。Vue 3 Web 控制台可通过 MSW 运行多租户资源浏览与
-Managed Add Job 流程，但尚未
+`AuthorityStore` 和默认 SQLite 单节点权威后端。Vue 3 Web 控制台可通过 MSW 运行多租户资源浏览、
+StorageVolume 登记与放置选择、Artifact/Playground/Snapshot 创建、Playground Commit 与 Managed
+Add Job 流程，并可查看 Commit 描述、Tag Ref、父 Commit 信息和文件 Diff，但尚未
 连接真实中心。这不代表 HTTP、PostgreSQL、mTLS、真实 S3 或 daemon 已经实现。能力状态和后续路线统一见
 [`implementation-plan.md`](implementation-plan.md)。
 

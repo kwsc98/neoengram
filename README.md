@@ -417,7 +417,8 @@ Agent 到 `neoengramd` 的依赖仅存在于 dev/test 组合测试。CLI 之外�
 
 `neoengram-web` 是独立 npm 应用，不进入 Cargo workspace，也不导入 Rust crate、Agent Schema 或
 数据库类型。它只从公开 OpenAPI 生成客户端类型；当前可通过 MSW 运行租户切换/创建、
-Artifact/Commit/Playground/Snapshot 浏览和 Managed Add Job，真实联网仍等待
+StorageVolume 登记与放置选择、Artifact/Playground/Snapshot 创建、Playground Commit、资源浏览和
+Commit 描述/Tag、父版本文件 Diff、Managed Add Job，真实联网仍等待
 `neoengramd` HTTP/OIDC adapter。
 
 ## 质量检查

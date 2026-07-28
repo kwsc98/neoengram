@@ -135,6 +135,14 @@ async function openSnapshot(project: string, artifact: string, commit: string): 
             </template>
           </el-table-column>
           <el-table-column prop="artifact_id" label="Artifact" min-width="160" />
+          <el-table-column label="放置" min-width="190">
+            <template #default="scope">
+              <div class="table-placement">
+                <strong>{{ scope.row.region }}</strong>
+                <code>{{ scope.row.storage_volume_id }}</code>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column label="文件" width="110">
             <template #default="scope">{{ formatCount(scope.row.logical_file_count) }}</template>
           </el-table-column>
@@ -170,7 +178,7 @@ async function openSnapshot(project: string, artifact: string, commit: string): 
               ><code>{{ snapshot.commit_id }}</code></span
             >
             <span
-              ><small>{{ formatBytes(snapshot.logical_size_bytes) }}</small
+              ><small>{{ snapshot.region }} · {{ formatBytes(snapshot.logical_size_bytes) }}</small
               ><ArrowRight
             /></span>
           </button>

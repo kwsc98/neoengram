@@ -1,24 +1,43 @@
 <script setup lang="ts">
-import { ArrowRight, Search } from '@element-plus/icons-vue';
-import { useQuery } from '@tanstack/vue-query';
-import { computed, ref, watch } from 'vue';
+import { ArrowRight, Plus, Search } from '@element-plus/icons-vue';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
+import { ElMessage } from 'element-plus';
+import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { queryArtifactList } from '@/api/operations';
+import { createArtifact, queryArtifactList } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
+import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
+import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
 
 const route = useRoute();
 const router = useRouter();
+const queryClient = useQueryClient();
+const tenants = useTenantsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
 const projectId = ref(String(route.query.project_id ?? ''));
 const searchInput = ref(String(route.query.q ?? ''));
 const search = ref(searchInput.value);
 const cursor = ref<string>();
 const cursorHistory = ref<string[]>([]);
+const createOpen = ref(false);
+const createError = ref('');
+const createForm = reactive({
+  projectId: '',
+  storageVolumeId: '',
+  artifactId: '',
+  displayName: '',
+  description: '',
+  defaultRef: 'refs/heads/main',
+});
+const canCreate = computed(
+  () => tenants.byId(tenantId.value)?.permissions.includes('artifact.create') ?? false,
+);
+const createMutation = useMutation({ mutationFn: createArtifact });
 
 watch(
   () => route.query,
@@ -78,11 +97,62 @@ async function openArtifact(project: string, artifact: string): Promise<void> {
     params: { tenantId: tenantId.value, projectId: project, artifactId: artifact },
   });
 }
+
+function openCreate(): void {
+  createForm.projectId = projectId.value;
+  createForm.storageVolumeId = '';
+  createForm.artifactId = '';
+  createForm.displayName = '';
+  createForm.description = '';
+  createForm.defaultRef = 'refs/heads/main';
+  createError.value = '';
+  createOpen.value = true;
+}
+
+async function submitCreate(): Promise<void> {
+  createError.value = '';
+  const resourceId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+  if (!resourceId.test(createForm.projectId) || !resourceId.test(createForm.artifactId)) {
+    createError.value = 'Project ID 和 Artifact ID 必须是合法资源标识';
+    return;
+  }
+  if (!createForm.displayName.trim()) {
+    createError.value = '请输入 Artifact 名称';
+    return;
+  }
+  if (!createForm.storageVolumeId) {
+    createError.value = '请选择 StorageVolume';
+    return;
+  }
+  try {
+    const result = await createMutation.mutateAsync({
+      tenant_id: tenantId.value,
+      project_id: createForm.projectId,
+      artifact_id: createForm.artifactId,
+      storage_volume_id: createForm.storageVolumeId,
+      display_name: createForm.displayName.trim(),
+      ...(createForm.description.trim() ? { description: createForm.description.trim() } : {}),
+      default_ref: createForm.defaultRef,
+    });
+    createOpen.value = false;
+    await queryClient.invalidateQueries({ queryKey: ['artifacts', tenantId.value] });
+    ElMessage.success(result.data.replayed ? '已返回现有 Artifact' : 'Artifact 已创建');
+    await openArtifact(result.data.artifact.project_id, result.data.artifact.artifact_id);
+  } catch (error) {
+    createError.value = error instanceof Error ? error.message : '创建 Artifact 失败';
+  }
+}
 </script>
 
 <template>
   <div class="page">
-    <PageHeading title="Artifacts" :description="`${tenantId} 内的受管 Artifact`" />
+    <PageHeading title="Artifacts" :description="`${tenantId} 内的受管 Artifact`">
+      <template #actions>
+        <el-button v-if="canCreate" type="primary" :icon="Plus" @click="openCreate">
+          创建 Artifact
+        </el-button>
+      </template>
+    </PageHeading>
 
     <form class="resource-toolbar" @submit.prevent="applyFilters">
       <ProjectFilter v-model="projectId" :tenant-id="tenantId" />
@@ -122,6 +192,14 @@ async function openArtifact(project: string, artifact: string): Promise<void> {
             </template>
           </el-table-column>
           <el-table-column prop="project_id" label="Project" min-width="170" />
+          <el-table-column label="放置" min-width="190">
+            <template #default="scope">
+              <div class="table-placement">
+                <strong>{{ scope.row.region }}</strong>
+                <code>{{ scope.row.storage_volume_id }}</code>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column prop="default_ref" label="Default ref" min-width="180" />
           <el-table-column label="更新时间" min-width="160">
             <template #default="scope">{{ formatTime(scope.row.updated_at_unix_ms) }}</template>
@@ -150,7 +228,7 @@ async function openArtifact(project: string, artifact: string): Promise<void> {
               ><code>{{ artifact.artifact_id }}</code></span
             >
             <span
-              ><small>{{ artifact.project_id }}</small
+              ><small>{{ artifact.project_id }} · {{ artifact.region }}</small
               ><ArrowRight
             /></span>
           </button>
@@ -164,5 +242,36 @@ async function openArtifact(project: string, artifact: string): Promise<void> {
         />
       </template>
     </section>
+
+    <el-dialog v-model="createOpen" title="创建 Artifact" width="min(560px, calc(100vw - 32px))">
+      <ApiProblemAlert v-if="createMutation.error.value" :error="createMutation.error.value" />
+      <el-alert v-if="createError" :title="createError" type="error" :closable="false" />
+      <el-form label-position="top" class="dialog-form">
+        <el-form-item label="Project">
+          <ProjectFilter v-model="createForm.projectId" :tenant-id="tenantId" />
+        </el-form-item>
+        <el-form-item label="Artifact ID">
+          <el-input v-model="createForm.artifactId" placeholder="evaluation-set" />
+        </el-form-item>
+        <el-form-item label="StorageVolume" required>
+          <StorageVolumeFilter v-model="createForm.storageVolumeId" :tenant-id="tenantId" />
+        </el-form-item>
+        <el-form-item label="名称">
+          <el-input v-model="createForm.displayName" placeholder="评测数据集" />
+        </el-form-item>
+        <el-form-item label="描述">
+          <el-input v-model="createForm.description" type="textarea" :rows="3" />
+        </el-form-item>
+        <el-form-item label="Default ref">
+          <el-input v-model="createForm.defaultRef" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="createOpen = false">取消</el-button>
+        <el-button type="primary" :loading="createMutation.isPending.value" @click="submitCreate">
+          创建 Artifact
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>

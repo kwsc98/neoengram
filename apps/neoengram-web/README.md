@@ -12,8 +12,9 @@ npm run api:generate
 npm run dev:mock
 ```
 
-浏览器访问 `http://127.0.0.1:4173`。Mock mode 提供多租户切换与创建、Project 筛选、Artifact
-与单 parent Commit 图、Playground/Snapshot 只读详情，以及 Managed Add Job 的
+浏览器访问 `http://127.0.0.1:4173`。Mock mode 提供多租户切换与创建、StorageVolume 登记、
+Artifact/Playground/Snapshot 放置选择与创建、Project 筛选、带详细描述和 Tag Ref 的 Playground
+Commit、单 parent Commit 图、当前版本与父版本的文件 Diff，以及 Managed Add Job 的
 create/query/finalize 状态机；它不能用于生产构建。
 
 真实 API 开发模式使用 `npm run dev`，Vite 默认把 `/api` 和 `/health` 代理到
