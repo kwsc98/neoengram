@@ -405,6 +405,8 @@ neoengram gc
 │   └── neoengram/                   # Clap、cwd 输入和唯一终端渲染入口
 ├── services/
 │   └── neoengramd/                  # 无网络中心状态机与内存适配器
+├── apps/
+│   └── neoengram-web/               # Vue 3 用户控制台；首版由 OpenAPI/MSW 驱动
 └── docs/                            # 代码与存储架构说明
 ```
 
@@ -412,6 +414,11 @@ neoengram gc
 只依赖 core，`neoengramd` 只依赖 protocol/core。该简图不枚举 CLI 对 core/engine 的直接类型导入；
 Agent 到 `neoengramd` 的依赖仅存在于 dev/test 组合测试。CLI 之外不渲染终端输出；完整约束见
 [`docs/code-architecture.md`](docs/code-architecture.md)。
+
+`neoengram-web` 是独立 npm 应用，不进入 Cargo workspace，也不导入 Rust crate、Agent Schema 或
+数据库类型。它只从公开 OpenAPI 生成客户端类型；当前可通过 MSW 运行租户切换/创建、
+Artifact/Commit/Playground/Snapshot 浏览和 Managed Add Job，真实联网仍等待
+`neoengramd` HTTP/OIDC adapter。
 
 ## 质量检查
 
@@ -440,8 +447,9 @@ crates.io 解析或 CLI 可从 registry 安装。
 当前存储边界。
 
 当前可运行产品完成的是本地 format v8、多 Workspace 与固定 Commit 只读 FUSE；P0 另提供 protocol、
-Agent 和中心控制面的 library/内存状态机。它不包含 HTTP、PostgreSQL、mTLS、真实 S3、daemon、
-认证、merge/rebase、`push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、分层 Merkle Directory 和流式 Commit
+Agent 和中心控制面的 library/内存状态机，以及由 MSW 驱动的多租户 Vue 3 Web 控制台。它不包含
+可联网 HTTP、PostgreSQL、mTLS、真实 S3、daemon、生产认证、merge/rebase、
+`push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、分层 Merkle Directory 和流式 Commit
 已经落地；CLI 通过结构化 Request/typed Result facade 调用 Standalone，并拥有全部成功文本与
 错误/结果渲染，Standalone 不再暴露通用 `CommandResult`。
 `commit` 已接入 Engine canonical graph builder/publisher；`checkout`、工作区 `restore` 和工作区 `rm`

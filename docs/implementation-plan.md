@@ -47,7 +47,10 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 
 - 中心服务采用模块化单体，逻辑权威经 `AuthorityStore` 与数据库解耦；SQLite 是单进程默认后端，
   PostgreSQL 是多实例/HA/RLS 目标，S3-compatible 存储保存 Chunk payload；
-- 客户端通过版本化 HTTP API 访问中心服务，不直接访问数据库；
+- 客户端通过 header-versioned、模块/动作式 HTTP JSON API 访问中心服务，不直接访问数据库；
+- Vue 3 Web 控制台作为独立 `apps/neoengram-web` npm 应用，只消费公开 OpenAPI；首版 MSW 可运行，
+  已覆盖租户切换/创建、Project 筛选、Artifact/Commit/Playground/Snapshot 只读浏览和 Managed Add
+  Job；真实联网依赖后续 HTTP/OIDC adapter；
 - 第一版远端同步只围绕 `main`/detached Commit，暂不解决多分支合并；
 - 服务端保存不可变历史，ref/对象的保留和 GC 由中心策略统一管理；
 - 默认部署边界是企业内部多租户；首版认证抽象使用外部 OIDC/JWKS 签发的 Bearer JWT；

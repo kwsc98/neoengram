@@ -1,0 +1,36 @@
+import type { components } from './generated/openapi';
+
+export type ApiVersionResponse = components['schemas']['ApiVersionResponse'];
+export type CreateAddJobRequest = components['schemas']['CreateAddJobRequest'];
+export type CreateAddJobResponse = components['schemas']['CreateAddJobResponse'];
+export type QueryJobResponse = components['schemas']['QueryJobResponse'];
+export type FinalizeAddJobResponse = components['schemas']['FinalizeAddJobResponse'];
+export type JobView = components['schemas']['JobView'];
+export type JobState = components['schemas']['JobState'];
+export type ProblemDetails = components['schemas']['ProblemDetails'];
+export type HealthResponse = components['schemas']['HealthResponse'];
+export type QueryTenantListRequest = components['schemas']['QueryTenantListRequest'];
+export type QueryTenantListResponse = components['schemas']['QueryTenantListResponse'];
+export type QueryTenantResponse = components['schemas']['QueryTenantResponse'];
+export type CreateTenantRequest = components['schemas']['CreateTenantRequest'];
+export type CreateTenantResponse = components['schemas']['CreateTenantResponse'];
+export type TenantView = components['schemas']['TenantView'];
+export type QueryProjectListRequest = components['schemas']['QueryProjectListRequest'];
+export type QueryProjectListResponse = components['schemas']['QueryProjectListResponse'];
+export type ProjectSummary = components['schemas']['ProjectSummary'];
+export type QueryArtifactListRequest = components['schemas']['QueryArtifactListRequest'];
+export type QueryArtifactListResponse = components['schemas']['QueryArtifactListResponse'];
+export type QueryArtifactResponse = components['schemas']['QueryArtifactResponse'];
+export type ArtifactView = components['schemas']['ArtifactView'];
+export type QueryArtifactCommitGraphResponse =
+  components['schemas']['QueryArtifactCommitGraphResponse'];
+export type CommitGraphView = components['schemas']['CommitGraphView'];
+export type CommitNode = components['schemas']['CommitNode'];
+export type QueryPlaygroundListRequest = components['schemas']['QueryPlaygroundListRequest'];
+export type QueryPlaygroundListResponse = components['schemas']['QueryPlaygroundListResponse'];
+export type QueryPlaygroundResponse = components['schemas']['QueryPlaygroundResponse'];
+export type PlaygroundView = components['schemas']['PlaygroundView'];
+export type QuerySnapshotListRequest = components['schemas']['QuerySnapshotListRequest'];
+export type QuerySnapshotListResponse = components['schemas']['QuerySnapshotListResponse'];
+export type QuerySnapshotResponse = components['schemas']['QuerySnapshotResponse'];
+export type SnapshotView = components['schemas']['SnapshotView'];
