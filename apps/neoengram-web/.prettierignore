@@ -1,0 +1,6 @@
+dist
+coverage
+playwright-report
+test-results
+src/api/generated/openapi.d.ts
+public/mockServiceWorker.js

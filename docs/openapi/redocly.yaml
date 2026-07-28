@@ -1,0 +1,20 @@
+apis:
+  public@v1:
+    root: ./neoengram-api.yaml
+
+extends:
+  - recommended
+
+rules:
+  no-ambiguous-paths: error
+  no-identical-paths: error
+  no-invalid-media-type-examples: error
+  no-server-example.com: error
+  no-unused-components: error
+  operation-2xx-response: error
+  operation-4xx-response: off
+  operation-description: error
+  operation-operationId: error
+  operation-summary: error
+  operation-tag-defined: error
+  security-defined: error

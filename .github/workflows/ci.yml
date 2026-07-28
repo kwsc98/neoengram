@@ -22,12 +22,38 @@ jobs:
         uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
+      - name: Install Node.js 22.12.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          cache: npm
+          cache-dependency-path: |
+            docs/openapi/package-lock.json
+            apps/neoengram-web/package-lock.json
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check architecture boundaries
         run: bash .github/check-architecture.sh
+      - name: Check public OpenAPI
+        run: |
+          npm ci --prefix docs/openapi --ignore-scripts
+          npm run lint --prefix docs/openapi
+          npm run bundle --prefix docs/openapi
+          npm run test:contract --prefix docs/openapi
+      - name: Install Web dependencies
+        run: npm ci
+        working-directory: apps/neoengram-web
+      - name: Check Vue Web
+        run: |
+          npm run format:check
+          npm run lint
+          npm run typecheck
+          npm run api:check
+          npm test
+          npm run build
+        working-directory: apps/neoengram-web
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Check documentation
@@ -105,6 +131,28 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run all-feature tests
         run: cargo test --workspace --all-targets --all-features --locked
+
+  web-e2e:
+    name: Vue Web E2E
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Node.js 22.12.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          cache: npm
+          cache-dependency-path: apps/neoengram-web/package-lock.json
+      - name: Install Web dependencies
+        run: npm ci
+        working-directory: apps/neoengram-web
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: apps/neoengram-web
+      - name: Run Vue Web end-to-end tests
+        run: npm run test:e2e
+        working-directory: apps/neoengram-web
 
   msrv:
     name: Minimum Rust 1.97.0

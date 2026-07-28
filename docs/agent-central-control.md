@@ -506,6 +506,11 @@ services/neoengramd/
 └── observability/   # metrics、trace、SLO
 ```
 
+用户 Web 控制台独立位于 `apps/neoengram-web/`，不嵌入中心 library，也不进入 Cargo workspace。
+它只能调用公开 OpenAPI；首版使用 MSW 模拟 17 个已定义 operation，包括多租户资源浏览与
+Managed Add Job，真实请求等待上表 `api/`、
+`identity/` adapter 落地。生产静态资源由反向代理与 `/api`、`/health` 组合为同一 origin。
+
 中心负责：
 
 - 认证主体并建立唯一 tenant context；
@@ -1198,27 +1203,34 @@ blob 放入受控 ObjectStore，PostgreSQL 保存 tenant-scoped ID、Hash、size
 
 ## 11. 中心管控、Agent 发起的协议
 
-### 11.1 未来 API 草案
+### 11.1 公开 API 契约与 Agent transport 草案
 
-以下路径和认证方式尚未实现，也不是 P0 wire compatibility 承诺；P0 只承诺
-`neoengram-protocol` 中的 transport-independent DTO、Schema、digest、错误码和限额。
+用户/CLI/UI 的首版公开契约见 [`openapi/neoengram-api.yaml`](openapi/neoengram-api.yaml)。它使用
+OpenAPI 3.1、普通 JSON 和模块/子域/动作路径；path 不含版本，认证业务方法通过
+`NeoEngram-API-Version: 1` header 协商版本，错误使用 RFC 9457 Problem Details。以下公开路径仍是
+待实现的 transport 契约，不表示当前 library-only `neoengramd` 已经监听 HTTP：
 
 ```text
-# 用户/CLI/UI 只访问这些中心业务 API
-POST /v1/tenants/{tenant_id}/artifacts
-GET  /v1/tenants/{tenant_id}/artifacts/{artifact_id}
-GET  /v1/tenants/{tenant_id}/artifacts/{artifact_id}/commits/{commit_id}
-GET  /v1/tenants/{tenant_id}/artifacts/{artifact_id}/snapshots/{commit_id}
-POST /v1/tenants/{tenant_id}/artifacts/{artifact_id}/playgrounds
+# 用户/CLI/UI 公开 OpenAPI；业务 ID 全部位于 JSON body
+POST /api/system/version/query
+POST /api/tenant/list/query
+POST /api/tenant/query
+POST /api/tenant/create
+POST /api/project/list/query
+POST /api/artifact/list/query
+POST /api/artifact/query
+POST /api/artifact/commit/graph/query
+POST /api/playground/list/query
+POST /api/playground/query
+POST /api/snapshot/list/query
+POST /api/snapshot/query
+POST /api/job/add/create
+POST /api/job/query
+POST /api/job/add/finalize
+GET  /health/live
+GET  /health/ready
 
-POST /v1/tenants/{tenant_id}/jobs
-GET  /v1/tenants/{tenant_id}/jobs/{job_id}
-POST /v1/tenants/{tenant_id}/jobs/{job_id}/cancel
-GET  /v1/tenants/{tenant_id}/playgrounds/{playground_id}/status-observation
-
-GET  /v1/tenants/{tenant_id}/gateways
-
-# Agent 使用节点证书主动访问这些中心 Agent API
+# 以下 Agent 路径只是未来 transport 草案，不属于公开 OpenAPI
 POST /v1/agents/bootstrap                                      # 一次性注册/证书签发
 POST /v1/agents/{agent_id}/sessions:connect                    # H2/H3 JSON 双向控制流
 GET  /v1/agents/{agent_id}/jobs/{job_id}/inputs/{input_id}/pages/{page}
@@ -1226,7 +1238,10 @@ POST /v1/agents/{agent_id}/jobs/{job_id}/metadata-batches
 PUT  /v1/agents/{agent_id}/jobs/{job_id}/metadata-batches/{batch_id}/pages/{page}
 ```
 
-用户 API 与 Agent API 使用不同认证域。用户 API 使用 OIDC principal 和 Tenant RBAC；Agent API 使用
+公开 OpenAPI 已定义 Tenant、Project、Artifact、Commit 图、Playground、Snapshot 的只读资源查询，
+但不承诺 Gateway、Job cancel/list、文件树或资源 mutation，也不暴露中心内部 `AssignJob`、
+`ExpireAddJob` 或 `ResumePublication`。用户 API 与 Agent API 使用不同认证域。用户 API 使用
+OIDC principal 和 Tenant RBAC；Agent API 使用
 绑定 `AgentInstance/ComputeNode` 的节点证书，只允许访问中心已经分配给该 Agent 的 Assignment。Agent
 不能用节点身份代替用户创建业务 Job，也不能读取未分配租户的队列。
 

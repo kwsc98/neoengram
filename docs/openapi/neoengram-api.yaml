@@ -1,0 +1,2468 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+
+info:
+  title: NeoEngram Public API
+  version: 1.0.0
+  summary: NeoEngram 用户、CLI 和 UI 使用的非 REST JSON API 契约
+  description: |
+    这是 NeoEngram 中心服务的首版公开 API 设计契约。当前仓库尚未实现 HTTP
+    server、路由或认证 adapter，因此本文档不表示这些地址已经可以访问。
+
+    业务方法使用“模块 / 子域 / 动作”路径，并通过普通 JSON 请求和响应调用；
+    路径不包含版本号。除版本查询和健康检查外，调用方必须发送
+    `NeoEngram-API-Version: 1` 和 Bearer JWT。
+
+    Agent 的双向 `application/json-seq` session 不属于本 OpenAPI。其消息、分页和
+    重放契约由 `neoengram-protocol` JSON Schema 与中心 Agent 架构文档定义。
+  license:
+    name: MIT OR Apache-2.0
+    identifier: MIT OR Apache-2.0
+
+servers:
+  - url: /
+    description: 与当前 neoengramd origin 相同
+
+tags:
+  - name: System
+    description: API 版本和兼容能力查询
+  - name: Tenant
+    description: 当前 principal 可见的租户与平台级租户创建方法
+  - name: Project
+    description: 租户内只读 Project 查询方法
+  - name: Artifact
+    description: 租户内 Artifact 和 Commit 图只读查询方法
+  - name: Playground
+    description: 租户内 Playground 只读查询方法
+  - name: Snapshot
+    description: 绑定 Artifact Commit 的只读 Snapshot 查询方法
+  - name: Job
+    description: 用户发起和查询的中心权威 Job 方法
+  - name: Health
+    description: 供进程管理器和负载均衡器调用的标准健康探针
+
+paths:
+  /api/system/version/query:
+    post:
+      tags: [System]
+      operationId: queryApiVersion
+      summary: 查询 API 和 Agent 协议版本
+      security: []
+      description: |
+        返回当前服务理解的公开 API 版本和 Agent wire protocol 版本。该方法用于
+        版本协商，因此不要求 `NeoEngram-API-Version` 或认证。
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmptyRequest'
+            example: {}
+      responses:
+        '200':
+          description: 版本与能力信息
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiVersionResponse'
+              example:
+                api_versions: [1]
+                agent_protocol_versions: [1]
+                capabilities:
+                  - managed_add
+                  - sqlite_authority
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/tenant/list/query:
+    post:
+      tags: [Tenant]
+      operationId: queryTenantList
+      summary: 查询当前用户可见租户
+      description: |
+        分页返回认证 principal 已获授权的租户。列表不会返回 principal 无权访问的租户，
+        `can_create_tenant` 只用于界面能力提示，服务端仍必须在创建时重新授权。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryTenantListRequest'
+            example:
+              page_size: 50
+              query: research
+      responses:
+        '200':
+          description: 当前 principal 可见的租户页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryTenantListResponse'
+              example:
+                items:
+                  - tenant_id: tenant-a
+                    display_name: 研究数据平台
+                    description: 研究团队的受管数据空间
+                    resource_version: '3'
+                    created_at_unix_ms: '1785167000000'
+                    updated_at_unix_ms: '1785167600000'
+                    permissions: [tenant.read, artifact.read, job.create]
+                next_cursor: tenant-page-2
+                can_create_tenant: true
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/tenant/query:
+    post:
+      tags: [Tenant]
+      operationId: queryTenant
+      summary: 查询单个租户
+      description: 查询当前 principal 可见的租户视图；不可见与不存在统一返回 404。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryTenantRequest'
+            example:
+              tenant_id: tenant-a
+      responses:
+        '200':
+          description: 可见租户的当前视图
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryTenantResponse'
+              example:
+                tenant:
+                  tenant_id: tenant-a
+                  display_name: 研究数据平台
+                  description: 研究团队的受管数据空间
+                  resource_version: '3'
+                  created_at_unix_ms: '1785167000000'
+                  updated_at_unix_ms: '1785167600000'
+                  permissions: [tenant.read, artifact.read, job.create]
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/tenant/create:
+    post:
+      tags: [Tenant]
+      operationId: createTenant
+      summary: 创建租户
+      description: |
+        仅平台管理员可调用。相同 tenant ID 和相同 canonical 创建内容返回既有租户并标记重放；
+        相同 tenant ID 对应不同内容时返回 `TENANT_ID_REUSED`。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTenantRequest'
+            example:
+              tenant_id: tenant-lab
+              display_name: 算法实验室
+              description: 算法团队的受管数据空间
+      responses:
+        '200':
+          description: 租户已创建或相同创建请求被重放
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateTenantResponse'
+              examples:
+                created:
+                  value:
+                    tenant:
+                      tenant_id: tenant-lab
+                      display_name: 算法实验室
+                      description: 算法团队的受管数据空间
+                      resource_version: '1'
+                      created_at_unix_ms: '1785168000000'
+                      updated_at_unix_ms: '1785168000000'
+                      permissions: [tenant.admin, tenant.read, artifact.read, job.create]
+                    replayed: false
+                replayed:
+                  value:
+                    tenant:
+                      tenant_id: tenant-lab
+                      display_name: 算法实验室
+                      description: 算法团队的受管数据空间
+                      resource_version: '1'
+                      created_at_unix_ms: '1785168000000'
+                      updated_at_unix_ms: '1785168000000'
+                      permissions: [tenant.admin, tenant.read, artifact.read, job.create]
+                    replayed: true
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '409':
+          $ref: '#/components/responses/TenantConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/project/list/query:
+    post:
+      tags: [Project]
+      operationId: queryProjectList
+      summary: 查询租户内 Project
+      description: 分页返回租户内当前 principal 可见的 Project，用于资源筛选。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryProjectListRequest'
+            example:
+              tenant_id: tenant-a
+              page_size: 50
+      responses:
+        '200':
+          description: Project 页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryProjectListResponse'
+              example:
+                items:
+                  - tenant_id: tenant-a
+                    project_id: project-vision
+                    display_name: 视觉数据
+                    created_at_unix_ms: '1785167000000'
+                    updated_at_unix_ms: '1785167600000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/artifact/list/query:
+    post:
+      tags: [Artifact]
+      operationId: queryArtifactList
+      summary: 查询租户内 Artifact
+      description: 按可选 Project 和关键字过滤，分页返回脱敏 Artifact 视图。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryArtifactListRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              page_size: 50
+      responses:
+        '200':
+          description: Artifact 页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryArtifactListResponse'
+              example:
+                items:
+                  - tenant_id: tenant-a
+                    project_id: project-vision
+                    artifact_id: road-scenes
+                    display_name: 道路场景数据集
+                    description: 训练与回归评估数据
+                    default_ref: refs/heads/main
+                    resource_version: '18'
+                    created_at_unix_ms: '1785167000000'
+                    updated_at_unix_ms: '1785167600000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/artifact/query:
+    post:
+      tags: [Artifact]
+      operationId: queryArtifact
+      summary: 查询 Artifact 详情
+      description: 按完整 tenant、project、artifact scope 查询公开 Artifact 元数据。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryArtifactRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+      responses:
+        '200':
+          description: Artifact 当前视图
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryArtifactResponse'
+              example:
+                artifact:
+                  tenant_id: tenant-a
+                  project_id: project-vision
+                  artifact_id: road-scenes
+                  display_name: 道路场景数据集
+                  description: 训练与回归评估数据
+                  default_ref: refs/heads/main
+                  resource_version: '18'
+                  created_at_unix_ms: '1785167000000'
+                  updated_at_unix_ms: '1785167600000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/artifact/commit/graph/query:
+    post:
+      tags: [Artifact]
+      operationId: queryArtifactCommitGraph
+      summary: 查询 Artifact Commit 图
+      description: |
+        分页返回单 parent Commit 节点和 Ref tips。Cursor 绑定 graph version 与完整 scope；
+        公开节点不包含 root directory、Manifest、Chunk 或存储信息。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryArtifactCommitGraphRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              page_size: 50
+      responses:
+        '200':
+          description: Commit 图的一页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryArtifactCommitGraphResponse'
+              example:
+                graph:
+                  graph_version: '18'
+                  refs:
+                    - name: refs/heads/main
+                      commit_id: commit-main-3
+                    - name: refs/heads/experiment
+                      commit_id: commit-exp-2
+                  nodes:
+                    - commit_id: commit-main-3
+                      parent_commit_id: commit-main-2
+                      message: 补充夜间道路场景
+                      ref_names: [refs/heads/main]
+                      created_at_unix_ms: '1785167600000'
+                    - commit_id: commit-exp-2
+                      parent_commit_id: commit-main-2
+                      message: 实验标注集
+                      ref_names: [refs/heads/experiment]
+                      created_at_unix_ms: '1785167500000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/CursorConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/list/query:
+    post:
+      tags: [Playground]
+      operationId: queryPlaygroundList
+      summary: 查询租户内 Playground
+      description: 分页查询 Playground；Artifact 筛选必须同时提供 Project scope。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryPlaygroundListRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              page_size: 50
+      responses:
+        '200':
+          description: Playground 页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryPlaygroundListResponse'
+              example:
+                items:
+                  - tenant_id: tenant-a
+                    project_id: project-vision
+                    artifact_id: road-scenes
+                    playground_id: labeling
+                    display_name: 标注工作区
+                    base_commit_id: commit-main-2
+                    head_commit_id: commit-main-3
+                    index_version:
+                      revision: '31'
+                      digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                    state: ready
+                    created_at_unix_ms: '1785167000000'
+                    updated_at_unix_ms: '1785167600000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/CursorConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/query:
+    post:
+      tags: [Playground]
+      operationId: queryPlayground
+      summary: 查询 Playground 详情
+      description: 按完整资源 scope 返回 Playground 的只读权威元数据。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryPlaygroundRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              playground_id: labeling
+      responses:
+        '200':
+          description: Playground 当前视图
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryPlaygroundResponse'
+              example:
+                playground:
+                  tenant_id: tenant-a
+                  project_id: project-vision
+                  artifact_id: road-scenes
+                  playground_id: labeling
+                  display_name: 标注工作区
+                  base_commit_id: commit-main-2
+                  head_commit_id: commit-main-3
+                  index_version:
+                    revision: '31'
+                    digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  state: ready
+                  created_at_unix_ms: '1785167000000'
+                  updated_at_unix_ms: '1785167600000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/snapshot/list/query:
+    post:
+      tags: [Snapshot]
+      operationId: querySnapshotList
+      summary: 查询租户内 Snapshot
+      description: 分页查询固定到 Artifact Commit 的只读 Snapshot。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuerySnapshotListRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              page_size: 50
+      responses:
+        '200':
+          description: Snapshot 页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuerySnapshotListResponse'
+              example:
+                items:
+                  - tenant_id: tenant-a
+                    project_id: project-vision
+                    artifact_id: road-scenes
+                    commit_id: commit-main-3
+                    message: 补充夜间道路场景
+                    ref_names: [refs/heads/main]
+                    created_at_unix_ms: '1785167600000'
+                    logical_file_count: '864'
+                    logical_size_bytes: '12884901888'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/CursorConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/snapshot/query:
+    post:
+      tags: [Snapshot]
+      operationId: querySnapshot
+      summary: 查询 Snapshot 详情
+      description: 使用 tenant、project、artifact、commit 复合身份查询只读 Snapshot。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuerySnapshotRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              commit_id: commit-main-3
+      responses:
+        '200':
+          description: Snapshot 当前视图
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuerySnapshotResponse'
+              example:
+                snapshot:
+                  tenant_id: tenant-a
+                  project_id: project-vision
+                  artifact_id: road-scenes
+                  commit_id: commit-main-3
+                  message: 补充夜间道路场景
+                  ref_names: [refs/heads/main]
+                  created_at_unix_ms: '1785167600000'
+                  logical_file_count: '864'
+                  logical_size_bytes: '12884901888'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/job/add/create:
+    post:
+      tags: [Job]
+      operationId: createAddJob
+      summary: 创建 Managed Add Job
+      description: |
+        创建一个 tenant-scoped Managed Add Job。`principal` 不由请求体声明，而是由
+        Bearer JWT 的认证结果注入。服务端在完成认证和请求校验后，使用 canonical
+        PrincipalRef 与完整 Add operation 计算 `request_digest`；客户端不提交该字段。
+
+        相同 `(tenant_id, job_id, request_digest)` 的重试返回原 Job，并将 `replayed`
+        设为 `true`。相同 Job ID 对应另一份服务端计算 digest 时返回 `JOB_ID_REUSED`。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAddJobRequest'
+            examples:
+              selectedPaths:
+                summary: 添加显式路径
+                value:
+                  tenant_id: tenant-a
+                  project_id: project-a
+                  artifact_id: artifact-a
+                  playground_id: playground-a
+                  job_id: job-20260727-001
+                  expected_index_version:
+                    revision: '0'
+                    digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  deadline_unix_ms: '1785168000000'
+                  paths:
+                    - dataset/images
+                    - dataset/labels.csv
+                  all: false
+              allPaths:
+                summary: 添加 Playground 全部变化
+                value:
+                  tenant_id: tenant-a
+                  project_id: project-a
+                  artifact_id: artifact-a
+                  playground_id: playground-a
+                  job_id: job-20260727-002
+                  expected_index_version:
+                    revision: '12'
+                    digest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+                  deadline_unix_ms: '1785168000000'
+                  paths: []
+                  all: true
+      responses:
+        '200':
+          description: Job 已创建，或同一请求被幂等重放
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAddJobResponse'
+              examples:
+                created:
+                  summary: 首次创建
+                  value:
+                    job:
+                      operation: add
+                      tenant_id: tenant-a
+                      project_id: project-a
+                      artifact_id: artifact-a
+                      playground_id: playground-a
+                      job_id: job-20260727-001
+                      state: queued
+                      resource_version: '1'
+                      deadline_unix_ms: '1785168000000'
+                    replayed: false
+                replayed:
+                  summary: 响应丢失后的同请求重放
+                  value:
+                    job:
+                      operation: add
+                      tenant_id: tenant-a
+                      project_id: project-a
+                      artifact_id: artifact-a
+                      playground_id: playground-a
+                      job_id: job-20260727-001
+                      state: queued
+                      resource_version: '1'
+                      deadline_unix_ms: '1785168000000'
+                    replayed: true
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '408':
+          $ref: '#/components/responses/DeadlineProblem'
+        '409':
+          $ref: '#/components/responses/CreateConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/job/query:
+    post:
+      tags: [Job]
+      operationId: queryJob
+      summary: 查询 Job 权威状态
+      description: |
+        只读取中心 authority，不直接访问 Agent。跨租户或调用方不可见的 Job 与不存在的
+        Job 一样返回 `404 JOB_NOT_FOUND`，不得泄漏资源存在性。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryJobRequest'
+            example:
+              tenant_id: tenant-a
+              job_id: job-20260727-001
+      responses:
+        '200':
+          description: 当前权威 Job 视图
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryJobResponse'
+              examples:
+                current:
+                  summary: 首次查询当前状态
+                  value:
+                    job:
+                      operation: add
+                      tenant_id: tenant-a
+                      project_id: project-a
+                      artifact_id: artifact-a
+                      playground_id: playground-a
+                      job_id: job-20260727-001
+                      state: running
+                      resource_version: '4'
+                      deadline_unix_ms: '1785168000000'
+                      progress:
+                        state: running
+                        phase: hashing
+                        files_completed: '320'
+                        bytes_completed: '4294967296'
+                repeated:
+                  summary: 重复查询同一权威版本
+                  value:
+                    job:
+                      operation: add
+                      tenant_id: tenant-a
+                      project_id: project-a
+                      artifact_id: artifact-a
+                      playground_id: playground-a
+                      job_id: job-20260727-001
+                      state: running
+                      resource_version: '4'
+                      deadline_unix_ms: '1785168000000'
+                      progress:
+                        state: running
+                        phase: hashing
+                        files_completed: '320'
+                        bytes_completed: '4294967296'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/JobNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/job/add/finalize:
+    post:
+      tags: [Job]
+      operationId: finalizeAddJob
+      summary: 校验并发布 Managed Add
+      description: |
+        对完整 MetadataBatch、中心 object durability 和 expected IndexVersion 执行最终校验与
+        CAS。成功、冲突和拒绝都会形成稳定的 Job decision；重复调用返回同一终态。
+
+        内部 `ResumePublication` 恢复方法不通过此接口暴露。用户调用始终重新执行授权，
+        但不会为已持久化的 Publishing candidate 重新构造发布内容。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FinalizeAddJobRequest'
+            example:
+              tenant_id: tenant-a
+              job_id: job-20260727-001
+      responses:
+        '200':
+          description: Add 已形成稳定发布决定
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FinalizeAddJobResponse'
+              examples:
+                published:
+                  summary: Index CAS 发布成功
+                  value:
+                    job:
+                      operation: add
+                      tenant_id: tenant-a
+                      project_id: project-a
+                      artifact_id: artifact-a
+                      playground_id: playground-a
+                      job_id: job-20260727-001
+                      state: succeeded
+                      resource_version: '7'
+                      deadline_unix_ms: '1785168000000'
+                      decision:
+                        outcome: publish
+                        final_state: succeeded
+                        published_index_version:
+                          revision: '1'
+                          digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+                      finalized_at_unix_ms: '1785167999000'
+                    decision:
+                      outcome: publish
+                      final_state: succeeded
+                      published_index_version:
+                        revision: '1'
+                        digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+                    finalized_at_unix_ms: '1785167999000'
+                    replayed: false
+                replayed:
+                  summary: 终态重放
+                  value:
+                    job:
+                      operation: add
+                      tenant_id: tenant-a
+                      project_id: project-a
+                      artifact_id: artifact-a
+                      playground_id: playground-a
+                      job_id: job-20260727-001
+                      state: succeeded
+                      resource_version: '7'
+                      deadline_unix_ms: '1785168000000'
+                      decision:
+                        outcome: publish
+                        final_state: succeeded
+                        published_index_version:
+                          revision: '1'
+                          digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+                      finalized_at_unix_ms: '1785167999000'
+                    decision:
+                      outcome: publish
+                      final_state: succeeded
+                      published_index_version:
+                        revision: '1'
+                        digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+                    finalized_at_unix_ms: '1785167999000'
+                    replayed: true
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/JobNotFoundProblem'
+        '408':
+          $ref: '#/components/responses/DeadlineProblem'
+        '409':
+          $ref: '#/components/responses/FinalizeConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: liveProbe
+      summary: 检查 neoengramd 进程是否存活
+      security: []
+      description: 不访问 authority；仅表示进程可以处理 HTTP 请求。
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 进程存活
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: ok
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: readyProbe
+      summary: 检查 neoengramd 是否可以接收业务请求
+      security: []
+      description: 至少验证 authority 已打开并通过其后端完整性检查。
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: 服务已就绪
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: ok
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        由部署配置的 OIDC issuer 签发。服务端从 token 映射 PrincipalRef 和 tenant scope；
+        请求体中的任何身份提示都不能覆盖认证结果。
+
+  parameters:
+    ApiVersion:
+      name: NeoEngram-API-Version
+      in: header
+      required: true
+      description: 公开 API 主版本；不兼容演进不改变 path。
+      schema:
+        type: string
+        enum: ['1']
+      example: '1'
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: |
+        可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+      schema:
+        $ref: '#/components/schemas/RequestId'
+      example: req-20260727-001
+    Traceparent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context traceparent。
+      schema:
+        type: string
+        minLength: 55
+        maxLength: 512
+      example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+  headers:
+    RequestId:
+      required: true
+      description: 服务端确认或生成的请求 ID。
+      schema:
+        $ref: '#/components/schemas/RequestId'
+      example: req-20260727-001
+
+  responses:
+    AuthenticationProblem:
+      description: Bearer token 缺失、无效或已过期
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:authentication-required
+            title: Authentication required
+            status: 401
+            detail: A valid Bearer token is required
+            instance: /api/job/query
+            code: AUTHENTICATION_REQUIRED
+            request_id: req-20260727-001
+            retryable: false
+    AuthorizationProblem:
+      description: principal 无权执行当前方法
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:authorization-denied
+            title: Authorization denied
+            status: 403
+            detail: The principal is not authorized for this operation
+            instance: /api/job/add/finalize
+            code: AUTHORIZATION_DENIED
+            request_id: req-20260727-001
+            retryable: false
+    JobNotFoundProblem:
+      description: Job 不存在或对当前 principal 不可见
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:job-not-found
+            title: Job not found
+            status: 404
+            detail: The requested Job was not found
+            instance: /api/job/query
+            code: JOB_NOT_FOUND
+            request_id: req-20260727-001
+            retryable: false
+    ResourceNotFoundProblem:
+      description: 资源不存在，或对当前 principal 不可见
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            tenantNotFound:
+              value:
+                type: urn:neoengram:problem:tenant-not-found
+                title: Tenant not found
+                status: 404
+                detail: The requested Tenant was not found
+                instance: /api/tenant/query
+                code: TENANT_NOT_FOUND
+                request_id: req-20260727-001
+                retryable: false
+            artifactNotFound:
+              value:
+                type: urn:neoengram:problem:artifact-not-found
+                title: Artifact not found
+                status: 404
+                detail: The requested Artifact was not found
+                instance: /api/artifact/query
+                code: ARTIFACT_NOT_FOUND
+                request_id: req-20260727-001
+                retryable: false
+    TenantConflictProblem:
+      description: Tenant ID 已绑定另一份创建内容
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:tenant-id-reused
+            title: Tenant ID reused
+            status: 409
+            detail: The Tenant ID already belongs to a different create request
+            instance: /api/tenant/create
+            code: TENANT_ID_REUSED
+            request_id: req-20260727-001
+            retryable: false
+    CursorConflictProblem:
+      description: Cursor 无效、已过期或与当前 scope/filter 不匹配
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:cursor-invalid
+            title: Cursor is invalid
+            status: 409
+            detail: The cursor is invalid or does not match the current query
+            instance: /api/artifact/commit/graph/query
+            code: CURSOR_INVALID
+            request_id: req-20260727-001
+            retryable: false
+    DeadlineProblem:
+      description: Job deadline 或有效 assignment lease 已过期
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:job-deadline-exceeded
+            title: Job deadline exceeded
+            status: 408
+            detail: The managed Add deadline has elapsed
+            instance: /api/job/add/finalize
+            code: JOB_DEADLINE_EXCEEDED
+            request_id: req-20260727-001
+            retryable: false
+    CreateConflictProblem:
+      description: Job ID 已绑定另一请求，或 Job 创建发生并发冲突
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            reusedJobId:
+              summary: 相同 Job ID 携带另一 request digest
+              value:
+                type: urn:neoengram:problem:job-id-reused
+                title: Job ID reused
+                status: 409
+                detail: The Job ID already belongs to a different managed Add request
+                instance: /api/job/add/create
+                code: JOB_ID_REUSED
+                request_id: req-20260727-001
+                retryable: false
+            concurrentUpdate:
+              summary: authority CAS 发生并发更新
+              value:
+                type: urn:neoengram:problem:concurrent-update
+                title: Concurrent update
+                status: 409
+                detail: The Job resource version changed during the request
+                instance: /api/job/add/create
+                code: CONCURRENT_UPDATE
+                request_id: req-20260727-001
+                retryable: true
+                retry_after_ms: '100'
+    FinalizeConflictProblem:
+      description: Job 状态、MetadataBatch、durability 或 CAS 前置条件尚不满足
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            invalidState:
+              summary: Job 尚未进入 Prepared
+              value:
+                type: urn:neoengram:problem:job-invalid-state
+                title: Job state does not allow finalization
+                status: 409
+                detail: Managed Add can only be finalized from Prepared or a stable terminal state
+                instance: /api/job/add/finalize
+                code: JOB_INVALID_STATE
+                request_id: req-20260727-001
+                retryable: false
+            objectNotDurable:
+              summary: 引用对象尚未被中心确认为 Durable
+              value:
+                type: urn:neoengram:problem:object-not-durable
+                title: Object is not durable
+                status: 409
+                detail: A referenced object has no durable central receipt
+                instance: /api/job/add/finalize
+                code: OBJECT_NOT_DURABLE
+                request_id: req-20260727-001
+                retryable: true
+                retry_after_ms: '1000'
+    PayloadTooLargeProblem:
+      description: 请求编码字节数超过当前方法上限
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:payload-too-large
+            title: Payload too large
+            status: 413
+            detail: The encoded request exceeds the method limit
+            instance: /api/job/add/create
+            code: PROTOCOL_LIMIT_EXCEEDED
+            request_id: req-20260727-001
+            retryable: false
+    ValidationProblem:
+      description: 请求 header、protocol 或 metadata 违反公开契约
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            unsupportedApiVersion:
+              summary: API 主版本不受支持
+              value:
+                type: urn:neoengram:problem:api-version-unsupported
+                title: API version is unsupported
+                status: 422
+                detail: NeoEngram-API-Version must be 1
+                instance: /api/job/query
+                code: API_VERSION_UNSUPPORTED
+                request_id: req-20260727-001
+                retryable: false
+                violations:
+                  - field: NeoEngram-API-Version
+                    reason: unsupported value
+            invalidPathSelection:
+              summary: Add path 集合无效
+              value:
+                type: urn:neoengram:problem:protocol-invalid
+                title: Request validation failed
+                status: 422
+                detail: paths must be non-empty unless all is true
+                instance: /api/job/add/create
+                code: PROTOCOL_INVALID
+                request_id: req-20260727-001
+                retryable: false
+                violations:
+                  - field: paths
+                    reason: must be non-empty unless all is true
+    InternalProblem:
+      description: 未分类的服务端内部错误
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:internal
+            title: Internal error
+            status: 500
+            detail: The server could not complete the request
+            instance: /api/job/query
+            code: INTERNAL
+            request_id: req-20260727-001
+            retryable: true
+    ServiceUnavailableProblem:
+      description: authority 或必要依赖暂不可用
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:storage-failure
+            title: Authority unavailable
+            status: 503
+            detail: The authority store is temporarily unavailable
+            instance: /health/ready
+            code: STORAGE_FAILURE
+            request_id: req-20260727-001
+            retryable: true
+            retry_after_ms: '1000'
+
+  schemas:
+    EmptyRequest:
+      type: object
+      additionalProperties: false
+
+    ApiVersionResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - api_versions
+        - agent_protocol_versions
+        - capabilities
+      properties:
+        api_versions:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: integer
+            enum: [1]
+        agent_protocol_versions:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: integer
+            enum: [1]
+        capabilities:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: '^[a-z][a-z0-9_]{0,127}$'
+
+    QueryTenantListRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+        query:
+          $ref: '#/components/schemas/SearchQuery'
+
+    QueryTenantListResponse:
+      type: object
+      additionalProperties: false
+      required: [items, can_create_tenant]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/TenantView'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+        can_create_tenant:
+          type: boolean
+
+    QueryTenantRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+
+    QueryTenantResponse:
+      type: object
+      additionalProperties: false
+      required: [tenant]
+      properties:
+        tenant:
+          $ref: '#/components/schemas/TenantView'
+
+    CreateTenantRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal]
+      required: [tenant_id, display_name]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+        description:
+          $ref: '#/components/schemas/Description'
+
+    CreateTenantResponse:
+      type: object
+      additionalProperties: false
+      required: [tenant, replayed]
+      properties:
+        tenant:
+          $ref: '#/components/schemas/TenantView'
+        replayed:
+          type: boolean
+
+    TenantView:
+      type: object
+      description: 当前 principal 可见的脱敏租户视图，不包含认证策略或存储配置。
+      additionalProperties: false
+      required:
+        - tenant_id
+        - display_name
+        - resource_version
+        - created_at_unix_ms
+        - updated_at_unix_ms
+        - permissions
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+        description:
+          $ref: '#/components/schemas/Description'
+        resource_version:
+          $ref: '#/components/schemas/CanonicalU64'
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        updated_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        permissions:
+          type: array
+          maxItems: 128
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/PermissionName'
+
+    QueryProjectListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+        query:
+          $ref: '#/components/schemas/SearchQuery'
+
+    QueryProjectListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ProjectSummary'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    ProjectSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - tenant_id
+        - project_id
+        - display_name
+        - created_at_unix_ms
+        - updated_at_unix_ms
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        updated_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    QueryArtifactListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+        query:
+          $ref: '#/components/schemas/SearchQuery'
+
+    QueryArtifactListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ArtifactView'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    QueryArtifactRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+
+    QueryArtifactResponse:
+      type: object
+      additionalProperties: false
+      required: [artifact]
+      properties:
+        artifact:
+          $ref: '#/components/schemas/ArtifactView'
+
+    ArtifactView:
+      type: object
+      description: 不暴露 placement、Agent、Manifest 或 authority 存储位置的 Artifact 视图。
+      additionalProperties: false
+      required:
+        - tenant_id
+        - project_id
+        - artifact_id
+        - display_name
+        - default_ref
+        - resource_version
+        - created_at_unix_ms
+        - updated_at_unix_ms
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+        description:
+          $ref: '#/components/schemas/Description'
+        default_ref:
+          $ref: '#/components/schemas/RefName'
+        resource_version:
+          $ref: '#/components/schemas/CanonicalU64'
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        updated_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    QueryArtifactCommitGraphRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+
+    QueryArtifactCommitGraphResponse:
+      type: object
+      additionalProperties: false
+      required: [graph]
+      properties:
+        graph:
+          $ref: '#/components/schemas/CommitGraphView'
+
+    CommitGraphView:
+      type: object
+      additionalProperties: false
+      required: [graph_version, refs, nodes]
+      properties:
+        graph_version:
+          $ref: '#/components/schemas/CanonicalU64'
+        refs:
+          type: array
+          maxItems: 1024
+          items:
+            $ref: '#/components/schemas/RefTip'
+        nodes:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/CommitNode'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    RefTip:
+      type: object
+      additionalProperties: false
+      required: [name, commit_id]
+      properties:
+        name:
+          $ref: '#/components/schemas/RefName'
+        commit_id:
+          $ref: '#/components/schemas/CommitId'
+
+    CommitNode:
+      type: object
+      description: 单 parent 的公开 Commit 节点，不包含 Directory 或 Manifest identity。
+      additionalProperties: false
+      required: [commit_id, message, ref_names, created_at_unix_ms]
+      properties:
+        commit_id:
+          $ref: '#/components/schemas/CommitId'
+        parent_commit_id:
+          $ref: '#/components/schemas/CommitId'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        ref_names:
+          type: array
+          maxItems: 1024
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/RefName'
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    QueryPlaygroundListRequest:
+      type: object
+      additionalProperties: false
+      dependentRequired:
+        artifact_id: [project_id]
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+        query:
+          $ref: '#/components/schemas/SearchQuery'
+
+    QueryPlaygroundListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/PlaygroundView'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    QueryPlaygroundRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id, playground_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+
+    QueryPlaygroundResponse:
+      type: object
+      additionalProperties: false
+      required: [playground]
+      properties:
+        playground:
+          $ref: '#/components/schemas/PlaygroundView'
+
+    PlaygroundView:
+      type: object
+      description: 不暴露 attachment、lease、fencing、Agent 或文件系统位置的 Playground 视图。
+      additionalProperties: false
+      required:
+        - tenant_id
+        - project_id
+        - artifact_id
+        - playground_id
+        - display_name
+        - index_version
+        - state
+        - created_at_unix_ms
+        - updated_at_unix_ms
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+        base_commit_id:
+          $ref: '#/components/schemas/CommitId'
+        head_commit_id:
+          $ref: '#/components/schemas/CommitId'
+        index_version:
+          $ref: '#/components/schemas/IndexVersion'
+        state:
+          type: string
+          enum: [ready, scanning, unavailable]
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        updated_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    QuerySnapshotListRequest:
+      type: object
+      additionalProperties: false
+      dependentRequired:
+        artifact_id: [project_id]
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+
+    QuerySnapshotListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/SnapshotView'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    QuerySnapshotRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id, commit_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        commit_id:
+          $ref: '#/components/schemas/CommitId'
+
+    QuerySnapshotResponse:
+      type: object
+      additionalProperties: false
+      required: [snapshot]
+      properties:
+        snapshot:
+          $ref: '#/components/schemas/SnapshotView'
+
+    SnapshotView:
+      type: object
+      description: 由 tenant、project、artifact、commit 复合身份确定的只读 Snapshot。
+      additionalProperties: false
+      required:
+        - tenant_id
+        - project_id
+        - artifact_id
+        - commit_id
+        - message
+        - ref_names
+        - created_at_unix_ms
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        commit_id:
+          $ref: '#/components/schemas/CommitId'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        ref_names:
+          type: array
+          maxItems: 1024
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/RefName'
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        logical_file_count:
+          $ref: '#/components/schemas/CanonicalU64'
+        logical_size_bytes:
+          $ref: '#/components/schemas/CanonicalU64'
+
+    CreateAddJobRequest:
+      type: object
+      description: |
+        公开 Add operation。服务端将认证后的 PrincipalRef 注入 canonical operation 后计算
+        `request_digest` 并写入内部 AddJobSpec；请求中的未知非保留字段按协议兼容规则参与 digest。
+      additionalProperties: true
+      required:
+        - tenant_id
+        - project_id
+        - artifact_id
+        - playground_id
+        - job_id
+        - expected_index_version
+        - deadline_unix_ms
+        - paths
+        - all
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        expected_index_version:
+          $ref: '#/components/schemas/IndexVersion'
+        deadline_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        paths:
+          type: array
+          maxItems: 4096
+          uniqueItems: true
+          description: |
+            严格排序、无 portable duplicate，且不能同时包含文件路径及其后代。
+            `all` 为 false 时至少包含一项。
+          items:
+            $ref: '#/components/schemas/LogicalPath'
+        all:
+          type: boolean
+
+    CreateAddJobResponse:
+      type: object
+      additionalProperties: false
+      required: [job, replayed]
+      properties:
+        job:
+          $ref: '#/components/schemas/JobView'
+        replayed:
+          type: boolean
+          description: true 表示返回的是已持久化的同一请求结果。
+
+    QueryJobRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, job_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        job_id:
+          $ref: '#/components/schemas/JobId'
+
+    QueryJobResponse:
+      type: object
+      additionalProperties: false
+      required: [job]
+      properties:
+        job:
+          $ref: '#/components/schemas/JobView'
+
+    FinalizeAddJobRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, job_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        job_id:
+          $ref: '#/components/schemas/JobId'
+
+    FinalizeAddJobResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - job
+        - decision
+        - finalized_at_unix_ms
+        - replayed
+      properties:
+        job:
+          $ref: '#/components/schemas/JobView'
+        decision:
+          $ref: '#/components/schemas/PublicJobDecision'
+        finalized_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        replayed:
+          type: boolean
+
+    JobView:
+      type: object
+      description: |
+        面向用户的脱敏 Job。不得增加 assignment target、Agent/Volume/Mount identity、
+        generation/fencing、PublicationCandidate、Manifest、IndexDelta 或 authority 物理信息。
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum:
+            - accepted
+            - agent_id
+            - agent_mount_id
+            - artifact_placement_id
+            - assignment
+            - assignment_generation
+            - assignment_id
+            - assignment_target
+            - decision_generation
+            - edge_cluster_id
+            - fencing
+            - fencing_token
+            - finalized_ack
+            - generation
+            - index_delta
+            - lease
+            - manifest
+            - manifests
+            - mount_generation
+            - mutations
+            - owner_generation
+            - placement_generation
+            - prepared
+            - publication_candidate
+            - resume_publication
+            - storage_volume_id
+      required:
+        - operation
+        - tenant_id
+        - project_id
+        - artifact_id
+        - playground_id
+        - job_id
+        - state
+        - resource_version
+        - deadline_unix_ms
+      properties:
+        operation:
+          type: string
+          const: add
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        state:
+          $ref: '#/components/schemas/JobState'
+        resource_version:
+          $ref: '#/components/schemas/CanonicalU64'
+        deadline_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        progress:
+          $ref: '#/components/schemas/PublicJobProgress'
+        decision:
+          $ref: '#/components/schemas/PublicJobDecision'
+        failure:
+          $ref: '#/components/schemas/PublicJobFailure'
+        finalized_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    PublicJobProgress:
+      type: object
+      additionalProperties: true
+      required:
+        - state
+        - phase
+        - files_completed
+        - bytes_completed
+      properties:
+        state:
+          $ref: '#/components/schemas/JobState'
+        phase:
+          type: string
+          minLength: 1
+          maxLength: 128
+        files_completed:
+          $ref: '#/components/schemas/CanonicalU64'
+        bytes_completed:
+          $ref: '#/components/schemas/CanonicalU64'
+        retry_after_ms:
+          $ref: '#/components/schemas/CanonicalU64'
+
+    PublicJobDecision:
+      oneOf:
+        - $ref: '#/components/schemas/PublishJobDecision'
+        - $ref: '#/components/schemas/ConflictJobDecision'
+        - $ref: '#/components/schemas/RejectJobDecision'
+      discriminator:
+        propertyName: outcome
+        mapping:
+          publish: '#/components/schemas/PublishJobDecision'
+          conflict: '#/components/schemas/ConflictJobDecision'
+          reject: '#/components/schemas/RejectJobDecision'
+
+    PublishJobDecision:
+      type: object
+      additionalProperties: true
+      required: [outcome, final_state, published_index_version]
+      properties:
+        outcome:
+          type: string
+          const: publish
+        final_state:
+          type: string
+          const: succeeded
+        published_index_version:
+          $ref: '#/components/schemas/IndexVersion'
+
+    ConflictJobDecision:
+      type: object
+      additionalProperties: true
+      required: [outcome, final_state, current_index_version]
+      properties:
+        outcome:
+          type: string
+          const: conflict
+        final_state:
+          type: string
+          const: conflicted
+        current_index_version:
+          $ref: '#/components/schemas/IndexVersion'
+
+    RejectJobDecision:
+      type: object
+      additionalProperties: true
+      required: [outcome, final_state, error]
+      properties:
+        outcome:
+          type: string
+          const: reject
+        final_state:
+          type: string
+          enum:
+            - rejected
+            - failed
+            - cancelled
+            - timed_out
+            - recovery_required
+        error:
+          $ref: '#/components/schemas/JobError'
+
+    PublicJobFailure:
+      type: object
+      additionalProperties: true
+      required: [final_state, failed_at_unix_ms, stage, error]
+      properties:
+        final_state:
+          type: string
+          enum:
+            - rejected
+            - failed
+            - cancelled
+            - timed_out
+            - recovery_required
+        failed_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        stage:
+          type: string
+          enum:
+            - execution
+            - object_transfer
+            - reporting
+            - finalization
+        error:
+          $ref: '#/components/schemas/JobError'
+
+    JobError:
+      type: object
+      additionalProperties: true
+      required: [code, message, retryable]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        retryable:
+          type: boolean
+        retry_after_ms:
+          $ref: '#/components/schemas/CanonicalU64'
+
+    ProblemDetails:
+      type: object
+      description: RFC 9457 Problem Details，并携带 NeoEngram 稳定错误字段。
+      additionalProperties: true
+      required:
+        - type
+        - title
+        - status
+        - detail
+        - instance
+        - code
+        - request_id
+        - retryable
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          pattern: '^urn:neoengram:problem:[a-z0-9-]+$'
+        title:
+          type: string
+          minLength: 1
+          maxLength: 256
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        instance:
+          type: string
+          format: uri-reference
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+        retryable:
+          type: boolean
+        retry_after_ms:
+          $ref: '#/components/schemas/CanonicalU64'
+        violations:
+          type: array
+          maxItems: 256
+          items:
+            $ref: '#/components/schemas/FieldViolation'
+
+    FieldViolation:
+      type: object
+      additionalProperties: false
+      required: [field, reason]
+      properties:
+        field:
+          type: string
+          minLength: 1
+          maxLength: 256
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1024
+
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+
+    TenantId:
+      $ref: '#/components/schemas/ResourceId'
+    ProjectId:
+      $ref: '#/components/schemas/ResourceId'
+    ArtifactId:
+      $ref: '#/components/schemas/ResourceId'
+    PlaygroundId:
+      $ref: '#/components/schemas/ResourceId'
+    CommitId:
+      $ref: '#/components/schemas/ResourceId'
+    JobId:
+      $ref: '#/components/schemas/ResourceId'
+    RequestId:
+      $ref: '#/components/schemas/ResourceId'
+
+    ResourceId:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$'
+
+    ErrorCode:
+      type: string
+      minLength: 1
+      maxLength: 96
+      pattern: '^[A-Z][A-Z0-9_]{0,95}$'
+
+    DisplayName:
+      type: string
+      minLength: 1
+      maxLength: 128
+
+    Description:
+      type: string
+      maxLength: 2048
+
+    PermissionName:
+      type: string
+      minLength: 3
+      maxLength: 128
+      pattern: '^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$'
+
+    RefName:
+      type: string
+      minLength: 1
+      maxLength: 512
+      pattern: '^refs/[A-Za-z0-9][A-Za-z0-9._/-]*$'
+
+    PageCursor:
+      type: string
+      minLength: 1
+      maxLength: 2048
+      description: 服务端生成、与资源 scope、筛选条件和排序绑定的不透明分页 token。
+
+    PageSize:
+      type: integer
+      minimum: 1
+      maximum: 100
+      default: 50
+
+    SearchQuery:
+      type: string
+      minLength: 1
+      maxLength: 256
+
+    ContentDigest:
+      type: string
+      minLength: 64
+      maxLength: 64
+      pattern: '^[0-9a-f]{64}$'
+
+    CanonicalU64:
+      type: string
+      minLength: 1
+      maxLength: 20
+      pattern: '^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$'
+
+    UnixMillis:
+      allOf:
+        - $ref: '#/components/schemas/CanonicalU64'
+      description: Unix 毫秒时间戳，编码为 canonical decimal JSON string。
+
+    LogicalPath:
+      type: string
+      minLength: 1
+      description: |
+        NFC 规范化、使用 `/` 分隔的 repository-relative portable path；不能包含绝对路径、
+        空/dot component、反斜杠、NUL、平台保留字符或 NeoEngram 内部名称。
+
+    IndexVersion:
+      type: object
+      additionalProperties: true
+      required: [revision, digest]
+      properties:
+        revision:
+          $ref: '#/components/schemas/CanonicalU64'
+        digest:
+          $ref: '#/components/schemas/ContentDigest'
+
+    JobState:
+      type: string
+      enum:
+        - queued
+        - assigned
+        - accepted
+        - running
+        - prepared
+        - publishing
+        - cancel_requested
+        - succeeded
+        - conflicted
+        - rejected
+        - failed
+        - cancelled
+        - timed_out
+        - recovery_required
+        - unknown

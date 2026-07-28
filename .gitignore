@@ -1,5 +1,11 @@
 /target
 /test/
+/docs/openapi/node_modules/
+/apps/neoengram-web/node_modules/
+/apps/neoengram-web/dist/
+/apps/neoengram-web/coverage/
+/apps/neoengram-web/playwright-report/
+/apps/neoengram-web/test-results/
 .neoengram/
 **/*.rs.bk
 .DS_Store

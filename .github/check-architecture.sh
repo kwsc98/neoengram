@@ -161,6 +161,66 @@ if [[ -e crates/neoengram-client ]]; then
   fail "neoengram-client is intentionally deferred until a user transport exists"
 fi
 
+web=apps/neoengram-web
+[[ -f "$web/package.json" ]] || fail "the Vue Web package is missing"
+[[ -f "$web/package-lock.json" ]] || fail "the Vue Web lockfile is missing"
+[[ -f "$web/src/api/generated/openapi.d.ts" ]] || \
+  fail "the generated Web OpenAPI types are missing"
+[[ ! -e "$web/Cargo.toml" ]] || fail "the Vue Web package must remain outside Cargo"
+[[ "$(<"$web/.node-version")" == "22.12.0" ]] || \
+  fail "the Vue Web package must pin Node.js 22.12.0"
+jq -e \
+  '.private == true and .engines.node == ">=22.12.0" and
+   .scripts["api:generate"] != null and .scripts["api:check"] != null' \
+  "$web/package.json" >/dev/null || fail "the Vue Web package metadata changed"
+web_internal_dependencies="$(
+  jq -r \
+    '[(.dependencies // {}), (.devDependencies // {})] | add | keys[] |
+     select(test("^neoengram(-|$)"))' \
+    "$web/package.json"
+)"
+[[ -z "$web_internal_dependencies" ]] || \
+  fail "the Vue Web package must not depend on Rust workspace packages"
+
+openapi=docs/openapi/neoengram-api.yaml
+[[ -f "$openapi" ]] || fail "the public OpenAPI contract is missing"
+rg -q '^openapi: 3\.1\.0$' "$openapi" || fail "the public contract must use OpenAPI 3.1"
+if rg -n '^  /v[0-9]+/|^  /api/v[0-9]+/|^  /api/[^:]+:[^:]+:$' "$openapi"; then
+  fail "public API paths must use unversioned module/action hierarchy"
+fi
+for path in \
+  /api/system/version/query \
+  /api/tenant/list/query \
+  /api/tenant/query \
+  /api/tenant/create \
+  /api/project/list/query \
+  /api/artifact/list/query \
+  /api/artifact/query \
+  /api/artifact/commit/graph/query \
+  /api/playground/list/query \
+  /api/playground/query \
+  /api/snapshot/list/query \
+  /api/snapshot/query \
+  /api/job/add/create \
+  /api/job/query \
+  /api/job/add/finalize \
+  /health/live \
+  /health/ready; do
+  rg -q "^  ${path}:$" "$openapi" || fail "public OpenAPI is missing $path"
+done
+for internal_operation in assignJob expireAddJob resumePublication; do
+  if rg -n "operationId: ${internal_operation}$" "$openapi"; then
+    fail "$internal_operation must remain outside the public OpenAPI"
+  fi
+done
+rg -q '^    ApiVersion:$' "$openapi" || fail "the API version header is not defined"
+rg -q '^    BearerAuth:$' "$openapi" || fail "the public Bearer security scheme is not defined"
+rg -q '^    ProblemDetails:$' "$openapi" || fail "RFC 9457 Problem Details is not defined"
+[[ "$(rg -c "#\/components\/parameters\/ApiVersion'" "$openapi")" == 14 ]] || \
+  fail "every public business method must require the API version header"
+[[ "$(rg -c 'BearerAuth: \[\]' "$openapi")" == 14 ]] || \
+  fail "every public business method must require Bearer authentication"
+
 terminal_output="$({
   rg -n '\b(e?print|e?println|dbg)!\s*\(' crates services \
     --glob '*.rs' \

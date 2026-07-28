@@ -3,8 +3,9 @@
 NeoEngram `0.2.0` 已完成 P0 crate 边界改造：本地 CLI、可复用领域模型、执行端口、文件系统
 适配器、Standalone 应用、wire protocol、Agent 和中心控制状态机分别拥有独立 crate。当前仍以
 本地 format v8 工作流为可运行产品；Agent 与中心仍是无网络 library，中心已提供后端无关
-`AuthorityStore` 和默认 SQLite 单节点权威后端。这不代表 HTTP、PostgreSQL、mTLS、真实 S3 或
-daemon 已经实现。能力状态和后续路线统一见
+`AuthorityStore` 和默认 SQLite 单节点权威后端。Vue 3 Web 控制台可通过 MSW 运行多租户资源浏览与
+Managed Add Job 流程，但尚未
+连接真实中心。这不代表 HTTP、PostgreSQL、mTLS、真实 S3 或 daemon 已经实现。能力状态和后续路线统一见
 [`implementation-plan.md`](implementation-plan.md)。
 
 ## Workspace 与职责
@@ -20,11 +21,18 @@ crates/
 └── neoengram/             # Clap、cwd 输入、typed Result/progress/diagnostic 的唯一终端渲染入口
 services/
 └── neoengramd/            # 无网络中心状态机、AuthorityStore、InMemory/SQLite 权威后端
+apps/
+└── neoengram-web/         # 独立 Vue 3 SPA；公开 OpenAPI 生成类型与 MSW 开发适配器
 ```
 
 除 `neoengram-core` 和 `neoengram` 外，P0 新增 package 均为 workspace-private。Agent 和
 `neoengramd` 当前均为 library-only；需要真实用户 API transport 时再创建 `neoengram-client`，
 不提前维护空 client crate。
+
+`neoengram-web` 不属于 Cargo workspace。它只能依赖 `docs/openapi/neoengram-api.yaml` 定义的公开
+HTTP 契约，不得导入 Rust crate、Agent JSON Schema、数据库结构或中心内部恢复方法。
+当前租户由 `/tenants/:tenantId/...` 路由确定；前端缓存 key 和每个资源请求都必须携带完整 tenant
+scope，服务端仍从认证结果执行 RBAC，不能信任浏览器选择。
 
 边界规则：
 
@@ -69,6 +77,8 @@ neoengram CLI -> standalone -> engine <- agent
                      +-> fs ----+    protocol <- neoengramd
                          ^             ^
                          +---- core ---+
+
+neoengram-web -> public OpenAPI -> neoengramd HTTP adapter (future)
 ```
 
 该图表示 production/runtime 的主要分层方向，不枚举所有直接 manifest 边；例如 CLI 还直接导入
