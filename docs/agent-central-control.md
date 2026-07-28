@@ -507,8 +507,8 @@ services/neoengramd/
 ```
 
 用户 Web 控制台独立位于 `apps/neoengram-web/`，不嵌入中心 library，也不进入 Cargo workspace。
-它只能调用公开 OpenAPI；首版使用 MSW 模拟 17 个已定义 operation，包括多租户资源浏览与
-Managed Add Job，真实请求等待上表 `api/`、
+它只能调用公开 OpenAPI；首版使用 MSW 模拟 25 个已定义 operation，包括 StorageVolume 登记、
+多租户资源创建/浏览、Playground Commit 与 Managed Add Job，真实请求等待上表 `api/`、
 `identity/` adapter 落地。生产静态资源由反向代理与 `/api`、`/health` 组合为同一 origin。
 
 中心负责：
@@ -1216,14 +1216,22 @@ POST /api/system/version/query
 POST /api/tenant/list/query
 POST /api/tenant/query
 POST /api/tenant/create
+POST /api/storage/volume/list/query
+POST /api/storage/volume/query
+POST /api/storage/volume/create
 POST /api/project/list/query
 POST /api/artifact/list/query
 POST /api/artifact/query
+POST /api/artifact/create
 POST /api/artifact/commit/graph/query
+POST /api/artifact/commit/diff/query
 POST /api/playground/list/query
 POST /api/playground/query
+POST /api/playground/create
+POST /api/playground/commit/create
 POST /api/snapshot/list/query
 POST /api/snapshot/query
+POST /api/snapshot/create
 POST /api/job/add/create
 POST /api/job/query
 POST /api/job/add/finalize
@@ -1238,9 +1246,11 @@ POST /v1/agents/{agent_id}/jobs/{job_id}/metadata-batches
 PUT  /v1/agents/{agent_id}/jobs/{job_id}/metadata-batches/{batch_id}/pages/{page}
 ```
 
-公开 OpenAPI 已定义 Tenant、Project、Artifact、Commit 图、Playground、Snapshot 的只读资源查询，
-但不承诺 Gateway、Job cancel/list、文件树或资源 mutation，也不暴露中心内部 `AssignJob`、
-`ExpireAddJob` 或 `ResumePublication`。用户 API 与 Agent API 使用不同认证域。用户 API 使用
+公开 OpenAPI 已定义 Tenant、StorageVolume、Project、Artifact、Commit 图、Playground、Snapshot
+的查询，支持已有 PVC/NFS StorageVolume 登记、资源放置选择、Artifact/Playground/Snapshot 创建与
+Playground Commit；它不负责创建 Kubernetes PV/PVC 或 NFS。仍不承诺 Gateway、Job cancel/list、
+文件树或其他资源 mutation，也不暴露中心内部 `AssignJob`、`ExpireAddJob` 或
+`ResumePublication`。用户 API 与 Agent API 使用不同认证域。用户 API 使用
 OIDC principal 和 Tenant RBAC；Agent API 使用
 绑定 `AgentInstance/ComputeNode` 的节点证书，只允许访问中心已经分配给该 Agent 的 Assignment。Agent
 不能用节点身份代替用户创建业务 Job，也不能读取未分配租户的队列。

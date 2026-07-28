@@ -28,14 +28,16 @@ tags:
     description: API 版本和兼容能力查询
   - name: Tenant
     description: 当前 principal 可见的租户与平台级租户创建方法
+  - name: Storage
+    description: 租户登记的 StorageVolume 查询与创建方法
   - name: Project
     description: 租户内只读 Project 查询方法
   - name: Artifact
-    description: 租户内 Artifact 和 Commit 图只读查询方法
+    description: 租户内 Artifact 创建、查询，以及 Commit 图和文件 Diff 查询方法
   - name: Playground
-    description: 租户内 Playground 只读查询方法
+    description: 租户内 Playground 创建、查询和 Commit 方法
   - name: Snapshot
-    description: 绑定 Artifact Commit 的只读 Snapshot 查询方法
+    description: 绑定 Artifact Commit 的只读 Snapshot 创建与查询方法
   - name: Job
     description: 用户发起和查询的中心权威 Job 方法
   - name: Health
@@ -266,6 +268,157 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailableProblem'
 
+  /api/storage/volume/list/query:
+    post:
+      tags: [Storage]
+      operationId: queryStorageVolumeList
+      summary: 查询租户内 StorageVolume
+      description: |
+        分页返回租户登记的逻辑存储卷。返回值不包含挂载路径、凭据、Agent ownership
+        或 fencing 信息；region 和 EdgeCluster 用于创建资源时选择放置位置。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryStorageVolumeListRequest'
+            example:
+              tenant_id: tenant-a
+              page_size: 50
+      responses:
+        '200':
+          description: StorageVolume 页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryStorageVolumeListResponse'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/CursorConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/storage/volume/query:
+    post:
+      tags: [Storage]
+      operationId: queryStorageVolume
+      summary: 查询单个 StorageVolume
+      description: 按 tenant 和稳定逻辑存储 ID 返回可用于资源放置选择的公开视图。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryStorageVolumeRequest'
+      responses:
+        '200':
+          description: StorageVolume 当前公开视图
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryStorageVolumeResponse'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/storage/volume/create:
+    post:
+      tags: [Storage]
+      operationId: createStorageVolume
+      summary: 登记 StorageVolume
+      description: |
+        在租户内登记已有 PVC 或 NFS 后端，不创建 Kubernetes PV/PVC 或 NFS 资源。
+        region 由 StorageVolume 固定，后续资源创建只提交 storage_volume_id。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateStorageVolumeRequest'
+            example:
+              tenant_id: tenant-a
+              storage_volume_id: volume-vision
+              display_name: 视觉数据 PVC
+              edge_cluster_id: cluster-cn-east-1
+              region: cn-shanghai
+              backend_type: pvc
+              access_mode: read_write_many
+              pvc_reference:
+                namespace: neoengram-data
+                claim_name: vision-data
+      responses:
+        '200':
+          description: StorageVolume 已登记或相同请求被重放
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateStorageVolumeResponse'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
   /api/project/list/query:
     post:
       tags: [Project]
@@ -356,6 +509,8 @@ paths:
                   - tenant_id: tenant-a
                     project_id: project-vision
                     artifact_id: road-scenes
+                    storage_volume_id: volume-shanghai-vision
+                    region: cn-shanghai
                     display_name: 道路场景数据集
                     description: 训练与回归评估数据
                     default_ref: refs/heads/main
@@ -414,6 +569,8 @@ paths:
                   tenant_id: tenant-a
                   project_id: project-vision
                   artifact_id: road-scenes
+                  storage_volume_id: volume-shanghai-vision
+                  region: cn-shanghai
                   display_name: 道路场景数据集
                   description: 训练与回归评估数据
                   default_ref: refs/heads/main
@@ -426,6 +583,58 @@ paths:
           $ref: '#/components/responses/AuthorizationProblem'
         '404':
           $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/artifact/create:
+    post:
+      tags: [Artifact]
+      operationId: createArtifact
+      summary: 创建 Artifact
+      description: 在指定 Tenant/Project 下创建空 Artifact；资源身份使相同请求可幂等重放。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateArtifactRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: evaluation-set
+              storage_volume_id: volume-shanghai-vision
+              display_name: 评测数据集
+              default_ref: refs/heads/main
+      responses:
+        '200':
+          description: 已创建或幂等返回的 Artifact
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateArtifactResponse'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
         '413':
           $ref: '#/components/responses/PayloadTooLargeProblem'
         '422':
@@ -506,6 +715,88 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailableProblem'
 
+  /api/artifact/commit/diff/query:
+    post:
+      tags: [Artifact]
+      operationId: queryArtifactCommitDiff
+      summary: 查询 Commit 文件差异
+      description: |
+        比较目标 Commit 与指定 base Commit；未提供 `base_commit_id` 时使用目标 Commit 的单一
+        parent，根 Commit 则与空基线比较。结果只返回公开路径、变更类型和逻辑大小统计，
+        不暴露 Directory、Manifest、Chunk、digest 或物理对象位置。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryArtifactCommitDiffRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              commit_id: commit-main-3
+      responses:
+        '200':
+          description: 目标 Commit 与 base/parent Commit 的文件级差异
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryArtifactCommitDiffResponse'
+              example:
+                diff:
+                  base_commit:
+                    commit_id: commit-main-2
+                    parent_commit_id: commit-root-1
+                    message: 完成首轮质量复核
+                    description: 完成白天场景的质量抽检和标签修订。
+                    ref_names: [refs/tags/v1.0]
+                    created_at_unix_ms: '1785067400000'
+                  target_commit:
+                    commit_id: commit-main-3
+                    parent_commit_id: commit-main-2
+                    message: 补充夜间道路场景
+                    description: 增加夜间和低照度样本，并更新场景索引。
+                    ref_names: [refs/heads/main]
+                    created_at_unix_ms: '1785167600000'
+                  summary:
+                    files_added: '1'
+                    files_modified: '1'
+                    files_deleted: '0'
+                    files_renamed: '0'
+                    bytes_added: '6144'
+                    bytes_removed: '2048'
+                  changes:
+                    - change_type: modified
+                      path: dataset/index.json
+                      old_size_bytes: '2048'
+                      new_size_bytes: '3072'
+                    - change_type: added
+                      path: dataset/night/manifest.jsonl
+                      new_size_bytes: '5120'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
   /api/playground/list/query:
     post:
       tags: [Playground]
@@ -545,6 +836,8 @@ paths:
                     project_id: project-vision
                     artifact_id: road-scenes
                     playground_id: labeling
+                    storage_volume_id: volume-shanghai-vision
+                    region: cn-shanghai
                     display_name: 标注工作区
                     base_commit_id: commit-main-2
                     head_commit_id: commit-main-3
@@ -610,6 +903,8 @@ paths:
                   project_id: project-vision
                   artifact_id: road-scenes
                   playground_id: labeling
+                  storage_volume_id: volume-shanghai-vision
+                  region: cn-shanghai
                   display_name: 标注工作区
                   base_commit_id: commit-main-2
                   head_commit_id: commit-main-3
@@ -625,6 +920,116 @@ paths:
           $ref: '#/components/responses/AuthorizationProblem'
         '404':
           $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/create:
+    post:
+      tags: [Playground]
+      operationId: createPlayground
+      summary: 创建 Playground
+      description: 在 Artifact 下创建受管可写 Playground，并可固定初始 base Commit。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePlaygroundRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              playground_id: review-july
+              storage_volume_id: volume-shanghai-vision
+              display_name: 七月复核
+              base_commit_id: commit-main-3
+      responses:
+        '200':
+          description: 已创建或幂等返回的 Playground
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatePlaygroundResponse'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/commit/create:
+    post:
+      tags: [Playground]
+      operationId: commitPlayground
+      summary: 提交 Playground
+      description: |
+        从 Playground 当前 IndexVersion 创建不可变 Commit，并以 `commit_request_id` 提供稳定的
+        mutation identity。服务端必须对 expected IndexVersion 和目标 Ref 执行 CAS。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitPlaygroundRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              playground_id: labeling
+              commit_request_id: commit-request-july-labels
+              expected_index_version:
+                revision: '31'
+                digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+              message: 完成七月标注复核
+      responses:
+        '200':
+          description: 已创建或幂等返回的 Commit
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommitPlaygroundResponse'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
         '413':
           $ref: '#/components/responses/PayloadTooLargeProblem'
         '422':
@@ -673,6 +1078,8 @@ paths:
                     project_id: project-vision
                     artifact_id: road-scenes
                     commit_id: commit-main-3
+                    storage_volume_id: volume-shanghai-archive
+                    region: cn-shanghai
                     message: 补充夜间道路场景
                     ref_names: [refs/heads/main]
                     created_at_unix_ms: '1785167600000'
@@ -734,6 +1141,8 @@ paths:
                   project_id: project-vision
                   artifact_id: road-scenes
                   commit_id: commit-main-3
+                  storage_volume_id: volume-shanghai-archive
+                  region: cn-shanghai
                   message: 补充夜间道路场景
                   ref_names: [refs/heads/main]
                   created_at_unix_ms: '1785167600000'
@@ -745,6 +1154,57 @@ paths:
           $ref: '#/components/responses/AuthorizationProblem'
         '404':
           $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/snapshot/create:
+    post:
+      tags: [Snapshot]
+      operationId: createSnapshot
+      summary: 创建 Snapshot
+      description: 为指定 Artifact Commit 创建或幂等返回固定只读 Snapshot。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSnapshotRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              commit_id: commit-main-3
+              storage_volume_id: volume-shanghai-archive
+      responses:
+        '200':
+          description: 已创建或幂等返回的 Snapshot
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateSnapshotResponse'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
         '413':
           $ref: '#/components/responses/PayloadTooLargeProblem'
         '422':
@@ -1261,6 +1721,24 @@ components:
             code: TENANT_ID_REUSED
             request_id: req-20260727-001
             retryable: false
+    MutationConflictProblem:
+      description: 资源 identity 已绑定另一创建内容，或 expected version 不再匹配
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: urn:neoengram:problem:resource-conflict
+            title: Resource mutation conflict
+            status: 409
+            detail: The resource identity or expected version conflicts with current state
+            instance: /api/playground/commit/create
+            code: RESOURCE_CONFLICT
+            request_id: req-20260727-001
+            retryable: false
     CursorConflictProblem:
       description: Cursor 无效、已过期或与当前 scope/filter 不匹配
       headers:
@@ -1591,6 +2069,184 @@ components:
           items:
             $ref: '#/components/schemas/PermissionName'
 
+    QueryStorageVolumeListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        region:
+          $ref: '#/components/schemas/RegionName'
+        backend_type:
+          $ref: '#/components/schemas/StorageBackendType'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+        query:
+          $ref: '#/components/schemas/SearchQuery'
+
+    QueryStorageVolumeListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/StorageVolumeView'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    QueryStorageVolumeRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, storage_volume_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+
+    QueryStorageVolumeResponse:
+      type: object
+      additionalProperties: false
+      required: [storage_volume]
+      properties:
+        storage_volume:
+          $ref: '#/components/schemas/StorageVolumeView'
+
+    CreateStorageVolumeRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal, credentials, mount_path]
+      required:
+        - tenant_id
+        - storage_volume_id
+        - display_name
+        - edge_cluster_id
+        - region
+        - backend_type
+        - access_mode
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+        edge_cluster_id:
+          $ref: '#/components/schemas/EdgeClusterId'
+        region:
+          $ref: '#/components/schemas/RegionName'
+        backend_type:
+          $ref: '#/components/schemas/StorageBackendType'
+        access_mode:
+          $ref: '#/components/schemas/StorageAccessMode'
+        pvc_reference:
+          $ref: '#/components/schemas/PvcReference'
+        nfs_reference:
+          $ref: '#/components/schemas/NfsReference'
+      oneOf:
+        - properties:
+            backend_type:
+              const: pvc
+          required: [pvc_reference]
+        - properties:
+            backend_type:
+              const: nfs
+          required: [nfs_reference]
+
+    CreateStorageVolumeResponse:
+      type: object
+      additionalProperties: false
+      required: [storage_volume, replayed]
+      properties:
+        storage_volume:
+          $ref: '#/components/schemas/StorageVolumeView'
+        replayed:
+          type: boolean
+
+    StorageVolumeView:
+      type: object
+      description: |
+        租户登记的稳定逻辑存储身份。PVC namespace/claim 可以公开用于运维识别；NFS
+        server、export path、凭据、中心挂载路径和 Agent ownership 不属于公开视图。
+      additionalProperties: false
+      required:
+        - tenant_id
+        - storage_volume_id
+        - display_name
+        - edge_cluster_id
+        - region
+        - backend_type
+        - access_mode
+        - state
+        - resource_version
+        - created_at_unix_ms
+        - updated_at_unix_ms
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+        edge_cluster_id:
+          $ref: '#/components/schemas/EdgeClusterId'
+        region:
+          $ref: '#/components/schemas/RegionName'
+        backend_type:
+          $ref: '#/components/schemas/StorageBackendType'
+        access_mode:
+          $ref: '#/components/schemas/StorageAccessMode'
+        pvc_reference:
+          $ref: '#/components/schemas/PvcReference'
+        state:
+          $ref: '#/components/schemas/StorageVolumeState'
+        resource_version:
+          $ref: '#/components/schemas/CanonicalU64'
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        updated_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    PvcReference:
+      type: object
+      additionalProperties: false
+      required: [namespace, claim_name]
+      properties:
+        namespace:
+          type: string
+          minLength: 1
+          maxLength: 253
+          pattern: '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+        claim_name:
+          type: string
+          minLength: 1
+          maxLength: 253
+          pattern: '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+
+    NfsReference:
+      type: object
+      description: 仅在登记请求中使用；服务端不得在公开 StorageVolumeView 中回显。
+      additionalProperties: false
+      required: [server, export_path]
+      properties:
+        server:
+          type: string
+          minLength: 1
+          maxLength: 253
+        export_path:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          pattern: '^/.*$'
+
     QueryProjectListRequest:
       type: object
       additionalProperties: false
@@ -1688,14 +2344,53 @@ components:
         artifact:
           $ref: '#/components/schemas/ArtifactView'
 
+    CreateArtifactRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal]
+      required: [tenant_id, project_id, artifact_id, storage_volume_id, display_name]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+        description:
+          $ref: '#/components/schemas/Description'
+        default_ref:
+          allOf:
+            - $ref: '#/components/schemas/RefName'
+          default: refs/heads/main
+
+    CreateArtifactResponse:
+      type: object
+      additionalProperties: false
+      required: [artifact, replayed]
+      properties:
+        artifact:
+          $ref: '#/components/schemas/ArtifactView'
+        replayed:
+          type: boolean
+
     ArtifactView:
       type: object
-      description: 不暴露 placement、Agent、Manifest 或 authority 存储位置的 Artifact 视图。
+      description: |
+        暴露用户选择的 StorageVolume ID 和派生 region，但不暴露内部 ArtifactPlacement、Agent、
+        Manifest、挂载路径或 authority 存储位置。
       additionalProperties: false
       required:
         - tenant_id
         - project_id
         - artifact_id
+        - storage_volume_id
+        - region
         - display_name
         - default_ref
         - resource_version
@@ -1708,6 +2403,10 @@ components:
           $ref: '#/components/schemas/ProjectId'
         artifact_id:
           $ref: '#/components/schemas/ArtifactId'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+        region:
+          $ref: '#/components/schemas/RegionName'
         display_name:
           $ref: '#/components/schemas/DisplayName'
         description:
@@ -1789,6 +2488,8 @@ components:
           type: string
           minLength: 1
           maxLength: 4096
+        description:
+          $ref: '#/components/schemas/Description'
         ref_names:
           type: array
           maxItems: 1024
@@ -1797,6 +2498,93 @@ components:
             $ref: '#/components/schemas/RefName'
         created_at_unix_ms:
           $ref: '#/components/schemas/UnixMillis'
+
+    QueryArtifactCommitDiffRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id, commit_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        commit_id:
+          $ref: '#/components/schemas/CommitId'
+        base_commit_id:
+          $ref: '#/components/schemas/CommitId'
+
+    QueryArtifactCommitDiffResponse:
+      type: object
+      additionalProperties: false
+      required: [diff]
+      properties:
+        diff:
+          $ref: '#/components/schemas/CommitDiffView'
+
+    CommitDiffView:
+      type: object
+      description: 目标 Commit 与显式 base 或其单一 parent 的公开文件级差异。
+      additionalProperties: false
+      required: [target_commit, summary, changes]
+      properties:
+        base_commit:
+          $ref: '#/components/schemas/CommitNode'
+        target_commit:
+          $ref: '#/components/schemas/CommitNode'
+        summary:
+          $ref: '#/components/schemas/CommitDiffSummary'
+        changes:
+          type: array
+          maxItems: 10000
+          items:
+            $ref: '#/components/schemas/CommitDiffEntry'
+
+    CommitDiffSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - files_added
+        - files_modified
+        - files_deleted
+        - files_renamed
+        - bytes_added
+        - bytes_removed
+      properties:
+        files_added:
+          $ref: '#/components/schemas/CanonicalU64'
+        files_modified:
+          $ref: '#/components/schemas/CanonicalU64'
+        files_deleted:
+          $ref: '#/components/schemas/CanonicalU64'
+        files_renamed:
+          $ref: '#/components/schemas/CanonicalU64'
+        bytes_added:
+          $ref: '#/components/schemas/CanonicalU64'
+        bytes_removed:
+          $ref: '#/components/schemas/CanonicalU64'
+
+    CommitDiffEntry:
+      type: object
+      additionalProperties: false
+      required: [change_type, path]
+      properties:
+        change_type:
+          type: string
+          enum: [added, modified, deleted, renamed]
+        path:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        previous_path:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        old_size_bytes:
+          $ref: '#/components/schemas/CanonicalU64'
+        new_size_bytes:
+          $ref: '#/components/schemas/CanonicalU64'
 
     QueryPlaygroundListRequest:
       type: object
@@ -1853,15 +2641,58 @@ components:
         playground:
           $ref: '#/components/schemas/PlaygroundView'
 
+    CreatePlaygroundRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal]
+      required:
+        - tenant_id
+        - project_id
+        - artifact_id
+        - playground_id
+        - storage_volume_id
+        - display_name
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+        display_name:
+          $ref: '#/components/schemas/DisplayName'
+        base_commit_id:
+          $ref: '#/components/schemas/CommitId'
+
+    CreatePlaygroundResponse:
+      type: object
+      additionalProperties: false
+      required: [playground, replayed]
+      properties:
+        playground:
+          $ref: '#/components/schemas/PlaygroundView'
+        replayed:
+          type: boolean
+
     PlaygroundView:
       type: object
-      description: 不暴露 attachment、lease、fencing、Agent 或文件系统位置的 Playground 视图。
+      description: |
+        暴露用户选择的 StorageVolume ID 和派生 region，但不暴露 attachment、lease、fencing、
+        Agent 或文件系统位置。
       additionalProperties: false
       required:
         - tenant_id
         - project_id
         - artifact_id
         - playground_id
+        - storage_volume_id
+        - region
         - display_name
         - index_version
         - state
@@ -1876,6 +2707,10 @@ components:
           $ref: '#/components/schemas/ArtifactId'
         playground_id:
           $ref: '#/components/schemas/PlaygroundId'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+        region:
+          $ref: '#/components/schemas/RegionName'
         display_name:
           $ref: '#/components/schemas/DisplayName'
         base_commit_id:
@@ -1891,6 +2726,58 @@ components:
           $ref: '#/components/schemas/UnixMillis'
         updated_at_unix_ms:
           $ref: '#/components/schemas/UnixMillis'
+
+    CommitPlaygroundRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal, request_digest]
+      required:
+        - tenant_id
+        - project_id
+        - artifact_id
+        - playground_id
+        - commit_request_id
+        - expected_index_version
+        - message
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        commit_request_id:
+          $ref: '#/components/schemas/ResourceId'
+        expected_index_version:
+          $ref: '#/components/schemas/IndexVersion'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        description:
+          $ref: '#/components/schemas/Description'
+        tag_names:
+          type: array
+          maxItems: 20
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/TagName'
+
+    CommitPlaygroundResponse:
+      type: object
+      additionalProperties: false
+      required: [commit, playground, replayed]
+      properties:
+        commit:
+          $ref: '#/components/schemas/CommitNode'
+        playground:
+          $ref: '#/components/schemas/PlaygroundView'
+        replayed:
+          type: boolean
 
     QuerySnapshotListRequest:
       type: object
@@ -1945,6 +2832,35 @@ components:
         snapshot:
           $ref: '#/components/schemas/SnapshotView'
 
+    CreateSnapshotRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal]
+      required: [tenant_id, project_id, artifact_id, commit_id, storage_volume_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        commit_id:
+          $ref: '#/components/schemas/CommitId'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+
+    CreateSnapshotResponse:
+      type: object
+      additionalProperties: false
+      required: [snapshot, replayed]
+      properties:
+        snapshot:
+          $ref: '#/components/schemas/SnapshotView'
+        replayed:
+          type: boolean
+
     SnapshotView:
       type: object
       description: 由 tenant、project、artifact、commit 复合身份确定的只读 Snapshot。
@@ -1954,6 +2870,8 @@ components:
         - project_id
         - artifact_id
         - commit_id
+        - storage_volume_id
+        - region
         - message
         - ref_names
         - created_at_unix_ms
@@ -1966,6 +2884,10 @@ components:
           $ref: '#/components/schemas/ArtifactId'
         commit_id:
           $ref: '#/components/schemas/CommitId'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+        region:
+          $ref: '#/components/schemas/RegionName'
         message:
           type: string
           minLength: 1
@@ -2351,6 +3273,10 @@ components:
 
     TenantId:
       $ref: '#/components/schemas/ResourceId'
+    StorageVolumeId:
+      $ref: '#/components/schemas/ResourceId'
+    EdgeClusterId:
+      $ref: '#/components/schemas/ResourceId'
     ProjectId:
       $ref: '#/components/schemas/ResourceId'
     ArtifactId:
@@ -2385,6 +3311,24 @@ components:
       type: string
       maxLength: 2048
 
+    RegionName:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[a-z0-9][a-z0-9-]{0,63}$'
+
+    StorageBackendType:
+      type: string
+      enum: [pvc, nfs]
+
+    StorageAccessMode:
+      type: string
+      enum: [read_write_many, read_write_once, read_only_many]
+
+    StorageVolumeState:
+      type: string
+      enum: [ready, degraded, unavailable]
+
     PermissionName:
       type: string
       minLength: 3
@@ -2396,6 +3340,12 @@ components:
       minLength: 1
       maxLength: 512
       pattern: '^refs/[A-Za-z0-9][A-Za-z0-9._/-]*$'
+
+    TagName:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^(?!refs/)[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,127})$'
 
     PageCursor:
       type: string

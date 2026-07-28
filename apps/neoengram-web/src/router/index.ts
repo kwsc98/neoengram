@@ -32,6 +32,12 @@ const routes: RouteRecordRaw[] = [
     meta: tenantMeta,
   },
   {
+    path: '/tenants/:tenantId/storage-volumes',
+    name: 'storage-volume-list',
+    component: () => import('@/pages/StorageVolumeListPage.vue'),
+    meta: tenantMeta,
+  },
+  {
     path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId',
     name: 'artifact-detail',
     component: () => import('@/pages/ArtifactDetailPage.vue'),

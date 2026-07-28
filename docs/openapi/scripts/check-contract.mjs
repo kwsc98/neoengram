@@ -37,14 +37,22 @@ const expectedOperations = {
   '/api/tenant/list/query': ['post', 'queryTenantList'],
   '/api/tenant/query': ['post', 'queryTenant'],
   '/api/tenant/create': ['post', 'createTenant'],
+  '/api/storage/volume/list/query': ['post', 'queryStorageVolumeList'],
+  '/api/storage/volume/query': ['post', 'queryStorageVolume'],
+  '/api/storage/volume/create': ['post', 'createStorageVolume'],
   '/api/project/list/query': ['post', 'queryProjectList'],
   '/api/artifact/list/query': ['post', 'queryArtifactList'],
   '/api/artifact/query': ['post', 'queryArtifact'],
+  '/api/artifact/create': ['post', 'createArtifact'],
   '/api/artifact/commit/graph/query': ['post', 'queryArtifactCommitGraph'],
+  '/api/artifact/commit/diff/query': ['post', 'queryArtifactCommitDiff'],
   '/api/playground/list/query': ['post', 'queryPlaygroundList'],
   '/api/playground/query': ['post', 'queryPlayground'],
+  '/api/playground/create': ['post', 'createPlayground'],
+  '/api/playground/commit/create': ['post', 'commitPlayground'],
   '/api/snapshot/list/query': ['post', 'querySnapshotList'],
   '/api/snapshot/query': ['post', 'querySnapshot'],
+  '/api/snapshot/create': ['post', 'createSnapshot'],
   '/api/job/add/create': ['post', 'createAddJob'],
   '/api/job/query': ['post', 'queryJob'],
   '/api/job/add/finalize': ['post', 'finalizeAddJob'],
@@ -238,6 +246,12 @@ const canonicalFields = [
   document.components.schemas.JobError.properties.retry_after_ms,
   document.components.schemas.ProblemDetails.properties.retry_after_ms,
   document.components.schemas.IndexVersion.properties.revision,
+  document.components.schemas.CommitDiffSummary.properties.files_added,
+  document.components.schemas.CommitDiffSummary.properties.files_modified,
+  document.components.schemas.CommitDiffSummary.properties.files_deleted,
+  document.components.schemas.CommitDiffSummary.properties.files_renamed,
+  document.components.schemas.CommitDiffSummary.properties.bytes_added,
+  document.components.schemas.CommitDiffSummary.properties.bytes_removed,
 ];
 for (const schema of canonicalFields) {
   assert(resolveRef(schema) === canonicalU64, 'a public u64 field does not use CanonicalU64');
@@ -263,14 +277,22 @@ const resourceContracts = {
   queryTenantList: ['QueryTenantListRequest', 'QueryTenantListResponse'],
   queryTenant: ['QueryTenantRequest', 'QueryTenantResponse'],
   createTenant: ['CreateTenantRequest', 'CreateTenantResponse'],
+  queryStorageVolumeList: ['QueryStorageVolumeListRequest', 'QueryStorageVolumeListResponse'],
+  queryStorageVolume: ['QueryStorageVolumeRequest', 'QueryStorageVolumeResponse'],
+  createStorageVolume: ['CreateStorageVolumeRequest', 'CreateStorageVolumeResponse'],
   queryProjectList: ['QueryProjectListRequest', 'QueryProjectListResponse'],
   queryArtifactList: ['QueryArtifactListRequest', 'QueryArtifactListResponse'],
   queryArtifact: ['QueryArtifactRequest', 'QueryArtifactResponse'],
+  createArtifact: ['CreateArtifactRequest', 'CreateArtifactResponse'],
   queryArtifactCommitGraph: ['QueryArtifactCommitGraphRequest', 'QueryArtifactCommitGraphResponse'],
+  queryArtifactCommitDiff: ['QueryArtifactCommitDiffRequest', 'QueryArtifactCommitDiffResponse'],
   queryPlaygroundList: ['QueryPlaygroundListRequest', 'QueryPlaygroundListResponse'],
   queryPlayground: ['QueryPlaygroundRequest', 'QueryPlaygroundResponse'],
+  createPlayground: ['CreatePlaygroundRequest', 'CreatePlaygroundResponse'],
+  commitPlayground: ['CommitPlaygroundRequest', 'CommitPlaygroundResponse'],
   querySnapshotList: ['QuerySnapshotListRequest', 'QuerySnapshotListResponse'],
   querySnapshot: ['QuerySnapshotRequest', 'QuerySnapshotResponse'],
+  createSnapshot: ['CreateSnapshotRequest', 'CreateSnapshotResponse'],
 };
 
 for (const [operationId, [requestName, responseName]] of Object.entries(resourceContracts)) {
@@ -291,9 +313,32 @@ assertSameMembers(snapshotRequest.required,
   'Snapshot identity must remain tenant/project/artifact/commit');
 assert(!snapshotRequest.properties.snapshot_id, 'Snapshot must not introduce an independent snapshot_id');
 
+const createSnapshotRequest = document.components.schemas.CreateSnapshotRequest;
+assertSameMembers(createSnapshotRequest.required,
+  ['tenant_id', 'project_id', 'artifact_id', 'commit_id', 'storage_volume_id'],
+  'Snapshot create identity must remain tenant/project/artifact/commit');
+assert(!createSnapshotRequest.properties.snapshot_id,
+  'Snapshot create must not introduce an independent snapshot_id');
+
+const commitRequest = document.components.schemas.CommitPlaygroundRequest;
+assert(commitRequest.required.includes('commit_request_id'),
+  'Playground Commit must have a stable mutation identity');
+assert(commitRequest.required.includes('expected_index_version'),
+  'Playground Commit must bind the expected IndexVersion');
+assert(commitRequest.properties.description && commitRequest.properties.tag_names,
+  'Playground Commit must accept a description and tag names');
+assert(commitRequest.properties.tag_names.maxItems === 20,
+  'Playground Commit tag limit changed');
+assert(!commitRequest.properties.actor
+  && !commitRequest.properties.principal
+  && !commitRequest.properties.request_digest,
+  'Playground Commit request must not declare actor, principal, or request_digest');
+
 const publicResourceViews = [
+  document.components.schemas.StorageVolumeView,
   document.components.schemas.ArtifactView,
   document.components.schemas.CommitNode,
+  document.components.schemas.CommitDiffEntry,
   document.components.schemas.PlaygroundView,
   document.components.schemas.SnapshotView,
 ];
@@ -308,12 +353,40 @@ const forbiddenResourceFields = [
   'manifest',
   'nfs_path',
   'object_location',
-  'storage_volume_id',
 ];
 for (const view of publicResourceViews) {
   const fields = Object.keys(view.properties ?? {}).map((field) => field.toLowerCase());
   assert(!forbiddenResourceFields.some((field) => fields.includes(field)),
     'a public resource view exposes an internal storage or scheduling field');
+}
+
+const commitDiff = document.components.schemas.CommitDiffView;
+assertSameMembers(commitDiff.required, ['target_commit', 'summary', 'changes'],
+  'Commit diff required fields changed');
+assert(!document.components.schemas.CommitDiffEntry.properties.manifest
+  && !document.components.schemas.CommitDiffEntry.properties.digest
+  && !document.components.schemas.CommitDiffEntry.properties.object_location,
+  'Commit diff must not expose internal content identities or locations');
+
+for (const schemaName of ['ArtifactView', 'PlaygroundView', 'SnapshotView']) {
+  const view = document.components.schemas[schemaName];
+  assert(view.required.includes('storage_volume_id') && view.required.includes('region'),
+    `${schemaName} must expose its public storage placement`);
+}
+
+for (const schemaName of [
+  'CreateArtifactRequest',
+  'CreatePlaygroundRequest',
+  'CreateSnapshotRequest',
+]) {
+  assert(document.components.schemas[schemaName].required.includes('storage_volume_id'),
+    `${schemaName} must select a StorageVolume`);
+}
+
+const storageVolumeView = document.components.schemas.StorageVolumeView;
+for (const forbidden of ['credentials', 'mount_path', 'nfs_reference', 'agent_id', 'fencing_token']) {
+  assert(!storageVolumeView.properties[forbidden],
+    `StorageVolumeView exposes forbidden field ${forbidden}`);
 }
 
 const createTenantRequest = document.components.schemas.CreateTenantRequest;

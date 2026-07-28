@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import {
   Box,
-  CirclePlus,
   Collection,
+  Coin,
   DataAnalysis,
   DocumentCopy,
   Fold,
@@ -39,16 +39,17 @@ const menuItems = computed(() => {
   const tenantId = currentTenantId.value;
   return [
     { name: 'tenant-overview', label: '租户概览', icon: DataAnalysis, params: { tenantId } },
+    { name: 'storage-volume-list', label: 'StorageVolumes', icon: Coin, params: { tenantId } },
     { name: 'artifact-list', label: 'Artifacts', icon: Box, params: { tenantId } },
     { name: 'playground-list', label: 'Playgrounds', icon: Collection, params: { tenantId } },
     { name: 'snapshot-list', label: 'Snapshots', icon: DocumentCopy, params: { tenantId } },
-    { name: 'job-create', label: '创建 Add Job', icon: CirclePlus, params: { tenantId } },
     { name: 'job-query', label: '查询 Job', icon: Search, params: { tenantId } },
   ];
 });
 
 const activeMenu = computed(() => {
   const name = String(route.name ?? '');
+  if (name.startsWith('storage-volume-')) return 'storage-volume-list';
   if (name.startsWith('artifact-')) return 'artifact-list';
   if (name.startsWith('playground-')) return 'playground-list';
   if (name.startsWith('snapshot-')) return 'snapshot-list';
@@ -71,6 +72,7 @@ async function navigate(name: string, params: Record<string, string>): Promise<v
 
 function targetForTenantSwitch(): string {
   const name = String(route.name ?? '');
+  if (name === 'storage-volume-list') return 'storage-volume-list';
   if (name === 'artifact-detail' || name === 'artifact-list') return 'artifact-list';
   if (name === 'playground-detail' || name === 'playground-list') return 'playground-list';
   if (name === 'snapshot-detail' || name === 'snapshot-list') return 'snapshot-list';

@@ -4,6 +4,7 @@ import type {
   PlaygroundView,
   ProjectSummary,
   SnapshotView,
+  StorageVolumeView,
   TenantView,
 } from '@/api/types';
 
@@ -18,7 +19,18 @@ export const tenants: TenantView[] = [
     resource_version: '3',
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
-    permissions: ['tenant.admin', 'tenant.read', 'artifact.read', 'job.create'],
+    permissions: [
+      'tenant.admin',
+      'tenant.read',
+      'storage.read',
+      'storage.create',
+      'artifact.read',
+      'artifact.create',
+      'playground.create',
+      'snapshot.create',
+      'commit.create',
+      'job.create',
+    ],
   },
   {
     tenant_id: 'tenant-b',
@@ -27,7 +39,7 @@ export const tenants: TenantView[] = [
     resource_version: '7',
     created_at_unix_ms: '1784167000000',
     updated_at_unix_ms: '1785067600000',
-    permissions: ['tenant.read', 'artifact.read'],
+    permissions: ['tenant.read', 'storage.read', 'artifact.read'],
   },
 ];
 
@@ -55,11 +67,71 @@ export const projects: ProjectSummary[] = [
   },
 ];
 
+export const storageVolumes: StorageVolumeView[] = [
+  {
+    tenant_id: 'tenant-a',
+    storage_volume_id: 'volume-shanghai-vision',
+    display_name: '视觉数据 PVC',
+    edge_cluster_id: 'cluster-cn-east-1',
+    region: 'cn-shanghai',
+    backend_type: 'pvc',
+    access_mode: 'read_write_many',
+    pvc_reference: { namespace: 'neoengram-data', claim_name: 'vision-data' },
+    state: 'ready',
+    resource_version: '4',
+    created_at_unix_ms: created,
+    updated_at_unix_ms: updated,
+  },
+  {
+    tenant_id: 'tenant-a',
+    storage_volume_id: 'volume-shanghai-archive',
+    display_name: '上海共享归档',
+    edge_cluster_id: 'cluster-cn-east-1',
+    region: 'cn-shanghai',
+    backend_type: 'nfs',
+    access_mode: 'read_write_many',
+    state: 'degraded',
+    resource_version: '8',
+    created_at_unix_ms: created,
+    updated_at_unix_ms: updated,
+  },
+  {
+    tenant_id: 'tenant-a',
+    storage_volume_id: 'volume-beijing-language',
+    display_name: '语言数据 PVC',
+    edge_cluster_id: 'cluster-cn-north-1',
+    region: 'cn-beijing',
+    backend_type: 'pvc',
+    access_mode: 'read_write_once',
+    pvc_reference: { namespace: 'neoengram-data', claim_name: 'language-data' },
+    state: 'ready',
+    resource_version: '2',
+    created_at_unix_ms: created,
+    updated_at_unix_ms: updated,
+  },
+  {
+    tenant_id: 'tenant-b',
+    storage_volume_id: 'volume-release',
+    display_name: '发布归档 PVC',
+    edge_cluster_id: 'cluster-cn-east-1',
+    region: 'cn-shanghai',
+    backend_type: 'pvc',
+    access_mode: 'read_only_many',
+    pvc_reference: { namespace: 'neoengram-release', claim_name: 'release-archive' },
+    state: 'ready',
+    resource_version: '7',
+    created_at_unix_ms: created,
+    updated_at_unix_ms: updated,
+  },
+];
+
 export const artifacts: ArtifactView[] = [
   {
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
+    storage_volume_id: 'volume-shanghai-vision',
+    region: 'cn-shanghai',
     display_name: '道路场景数据集',
     description: '覆盖白天、夜间和雨雪天气的训练样本',
     default_ref: 'refs/heads/main',
@@ -71,6 +143,8 @@ export const artifacts: ArtifactView[] = [
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'quality-reports',
+    storage_volume_id: 'volume-shanghai-vision',
+    region: 'cn-shanghai',
     display_name: '视觉质量报告',
     description: '数据回归检查与人工复核结果',
     default_ref: 'refs/heads/main',
@@ -82,6 +156,8 @@ export const artifacts: ArtifactView[] = [
     tenant_id: 'tenant-a',
     project_id: 'project-language',
     artifact_id: 'dialog-corpus',
+    storage_volume_id: 'volume-beijing-language',
+    region: 'cn-beijing',
     display_name: '对话语料',
     description: '脱敏后的多轮中文对话语料',
     default_ref: 'refs/heads/main',
@@ -93,6 +169,8 @@ export const artifacts: ArtifactView[] = [
     tenant_id: 'tenant-b',
     project_id: 'project-release',
     artifact_id: 'release-assets',
+    storage_volume_id: 'volume-release',
+    region: 'cn-shanghai',
     display_name: '发布资源',
     description: '已签发版本的固定交付内容',
     default_ref: 'refs/heads/stable',
@@ -117,6 +195,7 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           commit_id: 'commit-main-3',
           parent_commit_id: 'commit-main-2',
           message: '补充夜间道路场景',
+          description: '增加夜间和低照度样本，并更新场景索引。',
           ref_names: ['refs/heads/main'],
           created_at_unix_ms: '1785167600000',
         },
@@ -124,6 +203,7 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           commit_id: 'commit-exp-2',
           parent_commit_id: 'commit-main-2',
           message: '实验性标注规则',
+          description: '验证新的遮挡物和反光标注规则。',
           ref_names: ['refs/heads/experiment'],
           created_at_unix_ms: '1785167500000',
         },
@@ -131,12 +211,14 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           commit_id: 'commit-main-2',
           parent_commit_id: 'commit-root-1',
           message: '完成首轮质量复核',
+          description: '完成白天场景的质量抽检和标签修订。',
           ref_names: ['refs/tags/v1.0'],
           created_at_unix_ms: '1785067400000',
         },
         {
           commit_id: 'commit-root-1',
           message: '导入初始道路场景',
+          description: '建立道路场景数据集的初始版本。',
           ref_names: [],
           created_at_unix_ms: '1784967000000',
         },
@@ -210,6 +292,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
     playground_id: 'labeling',
+    storage_volume_id: 'volume-shanghai-vision',
+    region: 'cn-shanghai',
     display_name: '标注工作区',
     base_commit_id: 'commit-main-2',
     head_commit_id: 'commit-main-3',
@@ -223,6 +307,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-vision',
     artifact_id: 'quality-reports',
     playground_id: 'nightly-review',
+    storage_volume_id: 'volume-shanghai-archive',
+    region: 'cn-shanghai',
     display_name: '夜间回归检查',
     base_commit_id: 'report-commit-1',
     head_commit_id: 'report-commit-2',
@@ -236,6 +322,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-language',
     artifact_id: 'dialog-corpus',
     playground_id: 'safety-review',
+    storage_volume_id: 'volume-beijing-language',
+    region: 'cn-beijing',
     display_name: '安全标注复核',
     base_commit_id: 'dialog-commit-1',
     head_commit_id: 'dialog-commit-2',
@@ -249,6 +337,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-release',
     artifact_id: 'release-assets',
     playground_id: 'release-candidate',
+    storage_volume_id: 'volume-release',
+    region: 'cn-shanghai',
     display_name: '交付候选区',
     base_commit_id: 'release-commit-1',
     head_commit_id: 'release-commit-1',
@@ -265,6 +355,8 @@ export const snapshots: SnapshotView[] = [
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
     commit_id: 'commit-main-3',
+    storage_volume_id: 'volume-shanghai-archive',
+    region: 'cn-shanghai',
     message: '补充夜间道路场景',
     ref_names: ['refs/heads/main'],
     created_at_unix_ms: '1785167600000',
@@ -276,6 +368,8 @@ export const snapshots: SnapshotView[] = [
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
     commit_id: 'commit-main-2',
+    storage_volume_id: 'volume-shanghai-vision',
+    region: 'cn-shanghai',
     message: '完成首轮质量复核',
     ref_names: ['refs/tags/v1.0'],
     created_at_unix_ms: '1785067400000',
@@ -287,6 +381,8 @@ export const snapshots: SnapshotView[] = [
     project_id: 'project-language',
     artifact_id: 'dialog-corpus',
     commit_id: 'dialog-commit-2',
+    storage_volume_id: 'volume-beijing-language',
+    region: 'cn-beijing',
     message: '增加安全标注',
     ref_names: ['refs/heads/main'],
     created_at_unix_ms: updated,
@@ -298,6 +394,8 @@ export const snapshots: SnapshotView[] = [
     project_id: 'project-release',
     artifact_id: 'release-assets',
     commit_id: 'release-commit-1',
+    storage_volume_id: 'volume-release',
+    region: 'cn-shanghai',
     message: '发布 2026.07',
     ref_names: ['refs/heads/stable'],
     created_at_unix_ms: updated,
@@ -305,6 +403,25 @@ export const snapshots: SnapshotView[] = [
     logical_size_bytes: '734003200',
   },
 ];
+
+const initialTenants = structuredClone(tenants);
+const initialStorageVolumes = structuredClone(storageVolumes);
+const initialArtifacts = structuredClone(artifacts);
+const initialPlaygrounds = structuredClone(playgrounds);
+const initialSnapshots = structuredClone(snapshots);
+const initialCommitGraphs = [...commitGraphs].map(
+  ([key, graph]) => [key, structuredClone(graph)] as const,
+);
+
+export function resetMockData(): void {
+  tenants.splice(0, tenants.length, ...structuredClone(initialTenants));
+  storageVolumes.splice(0, storageVolumes.length, ...structuredClone(initialStorageVolumes));
+  artifacts.splice(0, artifacts.length, ...structuredClone(initialArtifacts));
+  playgrounds.splice(0, playgrounds.length, ...structuredClone(initialPlaygrounds));
+  snapshots.splice(0, snapshots.length, ...structuredClone(initialSnapshots));
+  commitGraphs.clear();
+  for (const [key, graph] of initialCommitGraphs) commitGraphs.set(key, structuredClone(graph));
+}
 
 export function resourceKey(...parts: string[]): string {
   return parts.join('\u0000');

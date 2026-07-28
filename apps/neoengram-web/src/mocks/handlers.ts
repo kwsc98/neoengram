@@ -1,8 +1,20 @@
 import { http, HttpResponse } from 'msw';
 
 import type {
+  CommitPlaygroundRequest,
+  CommitPlaygroundResponse,
+  CommitDiffEntry,
+  CommitNode,
   CreateAddJobRequest,
   CreateAddJobResponse,
+  CreateArtifactRequest,
+  CreateArtifactResponse,
+  CreatePlaygroundRequest,
+  CreatePlaygroundResponse,
+  CreateSnapshotRequest,
+  CreateSnapshotResponse,
+  CreateStorageVolumeRequest,
+  CreateStorageVolumeResponse,
   CreateTenantRequest,
   CreateTenantResponse,
   FinalizeAddJobResponse,
@@ -10,6 +22,7 @@ import type {
   ProblemDetails,
   QueryArtifactListRequest,
   QueryArtifactListResponse,
+  QueryArtifactCommitDiffResponse,
   QueryArtifactResponse,
   QueryPlaygroundListRequest,
   QueryPlaygroundListResponse,
@@ -19,10 +32,14 @@ import type {
   QuerySnapshotListRequest,
   QuerySnapshotListResponse,
   QuerySnapshotResponse,
+  QueryStorageVolumeListRequest,
+  QueryStorageVolumeListResponse,
+  QueryStorageVolumeResponse,
   QueryTenantListRequest,
   QueryTenantListResponse,
   QueryTenantResponse,
   QueryJobResponse,
+  StorageVolumeView,
   TenantView,
 } from '@/api/types';
 
@@ -32,7 +49,9 @@ import {
   playgrounds,
   projects,
   resourceKey,
+  resetMockData,
   snapshots,
+  storageVolumes,
   tenants,
 } from './data';
 
@@ -56,6 +75,13 @@ interface PageResult<T> {
 
 const jobs = new Map<string, StoredJob>();
 const tenantCreatePayloads = new Map<string, string>();
+const storageVolumeCreatePayloads = new Map<string, string>();
+const artifactCreatePayloads = new Map<string, string>();
+const playgroundCreatePayloads = new Map<string, string>();
+const commitRequests = new Map<
+  string,
+  { requestJson: string; response: CommitPlaygroundResponse }
+>();
 
 function requestId(request: Request): string {
   return request.headers.get('X-Request-ID') ?? `mock-fallback-${crypto.randomUUID()}`;
@@ -223,6 +249,57 @@ function requireTenant(request: Request, tenantId: string): HttpResponse<Problem
   );
 }
 
+function requireMutationAccess(
+  request: Request,
+  tenantId: string,
+): HttpResponse<ProblemDetails> | null {
+  const failed = requireTenant(request, tenantId);
+  if (failed) return failed;
+  if (isAdmin(request)) return null;
+  return problem(
+    request,
+    403,
+    'AUTHORIZATION_DENIED',
+    'Authorization denied',
+    'The principal is not authorized to mutate this resource',
+  );
+}
+
+function resolveStorageVolume(
+  request: Request,
+  tenantId: string,
+  storageVolumeId: string,
+): StorageVolumeView | HttpResponse<ProblemDetails> {
+  const storageVolume = storageVolumes.find(
+    (item) => item.tenant_id === tenantId && item.storage_volume_id === storageVolumeId,
+  );
+  if (!storageVolume) {
+    return problem(
+      request,
+      404,
+      'STORAGE_VOLUME_NOT_FOUND',
+      'StorageVolume not found',
+      'The selected StorageVolume does not exist in this Tenant',
+    );
+  }
+  if (storageVolume.state === 'unavailable') {
+    return mutationConflict(
+      request,
+      'STORAGE_VOLUME_UNAVAILABLE',
+      'The selected StorageVolume is unavailable for new resource placement',
+    );
+  }
+  return storageVolume;
+}
+
+function mutationConflict(
+  request: Request,
+  code: string,
+  detail: string,
+): HttpResponse<ProblemDetails> {
+  return problem(request, 409, code, 'Resource mutation conflict', detail);
+}
+
 function notFound(
   request: Request,
   resource: 'Artifact' | 'Playground' | 'Snapshot',
@@ -302,6 +379,64 @@ function advance(stored: StoredJob): void {
       bytes_completed: '12884901888',
     };
   }
+}
+
+function mockCommitChanges(target: CommitNode, base?: CommitNode): CommitDiffEntry[] {
+  if (!base) {
+    return [
+      {
+        change_type: 'added',
+        path: 'dataset/index.json',
+        new_size_bytes: '3072',
+      },
+      {
+        change_type: 'added',
+        path: `dataset/commits/${target.commit_id}.jsonl`,
+        new_size_bytes: '5120',
+      },
+    ];
+  }
+  return [
+    {
+      change_type: 'modified',
+      path: 'dataset/index.json',
+      old_size_bytes: '2048',
+      new_size_bytes: '3072',
+    },
+    {
+      change_type: 'added',
+      path: `dataset/commits/${target.commit_id}.jsonl`,
+      new_size_bytes: '5120',
+    },
+    {
+      change_type: 'deleted',
+      path: `dataset/commits/${base.commit_id}.tmp`,
+      old_size_bytes: '512',
+    },
+  ];
+}
+
+function diffSummary(changes: CommitDiffEntry[]) {
+  let bytesAdded = 0n;
+  let bytesRemoved = 0n;
+  for (const change of changes) {
+    const oldSize = BigInt(change.old_size_bytes ?? '0');
+    const newSize = BigInt(change.new_size_bytes ?? '0');
+    if (change.change_type === 'added') bytesAdded += newSize;
+    if (change.change_type === 'deleted') bytesRemoved += oldSize;
+    if (change.change_type === 'modified') {
+      if (newSize >= oldSize) bytesAdded += newSize - oldSize;
+      else bytesRemoved += oldSize - newSize;
+    }
+  }
+  return {
+    files_added: changes.filter((change) => change.change_type === 'added').length.toString(),
+    files_modified: changes.filter((change) => change.change_type === 'modified').length.toString(),
+    files_deleted: changes.filter((change) => change.change_type === 'deleted').length.toString(),
+    files_renamed: changes.filter((change) => change.change_type === 'renamed').length.toString(),
+    bytes_added: bytesAdded.toString(),
+    bytes_removed: bytesRemoved.toString(),
+  };
 }
 
 export const handlers = [
@@ -403,11 +538,159 @@ export const handlers = [
       resource_version: '1',
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
-      permissions: ['tenant.admin', 'tenant.read', 'artifact.read', 'job.create'],
+      permissions: [
+        'tenant.admin',
+        'tenant.read',
+        'storage.read',
+        'storage.create',
+        'artifact.read',
+        'artifact.create',
+        'playground.create',
+        'snapshot.create',
+        'commit.create',
+        'job.create',
+      ],
     };
     tenants.push(tenant);
     tenantCreatePayloads.set(body.tenant_id, requestJson);
     const response: CreateTenantResponse = { tenant, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/storage/volume/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryStorageVolumeListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const search = body.query?.toLocaleLowerCase('zh-CN');
+    const filtered = storageVolumes.filter(
+      (storageVolume) =>
+        storageVolume.tenant_id === body.tenant_id &&
+        (!body.region || storageVolume.region === body.region) &&
+        (!body.backend_type || storageVolume.backend_type === body.backend_type) &&
+        (!search ||
+          storageVolume.storage_volume_id.toLocaleLowerCase('zh-CN').includes(search) ||
+          storageVolume.display_name.toLocaleLowerCase('zh-CN').includes(search)),
+    );
+    const filters = {
+      tenant_id: body.tenant_id,
+      region: body.region ?? '',
+      backend_type: body.backend_type ?? '',
+      query: body.query ?? '',
+    };
+    const page = paginate(request, 'storage-volumes', filters, filtered, body);
+    if (page instanceof HttpResponse) return page;
+    const response: QueryStorageVolumeListResponse = page;
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/storage/volume/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as {
+      tenant_id: string;
+      storage_volume_id: string;
+    };
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const storageVolume = storageVolumes.find(
+      (item) =>
+        item.tenant_id === body.tenant_id && item.storage_volume_id === body.storage_volume_id,
+    );
+    if (!storageVolume) {
+      return problem(
+        request,
+        404,
+        'STORAGE_VOLUME_NOT_FOUND',
+        'StorageVolume not found',
+        'The requested StorageVolume was not found',
+      );
+    }
+    const response: QueryStorageVolumeResponse = { storage_volume: storageVolume };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/storage/volume/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateStorageVolumeRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const resourceId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+    const region = /^[a-z0-9][a-z0-9-]{0,63}$/;
+    const backendReferenceValid =
+      (body.backend_type === 'pvc' &&
+        Boolean(body.pvc_reference?.namespace && body.pvc_reference.claim_name) &&
+        !body.nfs_reference) ||
+      (body.backend_type === 'nfs' &&
+        Boolean(body.nfs_reference?.server && body.nfs_reference.export_path?.startsWith('/')) &&
+        !body.pvc_reference);
+    if (
+      !resourceId.test(body.storage_volume_id) ||
+      !resourceId.test(body.edge_cluster_id) ||
+      !body.display_name.trim() ||
+      !region.test(body.region) ||
+      !['read_write_many', 'read_write_once', 'read_only_many'].includes(body.access_mode) ||
+      !backendReferenceValid
+    ) {
+      return problem(
+        request,
+        422,
+        'PROTOCOL_INVALID',
+        'Request validation failed',
+        'StorageVolume identity, region and backend reference must be valid',
+        {
+          retryable: false,
+          violations: [
+            { field: 'storage_volume_id', reason: 'must be a valid resource ID' },
+            { field: 'backend_type', reason: 'must match exactly one backend reference' },
+          ],
+        },
+      );
+    }
+
+    const key = resourceKey(body.tenant_id, body.storage_volume_id);
+    const requestJson = stableJson(body);
+    const existing = storageVolumes.find(
+      (item) =>
+        item.tenant_id === body.tenant_id && item.storage_volume_id === body.storage_volume_id,
+    );
+    if (existing) {
+      if (storageVolumeCreatePayloads.get(key) !== requestJson) {
+        return mutationConflict(
+          request,
+          'STORAGE_VOLUME_ID_REUSED',
+          'The StorageVolume ID already belongs to a different registration request',
+        );
+      }
+      const response: CreateStorageVolumeResponse = {
+        storage_volume: existing,
+        replayed: true,
+      };
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+
+    const now = Date.now().toString();
+    const storageVolume: StorageVolumeView = {
+      tenant_id: body.tenant_id,
+      storage_volume_id: body.storage_volume_id,
+      display_name: body.display_name.trim(),
+      edge_cluster_id: body.edge_cluster_id,
+      region: body.region,
+      backend_type: body.backend_type,
+      access_mode: body.access_mode,
+      ...(body.backend_type === 'pvc' && body.pvc_reference
+        ? { pvc_reference: body.pvc_reference }
+        : {}),
+      state: 'ready',
+      resource_version: '1',
+      created_at_unix_ms: now,
+      updated_at_unix_ms: now,
+    };
+    storageVolumes.push(storageVolume);
+    storageVolumeCreatePayloads.set(key, requestJson);
+    const response: CreateStorageVolumeResponse = {
+      storage_volume: storageVolume,
+      replayed: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/project/list/query', async ({ request }) => {
@@ -480,6 +763,77 @@ export const handlers = [
     const response: QueryArtifactResponse = { artifact };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
+  http.post('*/api/artifact/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateArtifactRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    if (
+      !projects.some(
+        (project) => project.tenant_id === body.tenant_id && project.project_id === body.project_id,
+      )
+    ) {
+      return problem(
+        request,
+        404,
+        'PROJECT_NOT_FOUND',
+        'Project not found',
+        'The requested Project was not found',
+      );
+    }
+    const storageVolume = resolveStorageVolume(request, body.tenant_id, body.storage_volume_id);
+    if (storageVolume instanceof HttpResponse) return storageVolume;
+
+    const key = resourceKey(body.tenant_id, body.project_id, body.artifact_id);
+    const requestJson = stableJson(body);
+    const existing = artifacts.find(
+      (artifact) =>
+        artifact.tenant_id === body.tenant_id &&
+        artifact.project_id === body.project_id &&
+        artifact.artifact_id === body.artifact_id,
+    );
+    if (existing) {
+      const priorRequest = artifactCreatePayloads.get(key);
+      const equivalentExisting =
+        existing.display_name === body.display_name.trim() &&
+        existing.description === body.description?.trim() &&
+        existing.storage_volume_id === body.storage_volume_id &&
+        existing.default_ref === (body.default_ref ?? 'refs/heads/main');
+      if (
+        (priorRequest && priorRequest !== requestJson) ||
+        (!priorRequest && !equivalentExisting)
+      ) {
+        return mutationConflict(
+          request,
+          'ARTIFACT_ID_REUSED',
+          'The Artifact ID already belongs to a different create request',
+        );
+      }
+      const response: CreateArtifactResponse = { artifact: existing, replayed: true };
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+
+    const now = Date.now().toString();
+    const artifact = {
+      tenant_id: body.tenant_id,
+      project_id: body.project_id,
+      artifact_id: body.artifact_id,
+      storage_volume_id: storageVolume.storage_volume_id,
+      region: storageVolume.region,
+      display_name: body.display_name.trim(),
+      ...(body.description?.trim() ? { description: body.description.trim() } : {}),
+      default_ref: body.default_ref ?? 'refs/heads/main',
+      resource_version: '1',
+      created_at_unix_ms: now,
+      updated_at_unix_ms: now,
+    };
+    artifacts.push(artifact);
+    commitGraphs.set(key, { graph_version: '0', refs: [], nodes: [] });
+    artifactCreatePayloads.set(key, requestJson);
+    const response: CreateArtifactResponse = { artifact, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
   http.post('*/api/artifact/commit/graph/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
@@ -513,6 +867,67 @@ export const handlers = [
       },
       { headers: headers(request) },
     );
+  }),
+  http.post('*/api/artifact/commit/diff/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as {
+      tenant_id: string;
+      project_id: string;
+      artifact_id: string;
+      commit_id: string;
+      base_commit_id?: string;
+    };
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const graph = commitGraphs.get(resourceKey(body.tenant_id, body.project_id, body.artifact_id));
+    if (!graph) return notFound(request, 'Artifact');
+    const target = graph.nodes.find((node) => node.commit_id === body.commit_id);
+    if (!target) {
+      return problem(
+        request,
+        404,
+        'COMMIT_NOT_FOUND',
+        'Commit not found',
+        'The target Commit was not found in this Artifact',
+      );
+    }
+    const baseCommitId = body.base_commit_id ?? target.parent_commit_id;
+    if (baseCommitId === target.commit_id) {
+      return problem(
+        request,
+        422,
+        'PROTOCOL_INVALID',
+        'Request validation failed',
+        'base_commit_id must differ from commit_id',
+        {
+          retryable: false,
+          violations: [{ field: 'base_commit_id', reason: 'must differ from commit_id' }],
+        },
+      );
+    }
+    const base = baseCommitId
+      ? graph.nodes.find((node) => node.commit_id === baseCommitId)
+      : undefined;
+    if (baseCommitId && !base) {
+      return problem(
+        request,
+        404,
+        'COMMIT_NOT_FOUND',
+        'Commit not found',
+        'The base Commit was not found in this Artifact',
+      );
+    }
+    const changes = mockCommitChanges(target, base);
+    const response: QueryArtifactCommitDiffResponse = {
+      diff: {
+        ...(base ? { base_commit: base } : {}),
+        target_commit: target,
+        summary: diffSummary(changes),
+        changes,
+      },
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/playground/list/query', async ({ request }) => {
     const denied = authorize(request);
@@ -576,6 +991,219 @@ export const handlers = [
     const response: QueryPlaygroundResponse = { playground };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
+  http.post('*/api/playground/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreatePlaygroundRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const artifactKey = resourceKey(body.tenant_id, body.project_id, body.artifact_id);
+    const artifact = artifacts.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id,
+    );
+    const graph = commitGraphs.get(artifactKey);
+    if (!artifact || !graph) return notFound(request, 'Artifact');
+    const storageVolume = resolveStorageVolume(request, body.tenant_id, body.storage_volume_id);
+    if (storageVolume instanceof HttpResponse) return storageVolume;
+    if (
+      body.base_commit_id &&
+      !graph.nodes.some((node) => node.commit_id === body.base_commit_id)
+    ) {
+      return problem(
+        request,
+        404,
+        'COMMIT_NOT_FOUND',
+        'Commit not found',
+        'The requested base Commit was not found',
+      );
+    }
+
+    const key = resourceKey(body.tenant_id, body.project_id, body.artifact_id, body.playground_id);
+    const requestJson = stableJson(body);
+    const existing = playgrounds.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        item.playground_id === body.playground_id,
+    );
+    if (existing) {
+      const priorRequest = playgroundCreatePayloads.get(key);
+      const equivalentExisting =
+        existing.display_name === body.display_name.trim() &&
+        existing.storage_volume_id === body.storage_volume_id &&
+        existing.base_commit_id === body.base_commit_id;
+      if (
+        (priorRequest && priorRequest !== requestJson) ||
+        (!priorRequest && !equivalentExisting)
+      ) {
+        return mutationConflict(
+          request,
+          'PLAYGROUND_ID_REUSED',
+          'The Playground ID already belongs to a different create request',
+        );
+      }
+      const response: CreatePlaygroundResponse = { playground: existing, replayed: true };
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+
+    const defaultHead = graph.refs.find(
+      (refTip) => refTip.name === artifact.default_ref,
+    )?.commit_id;
+    const baseCommitId = body.base_commit_id ?? defaultHead;
+    const now = Date.now().toString();
+    const playground = {
+      tenant_id: body.tenant_id,
+      project_id: body.project_id,
+      artifact_id: body.artifact_id,
+      playground_id: body.playground_id,
+      storage_volume_id: storageVolume.storage_volume_id,
+      region: storageVolume.region,
+      display_name: body.display_name.trim(),
+      ...(baseCommitId ? { base_commit_id: baseCommitId, head_commit_id: baseCommitId } : {}),
+      index_version: { revision: '0', digest: '0'.repeat(64) },
+      state: 'ready' as const,
+      created_at_unix_ms: now,
+      updated_at_unix_ms: now,
+    };
+    playgrounds.push(playground);
+    playgroundCreatePayloads.set(key, requestJson);
+    const response: CreatePlaygroundResponse = { playground, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/playground/commit/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CommitPlaygroundRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+
+    const requestKey = resourceKey(body.tenant_id, body.commit_request_id);
+    const requestJson = stableJson(body);
+    const previous = commitRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'COMMIT_REQUEST_ID_REUSED',
+          'The Commit request ID already belongs to a different request',
+        );
+      }
+      const response = structuredClone(previous.response);
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+
+    const playground = playgrounds.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        item.playground_id === body.playground_id,
+    );
+    if (!playground) return notFound(request, 'Playground');
+    if (playground.state !== 'ready') {
+      return mutationConflict(
+        request,
+        'PLAYGROUND_NOT_READY',
+        'The Playground is not ready to create a Commit',
+      );
+    }
+    if (
+      playground.index_version.revision !== body.expected_index_version.revision ||
+      playground.index_version.digest !== body.expected_index_version.digest
+    ) {
+      return mutationConflict(
+        request,
+        'INDEX_VERSION_CONFLICT',
+        'The expected IndexVersion no longer matches the Playground',
+      );
+    }
+    if (!body.message.trim()) {
+      return problem(
+        request,
+        422,
+        'PROTOCOL_INVALID',
+        'Request validation failed',
+        'Commit message must not be empty',
+        {
+          retryable: false,
+          violations: [{ field: 'message', reason: 'must not be empty' }],
+        },
+      );
+    }
+    const tagNames = (body.tag_names ?? []).map((tagName) => tagName.trim());
+    const tagPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+    if (
+      tagNames.length > 20 ||
+      new Set(tagNames).size !== tagNames.length ||
+      tagNames.some((tagName) => !tagPattern.test(tagName) || tagName.startsWith('refs/'))
+    ) {
+      return problem(
+        request,
+        422,
+        'PROTOCOL_INVALID',
+        'Request validation failed',
+        'Tag names must be unique valid names without a refs/ prefix',
+        {
+          retryable: false,
+          violations: [{ field: 'tag_names', reason: 'contains an invalid or duplicate Tag name' }],
+        },
+      );
+    }
+
+    const artifactKey = resourceKey(body.tenant_id, body.project_id, body.artifact_id);
+    const artifact = artifacts.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id,
+    );
+    const graph = commitGraphs.get(artifactKey);
+    if (!artifact || !graph) return notFound(request, 'Artifact');
+    const tagRefs = tagNames.map((tagName) => `refs/tags/${tagName}`);
+    const conflictingTag = tagRefs.find((tagRef) =>
+      graph.refs.some((refTip) => refTip.name === tagRef),
+    );
+    if (conflictingTag) {
+      return mutationConflict(
+        request,
+        'TAG_ALREADY_EXISTS',
+        `The Tag ${conflictingTag.replace('refs/tags/', '')} already points to another Commit`,
+      );
+    }
+
+    const now = Date.now().toString();
+    const defaultRef = artifact.default_ref;
+    for (const node of graph.nodes) {
+      node.ref_names = node.ref_names.filter((name) => name !== defaultRef);
+    }
+    const commit = {
+      commit_id: `commit-${fingerprint({ request: body, at: now })}`,
+      ...(playground.head_commit_id ? { parent_commit_id: playground.head_commit_id } : {}),
+      message: body.message.trim(),
+      ...(body.description?.trim() ? { description: body.description.trim() } : {}),
+      ref_names: [defaultRef, ...tagRefs],
+      created_at_unix_ms: now,
+    };
+    graph.nodes.unshift(commit);
+    const refTip = graph.refs.find((candidate) => candidate.name === defaultRef);
+    if (refTip) refTip.commit_id = commit.commit_id;
+    else graph.refs.push({ name: defaultRef, commit_id: commit.commit_id });
+    for (const tagRef of tagRefs) graph.refs.push({ name: tagRef, commit_id: commit.commit_id });
+    graph.graph_version = (BigInt(graph.graph_version) + 1n).toString();
+    artifact.resource_version = (BigInt(artifact.resource_version) + 1n).toString();
+    artifact.updated_at_unix_ms = now;
+    playground.head_commit_id = commit.commit_id;
+    playground.updated_at_unix_ms = now;
+
+    const response: CommitPlaygroundResponse = { commit, playground, replayed: false };
+    commitRequests.set(requestKey, { requestJson, response: structuredClone(response) });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
   http.post('*/api/snapshot/list/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
@@ -631,6 +1259,60 @@ export const handlers = [
     );
     if (!snapshot) return notFound(request, 'Snapshot');
     const response: QuerySnapshotResponse = { snapshot };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/snapshot/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateSnapshotRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const existing = snapshots.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        item.commit_id === body.commit_id,
+    );
+    if (existing) {
+      if (existing.storage_volume_id !== body.storage_volume_id) {
+        return mutationConflict(
+          request,
+          'SNAPSHOT_PLACEMENT_CONFLICT',
+          'The Snapshot already exists on a different StorageVolume',
+        );
+      }
+      const response: CreateSnapshotResponse = { snapshot: existing, replayed: true };
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+
+    const storageVolume = resolveStorageVolume(request, body.tenant_id, body.storage_volume_id);
+    if (storageVolume instanceof HttpResponse) return storageVolume;
+
+    const graph = commitGraphs.get(resourceKey(body.tenant_id, body.project_id, body.artifact_id));
+    const commit = graph?.nodes.find((node) => node.commit_id === body.commit_id);
+    if (!commit) {
+      return problem(
+        request,
+        404,
+        'COMMIT_NOT_FOUND',
+        'Commit not found',
+        'The requested Commit was not found',
+      );
+    }
+    const snapshot = {
+      tenant_id: body.tenant_id,
+      project_id: body.project_id,
+      artifact_id: body.artifact_id,
+      commit_id: commit.commit_id,
+      storage_volume_id: storageVolume.storage_volume_id,
+      region: storageVolume.region,
+      message: commit.message,
+      ref_names: [...commit.ref_names],
+      created_at_unix_ms: commit.created_at_unix_ms,
+    };
+    snapshots.unshift(snapshot);
+    const response: CreateSnapshotResponse = { snapshot, replayed: false };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/job/add/create', async ({ request }) => {
@@ -751,5 +1433,9 @@ export function resetMockJobs(): void {
 export function resetMockState(): void {
   jobs.clear();
   tenantCreatePayloads.clear();
-  tenants.splice(2);
+  storageVolumeCreatePayloads.clear();
+  artifactCreatePayloads.clear();
+  playgroundCreatePayloads.clear();
+  commitRequests.clear();
+  resetMockData();
 }

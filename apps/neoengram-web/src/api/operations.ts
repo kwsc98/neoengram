@@ -2,13 +2,24 @@ import { apiClient } from './client';
 import { toApiProblem } from './problem';
 import type {
   ApiVersionResponse,
+  CommitPlaygroundRequest,
+  CommitPlaygroundResponse,
   CreateAddJobRequest,
   CreateAddJobResponse,
+  CreateArtifactRequest,
+  CreateArtifactResponse,
+  CreatePlaygroundRequest,
+  CreatePlaygroundResponse,
+  CreateSnapshotRequest,
+  CreateSnapshotResponse,
+  CreateStorageVolumeRequest,
+  CreateStorageVolumeResponse,
   FinalizeAddJobResponse,
   HealthResponse,
   CreateTenantRequest,
   CreateTenantResponse,
   QueryArtifactCommitGraphResponse,
+  QueryArtifactCommitDiffResponse,
   QueryArtifactListRequest,
   QueryArtifactListResponse,
   QueryArtifactResponse,
@@ -20,6 +31,9 @@ import type {
   QuerySnapshotListRequest,
   QuerySnapshotListResponse,
   QuerySnapshotResponse,
+  QueryStorageVolumeListRequest,
+  QueryStorageVolumeListResponse,
+  QueryStorageVolumeResponse,
   QueryTenantListRequest,
   QueryTenantListResponse,
   QueryTenantResponse,
@@ -78,6 +92,40 @@ export async function createTenant(
   );
 }
 
+export async function queryStorageVolumeList(
+  request: QueryStorageVolumeListRequest,
+): Promise<ApiResult<QueryStorageVolumeListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/storage/volume/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryStorageVolume(
+  tenantId: string,
+  storageVolumeId: string,
+): Promise<ApiResult<QueryStorageVolumeResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/storage/volume/query', {
+      body: { tenant_id: tenantId, storage_volume_id: storageVolumeId },
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function createStorageVolume(
+  request: CreateStorageVolumeRequest,
+): Promise<ApiResult<CreateStorageVolumeResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/storage/volume/create', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
 export async function queryProjectList(
   request: QueryProjectListRequest,
 ): Promise<ApiResult<QueryProjectListResponse>> {
@@ -107,6 +155,14 @@ export async function queryArtifact(
   );
 }
 
+export async function createArtifact(
+  request: CreateArtifactRequest,
+): Promise<ApiResult<CreateArtifactResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/artifact/create', { body: request, params: versionHeader }),
+  );
+}
+
 export async function queryArtifactCommitGraph(
   tenantId: string,
   projectId: string,
@@ -121,6 +177,27 @@ export async function queryArtifactCommitGraph(
         artifact_id: artifactId,
         page_size: 50,
         ...(cursor ? { cursor } : {}),
+      },
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryArtifactCommitDiff(
+  tenantId: string,
+  projectId: string,
+  artifactId: string,
+  commitId: string,
+  baseCommitId?: string,
+): Promise<ApiResult<QueryArtifactCommitDiffResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/artifact/commit/diff/query', {
+      body: {
+        tenant_id: tenantId,
+        project_id: projectId,
+        artifact_id: artifactId,
+        commit_id: commitId,
+        ...(baseCommitId ? { base_commit_id: baseCommitId } : {}),
       },
       params: versionHeader,
     }),
@@ -154,6 +231,25 @@ export async function queryPlayground(
   );
 }
 
+export async function createPlayground(
+  request: CreatePlaygroundRequest,
+): Promise<ApiResult<CreatePlaygroundResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/create', { body: request, params: versionHeader }),
+  );
+}
+
+export async function commitPlayground(
+  request: CommitPlaygroundRequest,
+): Promise<ApiResult<CommitPlaygroundResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/commit/create', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
 export async function querySnapshotList(
   request: QuerySnapshotListRequest,
 ): Promise<ApiResult<QuerySnapshotListResponse>> {
@@ -178,6 +274,14 @@ export async function querySnapshot(
       },
       params: versionHeader,
     }),
+  );
+}
+
+export async function createSnapshot(
+  request: CreateSnapshotRequest,
+): Promise<ApiResult<CreateSnapshotResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/snapshot/create', { body: request, params: versionHeader }),
   );
 }
 

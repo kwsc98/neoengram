@@ -1,11 +1,15 @@
 <script setup lang="ts">
-import { ArrowRight, RefreshRight } from '@element-plus/icons-vue';
-import { useQuery } from '@tanstack/vue-query';
-import { computed, ref, watch } from 'vue';
+import { ArrowRight, DocumentCopy, Files, Plus, RefreshRight } from '@element-plus/icons-vue';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
+import { ElMessage } from 'element-plus';
+import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import {
+  createPlayground,
+  createSnapshot,
   queryArtifact,
+  queryArtifactCommitDiff,
   queryArtifactCommitGraph,
   queryPlaygroundList,
   querySnapshotList,
@@ -13,10 +17,14 @@ import {
 import type { CommitNode } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
+import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
+import { useTenantsStore } from '@/stores/tenants';
 import { formatBytes, formatCount, formatTime, shortId } from '@/utils/format';
 
 const route = useRoute();
 const router = useRouter();
+const queryClient = useQueryClient();
+const tenants = useTenantsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
 const projectId = computed(() => String(route.params.projectId ?? ''));
 const artifactId = computed(() => String(route.params.artifactId ?? ''));
@@ -26,6 +34,26 @@ const activeTab = ref(allowedTabs.includes(initialTab) ? initialTab : 'overview'
 const commitNodes = ref<CommitNode[]>([]);
 const nextCommitCursor = ref<string>();
 const loadingMoreCommits = ref(false);
+const selectedCommitId = ref(String(route.query.commit_id ?? ''));
+const commitDetailOpen = ref(Boolean(selectedCommitId.value));
+const createPlaygroundOpen = ref(false);
+const createSnapshotOpen = ref(false);
+const mutationError = ref('');
+const playgroundForm = reactive({
+  playgroundId: '',
+  displayName: '',
+  baseCommitId: '',
+  storageVolumeId: '',
+});
+const snapshotForm = reactive({ commitId: '', storageVolumeId: '' });
+const canCreatePlayground = computed(
+  () => tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false,
+);
+const canCreateSnapshot = computed(
+  () => tenants.byId(tenantId.value)?.permissions.includes('snapshot.create') ?? false,
+);
+const createPlaygroundMutation = useMutation({ mutationFn: createPlayground });
+const createSnapshotMutation = useMutation({ mutationFn: createSnapshot });
 
 const artifactQuery = useQuery({
   queryKey: computed(() => ['artifact', tenantId.value, projectId.value, artifactId.value]),
@@ -38,6 +66,24 @@ const commitQuery = useQuery({
   queryFn: () => queryArtifactCommitGraph(tenantId.value, projectId.value, artifactId.value),
   enabled: computed(() => activeTab.value === 'commits'),
 });
+const commitDiffQuery = useQuery({
+  queryKey: computed(() => [
+    'artifact-commit-diff',
+    tenantId.value,
+    projectId.value,
+    artifactId.value,
+    selectedCommitId.value,
+  ]),
+  queryFn: () =>
+    queryArtifactCommitDiff(
+      tenantId.value,
+      projectId.value,
+      artifactId.value,
+      selectedCommitId.value,
+    ),
+  enabled: computed(() => commitDetailOpen.value && Boolean(selectedCommitId.value)),
+});
+const commitDiff = computed(() => commitDiffQuery.data.value?.data.diff);
 const playgroundQuery = useQuery({
   queryKey: computed(() => [
     'playgrounds',
@@ -91,9 +137,42 @@ watch(
   },
 );
 
+watch(
+  () => route.query.commit_id,
+  (commitId) => {
+    selectedCommitId.value = String(commitId ?? '');
+    commitDetailOpen.value = Boolean(selectedCommitId.value);
+  },
+);
+
 async function changeTab(tab: string | number): Promise<void> {
   const value = String(tab);
   await router.replace({ query: value === 'overview' ? {} : { tab: value } });
+}
+
+async function showCommitDetail(commitId: string): Promise<void> {
+  selectedCommitId.value = commitId;
+  commitDetailOpen.value = true;
+  await router.replace({ query: { tab: 'commits', commit_id: commitId } });
+}
+
+async function closeCommitDetail(): Promise<void> {
+  if (!route.query.commit_id) return;
+  await router.replace({ query: { tab: 'commits' } });
+}
+
+function diffTypeLabel(changeType: string): string {
+  return (
+    { added: '新增', modified: '修改', deleted: '删除', renamed: '重命名' }[changeType] ??
+    changeType
+  );
+}
+
+function diffTagType(changeType: string): 'success' | 'warning' | 'danger' | 'info' {
+  if (changeType === 'added') return 'success';
+  if (changeType === 'modified') return 'warning';
+  if (changeType === 'deleted') return 'danger';
+  return 'info';
 }
 
 async function loadMoreCommits(): Promise<void> {
@@ -136,6 +215,89 @@ async function openSnapshot(commitId: string): Promise<void> {
     },
   });
 }
+
+async function loadCommitChoices(): Promise<void> {
+  const result = await queryArtifactCommitGraph(tenantId.value, projectId.value, artifactId.value);
+  commitNodes.value = [...result.data.graph.nodes];
+  nextCommitCursor.value = result.data.graph.next_cursor;
+}
+
+async function showCreatePlayground(): Promise<void> {
+  mutationError.value = '';
+  playgroundForm.playgroundId = '';
+  playgroundForm.displayName = '';
+  playgroundForm.storageVolumeId = artifact.value?.storage_volume_id ?? '';
+  await loadCommitChoices();
+  playgroundForm.baseCommitId =
+    commitNodes.value.find((node) => node.ref_names.includes(artifact.value?.default_ref ?? ''))
+      ?.commit_id ?? '';
+  createPlaygroundOpen.value = true;
+}
+
+async function submitPlayground(): Promise<void> {
+  mutationError.value = '';
+  const resourceId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+  if (
+    !resourceId.test(playgroundForm.playgroundId) ||
+    !playgroundForm.displayName.trim() ||
+    !playgroundForm.storageVolumeId
+  ) {
+    mutationError.value = '请输入合法 Playground ID、名称并选择 StorageVolume';
+    return;
+  }
+  try {
+    const result = await createPlaygroundMutation.mutateAsync({
+      tenant_id: tenantId.value,
+      project_id: projectId.value,
+      artifact_id: artifactId.value,
+      playground_id: playgroundForm.playgroundId,
+      storage_volume_id: playgroundForm.storageVolumeId,
+      display_name: playgroundForm.displayName.trim(),
+      ...(playgroundForm.baseCommitId ? { base_commit_id: playgroundForm.baseCommitId } : {}),
+    });
+    createPlaygroundOpen.value = false;
+    await queryClient.invalidateQueries({ queryKey: ['playgrounds', tenantId.value] });
+    ElMessage.success(result.data.replayed ? '已返回现有 Playground' : 'Playground 已创建');
+    await openPlayground(result.data.playground.playground_id);
+  } catch (error) {
+    mutationError.value = error instanceof Error ? error.message : '创建 Playground 失败';
+  }
+}
+
+async function showCreateSnapshot(): Promise<void> {
+  mutationError.value = '';
+  snapshotForm.storageVolumeId = artifact.value?.storage_volume_id ?? '';
+  await loadCommitChoices();
+  snapshotForm.commitId =
+    commitNodes.value.find((node) => node.ref_names.includes(artifact.value?.default_ref ?? ''))
+      ?.commit_id ??
+    commitNodes.value[0]?.commit_id ??
+    '';
+  createSnapshotOpen.value = true;
+}
+
+async function submitSnapshot(): Promise<void> {
+  mutationError.value = '';
+  if (!snapshotForm.commitId || !snapshotForm.storageVolumeId) {
+    mutationError.value = '请选择 Commit 和 StorageVolume';
+    return;
+  }
+  try {
+    const result = await createSnapshotMutation.mutateAsync({
+      tenant_id: tenantId.value,
+      project_id: projectId.value,
+      artifact_id: artifactId.value,
+      commit_id: snapshotForm.commitId,
+      storage_volume_id: snapshotForm.storageVolumeId,
+    });
+    createSnapshotOpen.value = false;
+    await queryClient.invalidateQueries({ queryKey: ['snapshots', tenantId.value] });
+    ElMessage.success(result.data.replayed ? '该 Commit 已有 Snapshot' : 'Snapshot 已创建');
+    await openSnapshot(result.data.snapshot.commit_id);
+  } catch (error) {
+    mutationError.value = error instanceof Error ? error.message : '创建 Snapshot 失败';
+  }
+}
 </script>
 
 <template>
@@ -145,6 +307,17 @@ async function openSnapshot(commitId: string): Promise<void> {
       :description="`${projectId} / ${artifactId}`"
     >
       <template #actions>
+        <el-button v-if="canCreatePlayground" :icon="Plus" @click="showCreatePlayground">
+          创建 Playground
+        </el-button>
+        <el-button
+          v-if="canCreateSnapshot"
+          type="primary"
+          :icon="DocumentCopy"
+          @click="showCreateSnapshot"
+        >
+          创建 Snapshot
+        </el-button>
         <el-button
           :icon="RefreshRight"
           :loading="artifactQuery.isFetching.value"
@@ -178,6 +351,16 @@ async function openSnapshot(commitId: string): Promise<void> {
               <dt>Artifact ID</dt>
               <dd>
                 <code>{{ artifact.artifact_id }}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>Region</dt>
+              <dd>{{ artifact.region }}</dd>
+            </div>
+            <div>
+              <dt>StorageVolume</dt>
+              <dd>
+                <code>{{ artifact.storage_volume_id }}</code>
               </dd>
             </div>
             <div>
@@ -230,8 +413,21 @@ async function openSnapshot(commitId: string): Promise<void> {
                 <div class="commit-node__body">
                   <div class="commit-node__heading">
                     <strong>{{ node.message }}</strong>
-                    <time>{{ formatTime(node.created_at_unix_ms) }}</time>
+                    <span class="commit-node__actions">
+                      <time>{{ formatTime(node.created_at_unix_ms) }}</time>
+                      <el-button
+                        text
+                        type="primary"
+                        :icon="Files"
+                        @click="showCommitDetail(node.commit_id)"
+                      >
+                        详情与 Diff
+                      </el-button>
+                    </span>
                   </div>
+                  <p v-if="node.description" class="commit-node__description">
+                    {{ node.description }}
+                  </p>
                   <div class="commit-node__meta">
                     <code>{{ node.commit_id }}</code>
                     <span v-if="node.parent_commit_id">
@@ -278,6 +474,7 @@ async function openSnapshot(commitId: string): Promise<void> {
                 <code>{{ playground.playground_id }}</code>
               </span>
               <span class="relation-list__aside">
+                <small>{{ playground.region }}</small>
                 <el-tag effect="plain">{{ playground.state }}</el-tag
                 ><ArrowRight />
               </span>
@@ -310,7 +507,7 @@ async function openSnapshot(commitId: string): Promise<void> {
               </span>
               <span class="relation-list__aside">
                 <small>
-                  {{ formatCount(snapshot.logical_file_count) }} files ·
+                  {{ snapshot.region }} · {{ formatCount(snapshot.logical_file_count) }} files ·
                   {{ formatBytes(snapshot.logical_size_bytes) }}
                 </small>
                 <ArrowRight />
@@ -324,5 +521,226 @@ async function openSnapshot(commitId: string): Promise<void> {
     <div v-else-if="artifactQuery.isPending.value" class="page-loading">
       <el-skeleton :rows="8" animated />
     </div>
+
+    <el-dialog
+      v-model="createPlaygroundOpen"
+      title="创建 Playground"
+      width="min(560px, calc(100vw - 32px))"
+    >
+      <ApiProblemAlert
+        v-if="createPlaygroundMutation.error.value"
+        :error="createPlaygroundMutation.error.value"
+      />
+      <el-alert v-if="mutationError" :title="mutationError" type="error" :closable="false" />
+      <el-form label-position="top" class="dialog-form">
+        <el-form-item label="Playground ID">
+          <el-input v-model="playgroundForm.playgroundId" placeholder="review-july" />
+        </el-form-item>
+        <el-form-item label="名称">
+          <el-input v-model="playgroundForm.displayName" placeholder="七月复核" />
+        </el-form-item>
+        <el-form-item label="StorageVolume" required>
+          <StorageVolumeFilter v-model="playgroundForm.storageVolumeId" :tenant-id="tenantId" />
+        </el-form-item>
+        <el-form-item label="Base Commit">
+          <el-select v-model="playgroundForm.baseCommitId" clearable placeholder="空 Playground">
+            <el-option
+              v-for="node in commitNodes"
+              :key="node.commit_id"
+              :label="`${node.message} · ${shortId(node.commit_id, 14)}`"
+              :value="node.commit_id"
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="createPlaygroundOpen = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="createPlaygroundMutation.isPending.value"
+          @click="submitPlayground"
+        >
+          创建 Playground
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="createSnapshotOpen"
+      title="创建 Snapshot"
+      width="min(560px, calc(100vw - 32px))"
+    >
+      <ApiProblemAlert
+        v-if="createSnapshotMutation.error.value"
+        :error="createSnapshotMutation.error.value"
+      />
+      <el-alert v-if="mutationError" :title="mutationError" type="error" :closable="false" />
+      <el-form label-position="top" class="dialog-form">
+        <el-form-item label="StorageVolume" required>
+          <StorageVolumeFilter v-model="snapshotForm.storageVolumeId" :tenant-id="tenantId" />
+        </el-form-item>
+        <el-form-item label="固定到 Commit">
+          <el-select v-model="snapshotForm.commitId" placeholder="选择 Commit">
+            <el-option
+              v-for="node in commitNodes"
+              :key="node.commit_id"
+              :label="`${node.message} · ${shortId(node.commit_id, 14)}`"
+              :value="node.commit_id"
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="createSnapshotOpen = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="createSnapshotMutation.isPending.value"
+          @click="submitSnapshot"
+        >
+          创建 Snapshot
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-drawer
+      v-model="commitDetailOpen"
+      title="Commit 详情"
+      size="min(720px, 100vw)"
+      @closed="closeCommitDetail"
+    >
+      <ApiProblemAlert
+        v-if="commitDiffQuery.error.value"
+        :error="commitDiffQuery.error.value"
+        :retrying="commitDiffQuery.isFetching.value"
+        @retry="commitDiffQuery.refetch"
+      />
+      <el-skeleton v-if="commitDiffQuery.isPending.value" :rows="10" animated />
+      <template v-else-if="commitDiff">
+        <section class="commit-detail-section">
+          <div class="section-heading section-heading--inline">
+            <div>
+              <h2>{{ commitDiff.target_commit.message }}</h2>
+              <code>{{ commitDiff.target_commit.commit_id }}</code>
+            </div>
+          </div>
+          <dl class="definition-grid definition-grid--scope">
+            <div>
+              <dt>创建时间</dt>
+              <dd>{{ formatTime(commitDiff.target_commit.created_at_unix_ms) }}</dd>
+            </div>
+            <div>
+              <dt>Parent</dt>
+              <dd>
+                <code>{{ commitDiff.target_commit.parent_commit_id ?? '—' }}</code>
+              </dd>
+            </div>
+            <div class="definition-grid__wide">
+              <dt>Refs / Tags</dt>
+              <dd class="tag-list">
+                <el-tag
+                  v-for="name in commitDiff.target_commit.ref_names"
+                  :key="name"
+                  effect="plain"
+                >
+                  {{ name.replace('refs/heads/', '').replace('refs/tags/', 'tag:') }}
+                </el-tag>
+                <span v-if="commitDiff.target_commit.ref_names.length === 0">—</span>
+              </dd>
+            </div>
+            <div class="definition-grid__wide">
+              <dt>详细描述</dt>
+              <dd>{{ commitDiff.target_commit.description ?? '—' }}</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="commit-detail-section commit-parent-section">
+          <div class="section-heading section-heading--inline">
+            <div>
+              <h2>父 Commit</h2>
+              <p v-if="commitDiff.base_commit">{{ commitDiff.base_commit.message }}</p>
+              <p v-else>根 Commit，无父版本</p>
+            </div>
+            <el-button
+              v-if="commitDiff.base_commit"
+              text
+              type="primary"
+              :icon="ArrowRight"
+              @click="showCommitDetail(commitDiff.base_commit.commit_id)"
+            >
+              查看父 Commit
+            </el-button>
+          </div>
+          <dl v-if="commitDiff.base_commit" class="definition-grid definition-grid--scope">
+            <div>
+              <dt>Commit ID</dt>
+              <dd>
+                <code>{{ commitDiff.base_commit.commit_id }}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>创建时间</dt>
+              <dd>{{ formatTime(commitDiff.base_commit.created_at_unix_ms) }}</dd>
+            </div>
+            <div class="definition-grid__wide">
+              <dt>Refs / Tags</dt>
+              <dd class="tag-list">
+                <el-tag v-for="name in commitDiff.base_commit.ref_names" :key="name" effect="plain">
+                  {{ name.replace('refs/heads/', '').replace('refs/tags/', 'tag:') }}
+                </el-tag>
+                <span v-if="commitDiff.base_commit.ref_names.length === 0">—</span>
+              </dd>
+            </div>
+            <div class="definition-grid__wide">
+              <dt>详细描述</dt>
+              <dd>{{ commitDiff.base_commit.description ?? '—' }}</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="commit-detail-section">
+          <div class="section-heading">
+            <h2>文件 Diff</h2>
+          </div>
+          <div class="diff-summary">
+            <div>
+              <span>新增</span><strong>{{ formatCount(commitDiff.summary.files_added) }}</strong>
+            </div>
+            <div>
+              <span>修改</span><strong>{{ formatCount(commitDiff.summary.files_modified) }}</strong>
+            </div>
+            <div>
+              <span>删除</span><strong>{{ formatCount(commitDiff.summary.files_deleted) }}</strong>
+            </div>
+            <div>
+              <span>重命名</span
+              ><strong>{{ formatCount(commitDiff.summary.files_renamed) }}</strong>
+            </div>
+            <div>
+              <span>新增数据</span
+              ><strong>{{ formatBytes(commitDiff.summary.bytes_added) }}</strong>
+            </div>
+            <div>
+              <span>移除数据</span
+              ><strong>{{ formatBytes(commitDiff.summary.bytes_removed) }}</strong>
+            </div>
+          </div>
+          <div class="diff-list">
+            <div v-for="change in commitDiff.changes" :key="`${change.change_type}:${change.path}`">
+              <el-tag :type="diffTagType(change.change_type)" effect="plain">
+                {{ diffTypeLabel(change.change_type) }}
+              </el-tag>
+              <span class="diff-list__path">
+                <code>{{ change.path }}</code>
+                <small v-if="change.previous_path">原路径 {{ change.previous_path }}</small>
+              </span>
+              <span class="diff-list__size">
+                {{ formatBytes(change.old_size_bytes) }} → {{ formatBytes(change.new_size_bytes) }}
+              </span>
+            </div>
+          </div>
+        </section>
+      </template>
+    </el-drawer>
   </div>
 </template>

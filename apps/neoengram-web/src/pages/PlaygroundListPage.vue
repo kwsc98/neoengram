@@ -158,6 +158,14 @@ async function openPlayground(
           </el-table-column>
           <el-table-column prop="project_id" label="Project" min-width="150" />
           <el-table-column prop="artifact_id" label="Artifact" min-width="160" />
+          <el-table-column label="放置" min-width="190">
+            <template #default="scope">
+              <div class="table-placement">
+                <strong>{{ scope.row.region }}</strong>
+                <code>{{ scope.row.storage_volume_id }}</code>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column label="状态" width="110">
             <template #default="scope"
               ><el-tag effect="plain">{{ scope.row.state }}</el-tag></template
@@ -202,6 +210,7 @@ async function openPlayground(
               ><code>{{ playground.playground_id }}</code></span
             >
             <span
+              ><small>{{ playground.region }}</small
               ><el-tag size="small" effect="plain">{{ playground.state }}</el-tag
               ><ArrowRight
             /></span>

@@ -193,14 +193,22 @@ for path in \
   /api/tenant/list/query \
   /api/tenant/query \
   /api/tenant/create \
+  /api/storage/volume/list/query \
+  /api/storage/volume/query \
+  /api/storage/volume/create \
   /api/project/list/query \
   /api/artifact/list/query \
   /api/artifact/query \
+  /api/artifact/create \
   /api/artifact/commit/graph/query \
+  /api/artifact/commit/diff/query \
   /api/playground/list/query \
   /api/playground/query \
+  /api/playground/create \
+  /api/playground/commit/create \
   /api/snapshot/list/query \
   /api/snapshot/query \
+  /api/snapshot/create \
   /api/job/add/create \
   /api/job/query \
   /api/job/add/finalize \
@@ -216,9 +224,9 @@ done
 rg -q '^    ApiVersion:$' "$openapi" || fail "the API version header is not defined"
 rg -q '^    BearerAuth:$' "$openapi" || fail "the public Bearer security scheme is not defined"
 rg -q '^    ProblemDetails:$' "$openapi" || fail "RFC 9457 Problem Details is not defined"
-[[ "$(rg -c "#\/components\/parameters\/ApiVersion'" "$openapi")" == 14 ]] || \
+[[ "$(rg -c "#\/components\/parameters\/ApiVersion'" "$openapi")" == 22 ]] || \
   fail "every public business method must require the API version header"
-[[ "$(rg -c 'BearerAuth: \[\]' "$openapi")" == 14 ]] || \
+[[ "$(rg -c 'BearerAuth: \[\]' "$openapi")" == 22 ]] || \
   fail "every public business method must require Bearer authentication"
 
 terminal_output="$({
