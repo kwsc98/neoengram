@@ -42,6 +42,7 @@ import type {
   StorageVolumeView,
   TenantView,
 } from '@/api/types';
+import { LOGICAL_ARTIFACT_STORAGE_COMPAT_ID } from '@/features/artifacts/prototype';
 
 import {
   artifacts,
@@ -782,8 +783,16 @@ export const handlers = [
         'The requested Project was not found',
       );
     }
-    const storageVolume = resolveStorageVolume(request, body.tenant_id, body.storage_volume_id);
-    if (storageVolume instanceof HttpResponse) return storageVolume;
+    let storageVolume: StorageVolumeView | undefined;
+    if (body.storage_volume_id !== LOGICAL_ARTIFACT_STORAGE_COMPAT_ID) {
+      const resolvedStorageVolume = resolveStorageVolume(
+        request,
+        body.tenant_id,
+        body.storage_volume_id,
+      );
+      if (resolvedStorageVolume instanceof HttpResponse) return resolvedStorageVolume;
+      storageVolume = resolvedStorageVolume;
+    }
 
     const key = resourceKey(body.tenant_id, body.project_id, body.artifact_id);
     const requestJson = stableJson(body);
@@ -798,7 +807,7 @@ export const handlers = [
       const equivalentExisting =
         existing.display_name === body.display_name.trim() &&
         existing.description === body.description?.trim() &&
-        existing.storage_volume_id === body.storage_volume_id &&
+        existing.storage_volume_id === (storageVolume?.storage_volume_id ?? '') &&
         existing.default_ref === (body.default_ref ?? 'refs/heads/main');
       if (
         (priorRequest && priorRequest !== requestJson) ||
@@ -819,8 +828,8 @@ export const handlers = [
       tenant_id: body.tenant_id,
       project_id: body.project_id,
       artifact_id: body.artifact_id,
-      storage_volume_id: storageVolume.storage_volume_id,
-      region: storageVolume.region,
+      storage_volume_id: storageVolume?.storage_volume_id ?? '',
+      region: storageVolume?.region ?? '',
       display_name: body.display_name.trim(),
       ...(body.description?.trim() ? { description: body.description.trim() } : {}),
       default_ref: body.default_ref ?? 'refs/heads/main',

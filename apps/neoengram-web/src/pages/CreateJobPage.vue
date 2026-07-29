@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { CirclePlus, RefreshLeft } from '@element-plus/icons-vue';
+import { Back, CirclePlus, RefreshLeft } from '@element-plus/icons-vue';
 import { useMutation } from '@tanstack/vue-query';
 import { ElMessage } from 'element-plus';
 import { computed, reactive } from 'vue';
@@ -16,10 +16,18 @@ const route = useRoute();
 const router = useRouter();
 const recentJobs = useRecentJobsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
+const sourcePlayground = computed(() => ({
+  projectId: String(route.query.project_id ?? ''),
+  artifactId: String(route.query.artifact_id ?? ''),
+  playgroundId: String(route.query.playground_id ?? ''),
+}));
+const hasSourcePlayground = computed(() =>
+  Object.values(sourcePlayground.value).every((value) => Boolean(value)),
+);
 const form = reactive({
-  projectId: 'project-vision',
-  artifactId: 'road-scenes',
-  playgroundId: 'labeling',
+  projectId: sourcePlayground.value.projectId || 'project-vision',
+  artifactId: sourcePlayground.value.artifactId || 'road-scenes',
+  playgroundId: sourcePlayground.value.playgroundId || 'labeling',
   jobId: `job-${globalThis.crypto.randomUUID()}`,
   revision: '0',
   digest: 'a'.repeat(64),
@@ -37,6 +45,19 @@ function clearErrors(): void {
 
 function resetJobId(): void {
   form.jobId = `job-${globalThis.crypto.randomUUID()}`;
+}
+
+async function backToPlayground(): Promise<void> {
+  if (!hasSourcePlayground.value) return;
+  await router.push({
+    name: 'playground-detail',
+    params: {
+      tenantId: tenantId.value,
+      projectId: sourcePlayground.value.projectId,
+      artifactId: sourcePlayground.value.artifactId,
+      playgroundId: sourcePlayground.value.playgroundId,
+    },
+  });
 }
 
 async function submit(): Promise<void> {
@@ -78,7 +99,11 @@ async function submit(): Promise<void> {
 
 <template>
   <div class="page page--narrow">
-    <PageHeading title="创建 Add Job" :description="`当前租户：${tenantId}`" />
+    <PageHeading title="扫描 Playground 变更" :description="`当前租户：${tenantId}`">
+      <template v-if="hasSourcePlayground" #actions>
+        <el-button :icon="Back" @click="backToPlayground">返回 Playground</el-button>
+      </template>
+    </PageHeading>
 
     <ApiProblemAlert
       v-if="mutation.error.value"
@@ -91,8 +116,8 @@ async function submit(): Promise<void> {
       <section class="form-section">
         <div class="section-heading">
           <div>
-            <h2>资源范围</h2>
-            <p>Tenant 由当前路由固定，只声明其下的 Project、Artifact 与 Playground</p>
+            <h2>扫描范围</h2>
+            <p>系统将读取该 Playground 的当前文件状态并生成新的 IndexVersion</p>
           </div>
         </div>
         <div class="form-grid form-grid--two">
@@ -111,8 +136,8 @@ async function submit(): Promise<void> {
       <section class="form-section">
         <div class="section-heading">
           <div>
-            <h2>Job 与版本条件</h2>
-            <p>稳定 Job identity、expected IndexVersion 和 deadline</p>
+            <h2>一致性条件</h2>
+            <p>扫描只会在当前 IndexVersion 未发生变化时发布结果</p>
           </div>
         </div>
         <div class="form-grid form-grid--two">
@@ -162,7 +187,7 @@ async function submit(): Promise<void> {
           :icon="CirclePlus"
           :loading="mutation.isPending.value"
         >
-          创建 Job
+          开始扫描
         </el-button>
       </div>
     </form>

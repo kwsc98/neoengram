@@ -9,6 +9,12 @@ import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
+import {
+  activePreCommitLabel,
+  getActivePreCommit,
+  playgroundAvailabilityLabel,
+  preCommitScopeKey,
+} from '@/features/precommit/prototype';
 import { formatTime } from '@/utils/format';
 
 const route = useRoute();
@@ -94,11 +100,15 @@ async function openPlayground(
     },
   });
 }
+
+function rowPreCommitKey(project: string, artifact: string, playground: string): string {
+  return preCommitScopeKey(tenantId.value, project, artifact, playground);
+}
 </script>
 
 <template>
   <div class="page">
-    <PageHeading title="Playgrounds" :description="`${tenantId} 内的可写工作区`" />
+    <PageHeading title="工作区" :description="`${tenantId} 内可以产生数据变化的 Playground`" />
     <form class="resource-toolbar resource-toolbar--wide" @submit.prevent="applyFilters">
       <ProjectFilter v-model="projectId" :tenant-id="tenantId" />
       <el-select
@@ -166,10 +176,42 @@ async function openPlayground(
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="状态" width="110">
-            <template #default="scope"
-              ><el-tag effect="plain">{{ scope.row.state }}</el-tag></template
-            >
+          <el-table-column label="可用性 / 当前操作" min-width="190">
+            <template #default="scope">
+              <div class="state-stack">
+                <el-tag
+                  :type="scope.row.state === 'unavailable' ? 'danger' : 'success'"
+                  effect="plain"
+                >
+                  {{ playgroundAvailabilityLabel(scope.row.state) }}
+                </el-tag>
+                <el-tag
+                  v-if="
+                    getActivePreCommit(
+                      rowPreCommitKey(
+                        scope.row.project_id,
+                        scope.row.artifact_id,
+                        scope.row.playground_id,
+                      ),
+                    )
+                  "
+                  type="warning"
+                  effect="plain"
+                >
+                  Pre-commit ·
+                  {{
+                    activePreCommitLabel(
+                      rowPreCommitKey(
+                        scope.row.project_id,
+                        scope.row.artifact_id,
+                        scope.row.playground_id,
+                      ),
+                    )
+                  }}
+                </el-tag>
+                <span v-else>空闲</span>
+              </div>
+            </template>
           </el-table-column>
           <el-table-column label="更新时间" min-width="160">
             <template #default="scope">{{ formatTime(scope.row.updated_at_unix_ms) }}</template>
@@ -211,7 +253,33 @@ async function openPlayground(
             >
             <span
               ><small>{{ playground.region }}</small
-              ><el-tag size="small" effect="plain">{{ playground.state }}</el-tag
+              ><el-tag
+                :type="playground.state === 'unavailable' ? 'danger' : 'success'"
+                size="small"
+                effect="plain"
+                >{{ playgroundAvailabilityLabel(playground.state) }}</el-tag
+              ><el-tag
+                v-if="
+                  getActivePreCommit(
+                    rowPreCommitKey(
+                      playground.project_id,
+                      playground.artifact_id,
+                      playground.playground_id,
+                    ),
+                  )
+                "
+                type="warning"
+                size="small"
+                effect="plain"
+                >{{
+                  activePreCommitLabel(
+                    rowPreCommitKey(
+                      playground.project_id,
+                      playground.artifact_id,
+                      playground.playground_id,
+                    ),
+                  )
+                }}</el-tag
               ><ArrowRight
             /></span>
           </button>
@@ -227,3 +295,16 @@ async function openPlayground(
     </section>
   </div>
 </template>
+
+<style scoped>
+.state-stack {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.state-stack > span {
+  color: var(--muted);
+  font-size: 10px;
+}
+</style>

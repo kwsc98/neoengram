@@ -18,7 +18,14 @@ import type { CommitNode } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
+import {
+  activePreCommitLabel,
+  getActivePreCommit,
+  playgroundAvailabilityLabel,
+  preCommitScopeKey,
+} from '@/features/precommit/prototype';
 import { useTenantsStore } from '@/stores/tenants';
+import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime, shortId } from '@/utils/format';
 
 const route = useRoute();
@@ -64,8 +71,17 @@ const artifact = computed(() => artifactQuery.data.value?.data.artifact);
 const commitQuery = useQuery({
   queryKey: computed(() => ['artifact-commits', tenantId.value, projectId.value, artifactId.value]),
   queryFn: () => queryArtifactCommitGraph(tenantId.value, projectId.value, artifactId.value),
-  enabled: computed(() => activeTab.value === 'commits'),
+  enabled: computed(() => activeTab.value === 'overview' || activeTab.value === 'commits'),
 });
+const currentCommit = computed(() => {
+  const graph = commitQuery.data.value?.data.graph;
+  if (!graph) return undefined;
+  const currentCommitId = graph.refs.find(
+    (candidate) => candidate.name === artifact.value?.default_ref,
+  )?.commit_id;
+  return graph.nodes.find((node) => node.commit_id === currentCommitId) ?? graph.nodes[0];
+});
+const currentCommitTags = computed(() => commitTagNames(currentCommit.value?.ref_names ?? []));
 const commitDiffQuery = useQuery({
   queryKey: computed(() => [
     'artifact-commit-diff',
@@ -99,7 +115,7 @@ const playgroundQuery = useQuery({
       artifact_id: artifactId.value,
       page_size: 100,
     }),
-  enabled: computed(() => activeTab.value === 'playgrounds'),
+  enabled: computed(() => activeTab.value === 'overview' || activeTab.value === 'playgrounds'),
 });
 const snapshotQuery = useQuery({
   queryKey: computed(() => [
@@ -116,8 +132,13 @@ const snapshotQuery = useQuery({
       artifact_id: artifactId.value,
       page_size: 100,
     }),
-  enabled: computed(() => activeTab.value === 'snapshots'),
+  enabled: computed(() => activeTab.value === 'overview' || activeTab.value === 'snapshots'),
 });
+const artifactPlaygrounds = computed(() => playgroundQuery.data.value?.data.items ?? []);
+const artifactSnapshots = computed(() => snapshotQuery.data.value?.data.items ?? []);
+const availableRegions = computed(() => [
+  ...new Set(artifactSnapshots.value.map((snapshot) => snapshot.region)),
+]);
 
 watch(
   () => commitQuery.data.value,
@@ -216,6 +237,10 @@ async function openSnapshot(commitId: string): Promise<void> {
   });
 }
 
+function relationPreCommitKey(playgroundId: string): string {
+  return preCommitScopeKey(tenantId.value, projectId.value, artifactId.value, playgroundId);
+}
+
 async function loadCommitChoices(): Promise<void> {
   const result = await queryArtifactCommitGraph(tenantId.value, projectId.value, artifactId.value);
   commitNodes.value = [...result.data.graph.nodes];
@@ -226,7 +251,7 @@ async function showCreatePlayground(): Promise<void> {
   mutationError.value = '';
   playgroundForm.playgroundId = '';
   playgroundForm.displayName = '';
-  playgroundForm.storageVolumeId = artifact.value?.storage_volume_id ?? '';
+  playgroundForm.storageVolumeId = '';
   await loadCommitChoices();
   playgroundForm.baseCommitId =
     commitNodes.value.find((node) => node.ref_names.includes(artifact.value?.default_ref ?? ''))
@@ -266,7 +291,7 @@ async function submitPlayground(): Promise<void> {
 
 async function showCreateSnapshot(): Promise<void> {
   mutationError.value = '';
-  snapshotForm.storageVolumeId = artifact.value?.storage_volume_id ?? '';
+  snapshotForm.storageVolumeId = '';
   await loadCommitChoices();
   snapshotForm.commitId =
     commitNodes.value.find((node) => node.ref_names.includes(artifact.value?.default_ref ?? ''))
@@ -337,7 +362,7 @@ async function submitSnapshot(): Promise<void> {
 
     <section v-if="artifact" class="content-section resource-detail-shell">
       <el-tabs :model-value="activeTab" @tab-change="changeTab">
-        <el-tab-pane label="Overview" name="overview">
+        <el-tab-pane label="概览" name="overview">
           <dl class="definition-grid definition-grid--scope">
             <div>
               <dt>Tenant</dt>
@@ -354,23 +379,41 @@ async function submitSnapshot(): Promise<void> {
               </dd>
             </div>
             <div>
-              <dt>Region</dt>
-              <dd>{{ artifact.region }}</dd>
-            </div>
-            <div>
-              <dt>StorageVolume</dt>
-              <dd>
-                <code>{{ artifact.storage_volume_id }}</code>
-              </dd>
-            </div>
-            <div>
               <dt>Resource version</dt>
               <dd>{{ artifact.resource_version }}</dd>
             </div>
+            <div class="definition-grid__wide">
+              <dt>当前 Commit</dt>
+              <dd v-if="currentCommit" class="commit-identity">
+                <code>{{ currentCommit.commit_id }}</code>
+                <span>{{ currentCommit.message }}</span>
+              </dd>
+              <dd v-else>尚无 Commit</dd>
+            </div>
+            <div class="definition-grid__wide">
+              <dt>Tags</dt>
+              <dd class="tag-list">
+                <el-tag v-for="tagName in currentCommitTags" :key="tagName" effect="plain">
+                  {{ tagName }}
+                </el-tag>
+                <span v-if="currentCommitTags.length === 0">暂无 Tag</span>
+              </dd>
+            </div>
             <div>
-              <dt>Default ref</dt>
-              <dd>
-                <code>{{ artifact.default_ref }}</code>
+              <dt>Playgrounds</dt>
+              <dd>{{ artifactPlaygrounds.length }}</dd>
+            </div>
+            <div>
+              <dt>Snapshots</dt>
+              <dd>{{ artifactSnapshots.length }}</dd>
+            </div>
+            <div class="definition-grid__wide">
+              <dt>可用区域</dt>
+              <dd class="tag-list">
+                <el-tag v-for="region in availableRegions" :key="region" effect="plain">
+                  {{ region }}
+                </el-tag>
+                <span v-if="availableRegions.length === 0">尚无区域交付</span>
               </dd>
             </div>
             <div>
@@ -388,7 +431,7 @@ async function submitSnapshot(): Promise<void> {
           </dl>
         </el-tab-pane>
 
-        <el-tab-pane label="Commits" name="commits">
+        <el-tab-pane label="版本" name="commits">
           <ApiProblemAlert
             v-if="commitQuery.error.value"
             :error="commitQuery.error.value"
@@ -397,15 +440,9 @@ async function submitSnapshot(): Promise<void> {
           />
           <el-skeleton v-if="commitQuery.isPending.value" :rows="6" animated />
           <template v-else-if="commitQuery.data.value">
-            <div class="ref-strip">
-              <span>Graph version {{ commitQuery.data.value.data.graph.graph_version }}</span>
-              <el-tag
-                v-for="refTip in commitQuery.data.value.data.graph.refs"
-                :key="refTip.name"
-                effect="plain"
-              >
-                {{ refTip.name.replace('refs/heads/', '') }} · {{ shortId(refTip.commit_id, 14) }}
-              </el-tag>
+            <div class="commit-summary">
+              <span>{{ commitNodes.length }} 个 Commit</span>
+              <small>Tags 用于标记可识别的固定版本</small>
             </div>
             <ol class="commit-tree" aria-label="Commit 图">
               <li v-for="node in commitNodes" :key="node.commit_id" class="commit-node">
@@ -433,8 +470,13 @@ async function submitSnapshot(): Promise<void> {
                     <span v-if="node.parent_commit_id">
                       parent <code>{{ node.parent_commit_id }}</code>
                     </span>
-                    <el-tag v-for="name in node.ref_names" :key="name" size="small" effect="plain">
-                      {{ name.replace('refs/heads/', '').replace('refs/tags/', '') }}
+                    <el-tag
+                      v-for="tagName in commitTagNames(node.ref_names)"
+                      :key="tagName"
+                      size="small"
+                      effect="plain"
+                    >
+                      {{ tagName }}
                     </el-tag>
                   </div>
                 </div>
@@ -450,7 +492,7 @@ async function submitSnapshot(): Promise<void> {
           </template>
         </el-tab-pane>
 
-        <el-tab-pane label="Playgrounds" name="playgrounds">
+        <el-tab-pane label="工作区" name="playgrounds">
           <ApiProblemAlert
             v-if="playgroundQuery.error.value"
             :error="playgroundQuery.error.value"
@@ -475,14 +517,25 @@ async function submitSnapshot(): Promise<void> {
               </span>
               <span class="relation-list__aside">
                 <small>{{ playground.region }}</small>
-                <el-tag effect="plain">{{ playground.state }}</el-tag
+                <el-tag
+                  :type="playground.state === 'unavailable' ? 'danger' : 'success'"
+                  effect="plain"
+                  >{{ playgroundAvailabilityLabel(playground.state) }}</el-tag
+                ><el-tag
+                  v-if="getActivePreCommit(relationPreCommitKey(playground.playground_id))"
+                  type="warning"
+                  effect="plain"
+                  >Pre-commit ·
+                  {{
+                    activePreCommitLabel(relationPreCommitKey(playground.playground_id))
+                  }} </el-tag
                 ><ArrowRight />
               </span>
             </button>
           </div>
         </el-tab-pane>
 
-        <el-tab-pane label="Snapshots" name="snapshots">
+        <el-tab-pane label="快照" name="snapshots">
           <ApiProblemAlert
             v-if="snapshotQuery.error.value"
             :error="snapshotQuery.error.value"
@@ -635,16 +688,18 @@ async function submitSnapshot(): Promise<void> {
               </dd>
             </div>
             <div class="definition-grid__wide">
-              <dt>Refs / Tags</dt>
+              <dt>Tags</dt>
               <dd class="tag-list">
                 <el-tag
-                  v-for="name in commitDiff.target_commit.ref_names"
-                  :key="name"
+                  v-for="tagName in commitTagNames(commitDiff.target_commit.ref_names)"
+                  :key="tagName"
                   effect="plain"
                 >
-                  {{ name.replace('refs/heads/', '').replace('refs/tags/', 'tag:') }}
+                  {{ tagName }}
                 </el-tag>
-                <span v-if="commitDiff.target_commit.ref_names.length === 0">—</span>
+                <span v-if="commitTagNames(commitDiff.target_commit.ref_names).length === 0">
+                  暂无 Tag
+                </span>
               </dd>
             </div>
             <div class="definition-grid__wide">
@@ -683,12 +738,18 @@ async function submitSnapshot(): Promise<void> {
               <dd>{{ formatTime(commitDiff.base_commit.created_at_unix_ms) }}</dd>
             </div>
             <div class="definition-grid__wide">
-              <dt>Refs / Tags</dt>
+              <dt>Tags</dt>
               <dd class="tag-list">
-                <el-tag v-for="name in commitDiff.base_commit.ref_names" :key="name" effect="plain">
-                  {{ name.replace('refs/heads/', '').replace('refs/tags/', 'tag:') }}
+                <el-tag
+                  v-for="tagName in commitTagNames(commitDiff.base_commit.ref_names)"
+                  :key="tagName"
+                  effect="plain"
+                >
+                  {{ tagName }}
                 </el-tag>
-                <span v-if="commitDiff.base_commit.ref_names.length === 0">—</span>
+                <span v-if="commitTagNames(commitDiff.base_commit.ref_names).length === 0">
+                  暂无 Tag
+                </span>
               </dd>
             </div>
             <div class="definition-grid__wide">

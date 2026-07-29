@@ -181,7 +181,7 @@ function stateType(state: string): 'success' | 'warning' | 'danger' {
 
 <template>
   <div class="page">
-    <PageHeading title="StorageVolumes" :description="`${tenantId} 内已登记的逻辑存储`">
+    <PageHeading title="存储资源" :description="`${tenantId} 内按区域登记的 StorageVolume`">
       <template #actions>
         <el-button v-if="canCreate" type="primary" :icon="Plus" @click="openCreate">
           登记 StorageVolume

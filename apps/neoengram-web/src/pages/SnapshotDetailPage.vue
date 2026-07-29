@@ -7,6 +7,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { querySnapshot } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
+import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
 const route = useRoute();
@@ -26,6 +27,7 @@ const snapshotQuery = useQuery({
   queryFn: () => querySnapshot(tenantId.value, projectId.value, artifactId.value, commitId.value),
 });
 const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
+const snapshotTags = computed(() => commitTagNames(snapshot.value?.ref_names ?? []));
 </script>
 
 <template>
@@ -113,12 +115,12 @@ const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
             </dd>
           </div>
           <div class="definition-grid__wide">
-            <dt>Refs</dt>
+            <dt>Tags</dt>
             <dd class="tag-list">
-              <el-tag v-for="name in snapshot.ref_names" :key="name" effect="plain">{{
-                name
-              }}</el-tag>
-              <span v-if="snapshot.ref_names.length === 0">—</span>
+              <el-tag v-for="tagName in snapshotTags" :key="tagName" effect="plain">
+                {{ tagName }}
+              </el-tag>
+              <span v-if="snapshotTags.length === 0">暂无 Tag</span>
             </dd>
           </div>
         </dl>

@@ -19,6 +19,7 @@
   --muted: #66716c;
   --line: #d9dfdc;
   --surface: #ffffff;
+  --surface-soft: #f5f7f6;
   --amber: #bd7a12;
   --red: #b33a3a;
 }
@@ -194,6 +195,19 @@ code {
 }
 .sidebar-tenant--drawer {
   margin: 0 8px 12px;
+}
+.nav-group + .nav-group {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.nav-group__label {
+  display: block;
+  padding: 0 12px 6px;
+  color: #7a8580;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
 }
 .nav-item {
   width: 100%;
@@ -375,6 +389,16 @@ code {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+.commit-identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.commit-identity span {
+  color: var(--muted);
+  font-weight: 500;
 }
 .tenant-entry {
   min-height: calc(100vh - 150px);
@@ -664,7 +688,7 @@ code {
 .resource-detail-shell .el-tabs__header {
   margin-bottom: 22px;
 }
-.ref-strip {
+.commit-summary {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -673,7 +697,10 @@ code {
   padding: 12px 14px;
   background: #f2f5f3;
 }
-.ref-strip > span {
+.commit-summary > span {
+  font-weight: 650;
+}
+.commit-summary > small {
   margin-right: auto;
   color: var(--muted);
   font-size: 12px;
@@ -1136,6 +1163,16 @@ code {
     margin-top: 4px;
     color: var(--muted);
     font-size: 11px;
+  }
+  .mobile-resource-tags {
+    display: block;
+    max-width: 220px;
+    margin-top: 5px;
+    color: var(--green);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .resource-detail-shell {
     padding: 10px 12px 18px;
