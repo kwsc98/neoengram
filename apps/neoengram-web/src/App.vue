@@ -34,16 +34,31 @@ const form = reactive({ tenantId: '', displayName: '', description: '' });
 const currentTenantId = computed(() => String(route.params.tenantId ?? ''));
 const currentTenant = computed(() => tenants.byId(currentTenantId.value));
 
-const menuItems = computed(() => {
+const navGroups = computed(() => {
   if (!currentTenantId.value) return [];
   const tenantId = currentTenantId.value;
   return [
-    { name: 'tenant-overview', label: '租户概览', icon: DataAnalysis, params: { tenantId } },
-    { name: 'storage-volume-list', label: 'StorageVolumes', icon: Coin, params: { tenantId } },
-    { name: 'artifact-list', label: 'Artifacts', icon: Box, params: { tenantId } },
-    { name: 'playground-list', label: 'Playgrounds', icon: Collection, params: { tenantId } },
-    { name: 'snapshot-list', label: 'Snapshots', icon: DocumentCopy, params: { tenantId } },
-    { name: 'job-query', label: '查询 Job', icon: Search, params: { tenantId } },
+    {
+      label: '数据工作流',
+      items: [
+        { name: 'tenant-overview', label: '概览', icon: DataAnalysis, params: { tenantId } },
+        { name: 'artifact-list', label: '数据资产', icon: Box, params: { tenantId } },
+        { name: 'playground-list', label: '工作区', icon: Collection, params: { tenantId } },
+        { name: 'snapshot-list', label: '快照与交付', icon: DocumentCopy, params: { tenantId } },
+        { name: 'job-query', label: '活动', icon: Search, params: { tenantId } },
+      ],
+    },
+    {
+      label: '基础设施',
+      items: [
+        {
+          name: 'storage-volume-list',
+          label: '存储资源',
+          icon: Coin,
+          params: { tenantId },
+        },
+      ],
+    },
   ];
 });
 
@@ -72,11 +87,11 @@ async function navigate(name: string, params: Record<string, string>): Promise<v
 
 function targetForTenantSwitch(): string {
   const name = String(route.name ?? '');
-  if (name === 'storage-volume-list') return 'storage-volume-list';
-  if (name === 'artifact-detail' || name === 'artifact-list') return 'artifact-list';
-  if (name === 'playground-detail' || name === 'playground-list') return 'playground-list';
-  if (name === 'snapshot-detail' || name === 'snapshot-list') return 'snapshot-list';
-  if (name === 'job-create') return 'job-create';
+  if (name.startsWith('storage-volume-')) return 'storage-volume-list';
+  if (name.startsWith('artifact-')) return 'artifact-list';
+  if (name.startsWith('playground-')) return 'playground-list';
+  if (name.startsWith('snapshot-')) return 'snapshot-list';
+  if (name === 'job-create') return 'job-query';
   if (name === 'job-query' || name === 'job-detail') return 'job-query';
   return 'tenant-overview';
 }
@@ -211,21 +226,24 @@ async function submitTenant(): Promise<void> {
           <code>{{ currentTenant.tenant_id }}</code>
         </div>
         <nav aria-label="主导航">
-          <button
-            v-for="item in menuItems"
-            :key="item.name"
-            type="button"
-            class="nav-item"
-            :class="{ 'nav-item--active': activeMenu === item.name }"
-            @click="navigate(item.name, item.params)"
-          >
-            <el-icon><component :is="item.icon" /></el-icon>
-            <span>{{ item.label }}</span>
-          </button>
+          <div v-for="group in navGroups" :key="group.label" class="nav-group">
+            <span class="nav-group__label">{{ group.label }}</span>
+            <button
+              v-for="item in group.items"
+              :key="item.name"
+              type="button"
+              class="nav-item"
+              :class="{ 'nav-item--active': activeMenu === item.name }"
+              @click="navigate(item.name, item.params)"
+            >
+              <el-icon><component :is="item.icon" /></el-icon>
+              <span>{{ item.label }}</span>
+            </button>
+          </div>
         </nav>
         <div class="sidebar__footer">
           <span class="status-dot status-dot--ok" />
-          <span>Public API v1</span>
+          <span>控制面在线</span>
         </div>
       </aside>
 
@@ -242,17 +260,20 @@ async function submitTenant(): Promise<void> {
           <code>{{ currentTenant.tenant_id }}</code>
         </div>
         <nav aria-label="移动端主导航">
-          <button
-            v-for="item in menuItems"
-            :key="item.name"
-            type="button"
-            class="nav-item"
-            :class="{ 'nav-item--active': activeMenu === item.name }"
-            @click="navigate(item.name, item.params)"
-          >
-            <el-icon><component :is="item.icon" /></el-icon>
-            <span>{{ item.label }}</span>
-          </button>
+          <div v-for="group in navGroups" :key="group.label" class="nav-group">
+            <span class="nav-group__label">{{ group.label }}</span>
+            <button
+              v-for="item in group.items"
+              :key="item.name"
+              type="button"
+              class="nav-item"
+              :class="{ 'nav-item--active': activeMenu === item.name }"
+              @click="navigate(item.name, item.params)"
+            >
+              <el-icon><component :is="item.icon" /></el-icon>
+              <span>{{ item.label }}</span>
+            </button>
+          </div>
         </nav>
       </el-drawer>
 

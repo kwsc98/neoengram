@@ -36,7 +36,7 @@ function formatSeen(value: string): string {
 
 <template>
   <div class="page">
-    <PageHeading title="查询 Job" :description="`在 ${tenantId} 中按 job_id 查询权威状态`" />
+    <PageHeading title="活动" :description="`查看 ${tenantId} 中的数据扫描、物化和发布任务`" />
 
     <form class="query-bar query-bar--tenant" @submit.prevent="query">
       <div class="query-tenant">
@@ -51,7 +51,7 @@ function formatSeen(value: string): string {
     <section class="content-section">
       <div class="section-heading section-heading--inline">
         <div>
-          <h2>本租户最近访问</h2>
+          <h2>最近活动</h2>
           <p>{{ tenantJobs.length }} 条浏览器本地记录</p>
         </div>
         <el-button

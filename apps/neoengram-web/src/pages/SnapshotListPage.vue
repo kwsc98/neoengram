@@ -9,6 +9,7 @@ import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
+import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
 const route = useRoute();
@@ -84,7 +85,10 @@ async function openSnapshot(project: string, artifact: string, commit: string): 
 
 <template>
   <div class="page">
-    <PageHeading title="Snapshots" :description="`${tenantId} 内固定到 Commit 的只读视图`" />
+    <PageHeading
+      title="快照与交付"
+      :description="`${tenantId} 内固定版本的只读视图及区域可用状态`"
+    />
     <form class="resource-toolbar" @submit.prevent="applyFilters">
       <ProjectFilter v-model="projectId" :tenant-id="tenantId" />
       <el-select
@@ -135,6 +139,21 @@ async function openSnapshot(project: string, artifact: string, commit: string): 
             </template>
           </el-table-column>
           <el-table-column prop="artifact_id" label="Artifact" min-width="160" />
+          <el-table-column label="Tags" min-width="170">
+            <template #default="scope">
+              <div class="tag-list">
+                <el-tag
+                  v-for="tagName in commitTagNames(scope.row.ref_names)"
+                  :key="tagName"
+                  size="small"
+                  effect="plain"
+                >
+                  {{ tagName }}
+                </el-tag>
+                <span v-if="commitTagNames(scope.row.ref_names).length === 0">—</span>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column label="放置" min-width="190">
             <template #default="scope">
               <div class="table-placement">
@@ -175,7 +194,10 @@ async function openSnapshot(project: string, artifact: string, commit: string): 
           >
             <span
               ><strong>{{ snapshot.message }}</strong
-              ><code>{{ snapshot.commit_id }}</code></span
+              ><code>{{ snapshot.commit_id }}</code
+              ><small v-if="commitTagNames(snapshot.ref_names).length" class="mobile-resource-tags">
+                Tags: {{ commitTagNames(snapshot.ref_names).join(', ') }}
+              </small></span
             >
             <span
               ><small>{{ snapshot.region }} · {{ formatBytes(snapshot.logical_size_bytes) }}</small

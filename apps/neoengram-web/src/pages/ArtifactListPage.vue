@@ -10,7 +10,7 @@ import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
-import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
+import { LOGICAL_ARTIFACT_STORAGE_COMPAT_ID } from '@/features/artifacts/prototype';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
 
@@ -28,11 +28,9 @@ const createOpen = ref(false);
 const createError = ref('');
 const createForm = reactive({
   projectId: '',
-  storageVolumeId: '',
   artifactId: '',
   displayName: '',
   description: '',
-  defaultRef: 'refs/heads/main',
 });
 const canCreate = computed(
   () => tenants.byId(tenantId.value)?.permissions.includes('artifact.create') ?? false,
@@ -100,11 +98,9 @@ async function openArtifact(project: string, artifact: string): Promise<void> {
 
 function openCreate(): void {
   createForm.projectId = projectId.value;
-  createForm.storageVolumeId = '';
   createForm.artifactId = '';
   createForm.displayName = '';
   createForm.description = '';
-  createForm.defaultRef = 'refs/heads/main';
   createError.value = '';
   createOpen.value = true;
 }
@@ -120,19 +116,15 @@ async function submitCreate(): Promise<void> {
     createError.value = '请输入 Artifact 名称';
     return;
   }
-  if (!createForm.storageVolumeId) {
-    createError.value = '请选择 StorageVolume';
-    return;
-  }
   try {
     const result = await createMutation.mutateAsync({
       tenant_id: tenantId.value,
       project_id: createForm.projectId,
       artifact_id: createForm.artifactId,
-      storage_volume_id: createForm.storageVolumeId,
+      storage_volume_id: LOGICAL_ARTIFACT_STORAGE_COMPAT_ID,
       display_name: createForm.displayName.trim(),
       ...(createForm.description.trim() ? { description: createForm.description.trim() } : {}),
-      default_ref: createForm.defaultRef,
+      default_ref: 'refs/heads/main',
     });
     createOpen.value = false;
     await queryClient.invalidateQueries({ queryKey: ['artifacts', tenantId.value] });
@@ -146,7 +138,7 @@ async function submitCreate(): Promise<void> {
 
 <template>
   <div class="page">
-    <PageHeading title="Artifacts" :description="`${tenantId} 内的受管 Artifact`">
+    <PageHeading title="数据资产" :description="`${tenantId} 内版本化管理的 Artifact`">
       <template #actions>
         <el-button v-if="canCreate" type="primary" :icon="Plus" @click="openCreate">
           创建 Artifact
@@ -192,15 +184,7 @@ async function submitCreate(): Promise<void> {
             </template>
           </el-table-column>
           <el-table-column prop="project_id" label="Project" min-width="170" />
-          <el-table-column label="放置" min-width="190">
-            <template #default="scope">
-              <div class="table-placement">
-                <strong>{{ scope.row.region }}</strong>
-                <code>{{ scope.row.storage_volume_id }}</code>
-              </div>
-            </template>
-          </el-table-column>
-          <el-table-column prop="default_ref" label="Default ref" min-width="180" />
+          <el-table-column prop="description" label="描述" min-width="280" />
           <el-table-column label="更新时间" min-width="160">
             <template #default="scope">{{ formatTime(scope.row.updated_at_unix_ms) }}</template>
           </el-table-column>
@@ -228,7 +212,7 @@ async function submitCreate(): Promise<void> {
               ><code>{{ artifact.artifact_id }}</code></span
             >
             <span
-              ><small>{{ artifact.project_id }} · {{ artifact.region }}</small
+              ><small>{{ artifact.project_id }}</small
               ><ArrowRight
             /></span>
           </button>
@@ -253,17 +237,11 @@ async function submitCreate(): Promise<void> {
         <el-form-item label="Artifact ID">
           <el-input v-model="createForm.artifactId" placeholder="evaluation-set" />
         </el-form-item>
-        <el-form-item label="StorageVolume" required>
-          <StorageVolumeFilter v-model="createForm.storageVolumeId" :tenant-id="tenantId" />
-        </el-form-item>
         <el-form-item label="名称">
           <el-input v-model="createForm.displayName" placeholder="评测数据集" />
         </el-form-item>
         <el-form-item label="描述">
           <el-input v-model="createForm.description" type="textarea" :rows="3" />
-        </el-form-item>
-        <el-form-item label="Default ref">
-          <el-input v-model="createForm.defaultRef" />
         </el-form-item>
       </el-form>
       <template #footer>

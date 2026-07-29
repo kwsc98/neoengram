@@ -62,6 +62,18 @@ const routes: RouteRecordRaw[] = [
     meta: tenantMeta,
   },
   {
+    path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/playgrounds/:playgroundId/commit',
+    name: 'playground-commit-prototype',
+    component: () => import('@/pages/ReleaseWorkbenchPrototypePage.vue'),
+    meta: tenantMeta,
+  },
+  {
+    path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/snapshots/new',
+    name: 'snapshot-delivery-prototype',
+    component: () => import('@/pages/SnapshotDeliveryPrototypePage.vue'),
+    meta: tenantMeta,
+  },
+  {
     path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/snapshots/:commitId',
     name: 'snapshot-detail',
     component: () => import('@/pages/SnapshotDetailPage.vue'),
