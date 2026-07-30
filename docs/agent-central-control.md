@@ -8,6 +8,10 @@
 > 存储、多 Agent Playground 和中心 S3 的目标架构。当前 `0.2.0`/format v8 只实现 transport- and
 > storage-independent library、协议、内存适配器与中心 SQLite authority；文中 HTTP、PostgreSQL、mTLS、OIDC、真实 S3、
 > NFS fencing、Gateway 和 daemon 均是后续实现目标，不是当前可运行能力。
+>
+> 面向产品、交互和公开 API 的资源口径见
+> [`centralized-agent-product.md`](centralized-agent-product.md)。本文中的 Ref、ArtifactPlacement、lease、
+> fencing 和 mount generation 属于内部控制面概念，不代表它们应该出现在普通用户界面。
 
 P0 的 production/runtime 源码依赖主方向已经固定：
 
@@ -123,7 +127,7 @@ Artifact（版本化抽象文件系统）
 │       └── root Directory / Manifest（该版本内部的文件系统树）
 ├── Ref[*] ──▶ Commit
 ├── Playground[*]（读写；从 base Commit 创建，可发布新 Commit）
-└── Snapshot[*] ──▶ fixed Commit（只读；Ref 后续移动不影响内容）
+└── Snapshot[*] ──▶ fixed Commit + one RO placement（单 Region；内部 Ref 后续移动不影响内容）
 ```
 
 规范定义：
@@ -133,8 +137,9 @@ Artifact（版本化抽象文件系统）
   才把历史模型升级为 DAG；
 - `Playground` 保存 `base_commit_id + PlaygroundIndex/IndexVersion + placement`，是唯一允许产生
   staged/unstaged 变化的视图；一次 commit 从 Playground 发布新的不可变 Commit；
-- `Snapshot` 的内容身份是 `artifact_id + commit_id`，只提供只读访问；读取会话、lease 和可选
-  dataset profile 是独立资源，同一 Snapshot 可以同时被多个授权 handle 使用；
+- `Snapshot` 的内容身份是 `artifact_id + commit_id`，v1 同时绑定一个 StorageVolume 和派生 Region，
+  只提供单区域只读访问；读取会话、lease 和可选 dataset profile 是独立资源，同一 Snapshot 可以
+  同时被多个授权 handle 使用；
 - Agent 上传的 IndexDelta/ObjectReceipt 分页结果统一称为 `MetadataBatch`，不得再称为 Artifact。
 
 ### 3.2 租户与数据资源

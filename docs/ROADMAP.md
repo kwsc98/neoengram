@@ -1,9 +1,11 @@
 # NeoEngram Roadmap
 
-> 最后更新：2026-07-27
+> 最后更新：2026-07-30
 >
 > 本文是迭代执行视图，不重新定义产品能力或架构。
 > 能力状态、架构不变量和研究结论以 [`implementation-plan.md`](implementation-plan.md) 为准。
+> 面向用户的产品语义和验收主链路见
+> [`centralized-agent-product.md`](centralized-agent-product.md)。
 
 ## 当前基线
 
@@ -29,7 +31,7 @@
 | --- | --- | --- | --- |
 | R0 | 已完成 | format v8、协议 v1、Engine/Agent/中心内存状态机 | P0 / A0 |
 | R1 | 已完成 | AuthorityStore + SQLite 默认后端，覆盖全部中心权威状态 | P1 / A2 |
-| R2 | 下一步 | OIDC/JWKS、RBAC/RLS 和只读 Artifact/Ref/Snapshot API | P1 |
+| R2 | 下一步 | OIDC/JWKS、RBAC/RLS 和只读 Artifact/Commit/Tags/Snapshot API | P1 |
 | R3 | 后续 | mTLS Agent 会话、持久 Ledger、Storage Registry 和只读 Job | A1 / A2 |
 | R4 | 后续 | 中心 S3、短期票据和端到端 Managed Add | P2 / A4 |
 | R5 | 后续 | 中心 Commit/Ref CAS、固定 Snapshot 和 DatasetProfile | P1 / P2 |

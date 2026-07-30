@@ -30,12 +30,19 @@ PublicationCandidate、Manifest、IndexDelta、物理路径或数据库信息。
 对应资源的 `*_NOT_FOUND` 返回 404，不能泄漏目标资源是否存在。Snapshot 只使用
 `tenant_id + project_id + artifact_id + commit_id` 复合身份，不引入独立 snapshot ID。
 
-资源 mutation 同样只接受公开 DTO：StorageVolume 登记已有 PVC/NFS，不负责创建底层存储资源；
-Artifact、Playground 和 Snapshot 创建必须选择同租户 StorageVolume，region 由服务端派生。它们以
-资源 identity 幂等创建；
+资源 mutation 同样只接受公开 DTO：StorageVolume 登记已有 PVC/NFS，不负责创建底层存储资源。
+当前已提交契约仍要求 Artifact、Playground 和 Snapshot 创建选择同租户 StorageVolume，region 由
+服务端派生；这与 Web 原型冻结的目标产品口径并不完全一致。下一版契约必须按
+[`../centralized-agent-product.md`](../centralized-agent-product.md) 将 Artifact 改为无固定放置，只让
+Playground 和 Snapshot 各选择一个 Volume。迁移完成前，当前 Artifact placement 字段只能视为待
+移除的契约债务，不能作为新后端实现依据。
+
+Playground 和 Snapshot 继续使用完整资源 identity 幂等创建；同一身份改选其他 Volume 必须返回
+placement conflict，不能静默迁移。Snapshot 始终是单 Region、单 Volume。
 Playground Commit 以稳定 `commit_request_id` 绑定完整 scope、expected IndexVersion 和 message，
-可附带详细描述和最多 20 个新 Tag；Tag 作为真实 `refs/tags/*` Ref 创建，已存在时拒绝覆盖。
-服务端从认证结果建立 actor，并对目标 Ref 执行 CAS。Commit Diff 默认比较目标 Commit 与其单一
+可附带详细描述和最多 20 个新 Tag。当前契约仍把 Tag 编码成 `refs/tags/*`；下一版公开响应应直接
+提供 Tags，不能要求前端理解 Ref 前缀。服务端从认证结果建立 actor，并在内部版本指针上执行
+CAS；公开产品不允许用户选择目标 Ref。Commit Diff 默认比较目标 Commit 与其单一
 parent，根 Commit 与空基线比较；公开结果只包含 Commit 视图、逻辑路径、变更类型和大小统计。
 
 Agent API 不属于本 OpenAPI。Agent 的 H2/H3 JSON Text Sequence 双向 session、MetadataBatch 和

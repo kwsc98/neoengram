@@ -2,8 +2,10 @@
 
 > 本文是 NeoEngram 的唯一实现路线、能力状态和研究计划记录。代码、架构文档或
 > README 中出现的路线描述应与本文保持一致；如果出现冲突，以本文为准。
+> 中心化 Agent 的用户角色、公开资源语义、页面和交互口径见
+> [`centralized-agent-product.md`](centralized-agent-product.md)。
 
-最后更新：2026-07-28
+最后更新：2026-07-30
 当前阶段：`0.2.0` P0 与中心 `AuthorityStore`/SQLite 默认后端已实现；生产 transport、PG/MySQL 与对象存储适配器待实现
 
 ## 1. 产品目标
@@ -12,7 +14,7 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 训练数据的可复现维护、发布和读取，而不是完整的 AI 训练平台：
 
 - 客户端负责工作区、切块、校验、本地缓存和离线提交；
-- 中心控制面负责 tenant/project/artifact/ref、Commit/Directory/Manifest、并发提交、权限、
+- 中心控制面负责 tenant/project/artifact、Commit/Directory/Manifest、内部版本 CAS、并发提交、权限、
   会话和审计；
 - 数据面使用 S3-compatible 对象存储保存 Chunk/Pack payload，客户端保留本地缓存；
 - 读取面以固定的 Snapshot、Shard 分页和租约向训练任务提供一致数据；
@@ -33,10 +35,10 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 
 | 术语 | 规范定义 |
 | --- | --- |
-| `Artifact` | 一个版本化抽象文件系统，是 Commit、Ref、Playground、Snapshot 和对象归属的领域根 |
+| `Artifact` | 一个无固定 Region/StorageVolume 的版本化抽象文件系统，是 Commit、Playground、Snapshot 和对象归属的领域根 |
 | `Commit` | Artifact 的不可变版本节点；v1 单 parent，形成可分支的 Commit 历史树 |
 | `Playground` | 基于某个 Commit 的可读写工作区，拥有独立 IndexVersion，能够发布新 Commit |
-| `Snapshot` | 固定 `artifact_id + commit_id` 的只读快照；Ref 移动不能改变其内容 |
+| `Snapshot` | 固定 `artifact_id + commit_id` 的单 Region、单 StorageVolume 只读交付；内部版本指针移动不能改变其内容 |
 | `MetadataBatch` | Agent 向中心分页上传的 IndexDelta/ObjectReceipt 临时批次，不是 Artifact |
 
 当前 format v8 和 CLI 中的 `repository`、`workspace` 是 Standalone 名称：在中心领域模型中分别
@@ -49,8 +51,9 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
   PostgreSQL 是多实例/HA/RLS 目标，S3-compatible 存储保存 Chunk payload；
 - 客户端通过 header-versioned、模块/动作式 HTTP JSON API 访问中心服务，不直接访问数据库；
 - Vue 3 Web 控制台作为独立 `apps/neoengram-web` npm 应用，只消费公开 OpenAPI；首版 MSW 可运行，
-  已覆盖租户切换/创建、StorageVolume 登记与放置选择、Project 筛选、Artifact/Playground/Snapshot
-  创建、带描述和 Tag Ref 的 Playground Commit、父版本文件 Diff、资源浏览和 Managed Add Job；
+  已覆盖租户切换/创建、StorageVolume 登记与放置选择、Project 筛选、无固定放置 Artifact、单 Volume
+  Playground、单区域 Snapshot、Pre-commit、带描述和 Tags 的 Playground Commit、父版本文件/元数据
+  Diff、资源浏览和 Managed Add Job；
   真实联网依赖后续 HTTP/OIDC adapter；
 - 第一版远端同步只围绕 `main`/detached Commit，暂不解决多分支合并；
 - 服务端保存不可变历史，ref/对象的保留和 GC 由中心策略统一管理；
@@ -69,7 +72,7 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 | 身份认证 | `Authenticator` 抽象；v1 外部 OIDC/JWKS + Bearer JWT | 已确定设计，待实现 |
 | 授权范围 | tenant → project → artifact → ref；服务端 RBAC，默认拒绝 | 已确定设计，待实现 |
 | 对象访问 | 中心 API 鉴权后签发短期、对象/会话范围的 Signed URL | 已确定设计，待实现 |
-| 训练快照 | `artifact_id + commit_id` 的固定 Snapshot；可选 sidecar 描述 | 已确定设计，待实现 |
+| 训练快照 | `artifact_id + commit_id` 的固定、单 Region/单 StorageVolume Snapshot；可选 sidecar 描述 | 产品原型已确认，生产待实现 |
 | 历史保留 | ref、pin/hold、active lease/session/有效 ObjectTicket 作为 GC roots；隔离期后再回收 | 已确定设计，待实现 |
 | 规模与可靠性 | 千万文件、上亿 Chunk、PB 级 payload；99.9%、RPO 0、RTO 1 小时 | 后续基准验证 |
 
@@ -489,9 +492,15 @@ root、外部 IdP/数据库/S3/KMS 管理员完全失陷，也不把 `export` �
 
 - `Snapshot` 的稳定身份是 `tenant_id + project_id + artifact_id + commit_id`；Directory ID
   只表示文件内容指纹，不另复制一套文件图。
-- ref（例如 `main`）只在训练开始时解析一次；训练、恢复、重试和审计始终记录完整 Commit ID。
-- 只有 Commit → Directory → Manifest → Chunk 全图已持久化并校验后，Snapshot 才可读取；Snapshot
-  一旦可读取便始终固定该 Commit，不再使用训练状态改变它的只读文件语义。
+- v1 一个 Snapshot 只绑定一个 `storage_volume_id`，Region 由 Volume 派生；同一身份改用其他 Volume
+  必须冲突，不能把多个 Region placements 塞进同一个 Snapshot。
+- 内部版本指针只在训练开始时解析一次；产品界面和公开业务请求只展示/记录完整 Commit ID 与
+  Tags，不提供 Ref 或 Default Ref 概念。
+- 只有 Commit → Directory → Manifest → Chunk 全图已持久化并校验，且目标 Volume 的单区域只读
+  视图已完成物化和完整性校验后，Snapshot 才可读取；Snapshot 一旦可读取便始终固定该 Commit、
+  Region 和 Volume，不再使用训练状态改变它的只读文件语义。
+- 如果未来需要同一 Commit 同时交付多个 Region 或用途，必须引入独立 `snapshot_id`，每个 Snapshot
+  仍保持单 Region；该扩展不能改变当前复合身份的幂等和冲突语义。
 - sidecar 存在并通过 schema/source/ShardSet 校验时，独立的 `DatasetProfileState` 进入 `Ready`，训练
   API 只接受具有 Ready profile 的 Snapshot。sidecar 缺失时 Snapshot 仍是合法普通文件快照，但
   显示为未声明训练 profile；sidecar 无效时 profile 进入 `Rejected`，Snapshot 本身不失效。
@@ -646,3 +655,4 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-26 | 完成 `0.2.0` P0 crate/protocol/state-machine 改造并升级 format v8 | core 统一 typed IDs/canonical digest；CLI/Standalone/engine/fs 分层；Agent/中心提供无网络内存组合测试 |
 | 2026-07-26 | 将 Managed 对象 durability authority 固定为中心 S3，NFS 仅放 Playground/journal/cache | Finalize 必须经过 missing upload、中心 durability、MetadataBatch 完整性和 IndexVersion CAS；避免把 NFS/cache/receipt 当成权威 |
 | 2026-07-27 | 合并 R1.1/R1.2，完成 `AuthorityStore` 与默认 SQLite 中心权威后端 | 全部中心端口可跨重开恢复并运行同一后端契约；SQLite 限单进程且无 RLS/HA，PG/MySQL 后端保持独立 schema/migration |
+| 2026-07-30 | 基于 Web Mock 冻结中心化 Agent 产品定义 | Artifact 无固定放置；Commit 只从 Playground 发起；用户界面仅展示 Commit/Tags；Snapshot 固定单 Region/Volume；Pre-commit 与 Playground 主可用性正交 |

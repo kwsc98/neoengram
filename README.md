@@ -417,9 +417,14 @@ Agent 到 `neoengramd` 的依赖仅存在于 dev/test 组合测试。CLI 之外�
 
 `neoengram-web` 是独立 npm 应用，不进入 Cargo workspace，也不导入 Rust crate、Agent Schema 或
 数据库类型。它只从公开 OpenAPI 生成客户端类型；当前可通过 MSW 运行租户切换/创建、
-StorageVolume 登记与放置选择、Artifact/Playground/Snapshot 创建、Playground Commit、资源浏览和
+StorageVolume 登记与放置选择、无固定放置 Artifact、单 Volume Playground、单区域 Snapshot、
+Playground Commit、资源浏览和
 Commit 描述/Tag、父版本文件 Diff、Managed Add Job，真实联网仍等待
 `neoengramd` HTTP/OIDC adapter。
+
+中心化 Agent 的产品定位、用户角色、资源语义、页面规格、Pre-commit/Commit/Snapshot 主链路和
+OpenAPI 对齐清单见 [`docs/centralized-agent-product.md`](docs/centralized-agent-product.md)；技术权威
+边界继续以 [`docs/agent-central-control.md`](docs/agent-central-control.md) 为准。
 
 ## 质量检查
 
