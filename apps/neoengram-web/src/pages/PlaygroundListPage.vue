@@ -13,6 +13,7 @@ import {
   activePreCommitLabel,
   getActivePreCommit,
   playgroundAvailabilityLabel,
+  playgroundAvailabilityTagType,
   preCommitScopeKey,
 } from '@/features/precommit/prototype';
 import { formatTime } from '@/utils/format';
@@ -179,10 +180,7 @@ function rowPreCommitKey(project: string, artifact: string, playground: string):
           <el-table-column label="可用性 / 当前操作" min-width="190">
             <template #default="scope">
               <div class="state-stack">
-                <el-tag
-                  :type="scope.row.state === 'unavailable' ? 'danger' : 'success'"
-                  effect="plain"
-                >
+                <el-tag :type="playgroundAvailabilityTagType(scope.row.state)" effect="plain">
                   {{ playgroundAvailabilityLabel(scope.row.state) }}
                 </el-tag>
                 <el-tag
@@ -254,7 +252,7 @@ function rowPreCommitKey(project: string, artifact: string, playground: string):
             <span
               ><small>{{ playground.region }}</small
               ><el-tag
-                :type="playground.state === 'unavailable' ? 'danger' : 'success'"
+                :type="playgroundAvailabilityTagType(playground.state)"
                 size="small"
                 effect="plain"
                 >{{ playgroundAvailabilityLabel(playground.state) }}</el-tag

@@ -2,6 +2,8 @@ import { apiClient } from './client';
 import { toApiProblem } from './problem';
 import type {
   ApiVersionResponse,
+  CancelPreCommitRequest,
+  CancelPreCommitResponse,
   CommitPlaygroundRequest,
   CommitPlaygroundResponse,
   CreateAddJobRequest,
@@ -25,11 +27,26 @@ import type {
   QueryArtifactResponse,
   QueryPlaygroundListRequest,
   QueryPlaygroundListResponse,
+  QueryPlaygroundChangeListRequest,
+  QueryPlaygroundChangeListResponse,
+  QueryPlaygroundDatasetProfileRequest,
+  QueryPlaygroundDatasetProfileResponse,
+  QueryPlaygroundFileListRequest,
+  QueryPlaygroundFileListResponse,
+  QueryPlaygroundFileMetadataRequest,
+  QueryPlaygroundFileMetadataResponse,
+  QueryPreCommitResponse,
   QueryPlaygroundResponse,
   QueryProjectListRequest,
   QueryProjectListResponse,
   QuerySnapshotListRequest,
   QuerySnapshotListResponse,
+  QuerySnapshotActivityListRequest,
+  QuerySnapshotActivityListResponse,
+  QuerySnapshotDatasetProfileRequest,
+  QuerySnapshotDatasetProfileResponse,
+  QuerySnapshotFileListRequest,
+  QuerySnapshotFileListResponse,
   QuerySnapshotResponse,
   QueryStorageVolumeListRequest,
   QueryStorageVolumeListResponse,
@@ -38,6 +55,12 @@ import type {
   QueryTenantListResponse,
   QueryTenantResponse,
   QueryJobResponse,
+  RestartPreCommitRequest,
+  RestartPreCommitResponse,
+  RetrySnapshotDeliveryRequest,
+  RetrySnapshotDeliveryResponse,
+  StartPreCommitRequest,
+  StartPreCommitResponse,
 } from './types';
 
 export interface ApiResult<T> {
@@ -139,7 +162,7 @@ export async function queryArtifactList(
 ): Promise<ApiResult<QueryArtifactListResponse>> {
   return unwrap(
     await apiClient.POST('/api/artifact/list/query', { body: request, params: versionHeader }),
-  );
+  ) as ApiResult<QueryArtifactListResponse>;
 }
 
 export async function queryArtifact(
@@ -152,7 +175,7 @@ export async function queryArtifact(
       body: { tenant_id: tenantId, project_id: projectId, artifact_id: artifactId },
       params: versionHeader,
     }),
-  );
+  ) as ApiResult<QueryArtifactResponse>;
 }
 
 export async function createArtifact(
@@ -160,7 +183,7 @@ export async function createArtifact(
 ): Promise<ApiResult<CreateArtifactResponse>> {
   return unwrap(
     await apiClient.POST('/api/artifact/create', { body: request, params: versionHeader }),
-  );
+  ) as ApiResult<CreateArtifactResponse>;
 }
 
 export async function queryArtifactCommitGraph(
@@ -209,7 +232,7 @@ export async function queryPlaygroundList(
 ): Promise<ApiResult<QueryPlaygroundListResponse>> {
   return unwrap(
     await apiClient.POST('/api/playground/list/query', { body: request, params: versionHeader }),
-  );
+  ) as ApiResult<QueryPlaygroundListResponse>;
 }
 
 export async function queryPlayground(
@@ -228,7 +251,7 @@ export async function queryPlayground(
       },
       params: versionHeader,
     }),
-  );
+  ) as ApiResult<QueryPlaygroundResponse>;
 }
 
 export async function createPlayground(
@@ -236,6 +259,51 @@ export async function createPlayground(
 ): Promise<ApiResult<CreatePlaygroundResponse>> {
   return unwrap(
     await apiClient.POST('/api/playground/create', { body: request, params: versionHeader }),
+  ) as ApiResult<CreatePlaygroundResponse>;
+}
+
+export async function startPlaygroundPreCommit(
+  request: StartPreCommitRequest,
+): Promise<ApiResult<StartPreCommitResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/precommit/start', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryPlaygroundPreCommit(
+  tenantId: string,
+  precommitId: string,
+): Promise<ApiResult<QueryPreCommitResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/precommit/query', {
+      body: { tenant_id: tenantId, precommit_id: precommitId },
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function restartPlaygroundPreCommit(
+  request: RestartPreCommitRequest,
+): Promise<ApiResult<RestartPreCommitResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/precommit/restart', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function cancelPlaygroundPreCommit(
+  request: CancelPreCommitRequest,
+): Promise<ApiResult<CancelPreCommitResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/precommit/cancel', {
+      body: request,
+      params: versionHeader,
+    }),
   );
 }
 
@@ -247,6 +315,50 @@ export async function commitPlayground(
       body: request,
       params: versionHeader,
     }),
+  ) as ApiResult<CommitPlaygroundResponse>;
+}
+
+export async function queryPlaygroundFileList(
+  request: QueryPlaygroundFileListRequest,
+): Promise<ApiResult<QueryPlaygroundFileListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/file/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryPlaygroundChangeList(
+  request: QueryPlaygroundChangeListRequest,
+): Promise<ApiResult<QueryPlaygroundChangeListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/change/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryPlaygroundFileMetadata(
+  request: QueryPlaygroundFileMetadataRequest,
+): Promise<ApiResult<QueryPlaygroundFileMetadataResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/file/metadata/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryPlaygroundDatasetProfile(
+  request: QueryPlaygroundDatasetProfileRequest,
+): Promise<ApiResult<QueryPlaygroundDatasetProfileResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/playground/dataset/profile/query', {
+      body: request,
+      params: versionHeader,
+    }),
   );
 }
 
@@ -255,23 +367,16 @@ export async function querySnapshotList(
 ): Promise<ApiResult<QuerySnapshotListResponse>> {
   return unwrap(
     await apiClient.POST('/api/snapshot/list/query', { body: request, params: versionHeader }),
-  );
+  ) as ApiResult<QuerySnapshotListResponse>;
 }
 
 export async function querySnapshot(
   tenantId: string,
-  projectId: string,
-  artifactId: string,
-  commitId: string,
+  snapshotId: string,
 ): Promise<ApiResult<QuerySnapshotResponse>> {
   return unwrap(
     await apiClient.POST('/api/snapshot/query', {
-      body: {
-        tenant_id: tenantId,
-        project_id: projectId,
-        artifact_id: artifactId,
-        commit_id: commitId,
-      },
+      body: { tenant_id: tenantId, snapshot_id: snapshotId },
       params: versionHeader,
     }),
   );
@@ -282,6 +387,50 @@ export async function createSnapshot(
 ): Promise<ApiResult<CreateSnapshotResponse>> {
   return unwrap(
     await apiClient.POST('/api/snapshot/create', { body: request, params: versionHeader }),
+  ) as ApiResult<CreateSnapshotResponse>;
+}
+
+export async function retrySnapshotDelivery(
+  request: RetrySnapshotDeliveryRequest,
+): Promise<ApiResult<RetrySnapshotDeliveryResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/snapshot/delivery/retry', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function querySnapshotFileList(
+  request: QuerySnapshotFileListRequest,
+): Promise<ApiResult<QuerySnapshotFileListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/snapshot/file/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function querySnapshotActivityList(
+  request: QuerySnapshotActivityListRequest,
+): Promise<ApiResult<QuerySnapshotActivityListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/snapshot/activity/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function querySnapshotDatasetProfile(
+  request: QuerySnapshotDatasetProfileRequest,
+): Promise<ApiResult<QuerySnapshotDatasetProfileResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/snapshot/dataset/profile/query', {
+      body: request,
+      params: versionHeader,
+    }),
   );
 }
 

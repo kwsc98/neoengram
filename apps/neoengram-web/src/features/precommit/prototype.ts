@@ -1,5 +1,7 @@
 import { reactive } from 'vue';
 
+import type { PlaygroundState } from '@/api/types';
+
 export type PreCommitPhase =
   'queued' | 'scanning' | 'hashing' | 'uploading' | 'validating' | 'ready';
 
@@ -103,6 +105,14 @@ export function cancelPrototypePreCommit(scopeKey: string): void {
   delete activePreCommits[scopeKey];
 }
 
-export function playgroundAvailabilityLabel(state: string): string {
-  return state === 'unavailable' ? '异常' : '可用';
+export function playgroundAvailabilityLabel(state: PlaygroundState): string {
+  return { creating: '创建中', ready: '可用', abnormal: '异常' }[state];
+}
+
+export function playgroundAvailabilityTagType(
+  state: PlaygroundState,
+): 'warning' | 'success' | 'danger' {
+  if (state === 'creating') return 'warning';
+  if (state === 'abnormal') return 'danger';
+  return 'success';
 }

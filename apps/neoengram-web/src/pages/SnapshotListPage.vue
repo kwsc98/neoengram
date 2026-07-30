@@ -9,6 +9,11 @@ import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
+import {
+  snapshotPhaseLabel,
+  snapshotStateLabel,
+  snapshotStateTagType,
+} from '@/features/snapshots/prototype';
 import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
@@ -70,14 +75,14 @@ function previousPage(): void {
   cursor.value = cursorHistory.value.pop() || undefined;
 }
 
-async function openSnapshot(project: string, artifact: string, commit: string): Promise<void> {
+async function openSnapshot(project: string, artifact: string, snapshotId: string): Promise<void> {
   await router.push({
     name: 'snapshot-detail',
     params: {
       tenantId: tenantId.value,
       projectId: project,
       artifactId: artifact,
-      commitId: commit,
+      snapshotId,
     },
   });
 }
@@ -124,33 +129,48 @@ async function openSnapshot(project: string, artifact: string, commit: string): 
       />
       <template v-else>
         <el-table :data="snapshotQuery.data.value?.data.items" class="resource-table desktop-table">
-          <el-table-column label="Commit" min-width="260">
+          <el-table-column label="Snapshot" min-width="250">
             <template #default="scope">
               <button
                 class="resource-link"
                 type="button"
                 @click="
-                  openSnapshot(scope.row.project_id, scope.row.artifact_id, scope.row.commit_id)
+                  openSnapshot(scope.row.project_id, scope.row.artifact_id, scope.row.snapshot_id)
                 "
               >
                 <strong>{{ scope.row.message }}</strong
-                ><code>{{ scope.row.commit_id }}</code>
+                ><code>{{ scope.row.snapshot_id }}</code>
               </button>
             </template>
           </el-table-column>
+          <el-table-column label="Commit" min-width="170">
+            <template #default="scope"
+              ><code>{{ scope.row.commit_id }}</code></template
+            >
+          </el-table-column>
           <el-table-column prop="artifact_id" label="Artifact" min-width="160" />
+          <el-table-column label="状态" min-width="145">
+            <template #default="scope">
+              <div class="state-stack">
+                <el-tag :type="snapshotStateTagType(scope.row.state)" effect="plain">
+                  {{ snapshotStateLabel(scope.row.state) }}
+                </el-tag>
+                <small>{{ snapshotPhaseLabel(scope.row.phase) }}</small>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column label="Tags" min-width="170">
             <template #default="scope">
               <div class="tag-list">
                 <el-tag
-                  v-for="tagName in commitTagNames(scope.row.ref_names)"
+                  v-for="tagName in commitTagNames(scope.row.tag_names)"
                   :key="tagName"
                   size="small"
                   effect="plain"
                 >
                   {{ tagName }}
                 </el-tag>
-                <span v-if="commitTagNames(scope.row.ref_names).length === 0">—</span>
+                <span v-if="commitTagNames(scope.row.tag_names).length === 0">—</span>
               </div>
             </template>
           </el-table-column>
@@ -178,7 +198,7 @@ async function openSnapshot(project: string, artifact: string, commit: string): 
                 :icon="ArrowRight"
                 title="查看 Snapshot"
                 @click="
-                  openSnapshot(scope.row.project_id, scope.row.artifact_id, scope.row.commit_id)
+                  openSnapshot(scope.row.project_id, scope.row.artifact_id, scope.row.snapshot_id)
                 "
               />
             </template>
@@ -187,20 +207,23 @@ async function openSnapshot(project: string, artifact: string, commit: string): 
         <div class="mobile-resource-list">
           <button
             v-for="snapshot in snapshotQuery.data.value?.data.items"
-            :key="`${snapshot.project_id}/${snapshot.artifact_id}/${snapshot.commit_id}`"
+            :key="snapshot.snapshot_id"
             class="mobile-resource-item"
             type="button"
-            @click="openSnapshot(snapshot.project_id, snapshot.artifact_id, snapshot.commit_id)"
+            @click="openSnapshot(snapshot.project_id, snapshot.artifact_id, snapshot.snapshot_id)"
           >
             <span
               ><strong>{{ snapshot.message }}</strong
-              ><code>{{ snapshot.commit_id }}</code
-              ><small v-if="commitTagNames(snapshot.ref_names).length" class="mobile-resource-tags">
-                Tags: {{ commitTagNames(snapshot.ref_names).join(', ') }}
+              ><code>{{ snapshot.snapshot_id }}</code
+              ><small>Commit {{ snapshot.commit_id }}</small
+              ><small v-if="commitTagNames(snapshot.tag_names).length" class="mobile-resource-tags">
+                Tags: {{ commitTagNames(snapshot.tag_names).join(', ') }}
               </small></span
             >
             <span
               ><small>{{ snapshot.region }} · {{ formatBytes(snapshot.logical_size_bytes) }}</small
+              ><el-tag :type="snapshotStateTagType(snapshot.state)" size="small" effect="plain">
+                {{ snapshotStateLabel(snapshot.state) }} </el-tag
               ><ArrowRight
             /></span>
           </button>

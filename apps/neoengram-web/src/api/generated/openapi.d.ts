@@ -220,7 +220,8 @@ export interface paths {
         put?: never;
         /**
          * 创建 Artifact
-         * @description 在指定 Tenant/Project 下创建空 Artifact；资源身份使相同请求可幂等重放。
+         * @description 在指定 Tenant/Project 下创建空 Artifact，或从同 Tenant 另一 Artifact 的明确 Commit 派生。
+         *     Artifact 本身不选择 StorageVolume 或 Region；资源身份使相同请求可幂等重放。
          */
         post: operations["createArtifact"];
         delete?: never;
@@ -240,7 +241,7 @@ export interface paths {
         put?: never;
         /**
          * 查询 Artifact Commit 图
-         * @description 分页返回单 parent Commit 节点和 Ref tips。Cursor 绑定 graph version 与完整 scope；
+         * @description 分页返回单 parent Commit 节点、公开 Tags 和当前 head Commit。Cursor 绑定 graph version 与完整 scope；
          *     公开节点不包含 root directory、Manifest、Chunk 或存储信息。
          */
         post: operations["queryArtifactCommitGraph"];
@@ -283,7 +284,8 @@ export interface paths {
         put?: never;
         /**
          * 查询租户内 Playground
-         * @description 分页查询 Playground；Artifact 筛选必须同时提供 Project scope。
+         * @description 按 Project、Artifact、Region、主状态或关键字分页查询 Playground。Artifact 筛选必须同时
+         *     提供 Project scope；opaque cursor 与完整筛选条件绑定。
          */
         post: operations["queryPlaygroundList"];
         delete?: never;
@@ -332,6 +334,173 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/playground/precommit/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 发起 Playground Pre-commit
+         * @description 为 Ready Playground 的当前 IndexVersion 创建冻结候选。服务端生成 `precommit_id`；相同
+         *     `precommit_request_id` 和 payload 返回原结果，不同 payload 返回 409。200 返回时 Pre-commit
+         *     已持久化且可查询，扫描、哈希、上传和校验通过其状态、阶段与进度异步推进。
+         */
+        post: operations["startPlaygroundPreCommit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/playground/precommit/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Playground Pre-commit
+         * @description 使用 Tenant 和服务端生成的 Pre-commit ID 查询冻结候选、检查和 Diff 摘要。
+         */
+        post: operations["queryPlaygroundPreCommit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/playground/precommit/restart": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 重新发起 Playground Pre-commit
+         * @description 在同一 Pre-commit ID 上创建新的 attempt，并冻结请求给定的当前 IndexVersion。只允许从可重试
+         *     状态发起；相同 `restart_request_id` 和 payload 幂等返回，状态或版本不匹配返回 409。
+         */
+        post: operations["restartPlaygroundPreCommit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/playground/precommit/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 取消 Playground Pre-commit
+         * @description 取消尚未提交的 Pre-commit 并清除 Playground 的 active Pre-commit。相同
+         *     `cancel_request_id` 和 payload 幂等返回；已提交或状态不允许取消时返回 409。
+         */
+        post: operations["cancelPlaygroundPreCommit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/playground/file/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Playground 文件列表
+         * @description 分页返回当前工作区 IndexVersion 的逻辑文件和目录。响应不包含 Manifest ID、内容摘要、
+         *     对象位置、凭据或物理路径；opaque cursor 与资源 scope、IndexVersion 和筛选条件绑定。
+         */
+        post: operations["queryPlaygroundFileList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/playground/change/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Playground 文件变更
+         * @description 未提供 `precommit_id` 时分页查询当前工作区相对父 Commit 的变更；提供时查询该
+         *     Pre-commit 的冻结候选。响应只包含逻辑路径、变更类型、格式和大小统计。
+         */
+        post: operations["queryPlaygroundChangeList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/playground/file/metadata/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Playground 文件元数据
+         * @description 返回当前工作区中一个逻辑文件的大小、格式、Schema、统计、质量和 freshness；不返回
+         *     Manifest、Chunk、对象分布、凭据或底层文件系统路径。
+         */
+        post: operations["queryPlaygroundFileMetadata"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/playground/dataset/profile/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Playground Dataset Profile
+         * @description 返回当前工作区 IndexVersion 的公开数据集画像、Schema、质量和 freshness 摘要。
+         */
+        post: operations["queryPlaygroundDatasetProfile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/playground/commit/create": {
         parameters: {
             query?: never;
@@ -343,8 +512,9 @@ export interface paths {
         put?: never;
         /**
          * 提交 Playground
-         * @description 从 Playground 当前 IndexVersion 创建不可变 Commit，并以 `commit_request_id` 提供稳定的
-         *     mutation identity。服务端必须对 expected IndexVersion 和目标 Ref 执行 CAS。
+         * @description 消费属于该 Playground、状态为 Ready 且候选 IndexVersion 匹配的 Pre-commit，创建不可变
+         *     Commit，并把 Pre-commit 标记为 Committed。`commit_request_id` 是稳定 mutation identity；
+         *     200 返回时 Commit、Playground 和已消费 Pre-commit 均已持久化且可查询。
          */
         post: operations["commitPlayground"];
         delete?: never;
@@ -364,7 +534,8 @@ export interface paths {
         put?: never;
         /**
          * 查询租户内 Snapshot
-         * @description 分页查询固定到 Artifact Commit 的只读 Snapshot。
+         * @description 按 Project、Artifact、Commit、Region、StorageVolume 或状态分页查询独立 Snapshot。
+         *     opaque cursor 与全部筛选条件绑定。
          */
         post: operations["querySnapshotList"];
         delete?: never;
@@ -384,7 +555,7 @@ export interface paths {
         put?: never;
         /**
          * 查询 Snapshot 详情
-         * @description 使用 tenant、project、artifact、commit 复合身份查询只读 Snapshot。
+         * @description 使用 Tenant 和服务端生成的独立 Snapshot ID 查询脱敏交付详情。
          */
         post: operations["querySnapshot"];
         delete?: never;
@@ -404,9 +575,95 @@ export interface paths {
         put?: never;
         /**
          * 创建 Snapshot
-         * @description 为指定 Artifact Commit 创建或幂等返回固定只读 Snapshot。
+         * @description 为指定 Artifact Commit 和 StorageVolume 创建单区域只读 Snapshot。服务端生成 `snapshot_id`；
+         *     相同 `snapshot_request_id` 和 payload 返回 `replayed: true`，不同 request identity 命中同一
+         *     Commit/Volume 的未删除 Snapshot 时返回 `placement_reused: true`。200 返回时 Snapshot 记录
+         *     已持久化且可查询，后续交付由其状态和阶段表达。
          */
         post: operations["createSnapshot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/snapshot/delivery/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 重试 Snapshot 交付
+         * @description 对 Abnormal Snapshot 的同一固定 Commit/Volume 交付重新发起 attempt，使状态回到 Creating。
+         *     相同 `retry_request_id` 和 payload 幂等返回；状态不允许重试时返回 409。200 返回时新的交付
+         *     attempt 已持久化，后续进度通过 Snapshot 状态、阶段和活动查询。
+         */
+        post: operations["retrySnapshotDelivery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/snapshot/file/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Snapshot 文件列表
+         * @description 分页返回 Ready Snapshot 的逻辑文件和目录。Creating 或 Abnormal 状态返回 409；响应不包含
+         *     Manifest、内容摘要、对象位置、凭据或物理路径，opaque cursor 与筛选条件绑定。
+         */
+        post: operations["querySnapshotFileList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/snapshot/activity/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Snapshot 交付活动
+         * @description 分页返回 Snapshot 创建、阶段变化、失败、重试和就绪的脱敏活动记录。
+         */
+        post: operations["querySnapshotActivityList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/snapshot/dataset/profile/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Snapshot Dataset Profile
+         * @description 返回固定 Snapshot 的公开数据集画像、Schema、质量和 freshness 摘要。
+         */
+        post: operations["querySnapshotDatasetProfile"];
         delete?: never;
         options?: never;
         head?: never;
@@ -679,31 +936,47 @@ export interface components {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
-            storage_volume_id: components["schemas"]["StorageVolumeId"];
             display_name: components["schemas"]["DisplayName"];
             description?: components["schemas"]["Description"];
-            /** @default refs/heads/main */
-            default_ref: components["schemas"]["RefName"];
+            initialization: components["schemas"]["ArtifactInitialization"];
         } & {
             [key: string]: unknown;
+        };
+        ArtifactInitialization: components["schemas"]["EmptyArtifactInitialization"] | components["schemas"]["DerivedArtifactInitialization"];
+        EmptyArtifactInitialization: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            mode: "empty";
+        };
+        /** @description 来源 Artifact 必须属于当前 Tenant，来源 Commit 必须属于显式来源 Project/Artifact。 */
+        DerivedArtifactInitialization: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            mode: "derived";
+            source_project_id: components["schemas"]["ProjectId"];
+            source_artifact_id: components["schemas"]["ArtifactId"];
+            source_commit_id: components["schemas"]["CommitId"];
         };
         CreateArtifactResponse: {
             artifact: components["schemas"]["ArtifactView"];
             replayed: boolean;
         };
         /**
-         * @description 暴露用户选择的 StorageVolume ID 和派生 region，但不暴露内部 ArtifactPlacement、Agent、
-         *     Manifest、挂载路径或 authority 存储位置。
+         * @description Artifact 是不绑定 Region 或 StorageVolume 的版本化逻辑数据资产。初始化血缘只暴露
+         *     同 Tenant 的逻辑来源，不暴露 ArtifactPlacement、Manifest 或物理对象位置。
          */
         ArtifactView: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
-            storage_volume_id: components["schemas"]["StorageVolumeId"];
-            region: components["schemas"]["RegionName"];
             display_name: components["schemas"]["DisplayName"];
             description?: components["schemas"]["Description"];
-            default_ref: components["schemas"]["RefName"];
+            initialization: components["schemas"]["ArtifactInitialization"];
+            head_commit_id?: components["schemas"]["CommitId"];
             resource_version: components["schemas"]["CanonicalU64"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
@@ -720,13 +993,9 @@ export interface components {
         };
         CommitGraphView: {
             graph_version: components["schemas"]["CanonicalU64"];
-            refs: components["schemas"]["RefTip"][];
+            head_commit_id?: components["schemas"]["CommitId"];
             nodes: components["schemas"]["CommitNode"][];
             next_cursor?: components["schemas"]["PageCursor"];
-        };
-        RefTip: {
-            name: components["schemas"]["RefName"];
-            commit_id: components["schemas"]["CommitId"];
         };
         /** @description 单 parent 的公开 Commit 节点，不包含 Directory 或 Manifest identity。 */
         CommitNode: {
@@ -734,7 +1003,7 @@ export interface components {
             parent_commit_id?: components["schemas"]["CommitId"];
             message: string;
             description?: components["schemas"]["Description"];
-            ref_names: components["schemas"]["RefName"][];
+            tag_names: components["schemas"]["TagName"][];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
         };
         QueryArtifactCommitDiffRequest: {
@@ -774,6 +1043,8 @@ export interface components {
             tenant_id: components["schemas"]["TenantId"];
             project_id?: components["schemas"]["ProjectId"];
             artifact_id?: components["schemas"]["ArtifactId"];
+            region?: components["schemas"]["RegionName"];
+            state?: components["schemas"]["PlaygroundState"];
             cursor?: components["schemas"]["PageCursor"];
             page_size?: components["schemas"]["PageSize"];
             query?: components["schemas"]["SearchQuery"];
@@ -806,9 +1077,11 @@ export interface components {
             playground: components["schemas"]["PlaygroundView"];
             replayed: boolean;
         };
+        /** @enum {string} */
+        PlaygroundState: "creating" | "ready" | "abnormal";
         /**
-         * @description 暴露用户选择的 StorageVolume ID 和派生 region，但不暴露 attachment、lease、fencing、
-         *     Agent 或文件系统位置。
+         * @description Playground 的 Region 始终由所选 StorageVolume 派生。主状态只表达工作区可用性；
+         *     scanning、hashing、uploading 和 validating 仅属于独立 Pre-commit 流程。
          */
         PlaygroundView: {
             tenant_id: components["schemas"]["TenantId"];
@@ -821,10 +1094,103 @@ export interface components {
             base_commit_id?: components["schemas"]["CommitId"];
             head_commit_id?: components["schemas"]["CommitId"];
             index_version: components["schemas"]["IndexVersion"];
-            /** @enum {string} */
-            state: "ready" | "scanning" | "unavailable";
+            state: components["schemas"]["PlaygroundState"];
+            active_precommit_id?: components["schemas"]["PreCommitId"];
+            issue?: components["schemas"]["ResourceIssueSummary"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        StartPreCommitRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            playground_id: components["schemas"]["PlaygroundId"];
+            precommit_request_id: components["schemas"]["ResourceId"];
+            expected_index_version: components["schemas"]["IndexVersion"];
+        } & {
+            [key: string]: unknown;
+        };
+        StartPreCommitResponse: {
+            precommit: components["schemas"]["PreCommitView"];
+            playground: components["schemas"]["PlaygroundView"];
+            replayed: boolean;
+        };
+        QueryPreCommitRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            precommit_id: components["schemas"]["PreCommitId"];
+        };
+        QueryPreCommitResponse: {
+            precommit: components["schemas"]["PreCommitView"];
+        };
+        RestartPreCommitRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            precommit_id: components["schemas"]["PreCommitId"];
+            restart_request_id: components["schemas"]["ResourceId"];
+            expected_index_version: components["schemas"]["IndexVersion"];
+        } & {
+            [key: string]: unknown;
+        };
+        RestartPreCommitResponse: {
+            precommit: components["schemas"]["PreCommitView"];
+            playground: components["schemas"]["PlaygroundView"];
+            replayed: boolean;
+        };
+        CancelPreCommitRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            precommit_id: components["schemas"]["PreCommitId"];
+            cancel_request_id: components["schemas"]["ResourceId"];
+        } & {
+            [key: string]: unknown;
+        };
+        CancelPreCommitResponse: {
+            precommit: components["schemas"]["PreCommitView"];
+            playground: components["schemas"]["PlaygroundView"];
+            replayed: boolean;
+        };
+        /** @enum {string} */
+        PreCommitState: "running" | "ready" | "abnormal" | "cancelled" | "committed";
+        /** @enum {string} */
+        PreCommitPhase: "queued" | "scanning" | "hashing" | "uploading" | "validating" | "idle";
+        /** @description Playground 某一 IndexVersion 的冻结候选及其脱敏检查结果。 */
+        PreCommitView: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            playground_id: components["schemas"]["PlaygroundId"];
+            precommit_id: components["schemas"]["PreCommitId"];
+            precommit_request_id: components["schemas"]["ResourceId"];
+            attempt: number;
+            state: components["schemas"]["PreCommitState"];
+            phase: components["schemas"]["PreCommitPhase"];
+            progress: components["schemas"]["PreCommitProgress"];
+            checks: components["schemas"]["PreCommitCheck"][];
+            warnings: components["schemas"]["PreCommitNotice"][];
+            blockers: components["schemas"]["PreCommitNotice"][];
+            source_index_version: components["schemas"]["IndexVersion"];
+            candidate_index_version?: components["schemas"]["IndexVersion"];
+            diff_summary?: components["schemas"]["CommitDiffSummary"];
+            issue?: components["schemas"]["ResourceIssueSummary"];
+            committed_commit_id?: components["schemas"]["CommitId"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        PreCommitProgress: {
+            percent: number;
+            files_completed: components["schemas"]["CanonicalU64"];
+            files_total?: components["schemas"]["CanonicalU64"];
+            bytes_completed: components["schemas"]["CanonicalU64"];
+            bytes_total?: components["schemas"]["CanonicalU64"];
+        };
+        PreCommitCheck: {
+            check_id: components["schemas"]["ResourceId"];
+            /** @enum {string} */
+            status: "pending" | "passed" | "warning" | "failed";
+            summary: string;
+        };
+        PreCommitNotice: {
+            code: components["schemas"]["ErrorCode"];
+            message: string;
+            path?: components["schemas"]["LogicalPath"];
         };
         CommitPlaygroundRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -832,7 +1198,8 @@ export interface components {
             artifact_id: components["schemas"]["ArtifactId"];
             playground_id: components["schemas"]["PlaygroundId"];
             commit_request_id: components["schemas"]["ResourceId"];
-            expected_index_version: components["schemas"]["IndexVersion"];
+            precommit_id: components["schemas"]["PreCommitId"];
+            expected_candidate_index_version: components["schemas"]["IndexVersion"];
             message: string;
             description?: components["schemas"]["Description"];
             tag_names?: components["schemas"]["TagName"][];
@@ -842,12 +1209,157 @@ export interface components {
         CommitPlaygroundResponse: {
             commit: components["schemas"]["CommitNode"];
             playground: components["schemas"]["PlaygroundView"];
+            consumed_precommit: components["schemas"]["PreCommitView"];
             replayed: boolean;
         };
+        QueryPlaygroundFileListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            playground_id: components["schemas"]["PlaygroundId"];
+            path_prefix?: components["schemas"]["LogicalPath"];
+            format?: components["schemas"]["FileFormat"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
+        };
+        QueryPlaygroundFileListResponse: {
+            index_version: components["schemas"]["IndexVersion"];
+            items: components["schemas"]["LogicalFileEntry"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        QueryPlaygroundChangeListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            playground_id: components["schemas"]["PlaygroundId"];
+            precommit_id?: components["schemas"]["PreCommitId"];
+            change_type?: components["schemas"]["FileChangeType"];
+            path_prefix?: components["schemas"]["LogicalPath"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
+        };
+        QueryPlaygroundChangeListResponse: {
+            /** @enum {string} */
+            source: "workspace" | "precommit";
+            precommit_id?: components["schemas"]["PreCommitId"];
+            index_version: components["schemas"]["IndexVersion"];
+            summary: components["schemas"]["CommitDiffSummary"];
+            items: components["schemas"]["PlaygroundChangeEntry"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        PlaygroundChangeEntry: {
+            change_type: components["schemas"]["FileChangeType"];
+            path: components["schemas"]["LogicalPath"];
+            previous_path?: components["schemas"]["LogicalPath"];
+            old_size_bytes?: components["schemas"]["CanonicalU64"];
+            new_size_bytes?: components["schemas"]["CanonicalU64"];
+            format?: components["schemas"]["FileFormat"];
+        };
+        QueryPlaygroundFileMetadataRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            playground_id: components["schemas"]["PlaygroundId"];
+            path: components["schemas"]["LogicalPath"];
+        };
+        QueryPlaygroundFileMetadataResponse: {
+            index_version: components["schemas"]["IndexVersion"];
+            metadata: components["schemas"]["FileMetadataView"];
+        };
+        QueryPlaygroundDatasetProfileRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            playground_id: components["schemas"]["PlaygroundId"];
+        };
+        QueryPlaygroundDatasetProfileResponse: {
+            index_version: components["schemas"]["IndexVersion"];
+            profile: components["schemas"]["DatasetProfileView"];
+        };
+        LogicalFileEntry: {
+            path: components["schemas"]["LogicalPath"];
+            /** @enum {string} */
+            entry_type: "file" | "directory";
+            size_bytes?: components["schemas"]["CanonicalU64"];
+            format?: components["schemas"]["FileFormat"];
+            row_count?: components["schemas"]["CanonicalU64"];
+            updated_at_unix_ms?: components["schemas"]["UnixMillis"];
+        };
+        /** @description 只包含逻辑文件属性和数据统计，不包含 Manifest、对象或文件系统位置。 */
+        FileMetadataView: {
+            path: components["schemas"]["LogicalPath"];
+            size_bytes: components["schemas"]["CanonicalU64"];
+            format: components["schemas"]["FileFormat"];
+            media_type?: string;
+            row_count?: components["schemas"]["CanonicalU64"];
+            schema?: components["schemas"]["DatasetSchemaView"];
+            statistics?: components["schemas"]["DatasetStatisticsView"];
+            quality?: components["schemas"]["DataQualitySummary"];
+            freshness?: components["schemas"]["FreshnessSummary"];
+        };
+        /** @enum {string} */
+        DatasetProfileState: "not_declared" | "ready" | "rejected";
+        DatasetProfileView: {
+            state: components["schemas"]["DatasetProfileState"];
+            summary?: components["schemas"]["DatasetProfileSummary"];
+            schema?: components["schemas"]["DatasetSchemaView"];
+            statistics?: components["schemas"]["DatasetStatisticsView"];
+            quality?: components["schemas"]["DataQualitySummary"];
+            freshness?: components["schemas"]["FreshnessSummary"];
+            issue?: components["schemas"]["ResourceIssueSummary"];
+        };
+        DatasetProfileSummary: {
+            format_count: number;
+            logical_file_count: components["schemas"]["CanonicalU64"];
+            logical_size_bytes: components["schemas"]["CanonicalU64"];
+            row_count?: components["schemas"]["CanonicalU64"];
+            field_count?: number;
+        };
+        DatasetSchemaView: {
+            fields: components["schemas"]["DatasetFieldView"][];
+        };
+        DatasetFieldView: {
+            name: string;
+            data_type: string;
+            nullable: boolean;
+            description?: components["schemas"]["Description"];
+        };
+        DatasetStatisticsView: {
+            row_count?: components["schemas"]["CanonicalU64"];
+            column_count?: number;
+            null_value_count?: components["schemas"]["CanonicalU64"];
+            distinct_value_count?: components["schemas"]["CanonicalU64"];
+        };
+        DataQualitySummary: {
+            /** @enum {string} */
+            state: "not_evaluated" | "passed" | "warning" | "failed";
+            checks_total: number;
+            checks_passed: number;
+            checks_failed: number;
+        };
+        FreshnessSummary: {
+            observed_at_unix_ms: components["schemas"]["UnixMillis"];
+            source_updated_at_unix_ms?: components["schemas"]["UnixMillis"];
+            age_seconds?: components["schemas"]["CanonicalU64"];
+        };
+        /** @description 面向用户的脱敏异常摘要，不包含 Agent、挂载、凭据或物理位置。 */
+        ResourceIssueSummary: {
+            code: components["schemas"]["ErrorCode"];
+            message: string;
+            retryable: boolean;
+            occurred_at_unix_ms?: components["schemas"]["UnixMillis"];
+        };
+        /** @enum {string} */
+        FileChangeType: "added" | "modified" | "deleted" | "renamed";
+        FileFormat: string;
         QuerySnapshotListRequest: {
             tenant_id: components["schemas"]["TenantId"];
             project_id?: components["schemas"]["ProjectId"];
             artifact_id?: components["schemas"]["ArtifactId"];
+            commit_id?: components["schemas"]["CommitId"];
+            region?: components["schemas"]["RegionName"];
+            storage_volume_id?: components["schemas"]["StorageVolumeId"];
+            state?: components["schemas"]["SnapshotState"];
             cursor?: components["schemas"]["PageCursor"];
             page_size?: components["schemas"]["PageSize"];
         };
@@ -857,9 +1369,7 @@ export interface components {
         };
         QuerySnapshotRequest: {
             tenant_id: components["schemas"]["TenantId"];
-            project_id: components["schemas"]["ProjectId"];
-            artifact_id: components["schemas"]["ArtifactId"];
-            commit_id: components["schemas"]["CommitId"];
+            snapshot_id: components["schemas"]["SnapshotId"];
         };
         QuerySnapshotResponse: {
             snapshot: components["schemas"]["SnapshotView"];
@@ -870,15 +1380,71 @@ export interface components {
             artifact_id: components["schemas"]["ArtifactId"];
             commit_id: components["schemas"]["CommitId"];
             storage_volume_id: components["schemas"]["StorageVolumeId"];
+            snapshot_request_id: components["schemas"]["ResourceId"];
         } & {
             [key: string]: unknown;
         };
         CreateSnapshotResponse: {
             snapshot: components["schemas"]["SnapshotView"];
             replayed: boolean;
+            placement_reused: boolean;
         };
-        /** @description 由 tenant、project、artifact、commit 复合身份确定的只读 Snapshot。 */
+        RetrySnapshotDeliveryRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            snapshot_id: components["schemas"]["SnapshotId"];
+            retry_request_id: components["schemas"]["ResourceId"];
+        } & {
+            [key: string]: unknown;
+        };
+        RetrySnapshotDeliveryResponse: {
+            snapshot: components["schemas"]["SnapshotView"];
+            replayed: boolean;
+        };
+        QuerySnapshotFileListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            snapshot_id: components["schemas"]["SnapshotId"];
+            path_prefix?: components["schemas"]["LogicalPath"];
+            format?: components["schemas"]["FileFormat"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
+        };
+        QuerySnapshotFileListResponse: {
+            items: components["schemas"]["LogicalFileEntry"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        QuerySnapshotActivityListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            snapshot_id: components["schemas"]["SnapshotId"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
+        };
+        QuerySnapshotActivityListResponse: {
+            items: components["schemas"]["SnapshotActivityView"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        SnapshotActivityView: {
+            activity_id: components["schemas"]["ResourceId"];
+            /** @enum {string} */
+            activity_type: "created" | "phase_changed" | "ready" | "failed" | "retry_started";
+            summary: string;
+            phase?: components["schemas"]["SnapshotPhase"];
+            issue?: components["schemas"]["ResourceIssueSummary"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        QuerySnapshotDatasetProfileRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            snapshot_id: components["schemas"]["SnapshotId"];
+        };
+        QuerySnapshotDatasetProfileResponse: {
+            profile: components["schemas"]["DatasetProfileView"];
+        };
+        /** @enum {string} */
+        SnapshotState: "creating" | "ready" | "abnormal";
+        /** @enum {string} */
+        SnapshotPhase: "planning" | "materializing" | "verifying" | "idle";
+        /** @description 独立身份、固定 Commit、单 StorageVolume 和单 Region 的只读交付资源。 */
         SnapshotView: {
+            snapshot_id: components["schemas"]["SnapshotId"];
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
@@ -886,10 +1452,23 @@ export interface components {
             storage_volume_id: components["schemas"]["StorageVolumeId"];
             region: components["schemas"]["RegionName"];
             message: string;
-            ref_names: components["schemas"]["RefName"][];
+            tag_names: components["schemas"]["TagName"][];
+            state: components["schemas"]["SnapshotState"];
+            phase: components["schemas"]["SnapshotPhase"];
+            issue?: components["schemas"]["ResourceIssueSummary"];
+            integrity: components["schemas"]["SnapshotIntegritySummary"];
+            logical_file_count: components["schemas"]["CanonicalU64"];
+            logical_size_bytes: components["schemas"]["CanonicalU64"];
+            dataset_profile?: components["schemas"]["DatasetProfileSummary"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
-            logical_file_count?: components["schemas"]["CanonicalU64"];
-            logical_size_bytes?: components["schemas"]["CanonicalU64"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        SnapshotIntegritySummary: {
+            /** @enum {string} */
+            state: "pending" | "verified" | "failed";
+            files_verified: components["schemas"]["CanonicalU64"];
+            bytes_verified: components["schemas"]["CanonicalU64"];
+            verified_at_unix_ms?: components["schemas"]["UnixMillis"];
         };
         /**
          * @description 公开 Add operation。服务端将认证后的 PrincipalRef 注入 canonical operation 后计算
@@ -1052,6 +1631,8 @@ export interface components {
         ArtifactId: components["schemas"]["ResourceId"];
         PlaygroundId: components["schemas"]["ResourceId"];
         CommitId: components["schemas"]["ResourceId"];
+        PreCommitId: components["schemas"]["ResourceId"];
+        SnapshotId: components["schemas"]["ResourceId"];
         JobId: components["schemas"]["ResourceId"];
         RequestId: components["schemas"]["ResourceId"];
         ResourceId: string;
@@ -1066,7 +1647,6 @@ export interface components {
         /** @enum {string} */
         StorageVolumeState: "ready" | "degraded" | "unavailable";
         PermissionName: string;
-        RefName: string;
         TagName: string;
         /** @description 服务端生成、与资源 scope、筛选条件和排序绑定的不透明分页 token。 */
         PageCursor: string;
@@ -1915,11 +2495,12 @@ export interface operations {
                      *           "tenant_id": "tenant-a",
                      *           "project_id": "project-vision",
                      *           "artifact_id": "road-scenes",
-                     *           "storage_volume_id": "volume-shanghai-vision",
-                     *           "region": "cn-shanghai",
                      *           "display_name": "道路场景数据集",
                      *           "description": "训练与回归评估数据",
-                     *           "default_ref": "refs/heads/main",
+                     *           "initialization": {
+                     *             "mode": "empty"
+                     *           },
+                     *           "head_commit_id": "commit-main-3",
                      *           "resource_version": "18",
                      *           "created_at_unix_ms": "1785167000000",
                      *           "updated_at_unix_ms": "1785167600000"
@@ -1988,11 +2569,12 @@ export interface operations {
                      *         "tenant_id": "tenant-a",
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
-                     *         "storage_volume_id": "volume-shanghai-vision",
-                     *         "region": "cn-shanghai",
                      *         "display_name": "道路场景数据集",
                      *         "description": "训练与回归评估数据",
-                     *         "default_ref": "refs/heads/main",
+                     *         "initialization": {
+                     *           "mode": "empty"
+                     *         },
+                     *         "head_commit_id": "commit-main-3",
                      *         "resource_version": "18",
                      *         "created_at_unix_ms": "1785167000000",
                      *         "updated_at_unix_ms": "1785167600000"
@@ -2041,9 +2623,13 @@ export interface operations {
                  *       "tenant_id": "tenant-a",
                  *       "project_id": "project-vision",
                  *       "artifact_id": "evaluation-set",
-                 *       "storage_volume_id": "volume-shanghai-vision",
                  *       "display_name": "评测数据集",
-                 *       "default_ref": "refs/heads/main"
+                 *       "initialization": {
+                 *         "mode": "derived",
+                 *         "source_project_id": "project-vision",
+                 *         "source_artifact_id": "road-scenes",
+                 *         "source_commit_id": "commit-main-3"
+                 *       }
                  *     }
                  */
                 "application/json": components["schemas"]["CreateArtifactRequest"];
@@ -2118,23 +2704,15 @@ export interface operations {
                      * @example {
                      *       "graph": {
                      *         "graph_version": "18",
-                     *         "refs": [
-                     *           {
-                     *             "name": "refs/heads/main",
-                     *             "commit_id": "commit-main-3"
-                     *           },
-                     *           {
-                     *             "name": "refs/heads/experiment",
-                     *             "commit_id": "commit-exp-2"
-                     *           }
-                     *         ],
+                     *         "head_commit_id": "commit-main-3",
                      *         "nodes": [
                      *           {
                      *             "commit_id": "commit-main-3",
                      *             "parent_commit_id": "commit-main-2",
                      *             "message": "补充夜间道路场景",
-                     *             "ref_names": [
-                     *               "refs/heads/main"
+                     *             "tag_names": [
+                     *               "dataset/v4",
+                     *               "release-candidate"
                      *             ],
                      *             "created_at_unix_ms": "1785167600000"
                      *           },
@@ -2142,8 +2720,8 @@ export interface operations {
                      *             "commit_id": "commit-exp-2",
                      *             "parent_commit_id": "commit-main-2",
                      *             "message": "实验标注集",
-                     *             "ref_names": [
-                     *               "refs/heads/experiment"
+                     *             "tag_names": [
+                     *               "occlusion-experiment"
                      *             ],
                      *             "created_at_unix_ms": "1785167500000"
                      *           }
@@ -2216,8 +2794,8 @@ export interface operations {
                      *           "parent_commit_id": "commit-root-1",
                      *           "message": "完成首轮质量复核",
                      *           "description": "完成白天场景的质量抽检和标签修订。",
-                     *           "ref_names": [
-                     *             "refs/tags/v1.0"
+                     *           "tag_names": [
+                     *             "v1.0"
                      *           ],
                      *           "created_at_unix_ms": "1785067400000"
                      *         },
@@ -2226,8 +2804,9 @@ export interface operations {
                      *           "parent_commit_id": "commit-main-2",
                      *           "message": "补充夜间道路场景",
                      *           "description": "增加夜间和低照度样本，并更新场景索引。",
-                     *           "ref_names": [
-                     *             "refs/heads/main"
+                     *           "tag_names": [
+                     *             "dataset/v4",
+                     *             "release-candidate"
                      *           ],
                      *           "created_at_unix_ms": "1785167600000"
                      *         },
@@ -2297,6 +2876,8 @@ export interface operations {
                  *       "tenant_id": "tenant-a",
                  *       "project_id": "project-vision",
                  *       "artifact_id": "road-scenes",
+                 *       "region": "cn-shanghai",
+                 *       "state": "ready",
                  *       "page_size": 50
                  *     }
                  */
@@ -2486,6 +3067,692 @@ export interface operations {
             503: components["responses"]["ServiceUnavailableProblem"];
         };
     };
+    startPlaygroundPreCommit: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "road-scenes",
+                 *       "playground_id": "labeling",
+                 *       "precommit_request_id": "precommit-request-july-labels",
+                 *       "expected_index_version": {
+                 *         "revision": "31",
+                 *         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["StartPreCommitRequest"];
+            };
+        };
+        responses: {
+            /** @description 已创建或幂等返回的 Pre-commit */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "precommit": {
+                     *         "tenant_id": "tenant-a",
+                     *         "project_id": "project-vision",
+                     *         "artifact_id": "road-scenes",
+                     *         "playground_id": "labeling",
+                     *         "precommit_id": "precommit-july-labels-01",
+                     *         "precommit_request_id": "precommit-request-july-labels",
+                     *         "attempt": 1,
+                     *         "state": "running",
+                     *         "phase": "queued",
+                     *         "progress": {
+                     *           "percent": 0,
+                     *           "files_completed": "0",
+                     *           "bytes_completed": "0"
+                     *         },
+                     *         "checks": [],
+                     *         "warnings": [],
+                     *         "blockers": [],
+                     *         "source_index_version": {
+                     *           "revision": "31",
+                     *           "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     *         },
+                     *         "created_at_unix_ms": "1785167600000",
+                     *         "updated_at_unix_ms": "1785167600000"
+                     *       },
+                     *       "playground": {
+                     *         "tenant_id": "tenant-a",
+                     *         "project_id": "project-vision",
+                     *         "artifact_id": "road-scenes",
+                     *         "playground_id": "labeling",
+                     *         "storage_volume_id": "volume-shanghai-vision",
+                     *         "region": "cn-shanghai",
+                     *         "display_name": "标注工作区",
+                     *         "base_commit_id": "commit-main-2",
+                     *         "head_commit_id": "commit-main-3",
+                     *         "index_version": {
+                     *           "revision": "31",
+                     *           "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     *         },
+                     *         "state": "ready",
+                     *         "active_precommit_id": "precommit-july-labels-01",
+                     *         "created_at_unix_ms": "1785167000000",
+                     *         "updated_at_unix_ms": "1785167600000"
+                     *       },
+                     *       "replayed": false
+                     *     }
+                     */
+                    "application/json": components["schemas"]["StartPreCommitResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryPlaygroundPreCommit: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "precommit_id": "precommit-july-labels-01"
+                 *     }
+                 */
+                "application/json": components["schemas"]["QueryPreCommitRequest"];
+            };
+        };
+        responses: {
+            /** @description Pre-commit 当前视图 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "precommit": {
+                     *         "tenant_id": "tenant-a",
+                     *         "project_id": "project-vision",
+                     *         "artifact_id": "road-scenes",
+                     *         "playground_id": "labeling",
+                     *         "precommit_id": "precommit-july-labels-01",
+                     *         "precommit_request_id": "precommit-request-july-labels",
+                     *         "attempt": 1,
+                     *         "state": "ready",
+                     *         "phase": "idle",
+                     *         "progress": {
+                     *           "percent": 100,
+                     *           "files_completed": "864",
+                     *           "files_total": "864",
+                     *           "bytes_completed": "12884901888",
+                     *           "bytes_total": "12884901888"
+                     *         },
+                     *         "checks": [
+                     *           {
+                     *             "check_id": "metadata-shape",
+                     *             "status": "passed",
+                     *             "summary": "Metadata 和逻辑路径检查通过"
+                     *           }
+                     *         ],
+                     *         "warnings": [],
+                     *         "blockers": [],
+                     *         "source_index_version": {
+                     *           "revision": "31",
+                     *           "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     *         },
+                     *         "candidate_index_version": {
+                     *           "revision": "31",
+                     *           "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     *         },
+                     *         "diff_summary": {
+                     *           "files_added": "1",
+                     *           "files_modified": "1",
+                     *           "files_deleted": "0",
+                     *           "files_renamed": "0",
+                     *           "bytes_added": "6144",
+                     *           "bytes_removed": "2048"
+                     *         },
+                     *         "created_at_unix_ms": "1785167600000",
+                     *         "updated_at_unix_ms": "1785167700000"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QueryPreCommitResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    restartPlaygroundPreCommit: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "precommit_id": "precommit-july-labels-01",
+                 *       "restart_request_id": "restart-july-labels-02",
+                 *       "expected_index_version": {
+                 *         "revision": "32",
+                 *         "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["RestartPreCommitRequest"];
+            };
+        };
+        responses: {
+            /** @description 已重新发起或幂等返回的 Pre-commit */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestartPreCommitResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    cancelPlaygroundPreCommit: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "precommit_id": "precommit-july-labels-01",
+                 *       "cancel_request_id": "cancel-july-labels-01"
+                 *     }
+                 */
+                "application/json": components["schemas"]["CancelPreCommitRequest"];
+            };
+        };
+        responses: {
+            /** @description 已取消或幂等返回的 Pre-commit */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelPreCommitResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryPlaygroundFileList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "road-scenes",
+                 *       "playground_id": "labeling",
+                 *       "path_prefix": "dataset/night-rain",
+                 *       "format": "parquet",
+                 *       "page_size": 50
+                 *     }
+                 */
+                "application/json": components["schemas"]["QueryPlaygroundFileListRequest"];
+            };
+        };
+        responses: {
+            /** @description Playground 逻辑文件页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "index_version": {
+                     *         "revision": "31",
+                     *         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     *       },
+                     *       "items": [
+                     *         {
+                     *           "path": "dataset/night-rain/part-0042.parquet",
+                     *           "entry_type": "file",
+                     *           "size_bytes": "19971597926",
+                     *           "format": "parquet",
+                     *           "row_count": "12842731",
+                     *           "updated_at_unix_ms": "1785167500000"
+                     *         }
+                     *       ]
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QueryPlaygroundFileListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["CursorConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryPlaygroundChangeList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "road-scenes",
+                 *       "playground_id": "labeling",
+                 *       "precommit_id": "precommit-july-labels-01",
+                 *       "page_size": 50
+                 *     }
+                 */
+                "application/json": components["schemas"]["QueryPlaygroundChangeListRequest"];
+            };
+        };
+        responses: {
+            /** @description 当前工作区或冻结候选的文件变更页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "source": "precommit",
+                     *       "precommit_id": "precommit-july-labels-01",
+                     *       "index_version": {
+                     *         "revision": "31",
+                     *         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     *       },
+                     *       "summary": {
+                     *         "files_added": "1",
+                     *         "files_modified": "1",
+                     *         "files_deleted": "0",
+                     *         "files_renamed": "0",
+                     *         "bytes_added": "6144",
+                     *         "bytes_removed": "2048"
+                     *       },
+                     *       "items": [
+                     *         {
+                     *           "change_type": "modified",
+                     *           "path": "dataset/index.json",
+                     *           "old_size_bytes": "2048",
+                     *           "new_size_bytes": "3072",
+                     *           "format": "json"
+                     *         },
+                     *         {
+                     *           "change_type": "added",
+                     *           "path": "dataset/night-rain/part-0042.parquet",
+                     *           "new_size_bytes": "5120",
+                     *           "format": "parquet"
+                     *         }
+                     *       ]
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QueryPlaygroundChangeListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["CursorConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryPlaygroundFileMetadata: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "road-scenes",
+                 *       "playground_id": "labeling",
+                 *       "path": "dataset/night-rain/part-0042.parquet"
+                 *     }
+                 */
+                "application/json": components["schemas"]["QueryPlaygroundFileMetadataRequest"];
+            };
+        };
+        responses: {
+            /** @description 脱敏逻辑文件元数据 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "index_version": {
+                     *         "revision": "31",
+                     *         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     *       },
+                     *       "metadata": {
+                     *         "path": "dataset/night-rain/part-0042.parquet",
+                     *         "size_bytes": "19971597926",
+                     *         "format": "parquet",
+                     *         "media_type": "application/vnd.apache.parquet",
+                     *         "row_count": "12842731",
+                     *         "schema": {
+                     *           "fields": [
+                     *             {
+                     *               "name": "image_id",
+                     *               "data_type": "string",
+                     *               "nullable": false
+                     *             },
+                     *             {
+                     *               "name": "weather",
+                     *               "data_type": "string",
+                     *               "nullable": true
+                     *             }
+                     *           ]
+                     *         },
+                     *         "statistics": {
+                     *           "row_count": "12842731",
+                     *           "column_count": 18,
+                     *           "null_value_count": "1024"
+                     *         },
+                     *         "quality": {
+                     *           "state": "warning",
+                     *           "checks_total": 12,
+                     *           "checks_passed": 11,
+                     *           "checks_failed": 1
+                     *         },
+                     *         "freshness": {
+                     *           "observed_at_unix_ms": "1785167600000",
+                     *           "source_updated_at_unix_ms": "1785167400000",
+                     *           "age_seconds": "200"
+                     *         }
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QueryPlaygroundFileMetadataResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryPlaygroundDatasetProfile: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-vision",
+                 *       "artifact_id": "road-scenes",
+                 *       "playground_id": "labeling"
+                 *     }
+                 */
+                "application/json": components["schemas"]["QueryPlaygroundDatasetProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description Playground Dataset Profile */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "index_version": {
+                     *         "revision": "31",
+                     *         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                     *       },
+                     *       "profile": {
+                     *         "state": "ready",
+                     *         "summary": {
+                     *           "format_count": 4,
+                     *           "logical_file_count": "864",
+                     *           "logical_size_bytes": "12884901888",
+                     *           "row_count": "18409216",
+                     *           "field_count": 18
+                     *         },
+                     *         "quality": {
+                     *           "state": "warning",
+                     *           "checks_total": 12,
+                     *           "checks_passed": 11,
+                     *           "checks_failed": 1
+                     *         },
+                     *         "freshness": {
+                     *           "observed_at_unix_ms": "1785167600000",
+                     *           "age_seconds": "200"
+                     *         }
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QueryPlaygroundDatasetProfileResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
     commitPlayground: {
         parameters: {
             query?: never;
@@ -2518,11 +3785,17 @@ export interface operations {
                  *       "artifact_id": "road-scenes",
                  *       "playground_id": "labeling",
                  *       "commit_request_id": "commit-request-july-labels",
-                 *       "expected_index_version": {
+                 *       "precommit_id": "precommit-july-labels-01",
+                 *       "expected_candidate_index_version": {
                  *         "revision": "31",
                  *         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                  *       },
-                 *       "message": "完成七月标注复核"
+                 *       "message": "完成七月标注复核",
+                 *       "description": "完成夜间场景的人工复核并冻结训练候选。",
+                 *       "tag_names": [
+                 *         "dataset/v5",
+                 *         "reviewed"
+                 *       ]
                  *     }
                  */
                 "application/json": components["schemas"]["CommitPlaygroundRequest"];
@@ -2579,6 +3852,8 @@ export interface operations {
                  *       "tenant_id": "tenant-a",
                  *       "project_id": "project-vision",
                  *       "artifact_id": "road-scenes",
+                 *       "region": "cn-shanghai",
+                 *       "state": "ready",
                  *       "page_size": 50
                  *     }
                  */
@@ -2597,6 +3872,7 @@ export interface operations {
                      * @example {
                      *       "items": [
                      *         {
+                     *           "snapshot_id": "snap-road-main3-sha-01",
                      *           "tenant_id": "tenant-a",
                      *           "project_id": "project-vision",
                      *           "artifact_id": "road-scenes",
@@ -2604,10 +3880,20 @@ export interface operations {
                      *           "storage_volume_id": "volume-shanghai-archive",
                      *           "region": "cn-shanghai",
                      *           "message": "补充夜间道路场景",
-                     *           "ref_names": [
-                     *             "refs/heads/main"
+                     *           "tag_names": [
+                     *             "dataset/v4",
+                     *             "release-candidate"
                      *           ],
+                     *           "state": "ready",
+                     *           "phase": "idle",
+                     *           "integrity": {
+                     *             "state": "verified",
+                     *             "files_verified": "864",
+                     *             "bytes_verified": "12884901888",
+                     *             "verified_at_unix_ms": "1785167700000"
+                     *           },
                      *           "created_at_unix_ms": "1785167600000",
+                     *           "updated_at_unix_ms": "1785167700000",
                      *           "logical_file_count": "864",
                      *           "logical_size_bytes": "12884901888"
                      *         }
@@ -2655,9 +3941,7 @@ export interface operations {
                 /**
                  * @example {
                  *       "tenant_id": "tenant-a",
-                 *       "project_id": "project-vision",
-                 *       "artifact_id": "road-scenes",
-                 *       "commit_id": "commit-main-3"
+                 *       "snapshot_id": "snap-road-main3-sha-01"
                  *     }
                  */
                 "application/json": components["schemas"]["QuerySnapshotRequest"];
@@ -2674,6 +3958,7 @@ export interface operations {
                     /**
                      * @example {
                      *       "snapshot": {
+                     *         "snapshot_id": "snap-road-main3-sha-01",
                      *         "tenant_id": "tenant-a",
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
@@ -2681,10 +3966,20 @@ export interface operations {
                      *         "storage_volume_id": "volume-shanghai-archive",
                      *         "region": "cn-shanghai",
                      *         "message": "补充夜间道路场景",
-                     *         "ref_names": [
-                     *           "refs/heads/main"
+                     *         "tag_names": [
+                     *           "dataset/v4",
+                     *           "release-candidate"
                      *         ],
+                     *         "state": "ready",
+                     *         "phase": "idle",
+                     *         "integrity": {
+                     *           "state": "verified",
+                     *           "files_verified": "864",
+                     *           "bytes_verified": "12884901888",
+                     *           "verified_at_unix_ms": "1785167700000"
+                     *         },
                      *         "created_at_unix_ms": "1785167600000",
+                     *         "updated_at_unix_ms": "1785167700000",
                      *         "logical_file_count": "864",
                      *         "logical_size_bytes": "12884901888"
                      *       }
@@ -2733,7 +4028,8 @@ export interface operations {
                  *       "project_id": "project-vision",
                  *       "artifact_id": "road-scenes",
                  *       "commit_id": "commit-main-3",
-                 *       "storage_volume_id": "volume-shanghai-archive"
+                 *       "storage_volume_id": "volume-shanghai-archive",
+                 *       "snapshot_request_id": "snapshot-request-main3-shanghai"
                  *     }
                  */
                 "application/json": components["schemas"]["CreateSnapshotRequest"];
@@ -2747,6 +4043,37 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "snapshot": {
+                     *         "snapshot_id": "snap-road-main3-sha-01",
+                     *         "tenant_id": "tenant-a",
+                     *         "project_id": "project-vision",
+                     *         "artifact_id": "road-scenes",
+                     *         "commit_id": "commit-main-3",
+                     *         "storage_volume_id": "volume-shanghai-archive",
+                     *         "region": "cn-shanghai",
+                     *         "message": "补充夜间道路场景",
+                     *         "tag_names": [
+                     *           "dataset/v4",
+                     *           "release-candidate"
+                     *         ],
+                     *         "state": "creating",
+                     *         "phase": "planning",
+                     *         "integrity": {
+                     *           "state": "pending",
+                     *           "files_verified": "0",
+                     *           "bytes_verified": "0"
+                     *         },
+                     *         "logical_file_count": "864",
+                     *         "logical_size_bytes": "12884901888",
+                     *         "created_at_unix_ms": "1785167600000",
+                     *         "updated_at_unix_ms": "1785167600000"
+                     *       },
+                     *       "replayed": false,
+                     *       "placement_reused": false
+                     *     }
+                     */
                     "application/json": components["schemas"]["CreateSnapshotResponse"];
                 };
             };
@@ -2754,6 +4081,317 @@ export interface operations {
             403: components["responses"]["AuthorizationProblem"];
             404: components["responses"]["ResourceNotFoundProblem"];
             409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    retrySnapshotDelivery: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "snapshot_id": "snap-road-main2-sha-01",
+                 *       "retry_request_id": "retry-road-main2-sha-02"
+                 *     }
+                 */
+                "application/json": components["schemas"]["RetrySnapshotDeliveryRequest"];
+            };
+        };
+        responses: {
+            /** @description 已重新发起或幂等返回的 Snapshot */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "snapshot": {
+                     *         "snapshot_id": "snap-road-main2-sha-01",
+                     *         "tenant_id": "tenant-a",
+                     *         "project_id": "project-vision",
+                     *         "artifact_id": "road-scenes",
+                     *         "commit_id": "commit-main-2",
+                     *         "storage_volume_id": "volume-shanghai-vision",
+                     *         "region": "cn-shanghai",
+                     *         "message": "完成首轮质量复核",
+                     *         "tag_names": [
+                     *           "v1.0"
+                     *         ],
+                     *         "state": "creating",
+                     *         "phase": "planning",
+                     *         "integrity": {
+                     *           "state": "pending",
+                     *           "files_verified": "0",
+                     *           "bytes_verified": "0"
+                     *         },
+                     *         "logical_file_count": "820",
+                     *         "logical_size_bytes": "11884901888",
+                     *         "created_at_unix_ms": "1785067400000",
+                     *         "updated_at_unix_ms": "1785167800000"
+                     *       },
+                     *       "replayed": false
+                     *     }
+                     */
+                    "application/json": components["schemas"]["RetrySnapshotDeliveryResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    querySnapshotFileList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "snapshot_id": "snap-road-main3-sha-01",
+                 *       "path_prefix": "dataset/night-rain",
+                 *       "format": "parquet",
+                 *       "page_size": 50
+                 *     }
+                 */
+                "application/json": components["schemas"]["QuerySnapshotFileListRequest"];
+            };
+        };
+        responses: {
+            /** @description Snapshot 逻辑文件页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "items": [
+                     *         {
+                     *           "path": "dataset/night-rain/part-0042.parquet",
+                     *           "entry_type": "file",
+                     *           "size_bytes": "19971597926",
+                     *           "format": "parquet",
+                     *           "row_count": "12842731",
+                     *           "updated_at_unix_ms": "1785167500000"
+                     *         }
+                     *       ]
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QuerySnapshotFileListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    querySnapshotActivityList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "snapshot_id": "snap-road-main3-sha-01",
+                 *       "page_size": 50
+                 *     }
+                 */
+                "application/json": components["schemas"]["QuerySnapshotActivityListRequest"];
+            };
+        };
+        responses: {
+            /** @description Snapshot 活动页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "items": [
+                     *         {
+                     *           "activity_id": "activity-snap-road-main3-ready",
+                     *           "activity_type": "ready",
+                     *           "summary": "Snapshot 已完成完整性校验并可读取",
+                     *           "phase": "idle",
+                     *           "created_at_unix_ms": "1785167700000"
+                     *         },
+                     *         {
+                     *           "activity_id": "activity-snap-road-main3-created",
+                     *           "activity_type": "created",
+                     *           "summary": "Snapshot 记录已创建",
+                     *           "phase": "planning",
+                     *           "created_at_unix_ms": "1785167600000"
+                     *         }
+                     *       ]
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QuerySnapshotActivityListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["CursorConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    querySnapshotDatasetProfile: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "snapshot_id": "snap-road-main3-sha-01"
+                 *     }
+                 */
+                "application/json": components["schemas"]["QuerySnapshotDatasetProfileRequest"];
+            };
+        };
+        responses: {
+            /** @description Snapshot Dataset Profile */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "profile": {
+                     *         "state": "ready",
+                     *         "summary": {
+                     *           "format_count": 4,
+                     *           "logical_file_count": "864",
+                     *           "logical_size_bytes": "12884901888",
+                     *           "row_count": "18409216",
+                     *           "field_count": 18
+                     *         },
+                     *         "quality": {
+                     *           "state": "warning",
+                     *           "checks_total": 12,
+                     *           "checks_passed": 11,
+                     *           "checks_failed": 1
+                     *         },
+                     *         "freshness": {
+                     *           "observed_at_unix_ms": "1785167600000",
+                     *           "age_seconds": "200"
+                     *         }
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QuerySnapshotDatasetProfileResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];

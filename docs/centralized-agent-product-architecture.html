@@ -1,0 +1,1347 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NeoEngram 中心化 Agent 产品架构</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --page: #f4f6f8;
+        --surface: #ffffff;
+        --ink: #17191d;
+        --muted: #626b77;
+        --line: #d8dde4;
+        --blue: #245edb;
+        --blue-soft: #edf3ff;
+        --green: #168047;
+        --green-soft: #e9f8ef;
+        --amber: #ad5a08;
+        --amber-soft: #fff4dc;
+        --cyan: #08758d;
+        --cyan-soft: #e4f7fa;
+        --violet: #7655a8;
+        --violet-soft: #f3effa;
+        font-family:
+          Inter,
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          "PingFang SC",
+          "Hiragino Sans GB",
+          "Microsoft YaHei",
+          sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        background: var(--page);
+        color: var(--ink);
+      }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+        background: var(--page);
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        min-height: 76px;
+        padding: 14px max(24px, calc((100vw - 1520px) / 2));
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.96);
+      }
+
+      .title-kicker {
+        margin: 0 0 3px;
+        color: var(--blue);
+        font-size: 12px;
+        font-weight: 750;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 23px;
+        line-height: 1.25;
+        letter-spacing: 0;
+      }
+
+      .doc-link {
+        flex: 0 0 auto;
+        padding: 8px 11px;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        background: var(--surface);
+        font-size: 13px;
+        font-weight: 700;
+        text-decoration: none;
+      }
+
+      .doc-link:hover {
+        border-color: #9ba4b0;
+      }
+
+      main {
+        width: min(1568px, 100%);
+        margin: 0 auto;
+        padding: 22px 24px 48px;
+      }
+
+      .context-bar {
+        display: grid;
+        grid-template-columns: 1.35fr repeat(3, minmax(0, 0.65fr));
+        margin-bottom: 16px;
+        border: 1px solid var(--line);
+        background: var(--surface);
+      }
+
+      .context-intro,
+      .context-fact {
+        min-width: 0;
+        padding: 15px 17px;
+      }
+
+      .context-fact {
+        border-left: 1px solid var(--line);
+      }
+
+      .context-intro p,
+      .context-fact p {
+        margin: 0;
+      }
+
+      .context-intro p {
+        color: #39414b;
+        font-size: 13px;
+        line-height: 1.65;
+      }
+
+      .context-fact span {
+        display: block;
+        margin-bottom: 5px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 700;
+      }
+
+      .context-fact strong {
+        display: block;
+        font-size: 13px;
+        line-height: 1.4;
+      }
+
+      .diagram-shell {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--surface);
+        box-shadow: 0 10px 26px rgba(28, 36, 48, 0.07);
+      }
+
+      .diagram-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        min-height: 58px;
+        padding: 11px 16px;
+        border-bottom: 1px solid var(--line);
+        background: #fbfcfd;
+      }
+
+      .diagram-heading h2 {
+        margin: 0 0 3px;
+        font-size: 16px;
+        line-height: 1.3;
+        letter-spacing: 0;
+      }
+
+      .diagram-heading p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .legend {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 7px 13px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        white-space: nowrap;
+      }
+
+      .dot {
+        width: 10px;
+        height: 10px;
+        border: 1px solid currentColor;
+        border-radius: 2px;
+      }
+
+      .dot.control {
+        color: var(--blue);
+        background: var(--blue-soft);
+      }
+      .dot.authority {
+        color: var(--green);
+        background: var(--green-soft);
+      }
+      .dot.agent {
+        color: var(--amber);
+        background: var(--amber-soft);
+      }
+      .dot.storage {
+        color: var(--cyan);
+        background: var(--cyan-soft);
+      }
+      .dot.view {
+        color: #64748b;
+        background: #fff;
+      }
+
+      .canvas {
+        overflow: auto;
+        background-color: #f9fafb;
+        background-image:
+          linear-gradient(#edf0f3 1px, transparent 1px),
+          linear-gradient(90deg, #edf0f3 1px, transparent 1px);
+        background-size: 24px 24px;
+      }
+
+      .architecture {
+        display: block;
+        width: 100%;
+        min-width: 1120px;
+        height: auto;
+      }
+
+      .architecture text {
+        font-family: inherit;
+        letter-spacing: 0;
+        user-select: none;
+      }
+
+      .band {
+        stroke-width: 1.5;
+      }
+      .center-band {
+        fill: #f5f8ff;
+        stroke: #9db7ee;
+      }
+      .region-a {
+        fill: #fffbf3;
+        stroke: #d2a95b;
+        stroke-width: 2;
+      }
+      .region-b {
+        fill: #f1fafb;
+        stroke: #58a2b0;
+        stroke-width: 2;
+      }
+      .band-title {
+        fill: #252b33;
+        font-size: 16px;
+        font-weight: 800;
+      }
+      .band-note {
+        fill: #69727d;
+        font-size: 11px;
+        font-weight: 550;
+      }
+
+      .node rect {
+        stroke-width: 1.6;
+      }
+      .entry rect {
+        fill: #fff;
+        stroke: #4b5563;
+      }
+      .control rect {
+        fill: var(--blue-soft);
+        stroke: var(--blue);
+      }
+      .authority rect {
+        fill: var(--green-soft);
+        stroke: var(--green);
+        stroke-width: 2;
+      }
+      .agent rect {
+        fill: var(--amber-soft);
+        stroke: var(--amber);
+      }
+      .storage rect {
+        fill: var(--cyan-soft);
+        stroke: var(--cyan);
+      }
+      .view rect {
+        fill: #fff;
+        stroke: #64748b;
+      }
+      .guard rect {
+        fill: var(--violet-soft);
+        stroke: var(--violet);
+      }
+      .node-title {
+        fill: #20252b;
+        font-size: 14px;
+        font-weight: 800;
+      }
+      .node-copy {
+        fill: #5f6874;
+        font-size: 11px;
+        font-weight: 550;
+      }
+      .node-accent {
+        fill: var(--green);
+        font-size: 10px;
+        font-weight: 800;
+      }
+      .node-accent-blue {
+        fill: var(--blue);
+        font-size: 10px;
+        font-weight: 800;
+      }
+
+      .flow {
+        fill: none;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 2.2;
+      }
+
+      .control-flow {
+        stroke: var(--blue);
+        marker-end: url(#arrow-blue);
+      }
+      .control-bi {
+        stroke: var(--blue);
+        marker-start: url(#arrow-blue-start);
+        marker-end: url(#arrow-blue);
+      }
+      .meta-flow {
+        stroke: var(--violet);
+        stroke-dasharray: 6 5;
+        marker-end: url(#arrow-violet);
+      }
+      .object-flow {
+        stroke: var(--green);
+        stroke-width: 2.8;
+        marker-start: url(#arrow-green-start);
+        marker-end: url(#arrow-green);
+      }
+      .local-flow {
+        stroke: var(--amber);
+        marker-end: url(#arrow-amber);
+      }
+      .posix-rw {
+        stroke: var(--cyan);
+        stroke-width: 3;
+        marker-start: url(#arrow-cyan-start);
+        marker-end: url(#arrow-cyan);
+      }
+      .posix-ro {
+        stroke: var(--cyan);
+        stroke-width: 3;
+        marker-end: url(#arrow-cyan);
+      }
+      .relation {
+        stroke: #8a94a2;
+        stroke-width: 1.5;
+        stroke-dasharray: 4 4;
+        marker-end: url(#arrow-gray);
+      }
+
+      .edge-label rect {
+        fill: #fff;
+        stroke: #d8dde4;
+      }
+      .edge-label text {
+        fill: #4d5662;
+        font-size: 10px;
+        font-weight: 750;
+      }
+      .mobile-architecture {
+        display: none;
+      }
+
+      .rules {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        border-top: 1px solid var(--line);
+        background: #fff;
+      }
+
+      .rule {
+        min-width: 0;
+        padding: 15px 16px 17px;
+      }
+
+      .rule + .rule {
+        border-left: 1px solid var(--line);
+      }
+
+      .rule b {
+        display: block;
+        margin-bottom: 5px;
+        font-size: 12px;
+      }
+
+      .rule p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.55;
+      }
+
+      .flow-table-section {
+        margin-top: 20px;
+        border: 1px solid var(--line);
+        background: var(--surface);
+      }
+
+      .section-title {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 16px 18px 13px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .section-title h2 {
+        margin: 0;
+        font-size: 16px;
+        letter-spacing: 0;
+      }
+      .section-title p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;
+      }
+      th,
+      td {
+        padding: 11px 14px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+      }
+      th {
+        background: #fafbfc;
+        color: #59626d;
+        font-size: 11px;
+        font-weight: 750;
+      }
+      td {
+        color: #39414b;
+        font-size: 12px;
+        line-height: 1.45;
+        vertical-align: top;
+        overflow-wrap: anywhere;
+      }
+      tbody tr:last-child td {
+        border-bottom: 0;
+      }
+      td:first-child {
+        width: 16%;
+        font-weight: 750;
+      }
+      code {
+        padding: 1px 4px;
+        border-radius: 3px;
+        background: #eef1f4;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+      }
+
+      @media (max-width: 900px) {
+        .topbar {
+          align-items: flex-start;
+          padding: 13px 16px;
+        }
+        h1 {
+          font-size: 19px;
+        }
+        main {
+          padding: 14px 12px 32px;
+        }
+        .context-bar {
+          grid-template-columns: 1fr 1fr;
+        }
+        .context-intro {
+          grid-column: 1 / -1;
+          border-bottom: 1px solid var(--line);
+        }
+        .context-fact:nth-child(3) {
+          border-left: 0;
+        }
+        .diagram-header {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+        .legend {
+          justify-content: flex-start;
+        }
+        .rules {
+          grid-template-columns: 1fr 1fr;
+        }
+        .rule:nth-child(n + 3) {
+          border-top: 1px solid var(--line);
+        }
+        .rule:nth-child(odd) {
+          border-left: 0;
+        }
+        .section-title {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 4px;
+        }
+      }
+
+      @media (max-width: 640px) {
+        .doc-link {
+          display: none;
+        }
+        .context-bar {
+          grid-template-columns: 1fr;
+        }
+        .context-fact {
+          border-left: 0;
+          border-top: 1px solid var(--line);
+        }
+        .context-intro + .context-fact {
+          border-top: 0;
+        }
+        .context-fact:nth-child(3) {
+          border-top: 1px solid var(--line);
+        }
+        .canvas {
+          display: none;
+        }
+        .mobile-architecture {
+          display: block;
+          padding: 14px;
+          background: #f9fafb;
+        }
+        .mobile-layer {
+          padding: 12px;
+          border: 1px solid var(--line);
+          background: #fff;
+        }
+        .mobile-layer + .mobile-arrow {
+          height: 28px;
+        }
+        .mobile-layer h3 {
+          margin: 0 0 9px;
+          font-size: 13px;
+          letter-spacing: 0;
+        }
+        .mobile-layer p {
+          margin: 0;
+          color: var(--muted);
+          font-size: 11px;
+          line-height: 1.5;
+        }
+        .mobile-nodes {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 7px;
+        }
+        .mobile-node {
+          min-width: 0;
+          padding: 9px;
+          border: 1px solid;
+          border-radius: 4px;
+          font-size: 11px;
+          font-weight: 750;
+          line-height: 1.35;
+          overflow-wrap: anywhere;
+        }
+        .mobile-node.control {
+          border-color: var(--blue);
+          background: var(--blue-soft);
+        }
+        .mobile-node.authority {
+          border-color: var(--green);
+          background: var(--green-soft);
+        }
+        .mobile-node.agent {
+          border-color: var(--amber);
+          background: var(--amber-soft);
+        }
+        .mobile-node.storage {
+          border-color: var(--cyan);
+          background: var(--cyan-soft);
+        }
+        .mobile-node.view {
+          border-color: #64748b;
+          background: #fff;
+        }
+        .mobile-arrow {
+          position: relative;
+          color: var(--blue);
+          font-size: 10px;
+          font-weight: 750;
+          text-align: center;
+        }
+        .mobile-arrow::after {
+          display: block;
+          margin: 2px auto 0;
+          content: "↓";
+          font-size: 17px;
+          line-height: 1;
+        }
+        .mobile-regions {
+          display: grid;
+          gap: 10px;
+        }
+        .mobile-region {
+          padding: 11px;
+          border: 2px solid;
+          border-radius: 5px;
+        }
+        .mobile-region.a {
+          border-color: #d2a95b;
+          background: #fffbf3;
+        }
+        .mobile-region.b {
+          border-color: #58a2b0;
+          background: #f1fafb;
+        }
+        .mobile-region h4 {
+          margin: 0 0 8px;
+          font-size: 12px;
+          letter-spacing: 0;
+        }
+        .mobile-region p {
+          margin: 8px 0 0;
+          color: var(--muted);
+          font-size: 11px;
+          line-height: 1.5;
+        }
+        .mobile-region-note {
+          margin-top: 8px !important;
+          color: #8d322a !important;
+          font-weight: 700;
+        }
+        .rules {
+          grid-template-columns: 1fr;
+        }
+        .rule + .rule {
+          border-left: 0;
+          border-top: 1px solid var(--line);
+        }
+        thead {
+          display: none;
+        }
+        table,
+        tbody,
+        tr,
+        td {
+          display: block;
+          width: 100%;
+        }
+        tr {
+          padding: 8px 13px;
+          border-bottom: 1px solid var(--line);
+        }
+        tbody tr:last-child {
+          border-bottom: 0;
+        }
+        td {
+          display: grid;
+          grid-template-columns: 82px minmax(0, 1fr);
+          gap: 8px;
+          padding: 5px 0;
+          border-bottom: 0;
+        }
+        td::before {
+          color: var(--muted);
+          content: attr(data-label);
+          font-size: 10px;
+          font-weight: 750;
+        }
+        td:first-child {
+          width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="title-kicker">NeoEngram / Product Architecture</p>
+        <h1>中心化 Agent 产品架构</h1>
+      </div>
+      <a class="doc-link" href="centralized-agent-product.md">查看产品定义</a>
+    </header>
+
+    <main>
+      <section class="context-bar" aria-label="架构摘要">
+        <div class="context-intro">
+          <p>
+            中心管理逻辑数据资产、不可变版本与权威元数据；区域 Agent
+            负责扫描、校验、对象传输和物化；业务 Pod 直接访问区域存储上的可写
+            Playground 或只读 Snapshot。
+          </p>
+        </div>
+        <div class="context-fact">
+          <span>逻辑资产</span>
+          <strong>Artifact 无固定放置</strong>
+        </div>
+        <div class="context-fact">
+          <span>数据生产</span>
+          <strong>版本发布只来自 Playground</strong>
+        </div>
+        <div class="context-fact">
+          <span>版本交付</span>
+          <strong>同一 Commit 可多区域交付</strong>
+        </div>
+      </section>
+
+      <section class="diagram-shell" aria-labelledby="architecture-title">
+        <div class="diagram-header">
+          <div class="diagram-heading">
+            <h2 id="architecture-title">总体架构与数据边界</h2>
+            <p>中心是业务与元数据权威；区域只执行中心授权的任务。</p>
+          </div>
+          <div class="legend" aria-label="图例">
+            <span class="legend-item"><i class="dot control"></i>中心服务</span>
+            <span class="legend-item"
+              ><i class="dot authority"></i>权威存储</span
+            >
+            <span class="legend-item"><i class="dot agent"></i>Agent</span>
+            <span class="legend-item"><i class="dot storage"></i>区域存储</span>
+            <span class="legend-item"><i class="dot view"></i>数据视图</span>
+          </div>
+        </div>
+
+        <div class="canvas">
+          <svg
+            class="architecture"
+            viewBox="0 0 1480 970"
+            role="img"
+            aria-labelledby="svg-title svg-desc"
+          >
+            <title id="svg-title">NeoEngram 中心化 Agent 产品架构图</title>
+            <desc id="svg-desc">
+              Web 和 CLI 访问中央控制面，中央控制面通过出站控制连接调度两个区域
+              Agent。Agent 读写中央 S3 并操作各自区域存储，业务 Pod
+              直接访问区域存储上的 Playground。相同 Commit C1
+              在两个区域分别形成独立、单区域 Snapshot；两个区域不直接传输数据。
+            </desc>
+            <defs>
+              <marker
+                id="arrow-blue"
+                markerWidth="8"
+                markerHeight="8"
+                refX="7"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M0 0L8 4L0 8Z" fill="#245edb" />
+              </marker>
+              <marker
+                id="arrow-blue-start"
+                markerWidth="8"
+                markerHeight="8"
+                refX="1"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M8 0L0 4L8 8Z" fill="#245edb" />
+              </marker>
+              <marker
+                id="arrow-green"
+                markerWidth="8"
+                markerHeight="8"
+                refX="7"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M0 0L8 4L0 8Z" fill="#168047" />
+              </marker>
+              <marker
+                id="arrow-green-start"
+                markerWidth="8"
+                markerHeight="8"
+                refX="1"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M8 0L0 4L8 8Z" fill="#168047" />
+              </marker>
+              <marker
+                id="arrow-violet"
+                markerWidth="8"
+                markerHeight="8"
+                refX="7"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M0 0L8 4L0 8Z" fill="#7655a8" />
+              </marker>
+              <marker
+                id="arrow-amber"
+                markerWidth="8"
+                markerHeight="8"
+                refX="7"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M0 0L8 4L0 8Z" fill="#ad5a08" />
+              </marker>
+              <marker
+                id="arrow-cyan"
+                markerWidth="8"
+                markerHeight="8"
+                refX="7"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M0 0L8 4L0 8Z" fill="#08758d" />
+              </marker>
+              <marker
+                id="arrow-cyan-start"
+                markerWidth="8"
+                markerHeight="8"
+                refX="1"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M8 0L0 4L8 8Z" fill="#08758d" />
+              </marker>
+              <marker
+                id="arrow-gray"
+                markerWidth="8"
+                markerHeight="8"
+                refX="7"
+                refY="4"
+                orient="auto"
+              >
+                <path d="M0 0L8 4L0 8Z" fill="#8a94a2" />
+              </marker>
+            </defs>
+
+            <g class="node entry" transform="translate(565 24)">
+              <rect width="350" height="68" rx="5" />
+              <text class="node-title" x="175" y="29" text-anchor="middle">
+                Web Console · CLI · Automation
+              </text>
+              <text class="node-copy" x="175" y="49" text-anchor="middle">
+                唯一用户入口 · Tenant-scoped API
+              </text>
+            </g>
+
+            <path class="flow control-flow" d="M740 92V132" />
+
+            <rect
+              class="band center-band"
+              x="34"
+              y="132"
+              width="1412"
+              height="420"
+              rx="7"
+            />
+            <text class="band-title" x="58" y="163">中心控制面</text>
+            <text class="band-note" x="58" y="183">
+              多租户业务权威 · 产品资源与状态权威 · 大文件不经过 API 进程
+            </text>
+
+            <g class="node control" transform="translate(58 207)">
+              <rect width="208" height="92" rx="5" />
+              <text class="node-title" x="104" y="31" text-anchor="middle">
+                API / Auth
+              </text>
+              <text class="node-copy" x="104" y="53" text-anchor="middle">
+                Tenant RBAC · Quota
+              </text>
+              <text class="node-copy" x="104" y="71" text-anchor="middle">
+                幂等 · Problem Details
+              </text>
+            </g>
+
+            <g class="node control" transform="translate(292 207)">
+              <rect width="254" height="92" rx="5" />
+              <text class="node-title" x="127" y="27" text-anchor="middle">
+                产品资源目录
+              </text>
+              <text class="node-copy" x="127" y="48" text-anchor="middle">
+                Tenant · Project · Artifact
+              </text>
+              <text class="node-copy" x="127" y="66" text-anchor="middle">
+                Commit · Tags
+              </text>
+              <text
+                class="node-accent-blue"
+                x="127"
+                y="82"
+                text-anchor="middle"
+              >
+                Artifact 无 Region / Storage 字段
+              </text>
+            </g>
+
+            <g class="node control" transform="translate(572 207)">
+              <rect width="254" height="92" rx="5" />
+              <text class="node-title" x="127" y="27" text-anchor="middle">
+                工作流与状态
+              </text>
+              <text class="node-copy" x="127" y="49" text-anchor="middle">
+                Playground · Pre-commit
+              </text>
+              <text class="node-copy" x="127" y="67" text-anchor="middle">
+                Snapshot · Job
+              </text>
+              <text
+                class="node-accent-blue"
+                x="127"
+                y="82"
+                text-anchor="middle"
+              >
+                普通版本只从 Playground 发布
+              </text>
+            </g>
+
+            <g class="node control" transform="translate(852 207)">
+              <rect width="254" height="92" rx="5" />
+              <text class="node-title" x="127" y="27" text-anchor="middle">
+                元数据与 Diff
+              </text>
+              <text class="node-copy" x="127" y="49" text-anchor="middle">
+                Index · File Metadata
+              </text>
+              <text class="node-copy" x="127" y="67" text-anchor="middle">
+                Dataset Profile · Diff
+              </text>
+            </g>
+
+            <g class="node control" transform="translate(1132 207)">
+              <rect width="290" height="92" rx="5" />
+              <text class="node-title" x="145" y="27" text-anchor="middle">
+                调度与治理
+              </text>
+              <text class="node-copy" x="145" y="49" text-anchor="middle">
+                Scheduler · Assignment · Lease
+              </text>
+              <text class="node-copy" x="145" y="67" text-anchor="middle">
+                Fencing · Audit · Activity
+              </text>
+            </g>
+
+            <path class="flow control-flow" d="M266 253H282" />
+            <path class="flow control-flow" d="M546 253H562" />
+            <path class="flow control-flow" d="M826 253H842" />
+            <path class="flow control-flow" d="M1106 253H1122" />
+
+            <g class="node authority" transform="translate(318 355)">
+              <rect width="374" height="108" rx="5" />
+              <text class="node-title" x="187" y="31" text-anchor="middle">
+                Authority Store
+              </text>
+              <text class="node-copy" x="187" y="54" text-anchor="middle">
+                资源 · 状态 · Index · Commit History
+              </text>
+              <text class="node-copy" x="187" y="73" text-anchor="middle">
+                Manifest · Job · Audit
+              </text>
+              <text class="node-accent" x="187" y="94" text-anchor="middle">
+                唯一权威元数据
+              </text>
+            </g>
+
+            <g class="node authority" transform="translate(788 355)">
+              <rect width="374" height="108" rx="5" />
+              <text class="node-title" x="187" y="31" text-anchor="middle">
+                Central S3
+              </text>
+              <text class="node-copy" x="187" y="54" text-anchor="middle">
+                Content-addressed Immutable Objects
+              </text>
+              <text class="node-copy" x="187" y="73" text-anchor="middle">
+                Manifest 约束 · Durability Gate
+              </text>
+              <text class="node-accent" x="187" y="94" text-anchor="middle">
+                不可变 payload 耐久权威
+              </text>
+            </g>
+
+            <path class="flow relation" d="M419 299V344" />
+            <path class="flow relation" d="M699 299V325H567V344" />
+            <path class="flow relation" d="M979 299V325H629V344" />
+            <path class="flow relation" d="M1277 299V325H670V344" />
+
+            <rect
+              class="band region-a"
+              x="34"
+              y="635"
+              width="678"
+              height="301"
+              rx="7"
+            />
+            <text class="band-title" x="276" y="667">
+              Region A · EdgeCluster A
+            </text>
+            <text class="band-note" x="276" y="686">
+              区域执行面 · StorageVolume 决定 Region
+            </text>
+
+            <g class="node agent" transform="translate(58 714)">
+              <rect width="176" height="82" rx="5" />
+              <text class="node-title" x="88" y="30" text-anchor="middle">
+                Agent A
+              </text>
+              <text class="node-copy" x="88" y="51" text-anchor="middle">
+                受控执行器 / 观测者
+              </text>
+              <text class="node-copy" x="88" y="67" text-anchor="middle">
+                不拥有业务资源
+              </text>
+            </g>
+
+            <g class="node storage" transform="translate(276 714)">
+              <rect width="190" height="82" rx="5" />
+              <text class="node-title" x="95" y="30" text-anchor="middle">
+                StorageVolume A
+              </text>
+              <text class="node-copy" x="95" y="52" text-anchor="middle">
+                PVC / NFS · 区域存储
+              </text>
+            </g>
+
+            <g class="node entry" transform="translate(508 714)">
+              <rect width="180" height="82" rx="5" />
+              <text class="node-title" x="90" y="30" text-anchor="middle">
+                Business Pod A
+              </text>
+              <text class="node-copy" x="90" y="52" text-anchor="middle">
+                训练 / 数据工具
+              </text>
+            </g>
+
+            <g class="node view" transform="translate(276 833)">
+              <rect width="190" height="76" rx="5" />
+              <text class="node-title" x="95" y="28" text-anchor="middle">
+                Playground
+              </text>
+              <text class="node-copy" x="95" y="49" text-anchor="middle">
+                RW · 单 Region / Volume
+              </text>
+              <text class="node-accent-blue" x="95" y="65" text-anchor="middle">
+                可写数据生产视图
+              </text>
+            </g>
+
+            <g class="node view" transform="translate(498 833)">
+              <rect width="190" height="76" rx="5" />
+              <text class="node-title" x="95" y="28" text-anchor="middle">
+                Snapshot A
+              </text>
+              <text class="node-copy" x="95" y="49" text-anchor="middle">
+                RO · Commit C1
+              </text>
+              <text class="node-accent" x="95" y="65" text-anchor="middle">
+                单 Region / Volume
+              </text>
+            </g>
+
+            <path class="flow local-flow" d="M234 755H266" />
+            <path class="flow relation" d="M371 796V823" />
+            <path class="flow relation" d="M441 796V814H593V823" />
+            <path class="flow posix-rw" d="M508 774H480V870H466" />
+            <path class="flow posix-ro" d="M633 833V796" />
+
+            <rect
+              class="band region-b"
+              x="768"
+              y="635"
+              width="678"
+              height="301"
+              rx="7"
+            />
+            <text class="band-title" x="1010" y="667">
+              Region B · EdgeCluster B
+            </text>
+            <text class="band-note" x="1010" y="686">
+              独立网络域 · 独立 StorageVolume
+            </text>
+
+            <g class="node agent" transform="translate(792 714)">
+              <rect width="176" height="82" rx="5" />
+              <text class="node-title" x="88" y="30" text-anchor="middle">
+                Agent B
+              </text>
+              <text class="node-copy" x="88" y="51" text-anchor="middle">
+                受控执行器 / 观测者
+              </text>
+              <text class="node-copy" x="88" y="67" text-anchor="middle">
+                不拥有业务资源
+              </text>
+            </g>
+
+            <g class="node storage" transform="translate(1010 714)">
+              <rect width="190" height="82" rx="5" />
+              <text class="node-title" x="95" y="30" text-anchor="middle">
+                StorageVolume B
+              </text>
+              <text class="node-copy" x="95" y="52" text-anchor="middle">
+                PVC / NFS · 区域存储
+              </text>
+            </g>
+
+            <g class="node entry" transform="translate(1242 714)">
+              <rect width="180" height="82" rx="5" />
+              <text class="node-title" x="90" y="30" text-anchor="middle">
+                Business Pod B
+              </text>
+              <text class="node-copy" x="90" y="52" text-anchor="middle">
+                训练 / 数据工具
+              </text>
+            </g>
+
+            <g class="node view" transform="translate(1010 833)">
+              <rect width="190" height="76" rx="5" />
+              <text class="node-title" x="95" y="28" text-anchor="middle">
+                Playground
+              </text>
+              <text class="node-copy" x="95" y="49" text-anchor="middle">
+                RW · 单 Region / Volume
+              </text>
+              <text class="node-accent-blue" x="95" y="65" text-anchor="middle">
+                可写数据生产视图
+              </text>
+            </g>
+
+            <g class="node view" transform="translate(1232 833)">
+              <rect width="190" height="76" rx="5" />
+              <text class="node-title" x="95" y="28" text-anchor="middle">
+                Snapshot B
+              </text>
+              <text class="node-copy" x="95" y="49" text-anchor="middle">
+                RO · Commit C1
+              </text>
+              <text class="node-accent" x="95" y="65" text-anchor="middle">
+                单 Region / Volume
+              </text>
+            </g>
+
+            <path class="flow local-flow" d="M968 755H1000" />
+            <path class="flow relation" d="M1105 796V823" />
+            <path class="flow relation" d="M1175 796V814H1327V823" />
+            <path class="flow posix-rw" d="M1242 774H1214V870H1200" />
+            <path class="flow posix-ro" d="M1367 833V796" />
+
+            <path class="flow control-bi" d="M1277 299V581H146V704" />
+            <path class="flow control-bi" d="M1304 299V581H880V704" />
+            <g class="edge-label" transform="translate(574 568)">
+              <rect width="332" height="27" rx="3" />
+              <text x="166" y="18" text-anchor="middle">
+                Agent 主动建立控制连接 · assignment ↓ / status ↑
+              </text>
+            </g>
+
+            <path class="flow meta-flow" d="M210 704V617H922V309" />
+            <path class="flow meta-flow" d="M950 704V617H1002V309" />
+            <g class="edge-label" transform="translate(653 602)">
+              <rect width="200" height="24" rx="3" />
+              <text x="100" y="16" text-anchor="middle">
+                Index · metadata · progress
+              </text>
+            </g>
+
+            <path class="flow object-flow" d="M876 463V520H100V704" />
+            <path class="flow object-flow" d="M1080 463V520H935V704" />
+            <g class="edge-label" transform="translate(523 507)">
+              <rect width="286" height="25" rx="3" />
+              <text x="143" y="17" text-anchor="middle">
+                短期 object ticket · Agent 直连 Central S3
+              </text>
+            </g>
+          </svg>
+        </div>
+
+        <div class="mobile-architecture" aria-label="移动版架构图">
+          <div class="mobile-layer">
+            <h3>用户入口</h3>
+            <div class="mobile-nodes">
+              <div class="mobile-node view">Web Console</div>
+              <div class="mobile-node view">CLI / Automation</div>
+            </div>
+          </div>
+          <div class="mobile-arrow">Tenant-scoped API</div>
+          <div class="mobile-layer">
+            <h3>中心控制面 · 业务与元数据权威</h3>
+            <div class="mobile-nodes">
+              <div class="mobile-node control">API / Auth / RBAC</div>
+              <div class="mobile-node control">
+                资源目录<br />Artifact · Commit · Tags
+              </div>
+              <div class="mobile-node control">
+                Playground · Pre-commit · Snapshot · Job
+              </div>
+              <div class="mobile-node control">Metadata · Profile · Diff</div>
+              <div class="mobile-node authority">
+                Authority Store<br />权威元数据
+              </div>
+              <div class="mobile-node authority">
+                Central S3<br />不可变 payload
+              </div>
+            </div>
+            <p style="margin-top: 9px">
+              Artifact 无固定 Region/Storage；普通版本只从 Playground 发布。
+            </p>
+          </div>
+          <div class="mobile-arrow">
+            Agent 主动连接 · assignment ↓ / status ↑
+          </div>
+          <div class="mobile-regions">
+            <div class="mobile-region a">
+              <h4>Region A · EdgeCluster A</h4>
+              <div class="mobile-nodes">
+                <div class="mobile-node agent">Agent A<br />受控执行器</div>
+                <div class="mobile-node storage">
+                  StorageVolume A<br />PVC / NFS
+                </div>
+                <div class="mobile-node view">
+                  Playground<br />RW · 单 Region
+                </div>
+                <div class="mobile-node view">
+                  Snapshot A<br />RO · Commit C1
+                </div>
+              </div>
+              <p>Business Pod 直接通过 POSIX I/O 访问本区域数据视图。</p>
+            </div>
+            <div class="mobile-region b">
+              <h4>Region B · EdgeCluster B</h4>
+              <div class="mobile-nodes">
+                <div class="mobile-node agent">Agent B<br />受控执行器</div>
+                <div class="mobile-node storage">
+                  StorageVolume B<br />PVC / NFS
+                </div>
+                <div class="mobile-node view">
+                  Playground<br />RW · 单 Region
+                </div>
+                <div class="mobile-node view">
+                  Snapshot B<br />RO · Commit C1
+                </div>
+              </div>
+              <p>Business Pod 直接通过 POSIX I/O 访问本区域数据视图。</p>
+            </div>
+          </div>
+          <p class="mobile-region-note">
+            Region 之间没有 Agent-to-Agent 或 NFS-to-NFS 直连。
+          </p>
+        </div>
+
+        <div class="rules">
+          <div class="rule">
+            <b>Artifact 是逻辑身份</b>
+            <p>不绑定单一区域或存储；区域 placement 只作为内部实现存在。</p>
+          </div>
+          <div class="rule">
+            <b>Playground 是生产入口</b>
+            <p>
+              单 Volume、单 Region、可写；Pre-commit 完成后才能发布 Commit。
+            </p>
+          </div>
+          <div class="rule">
+            <b>Commit 是不可变版本</b>
+            <p>单 parent，可带 Tags；用户界面只显示 Commit ID 与 Tags。</p>
+          </div>
+          <div class="rule">
+            <b>Snapshot 是区域交付</b>
+            <p>
+              每个 Snapshot 有独立 ID、单 Volume、单 Region；同一 Commit
+              可以创建多个区域 Snapshot。
+            </p>
+          </div>
+          <div class="rule">
+            <b>区域间不建立直连</b>
+            <p>
+              没有 Agent-to-Agent 或 NFS-to-NFS 通道；跨区内容经中心 S3 交付。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="flow-table-section" aria-labelledby="flow-title">
+        <div class="section-title">
+          <h2 id="flow-title">四类路径</h2>
+          <p>控制面与数据面分离，任何实现都不能让大文件经过中心 API。</p>
+        </div>
+        <div class="flow-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>路径</th>
+                <th>方向</th>
+                <th>承载内容</th>
+                <th>边界</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td data-label="路径">产品 API</td>
+                <td data-label="方向">UI / CLI → Center</td>
+                <td data-label="承载内容">租户范围内的查询、创建和业务动作</td>
+                <td data-label="边界">认证、RBAC、幂等、审计</td>
+              </tr>
+              <tr>
+                <td data-label="路径">Agent 控制</td>
+                <td data-label="方向">Agent ↔ Center</td>
+                <td data-label="承载内容">
+                  Assignment、状态、进度、Index 和元数据
+                </td>
+                <td data-label="边界">
+                  Agent 主动连接；中心决定授权与最终状态
+                </td>
+              </tr>
+              <tr>
+                <td data-label="路径">对象传输</td>
+                <td data-label="方向">Agent ↔ Central S3</td>
+                <td data-label="承载内容">
+                  不可变对象、Manifest 约束下的 payload
+                </td>
+                <td data-label="边界">仅使用短期 ticket；S3 是耐久权威</td>
+              </tr>
+              <tr>
+                <td data-label="路径">业务 I/O</td>
+                <td data-label="方向">Pod ↔ StorageVolume</td>
+                <td data-label="承载内容">
+                  Playground 的 RW 或 Snapshot 的 RO 文件访问
+                </td>
+                <td data-label="边界">
+                  不经过 Agent 或中心 API；不得跨 Region 直连
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

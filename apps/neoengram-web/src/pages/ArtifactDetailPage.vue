@@ -22,8 +22,14 @@ import {
   activePreCommitLabel,
   getActivePreCommit,
   playgroundAvailabilityLabel,
+  playgroundAvailabilityTagType,
   preCommitScopeKey,
 } from '@/features/precommit/prototype';
+import {
+  snapshotPhaseLabel,
+  snapshotStateLabel,
+  snapshotStateTagType,
+} from '@/features/snapshots/prototype';
 import { useTenantsStore } from '@/stores/tenants';
 import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime, shortId } from '@/utils/format';
@@ -76,12 +82,9 @@ const commitQuery = useQuery({
 const currentCommit = computed(() => {
   const graph = commitQuery.data.value?.data.graph;
   if (!graph) return undefined;
-  const currentCommitId = graph.refs.find(
-    (candidate) => candidate.name === artifact.value?.default_ref,
-  )?.commit_id;
-  return graph.nodes.find((node) => node.commit_id === currentCommitId) ?? graph.nodes[0];
+  return graph.nodes.find((node) => node.commit_id === graph.head_commit_id) ?? graph.nodes[0];
 });
-const currentCommitTags = computed(() => commitTagNames(currentCommit.value?.ref_names ?? []));
+const currentCommitTags = computed(() => commitTagNames(currentCommit.value?.tag_names ?? []));
 const commitDiffQuery = useQuery({
   queryKey: computed(() => [
     'artifact-commit-diff',
@@ -225,14 +228,14 @@ async function openPlayground(playgroundId: string): Promise<void> {
   });
 }
 
-async function openSnapshot(commitId: string): Promise<void> {
+async function openSnapshot(snapshotId: string): Promise<void> {
   await router.push({
     name: 'snapshot-detail',
     params: {
       tenantId: tenantId.value,
       projectId: projectId.value,
       artifactId: artifactId.value,
-      commitId,
+      snapshotId,
     },
   });
 }
@@ -253,9 +256,7 @@ async function showCreatePlayground(): Promise<void> {
   playgroundForm.displayName = '';
   playgroundForm.storageVolumeId = '';
   await loadCommitChoices();
-  playgroundForm.baseCommitId =
-    commitNodes.value.find((node) => node.ref_names.includes(artifact.value?.default_ref ?? ''))
-      ?.commit_id ?? '';
+  playgroundForm.baseCommitId = artifact.value?.head_commit_id ?? '';
   createPlaygroundOpen.value = true;
 }
 
@@ -293,11 +294,7 @@ async function showCreateSnapshot(): Promise<void> {
   mutationError.value = '';
   snapshotForm.storageVolumeId = '';
   await loadCommitChoices();
-  snapshotForm.commitId =
-    commitNodes.value.find((node) => node.ref_names.includes(artifact.value?.default_ref ?? ''))
-      ?.commit_id ??
-    commitNodes.value[0]?.commit_id ??
-    '';
+  snapshotForm.commitId = artifact.value?.head_commit_id ?? commitNodes.value[0]?.commit_id ?? '';
   createSnapshotOpen.value = true;
 }
 
@@ -314,11 +311,18 @@ async function submitSnapshot(): Promise<void> {
       artifact_id: artifactId.value,
       commit_id: snapshotForm.commitId,
       storage_volume_id: snapshotForm.storageVolumeId,
+      snapshot_request_id: `snapshot-request-${globalThis.crypto.randomUUID()}`,
     });
     createSnapshotOpen.value = false;
     await queryClient.invalidateQueries({ queryKey: ['snapshots', tenantId.value] });
-    ElMessage.success(result.data.replayed ? '该 Commit 已有 Snapshot' : 'Snapshot 已创建');
-    await openSnapshot(result.data.snapshot.commit_id);
+    ElMessage.success(
+      result.data.replayed
+        ? '已返回原 Snapshot'
+        : result.data.placement_reused
+          ? '该 Commit 在此存储已有 Snapshot'
+          : 'Snapshot 已开始创建',
+    );
+    await openSnapshot(result.data.snapshot.snapshot_id);
   } catch (error) {
     mutationError.value = error instanceof Error ? error.message : '创建 Snapshot 失败';
   }
@@ -381,6 +385,28 @@ async function submitSnapshot(): Promise<void> {
             <div>
               <dt>Resource version</dt>
               <dd>{{ artifact.resource_version }}</dd>
+            </div>
+            <div>
+              <dt>初始化方式</dt>
+              <dd>
+                {{ artifact.initialization.mode === 'derived' ? '从 Commit 派生' : '空 Artifact' }}
+              </dd>
+            </div>
+            <div v-if="artifact.initialization.mode === 'derived'" class="definition-grid__wide">
+              <dt>来源血缘</dt>
+              <dd class="commit-identity">
+                <span v-if="artifact.initialization.mode === 'derived'">
+                  <small>{{ artifact.initialization.source_project_id }}</small>
+                  <strong>{{ artifact.initialization.source_artifact_id }}</strong>
+                </span>
+                <code>
+                  {{
+                    artifact.initialization.mode === 'derived'
+                      ? artifact.initialization.source_commit_id
+                      : '—'
+                  }}
+                </code>
+              </dd>
             </div>
             <div class="definition-grid__wide">
               <dt>当前 Commit</dt>
@@ -471,7 +497,7 @@ async function submitSnapshot(): Promise<void> {
                       parent <code>{{ node.parent_commit_id }}</code>
                     </span>
                     <el-tag
-                      v-for="tagName in commitTagNames(node.ref_names)"
+                      v-for="tagName in commitTagNames(node.tag_names)"
                       :key="tagName"
                       size="small"
                       effect="plain"
@@ -517,10 +543,9 @@ async function submitSnapshot(): Promise<void> {
               </span>
               <span class="relation-list__aside">
                 <small>{{ playground.region }}</small>
-                <el-tag
-                  :type="playground.state === 'unavailable' ? 'danger' : 'success'"
-                  effect="plain"
-                  >{{ playgroundAvailabilityLabel(playground.state) }}</el-tag
+                <el-tag :type="playgroundAvailabilityTagType(playground.state)" effect="plain">{{
+                  playgroundAvailabilityLabel(playground.state)
+                }}</el-tag
                 ><el-tag
                   v-if="getActivePreCommit(relationPreCommitKey(playground.playground_id))"
                   type="warning"
@@ -550,19 +575,24 @@ async function submitSnapshot(): Promise<void> {
           <div v-else class="relation-list">
             <button
               v-for="snapshot in snapshotQuery.data.value?.data.items"
-              :key="snapshot.commit_id"
+              :key="snapshot.snapshot_id"
               type="button"
-              @click="openSnapshot(snapshot.commit_id)"
+              @click="openSnapshot(snapshot.snapshot_id)"
             >
               <span>
                 <strong>{{ snapshot.message }}</strong>
-                <code>{{ snapshot.commit_id }}</code>
+                <code>{{ snapshot.snapshot_id }}</code>
+                <small>Commit {{ snapshot.commit_id }}</small>
               </span>
               <span class="relation-list__aside">
                 <small>
                   {{ snapshot.region }} · {{ formatCount(snapshot.logical_file_count) }} files ·
                   {{ formatBytes(snapshot.logical_size_bytes) }}
                 </small>
+                <el-tag :type="snapshotStateTagType(snapshot.state)" effect="plain">
+                  {{ snapshotStateLabel(snapshot.state) }} ·
+                  {{ snapshotPhaseLabel(snapshot.phase) }}
+                </el-tag>
                 <ArrowRight />
               </span>
             </button>
@@ -691,13 +721,13 @@ async function submitSnapshot(): Promise<void> {
               <dt>Tags</dt>
               <dd class="tag-list">
                 <el-tag
-                  v-for="tagName in commitTagNames(commitDiff.target_commit.ref_names)"
+                  v-for="tagName in commitTagNames(commitDiff.target_commit.tag_names)"
                   :key="tagName"
                   effect="plain"
                 >
                   {{ tagName }}
                 </el-tag>
-                <span v-if="commitTagNames(commitDiff.target_commit.ref_names).length === 0">
+                <span v-if="commitTagNames(commitDiff.target_commit.tag_names).length === 0">
                   暂无 Tag
                 </span>
               </dd>
@@ -741,13 +771,13 @@ async function submitSnapshot(): Promise<void> {
               <dt>Tags</dt>
               <dd class="tag-list">
                 <el-tag
-                  v-for="tagName in commitTagNames(commitDiff.base_commit.ref_names)"
+                  v-for="tagName in commitTagNames(commitDiff.base_commit.tag_names)"
                   :key="tagName"
                   effect="plain"
                 >
                   {{ tagName }}
                 </el-tag>
-                <span v-if="commitTagNames(commitDiff.base_commit.ref_names).length === 0">
+                <span v-if="commitTagNames(commitDiff.base_commit.tag_names).length === 0">
                   暂无 Tag
                 </span>
               </dd>

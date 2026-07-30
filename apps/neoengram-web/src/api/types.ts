@@ -30,6 +30,8 @@ export type ProjectSummary = components['schemas']['ProjectSummary'];
 export type QueryArtifactListRequest = components['schemas']['QueryArtifactListRequest'];
 export type QueryArtifactListResponse = components['schemas']['QueryArtifactListResponse'];
 export type QueryArtifactResponse = components['schemas']['QueryArtifactResponse'];
+export type ArtifactInitializationMode = components['schemas']['ArtifactInitialization']['mode'];
+export type ArtifactInitialization = components['schemas']['ArtifactInitialization'];
 export type CreateArtifactRequest = components['schemas']['CreateArtifactRequest'];
 export type CreateArtifactResponse = components['schemas']['CreateArtifactResponse'];
 export type ArtifactView = components['schemas']['ArtifactView'];
@@ -46,12 +48,58 @@ export type QueryPlaygroundListResponse = components['schemas']['QueryPlayground
 export type QueryPlaygroundResponse = components['schemas']['QueryPlaygroundResponse'];
 export type CreatePlaygroundRequest = components['schemas']['CreatePlaygroundRequest'];
 export type CreatePlaygroundResponse = components['schemas']['CreatePlaygroundResponse'];
+export type PlaygroundState = components['schemas']['PlaygroundState'];
+export type PlaygroundView = components['schemas']['PlaygroundView'];
+export type StartPreCommitRequest = components['schemas']['StartPreCommitRequest'];
+export type StartPreCommitResponse = components['schemas']['StartPreCommitResponse'];
+export type QueryPreCommitRequest = components['schemas']['QueryPreCommitRequest'];
+export type QueryPreCommitResponse = components['schemas']['QueryPreCommitResponse'];
+export type RestartPreCommitRequest = components['schemas']['RestartPreCommitRequest'];
+export type RestartPreCommitResponse = components['schemas']['RestartPreCommitResponse'];
+export type CancelPreCommitRequest = components['schemas']['CancelPreCommitRequest'];
+export type CancelPreCommitResponse = components['schemas']['CancelPreCommitResponse'];
+export type PreCommitState = components['schemas']['PreCommitState'];
+export type PreCommitPhase = components['schemas']['PreCommitPhase'];
+export type PreCommitView = components['schemas']['PreCommitView'];
 export type CommitPlaygroundRequest = components['schemas']['CommitPlaygroundRequest'];
 export type CommitPlaygroundResponse = components['schemas']['CommitPlaygroundResponse'];
-export type PlaygroundView = components['schemas']['PlaygroundView'];
+export type QueryPlaygroundFileListRequest =
+  components['schemas']['QueryPlaygroundFileListRequest'];
+export type QueryPlaygroundFileListResponse =
+  components['schemas']['QueryPlaygroundFileListResponse'];
+export type QueryPlaygroundChangeListRequest =
+  components['schemas']['QueryPlaygroundChangeListRequest'];
+export type QueryPlaygroundChangeListResponse =
+  components['schemas']['QueryPlaygroundChangeListResponse'];
+export type QueryPlaygroundFileMetadataRequest =
+  components['schemas']['QueryPlaygroundFileMetadataRequest'];
+export type QueryPlaygroundFileMetadataResponse =
+  components['schemas']['QueryPlaygroundFileMetadataResponse'];
+export type QueryPlaygroundDatasetProfileRequest =
+  components['schemas']['QueryPlaygroundDatasetProfileRequest'];
+export type QueryPlaygroundDatasetProfileResponse =
+  components['schemas']['QueryPlaygroundDatasetProfileResponse'];
+export type LogicalFileEntry = components['schemas']['LogicalFileEntry'];
+export type PlaygroundChangeEntry = components['schemas']['PlaygroundChangeEntry'];
+export type FileMetadataView = components['schemas']['FileMetadataView'];
+export type DatasetProfileView = components['schemas']['DatasetProfileView'];
 export type QuerySnapshotListRequest = components['schemas']['QuerySnapshotListRequest'];
 export type QuerySnapshotListResponse = components['schemas']['QuerySnapshotListResponse'];
 export type QuerySnapshotResponse = components['schemas']['QuerySnapshotResponse'];
 export type CreateSnapshotRequest = components['schemas']['CreateSnapshotRequest'];
 export type CreateSnapshotResponse = components['schemas']['CreateSnapshotResponse'];
+export type RetrySnapshotDeliveryRequest = components['schemas']['RetrySnapshotDeliveryRequest'];
+export type RetrySnapshotDeliveryResponse = components['schemas']['RetrySnapshotDeliveryResponse'];
+export type QuerySnapshotFileListRequest = components['schemas']['QuerySnapshotFileListRequest'];
+export type QuerySnapshotFileListResponse = components['schemas']['QuerySnapshotFileListResponse'];
+export type QuerySnapshotActivityListRequest =
+  components['schemas']['QuerySnapshotActivityListRequest'];
+export type QuerySnapshotActivityListResponse =
+  components['schemas']['QuerySnapshotActivityListResponse'];
+export type QuerySnapshotDatasetProfileRequest =
+  components['schemas']['QuerySnapshotDatasetProfileRequest'];
+export type QuerySnapshotDatasetProfileResponse =
+  components['schemas']['QuerySnapshotDatasetProfileResponse'];
+export type SnapshotState = components['schemas']['SnapshotState'];
+export type SnapshotPhase = components['schemas']['SnapshotPhase'];
 export type SnapshotView = components['schemas']['SnapshotView'];

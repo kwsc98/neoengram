@@ -165,6 +165,7 @@ test('creates an Artifact, Playground, Commit and Snapshot from resource pages',
   await expect(artifactDialog.getByRole('combobox', { name: 'StorageVolume 选择' })).toHaveCount(0);
   await artifactDialog.getByLabel('名称').fill('自动驾驶评测集');
   await artifactDialog.getByLabel('描述').fill('从资源页创建的端到端测试数据集');
+  await expect(artifactDialog.getByText('创建空 Artifact', { exact: true })).toBeVisible();
   await expect(artifactDialog.getByText('Default ref', { exact: true })).toHaveCount(0);
   await page.screenshot({
     path: testInfo.outputPath('artifact-create.png'),
@@ -215,10 +216,32 @@ test('creates an Artifact, Playground, Commit and Snapshot from resource pages',
   await page.getByRole('option', { name: /自动化评测 PVC/ }).click();
   await expect(snapshotDialog.getByText('自动化评测 PVC · cn-guangzhou')).toBeVisible();
   await snapshotDialog.getByRole('button', { name: '创建 Snapshot' }).click();
-  await expect(page).toHaveURL(/\/snapshots\/commit-/);
+  await expect(page).toHaveURL(/\/snapshots\/snap-/);
   await expect(page.getByRole('heading', { name: '建立自动驾驶评测基线' })).toBeVisible();
+  await expect(page.getByText('只读 · 创建中', { exact: true })).toBeVisible();
   await expect(page.getByText('cn-guangzhou', { exact: true }).first()).toBeVisible();
   await expectHealthyLayout(page);
+});
+
+test('creates an Artifact derived from an explicit source Commit', async ({ page }, testInfo) => {
+  const artifactId = `derived-${testInfo.project.name}`;
+  await page.goto('/tenants/tenant-a/artifacts?project_id=project-language');
+  await page.getByRole('button', { name: '创建 Artifact' }).click();
+  const dialog = page.getByRole('dialog', { name: '创建 Artifact' });
+  await dialog.getByLabel('Artifact ID').fill(artifactId);
+  await dialog.getByLabel('名称').fill('道路场景派生评测集');
+  await dialog.getByText('从 Commit 派生', { exact: true }).click();
+  await dialog.getByRole('combobox', { name: '来源 Artifact' }).click();
+  await page.getByRole('option', { name: /道路场景数据集/ }).click();
+  await dialog.getByRole('combobox', { name: '来源 Commit' }).click();
+  await page.getByRole('option', { name: /完成首轮质量复核 · commit-main-2/ }).click();
+  await dialog.getByRole('button', { name: '创建 Artifact' }).click();
+
+  await expect(page).toHaveURL(new RegExp(`/artifacts/${artifactId}$`));
+  await expect(page.getByText('从 Commit 派生', { exact: true })).toBeVisible();
+  await expect(page.getByText('road-scenes', { exact: true })).toBeVisible();
+  await expect(page.getByText('commit-main-2', { exact: true })).toBeVisible();
+  await expect(page.getByText('尚无 Commit')).toHaveCount(0);
 });
 
 test('browses Tenant-wide Playground and Snapshot details', async ({ page }, testInfo) => {
@@ -226,6 +249,9 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   const visiblePlaygroundList = page.locator(
     '.resource-table:visible, .mobile-resource-list:visible',
   );
+  await expect(visiblePlaygroundList.getByText('创建中', { exact: true })).toBeVisible();
+  await expect(visiblePlaygroundList.getByText('可用', { exact: true }).first()).toBeVisible();
+  await expect(visiblePlaygroundList.getByText('异常', { exact: true })).toBeVisible();
   await expect(visiblePlaygroundList.getByText('计算内容摘要')).toBeVisible();
   await expect(visiblePlaygroundList.getByText('中心一致性校验')).toBeVisible();
 
@@ -266,9 +292,19 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   await expect(page.getByText(/project-language \/ dialog-corpus \/ safety-review/)).toBeVisible();
 
   await page.goto('/tenants/tenant-a/snapshots');
-  await page.getByRole('button', { name: /补充夜间道路场景/ }).click();
-  await expect(page).toHaveURL(/\/snapshots\/commit-main-3$/);
-  await expect(page.getByText('只读 · Ready', { exact: true })).toBeVisible();
+  const visibleSnapshotList = page.locator(
+    '.resource-table:visible, .mobile-resource-list:visible',
+  );
+  await expect(visibleSnapshotList.getByText('创建中', { exact: true })).toBeVisible();
+  await expect(visibleSnapshotList.getByText('可用', { exact: true }).first()).toBeVisible();
+  await expect(visibleSnapshotList.getByText('异常', { exact: true })).toBeVisible();
+  const regionalSnapshots = page
+    .locator('.desktop-table .el-table__row')
+    .filter({ hasText: 'commit-main-3' });
+  await expect(regionalSnapshots).toHaveCount(2);
+  await page.getByRole('button', { name: /snap-road-main3-sha-01/ }).click();
+  await expect(page).toHaveURL(/\/snapshots\/snap-road-main3-sha-01$/);
+  await expect(page.getByText('只读 · 可用', { exact: true })).toBeVisible();
   await expect(page.getByText('固定 Commit', { exact: true })).toBeVisible();
   await expect(page.getByText('dataset/v4', { exact: true })).toBeVisible();
   await expect(page.getByText(/refs\/heads/)).toHaveCount(0);
@@ -352,7 +388,7 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   await page.getByRole('button', { name: '创建 Snapshot 并开始交付' }).click();
 
   await expect(page.getByRole('heading', { name: '正在交付 Snapshot' })).toBeVisible();
-  await expect(page.getByText('materializing · 64%')).toBeVisible();
+  await expect(page.getByText('Creating · 物化数据 64%')).toBeVisible();
   await page.getByRole('button', { name: '推进模拟' }).click();
   await expect(page.getByRole('heading', { name: 'Snapshot 已在目标区域就绪' })).toBeVisible();
   await expect(page.getByText('cn-guangzhou 已通过完整性校验')).toBeVisible();

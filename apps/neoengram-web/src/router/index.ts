@@ -74,7 +74,7 @@ const routes: RouteRecordRaw[] = [
     meta: tenantMeta,
   },
   {
-    path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/snapshots/:commitId',
+    path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/snapshots/:snapshotId',
     name: 'snapshot-detail',
     component: () => import('@/pages/SnapshotDetailPage.vue'),
     meta: tenantMeta,

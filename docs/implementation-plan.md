@@ -35,10 +35,10 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 
 | 术语 | 规范定义 |
 | --- | --- |
-| `Artifact` | 一个无固定 Region/StorageVolume 的版本化抽象文件系统，是 Commit、Playground、Snapshot 和对象归属的领域根 |
+| `Artifact` | 一个无固定 Region/StorageVolume 的版本化抽象文件系统，创建时为空或从同 Tenant 另一个 Artifact 的明确 Commit 派生，是 Commit、Playground、Snapshot 和对象归属的领域根 |
 | `Commit` | Artifact 的不可变版本节点；v1 单 parent，形成可分支的 Commit 历史树 |
 | `Playground` | 基于某个 Commit 的可读写工作区，拥有独立 IndexVersion，能够发布新 Commit |
-| `Snapshot` | 固定 `artifact_id + commit_id` 的单 Region、单 StorageVolume 只读交付；内部版本指针移动不能改变其内容 |
+| `Snapshot` | 具有独立 `snapshot_id`，固定 `artifact_id + commit_id` 和一个 Region/StorageVolume 的只读交付；同一 Commit 可有多个 Snapshot |
 | `MetadataBatch` | Agent 向中心分页上传的 IndexDelta/ObjectReceipt 临时批次，不是 Artifact |
 
 当前 format v8 和 CLI 中的 `repository`、`workspace` 是 Standalone 名称：在中心领域模型中分别
@@ -53,7 +53,8 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 - Vue 3 Web 控制台作为独立 `apps/neoengram-web` npm 应用，只消费公开 OpenAPI；首版 MSW 可运行，
   已覆盖租户切换/创建、StorageVolume 登记与放置选择、Project 筛选、无固定放置 Artifact、单 Volume
   Playground、单区域 Snapshot、Pre-commit、带描述和 Tags 的 Playground Commit、父版本文件/元数据
-  Diff、资源浏览和 Managed Add Job；
+  Diff、资源浏览和 Managed Add Job；派生 Artifact、独立 Snapshot ID、同 Commit 多区域 Snapshot、
+  分页元数据和领域状态机已经进入 OpenAPI v1，真实 HTTP 服务仍待实现；
   真实联网依赖后续 HTTP/OIDC adapter；
 - 第一版远端同步只围绕 `main`/detached Commit，暂不解决多分支合并；
 - 服务端保存不可变历史，ref/对象的保留和 GC 由中心策略统一管理；
@@ -490,17 +491,20 @@ root、外部 IdP/数据库/S3/KMS 管理员完全失陷，也不把 `export` �
 
 ### 9.1 Snapshot 身份与描述
 
-- `Snapshot` 的稳定身份是 `tenant_id + project_id + artifact_id + commit_id`；Directory ID
-  只表示文件内容指纹，不另复制一套文件图。
-- v1 一个 Snapshot 只绑定一个 `storage_volume_id`，Region 由 Volume 派生；同一身份改用其他 Volume
-  必须冲突，不能把多个 Region placements 塞进同一个 Snapshot。
+- `Snapshot` 的稳定资源身份是独立 `snapshot_id`；它引用
+  `tenant_id + project_id + artifact_id + commit_id`，Directory ID 只表示文件内容指纹，不另复制一套
+  文件图。OpenAPI v1 已使用 `tenant_id + snapshot_id` 查询独立 Snapshot。
+- 一个 Snapshot 只绑定一个 `storage_volume_id`，Region 由 Volume 派生，不能把多个 Region placements
+  塞进同一个 Snapshot。同一 Commit 可以创建多个 Snapshot，在不同 Volume/Region 分别交付；v1 同一
+  Commit/Volume 最多一个未删除 Snapshot。
 - 内部版本指针只在训练开始时解析一次；产品界面和公开业务请求只展示/记录完整 Commit ID 与
   Tags，不提供 Ref 或 Default Ref 概念。
 - 只有 Commit → Directory → Manifest → Chunk 全图已持久化并校验，且目标 Volume 的单区域只读
-  视图已完成物化和完整性校验后，Snapshot 才可读取；Snapshot 一旦可读取便始终固定该 Commit、
-  Region 和 Volume，不再使用训练状态改变它的只读文件语义。
-- 如果未来需要同一 Commit 同时交付多个 Region 或用途，必须引入独立 `snapshot_id`，每个 Snapshot
-  仍保持单 Region；该扩展不能改变当前复合身份的幂等和冲突语义。
+  视图已完成物化和完整性校验后，Snapshot 才从 `Creating` 进入 `Ready`；创建、物化、校验或基础设施
+  失败时进入 `Abnormal`。Snapshot 一旦可读取便始终固定该 Commit、Region 和 Volume，不再使用训练
+  状态改变它的只读文件语义。
+- 相同 request identity 重放必须返回同一 Snapshot；为同一 Commit 选择另一个 Volume 时创建新的
+  `snapshot_id`，不能迁移或扩展已有 Snapshot 的 placement。
 - sidecar 存在并通过 schema/source/ShardSet 校验时，独立的 `DatasetProfileState` 进入 `Ready`，训练
   API 只接受具有 Ready profile 的 Snapshot。sidecar 缺失时 Snapshot 仍是合法普通文件快照，但
   显示为未声明训练 profile；sidecar 无效时 profile 进入 `Rejected`，Snapshot 本身不失效。
@@ -656,3 +660,4 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-26 | 将 Managed 对象 durability authority 固定为中心 S3，NFS 仅放 Playground/journal/cache | Finalize 必须经过 missing upload、中心 durability、MetadataBatch 完整性和 IndexVersion CAS；避免把 NFS/cache/receipt 当成权威 |
 | 2026-07-27 | 合并 R1.1/R1.2，完成 `AuthorityStore` 与默认 SQLite 中心权威后端 | 全部中心端口可跨重开恢复并运行同一后端契约；SQLite 限单进程且无 RLS/HA，PG/MySQL 后端保持独立 schema/migration |
 | 2026-07-30 | 基于 Web Mock 冻结中心化 Agent 产品定义 | Artifact 无固定放置；Commit 只从 Playground 发起；用户界面仅展示 Commit/Tags；Snapshot 固定单 Region/Volume；Pre-commit 与 Playground 主可用性正交 |
+| 2026-07-30 | 冻结派生 Artifact 与多区域 Snapshot 产品身份 | Artifact 只能为空或从同 Tenant 明确 Commit 派生；Snapshot 使用独立 ID，同一 Commit 可有多个单 Region/Volume Snapshot；Playground/Snapshot 主状态统一为 Creating/Ready/Abnormal |

@@ -8,6 +8,7 @@ import {
   Lock,
   RefreshRight,
   Search,
+  WarningFilled,
 } from '@element-plus/icons-vue';
 import { useQuery } from '@tanstack/vue-query';
 import { computed, ref } from 'vue';
@@ -16,6 +17,11 @@ import { useRoute, useRouter } from 'vue-router';
 import { queryArtifactCommitDiff, querySnapshot } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
+import {
+  snapshotPhaseLabel,
+  snapshotStateLabel,
+  snapshotStateTagType,
+} from '@/features/snapshots/prototype';
 import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
@@ -32,7 +38,7 @@ const router = useRouter();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
 const projectId = computed(() => String(route.params.projectId ?? ''));
 const artifactId = computed(() => String(route.params.artifactId ?? ''));
-const commitId = computed(() => String(route.params.commitId ?? ''));
+const snapshotId = computed(() => String(route.params.snapshotId ?? ''));
 const activeTab = ref('overview');
 const fileSearch = ref('');
 
@@ -42,10 +48,14 @@ const snapshotQuery = useQuery({
     tenantId.value,
     projectId.value,
     artifactId.value,
-    commitId.value,
+    snapshotId.value,
   ]),
-  queryFn: () => querySnapshot(tenantId.value, projectId.value, artifactId.value, commitId.value),
+  queryFn: () => querySnapshot(tenantId.value, snapshotId.value),
+  refetchInterval: (query) =>
+    query.state.data?.data.snapshot.state === 'creating' ? 1_000 : false,
 });
+const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
+const commitId = computed(() => snapshot.value?.commit_id ?? '');
 const commitQuery = useQuery({
   queryKey: computed(() => [
     'artifact-commit-diff',
@@ -57,12 +67,12 @@ const commitQuery = useQuery({
   ]),
   queryFn: () =>
     queryArtifactCommitDiff(tenantId.value, projectId.value, artifactId.value, commitId.value),
+  enabled: computed(() => Boolean(commitId.value)),
 });
 
-const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
 const commitDiff = computed(() => commitQuery.data.value?.data.diff);
 const snapshotTags = computed(() =>
-  commitTagNames(commitDiff.value?.target_commit.ref_names ?? snapshot.value?.ref_names ?? []),
+  commitTagNames(commitDiff.value?.target_commit.tag_names ?? snapshot.value?.tag_names ?? []),
 );
 const refreshing = computed(() => snapshotQuery.isFetching.value || commitQuery.isFetching.value);
 
@@ -161,9 +171,11 @@ async function openCommit(): Promise<void> {
 
 <template>
   <div class="page snapshot-detail">
-    <PageHeading :title="snapshot?.message ?? commitId" :description="`Snapshot · ${commitId}`">
+    <PageHeading :title="snapshot?.message ?? snapshotId" :description="`Snapshot · ${snapshotId}`">
       <template #actions>
-        <el-tag type="success" effect="plain">只读 · Ready</el-tag>
+        <el-tag v-if="snapshot" :type="snapshotStateTagType(snapshot.state)" effect="plain">
+          只读 · {{ snapshotStateLabel(snapshot.state) }}
+        </el-tag>
         <el-button
           :icon="Back"
           @click="router.push({ name: 'snapshot-list', params: { tenantId } })"
@@ -190,7 +202,19 @@ async function openCommit(): Promise<void> {
     <template v-if="snapshot">
       <section class="snapshot-summary" aria-label="Snapshot 摘要">
         <div>
-          <span>状态</span><strong class="ready-value"><CircleCheck />Ready</strong>
+          <span>状态</span>
+          <strong
+            class="ready-value"
+            :class="{
+              'is-creating': snapshot.state === 'creating',
+              'is-abnormal': snapshot.state === 'abnormal',
+            }"
+          >
+            <CircleCheck v-if="snapshot.state === 'ready'" />
+            <RefreshRight v-else-if="snapshot.state === 'creating'" />
+            <WarningFilled v-else />
+            {{ snapshotStateLabel(snapshot.state) }}
+          </strong>
         </div>
         <div>
           <span>文件数</span><strong>{{ formatCount(snapshot.logical_file_count) }}</strong>
@@ -234,7 +258,7 @@ async function openCommit(): Promise<void> {
                     <h2>存储位置</h2>
                     <p>该 Snapshot 固定在一个区域和一个 StorageVolume</p>
                   </div>
-                  <span>单区域 Ready</span>
+                  <span>单区域 · {{ snapshotStateLabel(snapshot.state) }}</span>
                 </header>
                 <div class="placement-table">
                   <div class="placement-table__header">
@@ -243,10 +267,23 @@ async function openCommit(): Promise<void> {
                   </div>
                   <div>
                     <strong><Location />{{ snapshot.region }}</strong>
-                    <el-tag type="success" effect="plain">Ready</el-tag>
+                    <el-tag :type="snapshotStateTagType(snapshot.state)" effect="plain">
+                      {{ snapshotStateLabel(snapshot.state) }}
+                    </el-tag>
                     <code>{{ snapshot.storage_volume_id }}</code>
-                    <span>本地对象复用</span>
-                    <span class="placement-integrity"> <CircleCheck />100% · 3 分钟前 </span>
+                    <span>{{ snapshotPhaseLabel(snapshot.phase) }}</span>
+                    <span class="placement-integrity">
+                      <CircleCheck v-if="snapshot.state === 'ready'" />
+                      <RefreshRight v-else-if="snapshot.state === 'creating'" />
+                      <WarningFilled v-else />
+                      {{
+                        snapshot.state === 'ready'
+                          ? '100% · 已校验'
+                          : snapshot.state === 'creating'
+                            ? '64% · 物化中'
+                            : '完整性校验失败'
+                      }}
+                    </span>
                   </div>
                 </div>
               </section>
@@ -292,11 +329,17 @@ async function openCommit(): Promise<void> {
             <section class="snapshot-subsection snapshot-identity">
               <header>
                 <div>
-                  <h2>复合身份</h2>
-                  <p>Snapshot 由 Artifact 与 Commit 唯一确定</p>
+                  <h2>Snapshot 身份</h2>
+                  <p>每个 Snapshot 独立绑定一个 Commit、区域和 StorageVolume</p>
                 </div>
               </header>
               <dl>
+                <div>
+                  <dt>Snapshot ID</dt>
+                  <dd>
+                    <code>{{ snapshot.snapshot_id }}</code>
+                  </dd>
+                </div>
                 <div>
                   <dt>Tenant</dt>
                   <dd>{{ snapshot.tenant_id }}</dd>
@@ -315,11 +358,21 @@ async function openCommit(): Promise<void> {
                     <code>{{ snapshot.commit_id }}</code>
                   </dd>
                 </div>
+                <div>
+                  <dt>Region</dt>
+                  <dd>{{ snapshot.region }}</dd>
+                </div>
+                <div>
+                  <dt>StorageVolume</dt>
+                  <dd>
+                    <code>{{ snapshot.storage_volume_id }}</code>
+                  </dd>
+                </div>
               </dl>
             </section>
           </el-tab-pane>
 
-          <el-tab-pane label="文件" name="files">
+          <el-tab-pane label="文件" name="files" :disabled="snapshot.state !== 'ready'">
             <section class="snapshot-files">
               <header>
                 <div>
@@ -369,11 +422,35 @@ async function openCommit(): Promise<void> {
                 <p>Snapshot 创建、区域物化和完整性校验记录</p>
               </header>
               <el-timeline>
-                <el-timeline-item timestamp="今天 16:18" type="success">
-                  <strong>Snapshot Ready</strong>
-                  <p>{{ snapshot.region }} 已通过 Manifest 与对象完整性校验</p>
+                <el-timeline-item
+                  timestamp="当前"
+                  :type="
+                    snapshot.state === 'ready'
+                      ? 'success'
+                      : snapshot.state === 'creating'
+                        ? 'warning'
+                        : 'danger'
+                  "
+                >
+                  <strong
+                    >{{ snapshotStateLabel(snapshot.state) }} ·
+                    {{ snapshotPhaseLabel(snapshot.phase) }}</strong
+                  >
+                  <p>
+                    {{
+                      snapshot.state === 'ready'
+                        ? `${snapshot.region} 已通过 Manifest 与对象完整性校验`
+                        : snapshot.state === 'creating'
+                          ? `${snapshot.region} 正在物化并校验目标数据`
+                          : `${snapshot.region} 的交付任务异常，等待重试`
+                    }}
+                  </p>
                 </el-timeline-item>
-                <el-timeline-item timestamp="今天 16:13" type="success">
+                <el-timeline-item
+                  v-if="snapshot.state === 'ready'"
+                  timestamp="今天 16:13"
+                  type="success"
+                >
                   <strong>{{ snapshot.region }} 物化完成</strong>
                   <p>已写入 {{ snapshot.storage_volume_id }}</p>
                 </el-timeline-item>
@@ -439,6 +516,14 @@ async function openCommit(): Promise<void> {
 
 .ready-value svg {
   width: 16px;
+}
+
+.ready-value.is-creating {
+  color: var(--amber);
+}
+
+.ready-value.is-abnormal {
+  color: var(--red);
 }
 
 .snapshot-detail-shell {

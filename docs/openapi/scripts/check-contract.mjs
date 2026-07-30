@@ -49,10 +49,22 @@ const expectedOperations = {
   '/api/playground/list/query': ['post', 'queryPlaygroundList'],
   '/api/playground/query': ['post', 'queryPlayground'],
   '/api/playground/create': ['post', 'createPlayground'],
+  '/api/playground/precommit/start': ['post', 'startPlaygroundPreCommit'],
+  '/api/playground/precommit/query': ['post', 'queryPlaygroundPreCommit'],
+  '/api/playground/precommit/restart': ['post', 'restartPlaygroundPreCommit'],
+  '/api/playground/precommit/cancel': ['post', 'cancelPlaygroundPreCommit'],
+  '/api/playground/file/list/query': ['post', 'queryPlaygroundFileList'],
+  '/api/playground/change/list/query': ['post', 'queryPlaygroundChangeList'],
+  '/api/playground/file/metadata/query': ['post', 'queryPlaygroundFileMetadata'],
+  '/api/playground/dataset/profile/query': ['post', 'queryPlaygroundDatasetProfile'],
   '/api/playground/commit/create': ['post', 'commitPlayground'],
   '/api/snapshot/list/query': ['post', 'querySnapshotList'],
   '/api/snapshot/query': ['post', 'querySnapshot'],
   '/api/snapshot/create': ['post', 'createSnapshot'],
+  '/api/snapshot/delivery/retry': ['post', 'retrySnapshotDelivery'],
+  '/api/snapshot/file/list/query': ['post', 'querySnapshotFileList'],
+  '/api/snapshot/activity/list/query': ['post', 'querySnapshotActivityList'],
+  '/api/snapshot/dataset/profile/query': ['post', 'querySnapshotDatasetProfile'],
   '/api/job/add/create': ['post', 'createAddJob'],
   '/api/job/query': ['post', 'queryJob'],
   '/api/job/add/finalize': ['post', 'finalizeAddJob'],
@@ -289,10 +301,37 @@ const resourceContracts = {
   queryPlaygroundList: ['QueryPlaygroundListRequest', 'QueryPlaygroundListResponse'],
   queryPlayground: ['QueryPlaygroundRequest', 'QueryPlaygroundResponse'],
   createPlayground: ['CreatePlaygroundRequest', 'CreatePlaygroundResponse'],
+  startPlaygroundPreCommit: ['StartPreCommitRequest', 'StartPreCommitResponse'],
+  queryPlaygroundPreCommit: ['QueryPreCommitRequest', 'QueryPreCommitResponse'],
+  restartPlaygroundPreCommit: ['RestartPreCommitRequest', 'RestartPreCommitResponse'],
+  cancelPlaygroundPreCommit: ['CancelPreCommitRequest', 'CancelPreCommitResponse'],
+  queryPlaygroundFileList: ['QueryPlaygroundFileListRequest', 'QueryPlaygroundFileListResponse'],
+  queryPlaygroundChangeList: [
+    'QueryPlaygroundChangeListRequest',
+    'QueryPlaygroundChangeListResponse',
+  ],
+  queryPlaygroundFileMetadata: [
+    'QueryPlaygroundFileMetadataRequest',
+    'QueryPlaygroundFileMetadataResponse',
+  ],
+  queryPlaygroundDatasetProfile: [
+    'QueryPlaygroundDatasetProfileRequest',
+    'QueryPlaygroundDatasetProfileResponse',
+  ],
   commitPlayground: ['CommitPlaygroundRequest', 'CommitPlaygroundResponse'],
   querySnapshotList: ['QuerySnapshotListRequest', 'QuerySnapshotListResponse'],
   querySnapshot: ['QuerySnapshotRequest', 'QuerySnapshotResponse'],
   createSnapshot: ['CreateSnapshotRequest', 'CreateSnapshotResponse'],
+  retrySnapshotDelivery: ['RetrySnapshotDeliveryRequest', 'RetrySnapshotDeliveryResponse'],
+  querySnapshotFileList: ['QuerySnapshotFileListRequest', 'QuerySnapshotFileListResponse'],
+  querySnapshotActivityList: [
+    'QuerySnapshotActivityListRequest',
+    'QuerySnapshotActivityListResponse',
+  ],
+  querySnapshotDatasetProfile: [
+    'QuerySnapshotDatasetProfileRequest',
+    'QuerySnapshotDatasetProfileResponse',
+  ],
 };
 
 for (const [operationId, [requestName, responseName]] of Object.entries(resourceContracts)) {
@@ -309,22 +348,29 @@ for (const [operationId, [requestName, responseName]] of Object.entries(resource
 
 const snapshotRequest = document.components.schemas.QuerySnapshotRequest;
 assertSameMembers(snapshotRequest.required,
-  ['tenant_id', 'project_id', 'artifact_id', 'commit_id'],
-  'Snapshot identity must remain tenant/project/artifact/commit');
-assert(!snapshotRequest.properties.snapshot_id, 'Snapshot must not introduce an independent snapshot_id');
+  ['tenant_id', 'snapshot_id'],
+  'Snapshot query identity must be tenant/snapshot');
+assert(!snapshotRequest.properties.project_id
+  && !snapshotRequest.properties.artifact_id
+  && !snapshotRequest.properties.commit_id,
+  'Snapshot query must not retain the old composite identity');
 
 const createSnapshotRequest = document.components.schemas.CreateSnapshotRequest;
 assertSameMembers(createSnapshotRequest.required,
-  ['tenant_id', 'project_id', 'artifact_id', 'commit_id', 'storage_volume_id'],
-  'Snapshot create identity must remain tenant/project/artifact/commit');
+  ['tenant_id', 'project_id', 'artifact_id', 'commit_id', 'storage_volume_id', 'snapshot_request_id'],
+  'Snapshot create must bind Commit, Volume, and request identity');
 assert(!createSnapshotRequest.properties.snapshot_id,
-  'Snapshot create must not introduce an independent snapshot_id');
+  'Snapshot ID must remain server-generated');
+assertSameMembers(document.components.schemas.CreateSnapshotResponse.required,
+  ['snapshot', 'replayed', 'placement_reused'],
+  'Snapshot create replay signals changed');
 
 const commitRequest = document.components.schemas.CommitPlaygroundRequest;
 assert(commitRequest.required.includes('commit_request_id'),
   'Playground Commit must have a stable mutation identity');
-assert(commitRequest.required.includes('expected_index_version'),
-  'Playground Commit must bind the expected IndexVersion');
+assert(commitRequest.required.includes('precommit_id')
+  && commitRequest.required.includes('expected_candidate_index_version'),
+  'Playground Commit must consume a Pre-commit candidate');
 assert(commitRequest.properties.description && commitRequest.properties.tag_names,
   'Playground Commit must accept a description and tag names');
 assert(commitRequest.properties.tag_names.maxItems === 20,
@@ -333,6 +379,44 @@ assert(!commitRequest.properties.actor
   && !commitRequest.properties.principal
   && !commitRequest.properties.request_digest,
   'Playground Commit request must not declare actor, principal, or request_digest');
+assert(document.components.schemas.CommitPlaygroundResponse.required.includes('consumed_precommit'),
+  'Playground Commit response must return the consumed Pre-commit');
+
+const artifactCreate = document.components.schemas.CreateArtifactRequest;
+assert(!artifactCreate.properties.storage_volume_id && !artifactCreate.properties.default_ref,
+  'Artifact create must not select placement or a default Ref');
+assert(artifactCreate.required.includes('initialization'),
+  'Artifact create must declare initialization');
+const initialization = document.components.schemas.ArtifactInitialization;
+assert(initialization.discriminator?.propertyName === 'mode'
+  && initialization.oneOf?.length === 2,
+  'Artifact initialization must be a two-mode discriminated union');
+assertSameMembers(document.components.schemas.DerivedArtifactInitialization.required,
+  ['mode', 'source_project_id', 'source_artifact_id', 'source_commit_id'],
+  'Derived Artifact lineage scope changed');
+
+const commitNode = document.components.schemas.CommitNode;
+assert(commitNode.properties.tag_names && !commitNode.properties.ref_names,
+  'public Commit nodes must expose Tags without Refs');
+const commitGraph = document.components.schemas.CommitGraphView;
+assert(commitGraph.properties.head_commit_id && !commitGraph.properties.refs,
+  'public Commit graph must expose head Commit without Ref tips');
+
+assertSameMembers(document.components.schemas.PlaygroundState.enum,
+  ['creating', 'ready', 'abnormal'],
+  'Playground states changed');
+assertSameMembers(document.components.schemas.PreCommitState.enum,
+  ['running', 'ready', 'abnormal', 'cancelled', 'committed'],
+  'Pre-commit states changed');
+assertSameMembers(document.components.schemas.PreCommitPhase.enum,
+  ['queued', 'scanning', 'hashing', 'uploading', 'validating', 'idle'],
+  'Pre-commit phases changed');
+assertSameMembers(document.components.schemas.SnapshotState.enum,
+  ['creating', 'ready', 'abnormal'],
+  'Snapshot states changed');
+assertSameMembers(document.components.schemas.SnapshotPhase.enum,
+  ['planning', 'materializing', 'verifying', 'idle'],
+  'Snapshot phases changed');
 
 const publicResourceViews = [
   document.components.schemas.StorageVolumeView,
@@ -340,6 +424,9 @@ const publicResourceViews = [
   document.components.schemas.CommitNode,
   document.components.schemas.CommitDiffEntry,
   document.components.schemas.PlaygroundView,
+  document.components.schemas.PreCommitView,
+  document.components.schemas.LogicalFileEntry,
+  document.components.schemas.FileMetadataView,
   document.components.schemas.SnapshotView,
 ];
 const forbiddenResourceFields = [
@@ -353,6 +440,8 @@ const forbiddenResourceFields = [
   'manifest',
   'nfs_path',
   'object_location',
+  'physical_path',
+  'credentials',
 ];
 for (const view of publicResourceViews) {
   const fields = Object.keys(view.properties ?? {}).map((field) => field.toLowerCase());
@@ -368,14 +457,17 @@ assert(!document.components.schemas.CommitDiffEntry.properties.manifest
   && !document.components.schemas.CommitDiffEntry.properties.object_location,
   'Commit diff must not expose internal content identities or locations');
 
-for (const schemaName of ['ArtifactView', 'PlaygroundView', 'SnapshotView']) {
+for (const schemaName of ['PlaygroundView', 'SnapshotView']) {
   const view = document.components.schemas[schemaName];
   assert(view.required.includes('storage_volume_id') && view.required.includes('region'),
     `${schemaName} must expose its public storage placement`);
 }
+assert(!document.components.schemas.ArtifactView.properties.storage_volume_id
+  && !document.components.schemas.ArtifactView.properties.region
+  && !document.components.schemas.ArtifactView.properties.default_ref,
+  'ArtifactView must remain placement- and Ref-free');
 
 for (const schemaName of [
-  'CreateArtifactRequest',
   'CreatePlaygroundRequest',
   'CreateSnapshotRequest',
 ]) {
