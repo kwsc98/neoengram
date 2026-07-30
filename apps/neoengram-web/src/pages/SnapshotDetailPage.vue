@@ -19,15 +19,6 @@ import PageHeading from '@/components/PageHeading.vue';
 import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
-interface SnapshotPlacement {
-  region: string;
-  volume: string;
-  state: 'ready' | 'materializing';
-  mode: string;
-  integrity: string;
-  verifiedAt: string;
-}
-
 interface SnapshotFile {
   path: string;
   format: string;
@@ -74,31 +65,6 @@ const snapshotTags = computed(() =>
   commitTagNames(commitDiff.value?.target_commit.ref_names ?? snapshot.value?.ref_names ?? []),
 );
 const refreshing = computed(() => snapshotQuery.isFetching.value || commitQuery.isFetching.value);
-const snapshotPlacements = computed<SnapshotPlacement[]>(() => {
-  const current = snapshot.value;
-  if (!current) return [];
-  const placements: SnapshotPlacement[] = [
-    {
-      region: current.region,
-      volume: current.storage_volume_id,
-      state: 'ready',
-      mode: '本地对象复用',
-      integrity: '100%',
-      verifiedAt: '3 分钟前',
-    },
-  ];
-  if (current.artifact_id === 'road-scenes' && current.commit_id === 'commit-main-3') {
-    placements.push({
-      region: 'cn-guangzhou',
-      volume: 'volume-guangzhou-training',
-      state: 'ready',
-      mode: '跨区域物化',
-      integrity: '100%',
-      verifiedAt: '8 分钟前',
-    });
-  }
-  return placements;
-});
 
 const roadSceneFiles: SnapshotFile[] = [
   {
@@ -176,10 +142,6 @@ const filteredFiles = computed(() => {
   const query = fileSearch.value.trim().toLowerCase();
   return snapshotFiles.value.filter((file) => !query || file.path.toLowerCase().includes(query));
 });
-const deliveryRegions = computed(() =>
-  snapshotPlacements.value.map((placement) => placement.region).join('、'),
-);
-const crossRegionPlacement = computed(() => snapshotPlacements.value.at(1));
 const profileName = computed(() =>
   artifactId.value === 'road-scenes' ? 'training-dataset-v2' : '未声明',
 );
@@ -237,7 +199,7 @@ async function openCommit(): Promise<void> {
           <span>逻辑大小</span><strong>{{ formatBytes(snapshot.logical_size_bytes) }}</strong>
         </div>
         <div>
-          <span>可用区域</span><strong>{{ snapshotPlacements.length }}</strong>
+          <span>所在区域</span><strong>{{ snapshot.region }}</strong>
         </div>
         <div>
           <span>创建时间</span><strong>{{ formatTime(snapshot.created_at_unix_ms) }}</strong>
@@ -269,24 +231,22 @@ async function openCommit(): Promise<void> {
               <section class="snapshot-subsection">
                 <header>
                   <div>
-                    <h2>区域可用性</h2>
-                    <p>每个区域独立完成对象物化和完整性校验</p>
+                    <h2>存储位置</h2>
+                    <p>该 Snapshot 固定在一个区域和一个 StorageVolume</p>
                   </div>
-                  <span>{{ snapshotPlacements.length }} 个区域 Ready</span>
+                  <span>单区域 Ready</span>
                 </header>
                 <div class="placement-table">
                   <div class="placement-table__header">
                     <span>区域</span><span>状态</span><span>StorageVolume</span><span>物化方式</span
                     ><span>完整性</span>
                   </div>
-                  <div v-for="placement in snapshotPlacements" :key="placement.region">
-                    <strong><Location />{{ placement.region }}</strong>
+                  <div>
+                    <strong><Location />{{ snapshot.region }}</strong>
                     <el-tag type="success" effect="plain">Ready</el-tag>
-                    <code>{{ placement.volume }}</code>
-                    <span>{{ placement.mode }}</span>
-                    <span class="placement-integrity">
-                      <CircleCheck />{{ placement.integrity }} · {{ placement.verifiedAt }}
-                    </span>
+                    <code>{{ snapshot.storage_volume_id }}</code>
+                    <span>本地对象复用</span>
+                    <span class="placement-integrity"> <CircleCheck />100% · 3 分钟前 </span>
                   </div>
                 </div>
               </section>
@@ -410,16 +370,16 @@ async function openCommit(): Promise<void> {
               </header>
               <el-timeline>
                 <el-timeline-item timestamp="今天 16:18" type="success">
-                  <strong>所有目标区域 Ready</strong>
-                  <p>{{ snapshotPlacements.length }} 个区域均通过 Manifest 与对象完整性校验</p>
+                  <strong>Snapshot Ready</strong>
+                  <p>{{ snapshot.region }} 已通过 Manifest 与对象完整性校验</p>
                 </el-timeline-item>
-                <el-timeline-item v-if="crossRegionPlacement" timestamp="今天 16:13" type="success">
-                  <strong>{{ crossRegionPlacement.region }} 物化完成</strong>
-                  <p>跨区域传输 28.4 GiB，复用 82% 已有对象</p>
+                <el-timeline-item timestamp="今天 16:13" type="success">
+                  <strong>{{ snapshot.region }} 物化完成</strong>
+                  <p>已写入 {{ snapshot.storage_volume_id }}</p>
                 </el-timeline-item>
                 <el-timeline-item timestamp="今天 16:09" type="primary">
                   <strong>区域交付任务开始</strong>
-                  <p>已选择 {{ deliveryRegions }}</p>
+                  <p>目标区域 {{ snapshot.region }}</p>
                 </el-timeline-item>
                 <el-timeline-item :timestamp="formatTime(snapshot.created_at_unix_ms)">
                   <strong>Snapshot 创建</strong>
