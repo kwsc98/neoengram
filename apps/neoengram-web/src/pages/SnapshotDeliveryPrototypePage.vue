@@ -9,7 +9,7 @@ import {
   RefreshRight,
   WarningFilled,
 } from '@element-plus/icons-vue';
-import { ElCheckbox, ElMessage } from 'element-plus';
+import { ElMessage, ElRadio } from 'element-plus';
 import { computed, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
@@ -43,7 +43,7 @@ const deliveryState = ref<DeliveryState>('draft');
 const purpose = ref('夜间道路模型训练基线');
 const retention = ref('180d');
 const profile = ref('training-dataset-v2');
-const selectedPlacementIds = ref(['shanghai', 'guangzhou']);
+const selectedPlacementId = ref('guangzhou');
 const showInfrastructure = ref(false);
 
 const placements: RegionPlacement[] = [
@@ -82,30 +82,20 @@ const placements: RegionPlacement[] = [
 
 const stages: Array<{ key: Stage; index: number; label: string; detail: string }> = [
   { key: 'settings', index: 1, label: '固定版本', detail: '用途与保留策略' },
-  { key: 'placement', index: 2, label: '区域交付', detail: '选择计算区域' },
+  { key: 'placement', index: 2, label: '存储位置', detail: '选择一个区域' },
   { key: 'activity', index: 3, label: '可用状态', detail: '物化与完整性校验' },
 ];
 
 const activeStageIndex = computed(
   () => stages.find((stage) => stage.key === activeStage.value)?.index ?? 1,
 );
-const selectedPlacements = computed(() =>
-  placements.filter((placement) => selectedPlacementIds.value.includes(placement.id)),
+const selectedPlacement = computed(() =>
+  placements.find((placement) => placement.id === selectedPlacementId.value),
 );
 
 function goToStage(stage: Stage, index: number): void {
   if (index >= activeStageIndex.value || activeStage.value === 'activity') return;
   activeStage.value = stage;
-}
-
-function togglePlacement(placementId: string, selected: boolean | string | number): void {
-  if (selected) {
-    if (!selectedPlacementIds.value.includes(placementId)) {
-      selectedPlacementIds.value.push(placementId);
-    }
-    return;
-  }
-  selectedPlacementIds.value = selectedPlacementIds.value.filter((item) => item !== placementId);
 }
 
 function continueToPlacement(): void {
@@ -117,8 +107,8 @@ function continueToPlacement(): void {
 }
 
 function startDelivery(): void {
-  if (selectedPlacementIds.value.length === 0) {
-    ElMessage.warning('请选择至少一个目标区域');
+  if (!selectedPlacement.value) {
+    ElMessage.warning('请选择 Snapshot 所在区域');
     return;
   }
   deliveryState.value = 'materializing';
@@ -128,7 +118,7 @@ function startDelivery(): void {
 
 function advancePrototype(): void {
   deliveryState.value = 'ready';
-  ElMessage.success('所有目标区域均已 Ready');
+  ElMessage.success('Snapshot 已在选定区域 Ready');
 }
 
 function resetPrototype(): void {
@@ -137,14 +127,14 @@ function resetPrototype(): void {
   purpose.value = '夜间道路模型训练基线';
   retention.value = '180d';
   profile.value = 'training-dataset-v2';
-  selectedPlacementIds.value = ['shanghai', 'guangzhou'];
+  selectedPlacementId.value = 'guangzhou';
   showInfrastructure.value = false;
   ElMessage.info('Snapshot 交付原型已重置');
 }
 
-function placementStatus(placementId: string): string {
+function placementStatus(): string {
   if (deliveryState.value === 'ready') return 'ready';
-  return placementId === 'shanghai' ? 'ready' : 'materializing · 64%';
+  return 'materializing · 64%';
 }
 
 async function backToVersionHistory(): Promise<void> {
@@ -308,7 +298,7 @@ async function openSnapshotList(): Promise<void> {
       </div>
 
       <footer class="delivery-actions">
-        <span>下一步只选择计算区域，底层 Volume 由 Snapshot 交付策略决定。</span>
+        <span>下一步选择 Snapshot 所在区域，底层 Volume 由交付策略决定。</span>
         <el-button type="primary" :icon="ArrowRight" @click="continueToPlacement"
           >选择交付区域</el-button
         >
@@ -320,7 +310,7 @@ async function openSnapshotList(): Promise<void> {
         <header class="section-title">
           <div>
             <span>PLACEMENT</span>
-            <h2>选择需要就绪的计算区域</h2>
+            <h2>选择 Snapshot 所在区域</h2>
           </div>
           <el-switch
             v-model="showInfrastructure"
@@ -336,14 +326,14 @@ async function openSnapshotList(): Promise<void> {
             :key="placement.id"
             :class="{
               'is-disabled': placement.disabled,
-              'is-selected': selectedPlacementIds.includes(placement.id),
+              'is-selected': selectedPlacementId === placement.id,
             }"
           >
-            <el-checkbox
-              :model-value="selectedPlacementIds.includes(placement.id)"
+            <el-radio
+              v-model="selectedPlacementId"
+              :value="placement.id"
               :disabled="Boolean(placement.disabled)"
               :aria-label="`选择 ${placement.region} 区域`"
-              @change="(selected) => togglePlacement(placement.id, selected)"
             />
             <span class="placement-icon"><Location /></span>
             <div class="placement-copy">
@@ -382,9 +372,11 @@ async function openSnapshotList(): Promise<void> {
 
         <div class="placement-summary">
           <span
-            >已选择 <strong>{{ selectedPlacementIds.length }}</strong> 个区域</span
+            >所在区域 <strong>{{ selectedPlacement?.region }}</strong></span
           >
-          <span>预计跨区域传输 <strong>28.4 GiB</strong></span>
+          <span
+            >物化计划 <strong>{{ selectedPlacement?.transfer }}</strong></span
+          >
           <span>源对象完整性 <strong>verified</strong></span>
         </div>
       </section>
@@ -412,8 +404,8 @@ async function openSnapshotList(): Promise<void> {
             <p>
               {{
                 deliveryState === 'ready'
-                  ? '2 个区域已通过完整性校验，可以创建读取 Lease。'
-                  : '上海已就绪，广州正在下载并验证缺失对象。'
+                  ? `${selectedPlacement?.region} 已通过完整性校验，可以创建读取 Lease。`
+                  : `${selectedPlacement?.region} 正在物化并验证缺失对象。`
               }}
             </p>
           </div>
@@ -421,17 +413,14 @@ async function openSnapshotList(): Promise<void> {
         </header>
 
         <div class="activity-table">
-          <div v-for="placement in selectedPlacements" :key="placement.id">
+          <div v-if="selectedPlacement">
             <span class="activity-region"
-              ><Location /><strong>{{ placement.region }}</strong></span
+              ><Location /><strong>{{ selectedPlacement.region }}</strong></span
             >
-            <code>{{ placement.volume }}</code>
-            <span>{{ placement.transfer }}</span>
-            <el-tag
-              :type="placementStatus(placement.id) === 'ready' ? 'success' : 'warning'"
-              effect="plain"
-            >
-              {{ placementStatus(placement.id) }}
+            <code>{{ selectedPlacement.volume }}</code>
+            <span>{{ selectedPlacement.transfer }}</span>
+            <el-tag :type="placementStatus() === 'ready' ? 'success' : 'warning'" effect="plain">
+              {{ placementStatus() }}
             </el-tag>
           </div>
         </div>

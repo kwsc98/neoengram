@@ -273,8 +273,9 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   await expect(page.getByText('dataset/v4', { exact: true })).toBeVisible();
   await expect(page.getByText(/refs\/heads/)).toHaveCount(0);
   await expect(page.getByText('12 GiB', { exact: true })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '区域可用性' })).toBeVisible();
-  await expect(page.getByText('cn-guangzhou', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '存储位置' })).toBeVisible();
+  await expect(page.getByText('cn-shanghai', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('cn-guangzhou', { exact: true })).toHaveCount(0);
   await page.screenshot({
     path: testInfo.outputPath('snapshot-detail.png'),
     animations: 'disabled',
@@ -293,7 +294,7 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
 
   await page.getByRole('tab', { name: '活动' }).click();
   await expect(page.getByText('Snapshot 创建', { exact: true })).toBeVisible();
-  await expect(page.getByText('2 个区域均通过 Manifest 与对象完整性校验')).toBeVisible();
+  await expect(page.getByText('cn-shanghai 已通过 Manifest 与对象完整性校验')).toBeVisible();
   await expectHealthyLayout(page);
 });
 
@@ -338,8 +339,9 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   await expect(page.getByRole('heading', { name: '交付只读 Snapshot' })).toBeVisible();
   await page.getByRole('button', { name: '选择交付区域' }).click();
 
-  await expect(page.getByRole('heading', { name: '选择需要就绪的计算区域' })).toBeVisible();
-  await expect(page.getByRole('checkbox', { name: '选择 cn-guangzhou 区域' })).toBeChecked();
+  await expect(page.getByRole('heading', { name: '选择 Snapshot 所在区域' })).toBeVisible();
+  await expect(page.getByRole('radio', { name: '选择 cn-guangzhou 区域' })).toBeChecked();
+  await expect(page.getByRole('radio', { name: '选择 cn-shanghai 区域' })).not.toBeChecked();
   await expect(page.locator('.el-message')).toHaveCount(0);
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({
@@ -353,7 +355,7 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   await expect(page.getByText('materializing · 64%')).toBeVisible();
   await page.getByRole('button', { name: '推进模拟' }).click();
   await expect(page.getByRole('heading', { name: 'Snapshot 已在目标区域就绪' })).toBeVisible();
-  await expect(page.getByText('2 个区域已通过完整性校验')).toBeVisible();
+  await expect(page.getByText('cn-guangzhou 已通过完整性校验')).toBeVisible();
   await expectHealthyLayout(page);
   await expect(page.locator('.el-message')).toHaveCount(0);
   await page.evaluate(() => window.scrollTo(0, 0));
