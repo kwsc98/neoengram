@@ -88,8 +88,8 @@ StorageVolume 负责“Playground 字节和恢复 journal 在哪里”。
 | --- | --- | --- |
 | 控制入口 | 已确认 | 用户、CLI、UI 和自动化系统只调用 `neoengramd`，不能直接向 Agent 下发业务命令 |
 | Agent 控制循环 | P0 契约已实现 | ControlEnvelope、hello/heartbeat/assignment/report/failed/decision/finalized 已定义；mTLS/H2/H3 transport 待实现 |
-| 领域根 | 已确认 | Artifact 是版本化抽象文件系统；不能再用 Artifact 表示 Job 输出或临时传输文件 |
-| 可变/只读视图 | 已确认 | Playground 是读写工作区；Snapshot 固定一个 Commit，始终只读 |
+| 领域根 | 已确认 | Artifact 是版本化抽象文件系统；创建时为空或从同 Tenant 另一个 Artifact 的明确 Commit 派生，不能表示 Job 输出或临时传输文件 |
+| 可变/只读视图 | 已确认 | Playground 是单区域读写工作区；Snapshot 有独立 ID、固定一个 Commit 和一个单区域 RO placement；同一 Commit 可有多个 Snapshot |
 | 集群边界 | 已确认 | EdgeCluster 是网络/调度/故障域；跨集群不直连 Agent、不共享 NFS，对象经中心 S3/受控中转传输 |
 | 资源归属 | 已确认 | Index/对象属于 Tenant/Artifact，Playground 属于 StorageVolume placement；均不属于 Agent |
 | Artifact 存储位置 | 已确认 | 一个 Tenant 每集群可有多个 Volume；一个 Volume 可放同租户多个 Artifact；一个 Artifact 每集群最多一个活动 placement |
@@ -127,18 +127,22 @@ Artifact（版本化抽象文件系统）
 │       └── root Directory / Manifest（该版本内部的文件系统树）
 ├── Ref[*] ──▶ Commit
 ├── Playground[*]（读写；从 base Commit 创建，可发布新 Commit）
-└── Snapshot[*] ──▶ fixed Commit + one RO placement（单 Region；内部 Ref 后续移动不影响内容）
+└── Snapshot[*] ──▶ snapshot_id + fixed Commit + one RO placement（同一 Commit 可有多个单 Region Snapshot）
 ```
 
 规范定义：
 
 - `Artifact` 是逻辑文件系统，不是单个普通文件、对象 blob、NFS mount 或 Job 输出；
+- 新 Artifact 只能为空，或从同 Tenant 内另一个 Artifact 的明确 Commit 派生。派生时在新 Artifact 中创建
+  无 parent 的独立 root Commit，复用已 Durable 对象并记录
+  `derived_from_artifact_id + derived_from_commit_id`；来源 Commit 不是新 Artifact 版本图中的 parent；
 - `Commit` 发布后不可修改。v1 使用单 parent，因此版本历史是可分支的树；未来如果支持多 parent merge，
   才把历史模型升级为 DAG；
 - `Playground` 保存 `base_commit_id + PlaygroundIndex/IndexVersion + placement`，是唯一允许产生
   staged/unstaged 变化的视图；一次 commit 从 Playground 发布新的不可变 Commit；
-- `Snapshot` 的内容身份是 `artifact_id + commit_id`，v1 同时绑定一个 StorageVolume 和派生 Region，
-  只提供单区域只读访问；读取会话、lease 和可选 dataset profile 是独立资源，同一 Snapshot 可以
+- `Snapshot` 以独立 `snapshot_id` 为资源身份，同时绑定 `artifact_id + commit_id`、一个
+  StorageVolume 和派生 Region，只提供单区域只读访问；同一 Commit 可以有多个位于不同
+  Volume/Region 的 Snapshot。读取会话、lease 和可选 dataset profile 是独立资源，同一 Snapshot 可以
   同时被多个授权 handle 使用；
 - Agent 上传的 IndexDelta/ObjectReceipt 分页结果统一称为 `MetadataBatch`，不得再称为 Artifact。
 
@@ -200,7 +204,7 @@ EdgeCluster A ──x── EdgeCluster B       # 无 Agent/NFS 直连假设
 | `Artifact` | 一个版本化抽象文件系统；拥有 Commit 历史、Ref、Playground、Snapshot 和对象归属 |
 | `Commit` | Artifact 的不可变版本节点，包含 parent 和该版本文件系统树的 root Directory |
 | `Playground` | Artifact 下基于某个 Commit 的读写工作区；引用所在集群的 ArtifactPlacement，并使用其下相对路径 |
-| `Snapshot` | 固定到 Artifact 某个 Commit 的只读快照，可带读取 lease、retention 和 dataset sidecar |
+| `Snapshot` | 具有独立 ID、固定到 Artifact 某个 Commit 和一个单区域 RO placement 的交付资源，可带读取 lease、retention 和 dataset sidecar |
 | `EdgeCluster` | 一个边缘/Kubernetes 集群及其网络、调度、凭证和故障域 |
 | `ComputeNode` | CPU 主机、VM 或 Kubernetes Node；只表示执行位置 |
 | `AgentInstance` | 一个 Agent 进程身份、证书、版本、capability、session 和最近 heartbeat |

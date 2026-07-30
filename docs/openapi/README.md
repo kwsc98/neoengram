@@ -27,23 +27,25 @@ Tenant、StorageVolume、Artifact、Commit、Playground、Snapshot 与 `JobView`
 StorageVolume 的稳定逻辑 ID、region、EdgeCluster 和公开 PVC reference 可用于放置与运维识别；
 不得包含 Assignment target、Agent/Mount identity、generation、fencing token、NFS export、凭据、
 PublicationCandidate、Manifest、IndexDelta、物理路径或数据库信息。跨租户查询按
-对应资源的 `*_NOT_FOUND` 返回 404，不能泄漏目标资源是否存在。Snapshot 只使用
-`tenant_id + project_id + artifact_id + commit_id` 复合身份，不引入独立 snapshot ID。
+对应资源的 `*_NOT_FOUND` 返回 404，不能泄漏目标资源是否存在。Artifact 不携带放置字段；
+Playground 和 Snapshot 的 Region 始终由所选 StorageVolume 派生。
 
 资源 mutation 同样只接受公开 DTO：StorageVolume 登记已有 PVC/NFS，不负责创建底层存储资源。
-当前已提交契约仍要求 Artifact、Playground 和 Snapshot 创建选择同租户 StorageVolume，region 由
-服务端派生；这与 Web 原型冻结的目标产品口径并不完全一致。下一版契约必须按
-[`../centralized-agent-product.md`](../centralized-agent-product.md) 将 Artifact 改为无固定放置，只让
-Playground 和 Snapshot 各选择一个 Volume。迁移完成前，当前 Artifact placement 字段只能视为待
-移除的契约债务，不能作为新后端实现依据。
+Artifact 创建必须通过 discriminator 明确选择空初始化，或从同 Tenant 另一 Artifact 的明确 Commit
+派生；派生来源显式携带来源 Project。Playground 和 Snapshot 创建各自选择一个同 Tenant Volume。
 
-Playground 和 Snapshot 继续使用完整资源 identity 幂等创建；同一身份改选其他 Volume 必须返回
-placement conflict，不能静默迁移。Snapshot 始终是单 Region、单 Volume。
-Playground Commit 以稳定 `commit_request_id` 绑定完整 scope、expected IndexVersion 和 message，
-可附带详细描述和最多 20 个新 Tag。当前契约仍把 Tag 编码成 `refs/tags/*`；下一版公开响应应直接
-提供 Tags，不能要求前端理解 Ref 前缀。服务端从认证结果建立 actor，并在内部版本指针上执行
-CAS；公开产品不允许用户选择目标 Ref。Commit Diff 默认比较目标 Commit 与其单一
+Playground 继续使用完整资源 identity 幂等创建。Snapshot create 使用稳定 request identity；同一
+Commit/Volume 的重复创建返回已有未删除 Snapshot，同一 Commit 选择其他 Volume 时创建新的
+`snapshot_id`。每个 Snapshot 始终是单 Region、单 Volume，不能静默迁移或返回 placements 数组。
+Playground 的主状态仅为 Creating、Ready、Abnormal；扫描、哈希、上传和校验属于独立 Pre-commit。
+正式 Commit 以稳定 `commit_request_id` 消费 Ready Pre-commit 及其候选 IndexVersion，可附带详细
+描述和最多 20 个 Tag。公开契约只返回 Commit ID、父 Commit 和 Tags，不要求调用方理解 Ref。
+服务端从认证结果建立 actor，并在内部版本指针上执行 CAS。Commit Diff 默认比较目标 Commit 与其单一
 parent，根 Commit 与空基线比较；公开结果只包含 Commit 视图、逻辑路径、变更类型和大小统计。
+
+Playground 文件、变更、文件元数据和 Dataset Profile 使用拆分分页方法；Snapshot 提供独立详情、
+交付重试、Ready 文件清单、活动记录和 Dataset Profile。上述 DTO 仅包含逻辑路径、Schema、统计、
+质量和 freshness，不公开 Manifest ID、对象位置、凭据或物理路径。
 
 Agent API 不属于本 OpenAPI。Agent 的 H2/H3 JSON Text Sequence 双向 session、MetadataBatch 和
 重放规则继续由以下契约定义：
@@ -66,6 +68,6 @@ npm run test:contract
 ```
 
 `bundle` 只在仓库 `target/openapi/` 下生成 JSON 检查产物，不提交生成文件；`test:contract`
-基于该 bundle 校验公开路径、认证与版本头、状态映射、示例、u64 编码、Snapshot 复合身份和
-所有公开资源视图的脱敏边界。
+基于该 bundle 校验公开路径、认证与版本头、状态映射、示例、u64 编码、独立 Snapshot 身份、
+Pre-commit 候选消费、Artifact 初始化模型和所有公开资源视图的脱敏边界。
 CI 会按以上顺序运行相同命令。

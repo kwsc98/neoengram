@@ -509,11 +509,11 @@ paths:
                   - tenant_id: tenant-a
                     project_id: project-vision
                     artifact_id: road-scenes
-                    storage_volume_id: volume-shanghai-vision
-                    region: cn-shanghai
                     display_name: 道路场景数据集
                     description: 训练与回归评估数据
-                    default_ref: refs/heads/main
+                    initialization:
+                      mode: empty
+                    head_commit_id: commit-main-3
                     resource_version: '18'
                     created_at_unix_ms: '1785167000000'
                     updated_at_unix_ms: '1785167600000'
@@ -569,11 +569,11 @@ paths:
                   tenant_id: tenant-a
                   project_id: project-vision
                   artifact_id: road-scenes
-                  storage_volume_id: volume-shanghai-vision
-                  region: cn-shanghai
                   display_name: 道路场景数据集
                   description: 训练与回归评估数据
-                  default_ref: refs/heads/main
+                  initialization:
+                    mode: empty
+                  head_commit_id: commit-main-3
                   resource_version: '18'
                   created_at_unix_ms: '1785167000000'
                   updated_at_unix_ms: '1785167600000'
@@ -597,7 +597,9 @@ paths:
       tags: [Artifact]
       operationId: createArtifact
       summary: 创建 Artifact
-      description: 在指定 Tenant/Project 下创建空 Artifact；资源身份使相同请求可幂等重放。
+      description: |
+        在指定 Tenant/Project 下创建空 Artifact，或从同 Tenant 另一 Artifact 的明确 Commit 派生。
+        Artifact 本身不选择 StorageVolume 或 Region；资源身份使相同请求可幂等重放。
       security:
         - BearerAuth: []
       parameters:
@@ -614,9 +616,12 @@ paths:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: evaluation-set
-              storage_volume_id: volume-shanghai-vision
               display_name: 评测数据集
-              default_ref: refs/heads/main
+              initialization:
+                mode: derived
+                source_project_id: project-vision
+                source_artifact_id: road-scenes
+                source_commit_id: commit-main-3
       responses:
         '200':
           description: 已创建或幂等返回的 Artifact
@@ -650,7 +655,7 @@ paths:
       operationId: queryArtifactCommitGraph
       summary: 查询 Artifact Commit 图
       description: |
-        分页返回单 parent Commit 节点和 Ref tips。Cursor 绑定 graph version 与完整 scope；
+        分页返回单 parent Commit 节点、公开 Tags 和当前 head Commit。Cursor 绑定 graph version 与完整 scope；
         公开节点不包含 root directory、Manifest、Chunk 或存储信息。
       security:
         - BearerAuth: []
@@ -682,21 +687,17 @@ paths:
               example:
                 graph:
                   graph_version: '18'
-                  refs:
-                    - name: refs/heads/main
-                      commit_id: commit-main-3
-                    - name: refs/heads/experiment
-                      commit_id: commit-exp-2
+                  head_commit_id: commit-main-3
                   nodes:
                     - commit_id: commit-main-3
                       parent_commit_id: commit-main-2
                       message: 补充夜间道路场景
-                      ref_names: [refs/heads/main]
+                      tag_names: [dataset/v4, release-candidate]
                       created_at_unix_ms: '1785167600000'
                     - commit_id: commit-exp-2
                       parent_commit_id: commit-main-2
                       message: 实验标注集
-                      ref_names: [refs/heads/experiment]
+                      tag_names: [occlusion-experiment]
                       created_at_unix_ms: '1785167500000'
         '401':
           $ref: '#/components/responses/AuthenticationProblem'
@@ -758,14 +759,14 @@ paths:
                     parent_commit_id: commit-root-1
                     message: 完成首轮质量复核
                     description: 完成白天场景的质量抽检和标签修订。
-                    ref_names: [refs/tags/v1.0]
+                    tag_names: [v1.0]
                     created_at_unix_ms: '1785067400000'
                   target_commit:
                     commit_id: commit-main-3
                     parent_commit_id: commit-main-2
                     message: 补充夜间道路场景
                     description: 增加夜间和低照度样本，并更新场景索引。
-                    ref_names: [refs/heads/main]
+                    tag_names: [dataset/v4, release-candidate]
                     created_at_unix_ms: '1785167600000'
                   summary:
                     files_added: '1'
@@ -802,7 +803,9 @@ paths:
       tags: [Playground]
       operationId: queryPlaygroundList
       summary: 查询租户内 Playground
-      description: 分页查询 Playground；Artifact 筛选必须同时提供 Project scope。
+      description: |
+        按 Project、Artifact、Region、主状态或关键字分页查询 Playground。Artifact 筛选必须同时
+        提供 Project scope；opaque cursor 与完整筛选条件绑定。
       security:
         - BearerAuth: []
       parameters:
@@ -819,6 +822,8 @@ paths:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
+              region: cn-shanghai
+              state: ready
               page_size: 50
       responses:
         '200':
@@ -982,14 +987,595 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailableProblem'
 
+  /api/playground/precommit/start:
+    post:
+      tags: [Playground]
+      operationId: startPlaygroundPreCommit
+      summary: 发起 Playground Pre-commit
+      description: |
+        为 Ready Playground 的当前 IndexVersion 创建冻结候选。服务端生成 `precommit_id`；相同
+        `precommit_request_id` 和 payload 返回原结果，不同 payload 返回 409。200 返回时 Pre-commit
+        已持久化且可查询，扫描、哈希、上传和校验通过其状态、阶段与进度异步推进。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartPreCommitRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              playground_id: labeling
+              precommit_request_id: precommit-request-july-labels
+              expected_index_version:
+                revision: '31'
+                digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      responses:
+        '200':
+          description: 已创建或幂等返回的 Pre-commit
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartPreCommitResponse'
+              example:
+                precommit:
+                  tenant_id: tenant-a
+                  project_id: project-vision
+                  artifact_id: road-scenes
+                  playground_id: labeling
+                  precommit_id: precommit-july-labels-01
+                  precommit_request_id: precommit-request-july-labels
+                  attempt: 1
+                  state: running
+                  phase: queued
+                  progress:
+                    percent: 0
+                    files_completed: '0'
+                    bytes_completed: '0'
+                  checks: []
+                  warnings: []
+                  blockers: []
+                  source_index_version:
+                    revision: '31'
+                    digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  created_at_unix_ms: '1785167600000'
+                  updated_at_unix_ms: '1785167600000'
+                playground:
+                  tenant_id: tenant-a
+                  project_id: project-vision
+                  artifact_id: road-scenes
+                  playground_id: labeling
+                  storage_volume_id: volume-shanghai-vision
+                  region: cn-shanghai
+                  display_name: 标注工作区
+                  base_commit_id: commit-main-2
+                  head_commit_id: commit-main-3
+                  index_version:
+                    revision: '31'
+                    digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  state: ready
+                  active_precommit_id: precommit-july-labels-01
+                  created_at_unix_ms: '1785167000000'
+                  updated_at_unix_ms: '1785167600000'
+                replayed: false
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/precommit/query:
+    post:
+      tags: [Playground]
+      operationId: queryPlaygroundPreCommit
+      summary: 查询 Playground Pre-commit
+      description: 使用 Tenant 和服务端生成的 Pre-commit ID 查询冻结候选、检查和 Diff 摘要。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryPreCommitRequest'
+            example:
+              tenant_id: tenant-a
+              precommit_id: precommit-july-labels-01
+      responses:
+        '200':
+          description: Pre-commit 当前视图
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryPreCommitResponse'
+              example:
+                precommit:
+                  tenant_id: tenant-a
+                  project_id: project-vision
+                  artifact_id: road-scenes
+                  playground_id: labeling
+                  precommit_id: precommit-july-labels-01
+                  precommit_request_id: precommit-request-july-labels
+                  attempt: 1
+                  state: ready
+                  phase: idle
+                  progress:
+                    percent: 100
+                    files_completed: '864'
+                    files_total: '864'
+                    bytes_completed: '12884901888'
+                    bytes_total: '12884901888'
+                  checks:
+                    - check_id: metadata-shape
+                      status: passed
+                      summary: Metadata 和逻辑路径检查通过
+                  warnings: []
+                  blockers: []
+                  source_index_version:
+                    revision: '31'
+                    digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  candidate_index_version:
+                    revision: '31'
+                    digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  diff_summary:
+                    files_added: '1'
+                    files_modified: '1'
+                    files_deleted: '0'
+                    files_renamed: '0'
+                    bytes_added: '6144'
+                    bytes_removed: '2048'
+                  created_at_unix_ms: '1785167600000'
+                  updated_at_unix_ms: '1785167700000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/precommit/restart:
+    post:
+      tags: [Playground]
+      operationId: restartPlaygroundPreCommit
+      summary: 重新发起 Playground Pre-commit
+      description: |
+        在同一 Pre-commit ID 上创建新的 attempt，并冻结请求给定的当前 IndexVersion。只允许从可重试
+        状态发起；相同 `restart_request_id` 和 payload 幂等返回，状态或版本不匹配返回 409。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestartPreCommitRequest'
+            example:
+              tenant_id: tenant-a
+              precommit_id: precommit-july-labels-01
+              restart_request_id: restart-july-labels-02
+              expected_index_version:
+                revision: '32'
+                digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      responses:
+        '200':
+          description: 已重新发起或幂等返回的 Pre-commit
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestartPreCommitResponse'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/precommit/cancel:
+    post:
+      tags: [Playground]
+      operationId: cancelPlaygroundPreCommit
+      summary: 取消 Playground Pre-commit
+      description: |
+        取消尚未提交的 Pre-commit 并清除 Playground 的 active Pre-commit。相同
+        `cancel_request_id` 和 payload 幂等返回；已提交或状态不允许取消时返回 409。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelPreCommitRequest'
+            example:
+              tenant_id: tenant-a
+              precommit_id: precommit-july-labels-01
+              cancel_request_id: cancel-july-labels-01
+      responses:
+        '200':
+          description: 已取消或幂等返回的 Pre-commit
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelPreCommitResponse'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/file/list/query:
+    post:
+      tags: [Playground]
+      operationId: queryPlaygroundFileList
+      summary: 查询 Playground 文件列表
+      description: |
+        分页返回当前工作区 IndexVersion 的逻辑文件和目录。响应不包含 Manifest ID、内容摘要、
+        对象位置、凭据或物理路径；opaque cursor 与资源 scope、IndexVersion 和筛选条件绑定。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryPlaygroundFileListRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              playground_id: labeling
+              path_prefix: dataset/night-rain
+              format: parquet
+              page_size: 50
+      responses:
+        '200':
+          description: Playground 逻辑文件页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryPlaygroundFileListResponse'
+              example:
+                index_version:
+                  revision: '31'
+                  digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                items:
+                  - path: dataset/night-rain/part-0042.parquet
+                    entry_type: file
+                    size_bytes: '19971597926'
+                    format: parquet
+                    row_count: '12842731'
+                    updated_at_unix_ms: '1785167500000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/CursorConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/change/list/query:
+    post:
+      tags: [Playground]
+      operationId: queryPlaygroundChangeList
+      summary: 查询 Playground 文件变更
+      description: |
+        未提供 `precommit_id` 时分页查询当前工作区相对父 Commit 的变更；提供时查询该
+        Pre-commit 的冻结候选。响应只包含逻辑路径、变更类型、格式和大小统计。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryPlaygroundChangeListRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              playground_id: labeling
+              precommit_id: precommit-july-labels-01
+              page_size: 50
+      responses:
+        '200':
+          description: 当前工作区或冻结候选的文件变更页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryPlaygroundChangeListResponse'
+              example:
+                source: precommit
+                precommit_id: precommit-july-labels-01
+                index_version:
+                  revision: '31'
+                  digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                summary:
+                  files_added: '1'
+                  files_modified: '1'
+                  files_deleted: '0'
+                  files_renamed: '0'
+                  bytes_added: '6144'
+                  bytes_removed: '2048'
+                items:
+                  - change_type: modified
+                    path: dataset/index.json
+                    old_size_bytes: '2048'
+                    new_size_bytes: '3072'
+                    format: json
+                  - change_type: added
+                    path: dataset/night-rain/part-0042.parquet
+                    new_size_bytes: '5120'
+                    format: parquet
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/CursorConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/file/metadata/query:
+    post:
+      tags: [Playground]
+      operationId: queryPlaygroundFileMetadata
+      summary: 查询 Playground 文件元数据
+      description: |
+        返回当前工作区中一个逻辑文件的大小、格式、Schema、统计、质量和 freshness；不返回
+        Manifest、Chunk、对象分布、凭据或底层文件系统路径。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryPlaygroundFileMetadataRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              playground_id: labeling
+              path: dataset/night-rain/part-0042.parquet
+      responses:
+        '200':
+          description: 脱敏逻辑文件元数据
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryPlaygroundFileMetadataResponse'
+              example:
+                index_version:
+                  revision: '31'
+                  digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                metadata:
+                  path: dataset/night-rain/part-0042.parquet
+                  size_bytes: '19971597926'
+                  format: parquet
+                  media_type: application/vnd.apache.parquet
+                  row_count: '12842731'
+                  schema:
+                    fields:
+                      - name: image_id
+                        data_type: string
+                        nullable: false
+                      - name: weather
+                        data_type: string
+                        nullable: true
+                  statistics:
+                    row_count: '12842731'
+                    column_count: 18
+                    null_value_count: '1024'
+                  quality:
+                    state: warning
+                    checks_total: 12
+                    checks_passed: 11
+                    checks_failed: 1
+                  freshness:
+                    observed_at_unix_ms: '1785167600000'
+                    source_updated_at_unix_ms: '1785167400000'
+                    age_seconds: '200'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/playground/dataset/profile/query:
+    post:
+      tags: [Playground]
+      operationId: queryPlaygroundDatasetProfile
+      summary: 查询 Playground Dataset Profile
+      description: 返回当前工作区 IndexVersion 的公开数据集画像、Schema、质量和 freshness 摘要。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryPlaygroundDatasetProfileRequest'
+            example:
+              tenant_id: tenant-a
+              project_id: project-vision
+              artifact_id: road-scenes
+              playground_id: labeling
+      responses:
+        '200':
+          description: Playground Dataset Profile
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryPlaygroundDatasetProfileResponse'
+              example:
+                index_version:
+                  revision: '31'
+                  digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                profile:
+                  state: ready
+                  summary:
+                    format_count: 4
+                    logical_file_count: '864'
+                    logical_size_bytes: '12884901888'
+                    row_count: '18409216'
+                    field_count: 18
+                  quality:
+                    state: warning
+                    checks_total: 12
+                    checks_passed: 11
+                    checks_failed: 1
+                  freshness:
+                    observed_at_unix_ms: '1785167600000'
+                    age_seconds: '200'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
   /api/playground/commit/create:
     post:
       tags: [Playground]
       operationId: commitPlayground
       summary: 提交 Playground
       description: |
-        从 Playground 当前 IndexVersion 创建不可变 Commit，并以 `commit_request_id` 提供稳定的
-        mutation identity。服务端必须对 expected IndexVersion 和目标 Ref 执行 CAS。
+        消费属于该 Playground、状态为 Ready 且候选 IndexVersion 匹配的 Pre-commit，创建不可变
+        Commit，并把 Pre-commit 标记为 Committed。`commit_request_id` 是稳定 mutation identity；
+        200 返回时 Commit、Playground 和已消费 Pre-commit 均已持久化且可查询。
       security:
         - BearerAuth: []
       parameters:
@@ -1008,10 +1594,13 @@ paths:
               artifact_id: road-scenes
               playground_id: labeling
               commit_request_id: commit-request-july-labels
-              expected_index_version:
+              precommit_id: precommit-july-labels-01
+              expected_candidate_index_version:
                 revision: '31'
                 digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
               message: 完成七月标注复核
+              description: 完成夜间场景的人工复核并冻结训练候选。
+              tag_names: [dataset/v5, reviewed]
       responses:
         '200':
           description: 已创建或幂等返回的 Commit
@@ -1044,7 +1633,9 @@ paths:
       tags: [Snapshot]
       operationId: querySnapshotList
       summary: 查询租户内 Snapshot
-      description: 分页查询固定到 Artifact Commit 的只读 Snapshot。
+      description: |
+        按 Project、Artifact、Commit、Region、StorageVolume 或状态分页查询独立 Snapshot。
+        opaque cursor 与全部筛选条件绑定。
       security:
         - BearerAuth: []
       parameters:
@@ -1061,6 +1652,8 @@ paths:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
+              region: cn-shanghai
+              state: ready
               page_size: 50
       responses:
         '200':
@@ -1074,15 +1667,24 @@ paths:
                 $ref: '#/components/schemas/QuerySnapshotListResponse'
               example:
                 items:
-                  - tenant_id: tenant-a
+                  - snapshot_id: snap-road-main3-sha-01
+                    tenant_id: tenant-a
                     project_id: project-vision
                     artifact_id: road-scenes
                     commit_id: commit-main-3
                     storage_volume_id: volume-shanghai-archive
                     region: cn-shanghai
                     message: 补充夜间道路场景
-                    ref_names: [refs/heads/main]
+                    tag_names: [dataset/v4, release-candidate]
+                    state: ready
+                    phase: idle
+                    integrity:
+                      state: verified
+                      files_verified: '864'
+                      bytes_verified: '12884901888'
+                      verified_at_unix_ms: '1785167700000'
                     created_at_unix_ms: '1785167600000'
+                    updated_at_unix_ms: '1785167700000'
                     logical_file_count: '864'
                     logical_size_bytes: '12884901888'
         '401':
@@ -1107,7 +1709,7 @@ paths:
       tags: [Snapshot]
       operationId: querySnapshot
       summary: 查询 Snapshot 详情
-      description: 使用 tenant、project、artifact、commit 复合身份查询只读 Snapshot。
+      description: 使用 Tenant 和服务端生成的独立 Snapshot ID 查询脱敏交付详情。
       security:
         - BearerAuth: []
       parameters:
@@ -1122,9 +1724,7 @@ paths:
               $ref: '#/components/schemas/QuerySnapshotRequest'
             example:
               tenant_id: tenant-a
-              project_id: project-vision
-              artifact_id: road-scenes
-              commit_id: commit-main-3
+              snapshot_id: snap-road-main3-sha-01
       responses:
         '200':
           description: Snapshot 当前视图
@@ -1137,6 +1737,7 @@ paths:
                 $ref: '#/components/schemas/QuerySnapshotResponse'
               example:
                 snapshot:
+                  snapshot_id: snap-road-main3-sha-01
                   tenant_id: tenant-a
                   project_id: project-vision
                   artifact_id: road-scenes
@@ -1144,8 +1745,16 @@ paths:
                   storage_volume_id: volume-shanghai-archive
                   region: cn-shanghai
                   message: 补充夜间道路场景
-                  ref_names: [refs/heads/main]
+                  tag_names: [dataset/v4, release-candidate]
+                  state: ready
+                  phase: idle
+                  integrity:
+                    state: verified
+                    files_verified: '864'
+                    bytes_verified: '12884901888'
+                    verified_at_unix_ms: '1785167700000'
                   created_at_unix_ms: '1785167600000'
+                  updated_at_unix_ms: '1785167700000'
                   logical_file_count: '864'
                   logical_size_bytes: '12884901888'
         '401':
@@ -1168,7 +1777,11 @@ paths:
       tags: [Snapshot]
       operationId: createSnapshot
       summary: 创建 Snapshot
-      description: 为指定 Artifact Commit 创建或幂等返回固定只读 Snapshot。
+      description: |
+        为指定 Artifact Commit 和 StorageVolume 创建单区域只读 Snapshot。服务端生成 `snapshot_id`；
+        相同 `snapshot_request_id` 和 payload 返回 `replayed: true`，不同 request identity 命中同一
+        Commit/Volume 的未删除 Snapshot 时返回 `placement_reused: true`。200 返回时 Snapshot 记录
+        已持久化且可查询，后续交付由其状态和阶段表达。
       security:
         - BearerAuth: []
       parameters:
@@ -1187,6 +1800,7 @@ paths:
               artifact_id: road-scenes
               commit_id: commit-main-3
               storage_volume_id: volume-shanghai-archive
+              snapshot_request_id: snapshot-request-main3-shanghai
       responses:
         '200':
           description: 已创建或幂等返回的 Snapshot
@@ -1197,6 +1811,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CreateSnapshotResponse'
+              example:
+                snapshot:
+                  snapshot_id: snap-road-main3-sha-01
+                  tenant_id: tenant-a
+                  project_id: project-vision
+                  artifact_id: road-scenes
+                  commit_id: commit-main-3
+                  storage_volume_id: volume-shanghai-archive
+                  region: cn-shanghai
+                  message: 补充夜间道路场景
+                  tag_names: [dataset/v4, release-candidate]
+                  state: creating
+                  phase: planning
+                  integrity:
+                    state: pending
+                    files_verified: '0'
+                    bytes_verified: '0'
+                  logical_file_count: '864'
+                  logical_size_bytes: '12884901888'
+                  created_at_unix_ms: '1785167600000'
+                  updated_at_unix_ms: '1785167600000'
+                replayed: false
+                placement_reused: false
         '401':
           $ref: '#/components/responses/AuthenticationProblem'
         '403':
@@ -1205,6 +1842,265 @@ paths:
           $ref: '#/components/responses/ResourceNotFoundProblem'
         '409':
           $ref: '#/components/responses/MutationConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/snapshot/delivery/retry:
+    post:
+      tags: [Snapshot]
+      operationId: retrySnapshotDelivery
+      summary: 重试 Snapshot 交付
+      description: |
+        对 Abnormal Snapshot 的同一固定 Commit/Volume 交付重新发起 attempt，使状态回到 Creating。
+        相同 `retry_request_id` 和 payload 幂等返回；状态不允许重试时返回 409。200 返回时新的交付
+        attempt 已持久化，后续进度通过 Snapshot 状态、阶段和活动查询。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetrySnapshotDeliveryRequest'
+            example:
+              tenant_id: tenant-a
+              snapshot_id: snap-road-main2-sha-01
+              retry_request_id: retry-road-main2-sha-02
+      responses:
+        '200':
+          description: 已重新发起或幂等返回的 Snapshot
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetrySnapshotDeliveryResponse'
+              example:
+                snapshot:
+                  snapshot_id: snap-road-main2-sha-01
+                  tenant_id: tenant-a
+                  project_id: project-vision
+                  artifact_id: road-scenes
+                  commit_id: commit-main-2
+                  storage_volume_id: volume-shanghai-vision
+                  region: cn-shanghai
+                  message: 完成首轮质量复核
+                  tag_names: [v1.0]
+                  state: creating
+                  phase: planning
+                  integrity:
+                    state: pending
+                    files_verified: '0'
+                    bytes_verified: '0'
+                  logical_file_count: '820'
+                  logical_size_bytes: '11884901888'
+                  created_at_unix_ms: '1785067400000'
+                  updated_at_unix_ms: '1785167800000'
+                replayed: false
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/snapshot/file/list/query:
+    post:
+      tags: [Snapshot]
+      operationId: querySnapshotFileList
+      summary: 查询 Snapshot 文件列表
+      description: |
+        分页返回 Ready Snapshot 的逻辑文件和目录。Creating 或 Abnormal 状态返回 409；响应不包含
+        Manifest、内容摘要、对象位置、凭据或物理路径，opaque cursor 与筛选条件绑定。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuerySnapshotFileListRequest'
+            example:
+              tenant_id: tenant-a
+              snapshot_id: snap-road-main3-sha-01
+              path_prefix: dataset/night-rain
+              format: parquet
+              page_size: 50
+      responses:
+        '200':
+          description: Snapshot 逻辑文件页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuerySnapshotFileListResponse'
+              example:
+                items:
+                  - path: dataset/night-rain/part-0042.parquet
+                    entry_type: file
+                    size_bytes: '19971597926'
+                    format: parquet
+                    row_count: '12842731'
+                    updated_at_unix_ms: '1785167500000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/MutationConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/snapshot/activity/list/query:
+    post:
+      tags: [Snapshot]
+      operationId: querySnapshotActivityList
+      summary: 查询 Snapshot 交付活动
+      description: 分页返回 Snapshot 创建、阶段变化、失败、重试和就绪的脱敏活动记录。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuerySnapshotActivityListRequest'
+            example:
+              tenant_id: tenant-a
+              snapshot_id: snap-road-main3-sha-01
+              page_size: 50
+      responses:
+        '200':
+          description: Snapshot 活动页
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuerySnapshotActivityListResponse'
+              example:
+                items:
+                  - activity_id: activity-snap-road-main3-ready
+                    activity_type: ready
+                    summary: Snapshot 已完成完整性校验并可读取
+                    phase: idle
+                    created_at_unix_ms: '1785167700000'
+                  - activity_id: activity-snap-road-main3-created
+                    activity_type: created
+                    summary: Snapshot 记录已创建
+                    phase: planning
+                    created_at_unix_ms: '1785167600000'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
+        '409':
+          $ref: '#/components/responses/CursorConflictProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeProblem'
+        '422':
+          $ref: '#/components/responses/ValidationProblem'
+        '500':
+          $ref: '#/components/responses/InternalProblem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableProblem'
+
+  /api/snapshot/dataset/profile/query:
+    post:
+      tags: [Snapshot]
+      operationId: querySnapshotDatasetProfile
+      summary: 查询 Snapshot Dataset Profile
+      description: 返回固定 Snapshot 的公开数据集画像、Schema、质量和 freshness 摘要。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ApiVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Traceparent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuerySnapshotDatasetProfileRequest'
+            example:
+              tenant_id: tenant-a
+              snapshot_id: snap-road-main3-sha-01
+      responses:
+        '200':
+          description: Snapshot Dataset Profile
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuerySnapshotDatasetProfileResponse'
+              example:
+                profile:
+                  state: ready
+                  summary:
+                    format_count: 4
+                    logical_file_count: '864'
+                    logical_size_bytes: '12884901888'
+                    row_count: '18409216'
+                    field_count: 18
+                  quality:
+                    state: warning
+                    checks_total: 12
+                    checks_passed: 11
+                    checks_failed: 1
+                  freshness:
+                    observed_at_unix_ms: '1785167600000'
+                    age_seconds: '200'
+        '401':
+          $ref: '#/components/responses/AuthenticationProblem'
+        '403':
+          $ref: '#/components/responses/AuthorizationProblem'
+        '404':
+          $ref: '#/components/responses/ResourceNotFoundProblem'
         '413':
           $ref: '#/components/responses/PayloadTooLargeProblem'
         '422':
@@ -2350,7 +3246,7 @@ components:
       propertyNames:
         not:
           enum: [actor, principal]
-      required: [tenant_id, project_id, artifact_id, storage_volume_id, display_name]
+      required: [tenant_id, project_id, artifact_id, display_name, initialization]
       properties:
         tenant_id:
           $ref: '#/components/schemas/TenantId'
@@ -2358,16 +3254,47 @@ components:
           $ref: '#/components/schemas/ProjectId'
         artifact_id:
           $ref: '#/components/schemas/ArtifactId'
-        storage_volume_id:
-          $ref: '#/components/schemas/StorageVolumeId'
         display_name:
           $ref: '#/components/schemas/DisplayName'
         description:
           $ref: '#/components/schemas/Description'
-        default_ref:
-          allOf:
-            - $ref: '#/components/schemas/RefName'
-          default: refs/heads/main
+        initialization:
+          $ref: '#/components/schemas/ArtifactInitialization'
+
+    ArtifactInitialization:
+      oneOf:
+        - $ref: '#/components/schemas/EmptyArtifactInitialization'
+        - $ref: '#/components/schemas/DerivedArtifactInitialization'
+      discriminator:
+        propertyName: mode
+        mapping:
+          empty: '#/components/schemas/EmptyArtifactInitialization'
+          derived: '#/components/schemas/DerivedArtifactInitialization'
+
+    EmptyArtifactInitialization:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          const: empty
+
+    DerivedArtifactInitialization:
+      type: object
+      description: 来源 Artifact 必须属于当前 Tenant，来源 Commit 必须属于显式来源 Project/Artifact。
+      additionalProperties: false
+      required: [mode, source_project_id, source_artifact_id, source_commit_id]
+      properties:
+        mode:
+          type: string
+          const: derived
+        source_project_id:
+          $ref: '#/components/schemas/ProjectId'
+        source_artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        source_commit_id:
+          $ref: '#/components/schemas/CommitId'
 
     CreateArtifactResponse:
       type: object
@@ -2382,17 +3309,15 @@ components:
     ArtifactView:
       type: object
       description: |
-        暴露用户选择的 StorageVolume ID 和派生 region，但不暴露内部 ArtifactPlacement、Agent、
-        Manifest、挂载路径或 authority 存储位置。
+        Artifact 是不绑定 Region 或 StorageVolume 的版本化逻辑数据资产。初始化血缘只暴露
+        同 Tenant 的逻辑来源，不暴露 ArtifactPlacement、Manifest 或物理对象位置。
       additionalProperties: false
       required:
         - tenant_id
         - project_id
         - artifact_id
-        - storage_volume_id
-        - region
         - display_name
-        - default_ref
+        - initialization
         - resource_version
         - created_at_unix_ms
         - updated_at_unix_ms
@@ -2403,16 +3328,14 @@ components:
           $ref: '#/components/schemas/ProjectId'
         artifact_id:
           $ref: '#/components/schemas/ArtifactId'
-        storage_volume_id:
-          $ref: '#/components/schemas/StorageVolumeId'
-        region:
-          $ref: '#/components/schemas/RegionName'
         display_name:
           $ref: '#/components/schemas/DisplayName'
         description:
           $ref: '#/components/schemas/Description'
-        default_ref:
-          $ref: '#/components/schemas/RefName'
+        initialization:
+          $ref: '#/components/schemas/ArtifactInitialization'
+        head_commit_id:
+          $ref: '#/components/schemas/CommitId'
         resource_version:
           $ref: '#/components/schemas/CanonicalU64'
         created_at_unix_ms:
@@ -2447,15 +3370,12 @@ components:
     CommitGraphView:
       type: object
       additionalProperties: false
-      required: [graph_version, refs, nodes]
+      required: [graph_version, nodes]
       properties:
         graph_version:
           $ref: '#/components/schemas/CanonicalU64'
-        refs:
-          type: array
-          maxItems: 1024
-          items:
-            $ref: '#/components/schemas/RefTip'
+        head_commit_id:
+          $ref: '#/components/schemas/CommitId'
         nodes:
           type: array
           maxItems: 100
@@ -2464,21 +3384,11 @@ components:
         next_cursor:
           $ref: '#/components/schemas/PageCursor'
 
-    RefTip:
-      type: object
-      additionalProperties: false
-      required: [name, commit_id]
-      properties:
-        name:
-          $ref: '#/components/schemas/RefName'
-        commit_id:
-          $ref: '#/components/schemas/CommitId'
-
     CommitNode:
       type: object
       description: 单 parent 的公开 Commit 节点，不包含 Directory 或 Manifest identity。
       additionalProperties: false
-      required: [commit_id, message, ref_names, created_at_unix_ms]
+      required: [commit_id, message, tag_names, created_at_unix_ms]
       properties:
         commit_id:
           $ref: '#/components/schemas/CommitId'
@@ -2490,12 +3400,12 @@ components:
           maxLength: 4096
         description:
           $ref: '#/components/schemas/Description'
-        ref_names:
+        tag_names:
           type: array
-          maxItems: 1024
+          maxItems: 20
           uniqueItems: true
           items:
-            $ref: '#/components/schemas/RefName'
+            $ref: '#/components/schemas/TagName'
         created_at_unix_ms:
           $ref: '#/components/schemas/UnixMillis'
 
@@ -2599,6 +3509,10 @@ components:
           $ref: '#/components/schemas/ProjectId'
         artifact_id:
           $ref: '#/components/schemas/ArtifactId'
+        region:
+          $ref: '#/components/schemas/RegionName'
+        state:
+          $ref: '#/components/schemas/PlaygroundState'
         cursor:
           $ref: '#/components/schemas/PageCursor'
         page_size:
@@ -2680,11 +3594,15 @@ components:
         replayed:
           type: boolean
 
+    PlaygroundState:
+      type: string
+      enum: [creating, ready, abnormal]
+
     PlaygroundView:
       type: object
       description: |
-        暴露用户选择的 StorageVolume ID 和派生 region，但不暴露 attachment、lease、fencing、
-        Agent 或文件系统位置。
+        Playground 的 Region 始终由所选 StorageVolume 派生。主状态只表达工作区可用性；
+        scanning、hashing、uploading 和 validating 仅属于独立 Pre-commit 流程。
       additionalProperties: false
       required:
         - tenant_id
@@ -2720,12 +3638,257 @@ components:
         index_version:
           $ref: '#/components/schemas/IndexVersion'
         state:
-          type: string
-          enum: [ready, scanning, unavailable]
+          $ref: '#/components/schemas/PlaygroundState'
+        active_precommit_id:
+          $ref: '#/components/schemas/PreCommitId'
+        issue:
+          $ref: '#/components/schemas/ResourceIssueSummary'
         created_at_unix_ms:
           $ref: '#/components/schemas/UnixMillis'
         updated_at_unix_ms:
           $ref: '#/components/schemas/UnixMillis'
+
+    StartPreCommitRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal, request_digest]
+      required:
+        - tenant_id
+        - project_id
+        - artifact_id
+        - playground_id
+        - precommit_request_id
+        - expected_index_version
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        precommit_request_id:
+          $ref: '#/components/schemas/ResourceId'
+        expected_index_version:
+          $ref: '#/components/schemas/IndexVersion'
+
+    StartPreCommitResponse:
+      type: object
+      additionalProperties: false
+      required: [precommit, playground, replayed]
+      properties:
+        precommit:
+          $ref: '#/components/schemas/PreCommitView'
+        playground:
+          $ref: '#/components/schemas/PlaygroundView'
+        replayed:
+          type: boolean
+
+    QueryPreCommitRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, precommit_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        precommit_id:
+          $ref: '#/components/schemas/PreCommitId'
+
+    QueryPreCommitResponse:
+      type: object
+      additionalProperties: false
+      required: [precommit]
+      properties:
+        precommit:
+          $ref: '#/components/schemas/PreCommitView'
+
+    RestartPreCommitRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal, request_digest]
+      required: [tenant_id, precommit_id, restart_request_id, expected_index_version]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        precommit_id:
+          $ref: '#/components/schemas/PreCommitId'
+        restart_request_id:
+          $ref: '#/components/schemas/ResourceId'
+        expected_index_version:
+          $ref: '#/components/schemas/IndexVersion'
+
+    RestartPreCommitResponse:
+      type: object
+      additionalProperties: false
+      required: [precommit, playground, replayed]
+      properties:
+        precommit:
+          $ref: '#/components/schemas/PreCommitView'
+        playground:
+          $ref: '#/components/schemas/PlaygroundView'
+        replayed:
+          type: boolean
+
+    CancelPreCommitRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal, request_digest]
+      required: [tenant_id, precommit_id, cancel_request_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        precommit_id:
+          $ref: '#/components/schemas/PreCommitId'
+        cancel_request_id:
+          $ref: '#/components/schemas/ResourceId'
+
+    CancelPreCommitResponse:
+      type: object
+      additionalProperties: false
+      required: [precommit, playground, replayed]
+      properties:
+        precommit:
+          $ref: '#/components/schemas/PreCommitView'
+        playground:
+          $ref: '#/components/schemas/PlaygroundView'
+        replayed:
+          type: boolean
+
+    PreCommitState:
+      type: string
+      enum: [running, ready, abnormal, cancelled, committed]
+
+    PreCommitPhase:
+      type: string
+      enum: [queued, scanning, hashing, uploading, validating, idle]
+
+    PreCommitView:
+      type: object
+      description: Playground 某一 IndexVersion 的冻结候选及其脱敏检查结果。
+      additionalProperties: false
+      required:
+        - tenant_id
+        - project_id
+        - artifact_id
+        - playground_id
+        - precommit_id
+        - precommit_request_id
+        - attempt
+        - state
+        - phase
+        - progress
+        - checks
+        - warnings
+        - blockers
+        - source_index_version
+        - created_at_unix_ms
+        - updated_at_unix_ms
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        precommit_id:
+          $ref: '#/components/schemas/PreCommitId'
+        precommit_request_id:
+          $ref: '#/components/schemas/ResourceId'
+        attempt:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+        state:
+          $ref: '#/components/schemas/PreCommitState'
+        phase:
+          $ref: '#/components/schemas/PreCommitPhase'
+        progress:
+          $ref: '#/components/schemas/PreCommitProgress'
+        checks:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/PreCommitCheck'
+        warnings:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/PreCommitNotice'
+        blockers:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/PreCommitNotice'
+        source_index_version:
+          $ref: '#/components/schemas/IndexVersion'
+        candidate_index_version:
+          $ref: '#/components/schemas/IndexVersion'
+        diff_summary:
+          $ref: '#/components/schemas/CommitDiffSummary'
+        issue:
+          $ref: '#/components/schemas/ResourceIssueSummary'
+        committed_commit_id:
+          $ref: '#/components/schemas/CommitId'
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        updated_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    PreCommitProgress:
+      type: object
+      additionalProperties: false
+      required: [percent, files_completed, bytes_completed]
+      properties:
+        percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        files_completed:
+          $ref: '#/components/schemas/CanonicalU64'
+        files_total:
+          $ref: '#/components/schemas/CanonicalU64'
+        bytes_completed:
+          $ref: '#/components/schemas/CanonicalU64'
+        bytes_total:
+          $ref: '#/components/schemas/CanonicalU64'
+
+    PreCommitCheck:
+      type: object
+      additionalProperties: false
+      required: [check_id, status, summary]
+      properties:
+        check_id:
+          $ref: '#/components/schemas/ResourceId'
+        status:
+          type: string
+          enum: [pending, passed, warning, failed]
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 1024
+
+    PreCommitNotice:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2048
+        path:
+          $ref: '#/components/schemas/LogicalPath'
 
     CommitPlaygroundRequest:
       type: object
@@ -2739,7 +3902,8 @@ components:
         - artifact_id
         - playground_id
         - commit_request_id
-        - expected_index_version
+        - precommit_id
+        - expected_candidate_index_version
         - message
       properties:
         tenant_id:
@@ -2752,7 +3916,9 @@ components:
           $ref: '#/components/schemas/PlaygroundId'
         commit_request_id:
           $ref: '#/components/schemas/ResourceId'
-        expected_index_version:
+        precommit_id:
+          $ref: '#/components/schemas/PreCommitId'
+        expected_candidate_index_version:
           $ref: '#/components/schemas/IndexVersion'
         message:
           type: string
@@ -2770,14 +3936,360 @@ components:
     CommitPlaygroundResponse:
       type: object
       additionalProperties: false
-      required: [commit, playground, replayed]
+      required: [commit, playground, consumed_precommit, replayed]
       properties:
         commit:
           $ref: '#/components/schemas/CommitNode'
         playground:
           $ref: '#/components/schemas/PlaygroundView'
+        consumed_precommit:
+          $ref: '#/components/schemas/PreCommitView'
         replayed:
           type: boolean
+
+    QueryPlaygroundFileListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id, playground_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        path_prefix:
+          $ref: '#/components/schemas/LogicalPath'
+        format:
+          $ref: '#/components/schemas/FileFormat'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+
+    QueryPlaygroundFileListResponse:
+      type: object
+      additionalProperties: false
+      required: [index_version, items]
+      properties:
+        index_version:
+          $ref: '#/components/schemas/IndexVersion'
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/LogicalFileEntry'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    QueryPlaygroundChangeListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id, playground_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        precommit_id:
+          $ref: '#/components/schemas/PreCommitId'
+        change_type:
+          $ref: '#/components/schemas/FileChangeType'
+        path_prefix:
+          $ref: '#/components/schemas/LogicalPath'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+
+    QueryPlaygroundChangeListResponse:
+      type: object
+      additionalProperties: false
+      required: [source, index_version, summary, items]
+      properties:
+        source:
+          type: string
+          enum: [workspace, precommit]
+        precommit_id:
+          $ref: '#/components/schemas/PreCommitId'
+        index_version:
+          $ref: '#/components/schemas/IndexVersion'
+        summary:
+          $ref: '#/components/schemas/CommitDiffSummary'
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/PlaygroundChangeEntry'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    PlaygroundChangeEntry:
+      type: object
+      additionalProperties: false
+      required: [change_type, path]
+      properties:
+        change_type:
+          $ref: '#/components/schemas/FileChangeType'
+        path:
+          $ref: '#/components/schemas/LogicalPath'
+        previous_path:
+          $ref: '#/components/schemas/LogicalPath'
+        old_size_bytes:
+          $ref: '#/components/schemas/CanonicalU64'
+        new_size_bytes:
+          $ref: '#/components/schemas/CanonicalU64'
+        format:
+          $ref: '#/components/schemas/FileFormat'
+
+    QueryPlaygroundFileMetadataRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id, playground_id, path]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+        path:
+          $ref: '#/components/schemas/LogicalPath'
+
+    QueryPlaygroundFileMetadataResponse:
+      type: object
+      additionalProperties: false
+      required: [index_version, metadata]
+      properties:
+        index_version:
+          $ref: '#/components/schemas/IndexVersion'
+        metadata:
+          $ref: '#/components/schemas/FileMetadataView'
+
+    QueryPlaygroundDatasetProfileRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id, playground_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        artifact_id:
+          $ref: '#/components/schemas/ArtifactId'
+        playground_id:
+          $ref: '#/components/schemas/PlaygroundId'
+
+    QueryPlaygroundDatasetProfileResponse:
+      type: object
+      additionalProperties: false
+      required: [index_version, profile]
+      properties:
+        index_version:
+          $ref: '#/components/schemas/IndexVersion'
+        profile:
+          $ref: '#/components/schemas/DatasetProfileView'
+
+    LogicalFileEntry:
+      type: object
+      additionalProperties: false
+      required: [path, entry_type]
+      properties:
+        path:
+          $ref: '#/components/schemas/LogicalPath'
+        entry_type:
+          type: string
+          enum: [file, directory]
+        size_bytes:
+          $ref: '#/components/schemas/CanonicalU64'
+        format:
+          $ref: '#/components/schemas/FileFormat'
+        row_count:
+          $ref: '#/components/schemas/CanonicalU64'
+        updated_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    FileMetadataView:
+      type: object
+      description: 只包含逻辑文件属性和数据统计，不包含 Manifest、对象或文件系统位置。
+      additionalProperties: false
+      required: [path, size_bytes, format]
+      properties:
+        path:
+          $ref: '#/components/schemas/LogicalPath'
+        size_bytes:
+          $ref: '#/components/schemas/CanonicalU64'
+        format:
+          $ref: '#/components/schemas/FileFormat'
+        media_type:
+          type: string
+          minLength: 1
+          maxLength: 255
+        row_count:
+          $ref: '#/components/schemas/CanonicalU64'
+        schema:
+          $ref: '#/components/schemas/DatasetSchemaView'
+        statistics:
+          $ref: '#/components/schemas/DatasetStatisticsView'
+        quality:
+          $ref: '#/components/schemas/DataQualitySummary'
+        freshness:
+          $ref: '#/components/schemas/FreshnessSummary'
+
+    DatasetProfileState:
+      type: string
+      enum: [not_declared, ready, rejected]
+
+    DatasetProfileView:
+      type: object
+      additionalProperties: false
+      required: [state]
+      properties:
+        state:
+          $ref: '#/components/schemas/DatasetProfileState'
+        summary:
+          $ref: '#/components/schemas/DatasetProfileSummary'
+        schema:
+          $ref: '#/components/schemas/DatasetSchemaView'
+        statistics:
+          $ref: '#/components/schemas/DatasetStatisticsView'
+        quality:
+          $ref: '#/components/schemas/DataQualitySummary'
+        freshness:
+          $ref: '#/components/schemas/FreshnessSummary'
+        issue:
+          $ref: '#/components/schemas/ResourceIssueSummary'
+
+    DatasetProfileSummary:
+      type: object
+      additionalProperties: false
+      required: [format_count, logical_file_count, logical_size_bytes]
+      properties:
+        format_count:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+        logical_file_count:
+          $ref: '#/components/schemas/CanonicalU64'
+        logical_size_bytes:
+          $ref: '#/components/schemas/CanonicalU64'
+        row_count:
+          $ref: '#/components/schemas/CanonicalU64'
+        field_count:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+
+    DatasetSchemaView:
+      type: object
+      additionalProperties: false
+      required: [fields]
+      properties:
+        fields:
+          type: array
+          maxItems: 10000
+          items:
+            $ref: '#/components/schemas/DatasetFieldView'
+
+    DatasetFieldView:
+      type: object
+      additionalProperties: false
+      required: [name, data_type, nullable]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        data_type:
+          type: string
+          minLength: 1
+          maxLength: 256
+        nullable:
+          type: boolean
+        description:
+          $ref: '#/components/schemas/Description'
+
+    DatasetStatisticsView:
+      type: object
+      additionalProperties: false
+      properties:
+        row_count:
+          $ref: '#/components/schemas/CanonicalU64'
+        column_count:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+        null_value_count:
+          $ref: '#/components/schemas/CanonicalU64'
+        distinct_value_count:
+          $ref: '#/components/schemas/CanonicalU64'
+
+    DataQualitySummary:
+      type: object
+      additionalProperties: false
+      required: [state, checks_total, checks_passed, checks_failed]
+      properties:
+        state:
+          type: string
+          enum: [not_evaluated, passed, warning, failed]
+        checks_total:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+        checks_passed:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+        checks_failed:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+
+    FreshnessSummary:
+      type: object
+      additionalProperties: false
+      required: [observed_at_unix_ms]
+      properties:
+        observed_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        source_updated_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        age_seconds:
+          $ref: '#/components/schemas/CanonicalU64'
+
+    ResourceIssueSummary:
+      type: object
+      description: 面向用户的脱敏异常摘要，不包含 Agent、挂载、凭据或物理位置。
+      additionalProperties: false
+      required: [code, message, retryable]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2048
+        retryable:
+          type: boolean
+        occurred_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    FileChangeType:
+      type: string
+      enum: [added, modified, deleted, renamed]
+
+    FileFormat:
+      type: string
+      minLength: 1
+      maxLength: 128
 
     QuerySnapshotListRequest:
       type: object
@@ -2792,6 +4304,14 @@ components:
           $ref: '#/components/schemas/ProjectId'
         artifact_id:
           $ref: '#/components/schemas/ArtifactId'
+        commit_id:
+          $ref: '#/components/schemas/CommitId'
+        region:
+          $ref: '#/components/schemas/RegionName'
+        storage_volume_id:
+          $ref: '#/components/schemas/StorageVolumeId'
+        state:
+          $ref: '#/components/schemas/SnapshotState'
         cursor:
           $ref: '#/components/schemas/PageCursor'
         page_size:
@@ -2813,16 +4333,12 @@ components:
     QuerySnapshotRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, project_id, artifact_id, commit_id]
+      required: [tenant_id, snapshot_id]
       properties:
         tenant_id:
           $ref: '#/components/schemas/TenantId'
-        project_id:
-          $ref: '#/components/schemas/ProjectId'
-        artifact_id:
-          $ref: '#/components/schemas/ArtifactId'
-        commit_id:
-          $ref: '#/components/schemas/CommitId'
+        snapshot_id:
+          $ref: '#/components/schemas/SnapshotId'
 
     QuerySnapshotResponse:
       type: object
@@ -2837,8 +4353,14 @@ components:
       additionalProperties: true
       propertyNames:
         not:
-          enum: [actor, principal]
-      required: [tenant_id, project_id, artifact_id, commit_id, storage_volume_id]
+          enum: [actor, principal, request_digest]
+      required:
+        - tenant_id
+        - project_id
+        - artifact_id
+        - commit_id
+        - storage_volume_id
+        - snapshot_request_id
       properties:
         tenant_id:
           $ref: '#/components/schemas/TenantId'
@@ -2850,8 +4372,37 @@ components:
           $ref: '#/components/schemas/CommitId'
         storage_volume_id:
           $ref: '#/components/schemas/StorageVolumeId'
+        snapshot_request_id:
+          $ref: '#/components/schemas/ResourceId'
 
     CreateSnapshotResponse:
+      type: object
+      additionalProperties: false
+      required: [snapshot, replayed, placement_reused]
+      properties:
+        snapshot:
+          $ref: '#/components/schemas/SnapshotView'
+        replayed:
+          type: boolean
+        placement_reused:
+          type: boolean
+
+    RetrySnapshotDeliveryRequest:
+      type: object
+      additionalProperties: true
+      propertyNames:
+        not:
+          enum: [actor, principal, request_digest]
+      required: [tenant_id, snapshot_id, retry_request_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        snapshot_id:
+          $ref: '#/components/schemas/SnapshotId'
+        retry_request_id:
+          $ref: '#/components/schemas/ResourceId'
+
+    RetrySnapshotDeliveryResponse:
       type: object
       additionalProperties: false
       required: [snapshot, replayed]
@@ -2861,11 +4412,117 @@ components:
         replayed:
           type: boolean
 
+    QuerySnapshotFileListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, snapshot_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        snapshot_id:
+          $ref: '#/components/schemas/SnapshotId'
+        path_prefix:
+          $ref: '#/components/schemas/LogicalPath'
+        format:
+          $ref: '#/components/schemas/FileFormat'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+
+    QuerySnapshotFileListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/LogicalFileEntry'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    QuerySnapshotActivityListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, snapshot_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        snapshot_id:
+          $ref: '#/components/schemas/SnapshotId'
+        cursor:
+          $ref: '#/components/schemas/PageCursor'
+        page_size:
+          $ref: '#/components/schemas/PageSize'
+
+    QuerySnapshotActivityListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/SnapshotActivityView'
+        next_cursor:
+          $ref: '#/components/schemas/PageCursor'
+
+    SnapshotActivityView:
+      type: object
+      additionalProperties: false
+      required: [activity_id, activity_type, summary, created_at_unix_ms]
+      properties:
+        activity_id:
+          $ref: '#/components/schemas/ResourceId'
+        activity_type:
+          type: string
+          enum: [created, phase_changed, ready, failed, retry_started]
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        phase:
+          $ref: '#/components/schemas/SnapshotPhase'
+        issue:
+          $ref: '#/components/schemas/ResourceIssueSummary'
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    QuerySnapshotDatasetProfileRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, snapshot_id]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/TenantId'
+        snapshot_id:
+          $ref: '#/components/schemas/SnapshotId'
+
+    QuerySnapshotDatasetProfileResponse:
+      type: object
+      additionalProperties: false
+      required: [profile]
+      properties:
+        profile:
+          $ref: '#/components/schemas/DatasetProfileView'
+
+    SnapshotState:
+      type: string
+      enum: [creating, ready, abnormal]
+
+    SnapshotPhase:
+      type: string
+      enum: [planning, materializing, verifying, idle]
+
     SnapshotView:
       type: object
-      description: 由 tenant、project、artifact、commit 复合身份确定的只读 Snapshot。
+      description: 独立身份、固定 Commit、单 StorageVolume 和单 Region 的只读交付资源。
       additionalProperties: false
       required:
+        - snapshot_id
         - tenant_id
         - project_id
         - artifact_id
@@ -2873,9 +4530,17 @@ components:
         - storage_volume_id
         - region
         - message
-        - ref_names
+        - tag_names
+        - state
+        - phase
+        - integrity
+        - logical_file_count
+        - logical_size_bytes
         - created_at_unix_ms
+        - updated_at_unix_ms
       properties:
+        snapshot_id:
+          $ref: '#/components/schemas/SnapshotId'
         tenant_id:
           $ref: '#/components/schemas/TenantId'
         project_id:
@@ -2892,18 +4557,45 @@ components:
           type: string
           minLength: 1
           maxLength: 4096
-        ref_names:
+        tag_names:
           type: array
-          maxItems: 1024
+          maxItems: 20
           uniqueItems: true
           items:
-            $ref: '#/components/schemas/RefName'
-        created_at_unix_ms:
-          $ref: '#/components/schemas/UnixMillis'
+            $ref: '#/components/schemas/TagName'
+        state:
+          $ref: '#/components/schemas/SnapshotState'
+        phase:
+          $ref: '#/components/schemas/SnapshotPhase'
+        issue:
+          $ref: '#/components/schemas/ResourceIssueSummary'
+        integrity:
+          $ref: '#/components/schemas/SnapshotIntegritySummary'
         logical_file_count:
           $ref: '#/components/schemas/CanonicalU64'
         logical_size_bytes:
           $ref: '#/components/schemas/CanonicalU64'
+        dataset_profile:
+          $ref: '#/components/schemas/DatasetProfileSummary'
+        created_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+        updated_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
+
+    SnapshotIntegritySummary:
+      type: object
+      additionalProperties: false
+      required: [state, files_verified, bytes_verified]
+      properties:
+        state:
+          type: string
+          enum: [pending, verified, failed]
+        files_verified:
+          $ref: '#/components/schemas/CanonicalU64'
+        bytes_verified:
+          $ref: '#/components/schemas/CanonicalU64'
+        verified_at_unix_ms:
+          $ref: '#/components/schemas/UnixMillis'
 
     CreateAddJobRequest:
       type: object
@@ -3285,6 +4977,10 @@ components:
       $ref: '#/components/schemas/ResourceId'
     CommitId:
       $ref: '#/components/schemas/ResourceId'
+    PreCommitId:
+      $ref: '#/components/schemas/ResourceId'
+    SnapshotId:
+      $ref: '#/components/schemas/ResourceId'
     JobId:
       $ref: '#/components/schemas/ResourceId'
     RequestId:
@@ -3334,12 +5030,6 @@ components:
       minLength: 3
       maxLength: 128
       pattern: '^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$'
-
-    RefName:
-      type: string
-      minLength: 1
-      maxLength: 512
-      pattern: '^refs/[A-Za-z0-9][A-Za-z0-9._/-]*$'
 
     TagName:
       type: string

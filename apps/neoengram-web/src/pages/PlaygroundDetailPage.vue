@@ -24,6 +24,7 @@ import {
   cancelPrototypePreCommit,
   getActivePreCommit,
   playgroundAvailabilityLabel,
+  playgroundAvailabilityTagType,
   preCommitScopeKey,
   preCommitPhaseLabels,
   startPrototypePreCommit,
@@ -48,6 +49,8 @@ const playgroundQuery = useQuery({
   ]),
   queryFn: () =>
     queryPlayground(tenantId.value, projectId.value, artifactId.value, playgroundId.value),
+  refetchInterval: (query) =>
+    query.state.data?.data.playground.state === 'creating' ? 1_000 : false,
 });
 const playground = computed(() => playgroundQuery.data.value?.data.playground);
 const playgroundPreCommitKey = computed(() =>
@@ -504,11 +507,9 @@ async function openHeadCommit(): Promise<void> {
       <section class="resource-summary playground-summary">
         <div>
           <span>可用性</span
-          ><el-tag
-            :type="playground.state === 'unavailable' ? 'danger' : 'success'"
-            effect="plain"
-            >{{ playgroundAvailabilityLabel(playground.state) }}</el-tag
-          >
+          ><el-tag :type="playgroundAvailabilityTagType(playground.state)" effect="plain">{{
+            playgroundAvailabilityLabel(playground.state)
+          }}</el-tag>
         </div>
         <div>
           <span>当前操作</span>
@@ -531,13 +532,15 @@ async function openHeadCommit(): Promise<void> {
         class="precommit-status-band"
         :class="{
           'is-running': activePreCommit,
-          'is-unavailable': playground.state === 'unavailable',
+          'is-unavailable': playground.state === 'abnormal',
+          'is-creating': playground.state === 'creating',
         }"
         aria-label="Pre-commit 状态"
       >
         <span class="precommit-status-band__icon">
           <Clock v-if="activePreCommit" />
-          <WarningFilled v-else-if="playground.state === 'unavailable'" />
+          <WarningFilled v-else-if="playground.state === 'abnormal'" />
+          <Clock v-else-if="playground.state === 'creating'" />
           <CircleCheck v-else />
         </span>
         <div class="precommit-status-band__body">
@@ -549,9 +552,13 @@ async function openHeadCommit(): Promise<void> {
             </p>
             <el-progress :percentage="activePreCommit.progress" :stroke-width="5" />
           </template>
-          <template v-else-if="playground.state === 'unavailable'">
+          <template v-else-if="playground.state === 'abnormal'">
             <strong>当前无法发起 Pre-commit</strong>
             <p>中心元数据仍可查看；恢复 Storage、Agent 和挂载条件后才能准备新 Commit。</p>
+          </template>
+          <template v-else-if="playground.state === 'creating'">
+            <strong>工作区正在创建</strong>
+            <p>中心正在目标 StorageVolume 上初始化目录并恢复基线 Commit，完成后即可编辑。</p>
           </template>
           <template v-else>
             <strong>工作区可用，当前没有运行中的 Pre-commit</strong>
@@ -1135,6 +1142,12 @@ async function openHeadCommit(): Promise<void> {
   background: #fff4f3;
 }
 
+.precommit-status-band.is-creating {
+  border-color: #dbc28f;
+  border-left-color: var(--amber);
+  background: #fff9ec;
+}
+
 .precommit-status-band__icon {
   width: 36px;
   height: 36px;
@@ -1152,6 +1165,11 @@ async function openHeadCommit(): Promise<void> {
 .is-unavailable .precommit-status-band__icon {
   color: #a43c34;
   background: #f2d8d5;
+}
+
+.is-creating .precommit-status-band__icon {
+  color: #9d650f;
+  background: #f4e3bd;
 }
 
 .precommit-status-band__icon svg {

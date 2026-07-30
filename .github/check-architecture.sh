@@ -188,7 +188,7 @@ rg -q '^openapi: 3\.1\.0$' "$openapi" || fail "the public contract must use Open
 if rg -n '^  /v[0-9]+/|^  /api/v[0-9]+/|^  /api/[^:]+:[^:]+:$' "$openapi"; then
   fail "public API paths must use unversioned module/action hierarchy"
 fi
-for path in \
+business_paths=(
   /api/system/version/query \
   /api/tenant/list/query \
   /api/tenant/query \
@@ -205,15 +205,27 @@ for path in \
   /api/playground/list/query \
   /api/playground/query \
   /api/playground/create \
+  /api/playground/precommit/start \
+  /api/playground/precommit/query \
+  /api/playground/precommit/restart \
+  /api/playground/precommit/cancel \
+  /api/playground/file/list/query \
+  /api/playground/change/list/query \
+  /api/playground/file/metadata/query \
+  /api/playground/dataset/profile/query \
   /api/playground/commit/create \
   /api/snapshot/list/query \
   /api/snapshot/query \
   /api/snapshot/create \
+  /api/snapshot/delivery/retry \
+  /api/snapshot/file/list/query \
+  /api/snapshot/activity/list/query \
+  /api/snapshot/dataset/profile/query \
   /api/job/add/create \
   /api/job/query \
-  /api/job/add/finalize \
-  /health/live \
-  /health/ready; do
+  /api/job/add/finalize
+)
+for path in "${business_paths[@]}" /health/live /health/ready; do
   rg -q "^  ${path}:$" "$openapi" || fail "public OpenAPI is missing $path"
 done
 for internal_operation in assignJob expireAddJob resumePublication; do
@@ -224,9 +236,11 @@ done
 rg -q '^    ApiVersion:$' "$openapi" || fail "the API version header is not defined"
 rg -q '^    BearerAuth:$' "$openapi" || fail "the public Bearer security scheme is not defined"
 rg -q '^    ProblemDetails:$' "$openapi" || fail "RFC 9457 Problem Details is not defined"
-[[ "$(rg -c "#\/components\/parameters\/ApiVersion'" "$openapi")" == 22 ]] || \
+authenticated_business_method_count=$((${#business_paths[@]} - 1))
+[[ "$(rg -c "#\/components\/parameters\/ApiVersion'" "$openapi")" == \
+  "$authenticated_business_method_count" ]] || \
   fail "every public business method must require the API version header"
-[[ "$(rg -c 'BearerAuth: \[\]' "$openapi")" == 22 ]] || \
+[[ "$(rg -c 'BearerAuth: \[\]' "$openapi")" == "$authenticated_business_method_count" ]] || \
   fail "every public business method must require Bearer authentication"
 
 terminal_output="$({

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  cancelPlaygroundPreCommit,
   commitPlayground,
   createArtifact,
   createPlayground,
@@ -12,14 +13,25 @@ import {
   queryArtifactCommitGraph,
   queryArtifactList,
   queryPlayground,
+  queryPlaygroundChangeList,
+  queryPlaygroundDatasetProfile,
+  queryPlaygroundFileList,
+  queryPlaygroundFileMetadata,
   queryPlaygroundList,
+  queryPlaygroundPreCommit,
   queryProjectList,
   querySnapshot,
+  querySnapshotActivityList,
+  querySnapshotDatasetProfile,
+  querySnapshotFileList,
   querySnapshotList,
   queryStorageVolume,
   queryStorageVolumeList,
   queryTenant,
   queryTenantList,
+  restartPlaygroundPreCommit,
+  retrySnapshotDelivery,
+  startPlaygroundPreCommit,
 } from '@/api/operations';
 
 describe('tenant-scoped public resource operations', () => {
@@ -51,7 +63,7 @@ describe('tenant-scoped public resource operations', () => {
       tenant_id: 'tenant-a',
       page_size: 100,
     });
-    expect(storageVolumes.data.items).toHaveLength(3);
+    expect(storageVolumes.data.items).toHaveLength(4);
     expect(storageVolumes.data.items.every((item) => item.tenant_id === 'tenant-a')).toBe(true);
 
     const artifacts = await queryArtifactList({
@@ -64,8 +76,8 @@ describe('tenant-scoped public resource operations', () => {
       'quality-reports',
     ]);
     expect(
-      (await queryArtifact('tenant-a', 'project-vision', 'road-scenes')).data.artifact.default_ref,
-    ).toBe('refs/heads/main');
+      (await queryArtifact('tenant-a', 'project-vision', 'road-scenes')).data.artifact,
+    ).toMatchObject({ initialization: { mode: 'empty' }, head_commit_id: 'commit-main-3' });
 
     const playgroundPage = await queryPlaygroundList({ tenant_id: 'tenant-a', page_size: 100 });
     const playground = playgroundPage.data.items[0]!;
@@ -83,20 +95,23 @@ describe('tenant-scoped public resource operations', () => {
     const snapshotPage = await querySnapshotList({ tenant_id: 'tenant-a', page_size: 100 });
     const snapshot = snapshotPage.data.items[0]!;
     expect(
-      (
-        await querySnapshot(
-          snapshot.tenant_id,
-          snapshot.project_id,
-          snapshot.artifact_id,
-          snapshot.commit_id,
-        )
-      ).data.snapshot,
-    ).not.toHaveProperty('snapshot_id');
+      (await querySnapshot(snapshot.tenant_id, snapshot.snapshot_id)).data.snapshot,
+    ).toMatchObject({ snapshot_id: snapshot.snapshot_id, commit_id: snapshot.commit_id });
+    const regionalCopies = snapshotPage.data.items.filter(
+      (item) => item.artifact_id === 'road-scenes' && item.commit_id === 'commit-main-3',
+    );
+    expect(regionalCopies).toHaveLength(2);
+    expect(new Set(regionalCopies.map((item) => item.region))).toEqual(
+      new Set(['cn-shanghai', 'cn-guangzhou']),
+    );
   });
 
   it('returns a single-parent Commit graph and rejects a cursor bound to another filter', async () => {
     const graph = await queryArtifactCommitGraph('tenant-a', 'project-vision', 'road-scenes');
-    expect(graph.data.graph.refs.map((ref) => ref.name)).toContain('refs/heads/experiment');
+    expect(graph.data.graph.head_commit_id).toBe('commit-main-3');
+    expect(graph.data.graph.nodes.flatMap((node) => node.tag_names)).toContain(
+      'occlusion-experiment',
+    );
     expect(graph.data.graph.nodes.every((node) => !Array.isArray(node.parent_commit_id))).toBe(
       true,
     );
@@ -123,7 +138,7 @@ describe('tenant-scoped public resource operations', () => {
     ).rejects.toMatchObject({ status: 409, code: 'CURSOR_INVALID' });
   });
 
-  it('creates an Artifact and Playground, then commits and snapshots the result', async () => {
+  it('creates derived Artifacts and regional Snapshots while enforcing Playground readiness', async () => {
     const storageRequest = {
       tenant_id: 'tenant-a',
       storage_volume_id: 'volume-test-evaluation',
@@ -145,12 +160,34 @@ describe('tenant-scoped public resource operations', () => {
       tenant_id: 'tenant-a',
       project_id: 'project-vision',
       artifact_id: 'evaluation-set',
-      storage_volume_id: storageRequest.storage_volume_id,
       display_name: '评测数据集',
-      default_ref: 'refs/heads/main',
+      initialization: {
+        mode: 'derived' as const,
+        source_project_id: 'project-vision',
+        source_artifact_id: 'road-scenes',
+        source_commit_id: 'commit-main-2',
+      },
     };
-    expect((await createArtifact(artifactRequest)).data.replayed).toBe(false);
+    const createdArtifact = await createArtifact(artifactRequest);
+    expect(createdArtifact.data.replayed).toBe(false);
+    expect(createdArtifact.data.artifact).toMatchObject({
+      initialization: {
+        mode: 'derived',
+        source_project_id: 'project-vision',
+        source_artifact_id: 'road-scenes',
+        source_commit_id: 'commit-main-2',
+      },
+    });
+    expect(createdArtifact.data.artifact).not.toHaveProperty('storage_volume_id');
     expect((await createArtifact(artifactRequest)).data.replayed).toBe(true);
+    const derivedGraph = await queryArtifactCommitGraph(
+      'tenant-a',
+      'project-vision',
+      'evaluation-set',
+    );
+    expect(derivedGraph.data.graph.nodes).toHaveLength(1);
+    expect(derivedGraph.data.graph.nodes[0]?.parent_commit_id).toBeUndefined();
+    expect(derivedGraph.data.graph.nodes[0]?.description).toContain('road-scenes@commit-main-2');
 
     const playgroundRequest = {
       tenant_id: 'tenant-a',
@@ -159,78 +196,263 @@ describe('tenant-scoped public resource operations', () => {
       playground_id: 'review',
       storage_volume_id: storageRequest.storage_volume_id,
       display_name: '发布前复核',
+      base_commit_id: derivedGraph.data.graph.nodes[0]!.commit_id,
     };
     const createdPlayground = await createPlayground(playgroundRequest);
     expect(createdPlayground.data.playground.region).toBe('cn-guangzhou');
-    expect(createdPlayground.data.playground.head_commit_id).toBeUndefined();
-
-    const commitRequest = {
-      tenant_id: 'tenant-a',
-      project_id: 'project-vision',
-      artifact_id: 'evaluation-set',
-      playground_id: 'review',
-      commit_request_id: 'commit-request-test',
-      expected_index_version: createdPlayground.data.playground.index_version,
-      message: '建立评测基线',
-      description: '记录评测集初始导入范围和质量检查结果。',
-      tag_names: ['baseline', 'evaluation/v1'],
-    };
-    const committed = await commitPlayground(commitRequest);
-    expect(committed.data.replayed).toBe(false);
-    expect(committed.data.commit.description).toContain('初始导入范围');
-    expect(committed.data.commit.ref_names).toContain('refs/tags/baseline');
-    expect((await commitPlayground(commitRequest)).data.replayed).toBe(true);
-    expect(
-      (await queryArtifactCommitGraph('tenant-a', 'project-vision', 'evaluation-set')).data.graph
-        .refs[0]?.commit_id,
-    ).toBe(committed.data.commit.commit_id);
-    const rootDiff = await queryArtifactCommitDiff(
-      'tenant-a',
-      'project-vision',
-      'evaluation-set',
-      committed.data.commit.commit_id,
-    );
-    expect(rootDiff.data.diff.base_commit).toBeUndefined();
-    expect(rootDiff.data.diff.summary.files_added).toBe('2');
+    expect(createdPlayground.data.playground.state).toBe('creating');
 
     await expect(
+      startPlaygroundPreCommit({
+        tenant_id: 'tenant-a',
+        project_id: 'project-vision',
+        artifact_id: 'evaluation-set',
+        playground_id: 'review',
+        precommit_request_id: 'precommit-evaluation-not-ready',
+        expected_index_version: createdPlayground.data.playground.index_version,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: 'PLAYGROUND_NOT_READY',
+    });
+
+    const readyPlayground = (
+      await queryPlayground('tenant-a', 'project-vision', 'road-scenes', 'labeling')
+    ).data.playground;
+    const startedPreCommit = await startPlaygroundPreCommit({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'labeling',
+      precommit_request_id: 'precommit-request-test',
+      expected_index_version: readyPlayground.index_version,
+    });
+    expect(startedPreCommit.data.precommit.state).toBe('running');
+    const readyPreCommit = (
+      await queryPlaygroundPreCommit('tenant-a', startedPreCommit.data.precommit.precommit_id)
+    ).data.precommit;
+    expect(readyPreCommit.state).toBe('ready');
+    if (!readyPreCommit.candidate_index_version) throw new Error('expected candidate IndexVersion');
+    const readyCommitRequest = {
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'labeling',
+      commit_request_id: 'commit-request-test',
+      precommit_id: readyPreCommit.precommit_id,
+      expected_candidate_index_version: readyPreCommit.candidate_index_version,
+      message: '建立跨区域评测基线',
+      description: '记录评测集初始导入范围和质量检查结果。',
+      tag_names: ['test-baseline', 'test-evaluation/v1'],
+    };
+    const committed = await commitPlayground(readyCommitRequest);
+    expect(committed.data.replayed).toBe(false);
+    expect(committed.data.commit.description).toContain('初始导入范围');
+    expect(committed.data.commit.tag_names).toContain('test-baseline');
+    expect(committed.data.consumed_precommit.state).toBe('committed');
+    expect((await commitPlayground(readyCommitRequest)).data.replayed).toBe(true);
+    expect(
+      (await queryArtifactCommitGraph('tenant-a', 'project-vision', 'road-scenes')).data.graph
+        .head_commit_id,
+    ).toBe(committed.data.commit.commit_id);
+    const commitDiff = await queryArtifactCommitDiff(
+      'tenant-a',
+      'project-vision',
+      'road-scenes',
+      committed.data.commit.commit_id,
+    );
+    expect(commitDiff.data.diff.base_commit?.commit_id).toBe('commit-main-3');
+    expect(commitDiff.data.diff.summary.files_added).toBe('1');
+
+    const duplicateStarted = await startPlaygroundPreCommit({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'labeling',
+      precommit_request_id: 'precommit-duplicate-tag',
+      expected_index_version: readyPlayground.index_version,
+    });
+    const duplicateReady = (
+      await queryPlaygroundPreCommit('tenant-a', duplicateStarted.data.precommit.precommit_id)
+    ).data.precommit;
+    if (!duplicateReady.candidate_index_version) throw new Error('expected duplicate candidate');
+    await expect(
       commitPlayground({
-        ...commitRequest,
+        ...readyCommitRequest,
         commit_request_id: 'commit-request-duplicate-tag',
+        precommit_id: duplicateReady.precommit_id,
+        expected_candidate_index_version: duplicateReady.candidate_index_version,
         message: '重复使用 Tag',
-        tag_names: ['baseline'],
+        tag_names: ['test-baseline'],
       }),
     ).rejects.toMatchObject({ status: 409, code: 'TAG_ALREADY_EXISTS' });
 
     const snapshotRequest = {
       tenant_id: 'tenant-a',
       project_id: 'project-vision',
-      artifact_id: 'evaluation-set',
+      artifact_id: 'road-scenes',
       commit_id: committed.data.commit.commit_id,
       storage_volume_id: storageRequest.storage_volume_id,
+      snapshot_request_id: 'snapshot-request-evaluation-guangzhou',
     };
-    expect((await createSnapshot(snapshotRequest)).data.replayed).toBe(false);
+    const firstSnapshot = await createSnapshot(snapshotRequest);
+    expect(firstSnapshot.data.replayed).toBe(false);
+    expect(firstSnapshot.data.placement_reused).toBe(false);
+    expect(firstSnapshot.data.snapshot.state).toBe('creating');
     expect((await createSnapshot(snapshotRequest)).data.replayed).toBe(true);
+    const reusedPlacement = await createSnapshot({
+      ...snapshotRequest,
+      snapshot_request_id: 'snapshot-request-evaluation-guangzhou-reused',
+    });
+    expect(reusedPlacement.data.replayed).toBe(false);
+    expect(reusedPlacement.data.placement_reused).toBe(true);
+    expect(reusedPlacement.data.snapshot.snapshot_id).toBe(firstSnapshot.data.snapshot.snapshot_id);
     expect(
-      (
-        await querySnapshot(
-          snapshotRequest.tenant_id,
-          snapshotRequest.project_id,
-          snapshotRequest.artifact_id,
-          snapshotRequest.commit_id,
-        )
-      ).data.snapshot.message,
-    ).toBe('建立评测基线');
-    expect(
-      (
-        await querySnapshot(
-          snapshotRequest.tenant_id,
-          snapshotRequest.project_id,
-          snapshotRequest.artifact_id,
-          snapshotRequest.commit_id,
-        )
-      ).data.snapshot.region,
+      (await querySnapshot(snapshotRequest.tenant_id, firstSnapshot.data.snapshot.snapshot_id)).data
+        .snapshot.region,
     ).toBe('cn-guangzhou');
+
+    const secondSnapshot = await createSnapshot({
+      ...snapshotRequest,
+      storage_volume_id: 'volume-shanghai-vision',
+      snapshot_request_id: 'snapshot-request-evaluation-shanghai',
+    });
+    expect(secondSnapshot.data.replayed).toBe(false);
+    expect(secondSnapshot.data.snapshot.snapshot_id).not.toBe(
+      firstSnapshot.data.snapshot.snapshot_id,
+    );
+    expect(secondSnapshot.data.snapshot.commit_id).toBe(firstSnapshot.data.snapshot.commit_id);
+  });
+
+  it('drives Pre-commit states and returns paginated logical metadata', async () => {
+    const abnormalPlayground = (
+      await queryPlayground('tenant-a', 'project-vision', 'road-scenes', 'occlusion-audit')
+    ).data.playground;
+    const failing = await startPlaygroundPreCommit({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'occlusion-audit',
+      precommit_request_id: 'precommit-fail-validation',
+      expected_index_version: abnormalPlayground.index_version,
+    });
+    expect(failing.data.precommit.state).toBe('running');
+    const abnormal = (
+      await queryPlaygroundPreCommit('tenant-a', failing.data.precommit.precommit_id)
+    ).data.precommit;
+    expect(abnormal.state).toBe('abnormal');
+    expect(abnormal.blockers).toHaveLength(1);
+
+    const restarted = await restartPlaygroundPreCommit({
+      tenant_id: 'tenant-a',
+      precommit_id: abnormal.precommit_id,
+      restart_request_id: 'restart-precommit-failure-01',
+      expected_index_version: abnormalPlayground.index_version,
+    });
+    expect(restarted.data.precommit).toMatchObject({ state: 'running', attempt: 2 });
+    const cancelled = await cancelPlaygroundPreCommit({
+      tenant_id: 'tenant-a',
+      precommit_id: abnormal.precommit_id,
+      cancel_request_id: 'cancel-precommit-failure-01',
+    });
+    expect(cancelled.data.precommit.state).toBe('cancelled');
+
+    const playground = (
+      await queryPlayground('tenant-a', 'project-vision', 'road-scenes', 'labeling')
+    ).data.playground;
+    const started = await startPlaygroundPreCommit({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'labeling',
+      precommit_request_id: 'precommit-metadata-ready',
+      expected_index_version: playground.index_version,
+    });
+    const ready = (await queryPlaygroundPreCommit('tenant-a', started.data.precommit.precommit_id))
+      .data.precommit;
+    expect(ready.state).toBe('ready');
+
+    const files = await queryPlaygroundFileList({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'labeling',
+      page_size: 1,
+    });
+    expect(files.data.items).toHaveLength(1);
+    expect(files.data.next_cursor).toBeTruthy();
+    const changes = await queryPlaygroundChangeList({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'labeling',
+      precommit_id: ready.precommit_id,
+      page_size: 100,
+    });
+    expect(changes.data.source).toBe('precommit');
+    expect(changes.data.items.map((item) => item.change_type)).toEqual([
+      'modified',
+      'added',
+      'renamed',
+      'deleted',
+    ]);
+    const metadata = await queryPlaygroundFileMetadata({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'labeling',
+      path: 'dataset/night-rain/part-0042.parquet',
+    });
+    expect(metadata.data.metadata).toMatchObject({ format: 'parquet', row_count: '12842731' });
+    const profile = await queryPlaygroundDatasetProfile({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'labeling',
+    });
+    expect(profile.data.profile.state).toBe('ready');
+  });
+
+  it('retries Snapshot delivery and gates file browsing on Ready state', async () => {
+    const retry = await retrySnapshotDelivery({
+      tenant_id: 'tenant-a',
+      snapshot_id: 'snap-road-main2-sha-01',
+      retry_request_id: 'retry-snapshot-main2-01',
+    });
+    expect(retry.data.snapshot).toMatchObject({ state: 'creating', phase: 'materializing' });
+    expect(
+      (
+        await retrySnapshotDelivery({
+          tenant_id: 'tenant-a',
+          snapshot_id: 'snap-road-main2-sha-01',
+          retry_request_id: 'retry-snapshot-main2-01',
+        })
+      ).data.replayed,
+    ).toBe(true);
+
+    const readyFiles = await querySnapshotFileList({
+      tenant_id: 'tenant-a',
+      snapshot_id: 'snap-road-main3-sha-01',
+      page_size: 100,
+    });
+    expect(readyFiles.data.items[0]?.path).toBe('dataset/night-rain/part-0042.parquet');
+    await expect(
+      querySnapshotFileList({
+        tenant_id: 'tenant-a',
+        snapshot_id: 'snap-road-main3-gz-01',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'SNAPSHOT_NOT_READY' });
+    const activities = await querySnapshotActivityList({
+      tenant_id: 'tenant-a',
+      snapshot_id: 'snap-road-main3-sha-01',
+      page_size: 100,
+    });
+    expect(activities.data.items.map((item) => item.activity_type)).toContain('ready');
+    const profile = await querySnapshotDatasetProfile({
+      tenant_id: 'tenant-a',
+      snapshot_id: 'snap-road-main3-sha-01',
+    });
+    expect(profile.data.profile.summary?.logical_file_count).toBe('18554');
   });
 
   it('uses opaque cursors to continue the same filtered resource query', async () => {

@@ -5,12 +5,12 @@ import { ElMessage } from 'element-plus';
 import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { createArtifact, queryArtifactList } from '@/api/operations';
+import { createArtifact, queryArtifactCommitGraph, queryArtifactList } from '@/api/operations';
+import type { ArtifactInitializationMode } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
-import { LOGICAL_ARTIFACT_STORAGE_COMPAT_ID } from '@/features/artifacts/prototype';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
 
@@ -31,11 +31,57 @@ const createForm = reactive({
   artifactId: '',
   displayName: '',
   description: '',
+  initializationMode: 'empty' as ArtifactInitializationMode,
+  sourceArtifactKey: '',
+  sourceCommitId: '',
 });
 const canCreate = computed(
   () => tenants.byId(tenantId.value)?.permissions.includes('artifact.create') ?? false,
 );
 const createMutation = useMutation({ mutationFn: createArtifact });
+const sourceArtifactsQuery = useQuery({
+  queryKey: computed(() => ['artifacts', tenantId.value, 'artifact-source-options']),
+  queryFn: () => queryArtifactList({ tenant_id: tenantId.value, page_size: 100 }),
+  enabled: computed(() => createOpen.value && createForm.initializationMode === 'derived'),
+});
+function artifactOptionKey(project: string, artifact: string): string {
+  return `${project}\u0000${artifact}`;
+}
+
+const selectedSourceArtifact = computed(() =>
+  sourceArtifactsQuery.data.value?.data.items.find(
+    (artifact) =>
+      artifactOptionKey(artifact.project_id, artifact.artifact_id) === createForm.sourceArtifactKey,
+  ),
+);
+const sourceCommitQuery = useQuery({
+  queryKey: computed(() => [
+    'artifact-commits',
+    tenantId.value,
+    selectedSourceArtifact.value?.project_id ?? '',
+    selectedSourceArtifact.value?.artifact_id ?? '',
+    'artifact-source-options',
+  ]),
+  queryFn: () =>
+    queryArtifactCommitGraph(
+      tenantId.value,
+      selectedSourceArtifact.value?.project_id ?? '',
+      selectedSourceArtifact.value?.artifact_id ?? '',
+    ),
+  enabled: computed(
+    () =>
+      createOpen.value &&
+      createForm.initializationMode === 'derived' &&
+      Boolean(selectedSourceArtifact.value),
+  ),
+});
+
+watch(
+  () => createForm.sourceArtifactKey,
+  () => {
+    createForm.sourceCommitId = '';
+  },
+);
 
 watch(
   () => route.query,
@@ -101,6 +147,9 @@ function openCreate(): void {
   createForm.artifactId = '';
   createForm.displayName = '';
   createForm.description = '';
+  createForm.initializationMode = 'empty';
+  createForm.sourceArtifactKey = '';
+  createForm.sourceCommitId = '';
   createError.value = '';
   createOpen.value = true;
 }
@@ -116,15 +165,29 @@ async function submitCreate(): Promise<void> {
     createError.value = '请输入 Artifact 名称';
     return;
   }
+  if (
+    createForm.initializationMode === 'derived' &&
+    (!selectedSourceArtifact.value || !createForm.sourceCommitId)
+  ) {
+    createError.value = '请选择来源 Artifact 和明确的 Commit';
+    return;
+  }
   try {
     const result = await createMutation.mutateAsync({
       tenant_id: tenantId.value,
       project_id: createForm.projectId,
       artifact_id: createForm.artifactId,
-      storage_volume_id: LOGICAL_ARTIFACT_STORAGE_COMPAT_ID,
       display_name: createForm.displayName.trim(),
       ...(createForm.description.trim() ? { description: createForm.description.trim() } : {}),
-      default_ref: 'refs/heads/main',
+      initialization:
+        createForm.initializationMode === 'derived'
+          ? {
+              mode: 'derived',
+              source_project_id: selectedSourceArtifact.value!.project_id,
+              source_artifact_id: selectedSourceArtifact.value!.artifact_id,
+              source_commit_id: createForm.sourceCommitId,
+            }
+          : { mode: 'empty' },
     });
     createOpen.value = false;
     await queryClient.invalidateQueries({ queryKey: ['artifacts', tenantId.value] });
@@ -243,6 +306,54 @@ async function submitCreate(): Promise<void> {
         <el-form-item label="描述">
           <el-input v-model="createForm.description" type="textarea" :rows="3" />
         </el-form-item>
+        <el-form-item label="初始化方式">
+          <el-segmented
+            v-model="createForm.initializationMode"
+            :options="[
+              { label: '创建空 Artifact', value: 'empty' },
+              { label: '从 Commit 派生', value: 'derived' },
+            ]"
+          />
+        </el-form-item>
+        <template v-if="createForm.initializationMode === 'derived'">
+          <el-form-item label="来源 Artifact">
+            <el-select
+              v-model="createForm.sourceArtifactKey"
+              filterable
+              placeholder="选择同租户的数据资产"
+              :loading="sourceArtifactsQuery.isFetching.value"
+            >
+              <el-option
+                v-for="artifact in sourceArtifactsQuery.data.value?.data.items ?? []"
+                :key="`${artifact.project_id}/${artifact.artifact_id}`"
+                :label="`${artifact.display_name} · ${artifact.project_id}/${artifact.artifact_id}`"
+                :value="artifactOptionKey(artifact.project_id, artifact.artifact_id)"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="来源 Commit">
+            <el-select
+              v-model="createForm.sourceCommitId"
+              filterable
+              :disabled="!createForm.sourceArtifactKey"
+              :loading="sourceCommitQuery.isFetching.value"
+              placeholder="选择一个固定版本"
+            >
+              <el-option
+                v-for="commit in sourceCommitQuery.data.value?.data.graph.nodes ?? []"
+                :key="commit.commit_id"
+                :label="`${commit.message} · ${commit.commit_id}`"
+                :value="commit.commit_id"
+              />
+            </el-select>
+          </el-form-item>
+          <el-alert
+            title="新 Artifact 将获得独立的初始化 Commit；不会继承来源版本历史，也不会创建区域副本。"
+            type="info"
+            :closable="false"
+            show-icon
+          />
+        </template>
       </el-form>
       <template #footer>
         <el-button @click="createOpen = false">取消</el-button>
@@ -253,3 +364,10 @@ async function submitCreate(): Promise<void> {
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.dialog-form :deep(.el-segmented),
+.dialog-form :deep(.el-select) {
+  width: 100%;
+}
+</style>

@@ -14,7 +14,14 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { commitPlayground, queryPlayground } from '@/api/operations';
+import {
+  cancelPlaygroundPreCommit,
+  commitPlayground,
+  queryPlayground,
+  queryPlaygroundPreCommit,
+  startPlaygroundPreCommit,
+} from '@/api/operations';
+import type { PreCommitView } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import {
@@ -67,6 +74,7 @@ const tagNames = ref<string[]>([]);
 const commitError = ref('');
 const createdCommitId = ref('');
 const createdParentCommitId = ref('');
+const apiPreCommit = ref<PreCommitView>();
 let preparationTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
 
 const preparationSteps: PreparationStep[] = [
@@ -142,7 +150,12 @@ const diffRows = [
 const currentPreparation = computed(
   () => preparationSteps[preparationIndex.value] ?? preparationSteps[0]!,
 );
-const preCommitReady = computed(() => currentPreparation.value.phase === 'ready');
+const preCommitReady = computed(
+  () =>
+    currentPreparation.value.phase === 'ready' &&
+    apiPreCommit.value?.state === 'ready' &&
+    Boolean(apiPreCommit.value.candidate_index_version),
+);
 const activePreCommit = computed(() => getActivePreCommit(playgroundPreCommitKey.value));
 const preCommitJobId = computed(
   () =>
@@ -153,15 +166,38 @@ const commitCreated = computed(() => Boolean(createdCommitId.value));
 
 function schedulePreparation(): void {
   if (preparationIndex.value >= preparationSteps.length - 1) return;
-  preparationTimer = globalThis.setTimeout(() => {
+  preparationTimer = globalThis.setTimeout(async () => {
     preparationIndex.value += 1;
     advancePrototypePreCommit(playgroundPreCommitKey.value, currentPreparation.value.phase);
+    if (currentPreparation.value.phase === 'ready' && apiPreCommit.value) {
+      const result = await queryPlaygroundPreCommit(
+        tenantId.value,
+        apiPreCommit.value.precommit_id,
+      );
+      apiPreCommit.value = result.data.precommit;
+    }
     schedulePreparation();
   }, 420);
 }
 
-function startPreparation(resumeFromRoute = false): void {
+async function startPreparation(resumeFromRoute = false): Promise<void> {
   if (preparationTimer) globalThis.clearTimeout(preparationTimer);
+  const current = playground.value;
+  if (!current) return;
+  if (current.active_precommit_id) {
+    const existing = await queryPlaygroundPreCommit(tenantId.value, current.active_precommit_id);
+    apiPreCommit.value = existing.data.precommit;
+  } else {
+    const started = await startPlaygroundPreCommit({
+      tenant_id: tenantId.value,
+      project_id: projectId.value,
+      artifact_id: artifactId.value,
+      playground_id: playgroundId.value,
+      precommit_request_id: `precommit-request-${globalThis.crypto.randomUUID()}`,
+      expected_index_version: current.index_version,
+    });
+    apiPreCommit.value = started.data.precommit;
+  }
   const requestedPhase = resumeFromRoute ? String(route.query.resume_phase ?? '') : '';
   const requestedIndex = preparationSteps.findIndex((step) => step.phase === requestedPhase);
   preparationIndex.value = requestedIndex >= 0 ? requestedIndex : 0;
@@ -205,7 +241,16 @@ async function restartPreCommit(): Promise<void> {
     return;
   }
   resetCommitForm();
-  startPreparation(false);
+  if (apiPreCommit.value && apiPreCommit.value.state !== 'committed') {
+    await cancelPlaygroundPreCommit({
+      tenant_id: tenantId.value,
+      precommit_id: apiPreCommit.value.precommit_id,
+      cancel_request_id: `cancel-request-${globalThis.crypto.randomUUID()}`,
+    });
+  }
+  apiPreCommit.value = undefined;
+  await playgroundQuery.refetch();
+  await startPreparation(false);
   ElMessage.success('新的 Pre-commit 已发起');
 }
 
@@ -224,6 +269,13 @@ async function cancelPreparation(): Promise<void> {
     return;
   }
   if (preparationTimer) globalThis.clearTimeout(preparationTimer);
+  if (apiPreCommit.value && apiPreCommit.value.state !== 'committed') {
+    await cancelPlaygroundPreCommit({
+      tenant_id: tenantId.value,
+      precommit_id: apiPreCommit.value.precommit_id,
+      cancel_request_id: `cancel-request-${globalThis.crypto.randomUUID()}`,
+    });
+  }
   cancelPrototypePreCommit(playgroundPreCommitKey.value);
   ElMessage.success('Pre-commit 已取消，Playground 保持可用');
   await backToPlayground();
@@ -260,7 +312,8 @@ async function createCommit(): Promise<void> {
   }
   if (!addTag()) return;
   const current = playground.value;
-  if (!current) return;
+  const precommit = apiPreCommit.value;
+  if (!current || !precommit?.candidate_index_version) return;
   createdParentCommitId.value = current.head_commit_id ?? '';
   try {
     const result = await commitMutation.mutateAsync({
@@ -269,7 +322,8 @@ async function createCommit(): Promise<void> {
       artifact_id: artifactId.value,
       playground_id: playgroundId.value,
       commit_request_id: `commit-request-${globalThis.crypto.randomUUID()}`,
-      expected_index_version: current.index_version,
+      precommit_id: precommit.precommit_id,
+      expected_candidate_index_version: precommit.candidate_index_version,
       message: commitMessage.value.trim(),
       ...(commitDescription.value.trim() ? { description: commitDescription.value.trim() } : {}),
       ...(tagNames.value.length ? { tag_names: tagNames.value } : {}),
@@ -326,7 +380,7 @@ async function createSnapshotDelivery(): Promise<void> {
 watch(
   playground,
   (current) => {
-    if (current && !preparationStarted.value) startPreparation(true);
+    if (current && !preparationStarted.value) void startPreparation(true);
   },
   { immediate: true },
 );

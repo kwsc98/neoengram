@@ -1,6 +1,9 @@
 import { http, HttpResponse } from 'msw';
 
 import type {
+  ArtifactView,
+  CancelPreCommitRequest,
+  CancelPreCommitResponse,
   CommitPlaygroundRequest,
   CommitPlaygroundResponse,
   CommitDiffEntry,
@@ -19,6 +22,7 @@ import type {
   CreateTenantResponse,
   FinalizeAddJobResponse,
   JobView,
+  PreCommitView,
   ProblemDetails,
   QueryArtifactListRequest,
   QueryArtifactListResponse,
@@ -26,12 +30,33 @@ import type {
   QueryArtifactResponse,
   QueryPlaygroundListRequest,
   QueryPlaygroundListResponse,
+  QueryPlaygroundChangeListRequest,
+  QueryPlaygroundChangeListResponse,
+  QueryPlaygroundDatasetProfileRequest,
+  QueryPlaygroundDatasetProfileResponse,
+  QueryPlaygroundFileListRequest,
+  QueryPlaygroundFileListResponse,
+  QueryPlaygroundFileMetadataRequest,
+  QueryPlaygroundFileMetadataResponse,
+  QueryPreCommitResponse,
   QueryPlaygroundResponse,
   QueryProjectListRequest,
   QueryProjectListResponse,
   QuerySnapshotListRequest,
   QuerySnapshotListResponse,
+  QuerySnapshotActivityListRequest,
+  QuerySnapshotActivityListResponse,
+  QuerySnapshotDatasetProfileRequest,
+  QuerySnapshotDatasetProfileResponse,
+  QuerySnapshotFileListRequest,
+  QuerySnapshotFileListResponse,
   QuerySnapshotResponse,
+  RestartPreCommitRequest,
+  RestartPreCommitResponse,
+  RetrySnapshotDeliveryRequest,
+  RetrySnapshotDeliveryResponse,
+  StartPreCommitRequest,
+  StartPreCommitResponse,
   QueryStorageVolumeListRequest,
   QueryStorageVolumeListResponse,
   QueryStorageVolumeResponse,
@@ -42,7 +67,6 @@ import type {
   StorageVolumeView,
   TenantView,
 } from '@/api/types';
-import { LOGICAL_ARTIFACT_STORAGE_COMPAT_ID } from '@/features/artifacts/prototype';
 
 import {
   artifacts,
@@ -79,10 +103,23 @@ const tenantCreatePayloads = new Map<string, string>();
 const storageVolumeCreatePayloads = new Map<string, string>();
 const artifactCreatePayloads = new Map<string, string>();
 const playgroundCreatePayloads = new Map<string, string>();
+const playgroundReadyAt = new Map<string, number>();
 const commitRequests = new Map<
   string,
   { requestJson: string; response: CommitPlaygroundResponse }
 >();
+const precommits = new Map<string, PreCommitView>();
+const precommitMutationRequests = new Map<string, string>();
+const snapshotCreateRequests = new Map<
+  string,
+  { requestJson: string; response: CreateSnapshotResponse }
+>();
+const snapshotRetryRequests = new Map<
+  string,
+  { requestJson: string; response: RetrySnapshotDeliveryResponse }
+>();
+
+const snapshotReadyAt = new Map<string, number>();
 
 function requestId(request: Request): string {
   return request.headers.get('X-Request-ID') ?? `mock-fallback-${crypto.randomUUID()}`;
@@ -440,6 +477,89 @@ function diffSummary(changes: CommitDiffEntry[]) {
   };
 }
 
+const mockLogicalFiles: QueryPlaygroundFileListResponse['items'] = [
+  {
+    path: 'dataset/night-rain/part-0042.parquet',
+    entry_type: 'file',
+    size_bytes: '19971597926',
+    format: 'parquet',
+    row_count: '12842731',
+    updated_at_unix_ms: '1785167500000',
+  },
+  {
+    path: 'dataset/index.json',
+    entry_type: 'file',
+    size_bytes: '3250586',
+    format: 'json',
+    row_count: '18554',
+    updated_at_unix_ms: '1785167400000',
+  },
+  {
+    path: 'labels/reviewed/night-v4.jsonl',
+    entry_type: 'file',
+    size_bytes: '1503238554',
+    format: 'jsonl',
+    row_count: '18409216',
+    updated_at_unix_ms: '1785167300000',
+  },
+];
+
+const mockPlaygroundChanges: QueryPlaygroundChangeListResponse['items'] = [
+  {
+    change_type: 'modified',
+    path: 'dataset/index.json',
+    old_size_bytes: '2936012',
+    new_size_bytes: '3250586',
+    format: 'json',
+  },
+  {
+    change_type: 'added',
+    path: 'dataset/night-rain/part-0042.parquet',
+    new_size_bytes: '19971597926',
+    format: 'parquet',
+  },
+  {
+    change_type: 'renamed',
+    path: 'labels/reviewed/night-v4.jsonl',
+    previous_path: 'labels/reviewed/night-final.jsonl',
+    old_size_bytes: '1503238554',
+    new_size_bytes: '1503238554',
+    format: 'jsonl',
+  },
+  {
+    change_type: 'deleted',
+    path: 'labels/drafts/night-v3.tmp',
+    old_size_bytes: '650117120',
+    format: 'binary',
+  },
+];
+
+const mockDatasetProfile: QueryPlaygroundDatasetProfileResponse['profile'] = {
+  state: 'ready',
+  summary: {
+    format_count: 4,
+    logical_file_count: '18554',
+    logical_size_bytes: '845571686400',
+    row_count: '312847219',
+    field_count: 4,
+  },
+  schema: {
+    fields: [
+      { name: 'image_id', data_type: 'string', nullable: false },
+      { name: 'scene', data_type: 'string', nullable: false },
+      { name: 'captured_at', data_type: 'timestamp', nullable: false },
+      { name: 'quality_score', data_type: 'float32', nullable: true },
+    ],
+  },
+  statistics: { row_count: '312847219', column_count: 4, null_value_count: '1842' },
+  quality: { state: 'warning', checks_total: 8, checks_passed: 7, checks_failed: 0 },
+  freshness: {
+    observed_at_unix_ms: '1785167600000',
+    source_updated_at_unix_ms: '1785167500000',
+    age_seconds: '100',
+  },
+};
+
 export const handlers = [
   http.post('*/api/system/version/query', ({ request }) =>
     HttpResponse.json(
@@ -783,15 +903,36 @@ export const handlers = [
         'The requested Project was not found',
       );
     }
-    let storageVolume: StorageVolumeView | undefined;
-    if (body.storage_volume_id !== LOGICAL_ARTIFACT_STORAGE_COMPAT_ID) {
-      const resolvedStorageVolume = resolveStorageVolume(
-        request,
-        body.tenant_id,
-        body.storage_volume_id,
+    const initialization = body.initialization;
+    let sourceCommit: CommitNode | undefined;
+    if (initialization.mode === 'derived') {
+      const sourceArtifact = artifacts.find(
+        (artifact) =>
+          artifact.tenant_id === body.tenant_id &&
+          artifact.project_id === initialization.source_project_id &&
+          artifact.artifact_id === initialization.source_artifact_id,
       );
-      if (resolvedStorageVolume instanceof HttpResponse) return resolvedStorageVolume;
-      storageVolume = resolvedStorageVolume;
+      const sourceGraph = sourceArtifact
+        ? commitGraphs.get(
+            resourceKey(
+              sourceArtifact.tenant_id,
+              sourceArtifact.project_id,
+              sourceArtifact.artifact_id,
+            ),
+          )
+        : undefined;
+      sourceCommit = sourceGraph?.nodes.find(
+        (commit) => commit.commit_id === initialization.source_commit_id,
+      );
+      if (!sourceArtifact || !sourceCommit) {
+        return problem(
+          request,
+          404,
+          'SOURCE_COMMIT_NOT_FOUND',
+          'Source Commit not found',
+          'The selected source Artifact or Commit was not found in this Tenant',
+        );
+      }
     }
 
     const key = resourceKey(body.tenant_id, body.project_id, body.artifact_id);
@@ -807,8 +948,7 @@ export const handlers = [
       const equivalentExisting =
         existing.display_name === body.display_name.trim() &&
         existing.description === body.description?.trim() &&
-        existing.storage_volume_id === (storageVolume?.storage_volume_id ?? '') &&
-        existing.default_ref === (body.default_ref ?? 'refs/heads/main');
+        stableJson(existing.initialization) === stableJson(initialization);
       if (
         (priorRequest && priorRequest !== requestJson) ||
         (!priorRequest && !equivalentExisting)
@@ -824,21 +964,38 @@ export const handlers = [
     }
 
     const now = Date.now().toString();
-    const artifact = {
+    const rootCommit: CommitNode | undefined =
+      sourceCommit && initialization.mode === 'derived'
+        ? {
+            commit_id: `commit-root-${body.artifact_id}-${Date.now().toString(36)}`,
+            message: `从 ${initialization.source_artifact_id} 派生`,
+            description: `初始化来源 ${initialization.source_artifact_id}@${sourceCommit.commit_id}，后续版本历史独立演进。`,
+            tag_names: [],
+            created_at_unix_ms: now,
+          }
+        : undefined;
+    const artifact: ArtifactView = {
       tenant_id: body.tenant_id,
       project_id: body.project_id,
       artifact_id: body.artifact_id,
-      storage_volume_id: storageVolume?.storage_volume_id ?? '',
-      region: storageVolume?.region ?? '',
       display_name: body.display_name.trim(),
       ...(body.description?.trim() ? { description: body.description.trim() } : {}),
-      default_ref: body.default_ref ?? 'refs/heads/main',
+      initialization: structuredClone(initialization),
+      ...(rootCommit ? { head_commit_id: rootCommit.commit_id } : {}),
       resource_version: '1',
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
     artifacts.push(artifact);
-    commitGraphs.set(key, { graph_version: '0', refs: [], nodes: [] });
+    if (rootCommit) {
+      commitGraphs.set(key, {
+        graph_version: '1',
+        head_commit_id: rootCommit.commit_id,
+        nodes: [rootCommit],
+      });
+    } else {
+      commitGraphs.set(key, { graph_version: '0', nodes: [] });
+    }
     artifactCreatePayloads.set(key, requestJson);
     const response: CreateArtifactResponse = { artifact, replayed: false };
     return HttpResponse.json(response, { headers: headers(request) });
@@ -869,7 +1026,7 @@ export const handlers = [
       {
         graph: {
           graph_version: graph.graph_version,
-          refs: graph.refs,
+          ...(graph.head_commit_id ? { head_commit_id: graph.head_commit_id } : {}),
           nodes: page.items,
           ...(page.next_cursor ? { next_cursor: page.next_cursor } : {}),
         },
@@ -997,6 +1154,18 @@ export const handlers = [
         item.playground_id === body.playground_id,
     );
     if (!playground) return notFound(request, 'Playground');
+    const playgroundKey = resourceKey(
+      playground.tenant_id,
+      playground.project_id,
+      playground.artifact_id,
+      playground.playground_id,
+    );
+    const readyAt = playgroundReadyAt.get(playgroundKey);
+    if (playground.state === 'creating' && readyAt && Date.now() >= readyAt) {
+      playground.state = 'ready';
+      playground.updated_at_unix_ms = Date.now().toString();
+      playgroundReadyAt.delete(playgroundKey);
+    }
     const response: QueryPlaygroundResponse = { playground };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
@@ -1059,10 +1228,7 @@ export const handlers = [
       return HttpResponse.json(response, { headers: headers(request) });
     }
 
-    const defaultHead = graph.refs.find(
-      (refTip) => refTip.name === artifact.default_ref,
-    )?.commit_id;
-    const baseCommitId = body.base_commit_id ?? defaultHead;
+    const baseCommitId = body.base_commit_id ?? graph.head_commit_id;
     const now = Date.now().toString();
     const playground = {
       tenant_id: body.tenant_id,
@@ -1074,13 +1240,287 @@ export const handlers = [
       display_name: body.display_name.trim(),
       ...(baseCommitId ? { base_commit_id: baseCommitId, head_commit_id: baseCommitId } : {}),
       index_version: { revision: '0', digest: '0'.repeat(64) },
-      state: 'ready' as const,
+      state: 'creating' as const,
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
     playgrounds.push(playground);
     playgroundCreatePayloads.set(key, requestJson);
+    playgroundReadyAt.set(key, Date.now() + 800);
     const response: CreatePlaygroundResponse = { playground, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/playground/precommit/start', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as StartPreCommitRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const playground = playgrounds.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        item.playground_id === body.playground_id,
+    );
+    if (!playground) return notFound(request, 'Playground');
+    if (playground.state !== 'ready') {
+      return mutationConflict(
+        request,
+        'PLAYGROUND_NOT_READY',
+        'Only a Ready Playground can start Pre-commit',
+      );
+    }
+    if (
+      playground.index_version.revision !== body.expected_index_version.revision ||
+      playground.index_version.digest !== body.expected_index_version.digest
+    ) {
+      return mutationConflict(
+        request,
+        'INDEX_VERSION_CONFLICT',
+        'The expected IndexVersion no longer matches the Playground',
+      );
+    }
+
+    const requestKey = resourceKey(body.tenant_id, 'precommit-start', body.precommit_request_id);
+    const requestJson = stableJson(body);
+    const priorRequest = precommitMutationRequests.get(requestKey);
+    if (priorRequest && priorRequest !== requestJson) {
+      return mutationConflict(
+        request,
+        'PRECOMMIT_REQUEST_ID_REUSED',
+        'The Pre-commit request ID already belongs to a different request',
+      );
+    }
+    if (priorRequest) {
+      const existing = [...precommits.values()].find(
+        (item) =>
+          item.tenant_id === body.tenant_id &&
+          item.precommit_request_id === body.precommit_request_id,
+      )!;
+      const response: StartPreCommitResponse = { precommit: existing, playground, replayed: true };
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    if (playground.active_precommit_id) {
+      return mutationConflict(
+        request,
+        'PRECOMMIT_ALREADY_ACTIVE',
+        'The Playground already has an active Pre-commit',
+      );
+    }
+
+    const now = Date.now().toString();
+    const precommitId = `precommit-${fingerprint(body)}`;
+    const precommit: PreCommitView = {
+      tenant_id: body.tenant_id,
+      project_id: body.project_id,
+      artifact_id: body.artifact_id,
+      playground_id: body.playground_id,
+      precommit_id: precommitId,
+      precommit_request_id: body.precommit_request_id,
+      attempt: 1,
+      state: 'running',
+      phase: 'queued',
+      progress: { percent: 0, files_completed: '0', bytes_completed: '0' },
+      checks: [],
+      warnings: [],
+      blockers: [],
+      source_index_version: structuredClone(body.expected_index_version),
+      created_at_unix_ms: now,
+      updated_at_unix_ms: now,
+    };
+    precommits.set(resourceKey(body.tenant_id, precommitId), precommit);
+    precommitMutationRequests.set(requestKey, requestJson);
+    playground.active_precommit_id = precommitId;
+    playground.updated_at_unix_ms = now;
+    const response: StartPreCommitResponse = { precommit, playground, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/playground/precommit/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as { tenant_id: string; precommit_id: string };
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const precommit = precommits.get(resourceKey(body.tenant_id, body.precommit_id));
+    if (!precommit) {
+      return problem(
+        request,
+        404,
+        'PRECOMMIT_NOT_FOUND',
+        'Pre-commit not found',
+        'The requested Pre-commit was not found',
+      );
+    }
+    if (precommit.state === 'running') {
+      const now = Date.now().toString();
+      if (precommit.precommit_request_id.includes('fail')) {
+        precommit.state = 'abnormal';
+        precommit.phase = 'idle';
+        precommit.issue = {
+          code: 'PRECOMMIT_VALIDATION_FAILED',
+          message: '候选元数据未通过一致性校验。',
+          retryable: true,
+          occurred_at_unix_ms: now,
+        };
+        precommit.blockers = [
+          { code: 'PRECOMMIT_VALIDATION_FAILED', message: '候选元数据未通过一致性校验。' },
+        ];
+      } else {
+        precommit.state = 'ready';
+        precommit.phase = 'idle';
+        precommit.progress = {
+          percent: 100,
+          files_completed: '18554',
+          files_total: '18554',
+          bytes_completed: '845571686400',
+          bytes_total: '845571686400',
+        };
+        precommit.checks = [
+          { check_id: 'metadata-shape', status: 'passed', summary: 'Metadata 和逻辑路径检查通过' },
+        ];
+        precommit.candidate_index_version = structuredClone(precommit.source_index_version);
+        precommit.diff_summary = {
+          files_added: '2',
+          files_modified: '1',
+          files_deleted: '1',
+          files_renamed: '1',
+          bytes_added: '19971604070',
+          bytes_removed: '650117120',
+        };
+      }
+      precommit.updated_at_unix_ms = now;
+    }
+    const response: QueryPreCommitResponse = { precommit };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/playground/precommit/restart', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as RestartPreCommitRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const precommit = precommits.get(resourceKey(body.tenant_id, body.precommit_id));
+    if (!precommit) {
+      return problem(
+        request,
+        404,
+        'PRECOMMIT_NOT_FOUND',
+        'Pre-commit not found',
+        'The requested Pre-commit was not found',
+      );
+    }
+    const playground = playgrounds.find(
+      (item) =>
+        item.tenant_id === precommit.tenant_id &&
+        item.project_id === precommit.project_id &&
+        item.artifact_id === precommit.artifact_id &&
+        item.playground_id === precommit.playground_id,
+    )!;
+    const requestKey = resourceKey(body.tenant_id, 'precommit-restart', body.restart_request_id);
+    const requestJson = stableJson(body);
+    const priorRequest = precommitMutationRequests.get(requestKey);
+    if (priorRequest && priorRequest !== requestJson) {
+      return mutationConflict(
+        request,
+        'RESTART_REQUEST_ID_REUSED',
+        'The restart request ID belongs to another request',
+      );
+    }
+    if (priorRequest) {
+      const response: RestartPreCommitResponse = { precommit, playground, replayed: true };
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    if (!['abnormal', 'cancelled'].includes(precommit.state)) {
+      return mutationConflict(
+        request,
+        'PRECOMMIT_INVALID_STATE',
+        'This Pre-commit cannot be restarted',
+      );
+    }
+    if (
+      playground.index_version.revision !== body.expected_index_version.revision ||
+      playground.index_version.digest !== body.expected_index_version.digest
+    ) {
+      return mutationConflict(
+        request,
+        'INDEX_VERSION_CONFLICT',
+        'The expected IndexVersion no longer matches the Playground',
+      );
+    }
+    const now = Date.now().toString();
+    precommit.attempt += 1;
+    precommit.state = 'running';
+    precommit.phase = 'queued';
+    precommit.progress = { percent: 0, files_completed: '0', bytes_completed: '0' };
+    precommit.checks = [];
+    precommit.warnings = [];
+    precommit.blockers = [];
+    delete precommit.issue;
+    delete precommit.candidate_index_version;
+    delete precommit.diff_summary;
+    precommit.source_index_version = structuredClone(body.expected_index_version);
+    precommit.updated_at_unix_ms = now;
+    playground.active_precommit_id = precommit.precommit_id;
+    playground.updated_at_unix_ms = now;
+    precommitMutationRequests.set(requestKey, requestJson);
+    const response: RestartPreCommitResponse = { precommit, playground, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/playground/precommit/cancel', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CancelPreCommitRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const precommit = precommits.get(resourceKey(body.tenant_id, body.precommit_id));
+    if (!precommit) {
+      return problem(
+        request,
+        404,
+        'PRECOMMIT_NOT_FOUND',
+        'Pre-commit not found',
+        'The requested Pre-commit was not found',
+      );
+    }
+    const playground = playgrounds.find(
+      (item) =>
+        item.tenant_id === precommit.tenant_id &&
+        item.project_id === precommit.project_id &&
+        item.artifact_id === precommit.artifact_id &&
+        item.playground_id === precommit.playground_id,
+    )!;
+    const requestKey = resourceKey(body.tenant_id, 'precommit-cancel', body.cancel_request_id);
+    const requestJson = stableJson(body);
+    const priorRequest = precommitMutationRequests.get(requestKey);
+    if (priorRequest && priorRequest !== requestJson) {
+      return mutationConflict(
+        request,
+        'CANCEL_REQUEST_ID_REUSED',
+        'The cancel request ID belongs to another request',
+      );
+    }
+    if (priorRequest) {
+      const response: CancelPreCommitResponse = { precommit, playground, replayed: true };
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    if (precommit.state === 'committed') {
+      return mutationConflict(
+        request,
+        'PRECOMMIT_INVALID_STATE',
+        'A committed Pre-commit cannot be cancelled',
+      );
+    }
+    const now = Date.now().toString();
+    precommit.state = 'cancelled';
+    precommit.phase = 'idle';
+    precommit.updated_at_unix_ms = now;
+    if (playground.active_precommit_id === precommit.precommit_id) {
+      delete playground.active_precommit_id;
+    }
+    playground.updated_at_unix_ms = now;
+    precommitMutationRequests.set(requestKey, requestJson);
+    const response: CancelPreCommitResponse = { precommit, playground, replayed: false };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/playground/commit/create', async ({ request }) => {
@@ -1121,14 +1561,37 @@ export const handlers = [
         'The Playground is not ready to create a Commit',
       );
     }
+    const precommit = precommits.get(resourceKey(body.tenant_id, body.precommit_id));
     if (
-      playground.index_version.revision !== body.expected_index_version.revision ||
-      playground.index_version.digest !== body.expected_index_version.digest
+      !precommit ||
+      precommit.project_id !== body.project_id ||
+      precommit.artifact_id !== body.artifact_id ||
+      precommit.playground_id !== body.playground_id
+    ) {
+      return problem(
+        request,
+        404,
+        'PRECOMMIT_NOT_FOUND',
+        'Pre-commit not found',
+        'The requested Pre-commit was not found for this Playground',
+      );
+    }
+    if (precommit.state !== 'ready' || !precommit.candidate_index_version) {
+      return mutationConflict(
+        request,
+        'PRECOMMIT_NOT_READY',
+        'Commit requires a Ready Pre-commit candidate',
+      );
+    }
+    if (
+      precommit.candidate_index_version.revision !==
+        body.expected_candidate_index_version.revision ||
+      precommit.candidate_index_version.digest !== body.expected_candidate_index_version.digest
     ) {
       return mutationConflict(
         request,
         'INDEX_VERSION_CONFLICT',
-        'The expected IndexVersion no longer matches the Playground',
+        'The expected candidate IndexVersion no longer matches the Pre-commit',
       );
     }
     if (!body.message.trim()) {
@@ -1173,44 +1636,210 @@ export const handlers = [
     );
     const graph = commitGraphs.get(artifactKey);
     if (!artifact || !graph) return notFound(request, 'Artifact');
-    const tagRefs = tagNames.map((tagName) => `refs/tags/${tagName}`);
-    const conflictingTag = tagRefs.find((tagRef) =>
-      graph.refs.some((refTip) => refTip.name === tagRef),
+    const conflictingTag = tagNames.find((tagName) =>
+      graph.nodes.some((node) => node.tag_names.includes(tagName)),
     );
     if (conflictingTag) {
       return mutationConflict(
         request,
         'TAG_ALREADY_EXISTS',
-        `The Tag ${conflictingTag.replace('refs/tags/', '')} already points to another Commit`,
+        `The Tag ${conflictingTag} already points to another Commit`,
       );
     }
 
     const now = Date.now().toString();
-    const defaultRef = artifact.default_ref;
-    for (const node of graph.nodes) {
-      node.ref_names = node.ref_names.filter((name) => name !== defaultRef);
-    }
-    const commit = {
+    const commit: CommitNode = {
       commit_id: `commit-${fingerprint({ request: body, at: now })}`,
       ...(playground.head_commit_id ? { parent_commit_id: playground.head_commit_id } : {}),
       message: body.message.trim(),
       ...(body.description?.trim() ? { description: body.description.trim() } : {}),
-      ref_names: [defaultRef, ...tagRefs],
+      tag_names: tagNames,
       created_at_unix_ms: now,
     };
     graph.nodes.unshift(commit);
-    const refTip = graph.refs.find((candidate) => candidate.name === defaultRef);
-    if (refTip) refTip.commit_id = commit.commit_id;
-    else graph.refs.push({ name: defaultRef, commit_id: commit.commit_id });
-    for (const tagRef of tagRefs) graph.refs.push({ name: tagRef, commit_id: commit.commit_id });
+    graph.head_commit_id = commit.commit_id;
     graph.graph_version = (BigInt(graph.graph_version) + 1n).toString();
+    artifact.head_commit_id = commit.commit_id;
     artifact.resource_version = (BigInt(artifact.resource_version) + 1n).toString();
     artifact.updated_at_unix_ms = now;
     playground.head_commit_id = commit.commit_id;
     playground.updated_at_unix_ms = now;
+    delete playground.active_precommit_id;
+    precommit.state = 'committed';
+    precommit.phase = 'idle';
+    precommit.committed_commit_id = commit.commit_id;
+    precommit.updated_at_unix_ms = now;
 
-    const response: CommitPlaygroundResponse = { commit, playground, replayed: false };
+    const response: CommitPlaygroundResponse = {
+      commit,
+      playground,
+      consumed_precommit: precommit,
+      replayed: false,
+    };
     commitRequests.set(requestKey, { requestJson, response: structuredClone(response) });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/playground/file/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryPlaygroundFileListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const playground = playgrounds.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        item.playground_id === body.playground_id,
+    );
+    if (!playground) return notFound(request, 'Playground');
+    const filtered = mockLogicalFiles.filter(
+      (item) =>
+        (!body.path_prefix || item.path.startsWith(body.path_prefix)) &&
+        (!body.format || item.format === body.format),
+    );
+    const filters = {
+      tenant_id: body.tenant_id,
+      project_id: body.project_id,
+      artifact_id: body.artifact_id,
+      playground_id: body.playground_id,
+      path_prefix: body.path_prefix ?? '',
+      format: body.format ?? '',
+      index_version: playground.index_version,
+    };
+    const page = paginate(request, 'playground-files', filters, filtered, body);
+    if (page instanceof HttpResponse) return page;
+    const response: QueryPlaygroundFileListResponse = {
+      index_version: playground.index_version,
+      ...page,
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/playground/change/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryPlaygroundChangeListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const playground = playgrounds.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        item.playground_id === body.playground_id,
+    );
+    if (!playground) return notFound(request, 'Playground');
+    const precommit = body.precommit_id
+      ? precommits.get(resourceKey(body.tenant_id, body.precommit_id))
+      : undefined;
+    if (
+      body.precommit_id &&
+      (!precommit ||
+        precommit.project_id !== body.project_id ||
+        precommit.artifact_id !== body.artifact_id ||
+        precommit.playground_id !== body.playground_id)
+    ) {
+      return problem(
+        request,
+        404,
+        'PRECOMMIT_NOT_FOUND',
+        'Pre-commit not found',
+        'The requested Pre-commit was not found for this Playground',
+      );
+    }
+    const filtered = mockPlaygroundChanges.filter(
+      (item) =>
+        (!body.change_type || item.change_type === body.change_type) &&
+        (!body.path_prefix || item.path.startsWith(body.path_prefix)),
+    );
+    const indexVersion = precommit?.candidate_index_version ?? playground.index_version;
+    const filters = {
+      tenant_id: body.tenant_id,
+      project_id: body.project_id,
+      artifact_id: body.artifact_id,
+      playground_id: body.playground_id,
+      precommit_id: body.precommit_id ?? '',
+      change_type: body.change_type ?? '',
+      path_prefix: body.path_prefix ?? '',
+      index_version: indexVersion,
+    };
+    const page = paginate(request, 'playground-changes', filters, filtered, body);
+    if (page instanceof HttpResponse) return page;
+    const response: QueryPlaygroundChangeListResponse = {
+      source: precommit ? 'precommit' : 'workspace',
+      ...(precommit ? { precommit_id: precommit.precommit_id } : {}),
+      index_version: indexVersion,
+      summary: {
+        files_added: '1',
+        files_modified: '1',
+        files_deleted: '1',
+        files_renamed: '1',
+        bytes_added: '19971912500',
+        bytes_removed: '650117120',
+      },
+      ...page,
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/playground/file/metadata/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryPlaygroundFileMetadataRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const playground = playgrounds.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        item.playground_id === body.playground_id,
+    );
+    if (!playground) return notFound(request, 'Playground');
+    const file = mockLogicalFiles.find((item) => item.path === body.path);
+    if (!file || file.entry_type !== 'file' || !file.size_bytes || !file.format) {
+      return problem(
+        request,
+        404,
+        'FILE_NOT_FOUND',
+        'File not found',
+        'The logical file was not found',
+      );
+    }
+    const response: QueryPlaygroundFileMetadataResponse = {
+      index_version: playground.index_version,
+      metadata: {
+        path: file.path,
+        size_bytes: file.size_bytes,
+        format: file.format,
+        ...(file.row_count ? { row_count: file.row_count } : {}),
+        media_type:
+          file.format === 'parquet' ? 'application/vnd.apache.parquet' : 'application/json',
+        ...(mockDatasetProfile.schema ? { schema: mockDatasetProfile.schema } : {}),
+        ...(mockDatasetProfile.statistics ? { statistics: mockDatasetProfile.statistics } : {}),
+        ...(mockDatasetProfile.quality ? { quality: mockDatasetProfile.quality } : {}),
+        ...(mockDatasetProfile.freshness ? { freshness: mockDatasetProfile.freshness } : {}),
+      },
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/playground/dataset/profile/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryPlaygroundDatasetProfileRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const playground = playgrounds.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        item.playground_id === body.playground_id,
+    );
+    if (!playground) return notFound(request, 'Playground');
+    const response: QueryPlaygroundDatasetProfileResponse = {
+      index_version: playground.index_version,
+      profile: mockDatasetProfile,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/snapshot/list/query', async ({ request }) => {
@@ -1236,12 +1865,20 @@ export const handlers = [
       (snapshot) =>
         snapshot.tenant_id === body.tenant_id &&
         (!body.project_id || snapshot.project_id === body.project_id) &&
-        (!body.artifact_id || snapshot.artifact_id === body.artifact_id),
+        (!body.artifact_id || snapshot.artifact_id === body.artifact_id) &&
+        (!body.commit_id || snapshot.commit_id === body.commit_id) &&
+        (!body.region || snapshot.region === body.region) &&
+        (!body.storage_volume_id || snapshot.storage_volume_id === body.storage_volume_id) &&
+        (!body.state || snapshot.state === body.state),
     );
     const filters = {
       tenant_id: body.tenant_id,
       project_id: body.project_id ?? '',
       artifact_id: body.artifact_id ?? '',
+      commit_id: body.commit_id ?? '',
+      region: body.region ?? '',
+      storage_volume_id: body.storage_volume_id ?? '',
+      state: body.state ?? '',
     };
     const page = paginate(request, 'snapshots', filters, filtered, body);
     if (page instanceof HttpResponse) return page;
@@ -1251,22 +1888,26 @@ export const handlers = [
   http.post('*/api/snapshot/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as {
-      tenant_id: string;
-      project_id: string;
-      artifact_id: string;
-      commit_id: string;
-    };
+    const body = (await request.json()) as { tenant_id: string; snapshot_id: string };
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
     const snapshot = snapshots.find(
-      (item) =>
-        item.tenant_id === body.tenant_id &&
-        item.project_id === body.project_id &&
-        item.artifact_id === body.artifact_id &&
-        item.commit_id === body.commit_id,
+      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
     );
     if (!snapshot) return notFound(request, 'Snapshot');
+    const readyAt = snapshotReadyAt.get(resourceKey(snapshot.tenant_id, snapshot.snapshot_id));
+    if (snapshot.state === 'creating' && readyAt && Date.now() >= readyAt) {
+      snapshot.state = 'ready';
+      snapshot.phase = 'idle';
+      snapshot.integrity = {
+        state: 'verified',
+        files_verified: snapshot.logical_file_count,
+        bytes_verified: snapshot.logical_size_bytes,
+        verified_at_unix_ms: Date.now().toString(),
+      };
+      snapshot.updated_at_unix_ms = Date.now().toString();
+      snapshotReadyAt.delete(resourceKey(snapshot.tenant_id, snapshot.snapshot_id));
+    }
     const response: QuerySnapshotResponse = { snapshot };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
@@ -1276,22 +1917,36 @@ export const handlers = [
     const body = (await request.json()) as CreateSnapshotRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, body.snapshot_request_id);
+    const requestJson = stableJson(body);
+    const priorRequest = snapshotCreateRequests.get(requestKey);
+    if (priorRequest) {
+      if (priorRequest.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'SNAPSHOT_REQUEST_ID_REUSED',
+          'The Snapshot request ID already belongs to a different request',
+        );
+      }
+      const response = structuredClone(priorRequest.response);
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
     const existing = snapshots.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.commit_id === body.commit_id,
+        item.commit_id === body.commit_id &&
+        item.storage_volume_id === body.storage_volume_id,
     );
     if (existing) {
-      if (existing.storage_volume_id !== body.storage_volume_id) {
-        return mutationConflict(
-          request,
-          'SNAPSHOT_PLACEMENT_CONFLICT',
-          'The Snapshot already exists on a different StorageVolume',
-        );
-      }
-      const response: CreateSnapshotResponse = { snapshot: existing, replayed: true };
+      const response: CreateSnapshotResponse = {
+        snapshot: existing,
+        replayed: false,
+        placement_reused: true,
+      };
+      snapshotCreateRequests.set(requestKey, { requestJson, response: structuredClone(response) });
       return HttpResponse.json(response, { headers: headers(request) });
     }
 
@@ -1309,7 +1964,15 @@ export const handlers = [
         'The requested Commit was not found',
       );
     }
+    const sameCommitSnapshot = snapshots.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        item.commit_id === body.commit_id,
+    );
     const snapshot = {
+      snapshot_id: `snap-${body.artifact_id}-${storageVolume.region}-${Date.now().toString(36)}`,
       tenant_id: body.tenant_id,
       project_id: body.project_id,
       artifact_id: body.artifact_id,
@@ -1317,11 +1980,164 @@ export const handlers = [
       storage_volume_id: storageVolume.storage_volume_id,
       region: storageVolume.region,
       message: commit.message,
-      ref_names: [...commit.ref_names],
-      created_at_unix_ms: commit.created_at_unix_ms,
+      tag_names: [...commit.tag_names],
+      state: 'creating' as const,
+      phase: 'materializing' as const,
+      integrity: { state: 'pending' as const, files_verified: '0', bytes_verified: '0' },
+      logical_file_count: sameCommitSnapshot?.logical_file_count ?? '864',
+      logical_size_bytes: sameCommitSnapshot?.logical_size_bytes ?? '12884901888',
+      created_at_unix_ms: Date.now().toString(),
+      updated_at_unix_ms: Date.now().toString(),
     };
     snapshots.unshift(snapshot);
-    const response: CreateSnapshotResponse = { snapshot, replayed: false };
+    snapshotReadyAt.set(resourceKey(snapshot.tenant_id, snapshot.snapshot_id), Date.now() + 800);
+    const response: CreateSnapshotResponse = {
+      snapshot,
+      replayed: false,
+      placement_reused: false,
+    };
+    snapshotCreateRequests.set(requestKey, { requestJson, response: structuredClone(response) });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/snapshot/delivery/retry', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as RetrySnapshotDeliveryRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, body.retry_request_id);
+    const requestJson = stableJson(body);
+    const priorRequest = snapshotRetryRequests.get(requestKey);
+    if (priorRequest) {
+      if (priorRequest.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'RETRY_REQUEST_ID_REUSED',
+          'The retry request ID already belongs to a different request',
+        );
+      }
+      const response = structuredClone(priorRequest.response);
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const snapshot = snapshots.find(
+      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
+    );
+    if (!snapshot) return notFound(request, 'Snapshot');
+    if (snapshot.state !== 'abnormal') {
+      return mutationConflict(
+        request,
+        'SNAPSHOT_INVALID_STATE',
+        'Only an Abnormal Snapshot delivery can be retried',
+      );
+    }
+    snapshot.state = 'creating';
+    snapshot.phase = 'materializing';
+    snapshot.integrity = { state: 'pending', files_verified: '0', bytes_verified: '0' };
+    delete snapshot.issue;
+    snapshot.updated_at_unix_ms = Date.now().toString();
+    snapshotReadyAt.set(resourceKey(snapshot.tenant_id, snapshot.snapshot_id), Date.now() + 800);
+    const response: RetrySnapshotDeliveryResponse = { snapshot, replayed: false };
+    snapshotRetryRequests.set(requestKey, { requestJson, response: structuredClone(response) });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/snapshot/file/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QuerySnapshotFileListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const snapshot = snapshots.find(
+      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
+    );
+    if (!snapshot) return notFound(request, 'Snapshot');
+    if (snapshot.state !== 'ready') {
+      return mutationConflict(
+        request,
+        'SNAPSHOT_NOT_READY',
+        'Snapshot files are available only when the Snapshot is Ready',
+      );
+    }
+    const filtered = mockLogicalFiles.filter(
+      (item) =>
+        (!body.path_prefix || item.path.startsWith(body.path_prefix)) &&
+        (!body.format || item.format === body.format),
+    );
+    const filters = {
+      tenant_id: body.tenant_id,
+      snapshot_id: body.snapshot_id,
+      path_prefix: body.path_prefix ?? '',
+      format: body.format ?? '',
+    };
+    const page = paginate(request, 'snapshot-files', filters, filtered, body);
+    if (page instanceof HttpResponse) return page;
+    const response: QuerySnapshotFileListResponse = page;
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/snapshot/activity/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QuerySnapshotActivityListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const snapshot = snapshots.find(
+      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
+    );
+    if (!snapshot) return notFound(request, 'Snapshot');
+    const items: QuerySnapshotActivityListResponse['items'] = [
+      {
+        activity_id: `activity-${snapshot.snapshot_id}-created`,
+        activity_type: 'created' as const,
+        summary: 'Snapshot 记录已创建并开始区域交付',
+        phase: 'planning' as const,
+        created_at_unix_ms: snapshot.created_at_unix_ms,
+      },
+      ...(snapshot.state === 'ready'
+        ? [
+            {
+              activity_id: `activity-${snapshot.snapshot_id}-ready`,
+              activity_type: 'ready' as const,
+              summary: 'Snapshot 完整性校验通过并可读取',
+              phase: 'idle' as const,
+              created_at_unix_ms: snapshot.updated_at_unix_ms,
+            },
+          ]
+        : []),
+      ...(snapshot.state === 'abnormal' && snapshot.issue
+        ? [
+            {
+              activity_id: `activity-${snapshot.snapshot_id}-failed`,
+              activity_type: 'failed' as const,
+              summary: snapshot.issue.message,
+              phase: snapshot.phase,
+              issue: snapshot.issue,
+              created_at_unix_ms: snapshot.updated_at_unix_ms,
+            },
+          ]
+        : []),
+    ].sort((left, right) => right.created_at_unix_ms.localeCompare(left.created_at_unix_ms));
+    const page = paginate(
+      request,
+      'snapshot-activities',
+      { tenant_id: body.tenant_id, snapshot_id: body.snapshot_id },
+      items,
+      body,
+    );
+    if (page instanceof HttpResponse) return page;
+    const response: QuerySnapshotActivityListResponse = page;
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/snapshot/dataset/profile/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QuerySnapshotDatasetProfileRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const snapshot = snapshots.find(
+      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
+    );
+    if (!snapshot) return notFound(request, 'Snapshot');
+    const response: QuerySnapshotDatasetProfileResponse = { profile: mockDatasetProfile };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/job/add/create', async ({ request }) => {
@@ -1445,6 +2261,12 @@ export function resetMockState(): void {
   storageVolumeCreatePayloads.clear();
   artifactCreatePayloads.clear();
   playgroundCreatePayloads.clear();
+  playgroundReadyAt.clear();
   commitRequests.clear();
+  precommits.clear();
+  precommitMutationRequests.clear();
+  snapshotCreateRequests.clear();
+  snapshotRetryRequests.clear();
+  snapshotReadyAt.clear();
   resetMockData();
 }

@@ -16,7 +16,7 @@ import { useRoute, useRouter } from 'vue-router';
 import PageHeading from '@/components/PageHeading.vue';
 
 type Stage = 'settings' | 'placement' | 'activity';
-type DeliveryState = 'draft' | 'materializing' | 'ready';
+type DeliveryState = 'draft' | 'creating' | 'ready';
 
 interface RegionPlacement {
   id: string;
@@ -61,7 +61,7 @@ const placements: RegionPlacement[] = [
     id: 'guangzhou',
     region: 'cn-guangzhou',
     state: '目标区域已配置交付存储',
-    volume: 'volume-guangzhou-training',
+    volume: 'volume-guangzhou-delivery',
     cluster: 'cluster-cn-south-1',
     agent: 'agent-gz-03 · ready',
     transfer: '跨区域物化 · 28.4 GiB',
@@ -92,6 +92,9 @@ const activeStageIndex = computed(
 const selectedPlacement = computed(() =>
   placements.find((placement) => placement.id === selectedPlacementId.value),
 );
+const snapshotId = computed(
+  () => `snap-${artifactId.value}-${selectedPlacement.value?.id ?? 'pending'}-preview`,
+);
 
 function goToStage(stage: Stage, index: number): void {
   if (index >= activeStageIndex.value || activeStage.value === 'activity') return;
@@ -111,7 +114,7 @@ function startDelivery(): void {
     ElMessage.warning('请选择 Snapshot 所在区域');
     return;
   }
-  deliveryState.value = 'materializing';
+  deliveryState.value = 'creating';
   activeStage.value = 'activity';
   ElMessage.success('Snapshot 已创建，区域物化任务开始执行');
 }
@@ -134,7 +137,7 @@ function resetPrototype(): void {
 
 function placementStatus(): string {
   if (deliveryState.value === 'ready') return 'ready';
-  return 'materializing · 64%';
+  return 'Creating · 物化数据 64%';
 }
 
 async function backToVersionHistory(): Promise<void> {
@@ -202,8 +205,8 @@ async function openSnapshotList(): Promise<void> {
           <dd>{{ sourcePlayground }}</dd>
         </div>
         <div>
-          <dt>内容身份</dt>
-          <dd>artifact + commit</dd>
+          <dt>版本来源</dt>
+          <dd>Artifact + Commit</dd>
         </div>
         <div>
           <dt>访问模式</dt>
@@ -397,7 +400,7 @@ async function openSnapshotList(): Promise<void> {
             <RefreshRight v-else />
           </span>
           <div>
-            <small>{{ deliveryState === 'ready' ? 'READY' : 'MATERIALIZING' }}</small>
+            <small>{{ deliveryState === 'ready' ? 'READY' : 'CREATING · MATERIALIZING' }}</small>
             <h2>
               {{ deliveryState === 'ready' ? 'Snapshot 已在目标区域就绪' : '正在交付 Snapshot' }}
             </h2>
@@ -429,7 +432,8 @@ async function openSnapshotList(): Promise<void> {
           <div>
             <dt>Snapshot</dt>
             <dd>
-              <code>{{ artifactId }}@{{ commitId }}</code>
+              <code>{{ snapshotId }}</code>
+              <small>Commit {{ commitId }}</small>
             </dd>
           </div>
           <div>
