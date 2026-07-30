@@ -268,10 +268,32 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   await page.goto('/tenants/tenant-a/snapshots');
   await page.getByRole('button', { name: /补充夜间道路场景/ }).click();
   await expect(page).toHaveURL(/\/snapshots\/commit-main-3$/);
-  await expect(page.getByText('Snapshot 没有独立 snapshot_id')).toBeVisible();
+  await expect(page.getByText('只读 · Ready', { exact: true })).toBeVisible();
+  await expect(page.getByText('固定 Commit', { exact: true })).toBeVisible();
   await expect(page.getByText('dataset/v4', { exact: true })).toBeVisible();
   await expect(page.getByText(/refs\/heads/)).toHaveCount(0);
   await expect(page.getByText('12 GiB', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '区域可用性' })).toBeVisible();
+  await expect(page.getByText('cn-guangzhou', { exact: true })).toBeVisible();
+  await page.screenshot({
+    path: testInfo.outputPath('snapshot-detail.png'),
+    animations: 'disabled',
+    fullPage: true,
+  });
+
+  await page.getByRole('tab', { name: '文件' }).click();
+  await expect(page.getByRole('heading', { name: 'Snapshot 文件清单' })).toBeVisible();
+  const visibleSnapshotFile = page
+    .locator('code:visible')
+    .filter({ hasText: 'dataset/night-rain/part-0042.parquet' });
+  await expect(visibleSnapshotFile).toBeVisible();
+  await page.getByPlaceholder('按路径搜索').fill('night-rain/part-0042');
+  await expect(visibleSnapshotFile).toBeVisible();
+  await expect(page.getByText('当前显示 1 个代表文件，共 864 个文件')).toBeVisible();
+
+  await page.getByRole('tab', { name: '活动' }).click();
+  await expect(page.getByText('Snapshot 创建', { exact: true })).toBeVisible();
+  await expect(page.getByText('2 个区域均通过 Manifest 与对象完整性校验')).toBeVisible();
   await expectHealthyLayout(page);
 });
 
