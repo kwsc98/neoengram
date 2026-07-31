@@ -15,12 +15,12 @@ use neoengram_protocol::{
 
 use crate::{
     validation::{durable_from_receipt, invalid, same_index_version},
-    AssignmentOutbox, AssignmentPublishOutcome, AssignmentReserveOutcome, AuditEvent, AuditSink,
-    AuthorityCapabilities, AuthorityStore, AuthorizationRequest, Authorizer, CentralErrorCode,
-    CentralResult, Clock, ControlPlane, DurableObject, IndexKey, IndexPublishOutcome,
-    IndexPublishRejection, IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobKey,
-    JobRecord, JobRepository, MetadataBatchStager, ObjectCatalog, PublishedIndex,
-    StagedMetadataBatch,
+    AgentEnrollmentAuditEvent, AssignmentOutbox, AssignmentPublishOutcome,
+    AssignmentReserveOutcome, AuditEvent, AuditSink, AuthorityCapabilities, AuthorityStore,
+    AuthorizationRequest, Authorizer, CentralErrorCode, CentralResult, Clock, ControlPlane,
+    DurableObject, InMemoryAgentRegistry, IndexKey, IndexPublishOutcome, IndexPublishRejection,
+    IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobKey, JobRecord, JobRepository,
+    MetadataBatchStager, ObjectCatalog, PublishedIndex, StagedMetadataBatch,
 };
 
 #[derive(Debug, Default)]
@@ -639,11 +639,16 @@ impl IndexPublisher for InMemoryIndexPublisher {
 #[derive(Debug, Default)]
 pub struct InMemoryAuditSink {
     events: Mutex<BTreeMap<(TenantId, String), AuditEvent>>,
+    enrollment_events: Mutex<BTreeMap<(TenantId, String), AgentEnrollmentAuditEvent>>,
 }
 
 impl InMemoryAuditSink {
     pub fn events(&self) -> CentralResult<Vec<AuditEvent>> {
         Ok(lock(&self.events)?.values().cloned().collect())
+    }
+
+    pub fn enrollment_events(&self) -> CentralResult<Vec<AgentEnrollmentAuditEvent>> {
+        Ok(lock(&self.enrollment_events)?.values().cloned().collect())
     }
 }
 
@@ -662,6 +667,31 @@ impl AuditSink for InMemoryAuditSink {
             return Err(invalid(
                 CentralErrorCode::Internal,
                 format!("audit event ID {} was reused", event.event_id),
+            ));
+        }
+        events.insert(key, event);
+        Ok(false)
+    }
+
+    async fn record_enrollment_decision(
+        &self,
+        event: AgentEnrollmentAuditEvent,
+    ) -> CentralResult<bool> {
+        let mut events = lock(&self.enrollment_events)?;
+        let key = (event.tenant_id.clone(), event.event_id.clone());
+        if let Some(existing) = events.get(&key) {
+            if existing.kind == event.kind
+                && existing.enrollment_id == event.enrollment_id
+                && existing.storage_volume_id == event.storage_volume_id
+                && existing.decision_request_id == event.decision_request_id
+                && existing.resource_version == event.resource_version
+                && existing.actor == event.actor
+            {
+                return Ok(true);
+            }
+            return Err(invalid(
+                CentralErrorCode::Internal,
+                format!("enrollment audit event ID {} was reused", event.event_id),
             ));
         }
         events.insert(key, event);
@@ -717,6 +747,7 @@ pub struct InMemoryComponents {
     pub objects: Arc<InMemoryObjectCatalog>,
     pub publisher: Arc<InMemoryIndexPublisher>,
     pub audit: Arc<InMemoryAuditSink>,
+    pub agent_registry: Arc<InMemoryAgentRegistry>,
     pub clock: Arc<InMemoryClock>,
 }
 
@@ -731,6 +762,7 @@ impl InMemoryComponents {
             objects: Arc::new(InMemoryObjectCatalog::default()),
             publisher: Arc::new(InMemoryIndexPublisher::default()),
             audit: Arc::new(InMemoryAuditSink::default()),
+            agent_registry: Arc::new(InMemoryAgentRegistry::new()),
             clock: Arc::new(InMemoryClock::new(now_ms)),
         }
     }
@@ -755,6 +787,7 @@ impl InMemoryComponents {
             self.audit.clone(),
             AuthorityCapabilities::IN_MEMORY,
         )
+        .with_agent_registry(self.agent_registry.clone())
     }
 }
 

@@ -1,6 +1,8 @@
 import { http, HttpResponse } from 'msw';
 
 import type {
+  ApproveStorageEnrollmentRequest,
+  ApproveStorageEnrollmentResponse,
   ArtifactView,
   CancelPreCommitRequest,
   CancelPreCommitResponse,
@@ -16,6 +18,8 @@ import type {
   CreatePlaygroundResponse,
   CreateSnapshotRequest,
   CreateSnapshotResponse,
+  CreateStorageEnrollmentTokenRequest,
+  CreateStorageEnrollmentTokenResponse,
   CreateStorageVolumeRequest,
   CreateStorageVolumeResponse,
   CreateTenantRequest,
@@ -51,8 +55,14 @@ import type {
   QuerySnapshotFileListRequest,
   QuerySnapshotFileListResponse,
   QuerySnapshotResponse,
+  QueryStorageEnrollmentListRequest,
+  QueryStorageEnrollmentListResponse,
+  QueryStorageEnrollmentRequest,
+  QueryStorageEnrollmentResponse,
   RestartPreCommitRequest,
   RestartPreCommitResponse,
+  RejectStorageEnrollmentRequest,
+  RejectStorageEnrollmentResponse,
   RetrySnapshotDeliveryRequest,
   RetrySnapshotDeliveryResponse,
   StartPreCommitRequest,
@@ -64,6 +74,7 @@ import type {
   QueryTenantListResponse,
   QueryTenantResponse,
   QueryJobResponse,
+  StorageEnrollmentView,
   StorageVolumeView,
   TenantView,
 } from '@/api/types';
@@ -98,17 +109,65 @@ interface PageResult<T> {
   next_cursor?: string;
 }
 
+type StorageEnrollmentPermission =
+  'storage.enrollment.create' | 'storage.enrollment.read' | 'storage.enrollment.review';
+
+type StorageEnrollmentDescriptor = Pick<
+  StorageEnrollmentView,
+  | 'tenant_id'
+  | 'storage_volume_id'
+  | 'display_name'
+  | 'edge_cluster_id'
+  | 'region'
+  | 'access_mode'
+  | 'pvc_reference'
+>;
+
+interface PvcBinding {
+  tenantId: string;
+  storageVolumeId: string;
+}
+
+interface PvcOwner {
+  tenantId: string;
+  storageVolumeId: string;
+  identityFingerprint: string;
+}
+
 const jobs = new Map<string, StoredJob>();
 const tenantCreatePayloads = new Map<string, string>();
 const storageVolumeCreatePayloads = new Map<string, string>();
+const storageEnrollmentTokenRequests = new Map<
+  string,
+  {
+    requestJson: string;
+    descriptor: StorageEnrollmentDescriptor;
+    response: CreateStorageEnrollmentTokenResponse;
+  }
+>();
+const storageEnrollmentApprovalRequests = new Map<
+  string,
+  { requestJson: string; response: ApproveStorageEnrollmentResponse }
+>();
+const storageEnrollmentRejectionRequests = new Map<
+  string,
+  { requestJson: string; response: RejectStorageEnrollmentResponse }
+>();
+const storageEnrollments: StorageEnrollmentView[] = [];
+const storageEnrollmentFrozenDescriptors = new Map<string, StorageEnrollmentDescriptor>();
+const storageEnrollmentReviewAudit = new Map<string, string>();
+const pvcBindings = new Map<string, PvcBinding>();
+const activePvcOwners = new Map<string, PvcOwner>();
 const artifactCreatePayloads = new Map<string, string>();
 const playgroundCreatePayloads = new Map<string, string>();
-const playgroundReadyAt = new Map<string, number>();
+const playgroundQueryCounts = new Map<string, number>();
 const commitRequests = new Map<
   string,
   { requestJson: string; response: CommitPlaygroundResponse }
 >();
 const precommits = new Map<string, PreCommitView>();
+const precommitQueryCounts = new Map<string, number>();
+const precommitSourceHeads = new Map<string, string | null>();
 const precommitMutationRequests = new Map<string, string>();
 const snapshotCreateRequests = new Map<
   string,
@@ -118,8 +177,23 @@ const snapshotRetryRequests = new Map<
   string,
   { requestJson: string; response: RetrySnapshotDeliveryResponse }
 >();
+const snapshotQueryCounts = new Map<string, number>();
 
-const snapshotReadyAt = new Map<string, number>();
+const READY_AFTER_QUERY_COUNT = 2;
+
+function completesOnThisQuery(queryCounts: Map<string, number>, key: string): boolean {
+  const currentCount = queryCounts.get(key);
+  if (currentCount === undefined) return false;
+
+  const nextCount = currentCount + 1;
+  if (nextCount < READY_AFTER_QUERY_COUNT) {
+    queryCounts.set(key, nextCount);
+    return false;
+  }
+
+  queryCounts.delete(key);
+  return true;
+}
 
 function requestId(request: Request): string {
   return request.headers.get('X-Request-ID') ?? `mock-fallback-${crypto.randomUUID()}`;
@@ -303,6 +377,221 @@ function requireMutationAccess(
   );
 }
 
+function requireEnrollmentPermission(
+  request: Request,
+  tenantId: string,
+  permission: StorageEnrollmentPermission,
+): HttpResponse<ProblemDetails> | null {
+  const failed = requireTenant(request, tenantId);
+  if (failed) return failed;
+  const tenant = tenants.find((item) => item.tenant_id === tenantId);
+  if (isAdmin(request) && tenant?.permissions.includes(permission)) return null;
+  return problem(
+    request,
+    403,
+    'AUTHORIZATION_DENIED',
+    'Authorization denied',
+    `The principal is missing ${permission} in this Tenant`,
+  );
+}
+
+function storageEnrollmentNotFound(request: Request): HttpResponse<ProblemDetails> {
+  return problem(
+    request,
+    404,
+    'STORAGE_ENROLLMENT_NOT_FOUND',
+    'Storage enrollment not found',
+    'The requested Storage enrollment was not found',
+  );
+}
+
+const RESOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const REGION_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const KUBERNETES_NAMESPACE_PATTERN = /^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
+const KUBERNETES_PVC_CLAIM_PATTERN =
+  /^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*$/;
+
+function validPvcReference(reference: { namespace: string; claim_name: string }): boolean {
+  return (
+    reference.namespace.length <= 63 &&
+    KUBERNETES_NAMESPACE_PATTERN.test(reference.namespace) &&
+    reference.claim_name.length <= 253 &&
+    KUBERNETES_PVC_CLAIM_PATTERN.test(reference.claim_name)
+  );
+}
+
+function pvcIdentity(value: {
+  edge_cluster_id: string;
+  pvc_reference: { namespace: string; claim_name: string };
+}): string {
+  return resourceKey(
+    value.edge_cluster_id,
+    value.pvc_reference.namespace,
+    value.pvc_reference.claim_name,
+  );
+}
+
+function enrollmentDescriptor(value: StorageEnrollmentDescriptor): StorageEnrollmentDescriptor {
+  return {
+    tenant_id: value.tenant_id,
+    storage_volume_id: value.storage_volume_id,
+    display_name: value.display_name,
+    edge_cluster_id: value.edge_cluster_id,
+    region: value.region,
+    access_mode: value.access_mode,
+    pvc_reference: structuredClone(value.pvc_reference),
+  };
+}
+
+function descriptorMatches(
+  left: StorageEnrollmentDescriptor,
+  right: StorageEnrollmentDescriptor,
+): boolean {
+  return stableJson(enrollmentDescriptor(left)) === stableJson(enrollmentDescriptor(right));
+}
+
+function volumeMatchesDescriptor(
+  volume: StorageVolumeView,
+  descriptor: StorageEnrollmentDescriptor,
+): boolean {
+  return (
+    volume.backend_type === 'pvc' &&
+    volume.tenant_id === descriptor.tenant_id &&
+    volume.storage_volume_id === descriptor.storage_volume_id &&
+    volume.display_name === descriptor.display_name &&
+    volume.edge_cluster_id === descriptor.edge_cluster_id &&
+    volume.region === descriptor.region &&
+    volume.access_mode === descriptor.access_mode &&
+    volume.pvc_reference?.namespace === descriptor.pvc_reference.namespace &&
+    volume.pvc_reference?.claim_name === descriptor.pvc_reference.claim_name
+  );
+}
+
+function rebuildPvcAuthorityState(): void {
+  pvcBindings.clear();
+  activePvcOwners.clear();
+  for (const volume of storageVolumes) {
+    if (volume.backend_type !== 'pvc' || !volume.pvc_reference) continue;
+    const key = pvcIdentity({
+      edge_cluster_id: volume.edge_cluster_id,
+      pvc_reference: volume.pvc_reference,
+    });
+    pvcBindings.set(key, {
+      tenantId: volume.tenant_id,
+      storageVolumeId: volume.storage_volume_id,
+    });
+    if (volume.state === 'ready') {
+      activePvcOwners.set(key, {
+        tenantId: volume.tenant_id,
+        storageVolumeId: volume.storage_volume_id,
+        identityFingerprint: `seeded-owner:${volume.storage_volume_id}`,
+      });
+    }
+  }
+}
+
+function expireStorageEnrollments(): void {
+  const now = BigInt(Date.now());
+  for (const enrollment of storageEnrollments) {
+    if (enrollment.state !== 'pending_approval' || BigInt(enrollment.expires_at_unix_ms) > now) {
+      continue;
+    }
+    enrollment.state = 'expired';
+    enrollment.resource_version = (BigInt(enrollment.resource_version) + 1n).toString();
+    enrollment.updated_at_unix_ms = now.toString();
+  }
+}
+
+function seedStorageEnrollmentState(): void {
+  const createdAt = Date.now() - 60_000;
+  const expiresAt = createdAt + 24 * 60 * 60 * 1000;
+  const createdAtUnixMs = createdAt.toString();
+  const expiresAtUnixMs = expiresAt.toString();
+  storageEnrollments.length = 0;
+  storageEnrollmentFrozenDescriptors.clear();
+  storageEnrollments.push(
+    {
+      tenant_id: 'tenant-a',
+      storage_enrollment_id: 'storage-enrollment-review-01',
+      storage_volume_id: 'volume-review-pvc',
+      display_name: '待接入评测 PVC',
+      edge_cluster_id: 'cluster-cn-east-1',
+      region: 'cn-shanghai',
+      access_mode: 'read_write_many',
+      pvc_reference: { namespace: 'neoengram-data', claim_name: 'review-data' },
+      registration_kind: 'initial',
+      state: 'pending_approval',
+      agent_version: '0.2.0',
+      identity_fingerprint: 'a'.repeat(64),
+      probe: {
+        descriptor_matches: true,
+        observed_access_mode: 'read_write',
+        protocol_compatible: true,
+        observed_at_unix_ms: createdAtUnixMs,
+      },
+      resource_version: '1',
+      created_at_unix_ms: createdAtUnixMs,
+      expires_at_unix_ms: expiresAtUnixMs,
+      updated_at_unix_ms: createdAtUnixMs,
+    },
+    {
+      tenant_id: 'tenant-a',
+      storage_enrollment_id: 'storage-enrollment-review-02',
+      storage_volume_id: 'volume-shanghai-vision',
+      display_name: '视觉数据 PVC',
+      edge_cluster_id: 'cluster-cn-east-1',
+      region: 'cn-shanghai',
+      access_mode: 'read_write_many',
+      pvc_reference: { namespace: 'neoengram-data', claim_name: 'vision-data' },
+      registration_kind: 'replacement',
+      state: 'pending_approval',
+      agent_version: '0.2.0',
+      identity_fingerprint: 'b'.repeat(64),
+      probe: {
+        descriptor_matches: true,
+        observed_access_mode: 'read_write',
+        protocol_compatible: true,
+        observed_at_unix_ms: createdAtUnixMs,
+      },
+      resource_version: '1',
+      created_at_unix_ms: createdAtUnixMs,
+      expires_at_unix_ms: expiresAtUnixMs,
+      updated_at_unix_ms: createdAtUnixMs,
+    },
+    {
+      tenant_id: 'tenant-b',
+      storage_enrollment_id: 'storage-enrollment-tenant-b-01',
+      storage_volume_id: 'volume-tenant-b-pending',
+      display_name: 'Tenant B pending PVC',
+      edge_cluster_id: 'cluster-cn-east-1',
+      region: 'cn-shanghai',
+      access_mode: 'read_write_once',
+      pvc_reference: { namespace: 'neoengram-release', claim_name: 'pending-review' },
+      registration_kind: 'initial',
+      state: 'pending_approval',
+      agent_version: '0.2.0',
+      identity_fingerprint: 'c'.repeat(64),
+      probe: {
+        descriptor_matches: true,
+        observed_access_mode: 'read_write',
+        protocol_compatible: true,
+        observed_at_unix_ms: createdAtUnixMs,
+      },
+      resource_version: '1',
+      created_at_unix_ms: createdAtUnixMs,
+      expires_at_unix_ms: expiresAtUnixMs,
+      updated_at_unix_ms: createdAtUnixMs,
+    },
+  );
+  for (const enrollment of storageEnrollments) {
+    storageEnrollmentFrozenDescriptors.set(
+      resourceKey(enrollment.tenant_id, enrollment.storage_enrollment_id),
+      enrollmentDescriptor(enrollment),
+    );
+  }
+  rebuildPvcAuthorityState();
+}
+
 function resolveStorageVolume(
   request: Request,
   tenantId: string,
@@ -320,14 +609,52 @@ function resolveStorageVolume(
       'The selected StorageVolume does not exist in this Tenant',
     );
   }
-  if (storageVolume.state === 'unavailable') {
+  if (storageVolume.state !== 'ready') {
     return mutationConflict(
       request,
       'STORAGE_VOLUME_UNAVAILABLE',
-      'The selected StorageVolume is unavailable for new resource placement',
+      'Only a Ready StorageVolume can accept new resource placement',
     );
   }
   return storageVolume;
+}
+
+function seedPreCommitState(): void {
+  const playground = playgrounds.find(
+    (item) =>
+      item.tenant_id === 'tenant-a' &&
+      item.project_id === 'project-vision' &&
+      item.artifact_id === 'quality-reports' &&
+      item.playground_id === 'nightly-review',
+  );
+  if (!playground?.active_precommit_id) return;
+  const key = resourceKey(playground.tenant_id, playground.active_precommit_id);
+  precommits.set(key, {
+    tenant_id: playground.tenant_id,
+    project_id: playground.project_id,
+    artifact_id: playground.artifact_id,
+    playground_id: playground.playground_id,
+    precommit_id: playground.active_precommit_id,
+    precommit_request_id: 'precommit-nightly-seeded',
+    attempt: 1,
+    state: 'running',
+    phase: 'hashing',
+    progress: {
+      percent: 52,
+      files_completed: '9648',
+      files_total: '18554',
+      bytes_completed: '422785843200',
+      bytes_total: '845571686400',
+    },
+    checks: [],
+    warnings: [],
+    blockers: [],
+    source_index_version: structuredClone(playground.index_version),
+    created_at_unix_ms: playground.updated_at_unix_ms,
+    updated_at_unix_ms: playground.updated_at_unix_ms,
+  });
+  precommitQueryCounts.set(key, 2);
+  precommitSourceHeads.set(key, playground.head_commit_id ?? null);
 }
 
 function mutationConflict(
@@ -566,7 +893,13 @@ export const handlers = [
       {
         api_versions: [1],
         agent_protocol_versions: [1],
-        capabilities: ['managed_add', 'resource_browser', 'tenant_admin', 'sqlite_authority'],
+        capabilities: [
+          'managed_add',
+          'resource_browser',
+          'storage_enrollment',
+          'tenant_admin',
+          'sqlite_authority',
+        ],
       },
       { headers: headers(request) },
     ),
@@ -664,6 +997,9 @@ export const handlers = [
         'tenant.read',
         'storage.read',
         'storage.create',
+        'storage.enrollment.create',
+        'storage.enrollment.read',
+        'storage.enrollment.review',
         'artifact.read',
         'artifact.create',
         'playground.create',
@@ -735,20 +1071,19 @@ export const handlers = [
     const body = (await request.json()) as CreateStorageVolumeRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
-    const resourceId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-    const region = /^[a-z0-9][a-z0-9-]{0,63}$/;
     const backendReferenceValid =
       (body.backend_type === 'pvc' &&
-        Boolean(body.pvc_reference?.namespace && body.pvc_reference.claim_name) &&
+        Boolean(body.pvc_reference && validPvcReference(body.pvc_reference)) &&
         !body.nfs_reference) ||
       (body.backend_type === 'nfs' &&
         Boolean(body.nfs_reference?.server && body.nfs_reference.export_path?.startsWith('/')) &&
         !body.pvc_reference);
     if (
-      !resourceId.test(body.storage_volume_id) ||
-      !resourceId.test(body.edge_cluster_id) ||
+      !RESOURCE_ID_PATTERN.test(body.storage_volume_id) ||
+      !RESOURCE_ID_PATTERN.test(body.edge_cluster_id) ||
       !body.display_name.trim() ||
-      !region.test(body.region) ||
+      body.display_name.length > 128 ||
+      !REGION_PATTERN.test(body.region) ||
       !['read_write_many', 'read_write_once', 'read_only_many'].includes(body.access_mode) ||
       !backendReferenceValid
     ) {
@@ -789,6 +1124,22 @@ export const handlers = [
       return HttpResponse.json(response, { headers: headers(request) });
     }
 
+    if (body.backend_type === 'pvc' && body.pvc_reference) {
+      const binding = pvcBindings.get(
+        pvcIdentity({
+          edge_cluster_id: body.edge_cluster_id,
+          pvc_reference: body.pvc_reference,
+        }),
+      );
+      if (binding) {
+        return mutationConflict(
+          request,
+          'PVC_ALREADY_ENROLLED',
+          'The PVC is already registered as another StorageVolume',
+        );
+      }
+    }
+
     const now = Date.now().toString();
     const storageVolume: StorageVolumeView = {
       tenant_id: body.tenant_id,
@@ -801,17 +1152,423 @@ export const handlers = [
       ...(body.backend_type === 'pvc' && body.pvc_reference
         ? { pvc_reference: body.pvc_reference }
         : {}),
-      state: 'ready',
+      state: 'unavailable',
       resource_version: '1',
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
     storageVolumes.push(storageVolume);
+    if (storageVolume.backend_type === 'pvc' && storageVolume.pvc_reference) {
+      pvcBindings.set(
+        pvcIdentity({
+          edge_cluster_id: storageVolume.edge_cluster_id,
+          pvc_reference: storageVolume.pvc_reference,
+        }),
+        { tenantId: storageVolume.tenant_id, storageVolumeId: storageVolume.storage_volume_id },
+      );
+    }
     storageVolumeCreatePayloads.set(key, requestJson);
     const response: CreateStorageVolumeResponse = {
       storage_volume: storageVolume,
       replayed: false,
     };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/storage/enrollment/token/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateStorageEnrollmentTokenRequest;
+    const failed = requireEnrollmentPermission(
+      request,
+      body.tenant_id,
+      'storage.enrollment.create',
+    );
+    if (failed) return failed;
+    expireStorageEnrollments();
+    if (
+      !RESOURCE_ID_PATTERN.test(body.token_request_id) ||
+      !RESOURCE_ID_PATTERN.test(body.storage_volume_id) ||
+      !RESOURCE_ID_PATTERN.test(body.edge_cluster_id) ||
+      !body.display_name.trim() ||
+      body.display_name.length > 128 ||
+      !REGION_PATTERN.test(body.region) ||
+      !['read_write_many', 'read_write_once'].includes(body.access_mode) ||
+      !body.pvc_reference ||
+      !validPvcReference(body.pvc_reference)
+    ) {
+      return problem(
+        request,
+        422,
+        'PROTOCOL_INVALID',
+        'Request validation failed',
+        'Storage enrollment identity and PVC descriptor must be valid',
+        {
+          retryable: false,
+          violations: [
+            { field: 'storage_volume_id', reason: 'must be a valid resource ID' },
+            { field: 'pvc_reference', reason: 'namespace and claim_name are required' },
+          ],
+        },
+      );
+    }
+
+    const requestKey = resourceKey(body.tenant_id, body.token_request_id);
+    const requestJson = stableJson(body);
+    const previous = storageEnrollmentTokenRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'STORAGE_ENROLLMENT_TOKEN_REQUEST_ID_REUSED',
+          'The token request ID already belongs to another payload',
+        );
+      }
+      return HttpResponse.json(
+        { ...structuredClone(previous.response), replayed: true },
+        { headers: headers(request) },
+      );
+    }
+
+    const descriptor = enrollmentDescriptor(body);
+    const pvcKey = pvcIdentity(descriptor);
+
+    const existingVolume = storageVolumes.find(
+      (item) =>
+        item.tenant_id === body.tenant_id && item.storage_volume_id === body.storage_volume_id,
+    );
+    if (existingVolume && !volumeMatchesDescriptor(existingVolume, descriptor)) {
+      return mutationConflict(
+        request,
+        'STORAGE_VOLUME_DESCRIPTOR_CONFLICT',
+        'The existing StorageVolume descriptor does not match this enrollment',
+      );
+    }
+    const pvcBinding = pvcBindings.get(pvcKey);
+    if (
+      pvcBinding &&
+      (pvcBinding.tenantId !== body.tenant_id ||
+        pvcBinding.storageVolumeId !== body.storage_volume_id)
+    ) {
+      return mutationConflict(
+        request,
+        'PVC_ALREADY_ENROLLED',
+        'The PVC is already registered as another StorageVolume',
+      );
+    }
+    if (
+      storageEnrollments.some(
+        (item) =>
+          ((item.tenant_id === body.tenant_id &&
+            item.storage_volume_id === body.storage_volume_id) ||
+            pvcIdentity(item) === pvcKey) &&
+          item.state === 'pending_approval',
+      )
+    ) {
+      return mutationConflict(
+        request,
+        'STORAGE_ENROLLMENT_ALREADY_PENDING',
+        'This StorageVolume already has a pending enrollment request',
+      );
+    }
+
+    const now = Date.now();
+    const tokenId = `storage-enrollment-token-${crypto.randomUUID()}`;
+    const response: CreateStorageEnrollmentTokenResponse = {
+      token_id: tokenId,
+      bootstrap_token: `ngenr_v1_${crypto.randomUUID().replaceAll('-', '')}`,
+      expires_at_unix_ms: (now + 15 * 60 * 1000).toString(),
+      replayed: false,
+    };
+    storageEnrollmentTokenRequests.set(requestKey, {
+      requestJson,
+      descriptor,
+      response: structuredClone(response),
+    });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/storage/enrollment/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryStorageEnrollmentListRequest;
+    const failed = requireEnrollmentPermission(request, body.tenant_id, 'storage.enrollment.read');
+    if (failed) return failed;
+    expireStorageEnrollments();
+    const normalizedQuery = body.query?.trim().toLocaleLowerCase('en-US') ?? '';
+    const filtered = storageEnrollments.filter(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        (!body.state || item.state === body.state) &&
+        (!body.registration_kind || item.registration_kind === body.registration_kind) &&
+        (!normalizedQuery ||
+          item.storage_volume_id.toLocaleLowerCase('en-US').includes(normalizedQuery) ||
+          item.display_name.toLocaleLowerCase('en-US').includes(normalizedQuery)),
+    );
+    const page = paginate(
+      request,
+      'storage-enrollments',
+      {
+        tenant_id: body.tenant_id,
+        state: body.state ?? '',
+        registration_kind: body.registration_kind ?? '',
+        query: normalizedQuery,
+      },
+      filtered,
+      body,
+    );
+    if (page instanceof HttpResponse) return page;
+    const response: QueryStorageEnrollmentListResponse = page;
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/storage/enrollment/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryStorageEnrollmentRequest;
+    const failed = requireEnrollmentPermission(request, body.tenant_id, 'storage.enrollment.read');
+    if (failed) return failed;
+    expireStorageEnrollments();
+    const enrollment = storageEnrollments.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.storage_enrollment_id === body.storage_enrollment_id,
+    );
+    if (!enrollment) return storageEnrollmentNotFound(request);
+    const response: QueryStorageEnrollmentResponse = { enrollment: structuredClone(enrollment) };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/storage/enrollment/approve', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as ApproveStorageEnrollmentRequest;
+    const failed = requireEnrollmentPermission(
+      request,
+      body.tenant_id,
+      'storage.enrollment.review',
+    );
+    if (failed) return failed;
+    expireStorageEnrollments();
+    const enrollment = storageEnrollments.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.storage_enrollment_id === body.storage_enrollment_id,
+    );
+    if (!enrollment) return storageEnrollmentNotFound(request);
+    const requestKey = resourceKey(body.tenant_id, body.approval_request_id);
+    const requestJson = stableJson(body);
+    const previous = storageEnrollmentApprovalRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'STORAGE_ENROLLMENT_APPROVAL_ID_REUSED',
+          'The approval request ID already belongs to another payload',
+        );
+      }
+      return HttpResponse.json(
+        { ...structuredClone(previous.response), replayed: true },
+        { headers: headers(request) },
+      );
+    }
+
+    if (
+      enrollment.state !== 'pending_approval' ||
+      enrollment.resource_version !== body.expected_resource_version ||
+      (enrollment.registration_kind === 'replacement' && !body.confirm_replacement)
+    ) {
+      return mutationConflict(
+        request,
+        'STORAGE_ENROLLMENT_STATE_CONFLICT',
+        'The enrollment state, resource version or replacement confirmation is invalid',
+      );
+    }
+    if (
+      !enrollment.probe.descriptor_matches ||
+      !enrollment.probe.protocol_compatible ||
+      enrollment.probe.observed_access_mode !== 'read_write'
+    ) {
+      return mutationConflict(
+        request,
+        'STORAGE_ENROLLMENT_PROBE_FAILED',
+        'The reported mount is not eligible for approval',
+      );
+    }
+
+    const frozenDescriptor = storageEnrollmentFrozenDescriptors.get(
+      resourceKey(enrollment.tenant_id, enrollment.storage_enrollment_id),
+    );
+    if (!frozenDescriptor || !descriptorMatches(enrollment, frozenDescriptor)) {
+      return mutationConflict(
+        request,
+        'STORAGE_VOLUME_DESCRIPTOR_MISMATCH',
+        'The enrollment no longer matches the descriptor frozen at bootstrap',
+      );
+    }
+
+    const pvcKey = pvcIdentity(frozenDescriptor);
+    const binding = pvcBindings.get(pvcKey);
+    const owner = activePvcOwners.get(pvcKey);
+    let storageVolume = storageVolumes.find(
+      (item) =>
+        item.tenant_id === enrollment.tenant_id &&
+        item.storage_volume_id === enrollment.storage_volume_id,
+    );
+    if (
+      binding &&
+      (binding.tenantId !== enrollment.tenant_id ||
+        binding.storageVolumeId !== enrollment.storage_volume_id)
+    ) {
+      return mutationConflict(
+        request,
+        'PVC_ALREADY_ENROLLED',
+        'The PVC is already bound to another StorageVolume',
+      );
+    }
+    if (
+      storageEnrollments.some(
+        (item) =>
+          item.storage_enrollment_id !== enrollment.storage_enrollment_id &&
+          ['pending_approval', 'approved', 'enrolled'].includes(item.state) &&
+          pvcIdentity(item) === pvcKey,
+      )
+    ) {
+      return mutationConflict(
+        request,
+        'PVC_ALREADY_ENROLLED',
+        'The PVC already has another active enrollment',
+      );
+    }
+    if (enrollment.registration_kind === 'initial') {
+      if (storageVolume || binding || owner) {
+        return mutationConflict(
+          request,
+          'PVC_ALREADY_ENROLLED',
+          'An initial enrollment requires an unbound PVC and a missing StorageVolume',
+        );
+      }
+    } else if (
+      !storageVolume ||
+      !volumeMatchesDescriptor(storageVolume, frozenDescriptor) ||
+      !owner ||
+      owner.tenantId !== enrollment.tenant_id ||
+      owner.storageVolumeId !== enrollment.storage_volume_id
+    ) {
+      return mutationConflict(
+        request,
+        'STORAGE_ENROLLMENT_REPLACEMENT_CONFLICT',
+        'Replacement requires the exact existing Volume and its active owner',
+      );
+    }
+
+    const now = Date.now().toString();
+    if (!storageVolume) {
+      storageVolume = {
+        tenant_id: enrollment.tenant_id,
+        storage_volume_id: enrollment.storage_volume_id,
+        display_name: enrollment.display_name,
+        edge_cluster_id: enrollment.edge_cluster_id,
+        region: enrollment.region,
+        backend_type: 'pvc',
+        access_mode: enrollment.access_mode,
+        pvc_reference: structuredClone(enrollment.pvc_reference),
+        state: 'unavailable',
+        resource_version: '1',
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+      };
+      storageVolumes.push(storageVolume);
+    } else {
+      storageVolume.state = 'unavailable';
+      storageVolume.resource_version = (BigInt(storageVolume.resource_version) + 1n).toString();
+      storageVolume.updated_at_unix_ms = now;
+    }
+    pvcBindings.set(pvcKey, {
+      tenantId: enrollment.tenant_id,
+      storageVolumeId: enrollment.storage_volume_id,
+    });
+    activePvcOwners.set(pvcKey, {
+      tenantId: enrollment.tenant_id,
+      storageVolumeId: enrollment.storage_volume_id,
+      identityFingerprint: enrollment.identity_fingerprint,
+    });
+    enrollment.state = 'approved';
+    enrollment.resource_version = (BigInt(enrollment.resource_version) + 1n).toString();
+    enrollment.reviewed_at_unix_ms = now;
+    enrollment.updated_at_unix_ms = now;
+    const response: ApproveStorageEnrollmentResponse = {
+      enrollment: structuredClone(enrollment),
+      storage_volume: structuredClone(storageVolume),
+      replayed: false,
+    };
+    storageEnrollmentApprovalRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/storage/enrollment/reject', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as RejectStorageEnrollmentRequest;
+    const failed = requireEnrollmentPermission(
+      request,
+      body.tenant_id,
+      'storage.enrollment.review',
+    );
+    if (failed) return failed;
+    expireStorageEnrollments();
+    const enrollment = storageEnrollments.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.storage_enrollment_id === body.storage_enrollment_id,
+    );
+    if (!enrollment) return storageEnrollmentNotFound(request);
+    const requestKey = resourceKey(body.tenant_id, body.rejection_request_id);
+    const requestJson = stableJson(body);
+    const previous = storageEnrollmentRejectionRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'STORAGE_ENROLLMENT_REJECTION_ID_REUSED',
+          'The rejection request ID already belongs to another payload',
+        );
+      }
+      return HttpResponse.json(
+        { ...structuredClone(previous.response), replayed: true },
+        { headers: headers(request) },
+      );
+    }
+
+    if (
+      enrollment.state !== 'pending_approval' ||
+      enrollment.resource_version !== body.expected_resource_version
+    ) {
+      return mutationConflict(
+        request,
+        'STORAGE_ENROLLMENT_STATE_CONFLICT',
+        'The enrollment state or resource version is no longer current',
+      );
+    }
+
+    const now = Date.now().toString();
+    enrollment.state = 'rejected';
+    enrollment.resource_version = (BigInt(enrollment.resource_version) + 1n).toString();
+    enrollment.reviewed_at_unix_ms = now;
+    const reviewReason = body.reason?.trim();
+    if (reviewReason) {
+      storageEnrollmentReviewAudit.set(
+        resourceKey(enrollment.tenant_id, enrollment.storage_enrollment_id),
+        reviewReason,
+      );
+    }
+    enrollment.updated_at_unix_ms = now;
+    const response: RejectStorageEnrollmentResponse = {
+      enrollment: structuredClone(enrollment),
+      replayed: false,
+    };
+    storageEnrollmentRejectionRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/project/list/query', async ({ request }) => {
@@ -1160,11 +1917,12 @@ export const handlers = [
       playground.artifact_id,
       playground.playground_id,
     );
-    const readyAt = playgroundReadyAt.get(playgroundKey);
-    if (playground.state === 'creating' && readyAt && Date.now() >= readyAt) {
+    if (
+      playground.state === 'creating' &&
+      completesOnThisQuery(playgroundQueryCounts, playgroundKey)
+    ) {
       playground.state = 'ready';
       playground.updated_at_unix_ms = Date.now().toString();
-      playgroundReadyAt.delete(playgroundKey);
     }
     const response: QueryPlaygroundResponse = { playground };
     return HttpResponse.json(response, { headers: headers(request) });
@@ -1246,7 +2004,7 @@ export const handlers = [
     };
     playgrounds.push(playground);
     playgroundCreatePayloads.set(key, requestJson);
-    playgroundReadyAt.set(key, Date.now() + 800);
+    playgroundQueryCounts.set(key, 0);
     const response: CreatePlaygroundResponse = { playground, replayed: false };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
@@ -1329,7 +2087,10 @@ export const handlers = [
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
-    precommits.set(resourceKey(body.tenant_id, precommitId), precommit);
+    const precommitKey = resourceKey(body.tenant_id, precommitId);
+    precommits.set(precommitKey, precommit);
+    precommitQueryCounts.set(precommitKey, 0);
+    precommitSourceHeads.set(precommitKey, playground.head_commit_id ?? null);
     precommitMutationRequests.set(requestKey, requestJson);
     playground.active_precommit_id = precommitId;
     playground.updated_at_unix_ms = now;
@@ -1342,7 +2103,8 @@ export const handlers = [
     const body = (await request.json()) as { tenant_id: string; precommit_id: string };
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const precommit = precommits.get(resourceKey(body.tenant_id, body.precommit_id));
+    const precommitKey = resourceKey(body.tenant_id, body.precommit_id);
+    const precommit = precommits.get(precommitKey);
     if (!precommit) {
       return problem(
         request,
@@ -1367,27 +2129,52 @@ export const handlers = [
           { code: 'PRECOMMIT_VALIDATION_FAILED', message: '候选元数据未通过一致性校验。' },
         ];
       } else {
-        precommit.state = 'ready';
-        precommit.phase = 'idle';
-        precommit.progress = {
-          percent: 100,
-          files_completed: '18554',
-          files_total: '18554',
-          bytes_completed: '845571686400',
-          bytes_total: '845571686400',
-        };
-        precommit.checks = [
-          { check_id: 'metadata-shape', status: 'passed', summary: 'Metadata 和逻辑路径检查通过' },
+        const phases = [
+          { phase: 'queued' as const, percent: 0, files: '0', bytes: '0' },
+          { phase: 'scanning' as const, percent: 24, files: '3184', bytes: '128849018880' },
+          { phase: 'hashing' as const, percent: 52, files: '9648', bytes: '422785843200' },
+          { phase: 'uploading' as const, percent: 74, files: '18554', bytes: '625790156800' },
+          { phase: 'validating' as const, percent: 91, files: '18554', bytes: '769658139624' },
         ];
-        precommit.candidate_index_version = structuredClone(precommit.source_index_version);
-        precommit.diff_summary = {
-          files_added: '2',
-          files_modified: '1',
-          files_deleted: '1',
-          files_renamed: '1',
-          bytes_added: '19971604070',
-          bytes_removed: '650117120',
-        };
+        const nextCount = (precommitQueryCounts.get(precommitKey) ?? 0) + 1;
+        precommitQueryCounts.set(precommitKey, nextCount);
+        const next = phases[nextCount];
+        if (next) {
+          precommit.phase = next.phase;
+          precommit.progress = {
+            percent: next.percent,
+            files_completed: next.files,
+            files_total: '18554',
+            bytes_completed: next.bytes,
+            bytes_total: '845571686400',
+          };
+        } else {
+          precommit.state = 'ready';
+          precommit.phase = 'idle';
+          precommit.progress = {
+            percent: 100,
+            files_completed: '18554',
+            files_total: '18554',
+            bytes_completed: '845571686400',
+            bytes_total: '845571686400',
+          };
+          precommit.checks = [
+            {
+              check_id: 'metadata-shape',
+              status: 'passed',
+              summary: 'Metadata 和逻辑路径检查通过',
+            },
+          ];
+          precommit.candidate_index_version = structuredClone(precommit.source_index_version);
+          precommit.diff_summary = {
+            files_added: '2',
+            files_modified: '1',
+            files_deleted: '1',
+            files_renamed: '1',
+            bytes_added: '19971604070',
+            bytes_removed: '650117120',
+          };
+        }
       }
       precommit.updated_at_unix_ms = now;
     }
@@ -1461,6 +2248,9 @@ export const handlers = [
     delete precommit.diff_summary;
     precommit.source_index_version = structuredClone(body.expected_index_version);
     precommit.updated_at_unix_ms = now;
+    const precommitKey = resourceKey(body.tenant_id, body.precommit_id);
+    precommitQueryCounts.set(precommitKey, 0);
+    precommitSourceHeads.set(precommitKey, playground.head_commit_id ?? null);
     playground.active_precommit_id = precommit.precommit_id;
     playground.updated_at_unix_ms = now;
     precommitMutationRequests.set(requestKey, requestJson);
@@ -1592,6 +2382,14 @@ export const handlers = [
         request,
         'INDEX_VERSION_CONFLICT',
         'The expected candidate IndexVersion no longer matches the Pre-commit',
+      );
+    }
+    const frozenHead = precommitSourceHeads.get(resourceKey(body.tenant_id, body.precommit_id));
+    if (frozenHead === undefined || frozenHead !== (playground.head_commit_id ?? null)) {
+      return mutationConflict(
+        request,
+        'HEAD_COMMIT_CONFLICT',
+        'The Playground Head changed after this Pre-commit was started',
       );
     }
     if (!body.message.trim()) {
@@ -1895,8 +2693,8 @@ export const handlers = [
       (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
     );
     if (!snapshot) return notFound(request, 'Snapshot');
-    const readyAt = snapshotReadyAt.get(resourceKey(snapshot.tenant_id, snapshot.snapshot_id));
-    if (snapshot.state === 'creating' && readyAt && Date.now() >= readyAt) {
+    const snapshotKey = resourceKey(snapshot.tenant_id, snapshot.snapshot_id);
+    if (snapshot.state === 'creating' && completesOnThisQuery(snapshotQueryCounts, snapshotKey)) {
       snapshot.state = 'ready';
       snapshot.phase = 'idle';
       snapshot.integrity = {
@@ -1906,7 +2704,6 @@ export const handlers = [
         verified_at_unix_ms: Date.now().toString(),
       };
       snapshot.updated_at_unix_ms = Date.now().toString();
-      snapshotReadyAt.delete(resourceKey(snapshot.tenant_id, snapshot.snapshot_id));
     }
     const response: QuerySnapshotResponse = { snapshot };
     return HttpResponse.json(response, { headers: headers(request) });
@@ -1990,7 +2787,7 @@ export const handlers = [
       updated_at_unix_ms: Date.now().toString(),
     };
     snapshots.unshift(snapshot);
-    snapshotReadyAt.set(resourceKey(snapshot.tenant_id, snapshot.snapshot_id), Date.now() + 800);
+    snapshotQueryCounts.set(resourceKey(snapshot.tenant_id, snapshot.snapshot_id), 0);
     const response: CreateSnapshotResponse = {
       snapshot,
       replayed: false,
@@ -2036,7 +2833,7 @@ export const handlers = [
     snapshot.integrity = { state: 'pending', files_verified: '0', bytes_verified: '0' };
     delete snapshot.issue;
     snapshot.updated_at_unix_ms = Date.now().toString();
-    snapshotReadyAt.set(resourceKey(snapshot.tenant_id, snapshot.snapshot_id), Date.now() + 800);
+    snapshotQueryCounts.set(resourceKey(snapshot.tenant_id, snapshot.snapshot_id), 0);
     const response: RetrySnapshotDeliveryResponse = { snapshot, replayed: false };
     snapshotRetryRequests.set(requestKey, { requestJson, response: structuredClone(response) });
     return HttpResponse.json(response, { headers: headers(request) });
@@ -2259,14 +3056,28 @@ export function resetMockState(): void {
   jobs.clear();
   tenantCreatePayloads.clear();
   storageVolumeCreatePayloads.clear();
+  storageEnrollmentTokenRequests.clear();
+  storageEnrollmentApprovalRequests.clear();
+  storageEnrollmentRejectionRequests.clear();
+  storageEnrollmentFrozenDescriptors.clear();
+  storageEnrollmentReviewAudit.clear();
+  pvcBindings.clear();
+  activePvcOwners.clear();
   artifactCreatePayloads.clear();
   playgroundCreatePayloads.clear();
-  playgroundReadyAt.clear();
+  playgroundQueryCounts.clear();
   commitRequests.clear();
   precommits.clear();
+  precommitQueryCounts.clear();
+  precommitSourceHeads.clear();
   precommitMutationRequests.clear();
   snapshotCreateRequests.clear();
   snapshotRetryRequests.clear();
-  snapshotReadyAt.clear();
+  snapshotQueryCounts.clear();
   resetMockData();
+  seedStorageEnrollmentState();
+  seedPreCommitState();
 }
+
+seedStorageEnrollmentState();
+seedPreCommitState();

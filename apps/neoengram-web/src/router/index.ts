@@ -63,14 +63,14 @@ const routes: RouteRecordRaw[] = [
   },
   {
     path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/playgrounds/:playgroundId/commit',
-    name: 'playground-commit-prototype',
-    component: () => import('@/pages/ReleaseWorkbenchPrototypePage.vue'),
+    name: 'playground-commit',
+    component: () => import('@/pages/PlaygroundCommitPage.vue'),
     meta: tenantMeta,
   },
   {
     path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/snapshots/new',
-    name: 'snapshot-delivery-prototype',
-    component: () => import('@/pages/SnapshotDeliveryPrototypePage.vue'),
+    name: 'snapshot-create',
+    component: () => import('@/pages/SnapshotCreatePage.vue'),
     meta: tenantMeta,
   },
   {

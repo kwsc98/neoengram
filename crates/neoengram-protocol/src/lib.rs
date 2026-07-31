@@ -6,6 +6,7 @@
 
 mod control;
 mod digest;
+mod enrollment;
 mod error;
 mod ids;
 mod metadata;
@@ -16,12 +17,13 @@ mod validation;
 
 pub use control::*;
 pub use digest::{jcs_blake3, jcs_bytes};
+pub use enrollment::*;
 pub use error::{ProtocolError, ProtocolResult};
 pub use ids::*;
 pub use metadata::*;
 pub use s3::*;
 pub use scalars::*;
-pub use schema::{control_schema, metadata_schema, s3_schema};
+pub use schema::{control_schema, enrollment_schema, metadata_schema, s3_schema};
 
 /// The only protocol version emitted by this crate.
 pub const PROTOCOL_VERSION_V1: ProtocolVersion = ProtocolVersion::V1;

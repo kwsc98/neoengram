@@ -94,6 +94,11 @@ watch(
   },
 );
 
+watch([tenantId, projectId], () => {
+  cursor.value = undefined;
+  cursorHistory.value = [];
+});
+
 const artifactsQuery = useQuery({
   queryKey: computed(() => [
     'artifacts',

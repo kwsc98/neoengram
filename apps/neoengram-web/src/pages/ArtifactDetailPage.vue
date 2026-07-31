@@ -7,7 +7,6 @@ import { useRoute, useRouter } from 'vue-router';
 
 import {
   createPlayground,
-  createSnapshot,
   queryArtifact,
   queryArtifactCommitDiff,
   queryArtifactCommitGraph,
@@ -19,17 +18,14 @@ import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
 import {
-  activePreCommitLabel,
-  getActivePreCommit,
   playgroundAvailabilityLabel,
   playgroundAvailabilityTagType,
-  preCommitScopeKey,
-} from '@/features/precommit/prototype';
+} from '@/features/precommit/status';
 import {
   snapshotPhaseLabel,
   snapshotStateLabel,
   snapshotStateTagType,
-} from '@/features/snapshots/prototype';
+} from '@/features/snapshots/status';
 import { useTenantsStore } from '@/stores/tenants';
 import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime, shortId } from '@/utils/format';
@@ -50,7 +46,6 @@ const loadingMoreCommits = ref(false);
 const selectedCommitId = ref(String(route.query.commit_id ?? ''));
 const commitDetailOpen = ref(Boolean(selectedCommitId.value));
 const createPlaygroundOpen = ref(false);
-const createSnapshotOpen = ref(false);
 const mutationError = ref('');
 const playgroundForm = reactive({
   playgroundId: '',
@@ -58,7 +53,6 @@ const playgroundForm = reactive({
   baseCommitId: '',
   storageVolumeId: '',
 });
-const snapshotForm = reactive({ commitId: '', storageVolumeId: '' });
 const canCreatePlayground = computed(
   () => tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false,
 );
@@ -66,7 +60,6 @@ const canCreateSnapshot = computed(
   () => tenants.byId(tenantId.value)?.permissions.includes('snapshot.create') ?? false,
 );
 const createPlaygroundMutation = useMutation({ mutationFn: createPlayground });
-const createSnapshotMutation = useMutation({ mutationFn: createSnapshot });
 
 const artifactQuery = useQuery({
   queryKey: computed(() => ['artifact', tenantId.value, projectId.value, artifactId.value]),
@@ -169,6 +162,17 @@ watch(
   },
 );
 
+watch([tenantId, projectId, artifactId], () => {
+  commitNodes.value = [];
+  nextCommitCursor.value = undefined;
+  loadingMoreCommits.value = false;
+  selectedCommitId.value = String(route.query.commit_id ?? '');
+  commitDetailOpen.value = Boolean(selectedCommitId.value);
+  createPlaygroundOpen.value = false;
+  mutationError.value = '';
+  createPlaygroundMutation.reset();
+});
+
 async function changeTab(tab: string | number): Promise<void> {
   const value = String(tab);
   await router.replace({ query: value === 'overview' ? {} : { tab: value } });
@@ -200,7 +204,7 @@ function diffTagType(changeType: string): 'success' | 'warning' | 'danger' | 'in
 }
 
 async function loadMoreCommits(): Promise<void> {
-  if (!nextCommitCursor.value) return;
+  if (!nextCommitCursor.value || loadingMoreCommits.value) return;
   loadingMoreCommits.value = true;
   try {
     const result = await queryArtifactCommitGraph(
@@ -238,10 +242,6 @@ async function openSnapshot(snapshotId: string): Promise<void> {
       snapshotId,
     },
   });
-}
-
-function relationPreCommitKey(playgroundId: string): string {
-  return preCommitScopeKey(tenantId.value, projectId.value, artifactId.value, playgroundId);
 }
 
 async function loadCommitChoices(): Promise<void> {
@@ -291,41 +291,17 @@ async function submitPlayground(): Promise<void> {
 }
 
 async function showCreateSnapshot(): Promise<void> {
-  mutationError.value = '';
-  snapshotForm.storageVolumeId = '';
-  await loadCommitChoices();
-  snapshotForm.commitId = artifact.value?.head_commit_id ?? commitNodes.value[0]?.commit_id ?? '';
-  createSnapshotOpen.value = true;
-}
-
-async function submitSnapshot(): Promise<void> {
-  mutationError.value = '';
-  if (!snapshotForm.commitId || !snapshotForm.storageVolumeId) {
-    mutationError.value = '请选择 Commit 和 StorageVolume';
-    return;
-  }
-  try {
-    const result = await createSnapshotMutation.mutateAsync({
-      tenant_id: tenantId.value,
-      project_id: projectId.value,
-      artifact_id: artifactId.value,
-      commit_id: snapshotForm.commitId,
-      storage_volume_id: snapshotForm.storageVolumeId,
-      snapshot_request_id: `snapshot-request-${globalThis.crypto.randomUUID()}`,
-    });
-    createSnapshotOpen.value = false;
-    await queryClient.invalidateQueries({ queryKey: ['snapshots', tenantId.value] });
-    ElMessage.success(
-      result.data.replayed
-        ? '已返回原 Snapshot'
-        : result.data.placement_reused
-          ? '该 Commit 在此存储已有 Snapshot'
-          : 'Snapshot 已开始创建',
-    );
-    await openSnapshot(result.data.snapshot.snapshot_id);
-  } catch (error) {
-    mutationError.value = error instanceof Error ? error.message : '创建 Snapshot 失败';
-  }
+  await router.push({
+    name: 'snapshot-create',
+    params: {
+      tenantId: tenantId.value,
+      projectId: projectId.value,
+      artifactId: artifactId.value,
+    },
+    ...(artifact.value?.head_commit_id
+      ? { query: { commit_id: artifact.value.head_commit_id } }
+      : {}),
+  });
 }
 </script>
 
@@ -546,15 +522,10 @@ async function submitSnapshot(): Promise<void> {
                 <el-tag :type="playgroundAvailabilityTagType(playground.state)" effect="plain">{{
                   playgroundAvailabilityLabel(playground.state)
                 }}</el-tag
-                ><el-tag
-                  v-if="getActivePreCommit(relationPreCommitKey(playground.playground_id))"
-                  type="warning"
-                  effect="plain"
-                  >Pre-commit ·
-                  {{
-                    activePreCommitLabel(relationPreCommitKey(playground.playground_id))
-                  }} </el-tag
-                ><ArrowRight />
+                ><el-tag v-if="playground.active_precommit_id" type="warning" effect="plain">
+                  活动 Pre-commit
+                </el-tag>
+                <ArrowRight />
               </span>
             </button>
           </div>
@@ -644,43 +615,6 @@ async function submitSnapshot(): Promise<void> {
           @click="submitPlayground"
         >
           创建 Playground
-        </el-button>
-      </template>
-    </el-dialog>
-
-    <el-dialog
-      v-model="createSnapshotOpen"
-      title="创建 Snapshot"
-      width="min(560px, calc(100vw - 32px))"
-    >
-      <ApiProblemAlert
-        v-if="createSnapshotMutation.error.value"
-        :error="createSnapshotMutation.error.value"
-      />
-      <el-alert v-if="mutationError" :title="mutationError" type="error" :closable="false" />
-      <el-form label-position="top" class="dialog-form">
-        <el-form-item label="StorageVolume" required>
-          <StorageVolumeFilter v-model="snapshotForm.storageVolumeId" :tenant-id="tenantId" />
-        </el-form-item>
-        <el-form-item label="固定到 Commit">
-          <el-select v-model="snapshotForm.commitId" placeholder="选择 Commit">
-            <el-option
-              v-for="node in commitNodes"
-              :key="node.commit_id"
-              :label="`${node.message} · ${shortId(node.commit_id, 14)}`"
-              :value="node.commit_id"
-            />
-          </el-select>
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="createSnapshotOpen = false">取消</el-button>
-        <el-button
-          type="primary"
-          :loading="createSnapshotMutation.isPending.value"
-          @click="submitSnapshot"
-        >
-          创建 Snapshot
         </el-button>
       </template>
     </el-dialog>

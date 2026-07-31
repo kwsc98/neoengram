@@ -25,19 +25,60 @@ use sqlx::{
 };
 
 use crate::{
+    registry_sqlite::{open_sqlite_agent_registry, SqliteAgentRegistry, SqliteAgentRegistryConfig},
     validation::{durable_from_receipt, invalid, same_index_version},
-    AssignmentOutbox, AssignmentPublishOutcome, AssignmentReserveOutcome, AuditEvent, AuditKind,
-    AuditSink, AuthorityCapabilities, AuthorityStore, CentralError, CentralErrorCode,
-    CentralResult, DurableObject, IndexKey, IndexPublishOutcome, IndexPublishRejection,
-    IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobKey, JobRecord, JobRepository,
-    MetadataBatchStager, ObjectCatalog, PublishedIndex, StagedMetadataBatch,
+    AgentEnrollmentAuditEvent, AgentEnrollmentAuditKind, AssignmentOutbox,
+    AssignmentPublishOutcome, AssignmentReserveOutcome, AuditEvent, AuditKind, AuditSink,
+    AuthorityCapabilities, AuthorityStore, CentralError, CentralErrorCode, CentralResult,
+    DurableObject, IndexKey, IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest,
+    IndexPublisher, JobInsertOutcome, JobKey, JobRecord, JobRepository, MetadataBatchStager,
+    ObjectCatalog, PublishedIndex, StagedMetadataBatch,
 };
 
 const DATABASE_FILE_NAME: &str = "authority.sqlite3";
 const LOCK_FILE_NAME: &str = "authority.lock";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f41;
-const SQLITE_SCHEMA_VERSION: i64 = 1;
+const SQLITE_SCHEMA_VERSION: i64 = 2;
 const STORED_FORMAT_VERSION: u32 = 1;
+
+const V1_TABLES: &[&str] = &[
+    "control_jobs",
+    "assignment_outbox",
+    "metadata_batch_descriptors",
+    "metadata_batch_pages",
+    "durable_objects",
+    "playground_indexes",
+    "playground_index_records",
+    "immutable_manifests",
+    "index_publications",
+    "audit_events",
+];
+
+const V2_TABLES: &[&str] = &[
+    "control_jobs",
+    "assignment_outbox",
+    "metadata_batch_descriptors",
+    "metadata_batch_pages",
+    "durable_objects",
+    "playground_indexes",
+    "playground_index_records",
+    "immutable_manifests",
+    "index_publications",
+    "audit_events",
+    "agent_enrollment_audit_events",
+];
+
+const ENROLLMENT_AUDIT_SCHEMA_SQL: &str = r#"
+CREATE TABLE agent_enrollment_audit_events (
+    tenant_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    enrollment_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    occurred_at TEXT NOT NULL CHECK (occurred_at <> '' AND occurred_at NOT GLOB '*[^0-9]*'),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, event_id)
+) STRICT;
+"#;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE control_jobs (
@@ -141,6 +182,16 @@ CREATE TABLE audit_events (
     payload BLOB NOT NULL,
     PRIMARY KEY (tenant_id, event_id)
 ) STRICT;
+
+CREATE TABLE agent_enrollment_audit_events (
+    tenant_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    enrollment_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    occurred_at TEXT NOT NULL CHECK (occurred_at <> '' AND occurred_at NOT GLOB '*[^0-9]*'),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, event_id)
+) STRICT;
 "#;
 
 #[derive(Debug, Clone)]
@@ -161,6 +212,7 @@ impl SqliteAuthorityConfig {
 
 pub struct SqliteAuthority {
     inner: Arc<SqliteAuthorityStore>,
+    agent_registry: SqliteAgentRegistry,
 }
 
 impl SqliteAuthority {
@@ -175,10 +227,12 @@ impl SqliteAuthority {
             self.inner.clone(),
             AuthorityCapabilities::SQLITE,
         )
+        .with_agent_registry(self.agent_registry.repository())
     }
 
     pub async fn integrity_check(&self) -> CentralResult<()> {
-        validate_integrity(&self.inner.pool).await
+        validate_integrity(&self.inner.pool).await?;
+        self.agent_registry.integrity_check().await
     }
 
     pub async fn published_index(&self, key: &IndexKey) -> CentralResult<PublishedIndex> {
@@ -215,6 +269,42 @@ impl SqliteAuthority {
                 .map_err(storage_error)?;
         payloads.iter().map(|payload| decode(payload)).collect()
     }
+
+    pub async fn enrollment_audit_events(&self) -> CentralResult<Vec<AgentEnrollmentAuditEvent>> {
+        let payloads: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT payload FROM agent_enrollment_audit_events ORDER BY tenant_id, event_id",
+        )
+        .fetch_all(&self.inner.pool)
+        .await
+        .map_err(storage_error)?;
+        let mut events = payloads
+            .iter()
+            .map(|payload| decode::<AgentEnrollmentAuditEvent>(payload))
+            .collect::<CentralResult<Vec<_>>>()?;
+        for registry_event in self
+            .agent_registry
+            .repository()
+            .enrollment_audit_events()
+            .await?
+        {
+            if let Some(existing) = events.iter().find(|event| {
+                event.tenant_id == registry_event.tenant_id
+                    && event.event_id == registry_event.event_id
+            }) {
+                if existing != &registry_event {
+                    return Err(storage_corruption(
+                        "authority and Registry enrollment audit events disagree",
+                    ));
+                }
+            } else {
+                events.push(registry_event);
+            }
+        }
+        events.sort_by(|left, right| {
+            (&left.tenant_id, &left.event_id).cmp(&(&right.tenant_id, &right.event_id))
+        });
+        Ok(events)
+    }
 }
 
 struct SqliteAuthorityStore {
@@ -225,6 +315,11 @@ struct SqliteAuthorityStore {
 pub async fn open_sqlite_authority(
     config: SqliteAuthorityConfig,
 ) -> CentralResult<SqliteAuthority> {
+    let agent_registry = open_sqlite_agent_registry(SqliteAgentRegistryConfig {
+        path: config.path.clone(),
+        busy_timeout: config.busy_timeout,
+    })
+    .await?;
     let root = prepare_root(&config.path)?;
     let lock = open_lock(&root.join(LOCK_FILE_NAME))?;
     let database = root.join(DATABASE_FILE_NAME);
@@ -251,6 +346,7 @@ pub async fn open_sqlite_authority(
 
     Ok(SqliteAuthority {
         inner: Arc::new(SqliteAuthorityStore { pool, _lock: lock }),
+        agent_registry,
     })
 }
 
@@ -1031,6 +1127,54 @@ impl AuditSink for SqliteAuthorityStore {
             ))
         }
     }
+
+    async fn record_enrollment_decision(
+        &self,
+        event: AgentEnrollmentAuditEvent,
+    ) -> CentralResult<bool> {
+        let payload = encode(&event)?;
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO agent_enrollment_audit_events \
+             (tenant_id, event_id, enrollment_id, kind, occurred_at, payload) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.tenant_id.as_str())
+        .bind(&event.event_id)
+        .bind(event.enrollment_id.as_str())
+        .bind(enrollment_audit_kind_name(event.kind))
+        .bind(event.occurred_at_unix_ms.get().to_string())
+        .bind(payload)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if result.rows_affected() == 1 {
+            return Ok(false);
+        }
+        let existing: Vec<u8> = sqlx::query_scalar(
+            "SELECT payload FROM agent_enrollment_audit_events \
+             WHERE tenant_id = ? AND event_id = ?",
+        )
+        .bind(event.tenant_id.as_str())
+        .bind(&event.event_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let existing: AgentEnrollmentAuditEvent = decode(&existing)?;
+        if existing.kind == event.kind
+            && existing.enrollment_id == event.enrollment_id
+            && existing.storage_volume_id == event.storage_volume_id
+            && existing.decision_request_id == event.decision_request_id
+            && existing.resource_version == event.resource_version
+            && existing.actor == event.actor
+        {
+            Ok(true)
+        } else {
+            Err(invalid(
+                CentralErrorCode::Internal,
+                format!("enrollment audit event ID {} was reused", event.event_id),
+            ))
+        }
+    }
 }
 
 impl SqliteAuthorityStore {
@@ -1292,7 +1436,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 1")
+        sqlx::query("PRAGMA user_version = 2")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -1304,23 +1448,34 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             "SQLite authority application_id {application_id} is unsupported"
         )));
     }
-    if user_version != SQLITE_SCHEMA_VERSION {
-        return Err(storage_corruption(format!(
-            "SQLite authority user_version {user_version} is unsupported"
-        )));
+    match user_version {
+        1 => migrate_v1_to_v2(pool).await?,
+        SQLITE_SCHEMA_VERSION => {}
+        _ => {
+            return Err(storage_corruption(format!(
+                "SQLite authority user_version {user_version} is unsupported"
+            )));
+        }
     }
-    let expected = [
-        "control_jobs",
-        "assignment_outbox",
-        "metadata_batch_descriptors",
-        "metadata_batch_pages",
-        "durable_objects",
-        "playground_indexes",
-        "playground_index_records",
-        "immutable_manifests",
-        "index_publications",
-        "audit_events",
-    ];
+    validate_table_set(pool, V2_TABLES).await?;
+    validate_current_schema(pool).await
+}
+
+async fn migrate_v1_to_v2(pool: &SqlitePool) -> CentralResult<()> {
+    validate_table_set(pool, V1_TABLES).await?;
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    sqlx::raw_sql(ENROLLMENT_AUDIT_SCHEMA_SQL)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("PRAGMA user_version = 2")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+async fn validate_table_set(pool: &SqlitePool, expected: &[&str]) -> CentralResult<()> {
     let actual: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_schema \
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -1335,6 +1490,10 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             "SQLite authority table set differs from the current schema",
         ));
     }
+    Ok(())
+}
+
+async fn validate_current_schema(pool: &SqlitePool) -> CentralResult<()> {
     for expected_statement in SCHEMA_SQL
         .split(';')
         .map(str::trim)
@@ -1466,6 +1625,14 @@ const fn audit_kind_name(kind: AuditKind) -> &'static str {
         AuditKind::MetadataStaged => "metadata_staged",
         AuditKind::AddExpired => "add_expired",
         AuditKind::AddFinalized => "add_finalized",
+    }
+}
+
+const fn enrollment_audit_kind_name(kind: AgentEnrollmentAuditKind) -> &'static str {
+    match kind {
+        AgentEnrollmentAuditKind::Approved => "approved",
+        AgentEnrollmentAuditKind::Rejected => "rejected",
+        AgentEnrollmentAuditKind::ReplacementApproved => "replacement_approved",
     }
 }
 

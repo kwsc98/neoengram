@@ -1,0 +1,137 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neoengram-agent-volume-safe-slug
+  namespace: neoengram-agent-example
+  annotations:
+    neoengram.io/storage-volume-id: volume-example
+  labels:
+    app.kubernetes.io/name: neoengram-agent
+    app.kubernetes.io/component: storage-agent
+    app.kubernetes.io/instance: volume-safe-slug
+    neoengram.io/volume-slug: volume-safe-slug
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: neoengram-agent
+      app.kubernetes.io/instance: volume-safe-slug
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: neoengram-agent
+        app.kubernetes.io/component: storage-agent
+        app.kubernetes.io/instance: volume-safe-slug
+        neoengram.io/volume-slug: volume-safe-slug
+      annotations:
+        neoengram.io/storage-volume-id: volume-example
+        neoengram.io/config-revision: "replace-when-config-or-secret-changes"
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/neoengram/neoengram-agent@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          args:
+            - run
+            - --config
+            - /etc/neoengram/agent.yaml
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          startupProbe:
+            exec:
+              command:
+                - /usr/local/bin/neoengram-agent
+                - health
+                - --state-dir
+                - /var/lib/neoengram-agent
+                - --mode
+                - startup
+            failureThreshold: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /usr/local/bin/neoengram-agent
+                - health
+                - --state-dir
+                - /var/lib/neoengram-agent
+                - --mode
+                - live
+            failureThreshold: 3
+            periodSeconds: 20
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/neoengram-agent
+                - health
+                - --state-dir
+                - /var/lib/neoengram-agent
+                - --mode
+                - ready
+            failureThreshold: 2
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: business-volume
+              mountPath: /volume
+              readOnly: false
+            - name: agent-state
+              mountPath: /var/lib/neoengram-agent
+              readOnly: false
+            - name: config
+              mountPath: /etc/neoengram
+              readOnly: true
+            - name: bootstrap
+              mountPath: /var/run/secrets/neoengram
+              readOnly: true
+            - name: runtime-tmp
+              mountPath: /tmp
+      volumes:
+        - name: business-volume
+          persistentVolumeClaim:
+            claimName: replace-with-existing-business-pvc
+        - name: agent-state
+          persistentVolumeClaim:
+            claimName: neoengram-agent-state-volume-safe-slug
+        - name: config
+          configMap:
+            name: neoengram-agent-config-volume-safe-slug
+            defaultMode: 0444
+        - name: bootstrap
+          secret:
+            secretName: neoengram-agent-bootstrap-volume-safe-slug
+            # The consumed token Secret can be deleted after enrollment. An already
+            # enrolled Agent then restores its credentials from the state PVC.
+            optional: true
+            # Projected Secret files are root-owned. This single-container Pod uses
+            # read-only 0444 instead of a Pod fsGroup that could rewrite the business PVC.
+            defaultMode: 0444
+        - name: runtime-tmp
+          emptyDir:
+            sizeLimit: 1Gi

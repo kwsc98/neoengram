@@ -1,5 +1,6 @@
 use neoengram_protocol::{
-    control_schema, metadata_schema, s3_schema, DecimalU64, Generation, ProtocolVersion,
+    control_schema, enrollment_schema, metadata_schema, s3_schema, DecimalU64, Generation,
+    ProtocolVersion,
 };
 use serde_json::{json, Value};
 
@@ -8,6 +9,10 @@ fn committed_v1_schemas_match_the_generator() {
     assert_schema(
         include_str!("../schemas/v1/control-envelope.schema.json"),
         control_schema(),
+    );
+    assert_schema(
+        include_str!("../schemas/v1/agent-enrollment.schema.json"),
+        enrollment_schema(),
     );
     assert_schema(
         include_str!("../schemas/v1/metadata-batch.schema.json"),
@@ -37,6 +42,41 @@ fn schemas_publish_the_runtime_wire_limits() {
     assert_eq!(
         control.pointer("/$defs/JobPrepared/properties/candidate_digest/pattern"),
         Some(&json!("^[0-9a-f]{64}$"))
+    );
+
+    let enrollment = serde_json::to_value(enrollment_schema()).unwrap();
+    assert_eq!(
+        enrollment
+            .pointer("/$defs/AgentBootstrapRequest/properties/public_key_fingerprint/pattern"),
+        Some(&json!("^[0-9a-f]{64}$"))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/AgentMountIdentityDigest/pattern"),
+        Some(&json!("^[0-9a-f]{64}$"))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/PvcIdentityDigest/pattern"),
+        Some(&json!("^[0-9a-f]{64}$"))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/AgentBootstrapProbe/properties/mount_identity_digest/$ref"),
+        Some(&json!("#/$defs/AgentMountIdentityDigest"))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/AgentMountStatusReport/properties/mount_identity_digest/$ref"),
+        Some(&json!("#/$defs/AgentMountIdentityDigest"))
+    );
+    assert_eq!(
+        enrollment.pointer(
+            "/$defs/AgentEnrollmentTokenCreateRequest/properties/pvc_identity_digest/$ref"
+        ),
+        Some(&json!("#/$defs/PvcIdentityDigest"))
+    );
+    assert_eq!(
+        enrollment.pointer(
+            "/$defs/AgentEnrollmentTokenCreateRequest/properties/bootstrap_token/minLength"
+        ),
+        Some(&json!(32))
     );
 
     let metadata = serde_json::to_value(metadata_schema()).unwrap();

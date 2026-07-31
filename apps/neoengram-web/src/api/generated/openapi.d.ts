@@ -149,6 +149,134 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/storage/enrollment/token/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建 Storage enrollment bootstrap token
+         * @description 要求 `storage.enrollment.create` 权限。为尚未接入或需要替换 Agent 的 PVC 创建 15 分钟有效、
+         *     只能被内部 Agent bootstrap 成功消费一次的 opaque token；无需预先登记 StorageVolume。token
+         *     冻结并绑定 tenant、StorageVolume ID、display name、EdgeCluster、Region、access mode 和 PVC
+         *     descriptor；Agent 提交的 descriptor 或 probe 不匹配时审批不得通过。服务端只存储受保护的
+         *     token 材料。
+         *
+         *     `token_request_id` 是稳定 mutation identity；相同 ID 和完全相同 payload 重放原响应并将
+         *     `replayed` 设为 true，不同 payload 返回 409。原始 `bootstrap_token` 只允许出现在本方法的
+         *     成功响应中，不能进入 enrollment 列表、查询、审批、审计或日志。
+         */
+        post: operations["createStorageEnrollmentToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/storage/enrollment/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Storage enrollment 列表
+         * @description 要求 `storage.enrollment.read` 权限。分页返回当前 Tenant 内 Agent 已主动提交的脱敏 enrollment
+         *     记录；不可见 Tenant 与不存在 Tenant 使用相同的 404 语义。响应不包含 bootstrap token、CSR、
+         *     证书、PVC UID、mount path、AgentId/MountId、session、lease 或 fencing 信息。
+         */
+        post: operations["queryStorageEnrollmentList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/storage/enrollment/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询单个 Storage enrollment
+         * @description 要求 `storage.enrollment.read` 权限。按 Tenant 和 enrollment ID 返回脱敏审批视图；不存在与
+         *     跨 Tenant 不可见统一返回 404。该方法不返回任何 bootstrap 或 Agent credential 材料。
+         */
+        post: operations["queryStorageEnrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/storage/enrollment/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 批准 Storage enrollment
+         * @description 要求 `storage.enrollment.review` 权限。仅允许批准未过期的 `pending_approval` enrollment；服务端
+         *     必须在一个事务中执行 resource version CAS，校验冻结的 Tenant/Volume/EdgeCluster/Region/
+         *     access mode/PVC descriptor、probe、协议兼容性和一 PVC 一活动 Agent 唯一约束，并创建缺失的
+         *     StorageVolume，或为 replacement 精确绑定同一 Tenant 下 descriptor 完全一致的既有 Volume。
+         *     `registration_kind=replacement` 时必须显式传 `confirm_replacement=true`，否则返回 409。
+         *
+         *     审批响应中的 StorageVolume 固定为 `state=unavailable`；审批本身不会把 Volume 标为 ready。
+         *     Enrollment 先进入 `approved`，只有后续认证 Agent session 和健康 probe 才能进入 `enrolled` 并
+         *     使 Volume 成为 ready。公开响应不包含 bootstrap token、证书、AgentId 或 session identity。
+         *
+         *     `approval_request_id` 是稳定 mutation identity。相同 ID 和 payload 幂等重放；不同 payload、
+         *     stale `expected_resource_version`、非 pending_approval 状态或 PVC 已绑定另一活动 Agent 均返回 409。
+         */
+        post: operations["approveStorageEnrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/storage/enrollment/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 拒绝 Storage enrollment
+         * @description 要求 `storage.enrollment.review` 权限。仅允许拒绝未过期的 `pending_approval` enrollment；服务端使用
+         *     `expected_resource_version` 执行 CAS 并记录认证 actor 的审计事件。拒绝是终态，不签发 Agent
+         *     证书；Agent 需要新的 bootstrap token 才能重新申请。
+         *
+         *     可选 `reason` 仅写入认证 actor 的受控审计记录，不进入 StorageEnrollmentView、公开响应或日志。
+         *     `rejection_request_id` 是稳定 mutation identity。相同 ID 和 payload 幂等重放；不同 payload、
+         *     stale resource version 或非 pending_approval 状态返回 409。
+         */
+        post: operations["rejectStorageEnrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/project/list/query": {
         parameters: {
             query?: never;
@@ -325,7 +453,8 @@ export interface paths {
         put?: never;
         /**
          * 创建 Playground
-         * @description 在 Artifact 下创建受管可写 Playground，并可固定初始 base Commit。
+         * @description 在 Artifact 下创建受管可写 Playground，并可固定初始 base Commit。所选 StorageVolume 必须
+         *     属于同一 Tenant 且 `state=ready`；`degraded` 或 `unavailable` 均拒绝新放置并返回 409。
          */
         post: operations["createPlayground"];
         delete?: never;
@@ -345,9 +474,12 @@ export interface paths {
         put?: never;
         /**
          * 发起 Playground Pre-commit
-         * @description 为 Ready Playground 的当前 IndexVersion 创建冻结候选。服务端生成 `precommit_id`；相同
+         * @description 为 Ready Playground 的当前 IndexVersion 创建新的冻结候选会话。服务端生成新的
+         *     `precommit_id`，并在会话内部冻结当前 Head 供 Commit CAS 使用；Head 不作为公开请求或响应
+         *     字段。已有 running/ready active Pre-commit 时必须先 cancel，不得用 start 覆盖。相同
          *     `precommit_request_id` 和 payload 返回原结果，不同 payload 返回 409。200 返回时 Pre-commit
-         *     已持久化且可查询，扫描、哈希、上传和校验通过其状态、阶段与进度异步推进。
+         *     已持久化且可查询，扫描、哈希、上传和校验通过其状态、阶段与进度异步推进。页面查询或刷新
+         *     不得隐式调用本方法。
          */
         post: operations["startPlaygroundPreCommit"];
         delete?: never;
@@ -367,7 +499,9 @@ export interface paths {
         put?: never;
         /**
          * 查询 Playground Pre-commit
-         * @description 使用 Tenant 和服务端生成的 Pre-commit ID 查询冻结候选、检查和 Diff 摘要。
+         * @description 使用 Tenant 和服务端生成的 Pre-commit ID 查询冻结候选、检查和 Diff 摘要。完成且可提交的
+         *     结果是 `state=ready, phase=idle`；有阻断项的结果是 `state=abnormal, phase=idle` 且
+         *     `blockers` 非空。`ready` 是 state，不是 phase。
          */
         post: operations["queryPlaygroundPreCommit"];
         delete?: never;
@@ -386,9 +520,11 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 重新发起 Playground Pre-commit
-         * @description 在同一 Pre-commit ID 上创建新的 attempt，并冻结请求给定的当前 IndexVersion。只允许从可重试
-         *     状态发起；相同 `restart_request_id` 和 payload 幂等返回，状态或版本不匹配返回 409。
+         * 重试失败或已取消的 Playground Pre-commit
+         * @description 仅允许对 `abnormal` 或 `cancelled` Pre-commit 在同一 ID 上创建新 attempt，使 `attempt + 1`，
+         *     并冻结请求给定的当前 IndexVersion 与服务端当前 Head。Head 仍仅保存在内部。running/ready
+         *     会话的“重新检测”必须先 cancel，再调用 start 创建新的 `precommit_id`，不能调用 restart。
+         *     相同 `restart_request_id` 和 payload 幂等返回，状态或版本不匹配返回 409。
          */
         post: operations["restartPlaygroundPreCommit"];
         delete?: never;
@@ -409,7 +545,8 @@ export interface paths {
         /**
          * 取消 Playground Pre-commit
          * @description 取消尚未提交的 Pre-commit 并清除 Playground 的 active Pre-commit。相同
-         *     `cancel_request_id` 和 payload 幂等返回；已提交或状态不允许取消时返回 409。
+         *     `cancel_request_id` 和 payload 幂等返回；已提交或状态不允许取消时返回 409。取消后的会话
+         *     为 `state=cancelled, phase=idle`，旧候选不能被 Commit 消费。
          */
         post: operations["cancelPlaygroundPreCommit"];
         delete?: never;
@@ -512,9 +649,11 @@ export interface paths {
         put?: never;
         /**
          * 提交 Playground
-         * @description 消费属于该 Playground、状态为 Ready 且候选 IndexVersion 匹配的 Pre-commit，创建不可变
-         *     Commit，并把 Pre-commit 标记为 Committed。`commit_request_id` 是稳定 mutation identity；
-         *     200 返回时 Commit、Playground 和已消费 Pre-commit 均已持久化且可查询。
+         * @description 消费属于该 Playground、`state=ready, phase=idle`、无 blockers 且候选 IndexVersion 匹配的
+         *     Pre-commit，创建不可变 Commit，并把 Pre-commit 标记为 Committed。服务端必须同时校验
+         *     Playground 当前 Head 与该 Pre-commit attempt 内部冻结的 Head，并对内部版本指针执行 CAS；
+         *     Head 变化返回 409，公开请求不增加 `source_head_commit_id`。`commit_request_id` 是稳定
+         *     mutation identity；200 返回时 Commit、Playground 和已消费 Pre-commit 均已持久化且可查询。
          */
         post: operations["commitPlayground"];
         delete?: never;
@@ -575,10 +714,12 @@ export interface paths {
         put?: never;
         /**
          * 创建 Snapshot
-         * @description 为指定 Artifact Commit 和 StorageVolume 创建单区域只读 Snapshot。服务端生成 `snapshot_id`；
-         *     相同 `snapshot_request_id` 和 payload 返回 `replayed: true`，不同 request identity 命中同一
-         *     Commit/Volume 的未删除 Snapshot 时返回 `placement_reused: true`。200 返回时 Snapshot 记录
-         *     已持久化且可查询，后续交付由其状态和阶段表达。
+         * @description 为指定 Artifact Commit 和 StorageVolume 创建单区域只读 Snapshot。所选 StorageVolume 必须
+         *     属于同一 Tenant 且 `state=ready`；`degraded` 或 `unavailable` 均拒绝新放置并返回 409。服务端
+         *     生成 `snapshot_id`；相同 `snapshot_request_id` 和 payload 返回 `replayed: true`，不同 request
+         *     identity 命中同一 Commit/Volume 的未删除 Snapshot 时返回 `placement_reused: true`。用途、
+         *     保留策略和 Dataset Profile 均不是创建参数；Profile 是创建后查询的派生只读元数据。200 返回时
+         *     Snapshot 记录已持久化且可查询，后续交付由其状态和阶段表达。
          */
         post: operations["createSnapshot"];
         delete?: never;
@@ -871,7 +1012,8 @@ export interface components {
         };
         /**
          * @description 租户登记的稳定逻辑存储身份。PVC namespace/claim 可以公开用于运维识别；NFS
-         *     server、export path、凭据、中心挂载路径和 Agent ownership 不属于公开视图。
+         *     server、export path、凭据、中心挂载路径和 Agent ownership 不属于公开视图。只有 `state=ready`
+         *     可用于创建新的 Playground 或 Snapshot；`degraded` 与 `unavailable` 仍可查询，但禁止新放置。
          */
         StorageVolumeView: {
             tenant_id: components["schemas"]["TenantId"];
@@ -887,9 +1029,138 @@ export interface components {
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
         };
+        /**
+         * @description 为待接入 PVC 冻结完整公开 Volume descriptor 并创建 bootstrap token。该请求不要求
+         *     StorageVolume 已存在，也不接受现有 Volume resource version。
+         */
+        CreateStorageEnrollmentTokenRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            token_request_id: components["schemas"]["RequestId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            display_name: components["schemas"]["DisplayName"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            region: components["schemas"]["RegionName"];
+            access_mode: components["schemas"]["StorageEnrollmentAccessMode"];
+            pvc_reference: components["schemas"]["PvcReference"];
+        };
+        /**
+         * @description 原始 bootstrap token 只在本响应中返回。相同 token_request_id 和完全相同 payload 重放时返回
+         *     同一 token_id、bootstrap_token 和 expires_at_unix_ms，并将 replayed 设为 true。
+         */
+        CreateStorageEnrollmentTokenResponse: {
+            token_id: components["schemas"]["StorageEnrollmentTokenId"];
+            bootstrap_token: components["schemas"]["StorageEnrollmentBootstrapToken"];
+            expires_at_unix_ms: components["schemas"]["UnixMillis"];
+            replayed: boolean;
+        };
+        QueryStorageEnrollmentListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            state?: components["schemas"]["StorageEnrollmentState"];
+            registration_kind?: components["schemas"]["StorageEnrollmentRegistrationKind"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
+            query?: components["schemas"]["SearchQuery"];
+        };
+        QueryStorageEnrollmentListResponse: {
+            items: components["schemas"]["StorageEnrollmentView"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        QueryStorageEnrollmentRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            storage_enrollment_id: components["schemas"]["StorageEnrollmentId"];
+        };
+        QueryStorageEnrollmentResponse: {
+            enrollment: components["schemas"]["StorageEnrollmentView"];
+        };
+        /**
+         * @description 使用 expected_resource_version 对 pending_approval enrollment 执行 CAS。replacement 必须显式
+         *     confirm_replacement=true；approval_request_id 与完整 payload 构成稳定幂等 identity。
+         */
+        ApproveStorageEnrollmentRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            storage_enrollment_id: components["schemas"]["StorageEnrollmentId"];
+            approval_request_id: components["schemas"]["RequestId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+            confirm_replacement: boolean;
+        };
+        /**
+         * @description 审批事务返回更新后的 Enrollment 和创建或精确绑定的 StorageVolumeView。返回时 Enrollment 为
+         *     approved，StorageVolume 固定为 unavailable；后续认证 Agent session 和健康 probe 才能分别
+         *     推进到 enrolled 与 ready。
+         */
+        ApproveStorageEnrollmentResponse: {
+            enrollment: components["schemas"]["StorageEnrollmentView"];
+            storage_volume: components["schemas"]["StorageVolumeView"];
+            replayed: boolean;
+        };
+        /**
+         * @description 使用 expected_resource_version 对 pending_approval enrollment 执行 CAS；rejection_request_id
+         *     与完整 payload 构成稳定幂等 identity。
+         */
+        RejectStorageEnrollmentRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            storage_enrollment_id: components["schemas"]["StorageEnrollmentId"];
+            rejection_request_id: components["schemas"]["RequestId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+            reason?: string;
+        };
+        RejectStorageEnrollmentResponse: {
+            enrollment: components["schemas"]["StorageEnrollmentView"];
+            replayed: boolean;
+        };
+        /**
+         * @description Agent 使用单次 bootstrap token 提交的脱敏 PVC enrollment。pending_approval 自 created_at 起
+         *     24 小时未审核即进入 expired；终态仍保留 expires_at_unix_ms 作为原审批期限。approved 仅表示
+         *     管理员已审核并建立 unavailable Volume；认证 Agent session 和健康 probe 建立后才进入 enrolled。
+         *     本视图不包含 token、CSR、证书、PVC UID、挂载详情、拒绝原因或内部 Agent/session identity。
+         */
+        StorageEnrollmentView: {
+            tenant_id: components["schemas"]["TenantId"];
+            storage_enrollment_id: components["schemas"]["StorageEnrollmentId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            display_name: components["schemas"]["DisplayName"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            region: components["schemas"]["RegionName"];
+            access_mode: components["schemas"]["StorageEnrollmentAccessMode"];
+            pvc_reference: components["schemas"]["PvcReference"];
+            registration_kind: components["schemas"]["StorageEnrollmentRegistrationKind"];
+            state: components["schemas"]["StorageEnrollmentState"];
+            agent_version: string;
+            identity_fingerprint: string;
+            probe: components["schemas"]["StorageEnrollmentProbeSummary"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+            expires_at_unix_ms: components["schemas"]["UnixMillis"];
+            reviewed_at_unix_ms?: components["schemas"]["UnixMillis"];
+        };
+        /** @description Agent bootstrap 时提交的最小脱敏探测摘要，不包含挂载或设备 identity。 */
+        StorageEnrollmentProbeSummary: {
+            /** @enum {string} */
+            observed_access_mode: "read_only" | "read_write";
+            descriptor_matches: boolean;
+            protocol_compatible: boolean;
+            observed_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        /**
+         * @description initial 创建新的 Volume 绑定；replacement 审批时要求 confirm_replacement=true。
+         * @enum {string}
+         */
+        StorageEnrollmentRegistrationKind: "initial" | "replacement";
+        /**
+         * @description pending_approval 可被审核或在 24 小时后过期；approved 等待认证 Agent session 和健康 probe；
+         *     enrolled 表示 enrollment 已生效。rejected 与 expired 为终态。
+         * @enum {string}
+         */
+        StorageEnrollmentState: "pending_approval" | "approved" | "enrolled" | "rejected" | "expired";
+        /**
+         * @description 0.0.1 Volume-bound Agent 必须以 RW 方式挂载业务 PVC；只读 PVC 不可进入 enrollment。
+         * @enum {string}
+         */
+        StorageEnrollmentAccessMode: "read_write_many" | "read_write_once";
         PvcReference: {
-            namespace: string;
-            claim_name: string;
+            namespace: components["schemas"]["KubernetesNamespaceName"];
+            claim_name: components["schemas"]["KubernetesPvcClaimName"];
         };
         /** @description 仅在登记请求中使用；服务端不得在公开 StorageVolumeView 中回显。 */
         NfsReference: {
@@ -1062,6 +1333,10 @@ export interface components {
         QueryPlaygroundResponse: {
             playground: components["schemas"]["PlaygroundView"];
         };
+        /**
+         * @description 创建请求必须明确选择同 Tenant、`state=ready` 的 StorageVolume；Region 由 Volume 派生，不能
+         *     由调用方另行指定。
+         */
         CreatePlaygroundRequest: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
@@ -1100,6 +1375,10 @@ export interface components {
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
         };
+        /**
+         * @description 创建新 Pre-commit 会话的请求。服务端内部冻结当前 Head；客户端不提交
+         *     `source_head_commit_id`，也不能通过读取页面隐式发送本请求。
+         */
         StartPreCommitRequest: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
@@ -1122,6 +1401,10 @@ export interface components {
         QueryPreCommitResponse: {
             precommit: components["schemas"]["PreCommitView"];
         };
+        /**
+         * @description 仅为 abnormal/cancelled 会话创建下一 attempt，保持 `precommit_id`。running/ready 的重新检测
+         *     使用 cancel 后 start，并获得新的会话 ID。
+         */
         RestartPreCommitRequest: {
             tenant_id: components["schemas"]["TenantId"];
             precommit_id: components["schemas"]["PreCommitId"];
@@ -1147,11 +1430,22 @@ export interface components {
             playground: components["schemas"]["PlaygroundView"];
             replayed: boolean;
         };
-        /** @enum {string} */
+        /**
+         * @description 会话结果状态。可提交结果为 `ready`；阻断或执行失败为 `abnormal`。所有非 running 状态的
+         *     phase 均为 `idle`。
+         * @enum {string}
+         */
         PreCommitState: "running" | "ready" | "abnormal" | "cancelled" | "committed";
-        /** @enum {string} */
+        /**
+         * @description running 会话的执行阶段；`idle` 用于 ready、abnormal、cancelled 和 committed 终态。
+         *     `ready` 不是 phase。
+         * @enum {string}
+         */
         PreCommitPhase: "queued" | "scanning" | "hashing" | "uploading" | "validating" | "idle";
-        /** @description Playground 某一 IndexVersion 的冻结候选及其脱敏检查结果。 */
+        /**
+         * @description Playground 某一 IndexVersion 的冻结候选及其脱敏检查结果。`ready/idle` 必须有候选且 blockers
+         *     为空；`abnormal/idle` 且 blockers 非空在产品中显示为 Blocked。服务端冻结的 Head 不公开。
+         */
         PreCommitView: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
@@ -1192,6 +1486,10 @@ export interface components {
             message: string;
             path?: components["schemas"]["LogicalPath"];
         };
+        /**
+         * @description 消费 ready/idle Pre-commit 候选。服务端用该 attempt 内部冻结的 Head 执行 CAS；客户端只提交
+         *     expected candidate IndexVersion，不提交 expected/source Head。
+         */
         CommitPlaygroundRequest: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
@@ -1299,6 +1597,7 @@ export interface components {
         };
         /** @enum {string} */
         DatasetProfileState: "not_declared" | "ready" | "rejected";
+        /** @description Playground 或 Snapshot 派生的只读逻辑画像，不是 Snapshot 创建输入。 */
         DatasetProfileView: {
             state: components["schemas"]["DatasetProfileState"];
             summary?: components["schemas"]["DatasetProfileSummary"];
@@ -1374,6 +1673,10 @@ export interface components {
         QuerySnapshotResponse: {
             snapshot: components["schemas"]["SnapshotView"];
         };
+        /**
+         * @description 选择同 Tenant、`state=ready` 的 StorageVolume 为固定 Commit 创建 Snapshot。Region 由 Volume
+         *     派生；用途、保留策略和 Dataset Profile 不属于本请求。
+         */
         CreateSnapshotRequest: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
@@ -1626,6 +1929,8 @@ export interface components {
         };
         TenantId: components["schemas"]["ResourceId"];
         StorageVolumeId: components["schemas"]["ResourceId"];
+        StorageEnrollmentId: components["schemas"]["ResourceId"];
+        StorageEnrollmentTokenId: components["schemas"]["ResourceId"];
         EdgeClusterId: components["schemas"]["ResourceId"];
         ProjectId: components["schemas"]["ResourceId"];
         ArtifactId: components["schemas"]["ResourceId"];
@@ -1635,6 +1940,8 @@ export interface components {
         SnapshotId: components["schemas"]["ResourceId"];
         JobId: components["schemas"]["ResourceId"];
         RequestId: components["schemas"]["ResourceId"];
+        /** @description 15 分钟有效且只能成功消费一次的 opaque secret；不得写入日志、审计或其他公开 DTO。 */
+        StorageEnrollmentBootstrapToken: string;
         ResourceId: string;
         ErrorCode: string;
         DisplayName: string;
@@ -1644,6 +1951,10 @@ export interface components {
         StorageBackendType: "pvc" | "nfs";
         /** @enum {string} */
         StorageAccessMode: "read_write_many" | "read_write_once" | "read_only_many";
+        /** @description Kubernetes DNS-1123 label；Namespace 最长 63 字符且不允许点号。 */
+        KubernetesNamespaceName: string;
+        /** @description Kubernetes DNS-1123 subdomain；每个 label 最长 63 字符，完整名称最长 253 字符。 */
+        KubernetesPvcClaimName: string;
         /** @enum {string} */
         StorageVolumeState: "ready" | "degraded" | "unavailable";
         PermissionName: string;
@@ -1748,6 +2059,28 @@ export interface components {
                 "application/problem+json": components["schemas"]["ProblemDetails"];
             };
         };
+        /** @description Storage enrollment 不存在，或不属于当前认证 principal 可见的 Tenant */
+        StorageEnrollmentNotFoundProblem: {
+            headers: {
+                "X-Request-ID": components["headers"]["RequestId"];
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "type": "urn:neoengram:problem:storage-enrollment-not-found",
+                 *       "title": "Storage enrollment not found",
+                 *       "status": 404,
+                 *       "detail": "The requested Storage enrollment was not found",
+                 *       "instance": "/api/storage/enrollment/query",
+                 *       "code": "STORAGE_ENROLLMENT_NOT_FOUND",
+                 *       "request_id": "req-20260731-001",
+                 *       "retryable": false
+                 *     }
+                 */
+                "application/problem+json": components["schemas"]["ProblemDetails"];
+            };
+        };
         /** @description Tenant ID 已绑定另一份创建内容 */
         TenantConflictProblem: {
             headers: {
@@ -1789,6 +2122,16 @@ export interface components {
                  *       "retryable": false
                  *     }
                  */
+                "application/problem+json": components["schemas"]["ProblemDetails"];
+            };
+        };
+        /** @description enrollment identity、状态、绑定或 expected resource version 与当前权威状态冲突 */
+        StorageEnrollmentConflictProblem: {
+            headers: {
+                "X-Request-ID": components["headers"]["RequestId"];
+                [name: string]: unknown;
+            };
+            content: {
                 "application/problem+json": components["schemas"]["ProblemDetails"];
             };
         };
@@ -2372,6 +2715,412 @@ export interface operations {
             403: components["responses"]["AuthorizationProblem"];
             404: components["responses"]["ResourceNotFoundProblem"];
             409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createStorageEnrollmentToken: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "token_request_id": "storage-enrollment-token-vision-01",
+                 *       "storage_volume_id": "volume-vision",
+                 *       "display_name": "Vision dataset PVC",
+                 *       "edge_cluster_id": "cluster-cn-east-1",
+                 *       "region": "cn-east-1",
+                 *       "access_mode": "read_write_many",
+                 *       "pvc_reference": {
+                 *         "namespace": "neoengram-data",
+                 *         "claim_name": "vision-data"
+                 *       }
+                 *     }
+                 */
+                "application/json": components["schemas"]["CreateStorageEnrollmentTokenRequest"];
+            };
+        };
+        responses: {
+            /** @description bootstrap token 已创建或相同请求被重放 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateStorageEnrollmentTokenResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["StorageEnrollmentConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryStorageEnrollmentList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "state": "pending_approval",
+                 *       "page_size": 50
+                 *     }
+                 */
+                "application/json": components["schemas"]["QueryStorageEnrollmentListRequest"];
+            };
+        };
+        responses: {
+            /** @description Storage enrollment 页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "items": [
+                     *         {
+                     *           "tenant_id": "tenant-a",
+                     *           "storage_enrollment_id": "storage-enrollment-vision-01",
+                     *           "storage_volume_id": "volume-vision",
+                     *           "display_name": "Vision dataset PVC",
+                     *           "edge_cluster_id": "cluster-cn-east-1",
+                     *           "region": "cn-east-1",
+                     *           "access_mode": "read_write_many",
+                     *           "pvc_reference": {
+                     *             "namespace": "neoengram-data",
+                     *             "claim_name": "vision-data"
+                     *           },
+                     *           "registration_kind": "initial",
+                     *           "state": "pending_approval",
+                     *           "agent_version": "0.0.1",
+                     *           "identity_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *           "probe": {
+                     *             "observed_access_mode": "read_write",
+                     *             "descriptor_matches": true,
+                     *             "protocol_compatible": true,
+                     *             "observed_at_unix_ms": "1785168060000"
+                     *           },
+                     *           "resource_version": "1",
+                     *           "created_at_unix_ms": "1785168060000",
+                     *           "expires_at_unix_ms": "1785254460000",
+                     *           "updated_at_unix_ms": "1785168060000"
+                     *         }
+                     *       ]
+                     *     }
+                     */
+                    "application/json": components["schemas"]["QueryStorageEnrollmentListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["CursorConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryStorageEnrollment: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "storage_enrollment_id": "storage-enrollment-vision-01"
+                 *     }
+                 */
+                "application/json": components["schemas"]["QueryStorageEnrollmentRequest"];
+            };
+        };
+        responses: {
+            /** @description Storage enrollment 当前脱敏视图 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryStorageEnrollmentResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["StorageEnrollmentNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    approveStorageEnrollment: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "storage_enrollment_id": "storage-enrollment-vision-01",
+                 *       "approval_request_id": "approve-storage-enrollment-vision-01",
+                 *       "expected_resource_version": "1",
+                 *       "confirm_replacement": false
+                 *     }
+                 */
+                "application/json": components["schemas"]["ApproveStorageEnrollmentRequest"];
+            };
+        };
+        responses: {
+            /** @description enrollment 已批准或相同审批被重放 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "enrollment": {
+                     *         "tenant_id": "tenant-a",
+                     *         "storage_enrollment_id": "storage-enrollment-vision-01",
+                     *         "storage_volume_id": "volume-vision",
+                     *         "display_name": "Vision dataset PVC",
+                     *         "edge_cluster_id": "cluster-cn-east-1",
+                     *         "region": "cn-east-1",
+                     *         "access_mode": "read_write_many",
+                     *         "pvc_reference": {
+                     *           "namespace": "neoengram-data",
+                     *           "claim_name": "vision-data"
+                     *         },
+                     *         "registration_kind": "initial",
+                     *         "state": "approved",
+                     *         "agent_version": "0.0.1",
+                     *         "identity_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "probe": {
+                     *           "observed_access_mode": "read_write",
+                     *           "descriptor_matches": true,
+                     *           "protocol_compatible": true,
+                     *           "observed_at_unix_ms": "1785168060000"
+                     *         },
+                     *         "resource_version": "2",
+                     *         "created_at_unix_ms": "1785168060000",
+                     *         "expires_at_unix_ms": "1785254460000",
+                     *         "reviewed_at_unix_ms": "1785168120000",
+                     *         "updated_at_unix_ms": "1785168120000"
+                     *       },
+                     *       "storage_volume": {
+                     *         "tenant_id": "tenant-a",
+                     *         "storage_volume_id": "volume-vision",
+                     *         "display_name": "Vision dataset PVC",
+                     *         "edge_cluster_id": "cluster-cn-east-1",
+                     *         "region": "cn-east-1",
+                     *         "backend_type": "pvc",
+                     *         "access_mode": "read_write_many",
+                     *         "pvc_reference": {
+                     *           "namespace": "neoengram-data",
+                     *           "claim_name": "vision-data"
+                     *         },
+                     *         "state": "unavailable",
+                     *         "resource_version": "1",
+                     *         "created_at_unix_ms": "1785168120000",
+                     *         "updated_at_unix_ms": "1785168120000"
+                     *       },
+                     *       "replayed": false
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ApproveStorageEnrollmentResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["StorageEnrollmentNotFoundProblem"];
+            409: components["responses"]["StorageEnrollmentConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    rejectStorageEnrollment: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "storage_enrollment_id": "storage-enrollment-vision-01",
+                 *       "rejection_request_id": "reject-storage-enrollment-vision-01",
+                 *       "expected_resource_version": "1",
+                 *       "reason": "PVC descriptor 与本次部署变更窗口不匹配"
+                 *     }
+                 */
+                "application/json": components["schemas"]["RejectStorageEnrollmentRequest"];
+            };
+        };
+        responses: {
+            /** @description enrollment 已拒绝或相同拒绝请求被重放 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "enrollment": {
+                     *         "tenant_id": "tenant-a",
+                     *         "storage_enrollment_id": "storage-enrollment-vision-01",
+                     *         "storage_volume_id": "volume-vision",
+                     *         "display_name": "Vision dataset PVC",
+                     *         "edge_cluster_id": "cluster-cn-east-1",
+                     *         "region": "cn-east-1",
+                     *         "access_mode": "read_write_many",
+                     *         "pvc_reference": {
+                     *           "namespace": "neoengram-data",
+                     *           "claim_name": "vision-data"
+                     *         },
+                     *         "registration_kind": "initial",
+                     *         "state": "rejected",
+                     *         "agent_version": "0.0.1",
+                     *         "identity_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "probe": {
+                     *           "observed_access_mode": "read_write",
+                     *           "descriptor_matches": false,
+                     *           "protocol_compatible": true,
+                     *           "observed_at_unix_ms": "1785168060000"
+                     *         },
+                     *         "resource_version": "2",
+                     *         "created_at_unix_ms": "1785168060000",
+                     *         "expires_at_unix_ms": "1785254460000",
+                     *         "reviewed_at_unix_ms": "1785168120000",
+                     *         "updated_at_unix_ms": "1785168120000"
+                     *       },
+                     *       "replayed": false
+                     *     }
+                     */
+                    "application/json": components["schemas"]["RejectStorageEnrollmentResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["StorageEnrollmentNotFoundProblem"];
+            409: components["responses"]["StorageEnrollmentConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];

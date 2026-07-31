@@ -7,20 +7,20 @@ use neoengram_core::{
     ManifestId, ObjectId,
 };
 use neoengram_protocol::{
-    AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
-    AssignmentOperation, DecimalU64, DurabilityState, EdgeClusterId, Extensions, IndexDeltaRecord,
-    JobPrepared, JobState, MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage,
-    MetadataBatchRecords, MetadataBatchScope, MountGeneration, ObjectDurabilityReceipt,
-    OwnerGeneration, PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef,
-    ProjectId, ResourceVersion, SessionId, StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
-    WireObjectSpec,
+    AgentEnrollmentId, AgentId, AgentMountId, ArtifactId, ArtifactPlacementId,
+    AssignmentGeneration, AssignmentId, AssignmentOperation, DecimalU64, DurabilityState,
+    EdgeClusterId, Extensions, IndexDeltaRecord, JobPrepared, JobState, MetadataBatchDescriptor,
+    MetadataBatchId, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope, MountGeneration,
+    ObjectDurabilityReceipt, OwnerGeneration, PlacementGeneration, PlaygroundId, PrincipalId,
+    PrincipalKind, PrincipalRef, ProjectId, RequestId, ResourceVersion, SessionId, StorageVolumeId,
+    TenantId, UnixMillis, WireIndexVersion, WireObjectSpec,
 };
 use neoengramd::{
-    open_sqlite_authority, AddJobSpec, AllowAllAuthorizer, AssignJobRequest, AssignmentTarget,
-    AuditEvent, AuditKind, AuthorityCapabilities, AuthorityStore, CentralErrorCode, ControlPlane,
-    CreateAddJobRequest, FinalizeAddRequest, InMemoryComponents, IndexKey, IndexPublishOutcome,
-    IndexPublishRejection, IndexPublishRequest, JobKey, JobRecord, PublicationCandidate,
-    SqliteAuthorityConfig,
+    open_sqlite_authority, AddJobSpec, AgentEnrollmentAuditEvent, AgentEnrollmentAuditKind,
+    AllowAllAuthorizer, AssignJobRequest, AssignmentTarget, AuditEvent, AuditKind,
+    AuthorityCapabilities, AuthorityStore, CentralErrorCode, ControlPlane, CreateAddJobRequest,
+    FinalizeAddRequest, InMemoryComponents, IndexKey, IndexPublishOutcome, IndexPublishRejection,
+    IndexPublishRequest, JobKey, JobRecord, PublicationCandidate, SqliteAuthorityConfig,
 };
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use tempfile::TempDir;
@@ -105,6 +105,85 @@ async fn sqlite_reopen_recovers_every_authority_port() {
 }
 
 #[tokio::test]
+async fn sqlite_migrates_v1_authority_without_losing_existing_state() {
+    let directory = TempDir::new().unwrap();
+    let fixture = {
+        let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+            .await
+            .unwrap();
+        run_contract(authority.authority_store()).await
+    };
+    execute_raw(
+        directory.path(),
+        "DROP TABLE agent_enrollment_audit_events; PRAGMA user_version = 1",
+    )
+    .await;
+
+    let migrated = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    migrated.integrity_check().await.unwrap();
+    assert_contract_state(&migrated.authority_store(), &fixture).await;
+    assert!(migrated.enrollment_audit_events().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_enrollment_audit_is_idempotent_and_restart_stable() {
+    let directory = TempDir::new().unwrap();
+    let event = AgentEnrollmentAuditEvent {
+        event_id: "agent-enrollment:enrollment-a:approve-a".to_owned(),
+        kind: AgentEnrollmentAuditKind::Approved,
+        tenant_id: TenantId::new("tenant-a").unwrap(),
+        enrollment_id: AgentEnrollmentId::new("enrollment-a").unwrap(),
+        storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
+        decision_request_id: RequestId::new("approve-a").unwrap(),
+        resource_version: ResourceVersion::new(3),
+        actor: PrincipalRef {
+            kind: PrincipalKind::User,
+            id: PrincipalId::new("tenant-admin-a").unwrap(),
+            extensions: Extensions::new(),
+        },
+        occurred_at_unix_ms: UnixMillis::new(500),
+    };
+    {
+        let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let audit = authority.authority_store().audit();
+        assert!(!audit
+            .record_enrollment_decision(event.clone())
+            .await
+            .unwrap());
+        let mut replay = event.clone();
+        replay.occurred_at_unix_ms = UnixMillis::new(999);
+        assert!(audit.record_enrollment_decision(replay).await.unwrap());
+
+        let mut conflict = event.clone();
+        conflict.actor.id = PrincipalId::new("another-admin").unwrap();
+        assert_eq!(
+            audit
+                .record_enrollment_decision(conflict)
+                .await
+                .unwrap_err()
+                .code(),
+            CentralErrorCode::Internal
+        );
+        assert_eq!(
+            authority.enrollment_audit_events().await.unwrap(),
+            vec![event.clone()]
+        );
+    }
+
+    let reopened = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.enrollment_audit_events().await.unwrap(),
+        vec![event]
+    );
+}
+
+#[tokio::test]
 async fn tenant_scoped_ids_are_isolated_in_both_backends() {
     let memory = InMemoryComponents::new(100);
     assert_tenant_isolation(memory.authority_store()).await;
@@ -142,7 +221,7 @@ async fn sqlite_rejects_wrong_application_id_and_user_version() {
 
     let version_directory = TempDir::new().unwrap();
     initialize_and_close(version_directory.path()).await;
-    execute_raw(version_directory.path(), "PRAGMA user_version = 2").await;
+    execute_raw(version_directory.path(), "PRAGMA user_version = 3").await;
     assert_open_storage_failure(version_directory.path()).await;
 }
 

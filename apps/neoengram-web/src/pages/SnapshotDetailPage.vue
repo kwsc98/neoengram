@@ -10,28 +10,37 @@ import {
   Search,
   WarningFilled,
 } from '@element-plus/icons-vue';
-import { useQuery } from '@tanstack/vue-query';
-import { computed, ref } from 'vue';
+import { useMutation, useQuery } from '@tanstack/vue-query';
+import { ElMessage } from 'element-plus';
+import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { queryArtifactCommitDiff, querySnapshot } from '@/api/operations';
+import {
+  queryArtifactCommitDiff,
+  querySnapshot,
+  querySnapshotActivityList,
+  querySnapshotDatasetProfile,
+  querySnapshotFileList,
+  retrySnapshotDelivery,
+} from '@/api/operations';
+import type { LogicalFileEntry } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
+import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import {
+  datasetProfileStateLabel,
+  datasetProfileTagType,
+  snapshotActivityTagType,
+  snapshotActivityTypeLabel,
+  snapshotIntegrityLabel,
+  snapshotIntegrityTagType,
   snapshotPhaseLabel,
+  snapshotPollInterval,
   snapshotStateLabel,
   snapshotStateTagType,
-} from '@/features/snapshots/prototype';
+} from '@/features/snapshots/status';
 import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
-
-interface SnapshotFile {
-  path: string;
-  format: string;
-  size: string;
-  objects: string;
-  digest: string;
-}
 
 const route = useRoute();
 const router = useRouter();
@@ -39,8 +48,17 @@ const tenantId = computed(() => String(route.params.tenantId ?? ''));
 const projectId = computed(() => String(route.params.projectId ?? ''));
 const artifactId = computed(() => String(route.params.artifactId ?? ''));
 const snapshotId = computed(() => String(route.params.snapshotId ?? ''));
-const activeTab = ref('overview');
-const fileSearch = ref('');
+const allowedTabs = ['overview', 'files', 'activity', 'profile'];
+const requestedTab = computed(() => String(route.query.tab ?? 'overview'));
+const activeTab = ref(allowedTabs.includes(requestedTab.value) ? requestedTab.value : 'overview');
+
+const filePathInput = ref('');
+const filePathPrefix = ref('');
+const fileCursor = ref<string>();
+const fileCursorHistory = ref<string[]>([]);
+const activityCursor = ref<string>();
+const activityCursorHistory = ref<string[]>([]);
+const retryRequestId = ref<string>();
 
 const snapshotQuery = useQuery({
   queryKey: computed(() => [
@@ -50,12 +68,23 @@ const snapshotQuery = useQuery({
     artifactId.value,
     snapshotId.value,
   ]),
-  queryFn: () => querySnapshot(tenantId.value, snapshotId.value),
-  refetchInterval: (query) =>
-    query.state.data?.data.snapshot.state === 'creating' ? 1_000 : false,
+  queryFn: async () => {
+    const result = await querySnapshot(tenantId.value, snapshotId.value);
+    const item = result.data.snapshot;
+    if (
+      item.tenant_id !== tenantId.value ||
+      item.project_id !== projectId.value ||
+      item.artifact_id !== artifactId.value
+    ) {
+      throw new Error('Snapshot 不属于当前 Artifact');
+    }
+    return result;
+  },
+  refetchInterval: (query) => snapshotPollInterval(query.state.data?.data.snapshot.state),
 });
 const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
 const commitId = computed(() => snapshot.value?.commit_id ?? '');
+
 const commitQuery = useQuery({
   queryKey: computed(() => [
     'artifact-commit-diff',
@@ -69,103 +98,212 @@ const commitQuery = useQuery({
     queryArtifactCommitDiff(tenantId.value, projectId.value, artifactId.value, commitId.value),
   enabled: computed(() => Boolean(commitId.value)),
 });
-
 const commitDiff = computed(() => commitQuery.data.value?.data.diff);
 const snapshotTags = computed(() =>
   commitTagNames(commitDiff.value?.target_commit.tag_names ?? snapshot.value?.tag_names ?? []),
 );
-const refreshing = computed(() => snapshotQuery.isFetching.value || commitQuery.isFetching.value);
 
-const roadSceneFiles: SnapshotFile[] = [
-  {
-    path: 'dataset/index.json',
-    format: 'JSON',
-    size: '3.1 MiB',
-    objects: '3',
-    digest: 'b3:61f7a82c4fe909d8',
-  },
-  {
-    path: 'dataset/night-rain/part-0042.parquet',
-    format: 'Parquet',
-    size: '18.6 GiB',
-    objects: '147',
-    digest: 'b3:84c86a69ca3e714f',
-  },
-  {
-    path: 'images/night-rain/shard-023.tar',
-    format: 'TAR',
-    size: '8.3 GiB',
-    objects: '66',
-    digest: 'b3:85c84f4b756e43a2',
-  },
-  {
-    path: 'annotations/partition=night/date=2026-07-28/labels.parquet',
-    format: 'Parquet',
-    size: '2.7 GiB',
-    objects: '23',
-    digest: 'b3:29a36f8751c76409',
-  },
-  {
-    path: 'schemas/road-scene.avsc',
-    format: 'Avro',
-    size: '14 KiB',
-    objects: '1',
-    digest: 'b3:ce546f01d8d09c64',
-  },
-  {
-    path: 'profiles/night-v4.dataset-profile.json',
-    format: 'Profile',
-    size: '480 KiB',
-    objects: '1',
-    digest: 'b3:d87c5f31ac08a9fe',
-  },
-];
-
-const genericFiles: SnapshotFile[] = [
-  {
-    path: 'dataset/manifest.json',
-    format: 'JSON',
-    size: '1.8 MiB',
-    objects: '2',
-    digest: 'b3:4f1c81f220829bef',
-  },
-  {
-    path: 'dataset/part-0001.parquet',
-    format: 'Parquet',
-    size: '2.1 GiB',
-    objects: '32',
-    digest: 'b3:724c3618a61f8c7d',
-  },
-  {
-    path: 'schemas/dataset.avsc',
-    format: 'Avro',
-    size: '9 KiB',
-    objects: '1',
-    digest: 'b3:b82370a577e559a1',
-  },
-];
-
-const snapshotFiles = computed(() =>
-  artifactId.value === 'road-scenes' ? roadSceneFiles : genericFiles,
+const filesEnabled = computed(
+  () => activeTab.value === 'files' && snapshot.value?.state === 'ready',
 );
-const filteredFiles = computed(() => {
-  const query = fileSearch.value.trim().toLowerCase();
-  return snapshotFiles.value.filter((file) => !query || file.path.toLowerCase().includes(query));
+const fileQuery = useQuery({
+  queryKey: computed(() => [
+    'snapshot-files',
+    tenantId.value,
+    projectId.value,
+    artifactId.value,
+    snapshotId.value,
+    filePathPrefix.value,
+    fileCursor.value ?? '',
+  ]),
+  queryFn: () =>
+    querySnapshotFileList({
+      tenant_id: tenantId.value,
+      snapshot_id: snapshotId.value,
+      page_size: 50,
+      ...(filePathPrefix.value ? { path_prefix: filePathPrefix.value } : {}),
+      ...(fileCursor.value ? { cursor: fileCursor.value } : {}),
+    }),
+  enabled: filesEnabled,
 });
-const profileName = computed(() =>
-  artifactId.value === 'road-scenes' ? 'training-dataset-v2' : '未声明',
+
+const activityQuery = useQuery({
+  queryKey: computed(() => [
+    'snapshot-activities',
+    tenantId.value,
+    projectId.value,
+    artifactId.value,
+    snapshotId.value,
+    activityCursor.value ?? '',
+    snapshot.value?.updated_at_unix_ms ?? '',
+  ]),
+  queryFn: () =>
+    querySnapshotActivityList({
+      tenant_id: tenantId.value,
+      snapshot_id: snapshotId.value,
+      page_size: 25,
+      ...(activityCursor.value ? { cursor: activityCursor.value } : {}),
+    }),
+  enabled: computed(() => activeTab.value === 'activity' && Boolean(snapshot.value)),
+});
+
+const profileQuery = useQuery({
+  queryKey: computed(() => [
+    'snapshot-dataset-profile',
+    tenantId.value,
+    projectId.value,
+    artifactId.value,
+    snapshotId.value,
+  ]),
+  queryFn: () =>
+    querySnapshotDatasetProfile({
+      tenant_id: tenantId.value,
+      snapshot_id: snapshotId.value,
+    }),
+  enabled: computed(() => activeTab.value === 'profile' && Boolean(snapshot.value)),
+});
+const profile = computed(() => profileQuery.data.value?.data.profile);
+
+const retryMutation = useMutation({ mutationFn: retrySnapshotDelivery });
+
+watch(requestedTab, (tab) => {
+  activeTab.value = allowedTabs.includes(tab) ? tab : 'overview';
+});
+
+watch([tenantId, projectId, artifactId, snapshotId], () => {
+  activeTab.value = allowedTabs.includes(requestedTab.value) ? requestedTab.value : 'overview';
+  filePathInput.value = '';
+  filePathPrefix.value = '';
+  fileCursor.value = undefined;
+  fileCursorHistory.value = [];
+  activityCursor.value = undefined;
+  activityCursorHistory.value = [];
+  retryRequestId.value = undefined;
+  retryMutation.reset();
+});
+
+const refreshing = computed(
+  () =>
+    snapshotQuery.isFetching.value ||
+    commitQuery.isFetching.value ||
+    (activeTab.value === 'files' && fileQuery.isFetching.value) ||
+    (activeTab.value === 'activity' && activityQuery.isFetching.value) ||
+    (activeTab.value === 'profile' && profileQuery.isFetching.value),
 );
+
+function applyFileFilter(): void {
+  filePathPrefix.value = filePathInput.value.trim();
+  fileCursor.value = undefined;
+  fileCursorHistory.value = [];
+}
+
+function nextFilePage(): void {
+  const next = fileQuery.data.value?.data.next_cursor;
+  if (!next) return;
+  fileCursorHistory.value.push(fileCursor.value ?? '');
+  fileCursor.value = next;
+}
+
+function previousFilePage(): void {
+  fileCursor.value = fileCursorHistory.value.pop() || undefined;
+}
+
+function nextActivityPage(): void {
+  const next = activityQuery.data.value?.data.next_cursor;
+  if (!next) return;
+  activityCursorHistory.value.push(activityCursor.value ?? '');
+  activityCursor.value = next;
+}
+
+function previousActivityPage(): void {
+  activityCursor.value = activityCursorHistory.value.pop() || undefined;
+}
 
 async function refresh(): Promise<void> {
-  await Promise.all([snapshotQuery.refetch(), commitQuery.refetch()]);
+  const tasks: Array<Promise<unknown>> = [snapshotQuery.refetch()];
+  if (commitId.value) tasks.push(commitQuery.refetch());
+  if (filesEnabled.value) tasks.push(fileQuery.refetch());
+  if (activeTab.value === 'activity') tasks.push(activityQuery.refetch());
+  if (activeTab.value === 'profile') tasks.push(profileQuery.refetch());
+  await Promise.all(tasks);
+}
+
+async function retryDelivery(): Promise<void> {
+  if (retryMutation.isPending.value) return;
+  retryRequestId.value ??= `snapshot-retry-${globalThis.crypto.randomUUID()}`;
+  try {
+    const result = await retryMutation.mutateAsync({
+      tenant_id: tenantId.value,
+      snapshot_id: snapshotId.value,
+      retry_request_id: retryRequestId.value,
+    });
+    retryRequestId.value = undefined;
+    ElMessage.success(result.data.replayed ? '已返回同一重试请求的幂等结果' : '已重新开始交付');
+    activityCursor.value = undefined;
+    activityCursorHistory.value = [];
+    await snapshotQuery.refetch();
+    if (activeTab.value === 'activity') await activityQuery.refetch();
+  } catch {
+    // Keep retry_request_id stable so a transport retry remains idempotent.
+  }
 }
 
 async function openCommit(): Promise<void> {
   await router.push({
     name: 'artifact-detail',
-    params: { tenantId: tenantId.value, projectId: projectId.value, artifactId: artifactId.value },
+    params: {
+      tenantId: tenantId.value,
+      projectId: projectId.value,
+      artifactId: artifactId.value,
+    },
     query: { tab: 'commits', commit_id: commitId.value },
   });
+}
+
+async function backToList(): Promise<void> {
+  await router.push({
+    name: 'snapshot-list',
+    params: { tenantId: tenantId.value },
+    query: { project_id: projectId.value, artifact_id: artifactId.value },
+  });
+}
+
+function fileSize(file: LogicalFileEntry): string {
+  return file.size_bytes === undefined ? '—' : formatBytes(file.size_bytes);
+}
+
+function fileRows(file: LogicalFileEntry): string {
+  return file.row_count === undefined ? '—' : formatCount(file.row_count);
+}
+
+function entryTypeLabel(entryType: LogicalFileEntry['entry_type']): string {
+  return entryType === 'directory' ? '目录' : '文件';
+}
+
+function qualityStateLabel(state: string): string {
+  return (
+    {
+      not_evaluated: '未评估',
+      passed: '通过',
+      warning: '警告',
+      failed: '失败',
+    }[state] ?? state
+  );
+}
+
+function qualityTagType(state: string): 'info' | 'success' | 'warning' | 'danger' {
+  if (state === 'passed') return 'success';
+  if (state === 'warning') return 'warning';
+  if (state === 'failed') return 'danger';
+  return 'info';
+}
+
+function integrityPercent(): number {
+  if (!snapshot.value) return 0;
+  const total = BigInt(snapshot.value.logical_file_count);
+  if (total === 0n) return snapshot.value.integrity.state === 'verified' ? 100 : 0;
+  const verified = BigInt(snapshot.value.integrity.files_verified);
+  return Math.min(100, Number((verified * 10000n) / total) / 100);
 }
 </script>
 
@@ -176,11 +314,15 @@ async function openCommit(): Promise<void> {
         <el-tag v-if="snapshot" :type="snapshotStateTagType(snapshot.state)" effect="plain">
           只读 · {{ snapshotStateLabel(snapshot.state) }}
         </el-tag>
+        <el-button :icon="Back" @click="backToList">返回列表</el-button>
         <el-button
-          :icon="Back"
-          @click="router.push({ name: 'snapshot-list', params: { tenantId } })"
+          v-if="snapshot?.state === 'abnormal'"
+          type="primary"
+          :icon="RefreshRight"
+          :loading="retryMutation.isPending.value"
+          @click="retryDelivery"
         >
-          返回列表
+          重试交付
         </el-button>
         <el-button :icon="RefreshRight" :loading="refreshing" @click="refresh">刷新</el-button>
       </template>
@@ -198,13 +340,19 @@ async function openCommit(): Promise<void> {
       :retrying="commitQuery.isFetching.value"
       @retry="commitQuery.refetch"
     />
+    <ApiProblemAlert
+      v-if="retryMutation.error.value"
+      :error="retryMutation.error.value"
+      :retrying="retryMutation.isPending.value"
+      @retry="retryDelivery"
+    />
 
     <template v-if="snapshot">
       <section class="snapshot-summary" aria-label="Snapshot 摘要">
         <div>
           <span>状态</span>
           <strong
-            class="ready-value"
+            class="state-value"
             :class="{
               'is-creating': snapshot.state === 'creating',
               'is-abnormal': snapshot.state === 'abnormal',
@@ -217,6 +365,9 @@ async function openCommit(): Promise<void> {
           </strong>
         </div>
         <div>
+          <span>阶段</span><strong>{{ snapshotPhaseLabel(snapshot.phase) }}</strong>
+        </div>
+        <div>
           <span>文件数</span><strong>{{ formatCount(snapshot.logical_file_count) }}</strong>
         </div>
         <div>
@@ -226,9 +377,19 @@ async function openCommit(): Promise<void> {
           <span>所在区域</span><strong>{{ snapshot.region }}</strong>
         </div>
         <div>
-          <span>创建时间</span><strong>{{ formatTime(snapshot.created_at_unix_ms) }}</strong>
+          <span>更新时间</span><strong>{{ formatTime(snapshot.updated_at_unix_ms) }}</strong>
         </div>
       </section>
+
+      <el-alert
+        v-if="snapshot.issue"
+        class="snapshot-issue"
+        :title="snapshot.issue.message"
+        :description="snapshot.issue.code"
+        type="error"
+        :closable="false"
+        show-icon
+      />
 
       <section class="content-section snapshot-detail-shell">
         <el-tabs v-model="activeTab">
@@ -251,99 +412,128 @@ async function openCommit(): Promise<void> {
               </el-button>
             </section>
 
-            <div class="snapshot-overview-grid">
-              <section class="snapshot-subsection">
+            <div class="overview-grid">
+              <section class="snapshot-subsection placement-section">
                 <header>
                   <div>
                     <h2>存储位置</h2>
-                    <p>该 Snapshot 固定在一个区域和一个 StorageVolume</p>
+                    <p>{{ snapshot.region }}</p>
                   </div>
-                  <span>单区域 · {{ snapshotStateLabel(snapshot.state) }}</span>
+                  <el-tag :type="snapshotStateTagType(snapshot.state)" effect="plain">
+                    {{ snapshotStateLabel(snapshot.state) }}
+                  </el-tag>
                 </header>
-                <div class="placement-table">
-                  <div class="placement-table__header">
-                    <span>区域</span><span>状态</span><span>StorageVolume</span><span>物化方式</span
-                    ><span>完整性</span>
+                <dl class="placement-facts">
+                  <div>
+                    <dt>Region</dt>
+                    <dd><Location />{{ snapshot.region }}</dd>
                   </div>
                   <div>
-                    <strong><Location />{{ snapshot.region }}</strong>
-                    <el-tag :type="snapshotStateTagType(snapshot.state)" effect="plain">
-                      {{ snapshotStateLabel(snapshot.state) }}
-                    </el-tag>
-                    <code>{{ snapshot.storage_volume_id }}</code>
-                    <span>{{ snapshotPhaseLabel(snapshot.phase) }}</span>
-                    <span class="placement-integrity">
-                      <CircleCheck v-if="snapshot.state === 'ready'" />
-                      <RefreshRight v-else-if="snapshot.state === 'creating'" />
-                      <WarningFilled v-else />
-                      {{
-                        snapshot.state === 'ready'
-                          ? '100% · 已校验'
-                          : snapshot.state === 'creating'
-                            ? '64% · 物化中'
-                            : '完整性校验失败'
-                      }}
-                    </span>
-                  </div>
-                </div>
-              </section>
-
-              <section class="snapshot-subsection snapshot-policy">
-                <header>
-                  <div>
-                    <h2>完整性与策略</h2>
-                    <p>读取行为固定，不随后续 Commit 变化</p>
-                  </div>
-                </header>
-                <dl>
-                  <div>
-                    <dt>Manifest digest</dt>
-                    <dd><code>b3:9e2b74f5d5b89173</code></dd>
+                    <dt>StorageVolume</dt>
+                    <dd>
+                      <code>{{ snapshot.storage_volume_id }}</code>
+                    </dd>
                   </div>
                   <div>
-                    <dt>对象</dt>
-                    <dd>148,296 · verified</dd>
+                    <dt>交付阶段</dt>
+                    <dd>{{ snapshotPhaseLabel(snapshot.phase) }}</dd>
                   </div>
                   <div>
-                    <dt>访问模式</dt>
+                    <dt>访问</dt>
                     <dd>只读</dd>
                   </div>
+                </dl>
+              </section>
+
+              <section class="snapshot-subsection integrity-section">
+                <header>
                   <div>
-                    <dt>保留策略</dt>
-                    <dd>180 天</dd>
+                    <h2>完整性</h2>
+                    <p>{{ integrityPercent() }}%</p>
                   </div>
+                  <el-tag :type="snapshotIntegrityTagType(snapshot.integrity.state)" effect="plain">
+                    {{ snapshotIntegrityLabel(snapshot.integrity.state) }}
+                  </el-tag>
+                </header>
+                <el-progress
+                  :percentage="integrityPercent()"
+                  :status="
+                    snapshot.integrity.state === 'verified'
+                      ? 'success'
+                      : snapshot.integrity.state === 'failed'
+                        ? 'exception'
+                        : undefined
+                  "
+                />
+                <dl>
                   <div>
-                    <dt>Dataset Profile</dt>
-                    <dd>{{ profileName }}</dd>
-                  </div>
-                  <div>
-                    <dt>父 Commit</dt>
+                    <dt>已校验文件</dt>
                     <dd>
-                      <code>{{ commitDiff?.target_commit.parent_commit_id ?? '根 Commit' }}</code>
+                      {{ formatCount(snapshot.integrity.files_verified) }} /
+                      {{ formatCount(snapshot.logical_file_count) }}
                     </dd>
+                  </div>
+                  <div>
+                    <dt>已校验数据</dt>
+                    <dd>
+                      {{ formatBytes(snapshot.integrity.bytes_verified) }} /
+                      {{ formatBytes(snapshot.logical_size_bytes) }}
+                    </dd>
+                  </div>
+                  <div v-if="snapshot.integrity.verified_at_unix_ms">
+                    <dt>校验完成</dt>
+                    <dd>{{ formatTime(snapshot.integrity.verified_at_unix_ms) }}</dd>
                   </div>
                 </dl>
               </section>
             </div>
 
-            <section class="snapshot-subsection snapshot-identity">
+            <section v-if="commitDiff" class="snapshot-subsection diff-section">
               <header>
                 <div>
-                  <h2>Snapshot 身份</h2>
-                  <p>每个 Snapshot 独立绑定一个 Commit、区域和 StorageVolume</p>
+                  <h2>Commit Diff</h2>
+                  <p>
+                    {{ commitDiff.base_commit?.commit_id ?? '根 Commit' }} →
+                    {{ commitDiff.target_commit.commit_id }}
+                  </p>
                 </div>
               </header>
               <dl>
                 <div>
-                  <dt>Snapshot ID</dt>
-                  <dd>
-                    <code>{{ snapshot.snapshot_id }}</code>
-                  </dd>
+                  <dt>新增</dt>
+                  <dd>{{ formatCount(commitDiff.summary.files_added) }}</dd>
                 </div>
                 <div>
-                  <dt>Tenant</dt>
-                  <dd>{{ snapshot.tenant_id }}</dd>
+                  <dt>修改</dt>
+                  <dd>{{ formatCount(commitDiff.summary.files_modified) }}</dd>
                 </div>
+                <div>
+                  <dt>删除</dt>
+                  <dd>{{ formatCount(commitDiff.summary.files_deleted) }}</dd>
+                </div>
+                <div>
+                  <dt>重命名</dt>
+                  <dd>{{ formatCount(commitDiff.summary.files_renamed) }}</dd>
+                </div>
+                <div>
+                  <dt>增加</dt>
+                  <dd>{{ formatBytes(commitDiff.summary.bytes_added) }}</dd>
+                </div>
+                <div>
+                  <dt>移除</dt>
+                  <dd>{{ formatBytes(commitDiff.summary.bytes_removed) }}</dd>
+                </div>
+              </dl>
+            </section>
+
+            <section class="snapshot-subsection identity-section">
+              <header>
+                <div>
+                  <h2>Snapshot 身份</h2>
+                  <p>{{ snapshot.snapshot_id }}</p>
+                </div>
+              </header>
+              <dl>
                 <div>
                   <dt>Project</dt>
                   <dd>{{ snapshot.project_id }}</dd>
@@ -359,14 +549,8 @@ async function openCommit(): Promise<void> {
                   </dd>
                 </div>
                 <div>
-                  <dt>Region</dt>
-                  <dd>{{ snapshot.region }}</dd>
-                </div>
-                <div>
-                  <dt>StorageVolume</dt>
-                  <dd>
-                    <code>{{ snapshot.storage_volume_id }}</code>
-                  </dd>
+                  <dt>创建时间</dt>
+                  <dd>{{ formatTime(snapshot.created_at_unix_ms) }}</dd>
                 </div>
               </dl>
             </section>
@@ -376,42 +560,85 @@ async function openCommit(): Promise<void> {
             <section class="snapshot-files">
               <header>
                 <div>
-                  <h2>Snapshot 文件清单</h2>
-                  <p>只读 Manifest 中的代表性文件</p>
+                  <h2>Snapshot 文件</h2>
+                  <p>{{ formatCount(snapshot.logical_file_count) }} 个逻辑文件</p>
                 </div>
-                <el-input
-                  v-model="fileSearch"
-                  clearable
-                  :prefix-icon="Search"
-                  placeholder="按路径搜索"
-                />
+                <form @submit.prevent="applyFileFilter">
+                  <el-input
+                    v-model="filePathInput"
+                    clearable
+                    placeholder="按路径前缀筛选"
+                    aria-label="文件路径前缀"
+                  />
+                  <el-button native-type="submit" type="primary" :icon="Search">查询</el-button>
+                </form>
               </header>
-              <div class="snapshot-file-table desktop-snapshot-files">
-                <div class="snapshot-file-table__header">
-                  <span>路径</span><span>格式</span><span>大小</span><span>对象</span
-                  ><span>Digest</span>
+
+              <ApiProblemAlert
+                v-if="fileQuery.error.value"
+                :error="fileQuery.error.value"
+                :retrying="fileQuery.isFetching.value"
+                @retry="fileQuery.refetch"
+              />
+              <el-skeleton v-if="fileQuery.isPending.value" :rows="7" animated />
+              <el-empty
+                v-else-if="!fileQuery.data.value?.data.items.length"
+                description="当前路径前缀下没有文件"
+              />
+              <template v-else>
+                <el-table :data="fileQuery.data.value?.data.items" class="desktop-files">
+                  <el-table-column label="路径" min-width="300">
+                    <template #default="scope">
+                      <span class="file-path"
+                        ><Files /><code>{{ scope.row.path }}</code></span
+                      >
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="类型" width="90">
+                    <template #default="scope">{{ entryTypeLabel(scope.row.entry_type) }}</template>
+                  </el-table-column>
+                  <el-table-column label="格式" min-width="110">
+                    <template #default="scope">{{ scope.row.format ?? '—' }}</template>
+                  </el-table-column>
+                  <el-table-column label="大小" min-width="120">
+                    <template #default="scope"
+                      ><strong>{{ fileSize(scope.row) }}</strong></template
+                    >
+                  </el-table-column>
+                  <el-table-column label="行数" min-width="120">
+                    <template #default="scope">{{ fileRows(scope.row) }}</template>
+                  </el-table-column>
+                  <el-table-column label="更新时间" min-width="160">
+                    <template #default="scope">
+                      {{
+                        scope.row.updated_at_unix_ms
+                          ? formatTime(scope.row.updated_at_unix_ms)
+                          : '—'
+                      }}
+                    </template>
+                  </el-table-column>
+                </el-table>
+                <div class="mobile-files">
+                  <article v-for="file in fileQuery.data.value?.data.items" :key="file.path">
+                    <code>{{ file.path }}</code>
+                    <span>
+                      {{ entryTypeLabel(file.entry_type) }} · {{ file.format ?? '—' }} ·
+                      {{ fileSize(file) }}
+                    </span>
+                    <small>行数 {{ fileRows(file) }}</small>
+                  </article>
                 </div>
-                <div v-for="file in filteredFiles" :key="file.path">
-                  <span
-                    ><Files /><code>{{ file.path }}</code></span
-                  >
-                  <span>{{ file.format }}</span>
-                  <strong>{{ file.size }}</strong>
-                  <span>{{ file.objects }}</span>
-                  <code>{{ file.digest }}</code>
-                </div>
-              </div>
-              <div class="mobile-snapshot-files">
-                <article v-for="file in filteredFiles" :key="file.path">
-                  <code>{{ file.path }}</code>
-                  <span>{{ file.format }} · {{ file.size }} · {{ file.objects }} objects</span>
-                  <small>{{ file.digest }}</small>
-                </article>
-              </div>
-              <footer>
-                当前显示 {{ filteredFiles.length }} 个代表文件，共
-                {{ formatCount(snapshot.logical_file_count) }} 个文件
-              </footer>
+                <footer>
+                  <span>当前页 {{ fileQuery.data.value?.data.items.length ?? 0 }} 项</span>
+                  <PageCursor
+                    :has-previous="fileCursorHistory.length > 0"
+                    :has-next="Boolean(fileQuery.data.value?.data.next_cursor)"
+                    :loading="fileQuery.isFetching.value"
+                    @previous="previousFilePage"
+                    @next="nextFilePage"
+                  />
+                </footer>
+              </template>
             </section>
           </el-tab-pane>
 
@@ -419,50 +646,171 @@ async function openCommit(): Promise<void> {
             <section class="snapshot-activity">
               <header>
                 <h2>交付活动</h2>
-                <p>Snapshot 创建、区域物化和完整性校验记录</p>
+                <p>{{ snapshot.snapshot_id }}</p>
               </header>
-              <el-timeline>
-                <el-timeline-item
-                  timestamp="当前"
-                  :type="
-                    snapshot.state === 'ready'
-                      ? 'success'
-                      : snapshot.state === 'creating'
-                        ? 'warning'
-                        : 'danger'
-                  "
-                >
-                  <strong
-                    >{{ snapshotStateLabel(snapshot.state) }} ·
-                    {{ snapshotPhaseLabel(snapshot.phase) }}</strong
+              <ApiProblemAlert
+                v-if="activityQuery.error.value"
+                :error="activityQuery.error.value"
+                :retrying="activityQuery.isFetching.value"
+                @retry="activityQuery.refetch"
+              />
+              <el-skeleton v-if="activityQuery.isPending.value" :rows="6" animated />
+              <el-empty
+                v-else-if="!activityQuery.data.value?.data.items.length"
+                description="暂无交付活动"
+              />
+              <template v-else>
+                <el-timeline>
+                  <el-timeline-item
+                    v-for="activity in activityQuery.data.value?.data.items"
+                    :key="activity.activity_id"
+                    :timestamp="formatTime(activity.created_at_unix_ms)"
+                    :type="snapshotActivityTagType(activity.activity_type)"
                   >
-                  <p>
-                    {{
-                      snapshot.state === 'ready'
-                        ? `${snapshot.region} 已通过 Manifest 与对象完整性校验`
-                        : snapshot.state === 'creating'
-                          ? `${snapshot.region} 正在物化并校验目标数据`
-                          : `${snapshot.region} 的交付任务异常，等待重试`
-                    }}
-                  </p>
-                </el-timeline-item>
-                <el-timeline-item
-                  v-if="snapshot.state === 'ready'"
-                  timestamp="今天 16:13"
-                  type="success"
-                >
-                  <strong>{{ snapshot.region }} 物化完成</strong>
-                  <p>已写入 {{ snapshot.storage_volume_id }}</p>
-                </el-timeline-item>
-                <el-timeline-item timestamp="今天 16:09" type="primary">
-                  <strong>区域交付任务开始</strong>
-                  <p>目标区域 {{ snapshot.region }}</p>
-                </el-timeline-item>
-                <el-timeline-item :timestamp="formatTime(snapshot.created_at_unix_ms)">
-                  <strong>Snapshot 创建</strong>
-                  <p>固定到 {{ snapshot.commit_id }}</p>
-                </el-timeline-item>
-              </el-timeline>
+                    <strong>{{ snapshotActivityTypeLabel(activity.activity_type) }}</strong>
+                    <p>{{ activity.summary }}</p>
+                    <el-tag v-if="activity.phase" size="small" effect="plain">
+                      {{ snapshotPhaseLabel(activity.phase) }}
+                    </el-tag>
+                    <el-alert
+                      v-if="activity.issue"
+                      :title="activity.issue.message"
+                      :description="activity.issue.code"
+                      type="error"
+                      :closable="false"
+                    />
+                  </el-timeline-item>
+                </el-timeline>
+                <PageCursor
+                  :has-previous="activityCursorHistory.length > 0"
+                  :has-next="Boolean(activityQuery.data.value?.data.next_cursor)"
+                  :loading="activityQuery.isFetching.value"
+                  @previous="previousActivityPage"
+                  @next="nextActivityPage"
+                />
+              </template>
+            </section>
+          </el-tab-pane>
+
+          <el-tab-pane label="Dataset Profile" name="profile">
+            <section class="snapshot-profile">
+              <header>
+                <div>
+                  <h2>Dataset Profile</h2>
+                  <p>{{ snapshot.snapshot_id }}</p>
+                </div>
+                <el-tag v-if="profile" :type="datasetProfileTagType(profile.state)" effect="plain">
+                  {{ datasetProfileStateLabel(profile.state) }}
+                </el-tag>
+              </header>
+              <ApiProblemAlert
+                v-if="profileQuery.error.value"
+                :error="profileQuery.error.value"
+                :retrying="profileQuery.isFetching.value"
+                @retry="profileQuery.refetch"
+              />
+              <el-skeleton v-if="profileQuery.isPending.value" :rows="8" animated />
+              <template v-else-if="profile">
+                <el-alert
+                  v-if="profile.issue"
+                  :title="profile.issue.message"
+                  :description="profile.issue.code"
+                  type="error"
+                  :closable="false"
+                  show-icon
+                />
+                <el-empty
+                  v-if="profile.state === 'not_declared'"
+                  description="此 Snapshot 未声明 Dataset Profile"
+                />
+                <template v-else>
+                  <dl v-if="profile.summary" class="profile-summary">
+                    <div>
+                      <dt>格式</dt>
+                      <dd>{{ profile.summary.format_count }}</dd>
+                    </div>
+                    <div>
+                      <dt>文件</dt>
+                      <dd>{{ formatCount(profile.summary.logical_file_count) }}</dd>
+                    </div>
+                    <div>
+                      <dt>逻辑大小</dt>
+                      <dd>{{ formatBytes(profile.summary.logical_size_bytes) }}</dd>
+                    </div>
+                    <div>
+                      <dt>行数</dt>
+                      <dd>
+                        {{
+                          profile.summary.row_count ? formatCount(profile.summary.row_count) : '—'
+                        }}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>字段</dt>
+                      <dd>{{ profile.summary.field_count ?? '—' }}</dd>
+                    </div>
+                  </dl>
+
+                  <div class="profile-grid">
+                    <section v-if="profile.schema" class="profile-panel schema-panel">
+                      <header><h3>Schema</h3></header>
+                      <el-table :data="profile.schema.fields">
+                        <el-table-column prop="name" label="字段" min-width="140" />
+                        <el-table-column prop="data_type" label="类型" min-width="120" />
+                        <el-table-column label="可空" width="80">
+                          <template #default="scope">{{
+                            scope.row.nullable ? '是' : '否'
+                          }}</template>
+                        </el-table-column>
+                        <el-table-column prop="description" label="描述" min-width="160">
+                          <template #default="scope">{{ scope.row.description ?? '—' }}</template>
+                        </el-table-column>
+                      </el-table>
+                    </section>
+
+                    <section class="profile-panel profile-metrics">
+                      <header><h3>统计与质量</h3></header>
+                      <dl>
+                        <div v-if="profile.statistics?.row_count">
+                          <dt>统计行数</dt>
+                          <dd>{{ formatCount(profile.statistics.row_count) }}</dd>
+                        </div>
+                        <div v-if="profile.statistics?.column_count !== undefined">
+                          <dt>列数</dt>
+                          <dd>{{ profile.statistics.column_count }}</dd>
+                        </div>
+                        <div v-if="profile.statistics?.null_value_count">
+                          <dt>空值</dt>
+                          <dd>{{ formatCount(profile.statistics.null_value_count) }}</dd>
+                        </div>
+                        <div v-if="profile.statistics?.distinct_value_count">
+                          <dt>Distinct</dt>
+                          <dd>{{ formatCount(profile.statistics.distinct_value_count) }}</dd>
+                        </div>
+                        <div v-if="profile.quality">
+                          <dt>数据质量</dt>
+                          <dd>
+                            <el-tag :type="qualityTagType(profile.quality.state)" effect="plain">
+                              {{ qualityStateLabel(profile.quality.state) }}
+                            </el-tag>
+                          </dd>
+                        </div>
+                        <div v-if="profile.quality">
+                          <dt>检查</dt>
+                          <dd>
+                            {{ profile.quality.checks_passed }} /
+                            {{ profile.quality.checks_total }} 通过
+                          </dd>
+                        </div>
+                        <div v-if="profile.freshness">
+                          <dt>观测时间</dt>
+                          <dd>{{ formatTime(profile.freshness.observed_at_unix_ms) }}</dd>
+                        </div>
+                      </dl>
+                    </section>
+                  </div>
+                </template>
+              </template>
             </section>
           </el-tab-pane>
         </el-tabs>
@@ -478,19 +826,19 @@ async function openCommit(): Promise<void> {
 <style scoped>
 .snapshot-summary {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   border: 1px solid var(--line);
   background: var(--surface);
 }
 
 .snapshot-summary > div {
   min-width: 0;
-  min-height: 88px;
+  min-height: 84px;
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 7px;
-  padding: 16px;
+  padding: 14px;
   border-right: 1px solid var(--line);
 }
 
@@ -500,30 +848,34 @@ async function openCommit(): Promise<void> {
 
 .snapshot-summary span {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
 }
 
 .snapshot-summary strong {
   overflow-wrap: anywhere;
 }
 
-.ready-value {
+.state-value {
   display: flex;
   align-items: center;
   gap: 6px;
   color: var(--green);
 }
 
-.ready-value svg {
+.state-value svg {
   width: 16px;
 }
 
-.ready-value.is-creating {
+.state-value.is-creating {
   color: var(--amber);
 }
 
-.ready-value.is-abnormal {
+.state-value.is-abnormal {
   color: var(--red);
+}
+
+.snapshot-issue {
+  margin-top: 14px;
 }
 
 .snapshot-detail-shell {
@@ -580,9 +932,9 @@ async function openCommit(): Promise<void> {
   gap: 6px;
 }
 
-.snapshot-overview-grid {
+.overview-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.55fr) minmax(280px, 0.75fr);
+  grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.8fr);
   gap: 18px;
   margin-top: 18px;
 }
@@ -592,7 +944,8 @@ async function openCommit(): Promise<void> {
 }
 
 .snapshot-subsection > header,
-.snapshot-files > header {
+.snapshot-files > header,
+.snapshot-profile > header {
   min-height: 68px;
   display: flex;
   align-items: center;
@@ -607,209 +960,250 @@ async function openCommit(): Promise<void> {
 .snapshot-files h2,
 .snapshot-files p,
 .snapshot-activity h2,
-.snapshot-activity p {
+.snapshot-activity p,
+.snapshot-profile h2,
+.snapshot-profile p,
+.profile-panel h3 {
   margin: 0;
 }
 
 .snapshot-subsection h2,
 .snapshot-files h2,
-.snapshot-activity h2 {
+.snapshot-activity h2,
+.snapshot-profile h2 {
   font-size: 14px;
 }
 
 .snapshot-subsection p,
 .snapshot-files p,
-.snapshot-activity p {
+.snapshot-activity p,
+.snapshot-profile p {
   margin-top: 4px;
   color: var(--muted);
   font-size: 11px;
 }
 
-.snapshot-subsection > header > span {
-  color: var(--green);
-  font-size: 11px;
-  font-weight: 650;
-}
-
-.placement-table__header,
-.placement-table > div {
-  display: grid;
-  grid-template-columns: 130px 88px minmax(160px, 1fr) 120px minmax(160px, 1fr);
-  align-items: center;
-  gap: 10px;
-  padding: 12px 16px;
-}
-
-.placement-table__header {
-  color: var(--muted);
-  background: var(--surface-soft);
-  font-size: 10px;
-}
-
-.placement-table > div:not(.placement-table__header) {
-  min-height: 58px;
-  border-top: 1px solid var(--line);
-  font-size: 11px;
-}
-
-.placement-table > div:nth-child(2) {
-  border-top: 0;
-}
-
-.placement-table strong,
-.placement-integrity {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.placement-table strong svg,
-.placement-integrity svg {
-  width: 14px;
-  color: var(--green);
-}
-
-.snapshot-policy dl,
-.snapshot-identity dl {
+.placement-facts,
+.integrity-section dl,
+.diff-section dl,
+.identity-section dl,
+.profile-summary,
+.profile-metrics dl {
   margin: 0;
 }
 
-.snapshot-policy dl > div {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 11px 16px;
+.placement-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.placement-facts > div,
+.integrity-section dl > div,
+.identity-section dl > div,
+.profile-metrics dl > div {
+  min-width: 0;
+  padding: 14px 16px;
+  border-right: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
 }
 
-.snapshot-policy dl > div:last-child {
+.placement-facts > div:nth-child(2n),
+.identity-section dl > div:nth-child(4n),
+.profile-metrics dl > div:nth-child(2n) {
+  border-right: 0;
+}
+
+.placement-facts > div:nth-last-child(-n + 2),
+.identity-section dl > div,
+.profile-metrics dl > div:nth-last-child(-n + 2) {
   border-bottom: 0;
 }
 
-.snapshot-policy dt {
+.placement-facts dt,
+.integrity-section dt,
+.diff-section dt,
+.identity-section dt,
+.profile-summary dt,
+.profile-metrics dt {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
 }
 
-.snapshot-policy dd {
-  margin: 0;
-  font-size: 11px;
+.placement-facts dd,
+.integrity-section dd,
+.diff-section dd,
+.identity-section dd,
+.profile-summary dd,
+.profile-metrics dd {
+  margin: 6px 0 0;
   font-weight: 650;
-  text-align: right;
   overflow-wrap: anywhere;
 }
 
-.snapshot-identity {
+.placement-facts dd {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.placement-facts svg {
+  width: 15px;
+  color: var(--green);
+}
+
+.integrity-section :deep(.el-progress) {
+  padding: 18px 16px 4px;
+}
+
+.integrity-section dl {
+  padding: 8px 16px 14px;
+}
+
+.integrity-section dl > div {
+  padding: 9px 0;
+  border: 0;
+}
+
+.diff-section,
+.identity-section {
   margin-top: 18px;
 }
 
-.snapshot-identity dl {
+.diff-section dl {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
-.snapshot-identity dl > div {
+.diff-section dl > div {
   min-width: 0;
   padding: 14px 16px;
   border-right: 1px solid var(--line);
 }
 
-.snapshot-identity dl > div:last-child {
+.diff-section dl > div:last-child {
   border-right: 0;
 }
 
-.snapshot-identity dt {
-  margin-bottom: 5px;
-  color: var(--muted);
-  font-size: 10px;
+.identity-section dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
-.snapshot-identity dd {
-  margin: 0;
-  font-weight: 650;
-  overflow-wrap: anywhere;
-}
-
-.snapshot-files {
+.snapshot-files,
+.snapshot-activity,
+.snapshot-profile {
   border: 1px solid var(--line);
 }
 
-.snapshot-files > header .el-input {
-  width: min(320px, 45vw);
-}
-
-.snapshot-file-table__header,
-.snapshot-file-table > div {
+.snapshot-files > header form {
+  width: min(430px, 100%);
   display: grid;
-  grid-template-columns: minmax(300px, 1.5fr) 100px 100px 80px minmax(190px, 1fr);
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
 }
 
-.snapshot-file-table__header {
-  color: var(--muted);
-  background: var(--surface-soft);
-  font-size: 10px;
-}
-
-.snapshot-file-table > div:not(.snapshot-file-table__header) {
-  min-height: 54px;
-  border-top: 1px solid var(--line);
-  font-size: 11px;
-}
-
-.snapshot-file-table > div:nth-child(2) {
-  border-top: 0;
-}
-
-.snapshot-file-table > div > span:first-child {
-  min-width: 0;
+.file-path {
   display: flex;
   align-items: center;
   gap: 7px;
 }
 
-.snapshot-file-table svg {
-  width: 14px;
+.file-path svg {
   flex: 0 0 auto;
+  width: 15px;
   color: var(--green);
 }
 
-.snapshot-file-table code {
-  overflow-wrap: anywhere;
-}
-
 .snapshot-files > footer {
-  padding: 12px 16px;
+  min-height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
   border-top: 1px solid var(--line);
   color: var(--muted);
   font-size: 11px;
 }
 
-.mobile-snapshot-files {
+.mobile-files {
   display: none;
 }
 
 .snapshot-activity {
-  max-width: 820px;
-  padding: 8px 8px 0;
+  padding: 18px 20px;
 }
 
 .snapshot-activity > header {
-  margin-bottom: 24px;
+  margin-bottom: 20px;
 }
 
-.snapshot-activity strong {
-  font-size: 13px;
+.snapshot-activity :deep(.el-timeline) {
+  padding-left: 8px;
 }
 
-.snapshot-activity :deep(.el-timeline-item__timestamp) {
+.snapshot-activity :deep(.el-timeline-item__content) > p {
+  margin: 5px 0 8px;
   color: var(--muted);
 }
 
-@media (max-width: 1100px) {
+.snapshot-activity :deep(.el-alert) {
+  margin-top: 10px;
+}
+
+.snapshot-activity :deep(.page-cursor) {
+  justify-content: flex-end;
+}
+
+.profile-summary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  border-bottom: 1px solid var(--line);
+}
+
+.profile-summary > div {
+  min-width: 0;
+  padding: 14px 16px;
+  border-right: 1px solid var(--line);
+}
+
+.profile-summary > div:last-child {
+  border-right: 0;
+}
+
+.profile-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.7fr);
+  gap: 18px;
+  padding: 18px;
+}
+
+.profile-panel {
+  border: 1px solid var(--line);
+}
+
+.profile-panel > header {
+  padding: 13px 15px;
+  border-bottom: 1px solid var(--line);
+}
+
+.profile-panel h3 {
+  font-size: 13px;
+}
+
+.profile-metrics dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.snapshot-profile > .el-alert,
+.snapshot-files :deep(.api-problem),
+.snapshot-activity :deep(.api-problem),
+.snapshot-profile :deep(.api-problem) {
+  margin: 14px 16px;
+}
+
+@media (max-width: 1000px) {
   .snapshot-summary {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -818,132 +1212,146 @@ async function openCommit(): Promise<void> {
     border-right: 0;
   }
 
-  .snapshot-summary > div:nth-child(n + 4) {
-    border-top: 1px solid var(--line);
-  }
-
-  .snapshot-overview-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .placement-table__header,
-  .placement-table > div {
-    grid-template-columns: 120px 84px minmax(150px, 1fr) 110px minmax(150px, 1fr);
-  }
-}
-
-@media (max-width: 700px) {
-  .snapshot-summary {
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .snapshot-summary > div,
-  .snapshot-summary > div:nth-child(3) {
-    min-height: 76px;
-    border-right: 1px solid var(--line);
-    border-top: 1px solid var(--line);
-  }
-
-  .snapshot-summary > div:nth-child(-n + 2) {
-    border-top: 0;
-  }
-
-  .snapshot-summary > div:nth-child(even) {
-    border-right: 0;
-  }
-
-  .snapshot-summary > div:last-child {
-    grid-column: 1 / -1;
-    border-right: 0;
-  }
-
-  .snapshot-detail-shell {
-    padding: 8px 12px 18px;
+  .snapshot-summary > div:nth-child(-n + 3) {
+    border-bottom: 1px solid var(--line);
   }
 
   .fixed-commit-band {
-    grid-template-columns: 36px minmax(0, 1fr);
+    grid-template-columns: 42px minmax(0, 1fr) auto;
+  }
+
+  .fixed-commit-band__tags {
+    grid-column: 2 / 4;
+  }
+
+  .overview-grid,
+  .profile-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .snapshot-detail-shell {
+    padding-inline: 12px;
+  }
+
+  .desktop-files {
+    display: none;
+  }
+
+  .mobile-files {
+    display: grid;
+  }
+
+  .mobile-files article {
+    min-width: 0;
+    display: grid;
+    gap: 5px;
+    padding: 13px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .mobile-files code,
+  .mobile-files span,
+  .mobile-files small {
+    overflow-wrap: anywhere;
+  }
+
+  .mobile-files span,
+  .mobile-files small {
+    color: var(--muted);
+    font-size: 10px;
+  }
+
+  .diff-section dl,
+  .profile-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .diff-section dl > div:nth-child(3),
+  .profile-summary > div:nth-child(3) {
+    border-right: 0;
+  }
+
+  .diff-section dl > div:nth-child(-n + 3),
+  .profile-summary > div:nth-child(-n + 3) {
+    border-bottom: 1px solid var(--line);
+  }
+
+  .identity-section dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .identity-section dl > div:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--line);
+  }
+}
+
+@media (max-width: 560px) {
+  .snapshot-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .snapshot-summary > div:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .snapshot-summary > div:nth-child(3) {
+    border-right: 1px solid var(--line);
+  }
+
+  .snapshot-summary > div:nth-child(-n + 4) {
+    border-bottom: 1px solid var(--line);
+  }
+
+  .fixed-commit-band {
+    grid-template-columns: 38px minmax(0, 1fr);
   }
 
   .fixed-commit-band__tags,
   .fixed-commit-band .el-button {
-    grid-column: 1 / -1;
+    grid-column: 2;
+    justify-self: start;
   }
 
-  .snapshot-subsection > header,
-  .snapshot-files > header {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .placement-table > .placement-table__header {
-    display: none;
-  }
-
-  .placement-table > div:not(.placement-table__header) {
-    grid-template-columns: 1fr auto;
-    gap: 8px 12px;
-    padding: 14px;
-  }
-
-  .placement-table > div > code,
-  .placement-table > div > span:nth-child(4),
-  .placement-integrity {
-    grid-column: 1 / -1;
-  }
-
-  .snapshot-identity dl {
+  .placement-facts,
+  .identity-section dl,
+  .profile-metrics dl,
+  .profile-summary {
     grid-template-columns: 1fr;
   }
 
-  .snapshot-policy dl > div {
-    flex-direction: column;
-    gap: 5px;
-  }
-
-  .snapshot-policy dd {
-    max-width: 100%;
-    text-align: left;
-  }
-
-  .snapshot-identity dl > div {
+  .placement-facts > div,
+  .identity-section dl > div,
+  .profile-metrics dl > div,
+  .profile-summary > div {
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
 
-  .snapshot-identity dl > div:last-child {
+  .placement-facts > div:last-child,
+  .identity-section dl > div:last-child,
+  .profile-metrics dl > div:last-child,
+  .profile-summary > div:last-child {
     border-bottom: 0;
   }
 
-  .snapshot-files > header .el-input {
+  .snapshot-files > header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .snapshot-files > header form {
     width: 100%;
   }
 
-  .desktop-snapshot-files {
-    display: none;
+  .snapshot-files > footer {
+    align-items: stretch;
+    flex-direction: column;
   }
 
-  .mobile-snapshot-files {
-    display: block;
-  }
-
-  .mobile-snapshot-files article {
-    padding: 14px;
-    border-bottom: 1px solid var(--line);
-  }
-
-  .mobile-snapshot-files code,
-  .mobile-snapshot-files span,
-  .mobile-snapshot-files small {
-    display: block;
-    overflow-wrap: anywhere;
-  }
-
-  .mobile-snapshot-files span,
-  .mobile-snapshot-files small {
-    margin-top: 6px;
-    color: var(--muted);
-    font-size: 10px;
+  .snapshot-files > footer :deep(.page-cursor) {
+    justify-content: space-between;
   }
 }
 </style>

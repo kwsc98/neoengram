@@ -14,6 +14,8 @@ import {
   ElIcon,
   ElInput,
   ElOption,
+  ElProgress,
+  ElRadio,
   ElSelect,
   ElSegmented,
   ElSkeleton,
@@ -23,6 +25,7 @@ import {
   ElTableColumn,
   ElTag,
   ElTabs,
+  ElTimeline,
   ElTooltip,
 } from 'element-plus';
 import { createPinia } from 'pinia';
@@ -46,6 +49,8 @@ const elementComponents = [
   ElIcon,
   ElInput,
   ElOption,
+  ElProgress,
+  ElRadio,
   ElSelect,
   ElSegmented,
   ElSkeleton,
@@ -55,6 +60,7 @@ const elementComponents = [
   ElTableColumn,
   ElTag,
   ElTabs,
+  ElTimeline,
   ElTooltip,
 ] as const;
 

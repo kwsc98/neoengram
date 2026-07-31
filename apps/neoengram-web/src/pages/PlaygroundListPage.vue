@@ -10,12 +10,9 @@ import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
 import {
-  activePreCommitLabel,
-  getActivePreCommit,
   playgroundAvailabilityLabel,
   playgroundAvailabilityTagType,
-  preCommitScopeKey,
-} from '@/features/precommit/prototype';
+} from '@/features/precommit/status';
 import { formatTime } from '@/utils/format';
 
 const route = useRoute();
@@ -59,7 +56,29 @@ const playgroundQuery = useQuery({
 });
 
 watch(projectId, (value, previous) => {
-  if (value !== previous && artifactId.value) artifactId.value = '';
+  if (value !== previous && artifactId.value && String(route.query.project_id ?? '') !== value) {
+    artifactId.value = '';
+  }
+  cursor.value = undefined;
+  cursorHistory.value = [];
+});
+
+watch(
+  [tenantId, () => route.query],
+  ([, query]) => {
+    projectId.value = String(query.project_id ?? '');
+    artifactId.value = String(query.artifact_id ?? '');
+    searchInput.value = String(query.q ?? '');
+    search.value = searchInput.value;
+    cursor.value = undefined;
+    cursorHistory.value = [];
+  },
+  { deep: true },
+);
+
+watch(artifactId, () => {
+  cursor.value = undefined;
+  cursorHistory.value = [];
 });
 
 async function applyFilters(): Promise<void> {
@@ -100,10 +119,6 @@ async function openPlayground(
       playgroundId: playground,
     },
   });
-}
-
-function rowPreCommitKey(project: string, artifact: string, playground: string): string {
-  return preCommitScopeKey(tenantId.value, project, artifact, playground);
 }
 </script>
 
@@ -183,29 +198,8 @@ function rowPreCommitKey(project: string, artifact: string, playground: string):
                 <el-tag :type="playgroundAvailabilityTagType(scope.row.state)" effect="plain">
                   {{ playgroundAvailabilityLabel(scope.row.state) }}
                 </el-tag>
-                <el-tag
-                  v-if="
-                    getActivePreCommit(
-                      rowPreCommitKey(
-                        scope.row.project_id,
-                        scope.row.artifact_id,
-                        scope.row.playground_id,
-                      ),
-                    )
-                  "
-                  type="warning"
-                  effect="plain"
-                >
-                  Pre-commit ·
-                  {{
-                    activePreCommitLabel(
-                      rowPreCommitKey(
-                        scope.row.project_id,
-                        scope.row.artifact_id,
-                        scope.row.playground_id,
-                      ),
-                    )
-                  }}
+                <el-tag v-if="scope.row.active_precommit_id" type="warning" effect="plain">
+                  存在活动 Pre-commit
                 </el-tag>
                 <span v-else>空闲</span>
               </div>
@@ -257,27 +251,11 @@ function rowPreCommitKey(project: string, artifact: string, playground: string):
                 effect="plain"
                 >{{ playgroundAvailabilityLabel(playground.state) }}</el-tag
               ><el-tag
-                v-if="
-                  getActivePreCommit(
-                    rowPreCommitKey(
-                      playground.project_id,
-                      playground.artifact_id,
-                      playground.playground_id,
-                    ),
-                  )
-                "
+                v-if="playground.active_precommit_id"
                 type="warning"
                 size="small"
                 effect="plain"
-                >{{
-                  activePreCommitLabel(
-                    rowPreCommitKey(
-                      playground.project_id,
-                      playground.artifact_id,
-                      playground.playground_id,
-                    ),
-                  )
-                }}</el-tag
+                >活动 Pre-commit</el-tag
               ><ArrowRight
             /></span>
           </button>

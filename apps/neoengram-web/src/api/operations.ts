@@ -2,6 +2,8 @@ import { apiClient } from './client';
 import { toApiProblem } from './problem';
 import type {
   ApiVersionResponse,
+  ApproveStorageEnrollmentRequest,
+  ApproveStorageEnrollmentResponse,
   CancelPreCommitRequest,
   CancelPreCommitResponse,
   CommitPlaygroundRequest,
@@ -16,6 +18,8 @@ import type {
   CreateSnapshotResponse,
   CreateStorageVolumeRequest,
   CreateStorageVolumeResponse,
+  CreateStorageEnrollmentTokenRequest,
+  CreateStorageEnrollmentTokenResponse,
   FinalizeAddJobResponse,
   HealthResponse,
   CreateTenantRequest,
@@ -51,12 +55,17 @@ import type {
   QueryStorageVolumeListRequest,
   QueryStorageVolumeListResponse,
   QueryStorageVolumeResponse,
+  QueryStorageEnrollmentListRequest,
+  QueryStorageEnrollmentListResponse,
+  QueryStorageEnrollmentResponse,
   QueryTenantListRequest,
   QueryTenantListResponse,
   QueryTenantResponse,
   QueryJobResponse,
   RestartPreCommitRequest,
   RestartPreCommitResponse,
+  RejectStorageEnrollmentRequest,
+  RejectStorageEnrollmentResponse,
   RetrySnapshotDeliveryRequest,
   RetrySnapshotDeliveryResponse,
   StartPreCommitRequest,
@@ -143,6 +152,62 @@ export async function createStorageVolume(
 ): Promise<ApiResult<CreateStorageVolumeResponse>> {
   return unwrap(
     await apiClient.POST('/api/storage/volume/create', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function createStorageEnrollmentToken(
+  request: CreateStorageEnrollmentTokenRequest,
+): Promise<ApiResult<CreateStorageEnrollmentTokenResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/storage/enrollment/token/create', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryStorageEnrollmentList(
+  request: QueryStorageEnrollmentListRequest,
+): Promise<ApiResult<QueryStorageEnrollmentListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/storage/enrollment/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryStorageEnrollment(
+  tenantId: string,
+  storageEnrollmentId: string,
+): Promise<ApiResult<QueryStorageEnrollmentResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/storage/enrollment/query', {
+      body: { tenant_id: tenantId, storage_enrollment_id: storageEnrollmentId },
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function approveStorageEnrollment(
+  request: ApproveStorageEnrollmentRequest,
+): Promise<ApiResult<ApproveStorageEnrollmentResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/storage/enrollment/approve', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function rejectStorageEnrollment(
+  request: RejectStorageEnrollmentRequest,
+): Promise<ApiResult<RejectStorageEnrollmentResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/storage/enrollment/reject', {
       body: request,
       params: versionHeader,
     }),

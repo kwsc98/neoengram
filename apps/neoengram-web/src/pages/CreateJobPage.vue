@@ -2,7 +2,7 @@
 import { Back, CirclePlus, RefreshLeft } from '@element-plus/icons-vue';
 import { useMutation } from '@tanstack/vue-query';
 import { ElMessage } from 'element-plus';
-import { computed, reactive } from 'vue';
+import { computed, reactive, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { createAddJob } from '@/api/operations';
@@ -45,7 +45,31 @@ function clearErrors(): void {
 
 function resetJobId(): void {
   form.jobId = `job-${globalThis.crypto.randomUUID()}`;
+  mutation.reset();
 }
+
+watch(
+  () => [
+    tenantId.value,
+    form.projectId,
+    form.artifactId,
+    form.playgroundId,
+    form.revision,
+    form.digest,
+    form.deadline instanceof Date ? form.deadline.getTime() : '',
+    form.all,
+    form.pathsText,
+  ],
+  () => {
+    resetJobId();
+    clearErrors();
+  },
+);
+
+watch(
+  () => form.jobId,
+  () => mutation.reset(),
+);
 
 async function backToPlayground(): Promise<void> {
   if (!hasSourcePlayground.value) return;
@@ -61,6 +85,7 @@ async function backToPlayground(): Promise<void> {
 }
 
 async function submit(): Promise<void> {
+  if (mutation.isPending.value) return;
   clearErrors();
   const paths = parsePathLines(form.pathsText);
   const parsed = createJobFormSchema.safeParse({ ...form, tenantId: tenantId.value, paths });
@@ -88,6 +113,7 @@ async function submit(): Promise<void> {
   } catch {
     return;
   }
+  resetJobId();
   recentJobs.remember(request.tenant_id, request.job_id);
   ElMessage.success(result.data.replayed ? '已返回同一请求的幂等结果' : 'Add Job 已创建');
   await router.push({

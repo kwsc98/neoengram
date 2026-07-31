@@ -358,6 +358,26 @@ pub struct AuditEvent {
     pub occurred_at_unix_ms: UnixMillis,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AgentEnrollmentAuditKind {
+    Approved,
+    Rejected,
+    ReplacementApproved,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentEnrollmentAuditEvent {
+    pub event_id: String,
+    pub kind: AgentEnrollmentAuditKind,
+    pub tenant_id: neoengram_protocol::TenantId,
+    pub enrollment_id: neoengram_protocol::AgentEnrollmentId,
+    pub storage_volume_id: neoengram_protocol::StorageVolumeId,
+    pub decision_request_id: neoengram_protocol::RequestId,
+    pub resource_version: neoengram_protocol::ResourceVersion,
+    pub actor: neoengram_protocol::PrincipalRef,
+    pub occurred_at_unix_ms: UnixMillis,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ValidatedMetadata {
     pub manifests: Vec<Manifest>,
