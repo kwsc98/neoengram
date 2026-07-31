@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: neoengram-agent-config-volume-safe-slug
+  namespace: neoengram-agent-example
+  annotations:
+    neoengram.io/storage-volume-id: volume-example
+  labels:
+    app.kubernetes.io/name: neoengram-agent
+    app.kubernetes.io/component: storage-agent
+    app.kubernetes.io/instance: volume-safe-slug
+    neoengram.io/volume-slug: volume-safe-slug
+immutable: true
+data:
+  agent.yaml: |
+    schema_version: 1
+    protocol_version: 1
+    central_endpoint: https://neoengram.example.internal
+    tenant_id: tenant-example
+    edge_cluster_id: edge-example
+    storage_volume_id: volume-example
+    region: cn-example-1
+    storage:
+      backend_type: pvc
+      access_mode: read_write_many
+      mount_path: /volume
+      state_dir: /var/lib/neoengram-agent
+      marker_file: /volume/.neoengram-volume-marker
+      expected_volume_marker: volume-example
+      pvc_reference:
+        namespace: neoengram-agent-example
+        claim_name: replace-with-existing-business-pvc
+    registration:
+      approval_required: true
+      token_id: replace-with-storage-enrollment-token-id
+      bootstrap_token_file: /var/run/secrets/neoengram/bootstrap-token
+    session:
+      heartbeat_interval_seconds: 10
+      reconnect_max_delay_seconds: 30
+    logging:
+      format: json
+      level: info

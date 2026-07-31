@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use neoengram_protocol::{control_schema, metadata_schema, s3_schema};
+use neoengram_protocol::{control_schema, enrollment_schema, metadata_schema, s3_schema};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("schemas/v1");
@@ -9,6 +9,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_schema(
         output.join("control-envelope.schema.json"),
         &control_schema(),
+    )?;
+    write_schema(
+        output.join("agent-enrollment.schema.json"),
+        &enrollment_schema(),
     )?;
     write_schema(
         output.join("metadata-batch.schema.json"),

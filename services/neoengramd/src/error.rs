@@ -6,6 +6,16 @@ use neoengram_protocol::ProtocolError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CentralErrorCode {
     Unauthorized,
+    EnrollmentNotFound,
+    EnrollmentIdReused,
+    EnrollmentExpired,
+    EnrollmentDecisionConflict,
+    EnrollmentProbeFailed,
+    BootstrapDenied,
+    ApprovalRequired,
+    AgentIdentityMismatch,
+    AgentSessionActive,
+    VolumeOwnerConflict,
     JobNotFound,
     JobAlreadyExists,
     JobIdReused,
@@ -30,6 +40,16 @@ impl CentralErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unauthorized => "AUTHORIZATION_DENIED",
+            Self::EnrollmentNotFound => "AGENT_ENROLLMENT_NOT_FOUND",
+            Self::EnrollmentIdReused => "AGENT_ENROLLMENT_ID_REUSED",
+            Self::EnrollmentExpired => "AGENT_ENROLLMENT_EXPIRED",
+            Self::EnrollmentDecisionConflict => "AGENT_ENROLLMENT_DECISION_CONFLICT",
+            Self::EnrollmentProbeFailed => "AGENT_ENROLLMENT_PROBE_FAILED",
+            Self::BootstrapDenied => "AGENT_BOOTSTRAP_DENIED",
+            Self::ApprovalRequired => "AGENT_APPROVAL_REQUIRED",
+            Self::AgentIdentityMismatch => "AGENT_IDENTITY_MISMATCH",
+            Self::AgentSessionActive => "AGENT_SESSION_ACTIVE",
+            Self::VolumeOwnerConflict => "VOLUME_OWNER_CONFLICT",
             Self::JobNotFound => "JOB_NOT_FOUND",
             Self::JobAlreadyExists => "JOB_ALREADY_EXISTS",
             Self::JobIdReused => "JOB_ID_REUSED",

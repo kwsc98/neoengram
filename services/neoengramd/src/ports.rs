@@ -8,7 +8,8 @@ use neoengram_protocol::{
 };
 
 use crate::{
-    AuditEvent, AuthorizationRequest, CentralResult, DurableObject, IndexKey, IndexPublishOutcome,
+    AgentEnrollmentAuditEvent, AgentRegistryRecord, AgentRegistryReplacementRecords, AuditEvent,
+    AuthorizationRequest, CentralResult, DurableObject, IndexKey, IndexPublishOutcome,
     IndexPublishRequest, JobKey, JobRecord, StagedMetadataBatch,
 };
 
@@ -31,6 +32,89 @@ pub enum AssignmentReserveOutcome {
 pub enum AssignmentPublishOutcome {
     Published,
     AlreadyPublished,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentRegistryInsertOutcome {
+    Inserted(AgentRegistryRecord),
+    Existing(AgentRegistryRecord),
+}
+
+/// Durable aggregate repository for the one-Volume enrollment vertical slice.
+#[async_trait]
+pub trait AgentRegistryRepository: Send + Sync {
+    async fn get(
+        &self,
+        enrollment_id: &neoengram_protocol::AgentEnrollmentId,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_by_agent(
+        &self,
+        agent_id: &neoengram_protocol::AgentId,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_by_token_request_id(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        token_request_id: &neoengram_protocol::RequestId,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_by_token_digest(
+        &self,
+        token_digest: &neoengram_core::ContentDigest,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_by_bootstrap_request_id(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        bootstrap_request_id: &neoengram_protocol::RequestId,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_by_decision_request_id(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        decision_request_id: &neoengram_protocol::RequestId,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_by_installation_id(
+        &self,
+        installation_id: &neoengram_protocol::AgentInstallationId,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_by_public_key_fingerprint(
+        &self,
+        public_key_fingerprint: &neoengram_core::ContentDigest,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_current_by_volume(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        storage_volume_id: &neoengram_protocol::StorageVolumeId,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_pvc_binding(
+        &self,
+        edge_cluster_id: &neoengram_protocol::EdgeClusterId,
+        pvc_identity_digest: &neoengram_protocol::PvcIdentityDigest,
+    ) -> CentralResult<Option<crate::PvcVolumeBinding>>;
+    async fn expire_stale_token_intents(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        storage_volume_id: &neoengram_protocol::StorageVolumeId,
+        edge_cluster_id: &neoengram_protocol::EdgeClusterId,
+        pvc_identity_digest: &neoengram_protocol::PvcIdentityDigest,
+        now_unix_ms: neoengram_protocol::UnixMillis,
+    ) -> CentralResult<usize>;
+    /// Returns immutable decision audit events persisted in the same CAS aggregates.
+    async fn enrollment_audit_events(&self) -> CentralResult<Vec<AgentEnrollmentAuditEvent>>;
+    /// Inserts only a fresh `TokenIssued` intent; later states must use the CAS methods.
+    async fn insert_or_load(
+        &self,
+        record: AgentRegistryRecord,
+    ) -> CentralResult<AgentRegistryInsertOutcome>;
+    async fn replace(
+        &self,
+        expected_resource_version: u64,
+        record: AgentRegistryRecord,
+    ) -> CentralResult<AgentRegistryRecord>;
+    async fn activate_replacement(
+        &self,
+        expected_previous_resource_version: u64,
+        revoked: AgentRegistryRecord,
+        expected_replacement_resource_version: u64,
+        replacement: AgentRegistryRecord,
+    ) -> CentralResult<AgentRegistryReplacementRecords>;
 }
 
 #[async_trait]
@@ -105,6 +189,11 @@ pub trait IndexPublisher: Send + Sync {
 pub trait AuditSink: Send + Sync {
     /// Records one deterministic event ID. Replay retains the first observed timestamp.
     async fn record(&self, event: AuditEvent) -> CentralResult<bool>;
+    /// Records one deterministic enrollment decision event across retry/replay.
+    async fn record_enrollment_decision(
+        &self,
+        event: AgentEnrollmentAuditEvent,
+    ) -> CentralResult<bool>;
 }
 
 pub trait Clock: Send + Sync {
@@ -120,6 +209,7 @@ pub struct AuthorityStore {
     objects: Arc<dyn ObjectCatalog>,
     publisher: Arc<dyn IndexPublisher>,
     audit: Arc<dyn AuditSink>,
+    agent_registry: Option<Arc<dyn AgentRegistryRepository>>,
     capabilities: AuthorityCapabilities,
 }
 
@@ -142,6 +232,7 @@ impl AuthorityStore {
             objects,
             publisher,
             audit,
+            agent_registry: None,
             capabilities,
         }
     }
@@ -176,6 +267,18 @@ impl AuthorityStore {
         self.audit.clone()
     }
 
+    /// Adds the optional enrollment/Agent registry vertical slice to this composition root.
+    #[must_use]
+    pub fn with_agent_registry(mut self, registry: Arc<dyn AgentRegistryRepository>) -> Self {
+        self.agent_registry = Some(registry);
+        self
+    }
+
+    #[must_use]
+    pub fn agent_registry(&self) -> Option<Arc<dyn AgentRegistryRepository>> {
+        self.agent_registry.clone()
+    }
+
     #[must_use]
     pub const fn capabilities(&self) -> AuthorityCapabilities {
         self.capabilities
@@ -187,6 +290,8 @@ pub struct AuthorityCapabilities {
     pub single_process: bool,
     pub database_enforced_tenant_isolation: bool,
     pub high_availability: bool,
+    /// True when every enrollment decision and its immutable audit event share one CAS write.
+    pub atomic_agent_registry_audit: bool,
 }
 
 impl AuthorityCapabilities {
@@ -194,11 +299,13 @@ impl AuthorityCapabilities {
         single_process: true,
         database_enforced_tenant_isolation: false,
         high_availability: false,
+        atomic_agent_registry_audit: true,
     };
 
     pub const SQLITE: Self = Self {
         single_process: true,
         database_enforced_tenant_isolation: false,
         high_availability: false,
+        atomic_agent_registry_audit: true,
     };
 }

@@ -33,6 +33,19 @@ import {
   retrySnapshotDelivery,
   startPlaygroundPreCommit,
 } from '@/api/operations';
+import type { PreCommitView } from '@/api/types';
+import { playgrounds, storageVolumes } from '@/mocks/data';
+
+async function waitForPreCommitTerminal(
+  tenantId: string,
+  precommitId: string,
+): Promise<PreCommitView> {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const precommit = (await queryPlaygroundPreCommit(tenantId, precommitId)).data.precommit;
+    if (precommit.state !== 'running') return precommit;
+  }
+  throw new Error(`Pre-commit ${precommitId} did not reach a terminal state`);
+}
 
 describe('tenant-scoped public resource operations', () => {
   it('queries authorized tenants and creates a replayable Tenant', async () => {
@@ -106,6 +119,101 @@ describe('tenant-scoped public resource operations', () => {
     );
   });
 
+  it('rejects new placement on a non-Ready StorageVolume', async () => {
+    await expect(
+      createPlayground({
+        tenant_id: 'tenant-a',
+        project_id: 'project-vision',
+        artifact_id: 'road-scenes',
+        playground_id: 'degraded-placement',
+        storage_volume_id: 'volume-shanghai-archive',
+        display_name: '不可用放置测试',
+        base_commit_id: 'commit-main-3',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
+
+    await expect(
+      createSnapshot({
+        tenant_id: 'tenant-a',
+        project_id: 'project-vision',
+        artifact_id: 'road-scenes',
+        commit_id: 'commit-main-2',
+        storage_volume_id: 'volume-shanghai-archive',
+        snapshot_request_id: 'snapshot-degraded-placement',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
+
+    const unavailableVolume = storageVolumes.find(
+      (volume) => volume.storage_volume_id === 'volume-shanghai-archive',
+    );
+    if (!unavailableVolume) throw new Error('expected mock StorageVolume');
+    unavailableVolume.state = 'unavailable';
+
+    await expect(
+      createPlayground({
+        tenant_id: 'tenant-a',
+        project_id: 'project-vision',
+        artifact_id: 'road-scenes',
+        playground_id: 'unavailable-placement',
+        storage_volume_id: unavailableVolume.storage_volume_id,
+        display_name: '不可用放置测试',
+        base_commit_id: 'commit-main-3',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
+
+    await expect(
+      createSnapshot({
+        tenant_id: 'tenant-a',
+        project_id: 'project-vision',
+        artifact_id: 'road-scenes',
+        commit_id: 'commit-main-2',
+        storage_volume_id: unavailableVolume.storage_volume_id,
+        snapshot_request_id: 'snapshot-unavailable-placement',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
+  });
+
+  it('rejects Commit when the Playground Head changed after Pre-commit start', async () => {
+    const playground = (
+      await queryPlayground('tenant-a', 'project-vision', 'road-scenes', 'labeling')
+    ).data.playground;
+    const started = await startPlaygroundPreCommit({
+      tenant_id: playground.tenant_id,
+      project_id: playground.project_id,
+      artifact_id: playground.artifact_id,
+      playground_id: playground.playground_id,
+      precommit_request_id: 'precommit-head-conflict',
+      expected_index_version: playground.index_version,
+    });
+    const ready = await waitForPreCommitTerminal(
+      playground.tenant_id,
+      started.data.precommit.precommit_id,
+    );
+    if (!ready.candidate_index_version) throw new Error('expected candidate IndexVersion');
+    const stored = playgrounds.find(
+      (item) =>
+        item.tenant_id === playground.tenant_id &&
+        item.project_id === playground.project_id &&
+        item.artifact_id === playground.artifact_id &&
+        item.playground_id === playground.playground_id,
+    );
+    if (!stored) throw new Error('expected mock Playground');
+    stored.head_commit_id = 'commit-main-2';
+
+    await expect(
+      commitPlayground({
+        tenant_id: playground.tenant_id,
+        project_id: playground.project_id,
+        artifact_id: playground.artifact_id,
+        playground_id: playground.playground_id,
+        commit_request_id: 'commit-head-conflict',
+        precommit_id: ready.precommit_id,
+        expected_candidate_index_version: ready.candidate_index_version,
+        message: '此提交必须被 CAS 拒绝',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'HEAD_COMMIT_CONFLICT' });
+  });
+
   it('returns a single-parent Commit graph and rejects a cursor bound to another filter', async () => {
     const graph = await queryArtifactCommitGraph('tenant-a', 'project-vision', 'road-scenes');
     expect(graph.data.graph.head_commit_id).toBe('commit-main-3');
@@ -149,7 +257,10 @@ describe('tenant-scoped public resource operations', () => {
       access_mode: 'read_write_many' as const,
       pvc_reference: { namespace: 'neoengram-test', claim_name: 'evaluation-data' },
     };
-    expect((await createStorageVolume(storageRequest)).data.replayed).toBe(false);
+    expect((await createStorageVolume(storageRequest)).data).toMatchObject({
+      replayed: false,
+      storage_volume: { state: 'unavailable' },
+    });
     expect((await createStorageVolume(storageRequest)).data.replayed).toBe(true);
     expect(
       (await queryStorageVolume(storageRequest.tenant_id, storageRequest.storage_volume_id)).data
@@ -194,7 +305,7 @@ describe('tenant-scoped public resource operations', () => {
       project_id: 'project-vision',
       artifact_id: 'evaluation-set',
       playground_id: 'review',
-      storage_volume_id: storageRequest.storage_volume_id,
+      storage_volume_id: 'volume-guangzhou-delivery',
       display_name: '发布前复核',
       base_commit_id: derivedGraph.data.graph.nodes[0]!.commit_id,
     };
@@ -215,6 +326,26 @@ describe('tenant-scoped public resource operations', () => {
       status: 409,
       code: 'PLAYGROUND_NOT_READY',
     });
+    expect(
+      (
+        await queryPlayground(
+          playgroundRequest.tenant_id,
+          playgroundRequest.project_id,
+          playgroundRequest.artifact_id,
+          playgroundRequest.playground_id,
+        )
+      ).data.playground.state,
+    ).toBe('creating');
+    expect(
+      (
+        await queryPlayground(
+          playgroundRequest.tenant_id,
+          playgroundRequest.project_id,
+          playgroundRequest.artifact_id,
+          playgroundRequest.playground_id,
+        )
+      ).data.playground.state,
+    ).toBe('ready');
 
     const readyPlayground = (
       await queryPlayground('tenant-a', 'project-vision', 'road-scenes', 'labeling')
@@ -228,10 +359,12 @@ describe('tenant-scoped public resource operations', () => {
       expected_index_version: readyPlayground.index_version,
     });
     expect(startedPreCommit.data.precommit.state).toBe('running');
-    const readyPreCommit = (
-      await queryPlaygroundPreCommit('tenant-a', startedPreCommit.data.precommit.precommit_id)
-    ).data.precommit;
+    const readyPreCommit = await waitForPreCommitTerminal(
+      'tenant-a',
+      startedPreCommit.data.precommit.precommit_id,
+    );
     expect(readyPreCommit.state).toBe('ready');
+    expect(readyPreCommit.phase).toBe('idle');
     if (!readyPreCommit.candidate_index_version) throw new Error('expected candidate IndexVersion');
     const readyCommitRequest = {
       tenant_id: 'tenant-a',
@@ -272,9 +405,10 @@ describe('tenant-scoped public resource operations', () => {
       precommit_request_id: 'precommit-duplicate-tag',
       expected_index_version: readyPlayground.index_version,
     });
-    const duplicateReady = (
-      await queryPlaygroundPreCommit('tenant-a', duplicateStarted.data.precommit.precommit_id)
-    ).data.precommit;
+    const duplicateReady = await waitForPreCommitTerminal(
+      'tenant-a',
+      duplicateStarted.data.precommit.precommit_id,
+    );
     if (!duplicateReady.candidate_index_version) throw new Error('expected duplicate candidate');
     await expect(
       commitPlayground({
@@ -292,7 +426,7 @@ describe('tenant-scoped public resource operations', () => {
       project_id: 'project-vision',
       artifact_id: 'road-scenes',
       commit_id: committed.data.commit.commit_id,
-      storage_volume_id: storageRequest.storage_volume_id,
+      storage_volume_id: 'volume-guangzhou-delivery',
       snapshot_request_id: 'snapshot-request-evaluation-guangzhou',
     };
     const firstSnapshot = await createSnapshot(snapshotRequest);
@@ -307,10 +441,23 @@ describe('tenant-scoped public resource operations', () => {
     expect(reusedPlacement.data.replayed).toBe(false);
     expect(reusedPlacement.data.placement_reused).toBe(true);
     expect(reusedPlacement.data.snapshot.snapshot_id).toBe(firstSnapshot.data.snapshot.snapshot_id);
-    expect(
-      (await querySnapshot(snapshotRequest.tenant_id, firstSnapshot.data.snapshot.snapshot_id)).data
-        .snapshot.region,
-    ).toBe('cn-guangzhou');
+    const creatingSnapshot = (
+      await querySnapshot(snapshotRequest.tenant_id, firstSnapshot.data.snapshot.snapshot_id)
+    ).data.snapshot;
+    expect(creatingSnapshot).toMatchObject({
+      region: 'cn-guangzhou',
+      state: 'creating',
+      phase: 'materializing',
+      integrity: { state: 'pending' },
+    });
+    const readySnapshot = (
+      await querySnapshot(snapshotRequest.tenant_id, firstSnapshot.data.snapshot.snapshot_id)
+    ).data.snapshot;
+    expect(readySnapshot).toMatchObject({
+      state: 'ready',
+      phase: 'idle',
+      integrity: { state: 'verified' },
+    });
 
     const secondSnapshot = await createSnapshot({
       ...snapshotRequest,
@@ -341,6 +488,7 @@ describe('tenant-scoped public resource operations', () => {
       await queryPlaygroundPreCommit('tenant-a', failing.data.precommit.precommit_id)
     ).data.precommit;
     expect(abnormal.state).toBe('abnormal');
+    expect(abnormal.phase).toBe('idle');
     expect(abnormal.blockers).toHaveLength(1);
 
     const restarted = await restartPlaygroundPreCommit({
@@ -357,6 +505,19 @@ describe('tenant-scoped public resource operations', () => {
     });
     expect(cancelled.data.precommit.state).toBe('cancelled');
 
+    const restartedCancelled = await restartPlaygroundPreCommit({
+      tenant_id: 'tenant-a',
+      precommit_id: cancelled.data.precommit.precommit_id,
+      restart_request_id: 'restart-precommit-cancelled-01',
+      expected_index_version: abnormalPlayground.index_version,
+    });
+    expect(restartedCancelled.data.precommit).toMatchObject({
+      precommit_id: cancelled.data.precommit.precommit_id,
+      state: 'running',
+      phase: 'queued',
+      attempt: 3,
+    });
+
     const playground = (
       await queryPlayground('tenant-a', 'project-vision', 'road-scenes', 'labeling')
     ).data.playground;
@@ -368,9 +529,23 @@ describe('tenant-scoped public resource operations', () => {
       precommit_request_id: 'precommit-metadata-ready',
       expected_index_version: playground.index_version,
     });
-    const ready = (await queryPlaygroundPreCommit('tenant-a', started.data.precommit.precommit_id))
-      .data.precommit;
+    const observedPhases = [started.data.precommit.phase];
+    let ready = started.data.precommit;
+    while (ready.state === 'running') {
+      ready = (await queryPlaygroundPreCommit('tenant-a', started.data.precommit.precommit_id)).data
+        .precommit;
+      observedPhases.push(ready.phase);
+    }
+    expect(observedPhases).toEqual([
+      'queued',
+      'scanning',
+      'hashing',
+      'uploading',
+      'validating',
+      'idle',
+    ]);
     expect(ready.state).toBe('ready');
+    expect(ready.phase).toBe('idle');
 
     const files = await queryPlaygroundFileList({
       tenant_id: 'tenant-a',
@@ -429,6 +604,25 @@ describe('tenant-scoped public resource operations', () => {
         })
       ).data.replayed,
     ).toBe(true);
+
+    const firstRetryQuery = await querySnapshot('tenant-a', 'snap-road-main2-sha-01');
+    expect(firstRetryQuery.data.snapshot).toMatchObject({
+      state: 'creating',
+      phase: 'materializing',
+      integrity: { state: 'pending' },
+    });
+    await expect(
+      querySnapshotFileList({
+        tenant_id: 'tenant-a',
+        snapshot_id: 'snap-road-main2-sha-01',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'SNAPSHOT_NOT_READY' });
+    const completedRetry = await querySnapshot('tenant-a', 'snap-road-main2-sha-01');
+    expect(completedRetry.data.snapshot).toMatchObject({
+      state: 'ready',
+      phase: 'idle',
+      integrity: { state: 'verified' },
+    });
 
     const readyFiles = await querySnapshotFileList({
       tenant_id: 'tenant-a',

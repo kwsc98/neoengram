@@ -10,15 +10,19 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+fs2.workspace = true
 neoengram-core = { path = "../neoengram-core" }
 neoengram-engine = { path = "../neoengram-engine" }
 neoengram-protocol = { path = "../neoengram-protocol" }
+rusqlite.workspace = true
+rustix.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
 neoengramd = { path = "../../services/neoengramd" }
-serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 
 [lints]

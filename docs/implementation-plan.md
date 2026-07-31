@@ -5,8 +5,10 @@
 > 中心化 Agent 的用户角色、公开资源语义、页面和交互口径见
 > [`centralized-agent-product.md`](centralized-agent-product.md)。
 
-最后更新：2026-07-30
-当前阶段：`0.2.0` P0 与中心 `AuthorityStore`/SQLite 默认后端已实现；生产 transport、PG/MySQL 与对象存储适配器待实现
+最后更新：2026-07-31
+当前阶段：`0.2.0` P0、中心 `AuthorityStore`/SQLite 默认后端，以及 Volume-bound Agent enrollment、
+本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；生产 daemon/transport、PG/MySQL、
+对象存储适配器与真实 Kubernetes 验收待实现
 
 ## 1. 产品目标
 
@@ -74,6 +76,8 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 | 授权范围 | tenant → project → artifact → ref；服务端 RBAC，默认拒绝 | 已确定设计，待实现 |
 | 对象访问 | 中心 API 鉴权后签发短期、对象/会话范围的 Signed URL | 已确定设计，待实现 |
 | 训练快照 | `artifact_id + commit_id` 的固定、单 Region/单 StorageVolume Snapshot；可选 sidecar 描述 | 产品原型已确认，生产待实现 |
+| Kubernetes Agent 放置 | 一个业务 PVC = 一个 StorageVolume = 一个常驻 AgentInstance；固定挂载 `/volume`，Agent 状态使用独立 PVC | 0.0.1 部署边界已冻结，daemon 待实现 |
+| Agent 注册与接管 | Agent 主动出站注册并等待首次审批；0.0.1 仅支持 generation + 人工 takeover 的 cooperative fencing | 状态语义已冻结，强 fencing 待原型 |
 | 历史保留 | ref、pin/hold、active lease/session/有效 ObjectTicket 作为 GC roots；隔离期后再回收 | 已确定设计，待实现 |
 | 规模与可靠性 | 千万文件、上亿 Chunk、PB 级 payload；99.9%、RPO 0、RTO 1 小时 | 后续基准验证 |
 
@@ -151,8 +155,13 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
   `AuthorityStore`、InMemory 契约后端和默认 SQLite 持久 CAS。
   `JobPrepared.candidate_digest` 绑定 assignment identity、base IndexVersion、descriptors 和 extensions。
   两者都是 library-only，不包含网络；SQLite authority 支持单进程生产持久化，不支持 HA/RLS。
-- SQLite authority 独立使用 `authority.sqlite3`/`authority.lock`，不复用 Standalone format v8；只接受
-  当前 `application_id`、`user_version` 和 record format，不迁移、双读或回退旧格式。
+- SQLite authority 独立使用 `authority.sqlite3`/`authority.lock`，不复用 Standalone format v8；当前
+  `user_version = 2`，只提供 v1 到 v2 的原子窄迁移以增加独立 Storage Enrollment 审计表。其他
+  `application_id`、schema 版本、未知表或 record format 均失败关闭，不做双读或回退。
+- Volume-bound Agent Registry 使用独立 `agent-registry.sqlite3`/`agent-registry.lock`，与 R1
+  authority 在同一单进程 `AuthorityStore` 中组合，不共享 SQLite 文件。审批决策的规范审计事件
+  嵌入同一 Registry CAS aggregate 并与决策原子持久化；Authority audit 表仅是后续兼容投影，
+  两个 SQLite 文件之间没有跨库事务承诺。
 
 ### 3.3 质量基线
 
@@ -183,7 +192,7 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 | --- | --- | --- |
 | 客户端数据面 | 工作区、Index、FastCDC/WholeFile Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
 | 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | SQLite adapter 继续收敛到 engine 分页 ports |
-| 中心/Agent | protocol v1、Ledger、异步 AuthorityStore、中心状态机与 SQLite 单节点权威 | HTTP/mTLS、PostgreSQL HA/RLS、授权、调度与生产 daemon |
+| 中心/Agent | protocol v1、内存状态机、Agent 身份/Tenant Ledger SQLite adapter、mount probe、enrollment registry、异步 AuthorityStore 与中心 SQLite 单节点权威 | HTTP/mTLS、证书签发、PostgreSQL HA/RLS、真实授权/调度、生产 daemon 与 Kubernetes E2E |
 | 远端数据面 | 缺块协商、短期票据、receipt/durability DTO 与 ports | 真实 S3、幂等上传、Signed PUT/GET、对象生命周期 |
 | 读取面 | checkout、权限快照和固定 Commit FUSE | Snapshot、Shard 分页、mount lease、训练读取票据 |
 | 安全治理 | 本地路径安全和普通 Unix 权限 | JWT、RBAC、RLS、租户隔离、审计、密钥轮换和威胁模型 |
@@ -244,14 +253,17 @@ transport 交给 Agent；Agent 访问 Playground/NFS 和中心 S3 数据面，�
 - v1 的远端对象单元是独立 Object；Pack、hash fanout 和可验证 Pack range 是 P5 的存储优化，
   不得被 P2 的 Chunk 上传接口隐含承诺。
 
-节点侧 Agent 和中心 Job/Assignment/Finalize 状态机已有 library + 内存适配器；多租户生产部署、
+节点侧 Agent 和中心 Job/Assignment/Finalize 状态机已有 library + 内存适配器；一 PVC 一 Agent 纵切还
+增加了持久 SQLite 身份/Ledger、mount probe 和中心 Agent Registry adapter。多租户生产部署、
 多 EdgeCluster、CPU/NFS 调度、Gateway 和跨卷 checkout 仍处设计阶段，详细草案见
 [`agent-central-control.md`](agent-central-control.md)。该文档不代表当前已经存在网络 Agent、
 中心 PostgreSQL、生产 lease/fencing、Gateway 或 daemon。
 
 远程 Agent 设计已冻结以下存储约束：一个 Tenant 每个 EdgeCluster 可有多个 StorageVolume，一个
 Volume 可承载该 Tenant 的多个 Artifact，一个 Artifact 每集群最多一个 active `ArtifactPlacement`；
-StorageVolume 是 RW ownership/fencing 单元，每个 owner generation 只有一个活动 RW Agent。Managed
+0.0.1 Kubernetes 剖面把一个业务 PVC、一条 StorageVolume 记录和一个常驻 AgentInstance 一一绑定，
+Agent 完整挂载 `/volume`，身份与 Ledger 使用独立状态 PVC。StorageVolume 是 RW ownership/fencing
+单元，每个 owner generation 只有一个活动 RW Agent。Managed
 不可变对象的最终权威是中心 S3；NFS 只保留 Playground、journal 与可重建 cache。Artifact 根必须
 唯一且不重叠，禁止跨 Artifact hardlink；更换 NFS 必须经过
 freeze/copy/verify/CAS/drain/cleanup 迁移状态机。
@@ -260,6 +272,18 @@ Kubernetes 用户 Pod 只挂载本集群 NFS 上单个 Playground/Snapshot 的�
 `PodMountBinding` 描述和校验已有 Pod 的容器路径、StorageVolume、视图目录与 RO/RW 模式；Pod 的
 实际 I/O 经节点 NFS/CSI 客户端直达 NFS，不经过 Agent。Pod、NAS、PV、PVC 和 CSI volume 的创建、
 下发与回收不在本设计范围内；Snapshot 强制 RO，Playground RW 由部署策略协调。
+
+Agent 使用一次性、限定 EdgeCluster/StorageVolume 的 bootstrap credential 主动出站注册。中心先创建
+`pending_approval` 记录；TenantAdmin 在存储页核对声明范围、身份摘要和脱敏 mount probe 后首次审批。审批前
+不得建立业务 session、领取 Assignment 或成为 Volume Owner。Pod 正常重建复用独立状态 PVC 中的
+Agent 身份；状态盘丢失或接管时必须申请新的 AgentInstance。0.0.1 不部署 Operator，Agent 不使用
+ServiceAccount token 或 Kubernetes API，也不创建 Service、Ingress 或 HPA；Deployment 固定
+`replicas=1` 和 `strategy=Recreate`。
+
+0.0.1 的接管属于 cooperative fencing：先冻结全卷新写，人工停止并确认旧 Agent 退出，撤销旧身份和
+租约，再以 CAS 推进 credential/config/session/mount/owner generation，审批新 Agent 并运行 journal
+恢复。Recreate 和 generation 不是存储侧强隔离；无法证明旧写者已停止时，Volume 必须保持
+unavailable，禁止自动接管。
 
 ## 6. 分阶段实现计划
 
@@ -431,7 +455,7 @@ ID 和完整引用图校验。
 
 | 资源范围 | 代表性 action |
 | --- | --- |
-| Tenant | `tenant.read`、`tenant.manage`、`member.manage`、`audit.read`、`retention.manage` |
+| Tenant | `tenant.read`、`tenant.manage`、`member.manage`、`audit.read`、`retention.manage`、`storage.enrollment.create/read/review` |
 | Project | `project.read`、`project.manage`、`artifact.create` |
 | Artifact | `metadata.read`、`object.read`、`object.write`、`commit.publish`、`snapshot.read`、`snapshot.lease`、`artifact.manage`、`retention.manage` |
 | Ref | `ref.read`、`ref.update` |
@@ -442,7 +466,7 @@ ref，并按表中规则向下生效：
 
 | 角色 | 允许的最小 action | 绑定/继承规则 |
 | --- | --- | --- |
-| `TenantAdmin` | tenant/member/project/artifact/audit/retention 管理，以及其租户内全部仓库 action | tenant 绑定向下继承；不跨 tenant |
+| `TenantAdmin` | tenant/member/project/artifact/audit/retention 管理、`storage.enrollment.create/read/review`，以及其租户内全部仓库 action | tenant 绑定向下继承；不跨 tenant；只有该内置角色默认拥有 enrollment 权限 |
 | `ProjectAdmin` | project 管理、`artifact.create/manage`、项目审计读取 | project 绑定只管理该项目；数据读写和 ref 更新仍需仓库角色 |
 | `ArtifactReader` | `metadata.read`、`object.read`、`snapshot.read`、`snapshot.lease`、`ref.read` | artifact 绑定覆盖其 refs；ref 绑定只覆盖该 ref |
 | `ArtifactWriter` | Reader 全部 action，加 `object.write`、`commit.publish`、`ref.update` | artifact 绑定可更新其全部 refs；ref 绑定只能更新该 ref |
@@ -620,6 +644,11 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 - 故障注入：网络中断、进程终止、重复请求、对象损坏、数据库故障、密钥轮换、并发 CAS 和 GC。
 - Agent 存储布局：每 Artifact/EdgeCluster 单 active placement、同租户多 Artifact/Volume、根路径非重叠、
   NFS 别名拒绝、单 Volume RW Owner、全卷 failover、跨 Artifact hardlink 拒绝和显式 placement 迁移。
+- Agent Kubernetes 部署：一个业务 PVC/StorageVolume 只有一个 `replicas=1`、Recreate Agent，业务卷固定
+  挂到 `/volume`，身份/Ledger 使用独立 RWO 状态 PVC；无 ServiceAccount token、Kubernetes API、
+  Operator、Service、Ingress 或 HPA。
+- Agent 注册与接管：bootstrap 重放保持同一 pending 身份；首次审批前无 Job/Owner 权限；重启复用身份，
+  状态盘丢失创建新身份；人工 takeover 按 freeze/stop/revoke/CAS/recover 顺序且无法确认旧写者时失败关闭。
 - Kubernetes 挂载：已有 Pod 的容器路径到本集群物理 NFS、StorageVolume、ArtifactPlacement 和
   `PodMountBinding` 精确视图目录的映射，以及 sibling/objects/journal/Volume root 逃逸拒绝。
 - 规模基准：路径数、Chunk 数、Manifest/Shard 大小、峰值 RSS、吞吐、写放大、恢复时间和 SLO。
@@ -661,3 +690,4 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-27 | 合并 R1.1/R1.2，完成 `AuthorityStore` 与默认 SQLite 中心权威后端 | 全部中心端口可跨重开恢复并运行同一后端契约；SQLite 限单进程且无 RLS/HA，PG/MySQL 后端保持独立 schema/migration |
 | 2026-07-30 | 基于 Web Mock 冻结中心化 Agent 产品定义 | Artifact 无固定放置；Commit 只从 Playground 发起；用户界面仅展示 Commit/Tags；Snapshot 固定单 Region/Volume；Pre-commit 与 Playground 主可用性正交 |
 | 2026-07-30 | 冻结派生 Artifact 与多区域 Snapshot 产品身份 | Artifact 只能为空或从同 Tenant 明确 Commit 派生；Snapshot 使用独立 ID，同一 Commit 可有多个单 Region/Volume Snapshot；Playground/Snapshot 主状态统一为 Creating/Ready/Abnormal |
+| 2026-07-31 | 冻结 0.0.1 Kubernetes Agent 部署和接管边界 | 一个业务 PVC/StorageVolume 对应一个常驻 AgentInstance；固定 `/volume`、独立状态 PVC、主动注册和首次审批；无 Operator/Kubernetes API，故障接管仅承诺 generation + 人工流程的 cooperative fencing |

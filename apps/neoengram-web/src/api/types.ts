@@ -24,6 +24,29 @@ export type CreateStorageVolumeResponse = components['schemas']['CreateStorageVo
 export type StorageVolumeView = components['schemas']['StorageVolumeView'];
 export type StorageBackendType = components['schemas']['StorageBackendType'];
 export type StorageAccessMode = components['schemas']['StorageAccessMode'];
+export type CreateStorageEnrollmentTokenRequest =
+  components['schemas']['CreateStorageEnrollmentTokenRequest'];
+export type CreateStorageEnrollmentTokenResponse =
+  components['schemas']['CreateStorageEnrollmentTokenResponse'];
+export type QueryStorageEnrollmentListRequest =
+  components['schemas']['QueryStorageEnrollmentListRequest'];
+export type QueryStorageEnrollmentListResponse =
+  components['schemas']['QueryStorageEnrollmentListResponse'];
+export type QueryStorageEnrollmentRequest = components['schemas']['QueryStorageEnrollmentRequest'];
+export type QueryStorageEnrollmentResponse =
+  components['schemas']['QueryStorageEnrollmentResponse'];
+export type ApproveStorageEnrollmentRequest =
+  components['schemas']['ApproveStorageEnrollmentRequest'];
+export type ApproveStorageEnrollmentResponse =
+  components['schemas']['ApproveStorageEnrollmentResponse'];
+export type RejectStorageEnrollmentRequest =
+  components['schemas']['RejectStorageEnrollmentRequest'];
+export type RejectStorageEnrollmentResponse =
+  components['schemas']['RejectStorageEnrollmentResponse'];
+export type StorageEnrollmentState = components['schemas']['StorageEnrollmentState'];
+export type StorageEnrollmentAccessMode = components['schemas']['StorageEnrollmentAccessMode'];
+export type StorageEnrollmentView = components['schemas']['StorageEnrollmentView'];
+export type StorageEnrollmentProbeSummary = components['schemas']['StorageEnrollmentProbeSummary'];
 export type QueryProjectListRequest = components['schemas']['QueryProjectListRequest'];
 export type QueryProjectListResponse = components['schemas']['QueryProjectListResponse'];
 export type ProjectSummary = components['schemas']['ProjectSummary'];
@@ -102,4 +125,7 @@ export type QuerySnapshotDatasetProfileResponse =
   components['schemas']['QuerySnapshotDatasetProfileResponse'];
 export type SnapshotState = components['schemas']['SnapshotState'];
 export type SnapshotPhase = components['schemas']['SnapshotPhase'];
+export type SnapshotIntegrityState = components['schemas']['SnapshotIntegritySummary']['state'];
+export type SnapshotActivityType = components['schemas']['SnapshotActivityView']['activity_type'];
+export type DatasetProfileState = components['schemas']['DatasetProfileState'];
 export type SnapshotView = components['schemas']['SnapshotView'];

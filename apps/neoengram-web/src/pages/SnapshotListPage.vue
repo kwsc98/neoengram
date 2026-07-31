@@ -13,7 +13,7 @@ import {
   snapshotPhaseLabel,
   snapshotStateLabel,
   snapshotStateTagType,
-} from '@/features/snapshots/prototype';
+} from '@/features/snapshots/status';
 import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
@@ -50,7 +50,25 @@ const snapshotQuery = useQuery({
 });
 
 watch(projectId, (value, previous) => {
-  if (value !== previous && artifactId.value) artifactId.value = '';
+  if (value !== previous && artifactId.value && String(route.query.project_id ?? '') !== value) {
+    artifactId.value = '';
+  }
+});
+
+watch(
+  [tenantId, () => route.query],
+  ([, query]) => {
+    projectId.value = String(query.project_id ?? '');
+    artifactId.value = String(query.artifact_id ?? '');
+    cursor.value = undefined;
+    cursorHistory.value = [];
+  },
+  { deep: true },
+);
+
+watch([projectId, artifactId], () => {
+  cursor.value = undefined;
+  cursorHistory.value = [];
 });
 
 async function applyFilters(): Promise<void> {

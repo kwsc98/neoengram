@@ -129,7 +129,7 @@ assert_manifest_excludes \
   'neoengram-(engine|fs|standalone|agent)|rusqlite|reqwest|hyper|axum|sqlx|diesel|aws-sdk'
 assert_manifest_excludes \
   crates/neoengram-agent/Cargo.toml \
-  'neoengram-standalone|rusqlite|sqlx|diesel'
+  'neoengram-standalone|sqlx|diesel'
 assert_manifest_excludes \
   services/neoengramd/Cargo.toml \
   'neoengram-(engine|fs|standalone)|rusqlite|reqwest|hyper|axum|diesel|aws-sdk'
@@ -189,40 +189,45 @@ if rg -n '^  /v[0-9]+/|^  /api/v[0-9]+/|^  /api/[^:]+:[^:]+:$' "$openapi"; then
   fail "public API paths must use unversioned module/action hierarchy"
 fi
 business_paths=(
-  /api/system/version/query \
-  /api/tenant/list/query \
-  /api/tenant/query \
-  /api/tenant/create \
-  /api/storage/volume/list/query \
-  /api/storage/volume/query \
-  /api/storage/volume/create \
-  /api/project/list/query \
-  /api/artifact/list/query \
-  /api/artifact/query \
-  /api/artifact/create \
-  /api/artifact/commit/graph/query \
-  /api/artifact/commit/diff/query \
-  /api/playground/list/query \
-  /api/playground/query \
-  /api/playground/create \
-  /api/playground/precommit/start \
-  /api/playground/precommit/query \
-  /api/playground/precommit/restart \
-  /api/playground/precommit/cancel \
-  /api/playground/file/list/query \
-  /api/playground/change/list/query \
-  /api/playground/file/metadata/query \
-  /api/playground/dataset/profile/query \
-  /api/playground/commit/create \
-  /api/snapshot/list/query \
-  /api/snapshot/query \
-  /api/snapshot/create \
-  /api/snapshot/delivery/retry \
-  /api/snapshot/file/list/query \
-  /api/snapshot/activity/list/query \
-  /api/snapshot/dataset/profile/query \
-  /api/job/add/create \
-  /api/job/query \
+  /api/system/version/query
+  /api/tenant/list/query
+  /api/tenant/query
+  /api/tenant/create
+  /api/storage/volume/list/query
+  /api/storage/volume/query
+  /api/storage/volume/create
+  /api/storage/enrollment/token/create
+  /api/storage/enrollment/list/query
+  /api/storage/enrollment/query
+  /api/storage/enrollment/approve
+  /api/storage/enrollment/reject
+  /api/project/list/query
+  /api/artifact/list/query
+  /api/artifact/query
+  /api/artifact/create
+  /api/artifact/commit/graph/query
+  /api/artifact/commit/diff/query
+  /api/playground/list/query
+  /api/playground/query
+  /api/playground/create
+  /api/playground/precommit/start
+  /api/playground/precommit/query
+  /api/playground/precommit/restart
+  /api/playground/precommit/cancel
+  /api/playground/file/list/query
+  /api/playground/change/list/query
+  /api/playground/file/metadata/query
+  /api/playground/dataset/profile/query
+  /api/playground/commit/create
+  /api/snapshot/list/query
+  /api/snapshot/query
+  /api/snapshot/create
+  /api/snapshot/delivery/retry
+  /api/snapshot/file/list/query
+  /api/snapshot/activity/list/query
+  /api/snapshot/dataset/profile/query
+  /api/job/add/create
+  /api/job/query
   /api/job/add/finalize
 )
 for path in "${business_paths[@]}" /health/live /health/ready; do
@@ -237,7 +242,7 @@ rg -q '^    ApiVersion:$' "$openapi" || fail "the API version header is not defi
 rg -q '^    BearerAuth:$' "$openapi" || fail "the public Bearer security scheme is not defined"
 rg -q '^    ProblemDetails:$' "$openapi" || fail "RFC 9457 Problem Details is not defined"
 authenticated_business_method_count=$((${#business_paths[@]} - 1))
-[[ "$(rg -c "#\/components\/parameters\/ApiVersion'" "$openapi")" == \
+[[ "$(rg -c '#/components/parameters/ApiVersion' "$openapi")" == \
   "$authenticated_business_method_count" ]] || \
   fail "every public business method must require the API version header"
 [[ "$(rg -c 'BearerAuth: \[\]' "$openapi")" == "$authenticated_business_method_count" ]] || \
@@ -271,5 +276,7 @@ if [[ "$cli_sources" != "$expected_cli_sources" ]]; then
   echo "$cli_sources" >&2
   fail "neoengram must contain only the CLI adapter"
 fi
+
+bash deploy/kubernetes/agent/check-manifests.sh
 
 echo "architecture checks passed"

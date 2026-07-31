@@ -1,0 +1,622 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentEnrollmentEnvelope",
+  "description": "Transport-neutral envelope used by a future bootstrap/admin adapter.",
+  "type": "object",
+  "properties": {
+    "protocol_version": {
+      "$ref": "#/$defs/ProtocolVersion",
+      "const": 1
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/AgentEnrollmentTokenCreateRequest"
+        },
+        "type": {
+          "type": "string",
+          "const": "agent.enrollment.token.create"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/AgentBootstrapRequest"
+        },
+        "type": {
+          "type": "string",
+          "const": "agent.bootstrap"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/AgentBootstrapAccepted"
+        },
+        "type": {
+          "type": "string",
+          "const": "agent.bootstrap.accepted"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/AgentEnrollmentApprovalRequest"
+        },
+        "type": {
+          "type": "string",
+          "const": "agent.enrollment.approval"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/AgentMountStatusReport"
+        },
+        "type": {
+          "type": "string",
+          "const": "agent.mount.status"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    }
+  ],
+  "required": [
+    "protocol_version"
+  ],
+  "unevaluatedProperties": true,
+  "$defs": {
+    "AgentBootId": {
+      "description": "A validated agent boot ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AgentBootstrapAccepted": {
+      "description": "Stable identity returned after a valid, idempotent bootstrap.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "agent_mount_id": {
+          "$ref": "#/$defs/AgentMountId"
+        },
+        "bootstrap_request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "enrollment_id": {
+          "$ref": "#/$defs/AgentEnrollmentId"
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "resource_version": {
+          "$ref": "#/$defs/ResourceVersion"
+        },
+        "review_expires_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "state": {
+          "$ref": "#/$defs/AgentEnrollmentState"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "bootstrap_request_id",
+        "enrollment_id",
+        "agent_id",
+        "agent_mount_id",
+        "state",
+        "mount_generation",
+        "resource_version",
+        "review_expires_at_unix_ms",
+        "replayed"
+      ]
+    },
+    "AgentBootstrapProbe": {
+      "description": "Bootstrap-time evidence that can be projected into a public enrollment summary.",
+      "type": "object",
+      "properties": {
+        "access_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MountAccessMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fsync_supported": {
+          "type": "boolean"
+        },
+        "health": {
+          "$ref": "#/$defs/ResourceHealth"
+        },
+        "marker_matches": {
+          "type": "boolean"
+        },
+        "mount_boundary_detected": {
+          "type": "boolean"
+        },
+        "mount_identity_digest": {
+          "$ref": "#/$defs/AgentMountIdentityDigest"
+        },
+        "observed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "observed_volume_marker": {
+          "description": "Internal opaque marker value used by the center to verify `marker_matches`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VolumeMarkerId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rename_supported": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "marker_matches",
+        "mount_boundary_detected",
+        "mount_identity_digest",
+        "rename_supported",
+        "fsync_supported",
+        "health",
+        "observed_at_unix_ms"
+      ]
+    },
+    "AgentBootstrapRequest": {
+      "description": "First Agent contact. The opaque token resolves all Tenant and Volume scope centrally.",
+      "type": "object",
+      "properties": {
+        "agent_version": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "bootstrap_request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "bootstrap_token": {
+          "type": "string",
+          "maxLength": 2048,
+          "minLength": 32
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "uniqueItems": true
+        },
+        "edge_cluster_id": {
+          "$ref": "#/$defs/EdgeClusterId"
+        },
+        "installation_id": {
+          "$ref": "#/$defs/AgentInstallationId"
+        },
+        "probe": {
+          "description": "Sanitized mount evidence. Raw paths, filesystem IDs, and mount sources stay Agent-local.",
+          "$ref": "#/$defs/AgentBootstrapProbe"
+        },
+        "public_key_fingerprint": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "supported_protocol_versions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProtocolVersion"
+          },
+          "maxItems": 256
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "volume_descriptor_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "bootstrap_request_id",
+        "bootstrap_token",
+        "installation_id",
+        "tenant_id",
+        "edge_cluster_id",
+        "storage_volume_id",
+        "volume_descriptor_digest",
+        "agent_version",
+        "supported_protocol_versions",
+        "public_key_fingerprint",
+        "probe"
+      ]
+    },
+    "AgentEnrollmentApprovalRequest": {
+      "description": "Tenant-admin decision; the authenticated actor is supplied by the future adapter.",
+      "type": "object",
+      "properties": {
+        "confirm_replacement": {
+          "type": "boolean"
+        },
+        "decision": {
+          "$ref": "#/$defs/AgentEnrollmentDecision"
+        },
+        "decision_request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "enrollment_id": {
+          "$ref": "#/$defs/AgentEnrollmentId"
+        },
+        "expected_resource_version": {
+          "$ref": "#/$defs/ResourceVersion"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "enrollment_id",
+        "decision_request_id",
+        "expected_resource_version",
+        "decision",
+        "confirm_replacement"
+      ]
+    },
+    "AgentEnrollmentDecision": {
+      "type": "string",
+      "enum": [
+        "approve",
+        "reject"
+      ]
+    },
+    "AgentEnrollmentId": {
+      "description": "A validated agent enrollment ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AgentEnrollmentState": {
+      "type": "string",
+      "enum": [
+        "token_issued",
+        "pending_approval",
+        "approved",
+        "rejected",
+        "expired",
+        "revoked"
+      ]
+    },
+    "AgentEnrollmentTokenCreateRequest": {
+      "description": "Platform-created token intent. Reserved IDs are central-owned and never chosen by an Agent.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "agent_mount_id": {
+          "$ref": "#/$defs/AgentMountId"
+        },
+        "bootstrap_token": {
+          "type": "string",
+          "maxLength": 2048,
+          "minLength": 32
+        },
+        "created_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "desired_access_mode": {
+          "$ref": "#/$defs/MountAccessMode"
+        },
+        "edge_cluster_id": {
+          "$ref": "#/$defs/EdgeClusterId"
+        },
+        "enrollment_id": {
+          "$ref": "#/$defs/AgentEnrollmentId"
+        },
+        "expected_volume_marker": {
+          "$ref": "#/$defs/VolumeMarkerId"
+        },
+        "expires_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "pvc_identity_digest": {
+          "$ref": "#/$defs/PvcIdentityDigest"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "token_id": {
+          "$ref": "#/$defs/AgentEnrollmentTokenId"
+        },
+        "token_request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "volume_descriptor_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "token_id",
+        "token_request_id",
+        "enrollment_id",
+        "tenant_id",
+        "edge_cluster_id",
+        "storage_volume_id",
+        "volume_descriptor_digest",
+        "pvc_identity_digest",
+        "agent_id",
+        "agent_mount_id",
+        "expected_volume_marker",
+        "desired_access_mode",
+        "bootstrap_token",
+        "created_at_unix_ms",
+        "expires_at_unix_ms"
+      ]
+    },
+    "AgentEnrollmentTokenId": {
+      "description": "A validated agent enrollment token ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AgentId": {
+      "description": "A validated agent ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AgentInstallationId": {
+      "description": "A validated agent installation ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AgentMountId": {
+      "description": "A validated agent mount ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AgentMountIdentityDigest": {
+      "description": "Opaque identity of the filesystem mounted by one volume-scoped Agent.\n\nRaw mount sources and filesystem identifiers never cross the Agent boundary. The stable digest\nis bound during bootstrap and checked on every mount status report.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "AgentMountStatusReport": {
+      "description": "Mount observation submitted on an already-open, center-issued session generation.",
+      "type": "object",
+      "properties": {
+        "access_mode": {
+          "$ref": "#/$defs/MountAccessMode"
+        },
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "agent_mount_id": {
+          "$ref": "#/$defs/AgentMountId"
+        },
+        "boot_id": {
+          "$ref": "#/$defs/AgentBootId"
+        },
+        "health": {
+          "$ref": "#/$defs/ResourceHealth"
+        },
+        "installation_id": {
+          "$ref": "#/$defs/AgentInstallationId"
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "mount_identity_digest": {
+          "$ref": "#/$defs/AgentMountIdentityDigest"
+        },
+        "observed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "observed_volume_marker": {
+          "$ref": "#/$defs/VolumeMarkerId"
+        },
+        "owner_generation": {
+          "$ref": "#/$defs/OwnerGeneration"
+        },
+        "sequence": {
+          "$ref": "#/$defs/SequenceNumber"
+        },
+        "session_generation": {
+          "$ref": "#/$defs/SessionGeneration"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "agent_id",
+        "installation_id",
+        "boot_id",
+        "session_generation",
+        "sequence",
+        "agent_mount_id",
+        "storage_volume_id",
+        "mount_generation",
+        "owner_generation",
+        "observed_volume_marker",
+        "mount_identity_digest",
+        "access_mode",
+        "health",
+        "observed_at_unix_ms"
+      ]
+    },
+    "EdgeClusterId": {
+      "description": "A validated edge cluster ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "MountAccessMode": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "read_write"
+      ]
+    },
+    "MountGeneration": {
+      "description": "A mount generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "OwnerGeneration": {
+      "description": "A owner generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "ProtocolVersion": {
+      "description": "A numeric protocol revision carried in control envelopes and capability negotiation.\n\nUnlike generations and counters, protocol versions remain JSON numbers because they are small,\nclosed discriminants rather than potentially large monotonic values.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "PvcIdentityDigest": {
+      "description": "Opaque identity of the PVC named by an enrollment intent.\n\nThe canonical digest input contains only the validated namespace and claim name. EdgeCluster is\na separate registry scope, while Tenant is deliberately excluded so one cluster-scoped PVC\ncannot be admitted by multiple Tenants or under multiple StorageVolume IDs.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "RequestId": {
+      "description": "A validated request ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ResourceHealth": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "degraded",
+        "unavailable",
+        "unknown"
+      ]
+    },
+    "ResourceVersion": {
+      "description": "A resource version encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "SequenceNumber": {
+      "description": "A sequence number encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "SessionGeneration": {
+      "description": "A session generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "StorageVolumeId": {
+      "description": "A validated storage volume ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TenantId": {
+      "description": "A validated tenant ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "UnixMillis": {
+      "description": "A Unix millisecond timestamp encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "VolumeMarkerId": {
+      "description": "A validated volume marker ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    }
+  }
+}

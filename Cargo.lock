@@ -959,13 +959,17 @@ dependencies = [
 name = "neoengram-agent"
 version = "0.2.0"
 dependencies = [
+ "fs2",
  "futures",
  "neoengram-core",
  "neoengram-engine",
  "neoengram-protocol",
  "neoengramd",
+ "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

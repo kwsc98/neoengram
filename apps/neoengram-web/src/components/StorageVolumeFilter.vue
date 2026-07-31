@@ -39,7 +39,7 @@ const storageVolumesQuery = useQuery({
       :key="storageVolume.storage_volume_id"
       :label="`${storageVolume.display_name} · ${storageVolume.region}`"
       :value="storageVolume.storage_volume_id"
-      :disabled="storageVolume.state === 'unavailable'"
+      :disabled="storageVolume.state !== 'ready'"
     >
       <span class="storage-option__name">{{ storageVolume.display_name }}</span>
       <span class="storage-option__meta">

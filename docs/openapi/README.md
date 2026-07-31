@@ -30,6 +30,24 @@ PublicationCandidate、Manifest、IndexDelta、物理路径或数据库信息。
 对应资源的 `*_NOT_FOUND` 返回 404，不能泄漏目标资源是否存在。Artifact 不携带放置字段；
 Playground 和 Snapshot 的 Region 始终由所选 StorageVolume 派生。
 
+只有 `state=ready` 的 StorageVolume 可以承接新的 Playground 或 Snapshot；`degraded` 和
+`unavailable` 均拒绝新放置，但已有资源的公开元数据仍可查询。P0 Dashboard 只展示当前 Tenant、
+系统健康和资源导航；资源数量、关注项、区域统计、最近版本与跨资源活动依赖 P1 聚合接口。
+
+Storage Enrollment 使用三个权限：创建 bootstrap token 需要 `storage.enrollment.create`，列表和详情
+查询需要 `storage.enrollment.read`，批准与拒绝统一需要 `storage.enrollment.review`。管理员创建 token
+时提交并冻结完整的 PVC Volume descriptor，包括逻辑 Volume ID、display name、EdgeCluster、Region、
+access mode 和 PVC reference；不要求提前登记 StorageVolume。token 有效期为 15 分钟，只能被内部
+Agent bootstrap 成功消费一次。相同 `token_request_id` 和相同 payload 重放同一结果，改变 payload
+返回 409。原始 `bootstrap_token` 只在创建成功响应中出现，不进入查询、审批、审计或日志。
+
+Agent 消费 token 后通过内部 API 提交脱敏 enrollment，公开状态为 `pending_approval`，24 小时未审核
+则进入 `expired`。审核使用稳定的 approval/rejection request ID 和 `expected_resource_version` CAS。
+批准 initial enrollment 时原子创建缺失的逻辑 StorageVolume；replacement 则精确绑定 descriptor
+一致的既有 Volume，并要求 `confirm_replacement=true`。审批响应同时返回 Enrollment 与
+`StorageVolumeView`，此时分别是 `approved` 和 `unavailable`。只有后续认证 Agent session 与健康
+probe 才能推进到 `enrolled` 和 `ready`；拒绝进入终态 `rejected`。
+
 资源 mutation 同样只接受公开 DTO：StorageVolume 登记已有 PVC/NFS，不负责创建底层存储资源。
 Artifact 创建必须通过 discriminator 明确选择空初始化，或从同 Tenant 另一 Artifact 的明确 Commit
 派生；派生来源显式携带来源 Project。Playground 和 Snapshot 创建各自选择一个同 Tenant Volume。
@@ -38,14 +56,24 @@ Playground 继续使用完整资源 identity 幂等创建。Snapshot create 使�
 Commit/Volume 的重复创建返回已有未删除 Snapshot，同一 Commit 选择其他 Volume 时创建新的
 `snapshot_id`。每个 Snapshot 始终是单 Region、单 Volume，不能静默迁移或返回 placements 数组。
 Playground 的主状态仅为 Creating、Ready、Abnormal；扫描、哈希、上传和校验属于独立 Pre-commit。
-正式 Commit 以稳定 `commit_request_id` 消费 Ready Pre-commit 及其候选 IndexVersion，可附带详细
-描述和最多 20 个 Tag。公开契约只返回 Commit ID、父 Commit 和 Tags，不要求调用方理解 Ref。
-服务端从认证结果建立 actor，并在内部版本指针上执行 CAS。Commit Diff 默认比较目标 Commit 与其单一
-parent，根 Commit 与空基线比较；公开结果只包含 Commit 视图、逻辑路径、变更类型和大小统计。
+Pre-commit start 创建新的 `precommit_id`，并在服务端内部冻结当前 Head；running/ready 的重新检测
+使用 cancel 后 start，abnormal/cancelled 的失败重试才使用 restart，在同一 ID 上令 `attempt + 1`。
+可提交结果固定为 `state=ready, phase=idle`；`Blocked` 是 `state=abnormal, phase=idle` 且 blockers
+非空的产品标签，不是新的枚举值。
+
+正式 Commit 以稳定 `commit_request_id` 消费 ready/idle Pre-commit 及其候选 IndexVersion，可附带
+详细描述和最多 20 个 Tag。服务端从认证结果建立 actor，并对 Pre-commit attempt 内部冻结的 Head
+执行 CAS；Head 改变返回 409，公开请求不增加 `source_head_commit_id`。公开契约只返回 Commit ID、
+父 Commit 和 Tags，不要求调用方理解 Ref。Commit Diff 默认比较目标 Commit 与其单一 parent，根
+Commit 与空基线比较；公开结果只包含 Commit 视图、逻辑路径、变更类型和大小统计。
 
 Playground 文件、变更、文件元数据和 Dataset Profile 使用拆分分页方法；Snapshot 提供独立详情、
 交付重试、Ready 文件清单、活动记录和 Dataset Profile。上述 DTO 仅包含逻辑路径、Schema、统计、
 质量和 freshness，不公开 Manifest ID、对象位置、凭据或物理路径。
+
+Dataset Profile 是 Playground/Snapshot 派生的只读元数据，不是 Snapshot 创建参数。用途、保留策略、
+Lease/Mount、容量与底层诊断、Agent/assignment、fencing、Manifest/Chunk、文件内容 digest、对象分布
+和物理路径均不属于 P0 普通用户契约；后续能力必须通过独立 P1 或 operator API 与相应 RBAC 暴露。
 
 Agent API 不属于本 OpenAPI。Agent 的 H2/H3 JSON Text Sequence 双向 session、MetadataBatch 和
 重放规则继续由以下契约定义：
@@ -55,6 +83,9 @@ Agent API 不属于本 OpenAPI。Agent 的 H2/H3 JSON Text Sequence 双向 sessi
 - [`../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json`](../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json)
 
 `AssignJob`、`ExpireAddJob` 和 `ResumePublication` 是中心调度/恢复内部方法，不得加入公开 OpenAPI。
+Storage Enrollment 公开 DTO 同样不得暴露 CSR、公私钥、证书、bootstrap/poll credential、PVC UID、
+CSI handle、fsid/device、mount path/options/fingerprint、AgentId、AgentMountId、ComputeNodeId、session
+或 credential generation、heartbeat/job/assignment，以及 tenant owner、lease 或 fencing 信息。
 
 ## 校验
 
@@ -68,6 +99,7 @@ npm run test:contract
 ```
 
 `bundle` 只在仓库 `target/openapi/` 下生成 JSON 检查产物，不提交生成文件；`test:contract`
-基于该 bundle 校验公开路径、认证与版本头、状态映射、示例、u64 编码、独立 Snapshot 身份、
-Pre-commit 候选消费、Artifact 初始化模型和所有公开资源视图的脱敏边界。
+基于该 bundle 校验公开路径、认证与版本头、状态映射、示例、u64 编码、ready-only 放置、独立
+Snapshot 身份、Pre-commit 会话/attempt 语义、内部 Head CAS、Storage Enrollment token/审批边界、
+Artifact 初始化模型和所有公开资源视图的脱敏边界。
 CI 会按以上顺序运行相同命令。

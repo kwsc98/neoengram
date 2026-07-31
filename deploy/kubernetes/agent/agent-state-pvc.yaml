@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: neoengram-agent-state-volume-safe-slug
+  namespace: neoengram-agent-example
+  annotations:
+    neoengram.io/storage-volume-id: volume-example
+  labels:
+    app.kubernetes.io/name: neoengram-agent
+    app.kubernetes.io/component: agent-state
+    app.kubernetes.io/instance: volume-safe-slug
+    neoengram.io/volume-slug: volume-safe-slug
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem
+  storageClassName: replace-with-durable-rwo-storage-class
+  resources:
+    requests:
+      storage: 10Gi
