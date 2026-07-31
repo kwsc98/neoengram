@@ -65,6 +65,25 @@ describe('storage enrollment public operations', () => {
     }
   });
 
+  it('creates an enrollment token for an exact directly registered Volume', async () => {
+    const request = tokenRequest('direct-volume');
+    const direct = await createStorageVolume({
+      tenant_id: request.tenant_id,
+      storage_volume_id: request.storage_volume_id,
+      display_name: request.display_name,
+      edge_cluster_id: request.edge_cluster_id,
+      region: request.region,
+      backend_type: 'pvc',
+      access_mode: request.access_mode,
+      pvc_reference: request.pvc_reference,
+    });
+    expect(direct.data.storage_volume.state).toBe('unavailable');
+
+    const token = await createStorageEnrollmentToken(request);
+    expect(token.data).toMatchObject({ replayed: false });
+    expect(token.data.bootstrap_token).toMatch(/^ngenr_v1_/);
+  });
+
   it('approves with CAS, creates an unavailable Volume and replays the same decision', async () => {
     const pending = (
       await queryStorageEnrollmentList({
@@ -82,6 +101,13 @@ describe('storage enrollment public operations', () => {
       expected_resource_version: pending.resource_version,
       confirm_replacement: false,
     };
+    await expect(
+      approveStorageEnrollment({
+        ...approval,
+        approval_request_id: 'storage-approval-stale-version',
+        expected_resource_version: '0',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_ENROLLMENT_VERSION_CONFLICT' });
     const approved = await approveStorageEnrollment(approval);
     expect(approved.data).toMatchObject({
       replayed: false,
@@ -97,6 +123,49 @@ describe('storage enrollment public operations', () => {
     ).rejects.toMatchObject({ status: 409 });
   });
 
+  it('binds an exact unavailable, unowned Volume created through the compatibility API', async () => {
+    const direct = await createStorageVolume({
+      tenant_id: 'tenant-a',
+      storage_volume_id: 'volume-review-pvc',
+      display_name: '待接入评测 PVC',
+      edge_cluster_id: 'cluster-cn-east-1',
+      region: 'cn-shanghai',
+      backend_type: 'pvc',
+      access_mode: 'read_write_many',
+      pvc_reference: { namespace: 'neoengram-data', claim_name: 'review-data' },
+    });
+    expect(direct.data.storage_volume).toMatchObject({
+      state: 'unavailable',
+      resource_version: '1',
+    });
+
+    const pending = (
+      await queryStorageEnrollmentList({
+        tenant_id: 'tenant-a',
+        state: 'pending_approval',
+        query: 'volume-review-pvc',
+      })
+    ).data.items[0];
+    if (!pending) throw new Error('expected a pending enrollment');
+
+    const approved = await approveStorageEnrollment({
+      tenant_id: 'tenant-a',
+      storage_enrollment_id: pending.storage_enrollment_id,
+      approval_request_id: 'bind-direct-volume-approval',
+      expected_resource_version: pending.resource_version,
+      confirm_replacement: false,
+    });
+    expect(approved.data).toMatchObject({
+      replayed: false,
+      enrollment: { state: 'approved', registration_kind: 'initial' },
+      storage_volume: {
+        storage_volume_id: 'volume-review-pvc',
+        state: 'unavailable',
+        resource_version: '2',
+      },
+    });
+  });
+
   it('rejects without creating a Volume and keeps cross-tenant enrollment queries hidden', async () => {
     const pending = (
       await queryStorageEnrollmentList({
@@ -106,6 +175,15 @@ describe('storage enrollment public operations', () => {
       })
     ).data.items[0];
     if (!pending) throw new Error('expected a pending enrollment');
+
+    await expect(
+      rejectStorageEnrollment({
+        tenant_id: 'tenant-a',
+        storage_enrollment_id: pending.storage_enrollment_id,
+        rejection_request_id: 'storage-rejection-stale-version',
+        expected_resource_version: '0',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_ENROLLMENT_VERSION_CONFLICT' });
 
     const rejected = await rejectStorageEnrollment({
       tenant_id: 'tenant-a',
@@ -126,6 +204,48 @@ describe('storage enrollment public operations', () => {
     await expect(
       queryStorageEnrollment('tenant-b', pending.storage_enrollment_id),
     ).rejects.toMatchObject({ status: 403, code: 'AUTHORIZATION_DENIED' });
+  });
+
+  it('shares one Tenant-scoped request identity namespace across approve and reject', async () => {
+    const pending = (
+      await queryStorageEnrollmentList({
+        tenant_id: 'tenant-a',
+        state: 'pending_approval',
+        query: 'volume-review-pvc',
+      })
+    ).data.items[0];
+    const replacement = (
+      await queryStorageEnrollmentList({
+        tenant_id: 'tenant-a',
+        state: 'pending_approval',
+        registration_kind: 'replacement',
+      })
+    ).data.items[0];
+    if (!pending || !replacement) throw new Error('expected two pending enrollments');
+
+    await approveStorageEnrollment({
+      tenant_id: 'tenant-a',
+      storage_enrollment_id: pending.storage_enrollment_id,
+      approval_request_id: 'shared-review-request-id',
+      expected_resource_version: pending.resource_version,
+      confirm_replacement: false,
+    });
+    await expect(
+      rejectStorageEnrollment({
+        tenant_id: 'tenant-a',
+        storage_enrollment_id: replacement.storage_enrollment_id,
+        rejection_request_id: 'shared-review-request-id',
+        expected_resource_version: replacement.resource_version,
+        reason: 'must not reuse an approval identity',
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: 'STORAGE_ENROLLMENT_DECISION_ID_REUSED',
+    });
+    expect(
+      (await queryStorageEnrollment('tenant-a', replacement.storage_enrollment_id)).data.enrollment
+        .state,
+    ).toBe('pending_approval');
   });
 
   it('binds opaque cursors to the enrollment filter', async () => {
@@ -183,7 +303,7 @@ describe('storage enrollment public operations', () => {
         expected_resource_version: pending.resource_version,
         confirm_replacement: false,
       }),
-    ).rejects.toMatchObject({ status: 409 });
+    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_ENROLLMENT_STATE_CONFLICT' });
     await expect(
       rejectStorageEnrollment({
         tenant_id: 'tenant-a',
@@ -191,7 +311,7 @@ describe('storage enrollment public operations', () => {
         rejection_request_id: 'reject-expired-enrollment',
         expected_resource_version: pending.resource_version,
       }),
-    ).rejects.toMatchObject({ status: 409 });
+    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_ENROLLMENT_STATE_CONFLICT' });
     dateNow.mockRestore();
   });
 
@@ -261,7 +381,10 @@ describe('storage enrollment public operations', () => {
         expected_resource_version: replacement.resource_version,
         confirm_replacement: false,
       }),
-    ).rejects.toMatchObject({ status: 409 });
+    ).rejects.toMatchObject({
+      status: 409,
+      code: 'STORAGE_ENROLLMENT_REPLACEMENT_CONFIRMATION_REQUIRED',
+    });
     const approved = await approveStorageEnrollment({
       tenant_id: 'tenant-a',
       storage_enrollment_id: replacement.storage_enrollment_id,

@@ -808,6 +808,28 @@ assertDescriptionIncludes(
   ["state=ready", "degraded", "unavailable", "禁止新放置"],
   "StorageVolume ready-only placement semantics are not documented",
 );
+const createStorageVolumeOperation =
+  document.paths["/api/storage/volume/create"].post;
+assertDescriptionIncludes(
+  createStorageVolumeOperation,
+  [
+    "首次登记",
+    "state=unavailable",
+    "受信 Agent session",
+    "健康挂载",
+    "不得自动",
+    "ready",
+    "重放",
+    "当前权威视图",
+    "不改变或提升",
+  ],
+  "Direct StorageVolume registration must remain unavailable until Agent health is observed",
+);
+assertDescriptionIncludes(
+  createStorageVolumeOperation.responses["200"],
+  ["首次登记", "unavailable", "重放", "当前权威状态", "不触发状态提升"],
+  "Direct StorageVolume registration response state is not documented",
+);
 
 const createPlaygroundRequest =
   document.components.schemas.CreatePlaygroundRequest;
@@ -970,6 +992,37 @@ for (const [operationId, contract] of Object.entries(
     `${operationId} documents the wrong permission`,
   );
 }
+
+const storageEnrollmentConflictExamples =
+  document.components.responses.StorageEnrollmentConflictProblem.content[
+    "application/problem+json"
+  ].examples;
+assert(
+  storageEnrollmentConflictExamples.staleResourceVersion.value.code ===
+    "STORAGE_ENROLLMENT_VERSION_CONFLICT",
+  "Storage enrollment stale resource version conflict code drifted",
+);
+assert(
+  storageEnrollmentConflictExamples.tokenRequestIdentityReused.value.code ===
+    "STORAGE_ENROLLMENT_TOKEN_REQUEST_ID_REUSED",
+  "Storage enrollment token request identity conflict code drifted",
+);
+assert(
+  storageEnrollmentConflictExamples.decisionRequestIdentityReused.value.code ===
+    "STORAGE_ENROLLMENT_DECISION_ID_REUSED",
+  "Storage enrollment decision request identity conflict code drifted",
+);
+assert(
+  storageEnrollmentConflictExamples.replacementConfirmationRequired.value.code ===
+    "STORAGE_ENROLLMENT_REPLACEMENT_CONFIRMATION_REQUIRED",
+  "Storage enrollment replacement confirmation conflict code drifted",
+);
+assert(
+  !document.components.responses.DeadlineProblem.description
+    .toLowerCase()
+    .includes("lease"),
+  "Public Job deadline response must not expose assignment lease semantics",
+);
 
 const createEnrollmentTokenOperation =
   document.paths["/api/storage/enrollment/token/create"].post;
@@ -1365,10 +1418,15 @@ assertDescriptionIncludes(
   approveEnrollmentOperation,
   [
     "resource version CAS",
+    "initial",
     "创建缺失",
     "精确绑定",
+    "unavailable",
+    "无活动 Owner",
+    "replacement",
     "confirm_replacement=true",
     "state=unavailable",
+    "共享 Tenant 级 decision",
   ],
   "Storage enrollment approval transaction or replacement semantics are incomplete",
 );
