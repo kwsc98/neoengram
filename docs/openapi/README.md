@@ -43,8 +43,10 @@ Agent bootstrap 成功消费一次。相同 `token_request_id` 和相同 payload
 
 Agent 消费 token 后通过内部 API 提交脱敏 enrollment，公开状态为 `pending_approval`，24 小时未审核
 则进入 `expired`。审核使用稳定的 approval/rejection request ID 和 `expected_resource_version` CAS。
-批准 initial enrollment 时原子创建缺失的逻辑 StorageVolume；replacement 则精确绑定 descriptor
-一致的既有 Volume，并要求 `confirm_replacement=true`。审批响应同时返回 Enrollment 与
+两种审核 ID 共享 Tenant 级 decision request identity 命名空间，不能跨批准/拒绝或跨 enrollment 复用。
+批准 initial enrollment 时原子创建缺失的逻辑 StorageVolume，或精确绑定 descriptor 一致且
+`unavailable`、无活动 Owner 的既有 PVC Volume；replacement 则接管既有 Owner，并要求
+`confirm_replacement=true`。审批响应同时返回 Enrollment 与
 `StorageVolumeView`，此时分别是 `approved` 和 `unavailable`。只有后续认证 Agent session 与健康
 probe 才能推进到 `enrolled` 和 `ready`；拒绝进入终态 `rejected`。
 

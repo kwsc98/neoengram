@@ -141,6 +141,8 @@ export interface paths {
          * 登记 StorageVolume
          * @description 在租户内登记已有 PVC 或 NFS 后端，不创建 Kubernetes PV/PVC 或 NFS 资源。
          *     region 由 StorageVolume 固定，后续资源创建只提交 storage_volume_id。
+         *     首次登记的 Volume 响应必须为 `state=unavailable`；未经受信 Agent session 和健康挂载观测，
+         *     不得自动成为 `ready`。相同请求重放只返回当前权威视图，不改变或提升 Volume 状态。
          */
         post: operations["createStorageVolume"];
         delete?: never;
@@ -233,16 +235,18 @@ export interface paths {
          * 批准 Storage enrollment
          * @description 要求 `storage.enrollment.review` 权限。仅允许批准未过期的 `pending_approval` enrollment；服务端
          *     必须在一个事务中执行 resource version CAS，校验冻结的 Tenant/Volume/EdgeCluster/Region/
-         *     access mode/PVC descriptor、probe、协议兼容性和一 PVC 一活动 Agent 唯一约束，并创建缺失的
-         *     StorageVolume，或为 replacement 精确绑定同一 Tenant 下 descriptor 完全一致的既有 Volume。
+         *     access mode/PVC descriptor、probe、协议兼容性和一 PVC 一活动 Agent 唯一约束。initial 审批
+         *     创建缺失的 StorageVolume，或精确绑定 descriptor 完全一致且 `unavailable`、无活动 Owner 的
+         *     既有 PVC Volume；replacement 则精确绑定同一 Tenant 下由旧 Owner 占用的既有 Volume。
          *     `registration_kind=replacement` 时必须显式传 `confirm_replacement=true`，否则返回 409。
          *
          *     审批响应中的 StorageVolume 固定为 `state=unavailable`；审批本身不会把 Volume 标为 ready。
          *     Enrollment 先进入 `approved`，只有后续认证 Agent session 和健康 probe 才能进入 `enrolled` 并
          *     使 Volume 成为 ready。公开响应不包含 bootstrap token、证书、AgentId 或 session identity。
          *
-         *     `approval_request_id` 是稳定 mutation identity。相同 ID 和 payload 幂等重放；不同 payload、
-         *     stale `expected_resource_version`、非 pending_approval 状态或 PVC 已绑定另一活动 Agent 均返回 409。
+         *     `approval_request_id` 是稳定 mutation identity，并与 `rejection_request_id` 共享 Tenant 级 decision
+         *     request identity 命名空间。相同 ID 和 payload 幂等重放；跨审核动作复用、不同 payload、stale
+         *     `expected_resource_version`、非 pending_approval 状态或 PVC 已绑定另一活动 Agent 均返回 409。
          */
         post: operations["approveStorageEnrollment"];
         delete?: never;
@@ -264,11 +268,13 @@ export interface paths {
          * 拒绝 Storage enrollment
          * @description 要求 `storage.enrollment.review` 权限。仅允许拒绝未过期的 `pending_approval` enrollment；服务端使用
          *     `expected_resource_version` 执行 CAS 并记录认证 actor 的审计事件。拒绝是终态，不签发 Agent
-         *     证书；Agent 需要新的 bootstrap token 才能重新申请。
+         *     证书；0.0.1 永久退休该 candidate 的 installation identity 与公钥，再次申请需要初始化新的
+         *     Agent 状态身份、密钥和 bootstrap token。
          *
          *     可选 `reason` 仅写入认证 actor 的受控审计记录，不进入 StorageEnrollmentView、公开响应或日志。
-         *     `rejection_request_id` 是稳定 mutation identity。相同 ID 和 payload 幂等重放；不同 payload、
-         *     stale resource version 或非 pending_approval 状态返回 409。
+         *     `rejection_request_id` 是稳定 mutation identity，并与 `approval_request_id` 共享 Tenant 级 decision
+         *     request identity 命名空间。相同 ID 和 payload 幂等重放；跨审核动作复用、不同 payload、stale
+         *     resource version 或非 pending_approval 状态返回 409。
          */
         post: operations["rejectStorageEnrollment"];
         delete?: never;
@@ -1074,7 +1080,8 @@ export interface components {
         };
         /**
          * @description 使用 expected_resource_version 对 pending_approval enrollment 执行 CAS。replacement 必须显式
-         *     confirm_replacement=true；approval_request_id 与完整 payload 构成稳定幂等 identity。
+         *     confirm_replacement=true；approval_request_id 与完整 payload 构成稳定幂等 identity，并与
+         *     rejection_request_id 共享 Tenant 级 decision request identity 命名空间。
          */
         ApproveStorageEnrollmentRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -1095,7 +1102,8 @@ export interface components {
         };
         /**
          * @description 使用 expected_resource_version 对 pending_approval enrollment 执行 CAS；rejection_request_id
-         *     与完整 payload 构成稳定幂等 identity。
+         *     与完整 payload 构成稳定幂等 identity，并与 approval_request_id 共享 Tenant 级 decision request
+         *     identity 命名空间。
          */
         RejectStorageEnrollmentRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -1126,6 +1134,7 @@ export interface components {
             registration_kind: components["schemas"]["StorageEnrollmentRegistrationKind"];
             state: components["schemas"]["StorageEnrollmentState"];
             agent_version: string;
+            /** @description Agent installation 公钥 identity 的摘要，仅供审批比对；不是 mount/device fingerprint。 */
             identity_fingerprint: string;
             probe: components["schemas"]["StorageEnrollmentProbeSummary"];
             resource_version: components["schemas"]["CanonicalU64"];
@@ -1143,7 +1152,8 @@ export interface components {
             observed_at_unix_ms: components["schemas"]["UnixMillis"];
         };
         /**
-         * @description initial 创建新的 Volume 绑定；replacement 审批时要求 confirm_replacement=true。
+         * @description initial 建立首个 Owner，可创建缺失的 Volume，或绑定 descriptor 完全一致且 unavailable、无活动
+         *     Owner 的既有 PVC Volume；replacement 接管既有 Owner，审批时要求 confirm_replacement=true。
          * @enum {string}
          */
         StorageEnrollmentRegistrationKind: "initial" | "replacement";
@@ -2157,7 +2167,7 @@ export interface components {
                 "application/problem+json": components["schemas"]["ProblemDetails"];
             };
         };
-        /** @description Job deadline 或有效 assignment lease 已过期 */
+        /** @description Job deadline 已过期 */
         DeadlineProblem: {
             headers: {
                 "X-Request-ID": components["headers"]["RequestId"];
@@ -2701,7 +2711,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description StorageVolume 已登记或相同请求被重放 */
+            /** @description 首次登记返回 unavailable；相同请求重放返回当前权威状态且不触发状态提升 */
             200: {
                 headers: {
                     "X-Request-ID": components["headers"]["RequestId"];

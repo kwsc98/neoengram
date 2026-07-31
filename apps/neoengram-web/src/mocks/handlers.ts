@@ -145,13 +145,10 @@ const storageEnrollmentTokenRequests = new Map<
     response: CreateStorageEnrollmentTokenResponse;
   }
 >();
-const storageEnrollmentApprovalRequests = new Map<
+const storageEnrollmentDecisionRequests = new Map<
   string,
-  { requestJson: string; response: ApproveStorageEnrollmentResponse }
->();
-const storageEnrollmentRejectionRequests = new Map<
-  string,
-  { requestJson: string; response: RejectStorageEnrollmentResponse }
+  | { kind: 'approve'; requestJson: string; response: ApproveStorageEnrollmentResponse }
+  | { kind: 'reject'; requestJson: string; response: RejectStorageEnrollmentResponse }
 >();
 const storageEnrollments: StorageEnrollmentView[] = [];
 const storageEnrollmentFrozenDescriptors = new Map<string, StorageEnrollmentDescriptor>();
@@ -1354,13 +1351,13 @@ export const handlers = [
     if (!enrollment) return storageEnrollmentNotFound(request);
     const requestKey = resourceKey(body.tenant_id, body.approval_request_id);
     const requestJson = stableJson(body);
-    const previous = storageEnrollmentApprovalRequests.get(requestKey);
+    const previous = storageEnrollmentDecisionRequests.get(requestKey);
     if (previous) {
-      if (previous.requestJson !== requestJson) {
+      if (previous.kind !== 'approve' || previous.requestJson !== requestJson) {
         return mutationConflict(
           request,
-          'STORAGE_ENROLLMENT_APPROVAL_ID_REUSED',
-          'The approval request ID already belongs to another payload',
+          'STORAGE_ENROLLMENT_DECISION_ID_REUSED',
+          'The decision request ID already belongs to another review operation or payload',
         );
       }
       return HttpResponse.json(
@@ -1369,15 +1366,25 @@ export const handlers = [
       );
     }
 
-    if (
-      enrollment.state !== 'pending_approval' ||
-      enrollment.resource_version !== body.expected_resource_version ||
-      (enrollment.registration_kind === 'replacement' && !body.confirm_replacement)
-    ) {
+    if (enrollment.state !== 'pending_approval') {
       return mutationConflict(
         request,
         'STORAGE_ENROLLMENT_STATE_CONFLICT',
-        'The enrollment state, resource version or replacement confirmation is invalid',
+        'The enrollment is no longer pending approval',
+      );
+    }
+    if (enrollment.resource_version !== body.expected_resource_version) {
+      return mutationConflict(
+        request,
+        'STORAGE_ENROLLMENT_VERSION_CONFLICT',
+        'The enrollment resource version changed before review',
+      );
+    }
+    if (enrollment.registration_kind === 'replacement' && !body.confirm_replacement) {
+      return mutationConflict(
+        request,
+        'STORAGE_ENROLLMENT_REPLACEMENT_CONFIRMATION_REQUIRED',
+        'Replacement enrollment approval requires explicit confirmation',
       );
     }
     if (
@@ -1437,11 +1444,18 @@ export const handlers = [
       );
     }
     if (enrollment.registration_kind === 'initial') {
-      if (storageVolume || binding || owner) {
+      const createsMissingVolume = !storageVolume && !binding && !owner;
+      const bindsUnownedVolume =
+        storageVolume?.state === 'unavailable' &&
+        volumeMatchesDescriptor(storageVolume, frozenDescriptor) &&
+        binding?.tenantId === enrollment.tenant_id &&
+        binding.storageVolumeId === enrollment.storage_volume_id &&
+        !owner;
+      if (!createsMissingVolume && !bindsUnownedVolume) {
         return mutationConflict(
           request,
-          'PVC_ALREADY_ENROLLED',
-          'An initial enrollment requires an unbound PVC and a missing StorageVolume',
+          'STORAGE_ENROLLMENT_INITIAL_CONFLICT',
+          'Initial enrollment requires a missing Volume or an exact unavailable, unowned Volume binding',
         );
       }
     } else if (
@@ -1498,7 +1512,8 @@ export const handlers = [
       storage_volume: structuredClone(storageVolume),
       replayed: false,
     };
-    storageEnrollmentApprovalRequests.set(requestKey, {
+    storageEnrollmentDecisionRequests.set(requestKey, {
+      kind: 'approve',
       requestJson,
       response: structuredClone(response),
     });
@@ -1523,13 +1538,13 @@ export const handlers = [
     if (!enrollment) return storageEnrollmentNotFound(request);
     const requestKey = resourceKey(body.tenant_id, body.rejection_request_id);
     const requestJson = stableJson(body);
-    const previous = storageEnrollmentRejectionRequests.get(requestKey);
+    const previous = storageEnrollmentDecisionRequests.get(requestKey);
     if (previous) {
-      if (previous.requestJson !== requestJson) {
+      if (previous.kind !== 'reject' || previous.requestJson !== requestJson) {
         return mutationConflict(
           request,
-          'STORAGE_ENROLLMENT_REJECTION_ID_REUSED',
-          'The rejection request ID already belongs to another payload',
+          'STORAGE_ENROLLMENT_DECISION_ID_REUSED',
+          'The decision request ID already belongs to another review operation or payload',
         );
       }
       return HttpResponse.json(
@@ -1538,14 +1553,18 @@ export const handlers = [
       );
     }
 
-    if (
-      enrollment.state !== 'pending_approval' ||
-      enrollment.resource_version !== body.expected_resource_version
-    ) {
+    if (enrollment.state !== 'pending_approval') {
       return mutationConflict(
         request,
         'STORAGE_ENROLLMENT_STATE_CONFLICT',
-        'The enrollment state or resource version is no longer current',
+        'The enrollment is no longer pending approval',
+      );
+    }
+    if (enrollment.resource_version !== body.expected_resource_version) {
+      return mutationConflict(
+        request,
+        'STORAGE_ENROLLMENT_VERSION_CONFLICT',
+        'The enrollment resource version changed before review',
       );
     }
 
@@ -1565,7 +1584,8 @@ export const handlers = [
       enrollment: structuredClone(enrollment),
       replayed: false,
     };
-    storageEnrollmentRejectionRequests.set(requestKey, {
+    storageEnrollmentDecisionRequests.set(requestKey, {
+      kind: 'reject',
       requestJson,
       response: structuredClone(response),
     });
@@ -3057,8 +3077,7 @@ export function resetMockState(): void {
   tenantCreatePayloads.clear();
   storageVolumeCreatePayloads.clear();
   storageEnrollmentTokenRequests.clear();
-  storageEnrollmentApprovalRequests.clear();
-  storageEnrollmentRejectionRequests.clear();
+  storageEnrollmentDecisionRequests.clear();
   storageEnrollmentFrozenDescriptors.clear();
   storageEnrollmentReviewAudit.clear();
   pvcBindings.clear();

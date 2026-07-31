@@ -93,8 +93,17 @@ test('creates a PVC token and independently approves a pending enrollment', asyn
   const suffix = testInfo.project.name;
   const tokenVolumeId = `volume-enrollment-${suffix}`;
   const pendingVolumeId = 'volume-review-pvc';
+  let approvalRequestCount = 0;
+  page.on('request', (request) => {
+    if (new URL(request.url()).pathname.endsWith('/api/storage/enrollment/approve')) {
+      approvalRequestCount += 1;
+    }
+  });
 
-  await page.goto('/tenants/tenant-a/storage-volumes');
+  await page.goto('/tenants/tenant-b/storage-volumes');
+  await page.getByRole('combobox', { name: '当前租户' }).click();
+  await page.getByRole('option', { name: /研究数据平台/ }).click();
+  await expect(page).toHaveURL(/\/tenants\/tenant-a\/storage-volumes$/);
   await page.getByRole('button', { name: '接入 PVC' }).click();
   const enrollmentDialog = page.getByRole('dialog', { name: '接入 PVC' });
   await enrollmentDialog.getByLabel('StorageVolume ID').fill(tokenVolumeId);
@@ -125,8 +134,13 @@ test('creates a PVC token and independently approves a pending enrollment', asyn
   await expect(agentConfig).toContainText(
     'bootstrap_token_file: /var/run/secrets/neoengram/bootstrap-token',
   );
-  await enrollmentDialog.getByRole('button', { name: '完成' }).click();
+  await page.goBack();
+  await expect(page).toHaveURL(/\/tenants\/tenant-b\/storage-volumes$/);
   await expect(page.getByLabel('Bootstrap token', { exact: true })).toHaveCount(0);
+  await expect(enrollmentDialog).toHaveCount(0);
+  await page.getByRole('combobox', { name: '当前租户' }).click();
+  await page.getByRole('option', { name: /研究数据平台/ }).click();
+  await expect(page).toHaveURL(/\/tenants\/tenant-a\/storage-volumes$/);
 
   await page.getByRole('tab', { name: '待审批' }).click();
   const pendingSection = page.locator('.enrollment-section');
@@ -149,7 +163,20 @@ test('creates a PVC token and independently approves a pending enrollment', asyn
   await expect(pendingItem).toContainText('aaaaaaaaaaaa...aaaaaaaa');
   await pendingItem.getByRole('button', { name: `批准 ${pendingVolumeId}`, exact: true }).click();
   const approvalDialog = page.getByRole('dialog', { name: '批准存储接入' });
+  await page.goBack();
+  await expect(page).toHaveURL(/\/tenants\/tenant-b\/storage-volumes$/);
   await approvalDialog.getByRole('button', { name: '批准', exact: true }).click();
+  await expect(approvalDialog).toHaveCount(0);
+  expect(approvalRequestCount).toBe(0);
+
+  await page.getByRole('combobox', { name: '当前租户' }).click();
+  await page.getByRole('option', { name: /研究数据平台/ }).click();
+  await expect(page).toHaveURL(/\/tenants\/tenant-a\/storage-volumes$/);
+  await page.getByRole('tab', { name: '待审批' }).click();
+  await expect(pendingItem).toBeVisible();
+  await pendingItem.getByRole('button', { name: `批准 ${pendingVolumeId}`, exact: true }).click();
+  await approvalDialog.getByRole('button', { name: '批准', exact: true }).click();
+  await expect.poll(() => approvalRequestCount).toBe(1);
 
   await page.getByRole('tab', { name: '已登记' }).click();
   const volumeRow = page

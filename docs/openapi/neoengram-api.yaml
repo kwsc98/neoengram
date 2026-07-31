@@ -379,6 +379,8 @@ paths:
       description: |
         在租户内登记已有 PVC 或 NFS 后端，不创建 Kubernetes PV/PVC 或 NFS 资源。
         region 由 StorageVolume 固定，后续资源创建只提交 storage_volume_id。
+        首次登记的 Volume 响应必须为 `state=unavailable`；未经受信 Agent session 和健康挂载观测，
+        不得自动成为 `ready`。相同请求重放只返回当前权威视图，不改变或提升 Volume 状态。
       security:
         - BearerAuth: []
       parameters:
@@ -404,7 +406,7 @@ paths:
                 claim_name: vision-data
       responses:
         "200":
-          description: StorageVolume 已登记或相同请求被重放
+          description: 首次登记返回 unavailable；相同请求重放返回当前权威状态且不触发状态提升
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
@@ -640,16 +642,18 @@ paths:
       description: |
         要求 `storage.enrollment.review` 权限。仅允许批准未过期的 `pending_approval` enrollment；服务端
         必须在一个事务中执行 resource version CAS，校验冻结的 Tenant/Volume/EdgeCluster/Region/
-        access mode/PVC descriptor、probe、协议兼容性和一 PVC 一活动 Agent 唯一约束，并创建缺失的
-        StorageVolume，或为 replacement 精确绑定同一 Tenant 下 descriptor 完全一致的既有 Volume。
+        access mode/PVC descriptor、probe、协议兼容性和一 PVC 一活动 Agent 唯一约束。initial 审批
+        创建缺失的 StorageVolume，或精确绑定 descriptor 完全一致且 `unavailable`、无活动 Owner 的
+        既有 PVC Volume；replacement 则精确绑定同一 Tenant 下由旧 Owner 占用的既有 Volume。
         `registration_kind=replacement` 时必须显式传 `confirm_replacement=true`，否则返回 409。
 
         审批响应中的 StorageVolume 固定为 `state=unavailable`；审批本身不会把 Volume 标为 ready。
         Enrollment 先进入 `approved`，只有后续认证 Agent session 和健康 probe 才能进入 `enrolled` 并
         使 Volume 成为 ready。公开响应不包含 bootstrap token、证书、AgentId 或 session identity。
 
-        `approval_request_id` 是稳定 mutation identity。相同 ID 和 payload 幂等重放；不同 payload、
-        stale `expected_resource_version`、非 pending_approval 状态或 PVC 已绑定另一活动 Agent 均返回 409。
+        `approval_request_id` 是稳定 mutation identity，并与 `rejection_request_id` 共享 Tenant 级 decision
+        request identity 命名空间。相同 ID 和 payload 幂等重放；跨审核动作复用、不同 payload、stale
+        `expected_resource_version`、非 pending_approval 状态或 PVC 已绑定另一活动 Agent 均返回 409。
       security:
         - BearerAuth: []
       parameters:
@@ -745,11 +749,13 @@ paths:
       description: |
         要求 `storage.enrollment.review` 权限。仅允许拒绝未过期的 `pending_approval` enrollment；服务端使用
         `expected_resource_version` 执行 CAS 并记录认证 actor 的审计事件。拒绝是终态，不签发 Agent
-        证书；Agent 需要新的 bootstrap token 才能重新申请。
+        证书；0.0.1 永久退休该 candidate 的 installation identity 与公钥，再次申请需要初始化新的
+        Agent 状态身份、密钥和 bootstrap token。
 
         可选 `reason` 仅写入认证 actor 的受控审计记录，不进入 StorageEnrollmentView、公开响应或日志。
-        `rejection_request_id` 是稳定 mutation identity。相同 ID 和 payload 幂等重放；不同 payload、
-        stale resource version 或非 pending_approval 状态返回 409。
+        `rejection_request_id` 是稳定 mutation identity，并与 `approval_request_id` 共享 Tenant 级 decision
+        request identity 命名空间。相同 ID 和 payload 幂等重放；跨审核动作复用、不同 payload、stale
+        resource version 或非 pending_approval 状态返回 409。
       security:
         - BearerAuth: []
       parameters:
@@ -3091,15 +3097,25 @@ components:
                 code: STORAGE_ENROLLMENT_VERSION_CONFLICT
                 request_id: req-20260731-001
                 retryable: false
-            requestIdentityReused:
+            tokenRequestIdentityReused:
               value:
-                type: urn:neoengram:problem:storage-enrollment-request-id-reused
-                title: Storage enrollment request ID reused
+                type: urn:neoengram:problem:storage-enrollment-token-request-id-reused
+                title: Storage enrollment token request ID reused
                 status: 409
-                detail: The mutation request ID already belongs to a different payload
-                instance: /api/storage/enrollment/reject
-                code: STORAGE_ENROLLMENT_REQUEST_ID_REUSED
+                detail: The token request ID already belongs to a different payload
+                instance: /api/storage/enrollment/token/create
+                code: STORAGE_ENROLLMENT_TOKEN_REQUEST_ID_REUSED
                 request_id: req-20260731-002
+                retryable: false
+            decisionRequestIdentityReused:
+              value:
+                type: urn:neoengram:problem:storage-enrollment-decision-id-reused
+                title: Storage enrollment decision request ID reused
+                status: 409
+                detail: The decision request ID already belongs to another review action or payload
+                instance: /api/storage/enrollment/reject
+                code: STORAGE_ENROLLMENT_DECISION_ID_REUSED
+                request_id: req-20260731-003
                 retryable: false
             pvcAlreadyEnrolled:
               value:
@@ -3150,7 +3166,7 @@ components:
             request_id: req-20260727-001
             retryable: false
     DeadlineProblem:
-      description: Job deadline 或有效 assignment lease 已过期
+      description: Job deadline 已过期
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestId"
@@ -3711,7 +3727,8 @@ components:
       type: object
       description: |
         使用 expected_resource_version 对 pending_approval enrollment 执行 CAS。replacement 必须显式
-        confirm_replacement=true；approval_request_id 与完整 payload 构成稳定幂等 identity。
+        confirm_replacement=true；approval_request_id 与完整 payload 构成稳定幂等 identity，并与
+        rejection_request_id 共享 Tenant 级 decision request identity 命名空间。
       additionalProperties: false
       required:
         - tenant_id
@@ -3751,7 +3768,8 @@ components:
       type: object
       description: |
         使用 expected_resource_version 对 pending_approval enrollment 执行 CAS；rejection_request_id
-        与完整 payload 构成稳定幂等 identity。
+        与完整 payload 构成稳定幂等 identity，并与 approval_request_id 共享 Tenant 级 decision request
+        identity 命名空间。
       additionalProperties: false
       required:
         - tenant_id
@@ -3835,6 +3853,7 @@ components:
           maxLength: 128
         identity_fingerprint:
           type: string
+          description: Agent installation 公钥 identity 的摘要，仅供审批比对；不是 mount/device fingerprint。
           minLength: 64
           maxLength: 64
           pattern: "^[0-9a-f]{64}$"
@@ -3872,7 +3891,9 @@ components:
 
     StorageEnrollmentRegistrationKind:
       type: string
-      description: initial 创建新的 Volume 绑定；replacement 审批时要求 confirm_replacement=true。
+      description: |
+        initial 建立首个 Owner，可创建缺失的 Volume，或绑定 descriptor 完全一致且 unavailable、无活动
+        Owner 的既有 PVC Volume；replacement 接管既有 Owner，审批时要求 confirm_replacement=true。
       enum: [initial, replacement]
 
     StorageEnrollmentState:

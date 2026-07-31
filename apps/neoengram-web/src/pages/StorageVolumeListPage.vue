@@ -56,6 +56,7 @@ const cursor = ref<string>();
 const cursorHistory = ref<string[]>([]);
 const enrollmentCursor = ref<string>();
 const enrollmentCursorHistory = ref<string[]>([]);
+const tenantScopeVersion = ref(0);
 
 const enrollmentOpen = ref(false);
 const enrollmentError = ref('');
@@ -73,6 +74,7 @@ const enrollmentForm = reactive({
 
 const nfsOpen = ref(false);
 const nfsError = ref('');
+const nfsApiError = ref<unknown>();
 const nfsForm = reactive({
   storageVolumeId: '',
   displayName: '',
@@ -88,6 +90,8 @@ const nfsForm = reactive({
 
 const approvalRequests = new Map<string, ApproveStorageEnrollmentRequest>();
 const rejectionRequests = new Map<string, RejectStorageEnrollmentRequest>();
+const approvalError = ref<unknown>();
+const rejectionError = ref<unknown>();
 
 const tokenMutation = useMutation({ mutationFn: createStorageEnrollmentToken });
 const nfsMutation = useMutation({ mutationFn: createStorageVolume });
@@ -182,9 +186,20 @@ watch([tenantId, region, backendType], () => {
 });
 
 watch(tenantId, () => {
+  tenantScopeVersion.value += 1;
   activeView.value = 'volumes';
   enrollmentCursor.value = undefined;
   enrollmentCursorHistory.value = [];
+  enrollmentOpen.value = false;
+  nfsOpen.value = false;
+  clearEnrollmentSecret();
+  nfsError.value = '';
+  nfsApiError.value = undefined;
+  approvalError.value = undefined;
+  rejectionError.value = undefined;
+  nfsMutation.reset();
+  approveMutation.reset();
+  rejectMutation.reset();
   approvalRequests.clear();
   rejectionRequests.clear();
 });
@@ -303,12 +318,16 @@ async function submitEnrollment(): Promise<void> {
       claim_name: pvcClaimName,
     },
   };
+  const request = pendingTokenRequest.value;
+  const requestTenantId = tenantId.value;
 
   try {
-    const result = await tokenMutation.mutateAsync(pendingTokenRequest.value);
+    const result = await tokenMutation.mutateAsync(request);
+    if (tenantId.value !== requestTenantId || pendingTokenRequest.value !== request) return;
     tokenResult.value = result.data;
     ElMessage.success(result.data.replayed ? '已返回原接入凭证' : '接入凭证已生成');
   } catch (error) {
+    if (tenantId.value !== requestTenantId || pendingTokenRequest.value !== request) return;
     enrollmentError.value = error instanceof Error ? error.message : '生成接入凭证失败';
   }
 }
@@ -324,12 +343,14 @@ function openNfsCreate(): void {
     exportPath: '',
   });
   nfsError.value = '';
+  nfsApiError.value = undefined;
   nfsMutation.reset();
   nfsOpen.value = true;
 }
 
 async function submitNfsCreate(): Promise<void> {
   nfsError.value = '';
+  nfsApiError.value = undefined;
   if (!validateResourceFields(nfsForm)) {
     nfsError.value = '请填写合法的 StorageVolume ID、名称、EdgeCluster ID 和 Region';
     return;
@@ -339,77 +360,106 @@ async function submitNfsCreate(): Promise<void> {
     return;
   }
 
+  const requestTenantId = tenantId.value;
+  const requestScopeVersion = tenantScopeVersion.value;
+  const request = {
+    tenant_id: requestTenantId,
+    storage_volume_id: nfsForm.storageVolumeId,
+    display_name: nfsForm.displayName.trim(),
+    edge_cluster_id: nfsForm.edgeClusterId,
+    region: nfsForm.region,
+    backend_type: 'nfs' as const,
+    access_mode: nfsForm.accessMode,
+    nfs_reference: {
+      server: nfsForm.server.trim(),
+      export_path: nfsForm.exportPath.trim(),
+    },
+  };
+
   try {
-    const result = await nfsMutation.mutateAsync({
-      tenant_id: tenantId.value,
-      storage_volume_id: nfsForm.storageVolumeId,
-      display_name: nfsForm.displayName.trim(),
-      edge_cluster_id: nfsForm.edgeClusterId,
-      region: nfsForm.region,
-      backend_type: 'nfs',
-      access_mode: nfsForm.accessMode,
-      nfs_reference: {
-        server: nfsForm.server.trim(),
-        export_path: nfsForm.exportPath.trim(),
-      },
-    });
+    const result = await nfsMutation.mutateAsync(request);
+    await queryClient.invalidateQueries({ queryKey: ['storage-volumes', request.tenant_id] });
+    if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
     nfsOpen.value = false;
-    await queryClient.invalidateQueries({ queryKey: ['storage-volumes', tenantId.value] });
     ElMessage.success(
       result.data.replayed ? '已返回现有 StorageVolume' : '已登记，等待挂载健康检查',
     );
   } catch (error) {
-    nfsError.value = error instanceof Error ? error.message : '登记 NFS 失败';
+    if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
+    nfsApiError.value = error;
   }
 }
 
+function reviewRequestKey(requestTenantId: string, storageEnrollmentId: string): string {
+  return JSON.stringify([requestTenantId, storageEnrollmentId]);
+}
+
+function isCurrentTenantScope(requestTenantId: string, requestScopeVersion: number): boolean {
+  return tenantId.value === requestTenantId && tenantScopeVersion.value === requestScopeVersion;
+}
+
 async function approve(enrollment: StorageEnrollmentView): Promise<void> {
-  let request = approvalRequests.get(enrollment.storage_enrollment_id);
+  const requestTenantId = tenantId.value;
+  const requestScopeVersion = tenantScopeVersion.value;
+  const requestKey = reviewRequestKey(requestTenantId, enrollment.storage_enrollment_id);
+  approvalError.value = undefined;
+  rejectionError.value = undefined;
+  let request = approvalRequests.get(requestKey);
   if (!request) {
     try {
       await ElMessageBox.confirm(
         enrollment.registration_kind === 'replacement'
           ? '确认旧实例已停止且 PVC 已解除旧挂载后，再批准接管。'
-          : '批准后将创建 StorageVolume；它会保持 unavailable，直到接入实例上报健康 RW 挂载。',
+          : '批准后将创建或绑定 StorageVolume；它会保持 unavailable，直到接入实例上报健康 RW 挂载。',
         enrollment.registration_kind === 'replacement' ? '确认接管' : '批准存储接入',
         { type: 'warning', confirmButtonText: '批准', cancelButtonText: '取消' },
       );
     } catch {
       return;
     }
+    if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
     request = {
-      tenant_id: tenantId.value,
+      tenant_id: requestTenantId,
       storage_enrollment_id: enrollment.storage_enrollment_id,
       approval_request_id: `storage-enrollment-approve-${globalThis.crypto.randomUUID()}`,
       expected_resource_version: enrollment.resource_version,
       confirm_replacement: enrollment.registration_kind === 'replacement',
     };
-    approvalRequests.set(enrollment.storage_enrollment_id, request);
+    approvalRequests.set(requestKey, request);
   }
 
   try {
     const result = await approveMutation.mutateAsync(request);
-    approvalRequests.delete(enrollment.storage_enrollment_id);
+    if (approvalRequests.get(requestKey) === request) approvalRequests.delete(requestKey);
     await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ['storage-enrollments', tenantId.value] }),
-      queryClient.invalidateQueries({ queryKey: ['storage-volumes', tenantId.value] }),
+      queryClient.invalidateQueries({ queryKey: ['storage-enrollments', request.tenant_id] }),
+      queryClient.invalidateQueries({ queryKey: ['storage-volumes', request.tenant_id] }),
     ]);
+    if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
     ElMessage.success(result.data.replayed ? '已返回原审批结果' : '存储接入已批准');
   } catch (error) {
     if (isApiProblem(error) && !error.retryable) {
-      approvalRequests.delete(enrollment.storage_enrollment_id);
-      await queryClient.invalidateQueries({ queryKey: ['storage-enrollments', tenantId.value] });
+      if (approvalRequests.get(requestKey) === request) approvalRequests.delete(requestKey);
+      await queryClient.invalidateQueries({
+        queryKey: ['storage-enrollments', request.tenant_id],
+      });
     }
+    if (isCurrentTenantScope(requestTenantId, requestScopeVersion)) approvalError.value = error;
     // Transport and retryable service failures retain the exact request.
   }
 }
 
 async function reject(enrollment: StorageEnrollmentView): Promise<void> {
-  let request = rejectionRequests.get(enrollment.storage_enrollment_id);
+  const requestTenantId = tenantId.value;
+  const requestScopeVersion = tenantScopeVersion.value;
+  const requestKey = reviewRequestKey(requestTenantId, enrollment.storage_enrollment_id);
+  approvalError.value = undefined;
+  rejectionError.value = undefined;
+  let request = rejectionRequests.get(requestKey);
   if (!request) {
     try {
       const prompt = await ElMessageBox.prompt(
-        '拒绝后该接入实例需要使用新的 bootstrap token 再次申请。',
+        '拒绝后旧安装身份和密钥会退休；再次接入需要初始化新身份并使用新的 bootstrap token。',
         '拒绝存储接入',
         {
           type: 'warning',
@@ -419,14 +469,15 @@ async function reject(enrollment: StorageEnrollmentView): Promise<void> {
           cancelButtonText: '取消',
         },
       );
+      if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
       request = {
-        tenant_id: tenantId.value,
+        tenant_id: requestTenantId,
         storage_enrollment_id: enrollment.storage_enrollment_id,
         rejection_request_id: `storage-enrollment-reject-${globalThis.crypto.randomUUID()}`,
         expected_resource_version: enrollment.resource_version,
         reason: prompt.value.trim(),
       };
-      rejectionRequests.set(enrollment.storage_enrollment_id, request);
+      rejectionRequests.set(requestKey, request);
     } catch {
       return;
     }
@@ -434,14 +485,20 @@ async function reject(enrollment: StorageEnrollmentView): Promise<void> {
 
   try {
     const result = await rejectMutation.mutateAsync(request);
-    rejectionRequests.delete(enrollment.storage_enrollment_id);
-    await queryClient.invalidateQueries({ queryKey: ['storage-enrollments', tenantId.value] });
+    if (rejectionRequests.get(requestKey) === request) rejectionRequests.delete(requestKey);
+    await queryClient.invalidateQueries({
+      queryKey: ['storage-enrollments', request.tenant_id],
+    });
+    if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
     ElMessage.success(result.data.replayed ? '已返回原拒绝结果' : '存储接入已拒绝');
   } catch (error) {
     if (isApiProblem(error) && !error.retryable) {
-      rejectionRequests.delete(enrollment.storage_enrollment_id);
-      await queryClient.invalidateQueries({ queryKey: ['storage-enrollments', tenantId.value] });
+      if (rejectionRequests.get(requestKey) === request) rejectionRequests.delete(requestKey);
+      await queryClient.invalidateQueries({
+        queryKey: ['storage-enrollments', request.tenant_id],
+      });
     }
+    if (isCurrentTenantScope(requestTenantId, requestScopeVersion)) rejectionError.value = error;
     // Transport and retryable service failures retain the exact request.
   }
 }
@@ -603,8 +660,8 @@ function fingerprintSummary(value: string): string {
           @retry="enrollmentsQuery.refetch"
         />
         <ApiProblemAlert
-          v-if="approveMutation.error.value || rejectMutation.error.value"
-          :error="approveMutation.error.value ?? rejectMutation.error.value"
+          v-if="approvalError || rejectionError"
+          :error="approvalError ?? rejectionError"
         />
 
         <section class="content-section resource-section enrollment-section">
@@ -870,7 +927,7 @@ function fingerprintSummary(value: string): string {
     </el-dialog>
 
     <el-dialog v-model="nfsOpen" title="登记 NFS" width="min(620px, calc(100vw - 32px))">
-      <ApiProblemAlert v-if="nfsMutation.error.value" :error="nfsMutation.error.value" />
+      <ApiProblemAlert v-if="nfsApiError" :error="nfsApiError" />
       <el-alert v-if="nfsError" :title="nfsError" type="error" :closable="false" />
       <el-form label-position="top" class="dialog-form">
         <div class="dialog-form-grid">
