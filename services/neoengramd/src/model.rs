@@ -148,6 +148,7 @@ pub enum Action {
     StageMetadataBatch,
     ExpireAddJob,
     FinalizeAdd,
+    QueryJob,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -266,6 +267,18 @@ pub struct ExpireAddJobResult {
     pub decision: Option<JobDecision>,
     pub finalized: Option<JobFinalized>,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryJobRequest {
+    pub actor: PrincipalRef,
+    pub tenant_id: TenantId,
+    pub job_id: JobId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryJobResult {
+    pub job: JobRecord,
 }
 
 #[derive(Debug, Clone, PartialEq)]

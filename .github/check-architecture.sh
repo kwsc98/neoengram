@@ -17,7 +17,7 @@ rg -q '^rust-version = "1\.97\.0"$' Cargo.toml || fail "workspace MSRV must rema
 
 workspace_metadata="$(cargo metadata --no-deps --format-version 1 --locked)"
 
-expected_packages=$'neoengram\nneoengram-agent\nneoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol\nneoengram-standalone\nneoengramd'
+expected_packages=$'neoengram\nneoengram-agent\nneoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol\nneoengram-server\nneoengram-standalone\nneoengramd'
 actual_packages="$(
   jq -r '.packages[].name' <<<"$workspace_metadata" | LC_ALL=C sort
 )"
@@ -95,6 +95,7 @@ assert_internal_dependencies neoengram-standalone \
 assert_internal_dependencies neoengram-agent \
   $'neoengram-core\nneoengram-engine\nneoengram-protocol' 'neoengramd'
 assert_internal_dependencies neoengramd $'neoengram-core\nneoengram-protocol' ''
+assert_internal_dependencies neoengram-server $'neoengram-core\nneoengram-protocol\nneoengramd' ''
 
 assert_no_binary_target() {
   local package="$1"
@@ -108,6 +109,14 @@ assert_no_binary_target() {
 
 assert_no_binary_target neoengram-agent
 assert_no_binary_target neoengramd
+
+# neoengram-server must have a binary target.
+if ! jq -e \
+  '.packages[] | select(.name == "neoengram-server") |
+   [.targets[].kind[]] | index("bin") != null' \
+  >/dev/null <<<"$workspace_metadata"; then
+  fail "neoengram-server must keep its binary target"
+fi
 
 if ! jq -e \
   '.packages[] | select(.name == "neoengram") |
@@ -133,6 +142,9 @@ assert_manifest_excludes \
 assert_manifest_excludes \
   services/neoengramd/Cargo.toml \
   'neoengram-(engine|fs|standalone)|rusqlite|reqwest|hyper|axum|diesel|aws-sdk'
+assert_manifest_excludes \
+  services/neoengram-server/Cargo.toml \
+  'neoengram-(engine|fs|standalone|agent)|rusqlite|diesel|aws-sdk'
 for manifest in \
   crates/neoengram-core/Cargo.toml \
   crates/neoengram-engine/Cargo.toml \
@@ -153,7 +165,8 @@ for manifest in \
   crates/neoengram-protocol/Cargo.toml \
   crates/neoengram-standalone/Cargo.toml \
   crates/neoengram-agent/Cargo.toml \
-  services/neoengramd/Cargo.toml; do
+  services/neoengramd/Cargo.toml \
+  services/neoengram-server/Cargo.toml; do
   rg -q '^publish = false$' "$manifest" || fail "$manifest must remain workspace-private"
 done
 

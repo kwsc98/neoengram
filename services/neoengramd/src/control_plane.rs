@@ -17,8 +17,9 @@ use crate::{
     ExpireAddJobRequest, ExpireAddJobResult, FinalizeAddRequest, FinalizeAddResult,
     IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, IndexPublisher,
     JobInsertOutcome, JobRecord, JobRepository, MetadataBatchStager, MetadataBatchSubmission,
-    ObjectCatalog, PublicationCandidate, ReceiveReportRequest, ReceiveReportResult,
-    ResumePublicationRequest, StageMetadataBatchRequest, StageMetadataBatchResult,
+    ObjectCatalog, PublicationCandidate, QueryJobRequest, QueryJobResult, ReceiveReportRequest,
+    ReceiveReportResult, ResumePublicationRequest, StageMetadataBatchRequest,
+    StageMetadataBatchResult,
 };
 
 const CONTROL_ERROR_MESSAGE_LIMIT: usize = 4096;
@@ -111,6 +112,39 @@ impl ControlPlane {
         };
         self.audit(&job, AuditKind::JobCreated, "create").await?;
         Ok(CreateAddJobResult { job, replayed })
+    }
+
+    /// Loads a managed Add job by tenant and job identity, after authorization.
+    pub async fn query_job(&self, request: QueryJobRequest) -> CentralResult<QueryJobResult> {
+        let actor = request.actor.clone();
+        let sentinel = move || invalid(CentralErrorCode::ProtocolInvalid, "invalid query argument");
+        self.authorize(
+            Actor::Principal(actor.clone()),
+            Action::QueryJob,
+            &AddJobSpec {
+                job_id: request.job_id.clone(),
+                principal: actor,
+                tenant_id: request.tenant_id.clone(),
+                project_id: neoengram_protocol::ProjectId::new("query").map_err(|_| sentinel())?,
+                artifact_id: neoengram_protocol::ArtifactId::new("query")
+                    .map_err(|_| sentinel())?,
+                playground_id: neoengram_protocol::PlaygroundId::new("query")
+                    .map_err(|_| sentinel())?,
+                expected_index_version: neoengram_protocol::WireIndexVersion {
+                    revision: neoengram_protocol::IndexRevision::new(0),
+                    digest: neoengram_core::ContentDigest::hash(b"query-sentinel"),
+                    extensions: Default::default(),
+                },
+                request_digest: neoengram_core::ContentDigest::hash(b"query-sentinel"),
+                deadline_unix_ms: neoengram_protocol::UnixMillis::new(0),
+                paths: Vec::new(),
+                all: false,
+                extensions: Default::default(),
+            },
+        )
+        .await?;
+        let job = self.load(&request.tenant_id, &request.job_id).await?;
+        Ok(QueryJobResult { job })
     }
 
     /// Reserves its delivery identity, persists the assignment, then exposes it in the outbox.
