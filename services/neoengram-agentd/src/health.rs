@@ -39,6 +39,7 @@ pub enum RuntimeHealthPhase {
     Bootstrapping,
     PendingApproval,
     ApprovedWaitingCertificate,
+    SessionReady,
     Rejected,
     Expired,
 }
@@ -113,8 +114,9 @@ pub fn check_health(state_dir: impl AsRef<Path>, mode: HealthMode) -> AgentDaemo
 
     match mode {
         HealthMode::Startup | HealthMode::Live => Ok(()),
+        HealthMode::Ready if document.phase == RuntimeHealthPhase::SessionReady => Ok(()),
         HealthMode::Ready => Err(AgentDaemonError::Health(format!(
-            "Agent is not ready while registration phase is {:?}; certificate sessions are not implemented",
+            "Agent is not ready while runtime phase is {:?}",
             document.phase
         ))),
     }
@@ -428,6 +430,11 @@ mod tests {
         check_health(directory.path(), HealthMode::Startup).unwrap();
         check_health(directory.path(), HealthMode::Live).unwrap();
         assert!(check_health(directory.path(), HealthMode::Ready).is_err());
+
+        reporter
+            .set_phase(RuntimeHealthPhase::SessionReady)
+            .unwrap();
+        check_health(directory.path(), HealthMode::Ready).unwrap();
 
         drop(reporter);
         assert!(check_health(directory.path(), HealthMode::Startup).is_err());

@@ -12,13 +12,17 @@ pub mod runtime;
 pub mod service;
 
 pub use agent_transport::{
-    AgentEnrollmentHandler, AgentHttpError, AgentListenerConfig, AgentServerError,
-    AgentServerHandle, RegistryAgentEnrollmentHandler, RunningAgentServer,
+    AgentApiHandler, AgentDataPlaneHandler, AgentEnrollmentHandler, AgentHttpError,
+    AgentListenerConfig, AgentServerError, AgentServerHandle, RegistryAgentApiHandler,
+    RegistryAgentEnrollmentHandler, RunningAgentServer,
 };
 pub use controller::{
-    JobApi, JobApiClient, JobApiServer, JobController, StorageEnrollmentApi,
-    StorageEnrollmentApiClient, StorageEnrollmentApiServer, StorageEnrollmentController, SystemApi,
-    SystemApiClient, SystemApiServer, SystemController,
+    JobApi, JobApiClient, JobApiServer, JobController, PlaygroundApi, PlaygroundApiClient,
+    PlaygroundApiServer, PlaygroundController, StorageEnrollmentApi, StorageEnrollmentApiClient,
+    StorageEnrollmentApiServer, StorageEnrollmentController, StorageVolumeApi,
+    StorageVolumeApiClient, StorageVolumeApiServer, StorageVolumeController, SystemApi,
+    SystemApiClient, SystemApiServer, SystemController, TenantApi, TenantApiClient,
+    TenantApiServer, TenantController,
 };
 pub use error::NeoEngramProblemEncoder;
 pub use identity::{
@@ -26,5 +30,6 @@ pub use identity::{
 };
 pub use runtime::{run, AppState, Config, RuntimeError};
 pub use service::{
-    EnrollmentKeyring, EnrollmentService, HealthService, JobService, ReadinessProbe, SystemService,
+    AgentDataPlaneService, CatalogService, CoordinatorRun, EnrollmentKeyring, EnrollmentService,
+    HealthService, JobCoordinator, JobService, ReadinessProbe, SystemService,
 };

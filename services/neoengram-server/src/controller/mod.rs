@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+mod catalog;
+pub use catalog::*;
+
 use fusen_rs::{interface, Call, Error, Response};
 
 use crate::{
@@ -243,7 +246,7 @@ impl StorageEnrollmentApi for StorageEnrollmentController {
     }
 }
 
-fn authenticated_identity(call: &Call) -> Result<AuthenticatedIdentity, Error> {
+pub(super) fn authenticated_identity(call: &Call) -> Result<AuthenticatedIdentity, Error> {
     call.extensions()
         .get::<AuthenticatedIdentity>()
         .cloned()

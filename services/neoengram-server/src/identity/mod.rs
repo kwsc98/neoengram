@@ -785,19 +785,60 @@ fn canonical_oidc_principal(issuer: &str, subject: &str) -> String {
     format!("oidc:{}", blake3::hash(&input).to_hex())
 }
 
-/// Permissions exposed by the public job API.
+/// Permissions exposed by the public control-plane API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum Permission {
+    #[serde(rename = "job.create", alias = "create_add_job")]
     CreateAddJob,
+    #[serde(rename = "job.read", alias = "query_job")]
     QueryJob,
+    #[serde(rename = "job.finalize", alias = "finalize_add")]
     FinalizeAdd,
+    #[serde(rename = "tenant.read")]
+    TenantRead,
+    #[serde(rename = "tenant.create")]
+    TenantCreate,
+    #[serde(rename = "storage.read")]
+    StorageRead,
+    #[serde(rename = "storage.create")]
+    StorageCreate,
     #[serde(rename = "storage.enrollment.create")]
     StorageEnrollmentCreate,
     #[serde(rename = "storage.enrollment.read")]
     StorageEnrollmentRead,
     #[serde(rename = "storage.enrollment.review")]
     StorageEnrollmentReview,
+    #[serde(rename = "playground.read")]
+    PlaygroundRead,
+    #[serde(rename = "playground.create")]
+    PlaygroundCreate,
+}
+
+impl Permission {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CreateAddJob => "job.create",
+            Self::QueryJob => "job.read",
+            Self::FinalizeAdd => "job.finalize",
+            Self::TenantRead => "tenant.read",
+            Self::TenantCreate => "tenant.create",
+            Self::StorageRead => "storage.read",
+            Self::StorageCreate => "storage.create",
+            Self::StorageEnrollmentCreate => "storage.enrollment.create",
+            Self::StorageEnrollmentRead => "storage.enrollment.read",
+            Self::StorageEnrollmentReview => "storage.enrollment.review",
+            Self::PlaygroundRead => "playground.read",
+            Self::PlaygroundCreate => "playground.create",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantVisibility {
+    None,
+    All,
+    Explicit(Vec<TenantId>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -940,22 +981,72 @@ impl StaticRbacPolicy {
                 && (grant.tenants.contains("*") || grant.tenants.contains(tenant_id.as_str()))
         })
     }
+
+    /// Returns the tenant scope for one permission without exposing policy internals.
+    #[must_use]
+    pub fn tenant_visibility(
+        &self,
+        principal: &PrincipalRef,
+        permission: Permission,
+    ) -> TenantVisibility {
+        let Some(grant) = self.grants.get(principal.id.as_str()) else {
+            return TenantVisibility::None;
+        };
+        if !grant.permissions.contains(&permission) {
+            return TenantVisibility::None;
+        }
+        if grant.tenants.contains("*") {
+            return TenantVisibility::All;
+        }
+        TenantVisibility::Explicit(
+            grant
+                .tenants
+                .iter()
+                .map(|tenant| TenantId::new(tenant.clone()).expect("RBAC tenant was validated"))
+                .collect(),
+        )
+    }
+
+    /// Stable public permission names granted in one Tenant scope.
+    #[must_use]
+    pub fn permission_names(&self, principal: &PrincipalRef, tenant_id: &TenantId) -> Vec<String> {
+        let Some(grant) = self.grants.get(principal.id.as_str()) else {
+            return Vec::new();
+        };
+        if !(grant.tenants.contains("*") || grant.tenants.contains(tenant_id.as_str())) {
+            return Vec::new();
+        }
+        grant
+            .permissions
+            .iter()
+            .map(|permission| permission.name().to_owned())
+            .collect()
+    }
 }
 
 #[async_trait]
 impl Authorizer for StaticRbacPolicy {
     async fn authorize(&self, request: &AuthorizationRequest) -> CentralResult<()> {
+        if matches!(request.actor, Actor::Agent(_))
+            && matches!(
+                request.action,
+                Action::ReceiveReport | Action::StageMetadataBatch
+            )
+        {
+            // Agent transport authenticates the signed session and exact assignment scope before
+            // entering the control plane. RBAC has no principal binding for Agent identities.
+            return Ok(());
+        }
         let Actor::Principal(principal) = &request.actor else {
             return Err(authorization_error());
         };
         let permission = match request.action {
-            Action::CreateAddJob => Permission::CreateAddJob,
+            Action::CreateAddJob | Action::AssignJob | Action::ExpireAddJob => {
+                Permission::CreateAddJob
+            }
             Action::QueryJob => Permission::QueryJob,
             Action::FinalizeAdd => Permission::FinalizeAdd,
-            Action::AssignJob
-            | Action::ReceiveReport
-            | Action::StageMetadataBatch
-            | Action::ExpireAddJob => return Err(authorization_error()),
+            Action::ReceiveReport | Action::StageMetadataBatch => return Err(authorization_error()),
         };
         if self.is_allowed(principal, permission, &request.tenant_id) {
             Ok(())

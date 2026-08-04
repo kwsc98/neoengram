@@ -491,12 +491,14 @@ paths:
                   value:
                     token_id: storage-enrollment-token-01
                     bootstrap_token: ngenr_v1_hQ7Bv2jL0pK9Xz4cN6mR8sT1wY3aD5fG
+                    volume_descriptor_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                     expires_at_unix_ms: "1785168900000"
                     replayed: false
                 replayed:
                   value:
                     token_id: storage-enrollment-token-01
                     bootstrap_token: ngenr_v1_hQ7Bv2jL0pK9Xz4cN6mR8sT1wY3aD5fG
+                    volume_descriptor_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                     expires_at_unix_ms: "1785168900000"
                     replayed: true
         "401":
@@ -1283,8 +1285,8 @@ paths:
                     storage_volume_id: volume-shanghai-vision
                     region: cn-shanghai
                     display_name: 标注工作区
-                    base_commit_id: commit-main-2
-                    head_commit_id: commit-main-3
+                    base_commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                    head_commit_id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                     index_version:
                       revision: "31"
                       digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -1350,8 +1352,8 @@ paths:
                   storage_volume_id: volume-shanghai-vision
                   region: cn-shanghai
                   display_name: 标注工作区
-                  base_commit_id: commit-main-2
-                  head_commit_id: commit-main-3
+                  base_commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  head_commit_id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                   index_version:
                     revision: "31"
                     digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -1400,7 +1402,7 @@ paths:
               playground_id: review-july
               storage_volume_id: volume-shanghai-vision
               display_name: 七月复核
-              base_commit_id: commit-main-3
+              base_commit_id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
       responses:
         "200":
           description: 已创建或幂等返回的 Playground
@@ -1502,8 +1504,8 @@ paths:
                   storage_volume_id: volume-shanghai-vision
                   region: cn-shanghai
                   display_name: 标注工作区
-                  base_commit_id: commit-main-2
-                  head_commit_id: commit-main-3
+                  base_commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  head_commit_id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                   index_version:
                     revision: "31"
                     digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -3658,10 +3660,12 @@ components:
         - properties:
             backend_type:
               const: pvc
+            nfs_reference: false
           required: [pvc_reference]
         - properties:
             backend_type:
               const: nfs
+            pvc_reference: false
           required: [nfs_reference]
 
     CreateStorageVolumeResponse:
@@ -3756,14 +3760,18 @@ components:
       type: object
       description: |
         原始 bootstrap token 只在本响应中返回。相同 token_request_id 和完全相同 payload 重放时返回
-        同一 token_id、bootstrap_token 和 expires_at_unix_ms，并将 replayed 设为 true。
+        同一 token_id、bootstrap_token、volume_descriptor_digest 和 expires_at_unix_ms，并将
+        replayed 设为 true。Agent 配置必须使用该服务端冻结的 descriptor digest。
       additionalProperties: false
-      required: [token_id, bootstrap_token, expires_at_unix_ms, replayed]
+      required:
+        [token_id, bootstrap_token, volume_descriptor_digest, expires_at_unix_ms, replayed]
       properties:
         token_id:
           $ref: "#/components/schemas/StorageEnrollmentTokenId"
         bootstrap_token:
           $ref: "#/components/schemas/StorageEnrollmentBootstrapToken"
+        volume_descriptor_digest:
+          $ref: "#/components/schemas/ContentDigest"
         expires_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
         replayed:
@@ -4481,7 +4489,9 @@ components:
         display_name:
           $ref: "#/components/schemas/DisplayName"
         base_commit_id:
-          $ref: "#/components/schemas/CommitId"
+          allOf:
+            - $ref: "#/components/schemas/ContentDigest"
+          description: 可选的 canonical Commit 内容摘要；最小开发闭环不校验 Commit 记录存在。
 
     CreatePlaygroundResponse:
       type: object
@@ -4531,9 +4541,9 @@ components:
         display_name:
           $ref: "#/components/schemas/DisplayName"
         base_commit_id:
-          $ref: "#/components/schemas/CommitId"
+          $ref: "#/components/schemas/ContentDigest"
         head_commit_id:
-          $ref: "#/components/schemas/CommitId"
+          $ref: "#/components/schemas/ContentDigest"
         index_version:
           $ref: "#/components/schemas/IndexVersion"
         state:

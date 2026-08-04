@@ -68,6 +68,7 @@ impl JobKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct IndexKey {
     pub tenant_id: TenantId,
+    pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
     pub playground_id: PlaygroundId,
 }
@@ -128,6 +129,7 @@ impl JobRecord {
     pub fn index_key(&self) -> IndexKey {
         IndexKey {
             tenant_id: self.spec.tenant_id.clone(),
+            project_id: self.spec.project_id.clone(),
             artifact_id: self.spec.artifact_id.clone(),
             playground_id: self.spec.playground_id.clone(),
         }

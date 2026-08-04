@@ -520,6 +520,7 @@ function seedStorageEnrollmentState(): void {
       state: 'pending_approval',
       agent_version: '0.2.0',
       identity_fingerprint: 'a'.repeat(64),
+      proof_of_possession_status: 'verified',
       probe: {
         descriptor_matches: true,
         observed_access_mode: 'read_write',
@@ -544,6 +545,7 @@ function seedStorageEnrollmentState(): void {
       state: 'pending_approval',
       agent_version: '0.2.0',
       identity_fingerprint: 'b'.repeat(64),
+      proof_of_possession_status: 'verified',
       probe: {
         descriptor_matches: true,
         observed_access_mode: 'read_write',
@@ -568,6 +570,7 @@ function seedStorageEnrollmentState(): void {
       state: 'pending_approval',
       agent_version: '0.2.0',
       identity_fingerprint: 'c'.repeat(64),
+      proof_of_possession_status: 'verified',
       probe: {
         descriptor_matches: true,
         observed_access_mode: 'read_write',
@@ -1273,6 +1276,7 @@ export const handlers = [
     const response: CreateStorageEnrollmentTokenResponse = {
       token_id: tokenId,
       bootstrap_token: `ngenr_v1_${crypto.randomUUID().replaceAll('-', '')}`,
+      volume_descriptor_digest: 'd'.repeat(64),
       expires_at_unix_ms: (now + 15 * 60 * 1000).toString(),
       replayed: false,
     };

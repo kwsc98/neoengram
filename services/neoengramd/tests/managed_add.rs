@@ -10,14 +10,15 @@ use neoengram_core::{
 };
 use neoengram_protocol::{
     AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
-    ControlError, DecimalU64, DurabilityState, EdgeClusterId, ErrorCode, Extensions, FencingToken,
-    IndexDeltaRecord, JobAccepted, JobFailed, JobFailureStage, JobPrepared, JobProgress, JobState,
-    LeaseGrant, LeaseId, LeaseMode, ManifestRecord, MetadataBatchDescriptor, MetadataBatchId,
-    MetadataBatchKind, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope,
-    MetadataPublication, MountGeneration, ObjectDurabilityReceipt, ObjectReceiptId,
-    ObjectReceiptRecord, OwnerGeneration, PlacementGeneration, PlaygroundId, PrincipalId,
-    PrincipalKind, PrincipalRef, ProjectId, PublishDecision, SessionId, StorageVolumeId, TenantId,
-    UnixMillis, WireChunkRef, WireChunkingStrategy, WireIndexVersion, WireObjectSpec,
+    ControlError, ControlMessage, DecimalU64, DurabilityState, EdgeClusterId, ErrorCode,
+    Extensions, FencingToken, IndexDeltaRecord, JobAccepted, JobFailed, JobFailureStage,
+    JobPrepared, JobProgress, JobState, LeaseGrant, LeaseId, LeaseMode, ManifestRecord,
+    MetadataBatchDescriptor, MetadataBatchId, MetadataBatchKind, MetadataBatchPage,
+    MetadataBatchRecords, MetadataBatchScope, MetadataPublication, MountGeneration,
+    ObjectDurabilityReceipt, ObjectReceiptId, ObjectReceiptRecord, OwnerGeneration,
+    PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId,
+    PublishDecision, SessionGeneration, SessionId, StorageVolumeId, TenantId, UnixMillis,
+    WireChunkRef, WireChunkingStrategy, WireIndexVersion, WireObjectSpec,
 };
 use neoengramd::{
     Action, Actor, AddJobSpec, AgentReport, AssignJobRequest, AssignmentOutbox,
@@ -168,6 +169,7 @@ impl Scenario {
     fn index_key(&self) -> IndexKey {
         IndexKey {
             tenant_id: self.spec.tenant_id.clone(),
+            project_id: self.spec.project_id.clone(),
             artifact_id: self.spec.artifact_id.clone(),
             playground_id: self.spec.playground_id.clone(),
         }
@@ -478,6 +480,171 @@ async fn reserved_assignment_is_invisible_until_the_job_write_succeeds() {
         components.outbox.messages().unwrap(),
         vec![assigned.assignment]
     );
+}
+
+#[tokio::test]
+async fn accepted_assignment_retirement_prevents_stable_prefix_starvation() {
+    let components = InMemoryComponents::new(100);
+    let control = components.control_plane();
+    let (actor, first_spec, first_target) = inputs(&components).await;
+    let mut second_spec = first_spec.clone();
+    second_spec.job_id = neoengram_protocol::JobId::new("job-b").unwrap();
+    second_spec.request_digest = second_spec.computed_request_digest().unwrap();
+    let mut second_target = first_target.clone();
+    second_target.assignment_id = AssignmentId::new("assignment-z").unwrap();
+
+    for (spec, target) in [(&first_spec, &first_target), (&second_spec, &second_target)] {
+        control
+            .create_add_job(CreateAddJobRequest {
+                actor: actor.clone(),
+                spec: spec.clone(),
+            })
+            .await
+            .unwrap();
+        control
+            .assign_job(AssignJobRequest {
+                actor: actor.clone(),
+                tenant_id: spec.tenant_id.clone(),
+                job_id: spec.job_id.clone(),
+                target: target.clone(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let accepted = JobAccepted {
+        job_id: first_spec.job_id.clone(),
+        assignment_id: first_target.assignment_id.clone(),
+        assignment_generation: first_target.assignment_generation,
+        accepted_at_unix_ms: UnixMillis::new(200),
+        request_digest: first_spec.request_digest,
+        extensions: Extensions::new(),
+    };
+    let first = control
+        .receive_report(ReceiveReportRequest {
+            tenant_id: first_spec.tenant_id.clone(),
+            agent_id: first_target.agent_id.clone(),
+            report: AgentReport::Accepted(accepted.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(!first.replayed);
+    let replay = control
+        .receive_report(ReceiveReportRequest {
+            tenant_id: first_spec.tenant_id.clone(),
+            agent_id: first_target.agent_id.clone(),
+            report: AgentReport::Accepted(accepted),
+        })
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+
+    let pending = components
+        .outbox
+        .pending_for_agent(&first_target.agent_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    let neoengram_protocol::AssignmentOperation::Add { input, .. } = &pending[0].assignment;
+    assert_eq!(input.job_id, second_spec.job_id);
+
+    let messages = control
+        .poll_agent_messages(&first_target.agent_id, SessionGeneration::new(1), 1)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    let ControlMessage::Assignment(assignment) = &messages[0].message else {
+        panic!("the next live assignment must not be starved");
+    };
+    let neoengram_protocol::AssignmentOperation::Add { input, .. } = &assignment.assignment;
+    assert_eq!(input.job_id, second_spec.job_id);
+}
+
+#[tokio::test]
+async fn accepted_replay_recovers_when_retirement_failed_after_job_cas() {
+    let components = InMemoryComponents::new(100);
+    let outbox = Arc::new(FailRetireOnceOutbox::default());
+    let control = ControlPlane::new(
+        components.authorizer.clone(),
+        AuthorityStore::from_parts(
+            components.jobs.clone(),
+            outbox.clone(),
+            components.metadata.clone(),
+            components.objects.clone(),
+            components.publisher.clone(),
+            components.audit.clone(),
+            AuthorityCapabilities::IN_MEMORY,
+        ),
+        components.clock.clone(),
+    );
+    let (actor, spec, target) = inputs(&components).await;
+    control
+        .create_add_job(CreateAddJobRequest {
+            actor: actor.clone(),
+            spec: spec.clone(),
+        })
+        .await
+        .unwrap();
+    control
+        .assign_job(AssignJobRequest {
+            actor,
+            tenant_id: spec.tenant_id.clone(),
+            job_id: spec.job_id.clone(),
+            target: target.clone(),
+        })
+        .await
+        .unwrap();
+    let accepted = JobAccepted {
+        job_id: spec.job_id.clone(),
+        assignment_id: target.assignment_id.clone(),
+        assignment_generation: target.assignment_generation,
+        accepted_at_unix_ms: UnixMillis::new(200),
+        request_digest: spec.request_digest,
+        extensions: Extensions::new(),
+    };
+
+    let error = control
+        .receive_report(ReceiveReportRequest {
+            tenant_id: spec.tenant_id.clone(),
+            agent_id: target.agent_id.clone(),
+            report: AgentReport::Accepted(accepted.clone()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), CentralErrorCode::StorageFailure);
+    assert_eq!(
+        components
+            .jobs
+            .get(&JobKey::new(spec.tenant_id.clone(), spec.job_id.clone()))
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        JobState::Accepted
+    );
+    assert_eq!(
+        outbox
+            .pending_for_agent(&target.agent_id, 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let recovered = control
+        .receive_report(ReceiveReportRequest {
+            tenant_id: spec.tenant_id,
+            agent_id: target.agent_id.clone(),
+            report: AgentReport::Accepted(accepted),
+        })
+        .await
+        .unwrap();
+    assert!(recovered.replayed);
+    assert!(outbox
+        .pending_for_agent(&target.agent_id, 1)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1396,6 +1563,7 @@ async fn invalid_resulting_snapshot_becomes_a_stable_failed_decision() {
     let components = InMemoryComponents::new(100);
     let key = IndexKey {
         tenant_id: TenantId::new("tenant-a").unwrap(),
+        project_id: ProjectId::new("project-a").unwrap(),
         artifact_id: ArtifactId::new("artifact-a").unwrap(),
         playground_id: PlaygroundId::new("playground-a").unwrap(),
     };
@@ -1454,6 +1622,7 @@ async fn cas_mismatch_becomes_a_stable_conflicted_decision_and_replays() {
         .seed(
             IndexKey {
                 tenant_id: scenario.spec.tenant_id.clone(),
+                project_id: scenario.spec.project_id.clone(),
                 artifact_id: scenario.spec.artifact_id.clone(),
                 playground_id: scenario.spec.playground_id.clone(),
             },
@@ -1825,6 +1994,25 @@ impl JobRepository for CreateRaceRepository {
         Ok(result)
     }
 
+    async fn list_recoverable(
+        &self,
+        after: Option<&JobKey>,
+        now: UnixMillis,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        self.inner.list_recoverable(after, now, limit).await
+    }
+
+    async fn list_pending_decisions_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        self.inner
+            .list_pending_decisions_for_agent(agent_id, limit)
+            .await
+    }
+
     async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
         self.inner.insert_or_load(job).await
     }
@@ -1856,6 +2044,25 @@ impl AssignmentRaceRepository {
 impl JobRepository for AssignmentRaceRepository {
     async fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
         self.inner.get(key).await
+    }
+
+    async fn list_recoverable(
+        &self,
+        after: Option<&JobKey>,
+        now: UnixMillis,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        self.inner.list_recoverable(after, now, limit).await
+    }
+
+    async fn list_pending_decisions_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        self.inner
+            .list_pending_decisions_for_agent(agent_id, limit)
+            .await
     }
 
     async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
@@ -1890,6 +2097,25 @@ impl FailAssignmentWriteOnce {
 impl JobRepository for FailAssignmentWriteOnce {
     async fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
         self.inner.get(key).await
+    }
+
+    async fn list_recoverable(
+        &self,
+        after: Option<&JobKey>,
+        now: UnixMillis,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        self.inner.list_recoverable(after, now, limit).await
+    }
+
+    async fn list_pending_decisions_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        self.inner
+            .list_pending_decisions_for_agent(agent_id, limit)
+            .await
     }
 
     async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
@@ -1998,6 +2224,25 @@ impl JobRepository for FailTerminalOnce {
         self.inner.get(key).await
     }
 
+    async fn list_recoverable(
+        &self,
+        after: Option<&JobKey>,
+        now: UnixMillis,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        self.inner.list_recoverable(after, now, limit).await
+    }
+
+    async fn list_pending_decisions_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        self.inner
+            .list_pending_decisions_for_agent(agent_id, limit)
+            .await
+    }
+
     async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
         self.inner.insert_or_load(job).await
     }
@@ -2016,6 +2261,59 @@ impl JobRepository for FailTerminalOnce {
 struct FlakyOutbox {
     delivered: InMemoryAssignmentOutbox,
     reject_delivery: AtomicBool,
+}
+
+struct FailRetireOnceOutbox {
+    delivered: InMemoryAssignmentOutbox,
+    armed: AtomicBool,
+}
+
+impl Default for FailRetireOnceOutbox {
+    fn default() -> Self {
+        Self {
+            delivered: InMemoryAssignmentOutbox::default(),
+            armed: AtomicBool::new(true),
+        }
+    }
+}
+
+#[async_trait]
+impl AssignmentOutbox for FailRetireOnceOutbox {
+    async fn reserve(
+        &self,
+        assignment: neoengram_protocol::JobAssignment,
+    ) -> CentralResult<AssignmentReserveOutcome> {
+        self.delivered.reserve(assignment).await
+    }
+
+    async fn publish(
+        &self,
+        assignment: neoengram_protocol::JobAssignment,
+    ) -> CentralResult<AssignmentPublishOutcome> {
+        self.delivered.publish(assignment).await
+    }
+
+    async fn retire(
+        &self,
+        tenant_id: &TenantId,
+        assignment_id: &AssignmentId,
+    ) -> CentralResult<neoengramd::AssignmentRetireOutcome> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            return Err(CentralError::new(
+                CentralErrorCode::StorageFailure,
+                "injected assignment retirement failure",
+            ));
+        }
+        self.delivered.retire(tenant_id, assignment_id).await
+    }
+
+    async fn pending_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<neoengram_protocol::JobAssignment>> {
+        self.delivered.pending_for_agent(agent_id, limit).await
+    }
 }
 
 impl Default for FlakyOutbox {
@@ -2053,6 +2351,22 @@ impl AssignmentOutbox for FlakyOutbox {
             ));
         }
         self.delivered.publish(assignment).await
+    }
+
+    async fn retire(
+        &self,
+        tenant_id: &TenantId,
+        assignment_id: &AssignmentId,
+    ) -> CentralResult<neoengramd::AssignmentRetireOutcome> {
+        self.delivered.retire(tenant_id, assignment_id).await
+    }
+
+    async fn pending_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<neoengram_protocol::JobAssignment>> {
+        self.delivered.pending_for_agent(agent_id, limit).await
     }
 }
 
@@ -2458,12 +2772,14 @@ async fn inputs(components: &InMemoryComponents) -> (PrincipalRef, AddJobSpec, A
         extensions: Extensions::new(),
     };
     let tenant_id = TenantId::new("tenant-a").unwrap();
+    let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
     let playground_id = PlaygroundId::new("playground-a").unwrap();
     let expected_index_version = components
         .publisher
         .current_version(&IndexKey {
             tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
             playground_id: playground_id.clone(),
         })
@@ -2473,7 +2789,7 @@ async fn inputs(components: &InMemoryComponents) -> (PrincipalRef, AddJobSpec, A
         job_id: neoengram_protocol::JobId::new("job-a").unwrap(),
         principal: actor.clone(),
         tenant_id,
-        project_id: ProjectId::new("project-a").unwrap(),
+        project_id,
         artifact_id,
         playground_id,
         expected_index_version,

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use neoengram_protocol::{AssignmentOperation, JobAssignment};
+use neoengram_protocol::{AgentId, AssignmentOperation, JobAssignment};
 use sqlx::Row;
 
 use super::authority::*;
@@ -82,6 +82,80 @@ impl AssignmentOutbox for SqliteAuthorityStore {
         .map_err(storage_error)?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(AssignmentPublishOutcome::Published)
+    }
+
+    async fn retire(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        assignment_id: &neoengram_protocol::AssignmentId,
+    ) -> CentralResult<AssignmentRetireOutcome> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let row = sqlx::query(
+            "SELECT published, retired FROM assignment_outbox \
+             WHERE tenant_id = ? AND assignment_id = ?",
+        )
+        .bind(tenant_id.as_str())
+        .bind(assignment_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            invalid(
+                CentralErrorCode::Internal,
+                format!("assignment {assignment_id} is not reserved"),
+            )
+        })?;
+        let published: i64 = row.try_get("published").map_err(storage_error)?;
+        let retired: i64 = row.try_get("retired").map_err(storage_error)?;
+        if published != 1 {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                format!("assignment {assignment_id} is not published"),
+            ));
+        }
+        if retired == 1 {
+            return Ok(AssignmentRetireOutcome::AlreadyRetired);
+        }
+        sqlx::query(
+            "UPDATE assignment_outbox SET retired = 1 \
+             WHERE tenant_id = ? AND assignment_id = ? AND retired = 0",
+        )
+        .bind(tenant_id.as_str())
+        .bind(assignment_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(AssignmentRetireOutcome::Retired)
+    }
+
+    async fn pending_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobAssignment>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let payloads: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT payload FROM assignment_outbox WHERE published = 1 AND retired = 0 \
+             ORDER BY tenant_id, assignment_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let mut assignments = Vec::with_capacity(limit.min(payloads.len()));
+        for payload in payloads {
+            let assignment: JobAssignment = decode(&payload)?;
+            let AssignmentOperation::Add { input, .. } = &assignment.assignment;
+            if &input.agent_id == agent_id {
+                assignments.push(assignment);
+                if assignments.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(assignments)
     }
 }
 

@@ -4,6 +4,7 @@
 //! signature helpers, and JSON Schema generation. It intentionally has no dependency on an HTTP
 //! runtime, a database, a filesystem, the CLI, or the execution engine.
 
+mod agent_api;
 mod control;
 mod digest;
 mod enrollment;
@@ -15,6 +16,7 @@ mod scalars;
 mod schema;
 mod validation;
 
+pub use agent_api::*;
 pub use control::*;
 pub use digest::{domain_separated_jcs_bytes, jcs_blake3, jcs_bytes};
 pub use enrollment::*;
@@ -24,7 +26,7 @@ pub use metadata::*;
 pub use neoengram_core::ContentDigest;
 pub use s3::*;
 pub use scalars::*;
-pub use schema::{control_schema, enrollment_schema, metadata_schema, s3_schema};
+pub use schema::{agent_api_schema, control_schema, enrollment_schema, metadata_schema, s3_schema};
 pub use validation::decode_bounded_unique_json;
 
 /// The only protocol version emitted by this crate.

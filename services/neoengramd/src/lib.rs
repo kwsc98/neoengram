@@ -5,6 +5,8 @@
 //! default single-process SQLite authority adapter.
 
 mod agent_registry;
+mod catalog;
+mod catalog_memory;
 mod control_plane;
 #[cfg(feature = "authority-sqlite")]
 mod datasource;
@@ -18,6 +20,8 @@ mod registry_memory;
 mod validation;
 
 pub use agent_registry::*;
+pub use catalog::*;
+pub use catalog_memory::InMemoryControlCatalog;
 pub use control_plane::ControlPlane;
 pub use error::{CentralError, CentralErrorCode, CentralResult};
 #[cfg(feature = "authority-sqlite")]
@@ -36,3 +40,16 @@ pub use memory::{
 pub use model::*;
 pub use ports::*;
 pub use registry_memory::InMemoryAgentRegistry;
+
+fn mapper_recovery_predicate(job: &JobRecord, now: neoengram_protocol::UnixMillis) -> bool {
+    use neoengram_protocol::JobState;
+
+    matches!(
+        job.state,
+        JobState::Queued | JobState::Prepared | JobState::Publishing
+    ) || (job.spec.deadline_unix_ms.get() <= now.get()
+        && matches!(
+            job.state,
+            JobState::Assigned | JobState::Accepted | JobState::Running | JobState::CancelRequested
+        ))
+}

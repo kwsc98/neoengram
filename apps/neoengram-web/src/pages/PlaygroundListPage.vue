@@ -1,40 +1,47 @@
 <script setup lang="ts">
-import { ArrowRight, Search } from '@element-plus/icons-vue';
-import { useQuery } from '@tanstack/vue-query';
-import { computed, ref, watch } from 'vue';
+import { ArrowRight, Plus, Search } from '@element-plus/icons-vue';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
+import { ElMessage } from 'element-plus';
+import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { queryArtifactList, queryPlaygroundList } from '@/api/operations';
+import { createPlayground, queryPlaygroundList } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
-import ProjectFilter from '@/components/ProjectFilter.vue';
+import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
 import {
   playgroundAvailabilityLabel,
   playgroundAvailabilityTagType,
 } from '@/features/precommit/status';
+import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
 
 const route = useRoute();
 const router = useRouter();
+const queryClient = useQueryClient();
+const tenants = useTenantsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
+const canCreatePlayground = computed(
+  () => tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false,
+);
 const projectId = ref(String(route.query.project_id ?? ''));
 const artifactId = ref(String(route.query.artifact_id ?? ''));
 const searchInput = ref(String(route.query.q ?? ''));
 const search = ref(searchInput.value);
 const cursor = ref<string>();
 const cursorHistory = ref<string[]>([]);
-
-const artifactOptionsQuery = useQuery({
-  queryKey: computed(() => ['artifacts', tenantId.value, projectId.value, 'playground-filter']),
-  queryFn: () =>
-    queryArtifactList({
-      tenant_id: tenantId.value,
-      project_id: projectId.value,
-      page_size: 100,
-    }),
-  enabled: computed(() => Boolean(projectId.value)),
+const createOpen = ref(false);
+const createError = ref('');
+const createForm = reactive({
+  projectId: '',
+  artifactId: '',
+  playgroundId: '',
+  displayName: '',
+  storageVolumeId: '',
 });
+const createMutation = useMutation({ mutationFn: createPlayground });
+
 const playgroundQuery = useQuery({
   queryKey: computed(() => [
     'playgrounds',
@@ -72,6 +79,9 @@ watch(
     search.value = searchInput.value;
     cursor.value = undefined;
     cursorHistory.value = [];
+    createOpen.value = false;
+    createError.value = '';
+    createMutation.reset();
   },
   { deep: true },
 );
@@ -105,6 +115,57 @@ function previousPage(): void {
   cursor.value = cursorHistory.value.pop() || undefined;
 }
 
+function openCreate(): void {
+  Object.assign(createForm, {
+    projectId: projectId.value,
+    artifactId: artifactId.value,
+    playgroundId: '',
+    displayName: '',
+    storageVolumeId: '',
+  });
+  createError.value = '';
+  createMutation.reset();
+  createOpen.value = true;
+}
+
+async function submitCreate(): Promise<void> {
+  createError.value = '';
+  const resourceId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+  if (
+    !resourceId.test(createForm.projectId) ||
+    !resourceId.test(createForm.artifactId) ||
+    !resourceId.test(createForm.playgroundId) ||
+    !createForm.displayName.trim() ||
+    !resourceId.test(createForm.storageVolumeId)
+  ) {
+    createError.value = '请填写合法的 Project、Artifact、Playground、名称和 StorageVolume';
+    return;
+  }
+
+  let result;
+  try {
+    result = await createMutation.mutateAsync({
+      tenant_id: tenantId.value,
+      project_id: createForm.projectId,
+      artifact_id: createForm.artifactId,
+      playground_id: createForm.playgroundId,
+      display_name: createForm.displayName.trim(),
+      storage_volume_id: createForm.storageVolumeId,
+    });
+  } catch {
+    return;
+  }
+
+  await queryClient.invalidateQueries({ queryKey: ['playgrounds', tenantId.value] });
+  createOpen.value = false;
+  ElMessage.success(result.data.replayed ? '已返回现有 Playground' : 'Playground 已创建');
+  await openPlayground(
+    result.data.playground.project_id,
+    result.data.playground.artifact_id,
+    result.data.playground.playground_id,
+  );
+}
+
 async function openPlayground(
   project: string,
   artifact: string,
@@ -124,24 +185,24 @@ async function openPlayground(
 
 <template>
   <div class="page">
-    <PageHeading title="工作区" :description="`${tenantId} 内可以产生数据变化的 Playground`" />
+    <PageHeading title="工作区" :description="`${tenantId} 内可以产生数据变化的 Playground`">
+      <template v-if="canCreatePlayground" #actions>
+        <el-button type="primary" :icon="Plus" @click="openCreate">创建 Playground</el-button>
+      </template>
+    </PageHeading>
     <form class="resource-toolbar resource-toolbar--wide" @submit.prevent="applyFilters">
-      <ProjectFilter v-model="projectId" :tenant-id="tenantId" />
-      <el-select
+      <el-input
+        v-model="projectId"
+        aria-label="Project 筛选"
+        clearable
+        placeholder="全部 Project"
+      />
+      <el-input
         v-model="artifactId"
         aria-label="Artifact 筛选"
         clearable
-        filterable
-        :disabled="!projectId"
         placeholder="全部 Artifact"
-      >
-        <el-option
-          v-for="artifact in artifactOptionsQuery.data.value?.data.items ?? []"
-          :key="artifact.artifact_id"
-          :label="artifact.display_name"
-          :value="artifact.artifact_id"
-        />
-      </el-select>
+      />
       <el-input v-model="searchInput" clearable placeholder="搜索 Playground" />
       <el-button type="primary" native-type="submit" :icon="Search">查询</el-button>
     </form>
@@ -269,6 +330,36 @@ async function openPlayground(
         />
       </template>
     </section>
+
+    <el-dialog v-model="createOpen" title="创建 Playground" width="min(580px, calc(100vw - 32px))">
+      <ApiProblemAlert v-if="createMutation.error.value" :error="createMutation.error.value" />
+      <el-alert v-if="createError" :title="createError" type="error" :closable="false" />
+      <el-form label-position="top" class="dialog-form">
+        <div class="dialog-form-grid">
+          <el-form-item label="Project ID" required>
+            <el-input v-model="createForm.projectId" placeholder="project-lab" />
+          </el-form-item>
+          <el-form-item label="Artifact ID" required>
+            <el-input v-model="createForm.artifactId" placeholder="dataset-a" />
+          </el-form-item>
+          <el-form-item label="Playground ID" required>
+            <el-input v-model="createForm.playgroundId" placeholder="review-august" />
+          </el-form-item>
+          <el-form-item label="名称" required>
+            <el-input v-model="createForm.displayName" placeholder="八月复核" />
+          </el-form-item>
+        </div>
+        <el-form-item label="StorageVolume" required>
+          <StorageVolumeFilter v-model="createForm.storageVolumeId" :tenant-id="tenantId" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="createOpen = false">取消</el-button>
+        <el-button type="primary" :loading="createMutation.isPending.value" @click="submitCreate">
+          创建 Playground
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 

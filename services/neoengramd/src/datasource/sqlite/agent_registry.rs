@@ -9,7 +9,7 @@ use std::{
 use fs2::FileExt;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
-    SqlitePool,
+    Sqlite, SqlitePool, Transaction,
 };
 
 use crate::{CentralError, CentralErrorCode, CentralResult};
@@ -17,7 +17,7 @@ use crate::{CentralError, CentralErrorCode, CentralResult};
 const DATABASE_FILE_NAME: &str = "agent-registry.sqlite3";
 const LOCK_FILE_NAME: &str = "agent-registry.lock";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f52;
-const SQLITE_SCHEMA_VERSION: i64 = 3;
+const SQLITE_SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE agent_registry_records (
@@ -90,6 +90,92 @@ CREATE INDEX agent_registry_tenant_status_keyset
     ON agent_registry_records (
         tenant_id, enrollment_state, registration_kind,
         enrollment_created_at_unix_ms DESC, enrollment_id ASC
+    );
+CREATE TABLE tenant_catalog_records (
+    tenant_id TEXT NOT NULL PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    description TEXT,
+    resource_version TEXT NOT NULL CHECK (
+        resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
+    ),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms)
+) STRICT;
+CREATE INDEX tenant_catalog_keyset
+    ON tenant_catalog_records (created_at_unix_ms DESC, tenant_id ASC);
+CREATE TABLE storage_volume_catalog_records (
+    tenant_id TEXT NOT NULL,
+    storage_volume_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    edge_cluster_id TEXT NOT NULL,
+    region TEXT NOT NULL,
+    backend_type TEXT NOT NULL CHECK (backend_type IN ('pvc', 'nfs')),
+    access_mode TEXT NOT NULL CHECK (
+        access_mode IN ('read_write_once', 'read_write_many', 'read_only_many')
+    ),
+    pvc_namespace TEXT,
+    pvc_claim_name TEXT,
+    nfs_server TEXT,
+    nfs_export_path TEXT,
+    state TEXT NOT NULL CHECK (state IN ('ready', 'degraded', 'unavailable')),
+    enrollment_id TEXT,
+    resource_version TEXT NOT NULL CHECK (
+        resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
+    ),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    PRIMARY KEY (tenant_id, storage_volume_id),
+    CHECK (
+        (backend_type = 'pvc' AND pvc_namespace IS NOT NULL AND pvc_claim_name IS NOT NULL
+            AND nfs_server IS NULL AND nfs_export_path IS NULL)
+        OR
+        (backend_type = 'nfs' AND pvc_namespace IS NULL AND pvc_claim_name IS NULL
+            AND nfs_server IS NOT NULL AND nfs_export_path IS NOT NULL)
+    )
+) STRICT;
+CREATE UNIQUE INDEX storage_volume_catalog_pvc_identity
+    ON storage_volume_catalog_records (edge_cluster_id, pvc_namespace, pvc_claim_name)
+    WHERE backend_type = 'pvc';
+CREATE INDEX storage_volume_catalog_keyset
+    ON storage_volume_catalog_records (
+        tenant_id, created_at_unix_ms DESC, storage_volume_id ASC
+    );
+CREATE INDEX storage_volume_catalog_filter_keyset
+    ON storage_volume_catalog_records (
+        tenant_id, region, backend_type, created_at_unix_ms DESC, storage_volume_id ASC
+    );
+CREATE TABLE playground_catalog_records (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    playground_id TEXT NOT NULL,
+    storage_volume_id TEXT NOT NULL,
+    region TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    base_commit_digest BLOB,
+    head_commit_digest BLOB,
+    index_revision TEXT NOT NULL CHECK (
+        index_revision <> '' AND index_revision NOT GLOB '*[^0-9]*'
+    ),
+    index_digest BLOB NOT NULL CHECK (length(index_digest) = 32),
+    state TEXT NOT NULL CHECK (state IN ('creating', 'ready', 'abnormal')),
+    relative_root TEXT NOT NULL CHECK (
+        relative_root <> '' AND substr(relative_root, 1, 1) <> '/'
+    ),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    PRIMARY KEY (tenant_id, project_id, artifact_id, playground_id),
+    FOREIGN KEY (tenant_id, storage_volume_id)
+        REFERENCES storage_volume_catalog_records(tenant_id, storage_volume_id)
+) STRICT;
+CREATE INDEX playground_catalog_keyset
+    ON playground_catalog_records (
+        tenant_id, created_at_unix_ms DESC, project_id ASC, artifact_id ASC, playground_id ASC
+    );
+CREATE INDEX playground_catalog_filter_keyset
+    ON playground_catalog_records (
+        tenant_id, project_id, artifact_id, region, state,
+        created_at_unix_ms DESC, playground_id ASC
     );
 "#;
 
@@ -181,7 +267,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 3")
+        sqlx::query("PRAGMA user_version = 4")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -194,7 +280,11 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
         )));
     }
     match user_version {
-        2 => migrate_v2_to_v3(pool).await?,
+        2 => {
+            migrate_v2_to_v3(pool).await?;
+            migrate_v3_to_v4(pool).await?;
+        }
+        3 => migrate_v3_to_v4(pool).await?,
         SQLITE_SCHEMA_VERSION => {}
         _ => {
             return Err(storage_corruption(format!(
@@ -238,6 +328,90 @@ async fn migrate_v2_to_v3(pool: &SqlitePool) -> CentralResult<()> {
     .await
     .map_err(storage_error)?;
     transaction.commit().await.map_err(storage_error)
+}
+
+async fn migrate_v3_to_v4(pool: &SqlitePool) -> CentralResult<()> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    if catalog_schema_presence(&mut transaction).await? == CatalogSchemaPresence::Absent {
+        create_catalog_schema(&mut transaction).await?;
+    }
+    sqlx::query("PRAGMA user_version = 4")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogSchemaPresence {
+    Absent,
+    Current,
+}
+
+async fn create_catalog_schema(transaction: &mut Transaction<'_, Sqlite>) -> CentralResult<()> {
+    for statement in SCHEMA_SQL
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        let (_, name) = schema_object(statement)?;
+        if is_catalog_schema_object(name) {
+            sqlx::query(statement)
+                .execute(&mut **transaction)
+                .await
+                .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
+async fn catalog_schema_presence(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> CentralResult<CatalogSchemaPresence> {
+    let mut expected_count = 0_usize;
+    let mut present_count = 0_usize;
+    for expected_statement in SCHEMA_SQL
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        let (object_type, name) = schema_object(expected_statement)?;
+        if !is_catalog_schema_object(name) {
+            continue;
+        }
+        expected_count += 1;
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?")
+                .bind(object_type)
+                .bind(name)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(storage_error)?;
+        let Some(stored) = stored else {
+            continue;
+        };
+        if normalize_schema_sql(&stored) != normalize_schema_sql(expected_statement) {
+            return Err(storage_corruption(format!(
+                "Agent registry {object_type} {name} differs from the current schema"
+            )));
+        }
+        present_count += 1;
+    }
+    if present_count == 0 {
+        Ok(CatalogSchemaPresence::Absent)
+    } else if present_count == expected_count {
+        Ok(CatalogSchemaPresence::Current)
+    } else {
+        Err(storage_corruption(
+            "Agent registry control catalog schema is only partially present",
+        ))
+    }
+}
+
+fn is_catalog_schema_object(name: &str) -> bool {
+    name.starts_with("tenant_catalog_")
+        || name.starts_with("storage_volume_catalog_")
+        || name.starts_with("playground_catalog_")
 }
 
 async fn validate_current_schema(pool: &SqlitePool) -> CentralResult<()> {

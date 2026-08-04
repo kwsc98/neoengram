@@ -2,9 +2,11 @@
   "name": "@neoengram/openapi",
   "version": "1.0.0",
   "private": true,
-  "description": "Linting and bundling for the NeoEngram public OpenAPI contract",
+  "description": "Linting and bundling for the NeoEngram public and Agent OpenAPI contracts",
   "scripts": {
-    "lint": "redocly lint --config redocly.yaml neoengram-api.yaml",
+    "lint": "npm run lint:public && npm run lint:agent",
+    "lint:public": "redocly lint --config redocly.yaml neoengram-api.yaml",
+    "lint:agent": "redocly lint --config redocly.yaml neoengram-agent-api.yaml",
     "bundle": "mkdir -p ../../target/openapi && redocly bundle --config redocly.yaml neoengram-api.yaml --output ../../target/openapi/neoengram-api.json",
     "test:contract": "node scripts/check-contract.mjs"
   },

@@ -166,7 +166,7 @@ export async function createStorageEnrollmentToken(
       body: request,
       params: versionHeader,
     }),
-  );
+  ) as ApiResult<CreateStorageEnrollmentTokenResponse>;
 }
 
 export async function queryStorageEnrollmentList(

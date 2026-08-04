@@ -6,19 +6,18 @@ This directory defines the 0.0.1 deployment profile for one existing business PV
 one business PVC = one StorageVolume = one resident AgentInstance
 ```
 
-The Agent mounts the complete business PVC at `/volume`. The current daemon keeps its signing and approved
-identity, bootstrap polling watermark, and health record on a separate RWO PVC at
-`/var/lib/neoengram-agent`. Certificate material and the per-Tenant Job Ledger/cache will also belong on that
-state PVC when the business session is implemented. The central service, Web application, and Agent state
-database must not mount the business PVC.
+The Agent mounts the complete business PVC at `/volume`. Signing and approved identity, bootstrap polling
+watermark, health state, session recovery state, per-Tenant Job Ledger, and durable outbound report queue
+belong on a separate RWO PVC at `/var/lib/neoengram-agent`. The central service, Web application, and Agent
+state databases must not mount the business PVC.
 
-The repository contains the runnable `neoengram-agent` binary in the `neoengram-agentd` package. It loads this
-configuration shape, performs the mount probe, persists its signing identity on the state PVC, uses the
-outbound bootstrap/status transport, and implements the `health` command used by the probes. This is still an
-enrollment-only vertical slice: after approval the process remains in `approved_waiting_certificate`, and the
-ready probe intentionally fails because certificate issuance, authenticated sessions, heartbeats, and Job
-delivery are not implemented. The example image is only a placeholder and must be replaced with a real,
-digest-pinned build before applying these manifests.
+The repository contains the runnable `neoengram-agent` binary in the `neoengram-agentd` package. The
+development transport is outbound HTTP/1 JSON against the independent Agent OpenAPI: bootstrap, session
+open, heartbeat, message polling, Job reports, MetadataBatch pages, Index pages, object negotiation/upload,
+and close are action-style POST operations under `/agent/*`. Approved Ed25519 keys authenticate each request;
+the bootstrap token never becomes a session credential. Production certificate issuance and mTLS are not
+part of this profile. The example image is only a placeholder and must be replaced with a real, digest-pinned
+build before applying these manifests.
 
 ## Preconditions
 
@@ -60,7 +59,7 @@ state PVC. In particular, set:
   `volume_descriptor_digest`;
 - the public token ID in `registration.token_id` for stable bootstrap lookup/audit;
 - a durable RWO StorageClass for `agent-state-pvc.yaml`;
-- the central HTTPS endpoint; `/v1/agents/*` at that origin must reach the server's separate Agent listener,
+- the central HTTPS endpoint; `/agent/*` at that origin must reach the server's separate Agent listener,
   directly or through a reverse proxy, rather than the public Fusen listener;
 - a real, digest-pinned Agent image;
 - a new bootstrap token in a local copy of `secret.example.yaml`.
@@ -82,10 +81,10 @@ kubectl -n <namespace> create secret generic neoengram-agent-bootstrap-<volume-s
 ```
 
 The token authenticates only the registration request. It must not authorize a control session, Job,
-Tenant queue, or Volume ownership. The Agent generates its private key and stable registration request ID
-before the first network request and persists both on the state PVC. After approval, the center binds the
-approved Agent identity and the Agent persists that identity on the state PVC. Certificate issuance is not
-part of the current enrollment transport.
+Tenant queue, or Volume ownership. The Agent generates its Ed25519 private key and stable registration request
+ID before the first network request and persists both on the state PVC. After approval, the center binds the
+approved Agent identity and the Agent persists that identity on the state PVC. Session requests are signed by
+that approved key; no bearer credential is derived from the bootstrap token.
 
 ## Apply And Approve
 
@@ -110,8 +109,8 @@ reviews only the public Volume/PVC scope, Agent version, public-key identity sum
 result. Separately, the platform operator verifies the Deployment, actual PVC attachment, marker, and raw
 mount evidence through an internal operational channel; raw mount fingerprints never enter the public API.
 Approval creates or binds the StorageVolume as Unavailable and creates the AgentInstance. Only an approved
-identity with a valid certificate, session, matching generations, healthy RW observation, and completed
-recovery can make the Volume Ready or receive a Job.
+identity with a valid signed session, matching generations, healthy RW observation, and completed recovery
+can make the Volume Ready or receive a Job.
 
 Approval is a control-plane trust gate, not a filesystem permission gate: this Pod already has its declared
 PVC mount. Bootstrap requires evidence from the real mount, including its marker and RW probe, so 0.0.1 does
@@ -132,9 +131,9 @@ deployment workflow; removing the PVC from this template does not create a valid
 - Delete the one-time bootstrap Secret after the enrollment has consumed it and the Agent has persisted its
   approved identity. The Secret volume is optional so ordinary restarts use the state PVC instead
   of retaining or reusing bootstrap authority. If state is lost, create a fresh Secret and approval request.
-- Startup and liveness check the daemon-owned health record. In the current enrollment-only build readiness
-  always remains false, including after approval, because the certificate/session phase is not implemented;
-  loss of the center must not cause destructive restart loops.
+- Startup and liveness check the daemon-owned health record. Readiness must fail closed until an approved,
+  generation-current session has completed mount recovery and reported a healthy heartbeat. Loss of the
+  center must not cause destructive restart loops.
 - Kubernetes rollout settings and central generations provide cooperative fencing only. They do not stop a
   partitioned or compromised process that still owns RW storage credentials.
 

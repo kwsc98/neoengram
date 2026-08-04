@@ -1008,9 +1008,11 @@ export interface components {
         }) & ({
             /** @constant */
             backend_type?: "pvc";
+            nfs_reference?: never;
         } | {
             /** @constant */
             backend_type?: "nfs";
+            pvc_reference?: never;
         });
         CreateStorageVolumeResponse: {
             storage_volume: components["schemas"]["StorageVolumeView"];
@@ -1051,11 +1053,13 @@ export interface components {
         };
         /**
          * @description 原始 bootstrap token 只在本响应中返回。相同 token_request_id 和完全相同 payload 重放时返回
-         *     同一 token_id、bootstrap_token 和 expires_at_unix_ms，并将 replayed 设为 true。
+         *     同一 token_id、bootstrap_token、volume_descriptor_digest 和 expires_at_unix_ms，并将
+         *     replayed 设为 true。Agent 配置必须使用该服务端冻结的 descriptor digest。
          */
         CreateStorageEnrollmentTokenResponse: {
             token_id: components["schemas"]["StorageEnrollmentTokenId"];
             bootstrap_token: components["schemas"]["StorageEnrollmentBootstrapToken"];
+            volume_descriptor_digest: components["schemas"]["ContentDigest"];
             expires_at_unix_ms: components["schemas"]["UnixMillis"];
             replayed: boolean;
         };
@@ -1361,7 +1365,8 @@ export interface components {
             playground_id: components["schemas"]["PlaygroundId"];
             storage_volume_id: components["schemas"]["StorageVolumeId"];
             display_name: components["schemas"]["DisplayName"];
-            base_commit_id?: components["schemas"]["CommitId"];
+            /** @description 可选的 canonical Commit 内容摘要；最小开发闭环不校验 Commit 记录存在。 */
+            base_commit_id?: components["schemas"]["ContentDigest"];
         } & {
             [key: string]: unknown;
         };
@@ -1383,8 +1388,8 @@ export interface components {
             storage_volume_id: components["schemas"]["StorageVolumeId"];
             region: components["schemas"]["RegionName"];
             display_name: components["schemas"]["DisplayName"];
-            base_commit_id?: components["schemas"]["CommitId"];
-            head_commit_id?: components["schemas"]["CommitId"];
+            base_commit_id?: components["schemas"]["ContentDigest"];
+            head_commit_id?: components["schemas"]["ContentDigest"];
             index_version: components["schemas"]["IndexVersion"];
             state: components["schemas"]["PlaygroundState"];
             active_precommit_id?: components["schemas"]["PreCommitId"];
@@ -3729,8 +3734,8 @@ export interface operations {
                      *           "storage_volume_id": "volume-shanghai-vision",
                      *           "region": "cn-shanghai",
                      *           "display_name": "标注工作区",
-                     *           "base_commit_id": "commit-main-2",
-                     *           "head_commit_id": "commit-main-3",
+                     *           "base_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *           "head_commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                      *           "index_version": {
                      *             "revision": "31",
                      *             "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3809,8 +3814,8 @@ export interface operations {
                      *         "storage_volume_id": "volume-shanghai-vision",
                      *         "region": "cn-shanghai",
                      *         "display_name": "标注工作区",
-                     *         "base_commit_id": "commit-main-2",
-                     *         "head_commit_id": "commit-main-3",
+                     *         "base_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "head_commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                      *         "index_version": {
                      *           "revision": "31",
                      *           "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3866,7 +3871,7 @@ export interface operations {
                  *       "playground_id": "review-july",
                  *       "storage_volume_id": "volume-shanghai-vision",
                  *       "display_name": "七月复核",
-                 *       "base_commit_id": "commit-main-3"
+                 *       "base_commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                  *     }
                  */
                 "application/json": components["schemas"]["CreatePlaygroundRequest"];
@@ -3977,8 +3982,8 @@ export interface operations {
                      *         "storage_volume_id": "volume-shanghai-vision",
                      *         "region": "cn-shanghai",
                      *         "display_name": "标注工作区",
-                     *         "base_commit_id": "commit-main-2",
-                     *         "head_commit_id": "commit-main-3",
+                     *         "base_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "head_commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                      *         "index_version": {
                      *           "revision": "31",
                      *           "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

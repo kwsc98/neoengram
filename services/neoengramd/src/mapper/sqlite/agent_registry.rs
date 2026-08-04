@@ -23,6 +23,8 @@ use crate::{
     AGENT_ENROLLMENT_MAX_QUERY_CHARS,
 };
 
+use super::catalog::sync_volume_from_registry;
+
 const STORED_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone)]
@@ -61,6 +63,11 @@ impl SqliteAgentRegistry {
         self.inner.clone()
     }
 
+    #[must_use]
+    pub fn catalog_repository(&self) -> Arc<dyn crate::ControlCatalogRepository> {
+        self.inner.clone()
+    }
+
     pub async fn integrity_check(&self) -> CentralResult<()> {
         self.inner.datasource.integrity_check().await?;
         validate_records(&self.inner.pool).await
@@ -87,9 +94,9 @@ pub async fn open_sqlite_agent_registry(
     })
 }
 
-struct SqliteAgentRegistryStore {
-    pool: SqlitePool,
-    datasource: Arc<SqliteAgentRegistryDataSource>,
+pub(super) struct SqliteAgentRegistryStore {
+    pub(super) pool: SqlitePool,
+    pub(super) datasource: Arc<SqliteAgentRegistryDataSource>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -894,6 +901,7 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         ensure_immutable_registry_scope(&stored, &record)?;
         validate_registry_replace_transition(&stored, &record)?;
         let payload = encode(&record)?;
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         let result = sqlx::query(
             "UPDATE agent_registry_records SET bootstrap_request_id = ?, decision_request_id = ?, \
              installation_id = ?, public_key_fingerprint = ?, pvc_binding_role = ?, \
@@ -918,7 +926,7 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         .bind(record.enrollment.enrollment_id.as_str())
         .bind(record.enrollment.reserved_agent_id.as_str())
         .bind(expected_resource_version.to_string())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(registry_update_error)?;
         if result.rows_affected() != 1 {
@@ -927,6 +935,8 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
                 "Agent registry ResourceVersion changed",
             ));
         }
+        sync_volume_from_registry(&mut transaction, &record).await?;
+        transaction.commit().await.map_err(storage_error)?;
         Ok(record)
     }
 
@@ -1035,6 +1045,7 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
                 "Agent replacement records changed before atomic approval",
             ));
         }
+        sync_volume_from_registry(&mut transaction, &replacement).await?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(AgentRegistryReplacementRecords {
             revoked,

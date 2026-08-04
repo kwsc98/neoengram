@@ -12,6 +12,7 @@ use crate::{
     },
     error::{invalid_request, map_central_error},
     identity::AuthenticatedIdentity,
+    service::JobCoordinator,
 };
 
 const RESERVED_ADD_EXTENSIONS: &[&str] = &["actor", "principal", "request_digest"];
@@ -64,12 +65,22 @@ const JOB_VIEW_BLOCKED_EXTENSIONS: &[&str] = &[
 /// Managed Add application service that maps public DTOs to the control plane.
 pub struct JobService {
     control: Arc<ControlPlane>,
+    coordinator: Option<Arc<JobCoordinator>>,
 }
 
 impl JobService {
     /// Creates the service from explicit domain and authorization ports.
     pub fn new(control: Arc<ControlPlane>) -> Self {
-        Self { control }
+        Self {
+            control,
+            coordinator: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_coordinator(mut self, coordinator: Arc<JobCoordinator>) -> Self {
+        self.coordinator = Some(coordinator);
+        self
     }
 
     /// Creates or idempotently loads a managed Add job.
@@ -79,6 +90,12 @@ impl JobService {
         request: CreateAddJobRequest,
     ) -> Result<CreateAddJobResponse, fusen_rs::Error> {
         let spec = build_add_job_spec(request, identity.principal())?;
+        if let Some(coordinator) = &self.coordinator {
+            coordinator
+                .validate_spec(&spec)
+                .await
+                .map_err(map_central_error)?;
+        }
         let result = self
             .control
             .create_add_job(neoengramd::CreateAddJobRequest {
@@ -87,8 +104,20 @@ impl JobService {
             })
             .await
             .map_err(map_central_error)?;
+        let mut job = result.job;
+        if let Some(coordinator) = &self.coordinator {
+            match coordinator.schedule(&job).await {
+                Ok(Some(assigned)) => job = assigned,
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    job_id = %job.spec.job_id,
+                    error = %error,
+                    "immediate Job scheduling failed; recovery loop will retry"
+                ),
+            }
+        }
         Ok(CreateAddJobResponse {
-            job: job_record_to_view(&result.job),
+            job: job_record_to_view(&job),
             replayed: result.replayed,
         })
     }

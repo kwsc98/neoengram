@@ -11,13 +11,15 @@ import {
   Search,
   SwitchButton,
 } from '@element-plus/icons-vue';
-import { useQueryClient } from '@tanstack/vue-query';
+import { useQuery, useQueryClient } from '@tanstack/vue-query';
 import { ElMessage } from 'element-plus';
 import zhCn from 'element-plus/es/locale/lang/zh-cn';
 import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
+import { queryApiVersion } from '@/api/operations';
 import { runtimeConfig } from '@/config';
+import { supportsResourceBrowser } from '@/features/capabilities';
 import { useAuthStore } from '@/stores/auth';
 import { useTenantsStore } from '@/stores/tenants';
 
@@ -33,6 +35,14 @@ const createError = ref('');
 const form = reactive({ tenantId: '', displayName: '', description: '' });
 const currentTenantId = computed(() => String(route.params.tenantId ?? ''));
 const currentTenant = computed(() => tenants.byId(currentTenantId.value));
+const versionQuery = useQuery({
+  queryKey: ['system', 'version'],
+  queryFn: queryApiVersion,
+  staleTime: Number.POSITIVE_INFINITY,
+});
+const resourceBrowserEnabled = computed(() =>
+  supportsResourceBrowser(versionQuery.data.value?.data.capabilities),
+);
 
 const navGroups = computed(() => {
   if (!currentTenantId.value) return [];
@@ -42,9 +52,20 @@ const navGroups = computed(() => {
       label: '数据工作流',
       items: [
         { name: 'tenant-overview', label: '概览', icon: DataAnalysis, params: { tenantId } },
-        { name: 'artifact-list', label: '数据资产', icon: Box, params: { tenantId } },
+        ...(resourceBrowserEnabled.value
+          ? [{ name: 'artifact-list', label: '数据资产', icon: Box, params: { tenantId } }]
+          : []),
         { name: 'playground-list', label: '工作区', icon: Collection, params: { tenantId } },
-        { name: 'snapshot-list', label: '快照与交付', icon: DocumentCopy, params: { tenantId } },
+        ...(resourceBrowserEnabled.value
+          ? [
+              {
+                name: 'snapshot-list',
+                label: '快照与交付',
+                icon: DocumentCopy,
+                params: { tenantId },
+              },
+            ]
+          : []),
         { name: 'job-query', label: '活动', icon: Search, params: { tenantId } },
       ],
     },
@@ -175,6 +196,13 @@ async function submitTenant(): Promise<void> {
         <div class="topbar__right">
           <el-tag v-if="runtimeConfig.apiMode === 'mock'" type="warning" effect="plain">
             MOCK
+          </el-tag>
+          <el-tag
+            v-else-if="runtimeConfig.authMode === 'development'"
+            type="warning"
+            effect="plain"
+          >
+            DEV
           </el-tag>
           <div v-if="auth.authenticated" class="tenant-switcher">
             <el-select

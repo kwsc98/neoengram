@@ -95,10 +95,11 @@ assert_internal_dependencies neoengram-standalone \
 assert_internal_dependencies neoengram-agent \
   $'neoengram-core\nneoengram-engine\nneoengram-protocol' 'neoengramd'
 assert_internal_dependencies neoengram-agentd \
-  $'neoengram-agent\nneoengram-protocol' ''
+  $'neoengram-agent\nneoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol' ''
 assert_internal_dependencies neoengramd $'neoengram-core\nneoengram-protocol' ''
 assert_internal_dependencies neoengram-server \
-  $'neoengram-core\nneoengram-protocol\nneoengramd' 'neoengram-agentd'
+  $'neoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol\nneoengramd' \
+  'neoengram-agentd'
 
 assert_no_direct_dependency() {
   local package="$1"
@@ -155,7 +156,7 @@ for package in neoengram-protocol neoengram-agent neoengramd; do
 done
 
 assert_no_fusen_dependency neoengram-agentd
-for dependency in neoengram-core neoengram-server neoengramd; do
+for dependency in neoengram-server neoengramd; do
   assert_no_direct_dependency neoengram-agentd "$dependency"
 done
 
@@ -212,7 +213,7 @@ assert_manifest_excludes \
   'neoengram-(engine|fs|standalone)|rusqlite|diesel|aws-sdk'
 assert_manifest_excludes \
   services/neoengram-server/Cargo.toml \
-  'neoengram-(engine|fs|standalone)|neoengram-agent\s*=|rusqlite|sqlx|diesel|aws-sdk'
+  'neoengram-standalone|neoengram-agent\s*=|rusqlite|sqlx|diesel|aws-sdk'
 assert_manifest_excludes \
   services/neoengram-agentd/Cargo.toml \
   'rusqlite|sqlx|diesel'
@@ -243,15 +244,87 @@ controller_routes="$({
     services/neoengram-server/src \
     --glob '**/controller.rs' --glob '**/controller/**' || true
 } | LC_ALL=C sort)"
-expected_controller_routes=$'method = "GET", path = "/health/live"\nmethod = "GET", path = "/health/ready"\nmethod = "POST", path = "/api/job/add/create"\nmethod = "POST", path = "/api/job/add/finalize"\nmethod = "POST", path = "/api/job/query"\nmethod = "POST", path = "/api/storage/enrollment/approve"\nmethod = "POST", path = "/api/storage/enrollment/list/query"\nmethod = "POST", path = "/api/storage/enrollment/query"\nmethod = "POST", path = "/api/storage/enrollment/reject"\nmethod = "POST", path = "/api/storage/enrollment/token/create"\nmethod = "POST", path = "/api/system/version/query"'
+expected_controller_routes=$'method = "GET", path = "/health/live"\nmethod = "GET", path = "/health/ready"\nmethod = "POST", path = "/api/job/add/create"\nmethod = "POST", path = "/api/job/add/finalize"\nmethod = "POST", path = "/api/job/query"\nmethod = "POST", path = "/api/playground/create"\nmethod = "POST", path = "/api/playground/list/query"\nmethod = "POST", path = "/api/playground/query"\nmethod = "POST", path = "/api/storage/enrollment/approve"\nmethod = "POST", path = "/api/storage/enrollment/list/query"\nmethod = "POST", path = "/api/storage/enrollment/query"\nmethod = "POST", path = "/api/storage/enrollment/reject"\nmethod = "POST", path = "/api/storage/enrollment/token/create"\nmethod = "POST", path = "/api/storage/volume/create"\nmethod = "POST", path = "/api/storage/volume/list/query"\nmethod = "POST", path = "/api/storage/volume/query"\nmethod = "POST", path = "/api/system/version/query"\nmethod = "POST", path = "/api/tenant/create"\nmethod = "POST", path = "/api/tenant/list/query"\nmethod = "POST", path = "/api/tenant/query"'
 if [[ "$controller_routes" != "$expected_controller_routes" ]]; then
   echo "$controller_routes" >&2
   fail "neoengram-server must register exactly the approved public HTTP routes"
 fi
-for route in /v1/agents/bootstrap /v1/agents/bootstrap/status; do
-  rg -q "\"${route}\"" services/neoengram-server/src/agent_transport || \
-    fail "Agent Hyper adapter is missing ${route}"
+agent_openapi=docs/openapi/neoengram-agent-api.yaml
+[[ -f "$agent_openapi" ]] || fail "the independent Agent OpenAPI contract is missing"
+rg -q '^openapi: 3\.1\.0$' "$agent_openapi" || \
+  fail "the Agent contract must use OpenAPI 3.1"
+rg -q '^x-neoengram-body-security-schemes:$' "$agent_openapi" || \
+  fail "the Agent contract must define its body-carried security schemes"
+for security_scheme in \
+  BootstrapTokenAndEd25519 \
+  InstallationEd25519 \
+  ApprovedAgentEd25519; do
+  rg -q "^  ${security_scheme}:$" "$agent_openapi" || \
+    fail "Agent OpenAPI is missing body-carried security scheme ${security_scheme}"
 done
+
+agent_paths=(
+  /agent/enrollment/bootstrap
+  /agent/enrollment/status/query
+  /agent/session/open
+  /agent/session/heartbeat/report
+  /agent/session/message/list/query
+  /agent/job/report/create
+  /agent/job/metadata/batch/stage
+  /agent/job/metadata/page/stage
+  /agent/job/index/page/query
+  /agent/job/object/missing/query
+  /agent/job/object/upload
+  /agent/session/close
+)
+agent_path_constants=(
+  AGENT_ENROLLMENT_BOOTSTRAP_PATH
+  AGENT_ENROLLMENT_STATUS_QUERY_PATH
+  AGENT_SESSION_OPEN_PATH
+  AGENT_SESSION_HEARTBEAT_REPORT_PATH
+  AGENT_SESSION_MESSAGE_LIST_QUERY_PATH
+  AGENT_JOB_REPORT_CREATE_PATH
+  AGENT_JOB_METADATA_BATCH_STAGE_PATH
+  AGENT_JOB_METADATA_PAGE_STAGE_PATH
+  AGENT_JOB_INDEX_PAGE_QUERY_PATH
+  AGENT_JOB_OBJECT_MISSING_QUERY_PATH
+  AGENT_JOB_OBJECT_UPLOAD_PATH
+  AGENT_SESSION_CLOSE_PATH
+)
+for index in "${!agent_paths[@]}"; do
+  path="${agent_paths[$index]}"
+  path_constant="${agent_path_constants[$index]}"
+  rg -Fq "  ${path}:" "$agent_openapi" || fail "Agent OpenAPI is missing ${path}"
+  rg -Fq "pub const ${path_constant}: &str = \"${path}\";" \
+    crates/neoengram-protocol/src/agent_api.rs || \
+    fail "Agent protocol does not define ${path_constant} as ${path}"
+  rg -q "neoengram_protocol::${path_constant}" \
+    services/neoengram-server/src/agent_transport/mod.rs || \
+    fail "Agent Hyper adapter does not dispatch ${path_constant}"
+done
+[[ "$(rg -c '^  /[^ ]*:$' "$agent_openapi")" == "${#agent_paths[@]}" ]] || \
+  fail "Agent OpenAPI must expose exactly the approved action paths"
+[[ "$(rg -c '^    post:$' "$agent_openapi")" == "${#agent_paths[@]}" ]] || \
+  fail "every Agent OpenAPI action must use POST"
+[[ "$(rg -c '^      summary:' "$agent_openapi")" == "${#agent_paths[@]}" ]] || \
+  fail "every Agent OpenAPI action must define a summary"
+[[ "$(rg -c '^      description: >-$' "$agent_openapi")" == "${#agent_paths[@]}" ]] || \
+  fail "every Agent OpenAPI action must define a description"
+[[ "$(rg -c '^      security: \[\]$' "$agent_openapi")" == "${#agent_paths[@]}" ]] || \
+  fail "every Agent OpenAPI action must explicitly declare body-carried security"
+[[ "$(rg -c '^      x-neoengram-body-security:' "$agent_openapi")" == \
+  "${#agent_paths[@]}" ]] || \
+  fail "every Agent OpenAPI action must name its body-carried security scheme"
+if rg -n '^  /.*[{}].*:$|^    (get|put|patch|delete):' "$agent_openapi"; then
+  fail "Agent OpenAPI must not use path parameters or non-POST methods"
+fi
+if rg -n '/v1/agents|/agents/\{' \
+  crates/neoengram-protocol/src/agent_api.rs \
+  services/neoengram-agentd/src \
+  services/neoengram-server/src/agent_transport \
+  "$agent_openapi"; then
+  fail "Agent transport must use unversioned action paths with identities in JSON bodies"
+fi
 if rg -n '\b(assign_job|expire_add_job|resume_publication)\b' \
   services/neoengram-server/src \
   --glob '**/controller.rs' --glob '**/controller/**'; then

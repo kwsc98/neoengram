@@ -17,7 +17,7 @@ use crate::{CentralError, CentralErrorCode, CentralResult};
 const DATABASE_FILE_NAME: &str = "authority.sqlite3";
 const LOCK_FILE_NAME: &str = "authority.lock";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f41;
-const SQLITE_SCHEMA_VERSION: i64 = 2;
+const SQLITE_SCHEMA_VERSION: i64 = 4;
 
 const V1_TABLES: &[&str] = &[
     "control_jobs",
@@ -46,6 +46,9 @@ const V2_TABLES: &[&str] = &[
     "agent_enrollment_audit_events",
 ];
 
+const V3_TABLES: &[&str] = V2_TABLES;
+const V4_TABLES: &[&str] = V3_TABLES;
+
 const ENROLLMENT_AUDIT_SCHEMA_SQL: &str = r#"
 CREATE TABLE agent_enrollment_audit_events (
     tenant_id TEXT NOT NULL,
@@ -55,6 +58,47 @@ CREATE TABLE agent_enrollment_audit_events (
     occurred_at TEXT NOT NULL CHECK (occurred_at <> '' AND occurred_at NOT GLOB '*[^0-9]*'),
     payload BLOB NOT NULL,
     PRIMARY KEY (tenant_id, event_id)
+) STRICT;
+"#;
+
+const ASSIGNMENT_OUTBOX_V3_SCHEMA_SQL: &str = r#"
+CREATE TABLE assignment_outbox (
+    tenant_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    published INTEGER NOT NULL DEFAULT 0 CHECK (published IN (0, 1)),
+    retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
+    PRIMARY KEY (tenant_id, assignment_id),
+    FOREIGN KEY (tenant_id, job_id) REFERENCES control_jobs (tenant_id, job_id),
+    CHECK (retired = 0 OR published = 1)
+) STRICT;
+"#;
+
+const PLAYGROUND_INDEX_V4_SCHEMA_SQL: &str = r#"
+CREATE TABLE playground_indexes (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    playground_id TEXT NOT NULL,
+    revision TEXT NOT NULL CHECK (revision <> '' AND revision NOT GLOB '*[^0-9]*'),
+    digest BLOB NOT NULL CHECK (length(digest) = 32),
+    PRIMARY KEY (tenant_id, project_id, artifact_id, playground_id)
+) STRICT;
+
+CREATE TABLE playground_index_records (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    playground_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    manifest_id BLOB NOT NULL CHECK (length(manifest_id) = 32),
+    total_size TEXT NOT NULL CHECK (total_size <> '' AND total_size NOT GLOB '*[^0-9]*'),
+    chunk_count TEXT NOT NULL CHECK (chunk_count <> '' AND chunk_count NOT GLOB '*[^0-9]*'),
+    PRIMARY KEY (tenant_id, project_id, artifact_id, playground_id, path),
+    FOREIGN KEY (tenant_id, project_id, artifact_id, playground_id)
+        REFERENCES playground_indexes (tenant_id, project_id, artifact_id, playground_id)
+        ON DELETE CASCADE
 ) STRICT;
 "#;
 
@@ -76,8 +120,10 @@ CREATE TABLE assignment_outbox (
     job_id TEXT NOT NULL,
     payload BLOB NOT NULL,
     published INTEGER NOT NULL DEFAULT 0 CHECK (published IN (0, 1)),
+    retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
     PRIMARY KEY (tenant_id, assignment_id),
-    FOREIGN KEY (tenant_id, job_id) REFERENCES control_jobs (tenant_id, job_id)
+    FOREIGN KEY (tenant_id, job_id) REFERENCES control_jobs (tenant_id, job_id),
+    CHECK (retired = 0 OR published = 1)
 ) STRICT;
 
 CREATE TABLE metadata_batch_descriptors (
@@ -113,24 +159,26 @@ CREATE TABLE durable_objects (
 
 CREATE TABLE playground_indexes (
     tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
     playground_id TEXT NOT NULL,
     revision TEXT NOT NULL CHECK (revision <> '' AND revision NOT GLOB '*[^0-9]*'),
     digest BLOB NOT NULL CHECK (length(digest) = 32),
-    PRIMARY KEY (tenant_id, artifact_id, playground_id)
+    PRIMARY KEY (tenant_id, project_id, artifact_id, playground_id)
 ) STRICT;
 
 CREATE TABLE playground_index_records (
     tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
     playground_id TEXT NOT NULL,
     path TEXT NOT NULL,
     manifest_id BLOB NOT NULL CHECK (length(manifest_id) = 32),
     total_size TEXT NOT NULL CHECK (total_size <> '' AND total_size NOT GLOB '*[^0-9]*'),
     chunk_count TEXT NOT NULL CHECK (chunk_count <> '' AND chunk_count NOT GLOB '*[^0-9]*'),
-    PRIMARY KEY (tenant_id, artifact_id, playground_id, path),
-    FOREIGN KEY (tenant_id, artifact_id, playground_id)
-        REFERENCES playground_indexes (tenant_id, artifact_id, playground_id)
+    PRIMARY KEY (tenant_id, project_id, artifact_id, playground_id, path),
+    FOREIGN KEY (tenant_id, project_id, artifact_id, playground_id)
+        REFERENCES playground_indexes (tenant_id, project_id, artifact_id, playground_id)
         ON DELETE CASCADE
 ) STRICT;
 
@@ -329,7 +377,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 2")
+        sqlx::query("PRAGMA user_version = 4")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -342,7 +390,16 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
         )));
     }
     match user_version {
-        1 => migrate_v1_to_v2(pool).await?,
+        1 => {
+            migrate_v1_to_v2(pool).await?;
+            migrate_v2_to_v3(pool).await?;
+            migrate_v3_to_v4(pool).await?;
+        }
+        2 => {
+            migrate_v2_to_v3(pool).await?;
+            migrate_v3_to_v4(pool).await?;
+        }
+        3 => migrate_v3_to_v4(pool).await?,
         SQLITE_SCHEMA_VERSION => {}
         _ => {
             return Err(storage_corruption(format!(
@@ -350,7 +407,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             )));
         }
     }
-    validate_table_set(pool, V2_TABLES).await?;
+    validate_table_set(pool, V4_TABLES).await?;
     validate_current_schema(pool).await
 }
 
@@ -362,6 +419,252 @@ async fn migrate_v1_to_v2(pool: &SqlitePool) -> CentralResult<()> {
         .await
         .map_err(storage_error)?;
     sqlx::query("PRAGMA user_version = 2")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+async fn migrate_v2_to_v3(pool: &SqlitePool) -> CentralResult<()> {
+    validate_table_set(pool, V2_TABLES).await?;
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    sqlx::query("ALTER TABLE assignment_outbox RENAME TO assignment_outbox_v2")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::raw_sql(ASSIGNMENT_OUTBOX_V3_SCHEMA_SQL)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query(
+        "INSERT INTO assignment_outbox \
+         (tenant_id, assignment_id, job_id, payload, published, retired) \
+         SELECT outbox.tenant_id, outbox.assignment_id, outbox.job_id, outbox.payload, \
+                outbox.published, \
+                CASE WHEN outbox.published = 1 AND jobs.state <> 'assigned' THEN 1 ELSE 0 END \
+         FROM assignment_outbox_v2 AS outbox \
+         JOIN control_jobs AS jobs \
+           ON jobs.tenant_id = outbox.tenant_id AND jobs.job_id = outbox.job_id",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    sqlx::query("DROP TABLE assignment_outbox_v2")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("PRAGMA user_version = 3")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+async fn migrate_v3_to_v4(pool: &SqlitePool) -> CentralResult<()> {
+    validate_table_set(pool, V3_TABLES).await?;
+    let indexes_scoped: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pragma_table_info('playground_indexes') WHERE name = 'project_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(storage_error)?;
+    let records_scoped: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pragma_table_info('playground_index_records') \
+         WHERE name = 'project_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(storage_error)?;
+    if indexes_scoped != records_scoped {
+        return Err(storage_corruption(
+            "SQLite authority Index tables disagree on project scope",
+        ));
+    }
+    if indexes_scoped == 1 {
+        sqlx::query("PRAGMA user_version = 4")
+            .execute(pool)
+            .await
+            .map_err(storage_error)?;
+        return Ok(());
+    }
+
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    sqlx::query(
+        "UPDATE index_publications \
+         SET request_payload = CAST(json_set( \
+             CAST(request_payload AS TEXT), '$.value.index_key.project_id', \
+             (SELECT json_extract(CAST(job.payload AS TEXT), '$.value.spec.project_id') \
+              FROM control_jobs AS job \
+              WHERE job.tenant_id = index_publications.tenant_id \
+                AND job.job_id = index_publications.job_id)) AS BLOB) \
+         WHERE json_extract( \
+             CAST(request_payload AS TEXT), '$.value.index_key.project_id' \
+         ) IS NULL",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    let unscoped_publications: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM index_publications \
+         WHERE json_type( \
+                   CAST(request_payload AS TEXT), '$.value.index_key.project_id' \
+               ) IS NULL \
+            OR json_type( \
+                   CAST(request_payload AS TEXT), '$.value.index_key.project_id' \
+               ) <> 'text' \
+            OR json_extract( \
+                   CAST(request_payload AS TEXT), '$.value.index_key.project_id' \
+               ) = ''",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    if unscoped_publications != 0 {
+        return Err(storage_corruption(
+            "legacy Index publication cannot be mapped to an authority Job Project",
+        ));
+    }
+    let mismatched_publications: i64 = sqlx::query_scalar(
+        "SELECT count(*) \
+         FROM index_publications AS publication \
+         JOIN control_jobs AS job \
+           ON job.tenant_id = publication.tenant_id \
+          AND job.job_id = publication.job_id \
+         WHERE json_extract( \
+                   CAST(publication.request_payload AS TEXT), \
+                   '$.value.index_key.tenant_id' \
+               ) <> json_extract(CAST(job.payload AS TEXT), '$.value.spec.tenant_id') \
+            OR json_extract( \
+                   CAST(publication.request_payload AS TEXT), \
+                   '$.value.index_key.project_id' \
+               ) <> json_extract(CAST(job.payload AS TEXT), '$.value.spec.project_id') \
+            OR json_extract( \
+                   CAST(publication.request_payload AS TEXT), \
+                   '$.value.index_key.artifact_id' \
+               ) <> json_extract(CAST(job.payload AS TEXT), '$.value.spec.artifact_id') \
+            OR json_extract( \
+                   CAST(publication.request_payload AS TEXT), \
+                   '$.value.index_key.playground_id' \
+               ) <> json_extract(CAST(job.payload AS TEXT), '$.value.spec.playground_id')",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    if mismatched_publications != 0 {
+        return Err(storage_corruption(
+            "legacy Index publication disagrees with its authority Job scope",
+        ));
+    }
+
+    sqlx::query(
+        "CREATE TABLE index_projects_v4_migration ( \
+             tenant_id TEXT NOT NULL, \
+             artifact_id TEXT NOT NULL, \
+             playground_id TEXT NOT NULL, \
+             project_id TEXT NOT NULL, \
+             PRIMARY KEY (tenant_id, artifact_id, playground_id) \
+         ) STRICT",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    sqlx::query(
+        "INSERT INTO index_projects_v4_migration \
+         (tenant_id, artifact_id, playground_id, project_id) \
+         SELECT json_extract( \
+                    CAST(request_payload AS TEXT), '$.value.index_key.tenant_id' \
+                ), \
+                json_extract( \
+                    CAST(request_payload AS TEXT), '$.value.index_key.artifact_id' \
+                ), \
+                json_extract( \
+                    CAST(request_payload AS TEXT), '$.value.index_key.playground_id' \
+                ), \
+                min(json_extract( \
+                    CAST(request_payload AS TEXT), '$.value.index_key.project_id' \
+                )) \
+         FROM index_publications \
+         WHERE json_type(CAST(outcome_payload AS TEXT), '$.value.Published') IS NOT NULL \
+         GROUP BY 1, 2, 3 \
+         HAVING count(DISTINCT json_extract( \
+                    CAST(request_payload AS TEXT), '$.value.index_key.project_id' \
+                )) = 1",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    let indexes_without_unique_project: i64 = sqlx::query_scalar(
+        "SELECT count(*) \
+         FROM playground_indexes AS old \
+         LEFT JOIN index_projects_v4_migration AS mapped \
+           ON mapped.tenant_id = old.tenant_id \
+          AND mapped.artifact_id = old.artifact_id \
+          AND mapped.playground_id = old.playground_id \
+         WHERE mapped.project_id IS NULL",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    if indexes_without_unique_project != 0 {
+        return Err(storage_corruption(
+            "legacy Index cannot be mapped to exactly one successful publication Project",
+        ));
+    }
+
+    sqlx::query("ALTER TABLE playground_index_records RENAME TO playground_index_records_v3")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("ALTER TABLE playground_indexes RENAME TO playground_indexes_v3")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::raw_sql(PLAYGROUND_INDEX_V4_SCHEMA_SQL)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query(
+        "INSERT INTO playground_indexes \
+         (tenant_id, project_id, artifact_id, playground_id, revision, digest) \
+         SELECT old.tenant_id, mapped.project_id, old.artifact_id, old.playground_id, \
+                old.revision, old.digest \
+         FROM playground_indexes_v3 AS old \
+         JOIN index_projects_v4_migration AS mapped \
+           ON mapped.tenant_id = old.tenant_id \
+          AND mapped.artifact_id = old.artifact_id \
+          AND mapped.playground_id = old.playground_id",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    sqlx::query(
+        "INSERT INTO playground_index_records \
+         (tenant_id, project_id, artifact_id, playground_id, path, manifest_id, total_size, \
+          chunk_count) \
+         SELECT old.tenant_id, mapped.project_id, old.artifact_id, old.playground_id, \
+                old.path, old.manifest_id, old.total_size, old.chunk_count \
+         FROM playground_index_records_v3 AS old \
+         JOIN index_projects_v4_migration AS mapped \
+           ON mapped.tenant_id = old.tenant_id \
+          AND mapped.artifact_id = old.artifact_id \
+          AND mapped.playground_id = old.playground_id",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    sqlx::query("DROP TABLE playground_index_records_v3")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("DROP TABLE playground_indexes_v3")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("DROP TABLE index_projects_v4_migration")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("PRAGMA user_version = 4")
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;

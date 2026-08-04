@@ -50,6 +50,7 @@ impl SqliteAuthority {
             AuthorityCapabilities::SQLITE,
         )
         .with_agent_registry(self.agent_registry.repository())
+        .with_control_catalog(self.agent_registry.catalog_repository())
     }
 
     pub async fn integrity_check(&self) -> CentralResult<()> {

@@ -24,6 +24,8 @@ pub enum AgentDaemonError {
     Enrollment(String),
     #[error("Agent enrollment response is invalid: {0}")]
     EnrollmentProtocol(String),
+    #[error("Agent session transport failed: {0}")]
+    Session(String),
     #[error("Agent status timestamp state is invalid: {0}")]
     StatusClock(String),
     #[error("Agent enrollment was rejected")]

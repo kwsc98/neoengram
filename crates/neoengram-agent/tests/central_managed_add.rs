@@ -41,10 +41,12 @@ async fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries()
     let control = Arc::new(central.control_plane());
     let actor = principal();
     let tenant_id = TenantId::new("tenant-e2e").unwrap();
+    let project_id = ProjectId::new("project-e2e").unwrap();
     let artifact_id = ArtifactId::new("artifact-e2e").unwrap();
     let playground_id = PlaygroundId::new("playground-e2e").unwrap();
     let index_key = IndexKey {
         tenant_id: tenant_id.clone(),
+        project_id: project_id.clone(),
         artifact_id: artifact_id.clone(),
         playground_id: playground_id.clone(),
     };
@@ -53,7 +55,7 @@ async fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries()
         job_id: neoengram_protocol::JobId::new("job-e2e").unwrap(),
         principal: actor.clone(),
         tenant_id: tenant_id.clone(),
-        project_id: ProjectId::new("project-e2e").unwrap(),
+        project_id,
         artifact_id: artifact_id.clone(),
         playground_id: playground_id.clone(),
         expected_index_version: expected.clone(),
@@ -204,12 +206,14 @@ async fn agent_failure_round_trips_over_wire_into_the_control_plane() {
     let control = Arc::new(central.control_plane());
     let actor = principal();
     let tenant_id = TenantId::new("tenant-failure-e2e").unwrap();
+    let project_id = ProjectId::new("project-failure-e2e").unwrap();
     let artifact_id = ArtifactId::new("artifact-failure-e2e").unwrap();
     let playground_id = PlaygroundId::new("playground-failure-e2e").unwrap();
     let expected = central
         .publisher
         .current_version(&IndexKey {
             tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
             playground_id: playground_id.clone(),
         })
@@ -219,7 +223,7 @@ async fn agent_failure_round_trips_over_wire_into_the_control_plane() {
         job_id: neoengram_protocol::JobId::new("job-failure-e2e").unwrap(),
         principal: actor.clone(),
         tenant_id: tenant_id.clone(),
-        project_id: ProjectId::new("project-failure-e2e").unwrap(),
+        project_id,
         artifact_id,
         playground_id,
         expected_index_version: expected,
