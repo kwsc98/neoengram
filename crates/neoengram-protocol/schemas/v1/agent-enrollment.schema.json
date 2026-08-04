@@ -62,6 +62,38 @@
       "type": "object",
       "properties": {
         "payload": {
+          "$ref": "#/$defs/AgentBootstrapStatusRequest"
+        },
+        "type": {
+          "type": "string",
+          "const": "agent.bootstrap.status.request"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/AgentBootstrapStatusResponse"
+        },
+        "type": {
+          "type": "string",
+          "const": "agent.bootstrap.status.response"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
           "$ref": "#/$defs/AgentEnrollmentApprovalRequest"
         },
         "type": {
@@ -206,6 +238,27 @@
         "observed_at_unix_ms"
       ]
     },
+    "AgentBootstrapProof": {
+      "description": "Proof that a bootstrap or status caller controls the private key matching its SPKI.",
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/AgentSignatureAlgorithm"
+        },
+        "public_key_spki": {
+          "$ref": "#/$defs/Ed25519PublicKeySpki"
+        },
+        "signature": {
+          "$ref": "#/$defs/Ed25519Signature"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "algorithm",
+        "public_key_spki",
+        "signature"
+      ]
+    },
     "AgentBootstrapRequest": {
       "description": "First Agent contact. The opaque token resolves all Tenant and Volume scope centrally.",
       "type": "object",
@@ -241,6 +294,9 @@
         "probe": {
           "description": "Sanitized mount evidence. Raw paths, filesystem IDs, and mount sources stay Agent-local.",
           "$ref": "#/$defs/AgentBootstrapProbe"
+        },
+        "proof": {
+          "$ref": "#/$defs/AgentBootstrapProof"
         },
         "public_key_fingerprint": {
           "type": "string",
@@ -280,7 +336,99 @@
         "agent_version",
         "supported_protocol_versions",
         "public_key_fingerprint",
+        "proof",
         "probe"
+      ]
+    },
+    "AgentBootstrapStatusRequest": {
+      "description": "Signed polling request used before an approved Agent has a long-lived credential.",
+      "type": "object",
+      "properties": {
+        "bootstrap_request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "installation_id": {
+          "$ref": "#/$defs/AgentInstallationId"
+        },
+        "proof": {
+          "$ref": "#/$defs/AgentBootstrapProof"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "const": 1
+        },
+        "signed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "protocol_version",
+        "tenant_id",
+        "bootstrap_request_id",
+        "installation_id",
+        "signed_at_unix_ms",
+        "proof"
+      ]
+    },
+    "AgentBootstrapStatusResponse": {
+      "description": "Poll result for one stable bootstrap request identity.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bootstrap_request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "enrollment_id": {
+          "$ref": "#/$defs/AgentEnrollmentId"
+        },
+        "installation_id": {
+          "$ref": "#/$defs/AgentInstallationId"
+        },
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion",
+          "const": 1
+        },
+        "resource_version": {
+          "$ref": "#/$defs/ResourceVersion"
+        },
+        "state": {
+          "$ref": "#/$defs/AgentBootstrapStatusState"
+        },
+        "updated_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "protocol_version",
+        "bootstrap_request_id",
+        "installation_id",
+        "state",
+        "enrollment_id",
+        "resource_version",
+        "updated_at_unix_ms"
+      ]
+    },
+    "AgentBootstrapStatusState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "approved",
+        "rejected",
+        "expired"
       ]
     },
     "AgentEnrollmentApprovalRequest": {
@@ -510,6 +658,27 @@
         "health",
         "observed_at_unix_ms"
       ]
+    },
+    "AgentSignatureAlgorithm": {
+      "description": "Signature suite admitted for bootstrap proof of possession.",
+      "type": "string",
+      "enum": [
+        "ed25519"
+      ]
+    },
+    "Ed25519PublicKeySpki": {
+      "description": "Canonical RFC 8410 Ed25519 SubjectPublicKeyInfo DER, encoded as base64url without padding.",
+      "type": "string",
+      "maxLength": 59,
+      "minLength": 59,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "Ed25519Signature": {
+      "description": "Canonical 64-byte Ed25519 signature, encoded as base64url without padding.",
+      "type": "string",
+      "maxLength": 86,
+      "minLength": 86,
+      "pattern": "^[A-Za-z0-9_-]+$"
     },
     "EdgeClusterId": {
       "description": "A validated edge cluster ID wire identifier.",

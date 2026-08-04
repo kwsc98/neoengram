@@ -6,13 +6,19 @@ This directory defines the 0.0.1 deployment profile for one existing business PV
 one business PVC = one StorageVolume = one resident AgentInstance
 ```
 
-The Agent mounts the complete business PVC at `/volume`. Its identity, private key, certificate, SQLite
-Ledger, and recovery state live on a separate RWO PVC at `/var/lib/neoengram-agent`. The central service,
-Web application, and Agent state database must not mount the business PVC.
+The Agent mounts the complete business PVC at `/volume`. The current daemon keeps its signing and approved
+identity, bootstrap polling watermark, and health record on a separate RWO PVC at
+`/var/lib/neoengram-agent`. Certificate material and the per-Tenant Job Ledger/cache will also belong on that
+state PVC when the business session is implemented. The central service, Web application, and Agent state
+database must not mount the business PVC.
 
-These manifests are forward-looking deployment templates. The repository does not yet contain a runnable
-Agent daemon, registration transport, or the `health` command used by the probes. Replace the image only
-after those interfaces exist; applying the example unchanged will not produce a working Agent.
+The repository contains the runnable `neoengram-agent` binary in the `neoengram-agentd` package. It loads this
+configuration shape, performs the mount probe, persists its signing identity on the state PVC, uses the
+outbound bootstrap/status transport, and implements the `health` command used by the probes. This is still an
+enrollment-only vertical slice: after approval the process remains in `approved_waiting_certificate`, and the
+ready probe intentionally fails because certificate issuance, authenticated sessions, heartbeats, and Job
+delivery are not implemented. The example image is only a placeholder and must be replaced with a real,
+digest-pinned build before applying these manifests.
 
 ## Preconditions
 
@@ -50,9 +56,13 @@ state PVC. In particular, set:
 - all resource names and labels, namespace, Tenant, EdgeCluster, Region, and StorageVolume IDs;
 - the existing business PVC claim name;
 - the declared PVC namespace/claim and expected marker in `configmap.yaml`;
+- the frozen 64-character descriptor digest supplied for the enrollment in
+  `volume_descriptor_digest`;
 - the public token ID in `registration.token_id` for stable bootstrap lookup/audit;
 - a durable RWO StorageClass for `agent-state-pvc.yaml`;
-- the central HTTPS endpoint and a real, digest-pinned Agent image;
+- the central HTTPS endpoint; `/v1/agents/*` at that origin must reach the server's separate Agent listener,
+  directly or through a reverse proxy, rather than the public Fusen listener;
+- a real, digest-pinned Agent image;
 - a new bootstrap token in a local copy of `secret.example.yaml`.
 
 Run `bash check-manifests.sh` before rendering or applying a copy. It enforces the 0.0.1 placement and
@@ -73,8 +83,9 @@ kubectl -n <namespace> create secret generic neoengram-agent-bootstrap-<volume-s
 
 The token authenticates only the registration request. It must not authorize a control session, Job,
 Tenant queue, or Volume ownership. The Agent generates its private key and stable registration request ID
-before the first network request and persists both on the state PVC. After approval, the center invalidates
-the bootstrap token and the Agent persists its issued identity and certificate on the state PVC.
+before the first network request and persists both on the state PVC. After approval, the center binds the
+approved Agent identity and the Agent persists that identity on the state PVC. Certificate issuance is not
+part of the current enrollment transport.
 
 ## Apply And Approve
 
@@ -119,11 +130,11 @@ deployment workflow; removing the PVC from this template does not create a valid
   A token that expires before bootstrap has no candidate binding and only requires a new token request.
 - A ConfigMap or Secret replacement requires a manual Recreate rollout and a new revision annotation.
 - Delete the one-time bootstrap Secret after the enrollment has consumed it and the Agent has persisted its
-  issued identity/certificate. The Secret volume is optional so ordinary restarts use the state PVC instead
+  approved identity. The Secret volume is optional so ordinary restarts use the state PVC instead
   of retaining or reusing bootstrap authority. If state is lost, create a fresh Secret and approval request.
-- Liveness checks only local process/ledger health. Readiness additionally requires approval, an active
-  center session, and a matching mount fingerprint; loss of the center must not cause destructive restart
-  loops.
+- Startup and liveness check the daemon-owned health record. In the current enrollment-only build readiness
+  always remains false, including after approval, because the certificate/session phase is not implemented;
+  loss of the center must not cause destructive restart loops.
 - Kubernetes rollout settings and central generations provide cooperative fencing only. They do not stop a
   partitioned or compromised process that still owns RW storage credentials.
 

@@ -1,7 +1,8 @@
 use neoengram_agent::{
     AgentAssignmentState, AgentCertificateState, AgentErrorCode, ApprovedAgentIdentity,
     AssignmentKey, ClaimOutcome, Ledger, LedgerClaim, PrivateKeyMaterial, SqliteLedger,
-    SqliteLedgerConfig, SqliteSystemIdentityStore, SystemIdentitySeed,
+    SqliteLedgerConfig, SqliteSystemIdentityStore, SystemIdentitySeed, TerminalEnrollmentOutcome,
+    TerminalEnrollmentState,
 };
 use neoengram_core::ContentDigest;
 use neoengram_protocol::{
@@ -10,6 +11,7 @@ use neoengram_protocol::{
     OwnerGeneration, PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef,
     ProjectId, StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
 };
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[test]
 fn sqlite_ledger_recovers_claim_replay_and_cas_after_reopen() {
@@ -211,6 +213,17 @@ fn system_identity_is_immutable_redacted_and_restart_stable() {
     assert_eq!(store.bind_approved(1, approved).unwrap(), bound);
     assert_eq!(
         store
+            .bind_terminal_enrollment(
+                bound.revision,
+                TerminalEnrollmentOutcome::new(TerminalEnrollmentState::Rejected, "enrollment-a",)
+                    .unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+        AgentErrorCode::AssignmentMismatch
+    );
+    assert_eq!(
+        store
             .bind_approved(
                 bound.revision,
                 ApprovedAgentIdentity::new("agent-b", "enrollment-b").unwrap(),
@@ -256,6 +269,71 @@ fn system_identity_is_immutable_redacted_and_restart_stable() {
         AgentErrorCode::AssignmentMismatch
     );
     assert_secure_permissions(&root, &["system.sqlite3", "system.lock"]);
+}
+
+#[test]
+fn terminal_enrollment_outcome_is_cas_bound_replayable_and_restart_stable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("terminal-system");
+    let store = SqliteSystemIdentityStore::open(&root).unwrap();
+    store.initialize(identity_seed(b"terminal-key")).unwrap();
+
+    let rejected =
+        TerminalEnrollmentOutcome::new(TerminalEnrollmentState::Rejected, "enrollment-rejected")
+            .unwrap();
+    let terminal = store.bind_terminal_enrollment(1, rejected.clone()).unwrap();
+    assert_eq!(terminal.revision, 2);
+    assert_eq!(terminal.terminal_enrollment, Some(rejected.clone()));
+    assert_eq!(
+        store.bind_terminal_enrollment(1, rejected).unwrap(),
+        terminal
+    );
+    assert_eq!(
+        store
+            .bind_terminal_enrollment(
+                terminal.revision,
+                TerminalEnrollmentOutcome::new(
+                    TerminalEnrollmentState::Expired,
+                    "enrollment-rejected",
+                )
+                .unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+        AgentErrorCode::AssignmentMismatch
+    );
+    assert_eq!(
+        store
+            .bind_approved(
+                terminal.revision,
+                ApprovedAgentIdentity::new("agent-terminal", "enrollment-rejected").unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+        AgentErrorCode::AssignmentMismatch
+    );
+    assert_eq!(
+        store
+            .install_certificate(terminal.revision, 0, certificate(1, 1, 1, 1))
+            .unwrap_err()
+            .code(),
+        AgentErrorCode::InvalidState
+    );
+    store.integrity_check().unwrap();
+    drop(store);
+
+    let reopened = SqliteSystemIdentityStore::open(&root).unwrap();
+    assert_eq!(reopened.load().unwrap(), Some(terminal));
+}
+
+#[test]
+fn private_key_material_zeroizes_and_is_marked_for_zeroizing_drop() {
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+    assert_zeroize_on_drop::<PrivateKeyMaterial>();
+    let mut private_key = PrivateKeyMaterial::new(b"sensitive-private-key".to_vec()).unwrap();
+    private_key.zeroize();
+    assert!(private_key.expose_secret().iter().all(|byte| *byte == 0));
 }
 
 #[test]

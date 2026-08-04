@@ -6,20 +6,28 @@
 
 mod agent_registry;
 mod control_plane;
+#[cfg(feature = "authority-sqlite")]
+mod datasource;
 mod error;
+#[cfg(feature = "authority-sqlite")]
+mod mapper;
 mod memory;
 mod model;
 mod ports;
 mod registry_memory;
-#[cfg(feature = "authority-sqlite")]
-mod registry_sqlite;
-#[cfg(feature = "authority-sqlite")]
-mod sqlite;
 mod validation;
 
 pub use agent_registry::*;
 pub use control_plane::ControlPlane;
 pub use error::{CentralError, CentralErrorCode, CentralResult};
+#[cfg(feature = "authority-sqlite")]
+pub use mapper::sqlite::agent_registry::{
+    open_sqlite_agent_registry, SqliteAgentRegistry, SqliteAgentRegistryConfig,
+};
+#[cfg(feature = "authority-sqlite")]
+pub use mapper::sqlite::authority::{
+    open_sqlite_authority, SqliteAuthority, SqliteAuthorityConfig,
+};
 pub use memory::{
     AllowAllAuthorizer, DenyAllAuthorizer, InMemoryAssignmentOutbox, InMemoryAuditSink,
     InMemoryClock, InMemoryComponents, InMemoryIndexPublisher, InMemoryJobRepository,
@@ -28,9 +36,3 @@ pub use memory::{
 pub use model::*;
 pub use ports::*;
 pub use registry_memory::InMemoryAgentRegistry;
-#[cfg(feature = "authority-sqlite")]
-pub use registry_sqlite::{
-    open_sqlite_agent_registry, SqliteAgentRegistry, SqliteAgentRegistryConfig,
-};
-#[cfg(feature = "authority-sqlite")]
-pub use sqlite::{open_sqlite_authority, SqliteAuthority, SqliteAuthorityConfig};

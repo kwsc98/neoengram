@@ -2,12 +2,78 @@ use std::str::FromStr;
 
 use neoengram_core::ContentDigest;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{ProtocolError, ProtocolResult};
 
 /// Serializes a value using the RFC 8785 JSON Canonicalization Scheme.
 pub fn jcs_bytes<T: Serialize>(value: &T) -> ProtocolResult<Vec<u8>> {
+    let materialized = serde_json::to_value(value)?;
+    validate_binary64_numbers(&materialized)?;
     Ok(serde_json_canonicalizer::to_vec(value)?)
+}
+
+fn validate_binary64_numbers(value: &Value) -> ProtocolResult<()> {
+    match value {
+        Value::Number(number) => {
+            let lossless = number.as_i64().map_or_else(
+                || {
+                    number.as_u64().map_or_else(
+                        || number.as_f64().is_some_and(f64::is_finite),
+                        |integer| (integer as f64) as u128 == u128::from(integer),
+                    )
+                },
+                |integer| (integer as f64) as i128 == i128::from(integer),
+            );
+            if !lossless {
+                return Err(ProtocolError::InvalidField {
+                    field: "canonical_json_number",
+                    reason:
+                        "integer must round-trip through IEEE 754 binary64 without changing value"
+                            .to_owned(),
+                });
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                validate_binary64_numbers(item)?;
+            }
+        }
+        Value::Object(object) => {
+            for item in object.values() {
+                validate_binary64_numbers(item)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::String(_) => {}
+    }
+    Ok(())
+}
+
+/// Prefixes canonical JSON with an unambiguous protocol domain for signing.
+///
+/// The encoded form is the non-empty printable ASCII domain, one NUL byte, then the RFC 8785
+/// representation of `value`. Domains containing NUL are rejected so two protocols cannot produce
+/// the same byte sequence by shifting data across the separator.
+pub fn domain_separated_jcs_bytes<T: Serialize>(
+    domain: &str,
+    value: &T,
+) -> ProtocolResult<Vec<u8>> {
+    if domain.is_empty()
+        || !domain
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != 0)
+    {
+        return Err(ProtocolError::InvalidField {
+            field: "signing_domain",
+            reason: "must be non-empty printable ASCII without NUL".to_owned(),
+        });
+    }
+    let canonical = jcs_bytes(value)?;
+    let mut signing_bytes = Vec::with_capacity(domain.len() + 1 + canonical.len());
+    signing_bytes.extend_from_slice(domain.as_bytes());
+    signing_bytes.push(0);
+    signing_bytes.extend_from_slice(&canonical);
+    Ok(signing_bytes)
 }
 
 /// Returns BLAKE3 over the RFC 8785 canonical JSON representation.
@@ -111,5 +177,41 @@ mod tests {
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(jcs_bytes(&value).is_err());
         }
+    }
+
+    #[test]
+    fn jcs_rejects_integers_that_binary64_would_round_to_another_value() {
+        const MAX_CONSECUTIVE_INTEGER: u64 = 1_u64 << 53;
+
+        assert_eq!(
+            jcs_bytes(&json!({"nested": [MAX_CONSECUTIVE_INTEGER]})).unwrap(),
+            br#"{"nested":[9007199254740992]}"#
+        );
+        assert!(matches!(
+            jcs_bytes(&json!({"nested": [MAX_CONSECUTIVE_INTEGER + 1]})),
+            Err(ProtocolError::InvalidField {
+                field: "canonical_json_number",
+                ..
+            })
+        ));
+        assert_eq!(
+            jcs_bytes(&json!({"nested": [MAX_CONSECUTIVE_INTEGER + 2]})).unwrap(),
+            br#"{"nested":[9007199254740994]}"#
+        );
+    }
+
+    #[test]
+    fn signing_bytes_are_domain_separated() {
+        let value = json!({"request_id": "request-a"});
+        let first = domain_separated_jcs_bytes("neoengram.test.first.v1", &value).unwrap();
+        let second = domain_separated_jcs_bytes("neoengram.test.second.v1", &value).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            b"neoengram.test.first.v1\0{\"request_id\":\"request-a\"}"
+        );
+        assert!(domain_separated_jcs_bytes("", &value).is_err());
+        assert!(domain_separated_jcs_bytes("invalid\0domain", &value).is_err());
     }
 }

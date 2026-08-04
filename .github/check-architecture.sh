@@ -17,7 +17,7 @@ rg -q '^rust-version = "1\.97\.0"$' Cargo.toml || fail "workspace MSRV must rema
 
 workspace_metadata="$(cargo metadata --no-deps --format-version 1 --locked)"
 
-expected_packages=$'neoengram\nneoengram-agent\nneoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol\nneoengram-standalone\nneoengramd'
+expected_packages=$'neoengram\nneoengram-agent\nneoengram-agentd\nneoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol\nneoengram-server\nneoengram-standalone\nneoengramd'
 actual_packages="$(
   jq -r '.packages[].name' <<<"$workspace_metadata" | LC_ALL=C sort
 )"
@@ -94,7 +94,70 @@ assert_internal_dependencies neoengram-standalone \
   $'neoengram-core\nneoengram-engine\nneoengram-fs' ''
 assert_internal_dependencies neoengram-agent \
   $'neoengram-core\nneoengram-engine\nneoengram-protocol' 'neoengramd'
+assert_internal_dependencies neoengram-agentd \
+  $'neoengram-agent\nneoengram-protocol' ''
 assert_internal_dependencies neoengramd $'neoengram-core\nneoengram-protocol' ''
+assert_internal_dependencies neoengram-server \
+  $'neoengram-core\nneoengram-protocol\nneoengramd' 'neoengram-agentd'
+
+assert_no_direct_dependency() {
+  local package="$1"
+  local dependency="$2"
+
+  if jq -e --arg package "$package" --arg dependency "$dependency" \
+    '.packages[] | select(.name == $package) |
+     any(.dependencies[]; .name == $dependency or .rename == $dependency)' \
+    >/dev/null <<<"$workspace_metadata"; then
+    fail "$package must not depend on $dependency"
+  fi
+}
+
+assert_no_fusen_dependency() {
+  local package="$1"
+
+  if jq -e --arg package "$package" \
+    '.packages[] | select(.name == $package) |
+     any(.dependencies[]; .name == "fusen" or (.name | startswith("fusen-")))' \
+    >/dev/null <<<"$workspace_metadata"; then
+    fail "$package must remain independent of Fusen"
+  fi
+}
+
+# Check Cargo package identities instead of manifest text so aliases are caught
+# without matching comments, descriptions, or similarly named features.
+http_transport_dependencies=(
+  actix-http
+  actix-web
+  axum
+  h2
+  http
+  http-body
+  http-body-util
+  hyper
+  hyper-util
+  poem
+  reqwest
+  rocket
+  salvo
+  surf
+  tide
+  tiny_http
+  tonic
+  tower-http
+  ureq
+  warp
+)
+for package in neoengram-protocol neoengram-agent neoengramd; do
+  assert_no_fusen_dependency "$package"
+  for dependency in "${http_transport_dependencies[@]}"; do
+    assert_no_direct_dependency "$package" "$dependency"
+  done
+done
+
+assert_no_fusen_dependency neoengram-agentd
+for dependency in neoengram-core neoengram-server neoengramd; do
+  assert_no_direct_dependency neoengram-agentd "$dependency"
+done
 
 assert_no_binary_target() {
   local package="$1"
@@ -108,6 +171,20 @@ assert_no_binary_target() {
 
 assert_no_binary_target neoengram-agent
 assert_no_binary_target neoengramd
+
+if ! jq -e \
+  '.packages[] | select(.name == "neoengram-server") |
+   [.targets[].kind[]] | index("bin") != null' \
+  >/dev/null <<<"$workspace_metadata"; then
+  fail "neoengram-server must provide the HTTP server binary"
+fi
+
+if ! jq -e \
+  '.packages[] | select(.name == "neoengram-agentd") |
+   [.targets[] | select(.name == "neoengram-agent") | .kind[]] | index("bin") != null' \
+  >/dev/null <<<"$workspace_metadata"; then
+  fail "neoengram-agentd must provide the neoengram-agent binary"
+fi
 
 if ! jq -e \
   '.packages[] | select(.name == "neoengram") |
@@ -126,13 +203,21 @@ assert_manifest_excludes() {
 
 assert_manifest_excludes \
   crates/neoengram-protocol/Cargo.toml \
-  'neoengram-(engine|fs|standalone|agent)|rusqlite|reqwest|hyper|axum|sqlx|diesel|aws-sdk'
+  'neoengram-(engine|fs|standalone|agent)|rusqlite|sqlx|diesel|aws-sdk'
 assert_manifest_excludes \
   crates/neoengram-agent/Cargo.toml \
   'neoengram-standalone|sqlx|diesel'
 assert_manifest_excludes \
   services/neoengramd/Cargo.toml \
-  'neoengram-(engine|fs|standalone)|rusqlite|reqwest|hyper|axum|diesel|aws-sdk'
+  'neoengram-(engine|fs|standalone)|rusqlite|diesel|aws-sdk'
+assert_manifest_excludes \
+  services/neoengram-server/Cargo.toml \
+  'neoengram-(engine|fs|standalone)|neoengram-agent\s*=|rusqlite|sqlx|diesel|aws-sdk'
+assert_manifest_excludes \
+  services/neoengram-agentd/Cargo.toml \
+  'rusqlite|sqlx|diesel'
+rg -q '^fusen-rs = "=0\.9\.0"$' services/neoengram-server/Cargo.toml || \
+  fail "neoengram-server must pin fusen-rs exactly to 0.9.0"
 for manifest in \
   crates/neoengram-core/Cargo.toml \
   crates/neoengram-engine/Cargo.toml \
@@ -142,6 +227,46 @@ for manifest in \
 done
 rg -q '^sqlx = \{ workspace = true, optional = true \}$' services/neoengramd/Cargo.toml || \
   fail "SQLx must remain an optional neoengramd authority adapter dependency"
+
+for layer in controller service; do
+  if rg -n '\bsqlx\b' services/neoengram-server/src \
+    --glob "**/$layer.rs" --glob "**/$layer/**"; then
+    fail "neoengram-server $layer must not access SQLx"
+  fi
+done
+if rg -n '\bneoengramd\b' services/neoengram-server/src \
+  --glob '**/controller.rs' --glob '**/controller/**'; then
+  fail "neoengram-server controllers must call services instead of neoengramd directly"
+fi
+controller_routes="$({
+  rg -o --no-filename 'method = "(GET|POST)", path = "[^"]+"' \
+    services/neoengram-server/src \
+    --glob '**/controller.rs' --glob '**/controller/**' || true
+} | LC_ALL=C sort)"
+expected_controller_routes=$'method = "GET", path = "/health/live"\nmethod = "GET", path = "/health/ready"\nmethod = "POST", path = "/api/job/add/create"\nmethod = "POST", path = "/api/job/add/finalize"\nmethod = "POST", path = "/api/job/query"\nmethod = "POST", path = "/api/storage/enrollment/approve"\nmethod = "POST", path = "/api/storage/enrollment/list/query"\nmethod = "POST", path = "/api/storage/enrollment/query"\nmethod = "POST", path = "/api/storage/enrollment/reject"\nmethod = "POST", path = "/api/storage/enrollment/token/create"\nmethod = "POST", path = "/api/system/version/query"'
+if [[ "$controller_routes" != "$expected_controller_routes" ]]; then
+  echo "$controller_routes" >&2
+  fail "neoengram-server must register exactly the approved public HTTP routes"
+fi
+for route in /v1/agents/bootstrap /v1/agents/bootstrap/status; do
+  rg -q "\"${route}\"" services/neoengram-server/src/agent_transport || \
+    fail "Agent Hyper adapter is missing ${route}"
+done
+if rg -n '\b(assign_job|expire_add_job|resume_publication)\b' \
+  services/neoengram-server/src \
+  --glob '**/controller.rs' --glob '**/controller/**'; then
+  fail "internal scheduling and recovery methods must not be HTTP controllers"
+fi
+while IFS= read -r sqlx_source; do
+  if rg -n '\b(JobRepository|AssignmentOutbox|MetadataBatchStager|ObjectCatalog|IndexPublisher|AuditSink|AgentRegistry)\b' \
+    "$sqlx_source"; then
+    fail "SQLx repository implementations must remain in neoengramd mapper modules: $sqlx_source"
+  fi
+done < <(rg -l '\bsqlx\b' services/neoengramd/src \
+  --glob '*.rs' --glob '!**/mapper/**' --glob '!mapper.rs')
+if rg -n '\bmapper(::|\b)' services/neoengramd/src/datasource --glob '*.rs'; then
+  fail "neoengramd datasource modules must not depend on mappers"
+fi
 rg -q '^neoengram-engine\.workspace = true$' crates/neoengram-standalone/Cargo.toml || \
   fail "Standalone must compose the execution engine"
 rg -q '^neoengram-fs\.workspace = true$' crates/neoengram-standalone/Cargo.toml || \
@@ -153,6 +278,8 @@ for manifest in \
   crates/neoengram-protocol/Cargo.toml \
   crates/neoengram-standalone/Cargo.toml \
   crates/neoengram-agent/Cargo.toml \
+  services/neoengram-agentd/Cargo.toml \
+  services/neoengram-server/Cargo.toml \
   services/neoengramd/Cargo.toml; do
   rg -q '^publish = false$' "$manifest" || fail "$manifest must remain workspace-private"
 done

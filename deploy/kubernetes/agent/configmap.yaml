@@ -19,6 +19,7 @@ data:
     tenant_id: tenant-example
     edge_cluster_id: edge-example
     storage_volume_id: volume-example
+    volume_descriptor_digest: replace-with-64-lowercase-hex-descriptor-digest
     region: cn-example-1
     storage:
       backend_type: pvc

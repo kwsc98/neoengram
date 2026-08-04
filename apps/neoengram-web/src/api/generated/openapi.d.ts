@@ -1120,7 +1120,8 @@ export interface components {
          * @description Agent 使用单次 bootstrap token 提交的脱敏 PVC enrollment。pending_approval 自 created_at 起
          *     24 小时未审核即进入 expired；终态仍保留 expires_at_unix_ms 作为原审批期限。approved 仅表示
          *     管理员已审核并建立 unavailable Volume；认证 Agent session 和健康 probe 建立后才进入 enrolled。
-         *     本视图不包含 token、CSR、证书、PVC UID、挂载详情、拒绝原因或内部 Agent/session identity。
+         *     本视图不包含 token、token key ID、SPKI、签名、CSR、证书、PVC UID、挂载详情、拒绝原因或
+         *     内部 Agent/session identity。
          */
         StorageEnrollmentView: {
             tenant_id: components["schemas"]["TenantId"];
@@ -1136,6 +1137,7 @@ export interface components {
             agent_version: string;
             /** @description Agent installation 公钥 identity 的摘要，仅供审批比对；不是 mount/device fingerprint。 */
             identity_fingerprint: string;
+            proof_of_possession_status: components["schemas"]["StorageEnrollmentProofOfPossessionStatus"];
             probe: components["schemas"]["StorageEnrollmentProbeSummary"];
             resource_version: components["schemas"]["CanonicalU64"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
@@ -1151,6 +1153,11 @@ export interface components {
             protocol_compatible: boolean;
             observed_at_unix_ms: components["schemas"]["UnixMillis"];
         };
+        /**
+         * @description 服务端对 canonical bootstrap request 完成 Ed25519 验签后持久化的脱敏状态；不接受客户端声明。
+         * @enum {string}
+         */
+        StorageEnrollmentProofOfPossessionStatus: "verified";
         /**
          * @description initial 建立首个 Owner，可创建缺失的 Volume，或绑定 descriptor 完全一致且 unavailable、无活动
          *     Owner 的既有 PVC Volume；replacement 接管既有 Owner，审批时要求 confirm_replacement=true。
@@ -2241,6 +2248,50 @@ export interface components {
                 "application/problem+json": components["schemas"]["ProblemDetails"];
             };
         };
+        /** @description 服务端并发请求配额已耗尽 */
+        OverloadedProblem: {
+            headers: {
+                "X-Request-ID": components["headers"]["RequestId"];
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "type": "urn:neoengram:problem:overloaded",
+                 *       "title": "Resource exhausted",
+                 *       "status": 429,
+                 *       "detail": "server request concurrency is exhausted",
+                 *       "instance": "/api/job/query",
+                 *       "code": "OVERLOADED",
+                 *       "request_id": "req-20260727-001",
+                 *       "retryable": false
+                 *     }
+                 */
+                "application/problem+json": components["schemas"]["ProblemDetails"];
+            };
+        };
+        /** @description 请求超过服务端处理时限 */
+        RequestTimeoutProblem: {
+            headers: {
+                "X-Request-ID": components["headers"]["RequestId"];
+                [name: string]: unknown;
+            };
+            content: {
+                /**
+                 * @example {
+                 *       "type": "urn:neoengram:problem:deadline-exceeded",
+                 *       "title": "Request deadline exceeded",
+                 *       "status": 504,
+                 *       "detail": "service invocation deadline elapsed",
+                 *       "instance": "/api/job/query",
+                 *       "code": "DEADLINE_EXCEEDED",
+                 *       "request_id": "req-20260727-001",
+                 *       "retryable": false
+                 *     }
+                 */
+                "application/problem+json": components["schemas"]["ProblemDetails"];
+            };
+        };
         /** @description 未分类的服务端内部错误 */
         InternalProblem: {
             headers: {
@@ -2361,8 +2412,11 @@ export interface operations {
                 };
             };
             413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     queryTenantList: {
@@ -2791,8 +2845,10 @@ export interface operations {
             409: components["responses"]["StorageEnrollmentConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     queryStorageEnrollmentList: {
@@ -2857,6 +2913,7 @@ export interface operations {
                      *           "state": "pending_approval",
                      *           "agent_version": "0.0.1",
                      *           "identity_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *           "proof_of_possession_status": "verified",
                      *           "probe": {
                      *             "observed_access_mode": "read_write",
                      *             "descriptor_matches": true,
@@ -2880,8 +2937,10 @@ export interface operations {
             409: components["responses"]["CursorConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     queryStorageEnrollment: {
@@ -2934,8 +2993,10 @@ export interface operations {
             404: components["responses"]["StorageEnrollmentNotFoundProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     approveStorageEnrollment: {
@@ -3001,6 +3062,7 @@ export interface operations {
                      *         "state": "approved",
                      *         "agent_version": "0.0.1",
                      *         "identity_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "proof_of_possession_status": "verified",
                      *         "probe": {
                      *           "observed_access_mode": "read_write",
                      *           "descriptor_matches": true,
@@ -3042,8 +3104,10 @@ export interface operations {
             409: components["responses"]["StorageEnrollmentConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     rejectStorageEnrollment: {
@@ -3109,6 +3173,7 @@ export interface operations {
                      *         "state": "rejected",
                      *         "agent_version": "0.0.1",
                      *         "identity_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "proof_of_possession_status": "verified",
                      *         "probe": {
                      *           "observed_access_mode": "read_write",
                      *           "descriptor_matches": false,
@@ -3133,8 +3198,10 @@ export interface operations {
             409: components["responses"]["StorageEnrollmentConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     queryProjectList: {
@@ -5202,8 +5269,10 @@ export interface operations {
             409: components["responses"]["CreateConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     queryJob: {
@@ -5256,8 +5325,10 @@ export interface operations {
             404: components["responses"]["JobNotFoundProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     finalizeAddJob: {
@@ -5312,8 +5383,10 @@ export interface operations {
             409: components["responses"]["FinalizeConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     liveProbe: {
@@ -5346,7 +5419,11 @@ export interface operations {
                     "application/json": components["schemas"]["HealthResponse"];
                 };
             };
+            422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
             500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
     readyProbe: {
@@ -5379,7 +5456,11 @@ export interface operations {
                     "application/json": components["schemas"]["HealthResponse"];
                 };
             };
+            422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
+            500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
 }

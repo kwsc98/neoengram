@@ -1,6 +1,6 @@
 # NeoEngram Roadmap
 
-> 最后更新：2026-07-31
+> 最后更新：2026-08-03
 >
 > 本文是迭代执行视图，不重新定义产品能力或架构。
 > 能力状态、架构不变量和研究结论以 [`implementation-plan.md`](implementation-plan.md) 为准。
@@ -11,14 +11,14 @@
 
 - `0.2.0`、format v8 和 P0 crate/protocol/state-machine 改造已完成。
 - Standalone 本地工作流可运行；FUSE 实挂矩阵和大规模基准尚未完成。
-- Agent 与 `neoengramd` 仍是无网络 library；中心已具备后端无关 `AuthorityStore`、测试用 InMemory
-  后端和默认 SQLite 权威后端。
-- SQLite 支持单个 `neoengramd` 进程的中心权威持久化；PostgreSQL/MySQL、HTTP/mTLS、OIDC/RBAC、
-  真实 S3、daemon 和分布式 fencing 尚不存在。
+- `neoengramd` 保持无网络 library；`neoengram-server` 提供 Fusen 用户 listener 和可选 Hyper Agent
+  enrollment listener，中心已具备后端无关 `AuthorityStore`、测试用 InMemory 后端和默认 SQLite 权威后端。
+- SQLite 支持单个 server 进程的中心权威持久化；已注册的用户接口使用 OIDC/JWKS 与默认拒绝 RBAC。
+  PostgreSQL/MySQL、Agent mTLS session、真实 S3、多副本和分布式 fencing 尚不存在。
 - Managed 模式以中心 S3 为对象耐久权威；NFS 仅保存 Playground、journal 和可重建缓存。
 - 0.0.1 Kubernetes 部署剖面已冻结为一个业务 PVC/StorageVolume 对应一个常驻 AgentInstance；Agent
-  SQLite 身份/Ledger adapter、mount probe 与中心 enrollment/registry 领域纵切已实现，实际 daemon、
-  主动注册/审批 transport、证书签发和真实集群闭环仍待实现。
+  SQLite 身份/Ledger adapter、mount probe、可运行的 `neoengram-agentd`、主动 bootstrap/status transport
+  与中心 enrollment/registry 纵切已实现；证书签发、session/Job transport 和真实集群闭环仍待实现。
 
 ## 迭代规则
 
@@ -34,7 +34,7 @@
 | --- | --- | --- | --- |
 | R0 | 已完成 | format v8、协议 v1、Engine/Agent/中心内存状态机 | P0 / A0 |
 | R1 | 已完成 | AuthorityStore + SQLite 默认后端，覆盖全部中心权威状态 | P1 / A2 |
-| R2 | 进行中 | 一 PVC 一常驻 Agent：enrollment/审批契约与 UI、持久身份/Ledger adapter、mount probe、Storage Registry 领域状态机、部署模板和人工 cooperative takeover；daemon/transport 与集群验收待完成 | A1 / A2 |
+| R2 | 进行中 | 一 PVC 一常驻 Agent：enrollment/审批契约、持久身份/Ledger、mount probe、可运行 daemon、双 listener bootstrap/status、部署模板和人工 cooperative takeover；证书/session 与集群验收待完成 | A1 / A2 |
 | R3 | 后续 | 把 OIDC/JWKS、RBAC/RLS 扩展到其余只读 Artifact/Commit/Tags/Snapshot API | P1 |
 | R4 | 后续 | 完整 mTLS Agent session transport、只读 Job delivery、背压和重连 | A1 / A2 |
 | R5 | 后续 | 中心 S3、短期票据和端到端 Managed Add | P2 / A4 |
@@ -82,5 +82,5 @@ PostgreSQL/MySQL 后续实现同一行为契约，但各自拥有独立 SQL、mi
 - HTML 原型仅表达交互需求；与中心 S3 权威等最新不变量冲突时不得作为实现依据。
 - Kubernetes Agent 发布必须验证 `replicas=1`、Recreate、固定 `/volume`、独立状态 PVC、无
   ServiceAccount token/Kubernetes API，以及人工 takeover 失败关闭；这些约束不等价于存储侧强 fencing。
-- R2 的真实审批入口必须先具备可验证 TenantAdmin 身份和 `storage.enrollment.create/read/review` 的
-  默认拒绝授权；R3 是把 OIDC/JWKS、RBAC/RLS 扩展到其余公开资源，不允许 R2 用 MSW 身份替代验收。
+- R2 的真实审批入口已要求可验证 TenantAdmin 身份和 `storage.enrollment.create/read/review` 的默认拒绝
+  授权；集群验收不得用 MSW 身份替代。R3 继续把 OIDC/JWKS、RBAC/RLS 扩展到其余公开资源。

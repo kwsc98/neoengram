@@ -1,26 +1,34 @@
 #![cfg(feature = "authority-sqlite")]
 
-use std::{collections::BTreeSet, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use neoengram_core::ContentDigest;
 use neoengram_protocol::{
-    AgentBootId, AgentBootstrapProbe, AgentBootstrapRequest, AgentEnrollmentApprovalRequest,
+    AgentBootId, AgentBootstrapProbe, AgentBootstrapProof, AgentBootstrapRequest,
+    AgentBootstrapStatusRequest, AgentBootstrapStatusState, AgentEnrollmentApprovalRequest,
     AgentEnrollmentDecision, AgentEnrollmentId, AgentEnrollmentState,
     AgentEnrollmentTokenCreateRequest, AgentEnrollmentTokenId, AgentId, AgentInstallationId,
-    AgentMountId, AgentMountIdentityDigest, AgentMountStatusReport, EdgeClusterId, Extensions,
-    MountAccessMode, MountGeneration, OwnerGeneration, PrincipalId, PrincipalKind, PrincipalRef,
-    PvcIdentityDigest, RequestId, ResourceHealth, ResourceVersion, SequenceNumber,
-    SessionGeneration, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId, PROTOCOL_VERSION_V1,
+    AgentMountId, AgentMountIdentityDigest, AgentMountStatusReport, Ed25519PublicKeySpki,
+    Ed25519Signature, EdgeClusterId, Extensions, MountAccessMode, MountGeneration, OwnerGeneration,
+    PrincipalId, PrincipalKind, PrincipalRef, PvcIdentityDigest, RequestId, ResourceHealth,
+    ResourceVersion, SequenceNumber, SessionGeneration, StorageVolumeId, TenantId, UnixMillis,
+    VolumeMarkerId, PROTOCOL_VERSION_V1,
 };
 use neoengramd::{
     open_sqlite_agent_registry, open_sqlite_authority, AgentEnrollmentAuditEvent,
-    AgentEnrollmentAuditKind, AgentInstanceRecord, AgentInstanceState, AgentRegistryRecord,
-    AgentRegistryRepository, AgentRegistryService, CentralErrorCode, CloseAgentSessionRequest,
-    CompleteVolumeRecoveryRequest, DerivedVolumeState, ExpireAgentEnrollmentRequest,
+    AgentEnrollmentAuditKind, AgentEnrollmentLifecycleAuditKind, AgentEnrollmentListRequest,
+    AgentInstanceRecord, AgentInstanceState, AgentProofOfPossessionStatus, AgentRegistryRecord,
+    AgentRegistryRecordFormat, AgentRegistryRepository, AgentRegistryService,
+    BootstrapTokenMetadata, CentralErrorCode, CloseAgentSessionRequest,
+    CompleteVolumeRecoveryRequest, CreateStorageEnrollmentIntentRequest, DerivedVolumeState,
+    ExpireAgentEnrollmentRequest, FrozenPvcReference, FrozenStorageDescriptor,
     InMemoryAgentRegistry, InMemoryClock, InMemoryComponents, OpenAgentSessionRequest,
-    SqliteAgentRegistryConfig, SqliteAuthorityConfig, VolumeOwnerState,
+    SqliteAgentRegistryConfig, SqliteAuthorityConfig, StorageEnrollmentAccessMode,
+    StorageEnrollmentRegistrationKind, StorageEnrollmentState, VolumeOwnerState,
     AGENT_ENROLLMENT_REVIEW_WINDOW_MS,
 };
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
+use serde_json::json;
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use tempfile::TempDir;
 
@@ -98,6 +106,29 @@ async fn sqlite_registry_rejects_schema_drift_on_reopen() {
             .expect("schema drift must prevent reopening the Agent registry");
         assert_eq!(error.code(), CentralErrorCode::StorageFailure);
     }
+}
+
+#[tokio::test]
+async fn sqlite_registry_rejects_orphan_status_watermark_on_reopen() {
+    let directory = TempDir::new().unwrap();
+    drop(
+        open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+            .await
+            .unwrap(),
+    );
+    execute_registry_raw(
+        directory.path(),
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO agent_bootstrap_status_watermarks
+             (enrollment_id, signed_at_unix_ms) VALUES ('orphan-enrollment', 100);",
+    )
+    .await;
+
+    let error = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .err()
+        .expect("orphan bootstrap-status watermark must fail closed during reopen");
+    assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 
 #[test]
@@ -538,6 +569,109 @@ async fn assert_expired_token_releases_scope(repository: Arc<dyn AgentRegistryRe
             .code(),
         CentralErrorCode::BootstrapDenied
     );
+}
+
+#[tokio::test]
+async fn global_expiry_reconciliation_releases_unobserved_pending_scope() {
+    assert_global_expiry_releases_pending_scope(Arc::new(InMemoryAgentRegistry::new())).await;
+
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    assert_global_expiry_releases_pending_scope(sqlite.repository()).await;
+    sqlite.integrity_check().await.unwrap();
+}
+
+async fn assert_global_expiry_releases_pending_scope(repository: Arc<dyn AgentRegistryRepository>) {
+    let clock = Arc::new(InMemoryClock::new(200));
+    let service = AgentRegistryService::new(repository.clone(), clock.clone(), 100);
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x61);
+    let pending = service
+        .bootstrap_agent_with_proof(signed_bootstrap_request(
+            initial_bootstrap_request(),
+            &key_pair,
+        ))
+        .await
+        .unwrap();
+
+    let mut stale_token = scoped_token_request("stale");
+    stale_token.created_at_unix_ms = UnixMillis::new(100);
+    stale_token.expires_at_unix_ms = UnixMillis::new(201);
+    let stale_enrollment_id = stale_token.enrollment_id.clone();
+    service
+        .create_storage_enrollment_intent(scoped_rich_intent(stale_token, "stale"))
+        .await
+        .unwrap();
+
+    let review_expires_at = pending.record.enrollment.review_expires_at_unix_ms.unwrap();
+    clock.set(review_expires_at.get());
+    let reconciled = service.reconcile_expired_enrollments().await.unwrap();
+    assert_eq!(reconciled.expired_token_intents, 1);
+    assert_eq!(reconciled.expired_review_enrollments, 1);
+    assert_eq!(
+        service.reconcile_expired_enrollments().await.unwrap(),
+        Default::default()
+    );
+
+    let expired_pending = repository
+        .get(&initial_enrollment_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        expired_pending.enrollment.state,
+        AgentEnrollmentState::Expired
+    );
+    assert_eq!(
+        expired_pending.storage_enrollment.state,
+        Some(StorageEnrollmentState::Expired)
+    );
+    assert_eq!(
+        expired_pending
+            .storage_enrollment
+            .lifecycle_audit_events
+            .last()
+            .unwrap()
+            .kind,
+        AgentEnrollmentLifecycleAuditKind::Expired
+    );
+    let expired_token = repository.get(&stale_enrollment_id).await.unwrap().unwrap();
+    assert_eq!(
+        expired_token.enrollment.state,
+        AgentEnrollmentState::Expired
+    );
+    assert_eq!(
+        expired_token
+            .storage_enrollment
+            .lifecycle_audit_events
+            .last()
+            .unwrap()
+            .kind,
+        AgentEnrollmentLifecycleAuditKind::Expired
+    );
+
+    let mut renewed = independent_token_request();
+    renewed.tenant_id = tenant_id();
+    renewed.edge_cluster_id = edge_cluster_id();
+    renewed.storage_volume_id = storage_volume_id();
+    renewed.volume_descriptor_digest = volume_descriptor_digest();
+    renewed.pvc_identity_digest = pvc_identity_digest();
+    renewed.expected_volume_marker = VolumeMarkerId::new("volume-a").unwrap();
+    renewed.created_at_unix_ms = review_expires_at;
+    renewed.expires_at_unix_ms = UnixMillis::new(review_expires_at.get() + 1_000);
+    let created = service
+        .create_storage_enrollment_intent(rich_intent(renewed, "Vision dataset PVC"))
+        .await
+        .unwrap();
+    assert!(!created.replayed);
 }
 
 #[tokio::test]
@@ -1063,6 +1197,7 @@ async fn run_registry_identity_conflicts(repository: Arc<dyn AgentRegistryReposi
     );
 
     let mut reused_key = independent_bootstrap_request();
+    reused_key.proof = bootstrap_proof(AgentKind::Initial);
     reused_key.public_key_fingerprint = public_key_fingerprint(AgentKind::Initial);
     assert_eq!(
         service
@@ -1164,6 +1299,630 @@ async fn authority_compositions_expose_registry_and_deduplicate_decision_audit()
     assert!(sqlite_store.capabilities().atomic_agent_registry_audit);
 }
 
+#[tokio::test]
+async fn rich_create_replays_caller_intent_without_comparing_generated_material() {
+    let service = AgentRegistryService::new(
+        Arc::new(InMemoryAgentRegistry::new()),
+        Arc::new(InMemoryClock::new(100)),
+        100,
+    );
+    let first_request = rich_intent(initial_token_request(), "Vision dataset PVC");
+    let first = service
+        .create_storage_enrollment_intent(first_request.clone())
+        .await
+        .unwrap();
+    assert!(!first.replayed);
+    assert_eq!(
+        first.record.storage_enrollment.record_format,
+        AgentRegistryRecordFormat::CurrentV3
+    );
+    assert_eq!(
+        first.record.storage_enrollment.token_key_id.as_deref(),
+        Some("bootstrap-key-v1")
+    );
+
+    let mut regenerated = first_request;
+    regenerated.request.token_id = AgentEnrollmentTokenId::new("token-regenerated").unwrap();
+    regenerated.request.enrollment_id = AgentEnrollmentId::new("enrollment-regenerated").unwrap();
+    regenerated.request.agent_id = AgentId::new("agent-regenerated").unwrap();
+    regenerated.request.agent_mount_id = AgentMountId::new("mount-regenerated").unwrap();
+    regenerated.request.bootstrap_token = "r".repeat(40);
+    regenerated.request.created_at_unix_ms = UnixMillis::new(101);
+    regenerated.request.expires_at_unix_ms = UnixMillis::new(1_001);
+    regenerated.token.key_id = "rotated-key-v2".to_owned();
+    let replay = service
+        .create_storage_enrollment_intent(regenerated)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.record, first.record);
+
+    let mut conflict = rich_intent(initial_token_request(), "Another PVC");
+    conflict.request.token_id = AgentEnrollmentTokenId::new("token-conflict").unwrap();
+    assert_eq!(
+        service
+            .create_storage_enrollment_intent(conflict)
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::EnrollmentIdReused
+    );
+}
+
+#[tokio::test]
+async fn signed_bootstrap_status_is_bound_to_persisted_spki_and_clock() {
+    let repository: Arc<dyn AgentRegistryRepository> = Arc::new(InMemoryAgentRegistry::new());
+    let clock = Arc::new(InMemoryClock::new(200));
+    let service = AgentRegistryService::new(repository, clock.clone(), 100);
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x31);
+    let bootstrap = signed_bootstrap_request(
+        bootstrap_request(AgentKind::Initial, INITIAL_TOKEN),
+        &key_pair,
+    );
+    let pending = service.bootstrap_agent_with_proof(bootstrap).await.unwrap();
+    assert!(pending
+        .record
+        .candidate
+        .as_ref()
+        .unwrap()
+        .credential_evidence
+        .is_some());
+    assert_eq!(
+        pending
+            .record
+            .candidate
+            .as_ref()
+            .unwrap()
+            .proof_of_possession_status,
+        Some(AgentProofOfPossessionStatus::Verified)
+    );
+
+    let status_request = signed_status_request(&key_pair, UnixMillis::new(200));
+    let status = service
+        .bootstrap_status(status_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(status.state, AgentBootstrapStatusState::Pending);
+    assert!(status.agent_id.is_none());
+    assert_eq!(
+        service
+            .bootstrap_status(status_request)
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::BootstrapDenied
+    );
+
+    service
+        .decide_enrollment(
+            approval_request(initial_enrollment_id(), status.resource_version, false),
+            actor(),
+        )
+        .await
+        .unwrap();
+    clock.set(201);
+    let approved = service
+        .bootstrap_status(signed_status_request(&key_pair, UnixMillis::new(201)))
+        .await
+        .unwrap();
+    assert_eq!(approved.state, AgentBootstrapStatusState::Approved);
+    assert_eq!(approved.agent_id, Some(initial_agent_id()));
+
+    let other_key = test_key_pair(0x32);
+    assert_eq!(
+        service
+            .bootstrap_status(signed_status_request(&other_key, UnixMillis::new(202)))
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::BootstrapDenied
+    );
+    clock.set(60_202);
+    assert_eq!(
+        service
+            .bootstrap_status(signed_status_request(&key_pair, UnixMillis::new(200)))
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::BootstrapDenied
+    );
+}
+
+#[tokio::test]
+async fn sqlite_persists_and_validates_server_verified_bootstrap_pop() {
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let service =
+        AgentRegistryService::new(sqlite.repository(), Arc::new(InMemoryClock::new(200)), 100);
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x33);
+    service
+        .bootstrap_agent_with_proof(signed_bootstrap_request(
+            initial_bootstrap_request(),
+            &key_pair,
+        ))
+        .await
+        .unwrap();
+    drop(service);
+    sqlite.close().await;
+
+    let reopened = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let stored = reopened
+        .repository()
+        .get(&initial_enrollment_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored
+            .candidate
+            .as_ref()
+            .unwrap()
+            .proof_of_possession_status,
+        Some(AgentProofOfPossessionStatus::Verified)
+    );
+    reopened.close().await;
+
+    execute_registry_raw(
+        directory.path(),
+        "UPDATE agent_registry_records SET payload = CAST(json_remove(\
+             CAST(payload AS TEXT),\
+             '$.value.candidate.proof_of_possession_status') AS BLOB);",
+    )
+    .await;
+    let error = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .err()
+        .expect("rich CurrentV3 records without verified PoP status must fail closed");
+    assert_eq!(error.code(), CentralErrorCode::StorageFailure);
+}
+
+#[tokio::test]
+async fn sqlite_rejects_current_bootstrap_without_signed_payload_digest() {
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let service =
+        AgentRegistryService::new(sqlite.repository(), Arc::new(InMemoryClock::new(200)), 100);
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x34);
+    let request = signed_bootstrap_request(initial_bootstrap_request(), &key_pair);
+    let expected_digest = ContentDigest::hash(request.signing_bytes().unwrap());
+    let pending = service.bootstrap_agent_with_proof(request).await.unwrap();
+    assert_eq!(
+        pending
+            .record
+            .candidate
+            .as_ref()
+            .unwrap()
+            .bootstrap_signed_payload_digest,
+        Some(expected_digest)
+    );
+    drop(service);
+    sqlite.close().await;
+
+    execute_registry_raw(
+        directory.path(),
+        "UPDATE agent_registry_records SET payload = CAST(json_remove(\
+             CAST(payload AS TEXT),\
+             '$.value.candidate.bootstrap_signed_payload_digest') AS BLOB);",
+    )
+    .await;
+    let error = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .err()
+        .expect("rich CurrentV3 records without signed payload digest must fail closed");
+    assert_eq!(error.code(), CentralErrorCode::StorageFailure);
+}
+
+#[tokio::test]
+async fn concurrent_identical_signed_bootstrap_is_idempotent_in_memory_and_sqlite() {
+    run_signed_bootstrap_replay_race(Arc::new(InMemoryAgentRegistry::new())).await;
+
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    run_signed_bootstrap_replay_race(sqlite.repository()).await;
+    sqlite.integrity_check().await.unwrap();
+}
+
+#[tokio::test]
+async fn signed_bootstrap_replay_rejects_changed_order_or_extensions() {
+    let repository: Arc<dyn AgentRegistryRepository> = Arc::new(InMemoryAgentRegistry::new());
+    let service = AgentRegistryService::new(repository, Arc::new(InMemoryClock::new(200)), 100);
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x35);
+    let mut request = initial_bootstrap_request();
+    request.capabilities = vec!["read_v1".to_owned(), "write_v1".to_owned()];
+    request
+        .extensions
+        .insert("x-replay-evidence".to_owned(), json!({"revision": 1}));
+    let request = signed_bootstrap_request(request, &key_pair);
+    let accepted = service
+        .bootstrap_agent_with_proof(request.clone())
+        .await
+        .unwrap();
+    assert!(!accepted.accepted.replayed);
+
+    let mut reordered = request.clone();
+    reordered.capabilities.reverse();
+    let reordered = signed_bootstrap_request(reordered, &key_pair);
+    assert_ne!(
+        request.signing_bytes().unwrap(),
+        reordered.signing_bytes().unwrap()
+    );
+    assert_eq!(
+        service
+            .bootstrap_agent_with_proof(reordered)
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::AgentIdentityMismatch
+    );
+
+    let mut changed_extension = request.clone();
+    changed_extension
+        .extensions
+        .insert("x-replay-evidence".to_owned(), json!({"revision": 2}));
+    let changed_extension = signed_bootstrap_request(changed_extension, &key_pair);
+    assert_ne!(
+        request.signing_bytes().unwrap(),
+        changed_extension.signing_bytes().unwrap()
+    );
+    assert_eq!(
+        service
+            .bootstrap_agent_with_proof(changed_extension)
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::AgentIdentityMismatch
+    );
+
+    let replay = service.bootstrap_agent_with_proof(request).await.unwrap();
+    assert!(replay.accepted.replayed);
+    assert_eq!(replay.record, accepted.record);
+}
+
+#[tokio::test]
+async fn concurrent_bootstrap_status_replay_has_one_cas_winner() {
+    run_bootstrap_status_cas(Arc::new(InMemoryAgentRegistry::new())).await;
+
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    run_bootstrap_status_cas(sqlite.repository()).await;
+    sqlite.integrity_check().await.unwrap();
+}
+
+#[tokio::test]
+async fn bootstrap_status_poll_does_not_invalidate_enrollment_approval_cas() {
+    run_query_status_approve(Arc::new(InMemoryAgentRegistry::new())).await;
+
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    run_query_status_approve(sqlite.repository()).await;
+    sqlite.integrity_check().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejection_reason_is_restart_stable_and_debug_redacted_in_lifecycle_audit() {
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let service =
+        AgentRegistryService::new(sqlite.repository(), Arc::new(InMemoryClock::new(200)), 100);
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x61);
+    let pending = service
+        .bootstrap_agent_with_proof(signed_bootstrap_request(
+            initial_bootstrap_request(),
+            &key_pair,
+        ))
+        .await
+        .unwrap();
+    let mut rejection = approval_request(
+        initial_enrollment_id(),
+        pending.record.resource_version,
+        false,
+    );
+    rejection.decision = AgentEnrollmentDecision::Reject;
+    let reason = "controlled rejection detail".to_owned();
+    service
+        .decide_storage_enrollment(rejection, actor(), Some(reason.clone()))
+        .await
+        .unwrap();
+    let events = service
+        .enrollment_lifecycle_audit_events(&tenant_id())
+        .await
+        .unwrap();
+    let rejected = events
+        .iter()
+        .find(|event| event.kind == AgentEnrollmentLifecycleAuditKind::Rejected)
+        .unwrap();
+    assert_eq!(rejected.rejection_reason.as_deref(), Some(reason.as_str()));
+    assert!(!format!("{rejected:?}").contains(&reason));
+    drop(service);
+    sqlite.close().await;
+
+    let reopened = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let reopened_service = AgentRegistryService::new(
+        reopened.repository(),
+        Arc::new(InMemoryClock::new(200)),
+        100,
+    );
+    let reopened_events = reopened_service
+        .enrollment_lifecycle_audit_events(&tenant_id())
+        .await
+        .unwrap();
+    assert_eq!(events, reopened_events);
+}
+
+#[tokio::test]
+async fn tenant_list_keyset_and_search_match_in_memory_and_sqlite() {
+    run_enrollment_list_contract(Arc::new(InMemoryAgentRegistry::new())).await;
+
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    run_enrollment_list_contract(sqlite.repository()).await;
+    sqlite.integrity_check().await.unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_v2_active_registry_can_be_reissued_as_a_rich_replacement() {
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let service =
+        AgentRegistryService::new(sqlite.repository(), Arc::new(InMemoryClock::new(200)), 100);
+    service
+        .create_token_intent(initial_token_request())
+        .await
+        .unwrap();
+    let pending = service
+        .bootstrap_agent(initial_bootstrap_request())
+        .await
+        .unwrap();
+    let approved = service
+        .decide_enrollment(
+            approval_request(
+                initial_enrollment_id(),
+                pending.record.resource_version,
+                false,
+            ),
+            actor(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        approved.record.enrollment.state,
+        AgentEnrollmentState::Approved
+    );
+    drop(service);
+    sqlite.close().await;
+
+    execute_registry_raw(
+        directory.path(),
+        "DROP TABLE agent_bootstrap_status_watermarks;
+         DROP INDEX agent_registry_tenant_enrollment_keyset;
+         DROP INDEX agent_registry_tenant_status_keyset;
+         UPDATE agent_registry_records SET payload = CAST(json_remove(
+             CAST(payload AS TEXT), '$.value.storage_enrollment',
+             '$.value.candidate.credential_evidence',
+             '$.value.candidate.proof_of_possession_status',
+             '$.value.candidate.bootstrap_signed_payload_digest') AS BLOB);
+         ALTER TABLE agent_registry_records DROP COLUMN display_name;
+         ALTER TABLE agent_registry_records DROP COLUMN enrollment_created_at_unix_ms;
+         ALTER TABLE agent_registry_records DROP COLUMN registration_kind;
+         ALTER TABLE agent_registry_records DROP COLUMN enrollment_state;
+         PRAGMA user_version = 2;",
+    )
+    .await;
+
+    let reopened = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    reopened.integrity_check().await.unwrap();
+    let migrated = reopened
+        .repository()
+        .get(&initial_enrollment_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        migrated.storage_enrollment.record_format,
+        AgentRegistryRecordFormat::LegacyV2
+    );
+    assert_eq!(migrated.enrollment.state, AgentEnrollmentState::Approved);
+    let migrated_service = AgentRegistryService::new(
+        reopened.repository(),
+        Arc::new(InMemoryClock::new(200)),
+        100,
+    );
+    assert_eq!(
+        migrated_service
+            .query_enrollment(&tenant_id(), &initial_enrollment_id())
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::LegacyEnrollmentRequiresReissue
+    );
+
+    let list_request = AgentEnrollmentListRequest {
+        tenant_id: tenant_id(),
+        state: None,
+        registration_kind: None,
+        query: None,
+        after: None,
+        limit: 100,
+    };
+    assert!(migrated_service
+        .list_enrollments(list_request.clone())
+        .await
+        .unwrap()
+        .records
+        .is_empty());
+
+    let mut mismatched_replacement = replacement_token_request();
+    mismatched_replacement.volume_descriptor_digest = ContentDigest::hash(b"changed-descriptor");
+    assert_eq!(
+        migrated_service
+            .create_storage_enrollment_intent(rich_intent(
+                mismatched_replacement,
+                "Changed dataset PVC",
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::AgentIdentityMismatch
+    );
+
+    let replacement_intent = migrated_service
+        .create_storage_enrollment_intent(rich_intent(
+            replacement_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement_intent.record.enrollment.replaces_enrollment_id,
+        Some(initial_enrollment_id())
+    );
+    let replacement_key = test_key_pair(0x62);
+    let pending_replacement = migrated_service
+        .bootstrap_agent_with_proof(signed_bootstrap_request(
+            replacement_bootstrap_request(),
+            &replacement_key,
+        ))
+        .await
+        .unwrap();
+    let visible_pending = migrated_service
+        .list_enrollments(list_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(visible_pending.records.len(), 1);
+    assert_eq!(
+        visible_pending.records[0].enrollment.enrollment_id,
+        replacement_enrollment_id()
+    );
+
+    let replacement_approved = migrated_service
+        .decide_storage_enrollment(
+            approval_request(
+                replacement_enrollment_id(),
+                pending_replacement.record.resource_version,
+                true,
+            ),
+            actor(),
+            None,
+        )
+        .await
+        .unwrap();
+    let revoked_legacy = replacement_approved.revoked_record.unwrap();
+    assert_eq!(
+        revoked_legacy.storage_enrollment.record_format,
+        AgentRegistryRecordFormat::LegacyV2
+    );
+    assert_eq!(
+        revoked_legacy.enrollment.state,
+        AgentEnrollmentState::Revoked
+    );
+    assert_eq!(
+        replacement_approved.record.storage_enrollment.record_format,
+        AgentRegistryRecordFormat::CurrentV3
+    );
+    assert_eq!(
+        replacement_approved.record.enrollment.state,
+        AgentEnrollmentState::Approved
+    );
+    assert_eq!(
+        reopened
+            .repository()
+            .get_current_by_volume(&tenant_id(), &storage_volume_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .enrollment
+            .enrollment_id,
+        replacement_enrollment_id()
+    );
+    let visible_approved = migrated_service
+        .list_enrollments(list_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(visible_approved.records.len(), 1);
+    assert_eq!(
+        visible_approved.records[0].storage_enrollment.state,
+        Some(StorageEnrollmentState::Approved)
+    );
+    drop(migrated_service);
+    reopened.integrity_check().await.unwrap();
+    reopened.close().await;
+
+    let restarted = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let restarted_service = AgentRegistryService::new(
+        restarted.repository(),
+        Arc::new(InMemoryClock::new(200)),
+        100,
+    );
+    let restarted_page = restarted_service
+        .list_enrollments(list_request)
+        .await
+        .unwrap();
+    assert_eq!(restarted_page.records.len(), 1);
+    assert_eq!(
+        restarted_page.records[0].enrollment.enrollment_id,
+        replacement_enrollment_id()
+    );
+}
+
 async fn approve_initial(service: &AgentRegistryService) {
     service
         .create_token_intent(initial_token_request())
@@ -1184,6 +1943,445 @@ async fn approve_initial(service: &AgentRegistryService) {
         .unwrap();
     let replay = service.decide_enrollment(decision, actor()).await.unwrap();
     assert!(replay.replayed);
+}
+
+fn rich_intent(
+    request: AgentEnrollmentTokenCreateRequest,
+    display_name: &str,
+) -> CreateStorageEnrollmentIntentRequest {
+    CreateStorageEnrollmentIntentRequest {
+        request,
+        descriptor: FrozenStorageDescriptor {
+            display_name: display_name.to_owned(),
+            region: "cn-east-1".to_owned(),
+            access_mode: StorageEnrollmentAccessMode::ReadWriteMany,
+            pvc_reference: FrozenPvcReference {
+                namespace: "namespace-a".to_owned(),
+                claim_name: "claim-a".to_owned(),
+            },
+        },
+        token: BootstrapTokenMetadata {
+            key_id: "bootstrap-key-v1".to_owned(),
+        },
+    }
+}
+
+fn test_key_pair(seed: u8) -> Ed25519KeyPair {
+    Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap()
+}
+
+fn placeholder_proof_for_key(key_pair: &Ed25519KeyPair) -> AgentBootstrapProof {
+    let public_key = key_pair.public_key().as_ref().try_into().unwrap();
+    AgentBootstrapProof::new(
+        Ed25519PublicKeySpki::from_public_key_bytes(public_key),
+        Ed25519Signature::from_bytes([0; 64]),
+    )
+}
+
+fn signed_bootstrap_request(
+    mut request: AgentBootstrapRequest,
+    key_pair: &Ed25519KeyPair,
+) -> AgentBootstrapRequest {
+    request.proof = placeholder_proof_for_key(key_pair);
+    request.public_key_fingerprint = request.proof.public_key_fingerprint();
+    let signature = key_pair.sign(&request.signing_bytes().unwrap());
+    request.proof.signature = Ed25519Signature::new(signature.as_ref().to_vec()).unwrap();
+    request.verify().unwrap();
+    request
+}
+
+fn signed_status_request(
+    key_pair: &Ed25519KeyPair,
+    signed_at_unix_ms: UnixMillis,
+) -> AgentBootstrapStatusRequest {
+    let mut request = AgentBootstrapStatusRequest {
+        protocol_version: PROTOCOL_VERSION_V1,
+        tenant_id: tenant_id(),
+        bootstrap_request_id: bootstrap_request_id(AgentKind::Initial),
+        installation_id: initial_installation_id(),
+        signed_at_unix_ms,
+        proof: placeholder_proof_for_key(key_pair),
+        extensions: Extensions::new(),
+    };
+    let signature = key_pair.sign(&request.signing_bytes().unwrap());
+    request.proof.signature = Ed25519Signature::new(signature.as_ref().to_vec()).unwrap();
+    request.verify().unwrap();
+    request
+}
+
+async fn run_signed_bootstrap_replay_race(repository: Arc<dyn AgentRegistryRepository>) {
+    let service = Arc::new(AgentRegistryService::new(
+        repository.clone(),
+        Arc::new(InMemoryClock::new(200)),
+        100,
+    ));
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x53);
+    let request = signed_bootstrap_request(initial_bootstrap_request(), &key_pair);
+    let expected_digest = ContentDigest::hash(request.signing_bytes().unwrap());
+    let (left, right) = tokio::join!(
+        service.bootstrap_agent_with_proof(request.clone()),
+        service.bootstrap_agent_with_proof(request.clone())
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_eq!(left.record, right.record);
+    assert_eq!(
+        usize::from(left.accepted.replayed) + usize::from(right.accepted.replayed),
+        1
+    );
+    assert_eq!(
+        left.record
+            .candidate
+            .as_ref()
+            .unwrap()
+            .bootstrap_signed_payload_digest,
+        Some(expected_digest)
+    );
+
+    let approved = service
+        .decide_enrollment(
+            approval_request(initial_enrollment_id(), left.record.resource_version, false),
+            actor(),
+        )
+        .await
+        .unwrap();
+    let approved_replay = service.bootstrap_agent_with_proof(request).await.unwrap();
+    assert!(approved_replay.accepted.replayed);
+    assert_eq!(
+        approved_replay.accepted.state,
+        AgentEnrollmentState::Approved
+    );
+    assert_eq!(approved_replay.record, approved.record);
+    assert_eq!(
+        repository
+            .get(&initial_enrollment_id())
+            .await
+            .unwrap()
+            .unwrap(),
+        approved.record
+    );
+}
+
+async fn run_bootstrap_status_cas(repository: Arc<dyn AgentRegistryRepository>) {
+    let clock = Arc::new(InMemoryClock::new(200));
+    let service = Arc::new(AgentRegistryService::new(repository.clone(), clock, 100));
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x51);
+    let pending = service
+        .bootstrap_agent_with_proof(signed_bootstrap_request(
+            initial_bootstrap_request(),
+            &key_pair,
+        ))
+        .await
+        .unwrap();
+    let resource_version = pending.record.resource_version;
+    let updated_at_unix_ms = pending.record.storage_enrollment.updated_at_unix_ms;
+    let status_request = signed_status_request(&key_pair, UnixMillis::new(200));
+    let (left, right) = tokio::join!(
+        service.bootstrap_status(status_request.clone()),
+        service.bootstrap_status(status_request)
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    assert_eq!(
+        left.err().or_else(|| right.err()).unwrap().code(),
+        CentralErrorCode::BootstrapDenied
+    );
+    let stored = repository
+        .get(&initial_enrollment_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.resource_version, resource_version);
+    assert_eq!(
+        stored.storage_enrollment.updated_at_unix_ms,
+        updated_at_unix_ms
+    );
+}
+
+async fn run_query_status_approve(repository: Arc<dyn AgentRegistryRepository>) {
+    let clock = Arc::new(InMemoryClock::new(200));
+    let service = AgentRegistryService::new(repository, clock, 100);
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Vision dataset PVC",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x52);
+    service
+        .bootstrap_agent_with_proof(signed_bootstrap_request(
+            initial_bootstrap_request(),
+            &key_pair,
+        ))
+        .await
+        .unwrap();
+    let queried = service
+        .query_enrollment(&tenant_id(), &initial_enrollment_id())
+        .await
+        .unwrap();
+
+    let status = service
+        .bootstrap_status(signed_status_request(&key_pair, UnixMillis::new(200)))
+        .await
+        .unwrap();
+    assert_eq!(status.resource_version, queried.resource_version);
+    assert_eq!(
+        status.updated_at_unix_ms,
+        queried.storage_enrollment.updated_at_unix_ms.unwrap()
+    );
+
+    let approved = service
+        .decide_enrollment(
+            approval_request(initial_enrollment_id(), queried.resource_version, false),
+            actor(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        approved.record.enrollment.state,
+        AgentEnrollmentState::Approved
+    );
+}
+
+async fn run_enrollment_list_contract(repository: Arc<dyn AgentRegistryRepository>) {
+    let clock = Arc::new(InMemoryClock::new(100));
+    let service = AgentRegistryService::new(repository, clock.clone(), 100);
+    for (suffix, bootstrapped_at, seed) in [("a", 200, 0x41), ("b", 200, 0x42), ("c", 300, 0x43)] {
+        let token_request = scoped_token_request(suffix);
+        service
+            .create_storage_enrollment_intent(scoped_rich_intent(token_request.clone(), suffix))
+            .await
+            .unwrap();
+        clock.set(bootstrapped_at);
+        let key_pair = test_key_pair(seed);
+        service
+            .bootstrap_agent_with_proof(signed_bootstrap_request(
+                scoped_bootstrap_request(&token_request, suffix),
+                &key_pair,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let first = service
+        .list_enrollments(AgentEnrollmentListRequest {
+            tenant_id: tenant_id(),
+            state: Some(StorageEnrollmentState::PendingApproval),
+            registration_kind: Some(StorageEnrollmentRegistrationKind::Initial),
+            query: None,
+            after: None,
+            limit: 2,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .records
+            .iter()
+            .map(|record| record.enrollment.enrollment_id.as_str())
+            .collect::<Vec<_>>(),
+        ["enrollment-c", "enrollment-a"]
+    );
+    let next = first.next.unwrap();
+    assert_eq!(next.created_at_unix_ms, UnixMillis::new(200));
+
+    let second = service
+        .list_enrollments(AgentEnrollmentListRequest {
+            tenant_id: tenant_id(),
+            state: None,
+            registration_kind: None,
+            query: None,
+            after: Some(next),
+            limit: 2,
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(
+        second.records[0].enrollment.enrollment_id.as_str(),
+        "enrollment-b"
+    );
+    assert!(second.next.is_none());
+
+    let search = service
+        .list_enrollments(AgentEnrollmentListRequest {
+            tenant_id: tenant_id(),
+            state: None,
+            registration_kind: None,
+            query: Some("DATASET B".to_owned()),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(search.records.len(), 1);
+    assert_eq!(
+        search.records[0].enrollment.enrollment_id.as_str(),
+        "enrollment-b"
+    );
+    assert_eq!(
+        service
+            .query_enrollment(
+                &TenantId::new("tenant-hidden").unwrap(),
+                &AgentEnrollmentId::new("enrollment-b").unwrap(),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::EnrollmentNotFound
+    );
+
+    let unicode_query = service
+        .list_enrollments(AgentEnrollmentListRequest {
+            tenant_id: tenant_id(),
+            state: None,
+            registration_kind: None,
+            query: Some("界".repeat(256)),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(unicode_query.records.is_empty());
+    assert_eq!(
+        service
+            .list_enrollments(AgentEnrollmentListRequest {
+                tenant_id: tenant_id(),
+                state: None,
+                registration_kind: None,
+                query: Some("界".repeat(257)),
+                after: None,
+                limit: 10,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::ProtocolInvalid
+    );
+
+    let token_request = scoped_token_request("unicode");
+    let mut intent = scoped_rich_intent(token_request.clone(), "unicode");
+    intent.descriptor.display_name = "界".repeat(128);
+    service
+        .create_storage_enrollment_intent(intent)
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(0x44);
+    let pending = service
+        .bootstrap_agent_with_proof(signed_bootstrap_request(
+            scoped_bootstrap_request(&token_request, "unicode"),
+            &key_pair,
+        ))
+        .await
+        .unwrap();
+    let mut rejection = approval_request(
+        token_request.enrollment_id,
+        pending.record.resource_version,
+        false,
+    );
+    rejection.decision_request_id = RequestId::new("reject-unicode").unwrap();
+    rejection.decision = AgentEnrollmentDecision::Reject;
+    service
+        .decide_storage_enrollment(rejection, actor(), Some("界".repeat(2_048)))
+        .await
+        .unwrap();
+}
+
+fn scoped_token_request(suffix: &str) -> AgentEnrollmentTokenCreateRequest {
+    let storage_volume_id = StorageVolumeId::new(format!("volume-{suffix}")).unwrap();
+    AgentEnrollmentTokenCreateRequest {
+        token_id: AgentEnrollmentTokenId::new(format!("token-{suffix}")).unwrap(),
+        token_request_id: RequestId::new(format!("create-token-{suffix}")).unwrap(),
+        enrollment_id: AgentEnrollmentId::new(format!("enrollment-{suffix}")).unwrap(),
+        tenant_id: tenant_id(),
+        edge_cluster_id: edge_cluster_id(),
+        storage_volume_id: storage_volume_id.clone(),
+        volume_descriptor_digest: ContentDigest::hash(format!("descriptor-{suffix}")),
+        pvc_identity_digest: PvcIdentityDigest::derive("namespace-a", &format!("claim-{suffix}"))
+            .unwrap(),
+        agent_id: AgentId::new(format!("agent-{suffix}")).unwrap(),
+        agent_mount_id: AgentMountId::new(format!("mount-{suffix}")).unwrap(),
+        expected_volume_marker: VolumeMarkerId::new(storage_volume_id.as_str()).unwrap(),
+        desired_access_mode: MountAccessMode::ReadWrite,
+        bootstrap_token: scoped_bootstrap_token(suffix),
+        created_at_unix_ms: UnixMillis::new(100),
+        expires_at_unix_ms: UnixMillis::new(1_000),
+        extensions: Extensions::new(),
+    }
+}
+
+fn scoped_rich_intent(
+    request: AgentEnrollmentTokenCreateRequest,
+    suffix: &str,
+) -> CreateStorageEnrollmentIntentRequest {
+    CreateStorageEnrollmentIntentRequest {
+        request,
+        descriptor: FrozenStorageDescriptor {
+            display_name: format!("Dataset {suffix}"),
+            region: "cn-east-1".to_owned(),
+            access_mode: StorageEnrollmentAccessMode::ReadWriteMany,
+            pvc_reference: FrozenPvcReference {
+                namespace: "namespace-a".to_owned(),
+                claim_name: format!("claim-{suffix}"),
+            },
+        },
+        token: BootstrapTokenMetadata {
+            key_id: "bootstrap-key-v1".to_owned(),
+        },
+    }
+}
+
+fn scoped_bootstrap_request(
+    token_request: &AgentEnrollmentTokenCreateRequest,
+    suffix: &str,
+) -> AgentBootstrapRequest {
+    AgentBootstrapRequest {
+        bootstrap_request_id: RequestId::new(format!("bootstrap-{suffix}")).unwrap(),
+        bootstrap_token: scoped_bootstrap_token(suffix),
+        installation_id: AgentInstallationId::new(format!("installation-{suffix}")).unwrap(),
+        tenant_id: token_request.tenant_id.clone(),
+        edge_cluster_id: token_request.edge_cluster_id.clone(),
+        storage_volume_id: token_request.storage_volume_id.clone(),
+        volume_descriptor_digest: token_request.volume_descriptor_digest,
+        agent_version: "0.0.1".to_owned(),
+        supported_protocol_versions: vec![PROTOCOL_VERSION_V1],
+        capabilities: vec!["single_volume_v1".to_owned()],
+        public_key_fingerprint: ContentDigest::hash(b"placeholder"),
+        proof: bootstrap_proof_from_seed(9),
+        probe: AgentBootstrapProbe {
+            observed_volume_marker: Some(token_request.expected_volume_marker.clone()),
+            marker_matches: true,
+            mount_boundary_detected: true,
+            mount_identity_digest: AgentMountIdentityDigest::new(ContentDigest::hash(format!(
+                "mount-identity-{suffix}"
+            ))),
+            access_mode: Some(MountAccessMode::ReadWrite),
+            rename_supported: true,
+            fsync_supported: true,
+            health: ResourceHealth::Ready,
+            observed_at_unix_ms: UnixMillis::new(199),
+            extensions: Extensions::new(),
+        },
+        extensions: Extensions::new(),
+    }
+}
+
+fn scoped_bootstrap_token(suffix: &str) -> String {
+    format!("bootstrap-token-{suffix}-{}", "x".repeat(32))
 }
 
 #[tokio::test]
@@ -1965,7 +3163,8 @@ async fn run_lifecycle(
 
     let mut reused_identity = replacement_bootstrap_request();
     reused_identity.installation_id = initial_installation_id();
-    reused_identity.public_key_fingerprint = ContentDigest::hash(b"public-key-a");
+    reused_identity.proof = bootstrap_proof(AgentKind::Initial);
+    reused_identity.public_key_fingerprint = public_key_fingerprint(AgentKind::Initial);
     assert_eq!(
         service
             .bootstrap_agent(reused_identity)
@@ -2220,7 +3419,8 @@ fn independent_bootstrap_request() -> AgentBootstrapRequest {
     request.volume_descriptor_digest = ContentDigest::hash(b"volume-descriptor-c");
     request.probe.mount_identity_digest =
         AgentMountIdentityDigest::new(ContentDigest::hash(b"mount-c"));
-    request.public_key_fingerprint = ContentDigest::hash(b"public-key-c");
+    request.proof = bootstrap_proof_from_seed(3);
+    request.public_key_fingerprint = request.proof.public_key_fingerprint();
     request.probe.observed_volume_marker = Some(VolumeMarkerId::new("volume-c").unwrap());
     request
 }
@@ -2236,8 +3436,9 @@ fn bootstrap_request(kind: AgentKind, bootstrap_token: &str) -> AgentBootstrapRe
         volume_descriptor_digest: volume_descriptor_digest(),
         agent_version: "0.0.1".to_owned(),
         supported_protocol_versions: vec![PROTOCOL_VERSION_V1],
-        capabilities: BTreeSet::from(["single_volume_v1".to_owned()]),
+        capabilities: vec!["single_volume_v1".to_owned()],
         public_key_fingerprint: public_key_fingerprint(kind),
+        proof: bootstrap_proof(kind),
         probe: healthy_bootstrap_probe(),
         extensions: Extensions::new(),
     }
@@ -2439,10 +3640,21 @@ fn agent_mount_id(kind: AgentKind) -> AgentMountId {
 }
 
 fn public_key_fingerprint(kind: AgentKind) -> ContentDigest {
-    ContentDigest::hash(match kind {
-        AgentKind::Initial => b"public-key-a",
-        AgentKind::Replacement => b"public-key-b",
+    bootstrap_proof(kind).public_key_fingerprint()
+}
+
+fn bootstrap_proof(kind: AgentKind) -> AgentBootstrapProof {
+    bootstrap_proof_from_seed(match kind {
+        AgentKind::Initial => 1,
+        AgentKind::Replacement => 2,
     })
+}
+
+fn bootstrap_proof_from_seed(seed: u8) -> AgentBootstrapProof {
+    AgentBootstrapProof::new(
+        Ed25519PublicKeySpki::from_public_key_bytes([seed; 32]),
+        Ed25519Signature::from_bytes([seed; 64]),
+    )
 }
 
 fn boot_id(value: &str) -> AgentBootId {

@@ -143,6 +143,7 @@ pub enum Actor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     CreateAddJob,
+    QueryJob,
     AssignJob,
     ReceiveReport,
     StageMetadataBatch,
@@ -170,6 +171,18 @@ pub struct CreateAddJobRequest {
 pub struct CreateAddJobResult {
     pub job: JobRecord,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryJobRequest {
+    pub actor: PrincipalRef,
+    pub tenant_id: TenantId,
+    pub job_id: JobId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryJobResult {
+    pub job: JobRecord,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -5,9 +5,11 @@
 > 中心化 Agent 的用户角色、公开资源语义、页面和交互口径见
 > [`centralized-agent-product.md`](centralized-agent-product.md)。
 
-最后更新：2026-07-31
+最后更新：2026-08-03
 当前阶段：`0.2.0` P0、中心 `AuthorityStore`/SQLite 默认后端，以及 Volume-bound Agent enrollment、
-本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；生产 daemon/transport、PG/MySQL、
+本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；独立 `neoengram-server` 默认提供
+六个 Fusen system/Job 接口，启用 enrollment 后提供五个公开管理接口和两条独立 Agent 路由；
+`neoengram-agentd` 已可执行 bootstrap/status。完整公开 API、Agent session transport、PG/MySQL、
 对象存储适配器与真实 Kubernetes 验收待实现
 
 ## 1. 产品目标
@@ -51,16 +53,19 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 
 - 中心服务采用模块化单体，逻辑权威经 `AuthorityStore` 与数据库解耦；SQLite 是单进程默认后端，
   PostgreSQL 是多实例/HA/RLS 目标，S3-compatible 存储保存 Chunk payload；
-- 客户端通过 header-versioned、模块/动作式 HTTP JSON API 访问中心服务，不直接访问数据库；
+- 客户端通过 header-versioned、模块/动作式 HTTP JSON API 访问中心服务，不直接访问数据库；当前
+  server 默认注册版本查询、live/ready 和 Job create/query/finalize 六个接口；启用 enrollment 后，
+  Fusen 用户 listener 增加 token/list/query/approve/reject，独立 Hyper listener 提供 bootstrap/status；
 - Vue 3 Web 控制台作为独立 `apps/neoengram-web` npm 应用，只消费公开 OpenAPI；首版 MSW 可运行，
   已覆盖租户切换/创建、StorageVolume 登记与放置选择、Project 筛选、无固定放置 Artifact、单 Volume
   Playground、单区域 Snapshot、Pre-commit、带描述和 Tags 的 Playground Commit、父版本文件/元数据
   Diff、资源浏览和 Managed Add Job；派生 Artifact、独立 Snapshot ID、同 Commit 多区域 Snapshot、
-  分页元数据和领域状态机已经进入 OpenAPI v1，真实 HTTP 服务仍待实现；
-  真实联网依赖后续 HTTP/OIDC adapter；
+  分页元数据和领域状态机已经进入 OpenAPI v1，其余 operation 仍待实现；首批真实联网使用
+  Fusen 0.9.0、外部 OIDC/JWKS 和默认拒绝 RBAC；
 - 第一版远端同步只围绕 `main`/detached Commit，暂不解决多分支合并；
 - 服务端保存不可变历史，ref/对象的保留和 GC 由中心策略统一管理；
-- 默认部署边界是企业内部多租户；首版认证抽象使用外部 OIDC/JWKS 签发的 Bearer JWT；
+- 默认部署边界是企业内部多租户；首版认证抽象使用外部 OIDC/JWKS 签发的 Bearer JWT，缺失绑定、
+  未知或 disabled principal 默认拒绝；SQLite server 只部署一个副本，生产 TLS 由 Ingress/反向代理终止；
 - 对象通过短期签名票据访问，客户端不持有长期 S3 凭证；
 - v1 只做租户内对象去重，避免跨租户对象存在性侧信道。
 
@@ -69,14 +74,14 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 | 决策 | 当前建议 | 状态 |
 | --- | --- | --- |
 | Chunk payload 位置 | 中心 S3-compatible 存储是 Managed 耐久权威；NFS 仅放 Playground/journal/cache | P0 边界已冻结，真实 SDK 待实现 |
-| API 传输 | protocol 与 transport 分离；后续评估版本化 HTTP/HTTPS | P0 不实现 transport |
+| API 传输 | protocol 与 transport 分离；Fusen 用户 API + Hyper Agent enrollment | 默认六接口及可选五条管理/两条 Agent 路由已实现；其余 OpenAPI 和 Agent session 待实现 |
 | 一致性模型 | metadata/ref 强一致 CAS；对象经中心确认 Durable 后才能发布 | P0 状态机已实现 |
 | 中心权威存储 | `AuthorityStore` + 默认 SQLite；PG/MySQL 独立实现相同行为契约 | SQLite 单节点已完成，HA/RLS 待实现 |
-| 身份认证 | `Authenticator` 抽象；v1 外部 OIDC/JWKS + Bearer JWT | 已确定设计，待实现 |
-| 授权范围 | tenant → project → artifact → ref；服务端 RBAC，默认拒绝 | 已确定设计，待实现 |
+| 身份认证 | `Authenticator` 抽象；v1 外部 OIDC/JWKS + Bearer JWT | 已注册用户接口已接线并默认拒绝；Agent enrollment 使用 token + Ed25519 proof；生产轮换/E2E 持续加固 |
+| 授权范围 | tenant → project → artifact → ref；服务端 RBAC，默认拒绝 | Job 与 Storage enrollment 已接线，其余资源授权待实现 |
 | 对象访问 | 中心 API 鉴权后签发短期、对象/会话范围的 Signed URL | 已确定设计，待实现 |
 | 训练快照 | `artifact_id + commit_id` 的固定、单 Region/单 StorageVolume Snapshot；可选 sidecar 描述 | 产品原型已确认，生产待实现 |
-| Kubernetes Agent 放置 | 一个业务 PVC = 一个 StorageVolume = 一个常驻 AgentInstance；固定挂载 `/volume`，Agent 状态使用独立 PVC | 0.0.1 部署边界已冻结，daemon 待实现 |
+| Kubernetes Agent 放置 | 一个业务 PVC = 一个 StorageVolume = 一个常驻 AgentInstance；固定挂载 `/volume`，Agent 状态使用独立 PVC | enrollment daemon 与模板已实现；证书/session 和真实集群 E2E 待实现 |
 | Agent 注册与接管 | Agent 主动出站注册并等待首次审批；0.0.1 仅支持 generation + 人工 takeover 的 cooperative fencing | 状态语义已冻结，强 fencing 待原型 |
 | 历史保留 | ref、pin/hold、active lease/session/有效 ObjectTicket 作为 GC roots；隔离期后再回收 | 已确定设计，待实现 |
 | 规模与可靠性 | 千万文件、上亿 Chunk、PB 级 payload；99.9%、RPO 0、RTO 1 小时 | 后续基准验证 |
@@ -154,7 +159,9 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
   protocol `JobFailed`。`neoengramd` 已有 Create/Assign/Report/Stage/Finalize 状态机、异步
   `AuthorityStore`、InMemory 契约后端和默认 SQLite 持久 CAS。
   `JobPrepared.candidate_digest` 绑定 assignment identity、base IndexVersion、descriptors 和 extensions。
-  两者都是 library-only，不包含网络；SQLite authority 支持单进程生产持久化，不支持 HA/RLS。
+  领域状态机保持 library-only；用户/中心网络组装位于 `neoengram-server`，Agent enrollment 进程位于
+  `neoengram-agentd`。SQLite authority 支持
+  单进程、单 server 副本持久化，不支持 HA/RLS。
 - SQLite authority 独立使用 `authority.sqlite3`/`authority.lock`，不复用 Standalone format v8；当前
   `user_version = 2`，只提供 v1 到 v2 的原子窄迁移以增加独立 Storage Enrollment 审计表。其他
   `application_id`、schema 版本、未知表或 record format 均失败关闭，不做双读或回退。
@@ -192,10 +199,10 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 | --- | --- | --- |
 | 客户端数据面 | 工作区、Index、FastCDC/WholeFile Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
 | 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | SQLite adapter 继续收敛到 engine 分页 ports |
-| 中心/Agent | protocol v1、内存状态机、Agent 身份/Tenant Ledger SQLite adapter、mount probe、enrollment registry、异步 AuthorityStore 与中心 SQLite 单节点权威 | HTTP/mTLS、证书签发、PostgreSQL HA/RLS、真实授权/调度、生产 daemon 与 Kubernetes E2E |
+| 中心/Agent | protocol v1、内存状态机、Agent 身份/Tenant Ledger SQLite adapter、mount probe、enrollment registry、双 listener server、enrollment daemon、异步 AuthorityStore 与中心 SQLite 单节点权威 | Agent 证书/mTLS session/Job delivery、PostgreSQL HA/RLS、完整授权/调度与 Kubernetes E2E |
 | 远端数据面 | 缺块协商、短期票据、receipt/durability DTO 与 ports | 真实 S3、幂等上传、Signed PUT/GET、对象生命周期 |
 | 读取面 | checkout、权限快照和固定 Commit FUSE | Snapshot、Shard 分页、mount lease、训练读取票据 |
-| 安全治理 | 本地路径安全和普通 Unix 权限 | JWT、RBAC、RLS、租户隔离、审计、密钥轮换和威胁模型 |
+| 安全治理 | 本地路径安全、OIDC/JWKS、已注册接口的默认拒绝 RBAC、租户隐藏和 enrollment proof | RLS、完整资源授权/审计、密钥轮换和生产威胁模型 |
 | 训练数据语义 | 普通文件版本控制 | 可选 dataset sidecar、schema/source 摘要、确定性文件级 ShardSet |
 
 表中未来能力不得在没有代码、契约测试和验收记录时标记为“已完成”。
@@ -204,8 +211,9 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 
 这些限制不能在分布式服务上线前被忽略：
 
-1. **没有可联网生产控制面**：已有版本化 protocol、状态机和 SQLite 单进程权威，但尚无 HTTP、
-   mTLS、PostgreSQL HA/RLS、认证、授权、生产调度或可运行 daemon。
+1. **联网控制面仍是窄纵切**：已有默认六接口、可选 Storage enrollment 管理与 Agent
+   bootstrap/status、OIDC/JWKS 与 RBAC，但其余 OpenAPI、Agent mTLS/session/Job delivery、
+   PostgreSQL HA/RLS、生产调度和多副本部署仍未实现；SQLite server 必须保持单副本。
 2. **没有真实对象同步**：已有缺块/票据/完成/durability DTO，但尚无 S3 SDK、multipart、断点续传、
    fetch/clone/push/pull。
 3. **文件语义不完整**：当前模型未保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。
@@ -216,8 +224,8 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
    Loose 对象共享 inode 和权限，写入会污染所有引用该对象的快照。损坏必须从可信副本恢复。
 7. **没有训练读取语义**：当前不存在固定 Snapshot、ShardSet、schema/source 摘要或
    训练期间的 lease/retention root。
-8. **没有远端安全治理实现**：尚无 JWT 验证、RBAC、租户 RLS、Signed URL、审计、KMS/密钥轮换或
-   跨租户隔离实现。
+8. **远端安全治理尚未完整**：已注册用户接口具有 JWT 验证、默认拒绝 RBAC 和跨租户隐藏，但尚无
+   数据库 RLS、Signed URL、完整审计、KMS/密钥轮换或所有 OpenAPI 资源的授权实现。
 
 ## 5. 目标架构
 
@@ -234,15 +242,16 @@ neoengram CLI -> standalone -> engine <- agent
 该简图不枚举 CLI 对 core/engine 的直接类型导入；Agent 对 `neoengramd` 的 `dev-dependency` 只用于
 内存端到端组合测试，不属于生产依赖方向。
 
-Managed 运行时的目标数据流是用户 API 进入 `neoengramd`，中心经 `AuthorityStore` 持久化
-Job/Assignment 并通过未来
-transport 交给 Agent；Agent 访问 Playground/NFS 和中心 S3 数据面，结构化结果返回中心做最终 CAS。
-当前已实现 protocol、异步 ports、状态机和 SQLite 单进程 authority；transport 与真实 S3 尚未实现。
+Managed 运行时的目标数据流是用户 API 经 `neoengram-server` 进入 `neoengramd`，中心经
+`AuthorityStore` 持久化 Job/Assignment 并通过未来业务 session 交给 Agent；Agent 访问
+Playground/NFS 和中心 S3 数据面，结构化结果返回中心做最终 CAS。当前已实现 protocol、异步 ports、
+状态机、SQLite 单进程 authority、用户 HTTP 与 Agent bootstrap/status；其余用户 API、Agent
+session/Job transport 与真实 S3 尚未实现。
 
 边界规则：
 
 - PostgreSQL/S3 不作为本地 `MetadataStoreKind` 或 `ObjectStoreKind` 的简单枚举值。
-- 客户端只访问 `neoengramd` 的版本化 API，不直连 PostgreSQL，也不持有长期 S3 凭证。
+- 客户端只访问 `neoengram-server` 的版本化 API，不直连 `neoengramd`/PostgreSQL，也不持有长期 S3 凭证。
 - 服务端必须在 Index/ref CAS 前验证 Commit → Directory → Manifest → Object 的完整引用图。
 - 控制面负责认证、授权、元数据强一致、租约和审计；数据面只接受服务端签发的受限票据。
 - 读取面先把 ref 解析为固定 Commit，再分页读取 Manifest/Shard；ref 后续移动不能改变已打开
@@ -256,8 +265,8 @@ transport 交给 Agent；Agent 访问 Playground/NFS 和中心 S3 数据面，�
 节点侧 Agent 和中心 Job/Assignment/Finalize 状态机已有 library + 内存适配器；一 PVC 一 Agent 纵切还
 增加了持久 SQLite 身份/Ledger、mount probe 和中心 Agent Registry adapter。多租户生产部署、
 多 EdgeCluster、CPU/NFS 调度、Gateway 和跨卷 checkout 仍处设计阶段，详细草案见
-[`agent-central-control.md`](agent-central-control.md)。该文档不代表当前已经存在网络 Agent、
-中心 PostgreSQL、生产 lease/fencing、Gateway 或 daemon。
+[`agent-central-control.md`](agent-central-control.md)。当前网络 Agent 仅覆盖 enrollment；该文档不代表
+已经存在中心 PostgreSQL、生产 lease/fencing、Gateway 或业务 session daemon。
 
 远程 Agent 设计已冻结以下存储约束：一个 Tenant 每个 EdgeCluster 可有多个 StorageVolume，一个
 Volume 可承载该 Tenant 的多个 Artifact，一个 Artifact 每集群最多一个 active `ArtifactPlacement`；
@@ -307,7 +316,9 @@ unavailable，禁止自动接管。
   最后执行 expected IndexVersion CAS；NFS 仅保存 Playground、journal 和可重建 cache。
 
 验收：core/protocol golden 与 validator 测试、Agent/中心幂等和 CAS 组合测试、format v8 本地测试及
-架构依赖检查通过。P0 明确不包含 HTTP、PostgreSQL、mTLS、OIDC、真实 S3、NFS fencing 或 daemon。
+架构依赖检查通过。P0 后续增加了独立 Fusen 用户 HTTP、Hyper Agent enrollment、OIDC/RBAC 与
+`neoengram-agentd` 纵切；PostgreSQL、Agent mTLS/session、真实 S3、NFS fencing、其余公开 API 与 HA
+仍不包含在当前实现中。
 
 ### P1：中心元数据与安全 MVP
 
@@ -625,8 +636,10 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 - 组件组合：create job -> assignment -> ledger -> prepared -> Durable objects -> complete Batch ->
   expected IndexVersion CAS -> decision/finalized；在各边界重复投递，并覆盖 Job digest reuse、缺页、
   非 Durable object 和 CAS conflict。
-- 架构检查：protocol 不含 engine/fs/SQLite/HTTP，Agent 不依赖 standalone，`neoengramd` 不依赖
-  engine/fs，CLI 之外没有终端输出。
+- 架构检查：protocol 不含 engine/fs/SQLite/HTTP，Agent library 不依赖 standalone，`neoengramd` 不依赖
+  engine/fs 并保持 library-only；`neoengram-server -> neoengramd -> protocol/core` 与
+  `neoengram-agentd -> neoengram-agent/protocol`，controller/service 不访问 SQLx，controller 不绕过
+  service，CLI 之外没有终端输出。
 - 认证测试：错误签名、错误 issuer/audience、过期、未来 `nbf`、未知 `kid`、JWKS 轮换、服务身份
   和日志脱敏。
 - 授权测试：User/Service principal 的 role × scope × action 矩阵、默认拒绝、ref 级绑定、ACL 撤销

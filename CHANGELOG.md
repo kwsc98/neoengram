@@ -8,6 +8,10 @@
 
 ### Added
 
+- 新增基于 Fusen 0.9.0 的 `neoengram-server`，以 DTO/controller/service 分层暴露版本、健康和
+  Managed Add Job 六个 HTTP 接口，并接入外部 OIDC/JWKS、默认拒绝 RBAC 与优雅停机。
+- 将中心 SQLite adapter 拆为 datasource 与 mapper：连接、锁、schema/迁移和完整性归 datasource，
+  SQL 映射及 repository port 实现归 mapper；`neoengramd` 继续保持 library-only。
 - 新增持久化 `FastCdc`/`WholeFile` Manifest 策略，以及不可变的仓库级
   `init --chunking fastcdc|whole-file|mixed` 策略。固定仓库强制既定策略；mixed 仓库允许
   `add --chunking`，已跟踪文件默认沿用原策略，新文件默认 FastCDC。

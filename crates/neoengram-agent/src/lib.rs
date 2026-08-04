@@ -39,5 +39,5 @@ pub use state::{
 };
 pub use system_identity::{
     AgentCertificateState, ApprovedAgentIdentity, PrivateKeyMaterial, SqliteSystemIdentityStore,
-    SystemIdentityRecord, SystemIdentitySeed,
+    SystemIdentityRecord, SystemIdentitySeed, TerminalEnrollmentOutcome, TerminalEnrollmentState,
 };

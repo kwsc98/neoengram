@@ -1,5 +1,6 @@
 /target
 /test/
+**/neoengram-enrollment-e2e-*/
 /docs/openapi/node_modules/
 /apps/neoengram-web/node_modules/
 /apps/neoengram-web/dist/

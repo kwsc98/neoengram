@@ -6,17 +6,18 @@ info:
   version: 1.0.0
   summary: NeoEngram 用户、CLI 和 UI 使用的非 REST JSON API 契约
   description: |
-    这是 NeoEngram 中心服务的首版公开 API 设计契约。当前仓库尚未实现 HTTP
-    server、路由或认证 adapter，因此本文档不表示这些地址已经可以访问。
+    这是 NeoEngram 中心服务的首版公开 API 设计契约。`neoengram-server` 默认已实现版本、健康和
+    Managed Add Job 六个接口；启用 Agent enrollment 时还实现 token create、enrollment
+    list/query、approve 和 reject。其余 operation 仍是目标契约，不表示已经可以访问。
 
     业务方法使用“模块 / 子域 / 动作”路径，并通过普通 JSON 请求和响应调用；
     路径不包含版本号。除版本查询和健康检查外，调用方必须发送
     `NeoEngram-API-Version: 1` 和 Bearer JWT。
 
-    Agent 的双向 `application/json-seq` session 不属于本 OpenAPI。其消息、分页和
-    重放契约由 `neoengram-protocol` JSON Schema 与中心 Agent 架构文档定义。Storage enrollment
-    仅公开 Tenant 管理员创建一次性 bootstrap token 和审批 Agent 主动提交的脱敏申请；bootstrap
-    消费、CSR、证书、挂载证明、session 和 heartbeat 仍属于内部 Agent API。
+    Agent API 不属于本 OpenAPI。独立 listener 已实现 bootstrap token 消费和签名状态轮询；双向
+    `application/json-seq` session、证书和 heartbeat 尚未实现，其消息、分页和重放契约由
+    `neoengram-protocol` JSON Schema 与中心 Agent 架构文档定义。Storage enrollment 仅公开 Tenant
+    管理员创建一次性 bootstrap token 和审批 Agent 主动提交的脱敏申请。
 
     本契约只公开 P0 用户资源和脱敏逻辑元数据。Dashboard 聚合、容量与底层诊断、用途与保留
     策略、Lease/Mount、Agent/assignment、fencing、Manifest/Chunk、文件内容 digest、对象位置和
@@ -27,7 +28,7 @@ info:
 
 servers:
   - url: /
-    description: 与当前 neoengramd origin 相同
+    description: 与当前 neoengram-server 用户 API origin 相同
 
 tags:
   - name: System
@@ -88,10 +89,16 @@ paths:
                   - sqlite_authority
         "413":
           $ref: "#/components/responses/PayloadTooLargeProblem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /api/tenant/list/query:
     post:
@@ -504,10 +511,14 @@ paths:
           $ref: "#/components/responses/PayloadTooLargeProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /api/storage/enrollment/list/query:
     post:
@@ -560,6 +571,7 @@ paths:
                     state: pending_approval
                     agent_version: 0.0.1
                     identity_fingerprint: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                    proof_of_possession_status: verified
                     probe:
                       observed_access_mode: read_write
                       descriptor_matches: true
@@ -581,10 +593,14 @@ paths:
           $ref: "#/components/responses/PayloadTooLargeProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /api/storage/enrollment/query:
     post:
@@ -629,10 +645,14 @@ paths:
           $ref: "#/components/responses/PayloadTooLargeProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /api/storage/enrollment/approve:
     post:
@@ -698,6 +718,7 @@ paths:
                   state: approved
                   agent_version: 0.0.1
                   identity_fingerprint: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  proof_of_possession_status: verified
                   probe:
                     observed_access_mode: read_write
                     descriptor_matches: true
@@ -736,10 +757,14 @@ paths:
           $ref: "#/components/responses/PayloadTooLargeProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /api/storage/enrollment/reject:
     post:
@@ -800,6 +825,7 @@ paths:
                   state: rejected
                   agent_version: 0.0.1
                   identity_fingerprint: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  proof_of_possession_status: verified
                   probe:
                     observed_access_mode: read_write
                     descriptor_matches: false
@@ -823,10 +849,14 @@ paths:
           $ref: "#/components/responses/PayloadTooLargeProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /api/project/list/query:
     post:
@@ -2640,10 +2670,14 @@ paths:
           $ref: "#/components/responses/PayloadTooLargeProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /api/job/query:
     post:
@@ -2725,10 +2759,14 @@ paths:
           $ref: "#/components/responses/PayloadTooLargeProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /api/job/add/finalize:
     post:
@@ -2837,10 +2875,14 @@ paths:
           $ref: "#/components/responses/PayloadTooLargeProblem"
         "422":
           $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /health/live:
     get:
@@ -2863,8 +2905,16 @@ paths:
                 $ref: "#/components/schemas/HealthResponse"
               example:
                 status: ok
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
         "500":
           $ref: "#/components/responses/InternalProblem"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
   /health/ready:
     get:
@@ -2887,8 +2937,16 @@ paths:
                 $ref: "#/components/schemas/HealthResponse"
               example:
                 status: ok
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
+        "500":
+          $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
 
 components:
   securitySchemes:
@@ -2897,8 +2955,9 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        由部署配置的 OIDC issuer 签发。服务端从 token 映射 PrincipalRef 和 tenant scope；
-        请求体中的任何身份提示都不能覆盖认证结果。
+        由部署配置的 OIDC issuer 签发。服务端从验证后的 issuer/sub 映射 PrincipalRef，
+        tenant scope 只能由启动时加载的服务端 RBAC 策略授予。JWT 中的 tenant、role、group
+        只能作为审计提示；token 或请求体中的身份提示都不能覆盖服务端授权结果。
 
   parameters:
     ApiVersion:
@@ -3305,6 +3364,42 @@ components:
                 violations:
                   - field: paths
                     reason: must be non-empty unless all is true
+    OverloadedProblem:
+      description: 服务端并发请求配额已耗尽
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+          example:
+            type: urn:neoengram:problem:overloaded
+            title: Resource exhausted
+            status: 429
+            detail: server request concurrency is exhausted
+            instance: /api/job/query
+            code: OVERLOADED
+            request_id: req-20260727-001
+            retryable: false
+    RequestTimeoutProblem:
+      description: 请求超过服务端处理时限
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+          example:
+            type: urn:neoengram:problem:deadline-exceeded
+            title: Request deadline exceeded
+            status: 504
+            detail: service invocation deadline elapsed
+            instance: /api/job/query
+            code: DEADLINE_EXCEEDED
+            request_id: req-20260727-001
+            retryable: false
     InternalProblem:
       description: 未分类的服务端内部错误
       headers:
@@ -3806,7 +3901,8 @@ components:
         Agent 使用单次 bootstrap token 提交的脱敏 PVC enrollment。pending_approval 自 created_at 起
         24 小时未审核即进入 expired；终态仍保留 expires_at_unix_ms 作为原审批期限。approved 仅表示
         管理员已审核并建立 unavailable Volume；认证 Agent session 和健康 probe 建立后才进入 enrolled。
-        本视图不包含 token、CSR、证书、PVC UID、挂载详情、拒绝原因或内部 Agent/session identity。
+        本视图不包含 token、token key ID、SPKI、签名、CSR、证书、PVC UID、挂载详情、拒绝原因或
+        内部 Agent/session identity。
       additionalProperties: false
       required:
         - tenant_id
@@ -3821,6 +3917,7 @@ components:
         - state
         - agent_version
         - identity_fingerprint
+        - proof_of_possession_status
         - probe
         - resource_version
         - created_at_unix_ms
@@ -3857,6 +3954,8 @@ components:
           minLength: 64
           maxLength: 64
           pattern: "^[0-9a-f]{64}$"
+        proof_of_possession_status:
+          $ref: "#/components/schemas/StorageEnrollmentProofOfPossessionStatus"
         probe:
           $ref: "#/components/schemas/StorageEnrollmentProbeSummary"
         resource_version:
@@ -3888,6 +3987,11 @@ components:
           type: boolean
         observed_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
+
+    StorageEnrollmentProofOfPossessionStatus:
+      type: string
+      description: 服务端对 canonical bootstrap request 完成 Ed25519 验签后持久化的脱敏状态；不接受客户端声明。
+      enum: [verified]
 
     StorageEnrollmentRegistrationKind:
       type: string

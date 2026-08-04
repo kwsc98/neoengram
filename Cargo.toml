@@ -49,3 +49,6 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+[patch.crates-io]
+fusen-rs = { path = "vendor/fusen-rs" }
