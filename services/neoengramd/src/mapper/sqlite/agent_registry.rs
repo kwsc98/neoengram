@@ -1,86 +1,29 @@
-use std::{
-    collections::BTreeSet,
-    fs::{self, File, OpenOptions},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use fs2::FileExt;
 use neoengram_core::ContentDigest;
 use neoengram_protocol::{
     AgentEnrollmentId, AgentEnrollmentState, AgentId, AgentInstallationId, EdgeClusterId,
     PvcIdentityDigest, RequestId, ResourceVersion, StorageVolumeId, TenantId, UnixMillis,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{
-    sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
-    },
-    Row, SqlitePool,
-};
+use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::{
-    checked_next_registry_resource_version, ensure_immutable_registry_scope,
-    validate_registry_insert, validate_registry_record, validate_registry_replace_transition,
-    validate_registry_replacement_transition, AgentRegistryInsertOutcome, AgentRegistryRecord,
-    AgentRegistryReplacementRecords, AgentRegistryRepository, CentralError, CentralErrorCode,
-    CentralResult, PvcVolumeBinding,
+    checked_next_registry_resource_version,
+    datasource::sqlite::agent_registry::SqliteAgentRegistryDataSource,
+    ensure_immutable_registry_scope, transition_storage_enrollment, validate_registry_insert,
+    validate_registry_record, validate_registry_replace_transition,
+    validate_registry_replacement_transition, AgentEnrollmentExpiryReconciliation,
+    AgentEnrollmentLifecycleAuditKind, AgentEnrollmentListCursor, AgentEnrollmentListPage,
+    AgentEnrollmentListRequest, AgentRegistryInsertOutcome, AgentRegistryRecord,
+    AgentRegistryRecordFormat, AgentRegistryReplacementRecords, AgentRegistryRepository,
+    CentralError, CentralErrorCode, CentralResult, PvcVolumeBinding,
+    StorageEnrollmentRegistrationKind, StorageEnrollmentState, AGENT_ENROLLMENT_MAX_PAGE_SIZE,
+    AGENT_ENROLLMENT_MAX_QUERY_CHARS,
 };
 
-const DATABASE_FILE_NAME: &str = "agent-registry.sqlite3";
-const LOCK_FILE_NAME: &str = "agent-registry.lock";
-const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f52;
-const SQLITE_SCHEMA_VERSION: i64 = 2;
 const STORED_FORMAT_VERSION: u32 = 1;
-
-const SCHEMA_SQL: &str = r#"
-CREATE TABLE agent_registry_records (
-    enrollment_id TEXT NOT NULL PRIMARY KEY,
-    agent_id TEXT NOT NULL UNIQUE,
-    token_id TEXT NOT NULL UNIQUE,
-    token_request_id TEXT NOT NULL,
-    token_digest TEXT NOT NULL UNIQUE,
-    tenant_id TEXT NOT NULL,
-    edge_cluster_id TEXT NOT NULL,
-    storage_volume_id TEXT NOT NULL,
-    pvc_identity_digest TEXT NOT NULL,
-    pvc_binding_role TEXT CHECK (pvc_binding_role IN ('owner', 'replacement')),
-    bootstrap_request_id TEXT,
-    decision_request_id TEXT,
-    installation_id TEXT,
-    public_key_fingerprint TEXT,
-    resource_version TEXT NOT NULL CHECK (
-        resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
-    ),
-    payload BLOB NOT NULL
-) STRICT;
-CREATE INDEX agent_registry_volume_scope
-    ON agent_registry_records (tenant_id, storage_volume_id);
-CREATE INDEX agent_registry_pvc_identity_scope
-    ON agent_registry_records (edge_cluster_id, pvc_identity_digest);
-CREATE UNIQUE INDEX agent_registry_active_volume_binding
-    ON agent_registry_records (tenant_id, storage_volume_id, pvc_binding_role)
-    WHERE pvc_binding_role IS NOT NULL;
-CREATE UNIQUE INDEX agent_registry_active_pvc_binding
-    ON agent_registry_records (edge_cluster_id, pvc_identity_digest, pvc_binding_role)
-    WHERE pvc_binding_role IS NOT NULL;
-CREATE UNIQUE INDEX agent_registry_token_request_identity
-    ON agent_registry_records (tenant_id, token_request_id);
-CREATE UNIQUE INDEX agent_registry_bootstrap_request_identity
-    ON agent_registry_records (tenant_id, bootstrap_request_id)
-    WHERE bootstrap_request_id IS NOT NULL;
-CREATE UNIQUE INDEX agent_registry_decision_request_identity
-    ON agent_registry_records (tenant_id, decision_request_id)
-    WHERE decision_request_id IS NOT NULL;
-CREATE UNIQUE INDEX agent_registry_installation_identity
-    ON agent_registry_records (installation_id)
-    WHERE installation_id IS NOT NULL;
-CREATE UNIQUE INDEX agent_registry_public_key_identity
-    ON agent_registry_records (public_key_fingerprint)
-    WHERE public_key_fingerprint IS NOT NULL;
-"#;
 
 #[derive(Clone)]
 pub struct SqliteAgentRegistryConfig {
@@ -119,44 +62,34 @@ impl SqliteAgentRegistry {
     }
 
     pub async fn integrity_check(&self) -> CentralResult<()> {
-        validate_current_schema(&self.inner.pool).await?;
-        validate_integrity(&self.inner.pool).await
+        self.inner.datasource.integrity_check().await?;
+        validate_records(&self.inner.pool).await
+    }
+
+    pub async fn readiness_check(&self) -> CentralResult<()> {
+        self.inner.datasource.readiness_check().await
+    }
+
+    pub async fn close(&self) {
+        self.inner.datasource.close().await;
     }
 }
 
 pub async fn open_sqlite_agent_registry(
     config: SqliteAgentRegistryConfig,
 ) -> CentralResult<SqliteAgentRegistry> {
-    let root = prepare_root(&config.path)?;
-    let lock = open_lock(&root.join(LOCK_FILE_NAME))?;
-    let database = root.join(DATABASE_FILE_NAME);
-    validate_database_path(&database)?;
-    let initialize =
-        !database.exists() || fs::metadata(&database).map_err(storage_error)?.len() == 0;
-    let options = SqliteConnectOptions::new()
-        .filename(&database)
-        .create_if_missing(true)
-        .foreign_keys(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Full)
-        .busy_timeout(config.busy_timeout);
-    let pool = SqlitePoolOptions::new()
-        .min_connections(1)
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .map_err(storage_error)?;
-    initialize_or_validate(&pool, initialize).await?;
-    secure_file(&database)?;
-    validate_integrity(&pool).await?;
+    let datasource =
+        Arc::new(SqliteAgentRegistryDataSource::open(&config.path, config.busy_timeout).await?);
+    let pool = datasource.pool().clone();
+    validate_records(&pool).await?;
     Ok(SqliteAgentRegistry {
-        inner: Arc::new(SqliteAgentRegistryStore { pool, _lock: lock }),
+        inner: Arc::new(SqliteAgentRegistryStore { pool, datasource }),
     })
 }
 
 struct SqliteAgentRegistryStore {
     pool: SqlitePool,
-    _lock: File,
+    datasource: Arc<SqliteAgentRegistryDataSource>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -182,6 +115,116 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         .await
         .map_err(storage_error)?;
         row.map(decode_row).transpose()
+    }
+
+    async fn get_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        enrollment_id: &AgentEnrollmentId,
+    ) -> CentralResult<Option<AgentRegistryRecord>> {
+        let row = sqlx::query(
+            "SELECT enrollment_id, agent_id, token_id, token_request_id, token_digest, bootstrap_request_id, decision_request_id, installation_id, public_key_fingerprint, \
+             tenant_id, edge_cluster_id, storage_volume_id, pvc_identity_digest, pvc_binding_role, \
+             resource_version, payload FROM agent_registry_records \
+             WHERE tenant_id = ? AND enrollment_id = ?",
+        )
+        .bind(tenant_id.as_str())
+        .bind(enrollment_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        row.map(decode_row).transpose()
+    }
+
+    async fn list_for_tenant(
+        &self,
+        request: &AgentEnrollmentListRequest,
+    ) -> CentralResult<AgentEnrollmentListPage> {
+        if request.limit == 0 || request.limit > AGENT_ENROLLMENT_MAX_PAGE_SIZE {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Agent enrollment page size is outside the supported range",
+            )
+            .with_retryable(false));
+        }
+        if request.query.as_ref().is_some_and(|query| {
+            query.is_empty() || query.chars().count() > AGENT_ENROLLMENT_MAX_QUERY_CHARS
+        }) {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Agent enrollment query must contain 1 to 256 characters",
+            )
+            .with_retryable(false));
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT enrollment_id, agent_id, token_id, token_request_id, token_digest, \
+             bootstrap_request_id, decision_request_id, installation_id, public_key_fingerprint, \
+             tenant_id, edge_cluster_id, storage_volume_id, pvc_identity_digest, pvc_binding_role, \
+             resource_version, payload FROM agent_registry_records WHERE tenant_id = ",
+        );
+        query.push_bind(request.tenant_id.as_str());
+        query.push(
+            " AND enrollment_state IN \
+             ('pending_approval', 'approved', 'enrolled', 'rejected', 'expired')",
+        );
+        if let Some(state) = request.state {
+            query.push(" AND enrollment_state = ");
+            query.push_bind(storage_enrollment_state_name(state));
+        }
+        if let Some(kind) = request.registration_kind {
+            query.push(" AND registration_kind = ");
+            query.push_bind(registration_kind_name(kind));
+        }
+        if let Some(search) = &request.query {
+            let pattern = format!("%{}%", escape_like_pattern(&search.to_lowercase()));
+            query.push(" AND (LOWER(enrollment_id) LIKE ");
+            query.push_bind(pattern.clone());
+            query.push(" ESCAPE '\\' OR LOWER(storage_volume_id) LIKE ");
+            query.push_bind(pattern.clone());
+            query.push(" ESCAPE '\\' OR LOWER(display_name) LIKE ");
+            query.push_bind(pattern);
+            query.push(" ESCAPE '\\')");
+        }
+        if let Some(cursor) = &request.after {
+            let created_at = sqlite_millis(cursor.created_at_unix_ms)?;
+            query.push(" AND (enrollment_created_at_unix_ms < ");
+            query.push_bind(created_at);
+            query.push(" OR (enrollment_created_at_unix_ms = ");
+            query.push_bind(created_at);
+            query.push(" AND enrollment_id > ");
+            query.push_bind(cursor.enrollment_id.as_str());
+            query.push("))");
+        }
+        query.push(" ORDER BY enrollment_created_at_unix_ms DESC, enrollment_id ASC LIMIT ");
+        let fetch_limit = i64::try_from(request.limit + 1).map_err(|_| {
+            CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Agent enrollment page size exceeds the SQLite range",
+            )
+            .with_retryable(false)
+        })?;
+        query.push_bind(fetch_limit);
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        let mut records = rows
+            .into_iter()
+            .map(decode_row)
+            .collect::<CentralResult<Vec<_>>>()?;
+        let has_more = records.len() > request.limit;
+        records.truncate(request.limit);
+        let next = has_more.then(|| {
+            let last = records
+                .last()
+                .expect("a non-empty Agent enrollment page has a final row");
+            AgentEnrollmentListCursor {
+                created_at_unix_ms: public_enrollment_created_at(last),
+                enrollment_id: last.enrollment.enrollment_id.clone(),
+            }
+        });
+        Ok(AgentEnrollmentListPage { records, next })
     }
 
     async fn get_by_agent(&self, agent_id: &AgentId) -> CentralResult<Option<AgentRegistryRecord>> {
@@ -444,13 +487,26 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
             let next = checked_next_registry_resource_version(previous)?;
             record.enrollment.state = AgentEnrollmentState::Expired;
             record.resource_version = ResourceVersion::new(next);
+            transition_storage_enrollment(
+                &mut record,
+                None,
+                AgentEnrollmentLifecycleAuditKind::Expired,
+                now_unix_ms,
+                None,
+            );
             validate_registry_record(&record)?;
             let payload = encode(&record)?;
             let result = sqlx::query(
                 "UPDATE agent_registry_records SET pvc_binding_role = NULL, \
+                 enrollment_state = ?, registration_kind = ?, \
+                 enrollment_created_at_unix_ms = ?, display_name = ?, \
                  resource_version = ?, payload = ? \
                  WHERE enrollment_id = ? AND resource_version = ?",
             )
+            .bind(indexed_enrollment_state(&record))
+            .bind(indexed_registration_kind(&record))
+            .bind(indexed_enrollment_created_at(&record)?)
+            .bind(indexed_display_name(&record))
             .bind(next.to_string())
             .bind(payload)
             .bind(record.enrollment.enrollment_id.as_str())
@@ -468,6 +524,153 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         }
         transaction.commit().await.map_err(storage_error)?;
         Ok(expired)
+    }
+
+    async fn expire_stale_review_enrollments(
+        &self,
+        tenant_id: &TenantId,
+        now_unix_ms: UnixMillis,
+    ) -> CentralResult<usize> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let rows = sqlx::query(
+            "SELECT enrollment_id, agent_id, token_id, token_request_id, token_digest, bootstrap_request_id, decision_request_id, installation_id, public_key_fingerprint, \
+             tenant_id, edge_cluster_id, storage_volume_id, pvc_identity_digest, \
+             pvc_binding_role, resource_version, payload FROM agent_registry_records \
+             WHERE tenant_id = ?",
+        )
+        .bind(tenant_id.as_str())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let mut expired = 0;
+        for row in rows {
+            let mut record = decode_row(row)?;
+            if record.enrollment.state != AgentEnrollmentState::PendingApproval
+                || record
+                    .enrollment
+                    .review_expires_at_unix_ms
+                    .is_none_or(|expires_at| expires_at.get() > now_unix_ms.get())
+            {
+                continue;
+            }
+            let previous = record.resource_version.get();
+            let next = checked_next_registry_resource_version(previous)?;
+            record.enrollment.state = AgentEnrollmentState::Expired;
+            record.resource_version = ResourceVersion::new(next);
+            transition_storage_enrollment(
+                &mut record,
+                Some(StorageEnrollmentState::Expired),
+                AgentEnrollmentLifecycleAuditKind::Expired,
+                now_unix_ms,
+                None,
+            );
+            validate_registry_record(&record)?;
+            let payload = encode(&record)?;
+            let result = sqlx::query(
+                "UPDATE agent_registry_records SET pvc_binding_role = NULL, \
+                 enrollment_state = ?, registration_kind = ?, \
+                 enrollment_created_at_unix_ms = ?, display_name = ?, \
+                 resource_version = ?, payload = ? \
+                 WHERE enrollment_id = ? AND resource_version = ?",
+            )
+            .bind(indexed_enrollment_state(&record))
+            .bind(indexed_registration_kind(&record))
+            .bind(indexed_enrollment_created_at(&record)?)
+            .bind(indexed_display_name(&record))
+            .bind(next.to_string())
+            .bind(payload)
+            .bind(record.enrollment.enrollment_id.as_str())
+            .bind(previous.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(registry_update_error)?;
+            if result.rows_affected() != 1 {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "Agent review state changed during expiry reconciliation",
+                ));
+            }
+            expired += 1;
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(expired)
+    }
+
+    async fn reconcile_expired_enrollments(
+        &self,
+        now_unix_ms: UnixMillis,
+    ) -> CentralResult<AgentEnrollmentExpiryReconciliation> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let rows = sqlx::query(
+            "SELECT enrollment_id, agent_id, token_id, token_request_id, token_digest, bootstrap_request_id, decision_request_id, installation_id, public_key_fingerprint, \
+             tenant_id, edge_cluster_id, storage_volume_id, pvc_identity_digest, \
+             pvc_binding_role, resource_version, payload FROM agent_registry_records \
+             WHERE enrollment_state IN ('token_issued', 'pending_approval')",
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let mut reconciliation = AgentEnrollmentExpiryReconciliation::default();
+        for row in rows {
+            let mut record = decode_row(row)?;
+            let public_state = match record.enrollment.state {
+                AgentEnrollmentState::TokenIssued
+                    if record.enrollment.expires_at_unix_ms.get() <= now_unix_ms.get() =>
+                {
+                    reconciliation.expired_token_intents += 1;
+                    None
+                }
+                AgentEnrollmentState::PendingApproval
+                    if record
+                        .enrollment
+                        .review_expires_at_unix_ms
+                        .is_some_and(|expires_at| expires_at.get() <= now_unix_ms.get()) =>
+                {
+                    reconciliation.expired_review_enrollments += 1;
+                    Some(StorageEnrollmentState::Expired)
+                }
+                _ => continue,
+            };
+            let previous = record.resource_version.get();
+            let next = checked_next_registry_resource_version(previous)?;
+            record.enrollment.state = AgentEnrollmentState::Expired;
+            record.resource_version = ResourceVersion::new(next);
+            transition_storage_enrollment(
+                &mut record,
+                public_state,
+                AgentEnrollmentLifecycleAuditKind::Expired,
+                now_unix_ms,
+                None,
+            );
+            validate_registry_record(&record)?;
+            let payload = encode(&record)?;
+            let update = sqlx::query(
+                "UPDATE agent_registry_records SET pvc_binding_role = NULL, \
+                 enrollment_state = ?, registration_kind = ?, \
+                 enrollment_created_at_unix_ms = ?, display_name = ?, \
+                 resource_version = ?, payload = ? \
+                 WHERE enrollment_id = ? AND resource_version = ?",
+            )
+            .bind(indexed_enrollment_state(&record))
+            .bind(indexed_registration_kind(&record))
+            .bind(indexed_enrollment_created_at(&record)?)
+            .bind(indexed_display_name(&record))
+            .bind(next.to_string())
+            .bind(payload)
+            .bind(record.enrollment.enrollment_id.as_str())
+            .bind(previous.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(registry_update_error)?;
+            if update.rows_affected() != 1 {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "Agent enrollment changed during global expiry reconciliation",
+                ));
+            }
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(reconciliation)
     }
 
     async fn enrollment_audit_events(
@@ -492,6 +695,61 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
             (&left.tenant_id, &left.event_id).cmp(&(&right.tenant_id, &right.event_id))
         });
         Ok(events)
+    }
+
+    async fn enrollment_lifecycle_audit_events(
+        &self,
+        tenant_id: &TenantId,
+    ) -> CentralResult<Vec<crate::AgentEnrollmentLifecycleAuditEvent>> {
+        let rows = sqlx::query(
+            "SELECT enrollment_id, agent_id, token_id, token_request_id, token_digest, bootstrap_request_id, decision_request_id, installation_id, public_key_fingerprint, \
+             tenant_id, edge_cluster_id, storage_volume_id, pvc_identity_digest, pvc_binding_role, resource_version, payload \
+             FROM agent_registry_records WHERE tenant_id = ? ORDER BY enrollment_id",
+        )
+        .bind(tenant_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let mut events = rows
+            .into_iter()
+            .map(decode_row)
+            .collect::<CentralResult<Vec<_>>>()?
+            .into_iter()
+            .flat_map(|record| record.storage_enrollment.lifecycle_audit_events)
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            (&left.occurred_at_unix_ms, &left.event_id)
+                .cmp(&(&right.occurred_at_unix_ms, &right.event_id))
+        });
+        Ok(events)
+    }
+
+    async fn consume_bootstrap_status_signed_at(
+        &self,
+        enrollment_id: &AgentEnrollmentId,
+        signed_at_unix_ms: UnixMillis,
+    ) -> CentralResult<()> {
+        let signed_at_unix_ms = sqlite_millis(signed_at_unix_ms)?;
+        let result = sqlx::query(
+            "INSERT INTO agent_bootstrap_status_watermarks \
+             (enrollment_id, signed_at_unix_ms) VALUES (?, ?) \
+             ON CONFLICT(enrollment_id) DO UPDATE SET \
+                 signed_at_unix_ms = excluded.signed_at_unix_ms \
+             WHERE excluded.signed_at_unix_ms \
+                 > agent_bootstrap_status_watermarks.signed_at_unix_ms",
+        )
+        .bind(enrollment_id.as_str())
+        .bind(signed_at_unix_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if result.rows_affected() != 1 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "Agent bootstrap status replay watermark changed",
+            ));
+        }
+        Ok(())
     }
 
     async fn insert_or_load(
@@ -565,7 +823,9 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
              (enrollment_id, agent_id, token_id, token_request_id, token_digest, tenant_id, \
               edge_cluster_id, storage_volume_id, pvc_identity_digest, bootstrap_request_id, \
               pvc_binding_role, decision_request_id, installation_id, public_key_fingerprint, \
-              resource_version, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              resource_version, payload, enrollment_state, registration_kind, \
+              enrollment_created_at_unix_ms, display_name) \
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.enrollment.enrollment_id.as_str())
         .bind(record.enrollment.reserved_agent_id.as_str())
@@ -591,6 +851,10 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         .bind(candidate_public_key_fingerprint(&record))
         .bind(record.resource_version.get().to_string())
         .bind(payload)
+        .bind(indexed_enrollment_state(&record))
+        .bind(indexed_registration_kind(&record))
+        .bind(indexed_enrollment_created_at(&record)?)
+        .bind(indexed_display_name(&record))
         .execute(&mut *transaction)
         .await;
         if let Err(error) = inserted {
@@ -633,6 +897,8 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         let result = sqlx::query(
             "UPDATE agent_registry_records SET bootstrap_request_id = ?, decision_request_id = ?, \
              installation_id = ?, public_key_fingerprint = ?, pvc_binding_role = ?, \
+             enrollment_state = ?, registration_kind = ?, \
+             enrollment_created_at_unix_ms = ?, display_name = ?, \
              resource_version = ?, payload = ? \
              WHERE enrollment_id = ? AND agent_id = ? AND resource_version = ?",
         )
@@ -643,6 +909,10 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         .bind(candidate_installation_id(&record))
         .bind(candidate_public_key_fingerprint(&record))
         .bind(pvc_binding_role(&record))
+        .bind(indexed_enrollment_state(&record))
+        .bind(indexed_registration_kind(&record))
+        .bind(indexed_enrollment_created_at(&record)?)
+        .bind(indexed_display_name(&record))
         .bind(record.resource_version.get().to_string())
         .bind(payload)
         .bind(record.enrollment.enrollment_id.as_str())
@@ -707,6 +977,8 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         let revoked_result = sqlx::query(
             "UPDATE agent_registry_records SET bootstrap_request_id = ?, decision_request_id = ?, \
              installation_id = ?, public_key_fingerprint = ?, pvc_binding_role = ?, \
+             enrollment_state = ?, registration_kind = ?, \
+             enrollment_created_at_unix_ms = ?, display_name = ?, \
              resource_version = ?, payload = ? \
              WHERE enrollment_id = ? AND agent_id = ? AND resource_version = ?",
         )
@@ -717,6 +989,10 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         .bind(candidate_installation_id(&revoked))
         .bind(candidate_public_key_fingerprint(&revoked))
         .bind(pvc_binding_role(&revoked))
+        .bind(indexed_enrollment_state(&revoked))
+        .bind(indexed_registration_kind(&revoked))
+        .bind(indexed_enrollment_created_at(&revoked)?)
+        .bind(indexed_display_name(&revoked))
         .bind(revoked.resource_version.get().to_string())
         .bind(revoked_payload)
         .bind(revoked.enrollment.enrollment_id.as_str())
@@ -729,6 +1005,8 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         let replacement_result = sqlx::query(
             "UPDATE agent_registry_records SET bootstrap_request_id = ?, decision_request_id = ?, \
              installation_id = ?, public_key_fingerprint = ?, pvc_binding_role = ?, \
+             enrollment_state = ?, registration_kind = ?, \
+             enrollment_created_at_unix_ms = ?, display_name = ?, \
              resource_version = ?, payload = ? \
              WHERE enrollment_id = ? AND agent_id = ? AND resource_version = ?",
         )
@@ -739,6 +1017,10 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         .bind(candidate_installation_id(&replacement))
         .bind(candidate_public_key_fingerprint(&replacement))
         .bind(pvc_binding_role(&replacement))
+        .bind(indexed_enrollment_state(&replacement))
+        .bind(indexed_registration_kind(&replacement))
+        .bind(indexed_enrollment_created_at(&replacement)?)
+        .bind(indexed_display_name(&replacement))
         .bind(replacement.resource_version.get().to_string())
         .bind(replacement_payload)
         .bind(replacement.enrollment.enrollment_id.as_str())
@@ -785,6 +1067,90 @@ fn candidate_public_key_fingerprint(record: &AgentRegistryRecord) -> Option<Stri
         .candidate
         .as_ref()
         .map(|candidate| candidate.public_key_fingerprint.to_string())
+}
+
+fn indexed_enrollment_state(record: &AgentRegistryRecord) -> &'static str {
+    if record.storage_enrollment.record_format == AgentRegistryRecordFormat::LegacyV2 {
+        return "legacy";
+    }
+    match record.storage_enrollment.state {
+        Some(StorageEnrollmentState::PendingApproval) => "pending_approval",
+        Some(StorageEnrollmentState::Approved) => "approved",
+        Some(StorageEnrollmentState::Enrolled) => "enrolled",
+        Some(StorageEnrollmentState::Rejected) => "rejected",
+        Some(StorageEnrollmentState::Expired) => "expired",
+        None if record.enrollment.state == AgentEnrollmentState::Revoked => "revoked",
+        None => "token_issued",
+    }
+}
+
+fn indexed_registration_kind(record: &AgentRegistryRecord) -> &'static str {
+    if record.storage_enrollment.record_format == AgentRegistryRecordFormat::LegacyV2 {
+        return "legacy";
+    }
+    match record.storage_enrollment.registration_kind {
+        Some(StorageEnrollmentRegistrationKind::Initial) => "initial",
+        Some(StorageEnrollmentRegistrationKind::Replacement) => "replacement",
+        None => "legacy",
+    }
+}
+
+fn indexed_enrollment_created_at(record: &AgentRegistryRecord) -> CentralResult<i64> {
+    if record.storage_enrollment.record_format == AgentRegistryRecordFormat::LegacyV2
+        || record.storage_enrollment.state.is_none()
+    {
+        return Ok(0);
+    }
+    sqlite_millis(public_enrollment_created_at(record))
+}
+
+fn indexed_display_name(record: &AgentRegistryRecord) -> Option<&str> {
+    record
+        .storage_enrollment
+        .descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.display_name.as_str())
+}
+
+const fn storage_enrollment_state_name(state: StorageEnrollmentState) -> &'static str {
+    match state {
+        StorageEnrollmentState::PendingApproval => "pending_approval",
+        StorageEnrollmentState::Approved => "approved",
+        StorageEnrollmentState::Enrolled => "enrolled",
+        StorageEnrollmentState::Rejected => "rejected",
+        StorageEnrollmentState::Expired => "expired",
+    }
+}
+
+const fn registration_kind_name(kind: StorageEnrollmentRegistrationKind) -> &'static str {
+    match kind {
+        StorageEnrollmentRegistrationKind::Initial => "initial",
+        StorageEnrollmentRegistrationKind::Replacement => "replacement",
+    }
+}
+
+fn public_enrollment_created_at(record: &AgentRegistryRecord) -> UnixMillis {
+    record
+        .enrollment
+        .bootstrapped_at_unix_ms
+        .unwrap_or(record.enrollment.created_at_unix_ms)
+}
+
+fn sqlite_millis(value: UnixMillis) -> CentralResult<i64> {
+    i64::try_from(value.get()).map_err(|_| {
+        CentralError::new(
+            CentralErrorCode::ProtocolInvalid,
+            "Agent enrollment timestamp exceeds the SQLite keyset range",
+        )
+        .with_retryable(false)
+    })
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn pvc_binding_role(record: &AgentRegistryRecord) -> Option<&'static str> {
@@ -1113,205 +1479,33 @@ fn decode_row(row: SqliteRow) -> CentralResult<AgentRegistryRecord> {
     Ok(stored.value)
 }
 
-async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralResult<()> {
-    let application_id: i64 = sqlx::query_scalar("PRAGMA application_id")
-        .fetch_one(pool)
-        .await
-        .map_err(storage_error)?;
-    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(pool)
-        .await
-        .map_err(storage_error)?;
-    if initialize {
-        if application_id != 0 || user_version != 0 {
-            return Err(storage_corruption(
-                "empty Agent registry carries unexpected schema identity",
-            ));
-        }
-        let mut transaction = pool.begin().await.map_err(storage_error)?;
-        sqlx::raw_sql(SCHEMA_SQL)
-            .execute(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
-        sqlx::query("PRAGMA application_id = 1313165138")
-            .execute(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 2")
-            .execute(&mut *transaction)
-            .await
-            .map_err(storage_error)?;
-        transaction.commit().await.map_err(storage_error)?;
-        return Ok(());
-    }
-    if application_id != SQLITE_APPLICATION_ID || user_version != SQLITE_SCHEMA_VERSION {
-        return Err(storage_corruption(format!(
-            "unsupported Agent registry schema identity {application_id}/{user_version}"
-        )));
-    }
-    validate_current_schema(pool).await
-}
-
-async fn validate_current_schema(pool: &SqlitePool) -> CentralResult<()> {
-    let mut expected_objects = BTreeSet::new();
-    for expected_statement in SCHEMA_SQL
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-    {
-        let (object_type, name) = schema_object(expected_statement)?;
-        expected_objects.insert((object_type, name));
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?")
-                .bind(object_type)
-                .bind(name)
-                .fetch_optional(pool)
-                .await
-                .map_err(storage_error)?;
-        let stored = stored.ok_or_else(|| {
-            storage_corruption(format!("Agent registry {object_type} {name} is missing"))
-        })?;
-        if normalize_schema_sql(&stored) != normalize_schema_sql(expected_statement) {
-            return Err(storage_corruption(format!(
-                "Agent registry {object_type} {name} differs from the current schema"
-            )));
-        }
-    }
-
-    let actual_objects = sqlx::query_as::<_, (String, String)>(
-        "SELECT type, name FROM sqlite_schema \
-         WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' \
-         ORDER BY type, name",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(storage_error)?
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    let expected_objects = expected_objects
-        .into_iter()
-        .map(|(object_type, name)| (object_type.to_owned(), name.to_owned()))
-        .collect::<BTreeSet<_>>();
-    if actual_objects != expected_objects {
-        return Err(storage_corruption(
-            "Agent registry table or index set differs from the current schema",
-        ));
-    }
-    Ok(())
-}
-
-fn schema_object(statement: &str) -> CentralResult<(&'static str, &str)> {
-    let words = statement.split_ascii_whitespace().collect::<Vec<_>>();
-    match words.as_slice() {
-        ["CREATE", "TABLE", name, ..] => Ok(("table", name)),
-        ["CREATE", "INDEX", name, ..] | ["CREATE", "UNIQUE", "INDEX", name, ..] => {
-            Ok(("index", name))
-        }
-        _ => Err(storage_corruption(
-            "invalid embedded Agent registry schema statement",
-        )),
-    }
-}
-
-fn normalize_schema_sql(sql: &str) -> String {
-    sql.chars()
-        .filter(|character| !character.is_ascii_whitespace())
-        .collect()
-}
-
-async fn validate_integrity(pool: &SqlitePool) -> CentralResult<()> {
-    let results: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
-        .fetch_all(pool)
-        .await
-        .map_err(storage_error)?;
-    if results != ["ok"] {
-        return Err(storage_corruption(format!(
-            "Agent registry integrity check failed: {}",
-            results.join("; ")
-        )));
-    }
+async fn validate_records(pool: &SqlitePool) -> CentralResult<()> {
     let rows = sqlx::query(
         "SELECT enrollment_id, agent_id, token_id, token_request_id, token_digest, bootstrap_request_id, decision_request_id, installation_id, public_key_fingerprint, \
          tenant_id, edge_cluster_id, storage_volume_id, pvc_identity_digest, \
-         pvc_binding_role, resource_version, payload FROM agent_registry_records",
+         pvc_binding_role, resource_version, payload, enrollment_state, registration_kind, \
+         enrollment_created_at_unix_ms, display_name FROM agent_registry_records",
     )
     .fetch_all(pool)
     .await
     .map_err(storage_error)?;
     for row in rows {
-        let _ = decode_row(row)?;
-    }
-    Ok(())
-}
-
-fn prepare_root(path: &Path) -> CentralResult<PathBuf> {
-    if path.as_os_str().is_empty() {
-        return Err(storage_corruption("Agent registry path must be explicit"));
-    }
-    if path.exists() {
-        let metadata = fs::symlink_metadata(path).map_err(storage_error)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        let indexed_state: String = row.try_get("enrollment_state").map_err(storage_error)?;
+        let indexed_kind: String = row.try_get("registration_kind").map_err(storage_error)?;
+        let indexed_created_at: i64 = row
+            .try_get("enrollment_created_at_unix_ms")
+            .map_err(storage_error)?;
+        let indexed_name: Option<String> = row.try_get("display_name").map_err(storage_error)?;
+        let record = decode_row(row)?;
+        if indexed_state != indexed_enrollment_state(&record)
+            || indexed_kind != indexed_registration_kind(&record)
+            || indexed_created_at != indexed_enrollment_created_at(&record)?
+            || indexed_name.as_deref() != indexed_display_name(&record)
+        {
             return Err(storage_corruption(
-                "Agent registry path must be a real directory",
+                "Agent registry public query columns differ from the stored aggregate",
             ));
         }
-    } else {
-        fs::create_dir_all(path).map_err(storage_error)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(storage_error)?;
-    }
-    fs::canonicalize(path).map_err(storage_error)
-}
-
-fn open_lock(path: &Path) -> CentralResult<File> {
-    if path.exists()
-        && fs::symlink_metadata(path)
-            .map_err(storage_error)?
-            .file_type()
-            .is_symlink()
-    {
-        return Err(storage_corruption(
-            "Agent registry lock cannot be a symbolic link",
-        ));
-    }
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .map_err(storage_error)?;
-    file.try_lock_exclusive().map_err(|_error| {
-        CentralError::new(
-            CentralErrorCode::StorageFailure,
-            "Agent registry is already open",
-        )
-    })?;
-    secure_file(path)?;
-    Ok(file)
-}
-
-fn validate_database_path(path: &Path) -> CentralResult<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(path).map_err(storage_error)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(storage_corruption(
-            "Agent registry database must be a regular file",
-        ));
-    }
-    Ok(())
-}
-
-fn secure_file(path: &Path) -> CentralResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(storage_error)?;
     }
     Ok(())
 }
@@ -1329,4 +1523,25 @@ fn missing(message: &'static str) -> CentralError {
 
 fn storage_corruption(message: impl Into<String>) -> CentralError {
     CentralError::new(CentralErrorCode::StorageFailure, message).with_retryable(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn close_releases_lock_while_the_old_handle_remains_alive() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let registry = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+            .await
+            .unwrap();
+
+        registry.close().await;
+
+        let reopened = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+            .await
+            .unwrap();
+        reopened.close().await;
+        drop(registry);
+    }
 }

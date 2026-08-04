@@ -9,15 +9,19 @@ use neoengram_protocol::{
 
 use crate::{
     checked_next_registry_resource_version, ensure_immutable_registry_scope,
-    validate_registry_insert, validate_registry_record, validate_registry_replace_transition,
-    validate_registry_replacement_transition, AgentRegistryInsertOutcome, AgentRegistryRecord,
-    AgentRegistryReplacementRecords, AgentRegistryRepository, CentralError, CentralErrorCode,
-    CentralResult, PvcVolumeBinding,
+    transition_storage_enrollment, validate_registry_insert, validate_registry_record,
+    validate_registry_replace_transition, validate_registry_replacement_transition,
+    AgentEnrollmentExpiryReconciliation, AgentEnrollmentLifecycleAuditKind,
+    AgentEnrollmentListCursor, AgentEnrollmentListPage, AgentEnrollmentListRequest,
+    AgentRegistryInsertOutcome, AgentRegistryRecord, AgentRegistryReplacementRecords,
+    AgentRegistryRepository, CentralError, CentralErrorCode, CentralResult, PvcVolumeBinding,
+    StorageEnrollmentState, AGENT_ENROLLMENT_MAX_PAGE_SIZE, AGENT_ENROLLMENT_MAX_QUERY_CHARS,
 };
 
 #[derive(Debug, Default)]
 pub struct InMemoryAgentRegistry {
     records: Mutex<BTreeMap<AgentEnrollmentId, AgentRegistryRecord>>,
+    bootstrap_status_watermarks: Mutex<BTreeMap<AgentEnrollmentId, UnixMillis>>,
 }
 
 impl InMemoryAgentRegistry {
@@ -49,6 +53,111 @@ impl AgentRegistryRepository for InMemoryAgentRegistry {
             .map_err(lock_error)?
             .get(enrollment_id)
             .cloned())
+    }
+
+    async fn get_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        enrollment_id: &AgentEnrollmentId,
+    ) -> CentralResult<Option<AgentRegistryRecord>> {
+        Ok(self
+            .records
+            .lock()
+            .map_err(lock_error)?
+            .get(enrollment_id)
+            .filter(|record| &record.enrollment.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    async fn list_for_tenant(
+        &self,
+        request: &AgentEnrollmentListRequest,
+    ) -> CentralResult<AgentEnrollmentListPage> {
+        if request.limit == 0 || request.limit > AGENT_ENROLLMENT_MAX_PAGE_SIZE {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Agent enrollment page size is outside the supported range",
+            )
+            .with_retryable(false));
+        }
+        if request.query.as_ref().is_some_and(|query| {
+            query.is_empty() || query.chars().count() > AGENT_ENROLLMENT_MAX_QUERY_CHARS
+        }) {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Agent enrollment query must contain 1 to 256 characters",
+            )
+            .with_retryable(false));
+        }
+        let records = self.records.lock().map_err(lock_error)?;
+        let normalized_query = request.query.as_ref().map(|query| query.to_lowercase());
+        let mut matches =
+            records
+                .values()
+                .filter(|record| record.enrollment.tenant_id == request.tenant_id)
+                .filter(|record| record.storage_enrollment.state.is_some())
+                .filter(|record| {
+                    request
+                        .state
+                        .is_none_or(|state| record.storage_enrollment.state == Some(state))
+                })
+                .filter(|record| {
+                    request.registration_kind.is_none_or(|kind| {
+                        record.storage_enrollment.registration_kind == Some(kind)
+                    })
+                })
+                .filter(|record| {
+                    normalized_query.as_ref().is_none_or(|query| {
+                        record
+                            .enrollment
+                            .enrollment_id
+                            .as_str()
+                            .to_lowercase()
+                            .contains(query)
+                            || record
+                                .enrollment
+                                .storage_volume_id
+                                .as_str()
+                                .to_lowercase()
+                                .contains(query)
+                            || record.storage_enrollment.descriptor.as_ref().is_some_and(
+                                |descriptor| descriptor.display_name.to_lowercase().contains(query),
+                            )
+                    })
+                })
+                .filter(|record| {
+                    request.after.as_ref().is_none_or(|cursor| {
+                        public_enrollment_created_at(record).get() < cursor.created_at_unix_ms.get()
+                            || (public_enrollment_created_at(record) == cursor.created_at_unix_ms
+                                && record.enrollment.enrollment_id > cursor.enrollment_id)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            public_enrollment_created_at(right)
+                .cmp(&public_enrollment_created_at(left))
+                .then_with(|| {
+                    left.enrollment
+                        .enrollment_id
+                        .cmp(&right.enrollment.enrollment_id)
+                })
+        });
+        let has_more = matches.len() > request.limit;
+        matches.truncate(request.limit);
+        let next = has_more.then(|| {
+            let last = matches
+                .last()
+                .expect("a non-empty page has a last enrollment");
+            AgentEnrollmentListCursor {
+                created_at_unix_ms: public_enrollment_created_at(last),
+                enrollment_id: last.enrollment.enrollment_id.clone(),
+            }
+        });
+        Ok(AgentEnrollmentListPage {
+            records: matches,
+            next,
+        })
     }
 
     async fn get_by_agent(&self, agent_id: &AgentId) -> CentralResult<Option<AgentRegistryRecord>> {
@@ -233,6 +342,13 @@ impl AgentRegistryRepository for InMemoryAgentRegistry {
                 let next = checked_next_registry_resource_version(record.resource_version.get())?;
                 expired.enrollment.state = AgentEnrollmentState::Expired;
                 expired.resource_version = neoengram_protocol::ResourceVersion::new(next);
+                transition_storage_enrollment(
+                    &mut expired,
+                    None,
+                    AgentEnrollmentLifecycleAuditKind::Expired,
+                    now_unix_ms,
+                    None,
+                );
                 validate_registry_record(&expired)?;
                 staged.push((record.enrollment.enrollment_id.clone(), expired));
             }
@@ -242,6 +358,90 @@ impl AgentRegistryRepository for InMemoryAgentRegistry {
             records.insert(enrollment_id, record);
         }
         Ok(expired)
+    }
+
+    async fn expire_stale_review_enrollments(
+        &self,
+        tenant_id: &TenantId,
+        now_unix_ms: UnixMillis,
+    ) -> CentralResult<usize> {
+        let mut records = self.records.lock().map_err(lock_error)?;
+        let mut staged = Vec::new();
+        for record in records.values() {
+            if &record.enrollment.tenant_id != tenant_id
+                || record.enrollment.state != AgentEnrollmentState::PendingApproval
+                || record
+                    .enrollment
+                    .review_expires_at_unix_ms
+                    .is_none_or(|expires_at| expires_at.get() > now_unix_ms.get())
+            {
+                continue;
+            }
+            let mut expired = record.clone();
+            let next = checked_next_registry_resource_version(record.resource_version.get())?;
+            expired.enrollment.state = AgentEnrollmentState::Expired;
+            expired.resource_version = neoengram_protocol::ResourceVersion::new(next);
+            transition_storage_enrollment(
+                &mut expired,
+                Some(StorageEnrollmentState::Expired),
+                AgentEnrollmentLifecycleAuditKind::Expired,
+                now_unix_ms,
+                None,
+            );
+            validate_registry_record(&expired)?;
+            staged.push((record.enrollment.enrollment_id.clone(), expired));
+        }
+        let expired = staged.len();
+        for (enrollment_id, record) in staged {
+            records.insert(enrollment_id, record);
+        }
+        Ok(expired)
+    }
+
+    async fn reconcile_expired_enrollments(
+        &self,
+        now_unix_ms: UnixMillis,
+    ) -> CentralResult<AgentEnrollmentExpiryReconciliation> {
+        let mut records = self.records.lock().map_err(lock_error)?;
+        let mut staged = Vec::new();
+        let mut result = AgentEnrollmentExpiryReconciliation::default();
+        for record in records.values() {
+            let public_state = match record.enrollment.state {
+                AgentEnrollmentState::TokenIssued
+                    if record.enrollment.expires_at_unix_ms.get() <= now_unix_ms.get() =>
+                {
+                    result.expired_token_intents += 1;
+                    None
+                }
+                AgentEnrollmentState::PendingApproval
+                    if record
+                        .enrollment
+                        .review_expires_at_unix_ms
+                        .is_some_and(|expires_at| expires_at.get() <= now_unix_ms.get()) =>
+                {
+                    result.expired_review_enrollments += 1;
+                    Some(StorageEnrollmentState::Expired)
+                }
+                _ => continue,
+            };
+            let mut expired = record.clone();
+            let next = checked_next_registry_resource_version(record.resource_version.get())?;
+            expired.enrollment.state = AgentEnrollmentState::Expired;
+            expired.resource_version = neoengram_protocol::ResourceVersion::new(next);
+            transition_storage_enrollment(
+                &mut expired,
+                public_state,
+                AgentEnrollmentLifecycleAuditKind::Expired,
+                now_unix_ms,
+                None,
+            );
+            validate_registry_record(&expired)?;
+            staged.push((record.enrollment.enrollment_id.clone(), expired));
+        }
+        for (enrollment_id, record) in staged {
+            records.insert(enrollment_id, record);
+        }
+        Ok(result)
     }
 
     async fn enrollment_audit_events(
@@ -258,6 +458,47 @@ impl AgentRegistryRepository for InMemoryAgentRegistry {
             (&left.tenant_id, &left.event_id).cmp(&(&right.tenant_id, &right.event_id))
         });
         Ok(events)
+    }
+
+    async fn enrollment_lifecycle_audit_events(
+        &self,
+        tenant_id: &TenantId,
+    ) -> CentralResult<Vec<crate::AgentEnrollmentLifecycleAuditEvent>> {
+        let mut events = self
+            .records
+            .lock()
+            .map_err(lock_error)?
+            .values()
+            .filter(|record| &record.enrollment.tenant_id == tenant_id)
+            .flat_map(|record| record.storage_enrollment.lifecycle_audit_events.clone())
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            (&left.occurred_at_unix_ms, &left.event_id)
+                .cmp(&(&right.occurred_at_unix_ms, &right.event_id))
+        });
+        Ok(events)
+    }
+
+    async fn consume_bootstrap_status_signed_at(
+        &self,
+        enrollment_id: &AgentEnrollmentId,
+        signed_at_unix_ms: UnixMillis,
+    ) -> CentralResult<()> {
+        let mut watermarks = self
+            .bootstrap_status_watermarks
+            .lock()
+            .map_err(lock_error)?;
+        if watermarks
+            .get(enrollment_id)
+            .is_some_and(|stored| signed_at_unix_ms.get() <= stored.get())
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "Agent bootstrap status replay watermark changed",
+            ));
+        }
+        watermarks.insert(enrollment_id.clone(), signed_at_unix_ms);
+        Ok(())
     }
 
     async fn insert_or_load(
@@ -546,6 +787,13 @@ fn is_terminal(state: AgentEnrollmentState) -> bool {
             | AgentEnrollmentState::Expired
             | AgentEnrollmentState::Revoked
     )
+}
+
+fn public_enrollment_created_at(record: &AgentRegistryRecord) -> UnixMillis {
+    record
+        .enrollment
+        .bootstrapped_at_unix_ms
+        .unwrap_or(record.enrollment.created_at_unix_ms)
 }
 
 fn missing(message: &'static str) -> CentralError {

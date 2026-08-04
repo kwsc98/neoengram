@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -13,6 +13,25 @@ pub(crate) fn parse_unique_json(bytes: &[u8]) -> ProtocolResult<Value> {
     let UniqueJsonValue(value) = UniqueJsonValue::deserialize(&mut deserializer)?;
     deserializer.end()?;
     Ok(value)
+}
+
+/// Decodes one bounded JSON value while recursively rejecting duplicate object members.
+///
+/// The byte limit is checked before parsing, allowing transport adapters to preserve duplicate-key
+/// detection without first materializing an untrusted `serde_json::Value`.
+pub fn decode_bounded_unique_json<T>(bytes: &[u8], max_bytes: usize) -> ProtocolResult<T>
+where
+    T: DeserializeOwned,
+{
+    if bytes.len() > max_bytes {
+        return Err(ProtocolError::LimitExceeded {
+            limit_name: "JSON message bytes",
+            limit: max_bytes,
+            actual: bytes.len(),
+        });
+    }
+    let value = parse_unique_json(bytes)?;
+    Ok(serde_json::from_value(value)?)
 }
 
 struct UniqueJsonValue(Value);

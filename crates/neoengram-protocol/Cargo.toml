@@ -10,8 +10,10 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+base64 = "0.22.1"
 blake3.workspace = true
 neoengram-core.workspace = true
+ring = "0.17.14"
 schemars = "1.2.1"
 serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }

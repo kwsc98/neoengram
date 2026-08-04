@@ -51,6 +51,34 @@ fn schemas_publish_the_runtime_wire_limits() {
         Some(&json!("^[0-9a-f]{64}$"))
     );
     assert_eq!(
+        enrollment.pointer("/$defs/AgentBootstrapRequest/properties/capabilities/uniqueItems"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/Ed25519PublicKeySpki/minLength"),
+        Some(&json!(59))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/Ed25519PublicKeySpki/maxLength"),
+        Some(&json!(59))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/Ed25519Signature/minLength"),
+        Some(&json!(86))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/AgentSignatureAlgorithm/enum/0"),
+        Some(&json!("ed25519"))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/AgentBootstrapStatusRequest/properties/protocol_version/const"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        enrollment.pointer("/$defs/AgentBootstrapStatusResponse/properties/protocol_version/const"),
+        Some(&json!(1))
+    );
+    assert_eq!(
         enrollment.pointer("/$defs/AgentMountIdentityDigest/pattern"),
         Some(&json!("^[0-9a-f]{64}$"))
     );

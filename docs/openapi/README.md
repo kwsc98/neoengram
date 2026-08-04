@@ -1,7 +1,25 @@
 # NeoEngram Public OpenAPI
 
 [`neoengram-api.yaml`](neoengram-api.yaml) 是面向用户、CLI 和 UI 的公开 API 设计契约。
-当前 `neoengramd` 仍是 library-only；本文档不表示仓库已经提供可监听的 HTTP server。
+`neoengramd` 保持 library-only，独立的 `neoengram-server` 使用 Fusen 0.9.0 提供可监听 HTTP server。
+默认配置注册以下六个接口：
+
+```text
+POST /api/system/version/query
+GET  /health/live
+GET  /health/ready
+POST /api/job/add/create
+POST /api/job/query
+POST /api/job/add/finalize
+```
+
+启用 Agent enrollment 时，同一 Fusen 用户 listener 还注册 token create、enrollment list/query、approve
+和 reject 五个公开管理接口；独立 Hyper listener 注册 `/v1/agents/bootstrap` 与
+`/v1/agents/bootstrap/status`。后两条是内部 Agent API，不属于本 OpenAPI。本文档中的其他 operation
+仍是目标契约，不表示已经可调用。
+
+业务接口使用外部 OIDC/JWKS Bearer JWT 和服务端 RBAC，无法确认身份或授权时默认拒绝。SQLite
+运行模式只支持单副本；生产 TLS 由 Ingress/反向代理终止。
 
 ## 设计约定
 
@@ -20,8 +38,9 @@
 
 ## 安全边界
 
-除版本查询和健康探针外，公开业务 API 使用 Bearer JWT。服务端必须从配置的 OIDC issuer 验证 token，并从认证结果导出
-`PrincipalRef` 和 tenant scope；客户端不能通过请求 body 覆盖身份。
+除版本查询和健康探针外，公开业务 API 使用 Bearer JWT。服务端必须从配置的 OIDC issuer 验证
+token，并从验证后的 issuer/sub 导出 `PrincipalRef`；tenant scope 只能由启动时加载的服务端 RBAC
+策略授予。JWT 中的 tenant、role、group 只作审计提示，客户端不能通过 token 或请求 body 覆盖授权。
 
 Tenant、StorageVolume、Artifact、Commit、Playground、Snapshot 与 `JobView` 均为脱敏视图。
 StorageVolume 的稳定逻辑 ID、region、EdgeCluster 和公开 PVC reference 可用于放置与运维识别；

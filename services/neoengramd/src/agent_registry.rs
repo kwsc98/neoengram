@@ -3,12 +3,14 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 use neoengram_core::ContentDigest;
 use neoengram_protocol::{
     AgentBootId, AgentBootstrapAccepted, AgentBootstrapProbe, AgentBootstrapRequest,
+    AgentBootstrapStatusRequest, AgentBootstrapStatusResponse, AgentBootstrapStatusState,
     AgentEnrollmentApprovalRequest, AgentEnrollmentDecision, AgentEnrollmentId,
     AgentEnrollmentState, AgentEnrollmentTokenCreateRequest, AgentEnrollmentTokenId, AgentId,
     AgentInstallationId, AgentMountId, AgentMountIdentityDigest, AgentMountStatusReport,
-    EdgeClusterId, Extensions, MountAccessMode, MountGeneration, OwnerGeneration, PrincipalRef,
-    ProtocolVersion, PvcIdentityDigest, RequestId, ResourceHealth, ResourceVersion, SequenceNumber,
-    SessionGeneration, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId,
+    AgentSignatureAlgorithm, Ed25519PublicKeySpki, Ed25519Signature, EdgeClusterId, Extensions,
+    MountAccessMode, MountGeneration, OwnerGeneration, PrincipalRef, ProtocolVersion,
+    PvcIdentityDigest, RequestId, ResourceHealth, ResourceVersion, SequenceNumber,
+    SessionGeneration, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId, PROTOCOL_VERSION_V1,
 };
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +20,184 @@ use crate::{
 };
 
 pub const AGENT_ENROLLMENT_REVIEW_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+pub const AGENT_BOOTSTRAP_STATUS_MAX_CLOCK_SKEW_MS: u64 = 60 * 1_000;
+pub const AGENT_ENROLLMENT_MAX_PAGE_SIZE: usize = 100;
+pub const AGENT_ENROLLMENT_MAX_QUERY_CHARS: usize = 256;
+
+/// Persisted format provenance. Missing provenance means the record predates schema v3.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRegistryRecordFormat {
+    #[default]
+    LegacyV2,
+    CurrentV3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageEnrollmentAccessMode {
+    ReadWriteMany,
+    ReadWriteOnce,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenPvcReference {
+    pub namespace: String,
+    pub claim_name: String,
+}
+
+/// Public Volume fields frozen when the bootstrap token is created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenStorageDescriptor {
+    pub display_name: String,
+    pub region: String,
+    pub access_mode: StorageEnrollmentAccessMode,
+    pub pvc_reference: FrozenPvcReference,
+}
+
+/// Identifies the key used to derive a replayable token. No reversible token material is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapTokenMetadata {
+    pub key_id: String,
+}
+
+/// Credential evidence retained so status proofs can be verified after restart.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCredentialEvidence {
+    pub algorithm: AgentSignatureAlgorithm,
+    pub public_key_spki: Ed25519PublicKeySpki,
+    pub proof_of_possession: Ed25519Signature,
+}
+
+impl fmt::Debug for AgentCredentialEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentCredentialEvidence")
+            .field("algorithm", &self.algorithm)
+            .field("public_key_spki", &"[REDACTED]")
+            .field("proof_of_possession", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Server-owned result of verifying the bootstrap proof against its canonical request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProofOfPossessionStatus {
+    Verified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageEnrollmentRegistrationKind {
+    Initial,
+    Replacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageEnrollmentState {
+    PendingApproval,
+    Approved,
+    Enrolled,
+    Rejected,
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEnrollmentLifecycleAuditKind {
+    TokenIssued,
+    PendingApproval,
+    Approved,
+    Enrolled,
+    Rejected,
+    Expired,
+    Revoked,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEnrollmentLifecycleAuditEvent {
+    pub event_id: String,
+    pub kind: AgentEnrollmentLifecycleAuditKind,
+    pub tenant_id: TenantId,
+    pub enrollment_id: AgentEnrollmentId,
+    pub resource_version: ResourceVersion,
+    pub occurred_at_unix_ms: UnixMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+}
+
+impl fmt::Debug for AgentEnrollmentLifecycleAuditEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentEnrollmentLifecycleAuditEvent")
+            .field("event_id", &self.event_id)
+            .field("kind", &self.kind)
+            .field("tenant_id", &self.tenant_id)
+            .field("enrollment_id", &self.enrollment_id)
+            .field("resource_version", &self.resource_version)
+            .field("occurred_at_unix_ms", &self.occurred_at_unix_ms)
+            .field(
+                "rejection_reason",
+                &self.rejection_reason.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// HTTP-facing enrollment metadata stored in the same CAS aggregate as runtime state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageEnrollmentMetadata {
+    #[serde(default)]
+    pub record_format: AgentRegistryRecordFormat,
+    #[serde(default)]
+    pub descriptor: Option<FrozenStorageDescriptor>,
+    #[serde(default)]
+    pub token_key_id: Option<String>,
+    #[serde(default)]
+    pub registration_kind: Option<StorageEnrollmentRegistrationKind>,
+    #[serde(default)]
+    pub state: Option<StorageEnrollmentState>,
+    #[serde(default)]
+    pub updated_at_unix_ms: Option<UnixMillis>,
+    #[serde(default)]
+    pub lifecycle_audit_events: Vec<AgentEnrollmentLifecycleAuditEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateStorageEnrollmentIntentRequest {
+    pub request: AgentEnrollmentTokenCreateRequest,
+    pub descriptor: FrozenStorageDescriptor,
+    pub token: BootstrapTokenMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BootstrapStorageEnrollmentRequest {
+    pub request: AgentBootstrapRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentEnrollmentListCursor {
+    pub created_at_unix_ms: UnixMillis,
+    pub enrollment_id: AgentEnrollmentId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentEnrollmentListRequest {
+    pub tenant_id: TenantId,
+    pub state: Option<StorageEnrollmentState>,
+    pub registration_kind: Option<StorageEnrollmentRegistrationKind>,
+    pub query: Option<String>,
+    pub after: Option<AgentEnrollmentListCursor>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentEnrollmentListPage {
+    pub records: Vec<AgentRegistryRecord>,
+    pub next: Option<AgentEnrollmentListCursor>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentInstanceState {
@@ -110,11 +290,17 @@ pub struct AgentCandidateRecord {
     pub bootstrap_request_id: RequestId,
     pub installation_id: AgentInstallationId,
     pub public_key_fingerprint: ContentDigest,
+    #[serde(default)]
+    pub bootstrap_signed_payload_digest: Option<ContentDigest>,
     pub mount_identity_digest: AgentMountIdentityDigest,
     pub agent_version: String,
     pub supported_protocol_versions: Vec<ProtocolVersion>,
     pub capabilities: BTreeSet<String>,
     pub probe: AgentBootstrapProbe,
+    #[serde(default)]
+    pub credential_evidence: Option<AgentCredentialEvidence>,
+    #[serde(default)]
+    pub proof_of_possession_status: Option<AgentProofOfPossessionStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +358,8 @@ pub struct AgentRegistryRecord {
     /// Immutable and atomically persisted with the enrollment decision CAS.
     #[serde(default)]
     pub decision_audit_event: Option<AgentEnrollmentAuditEvent>,
+    #[serde(default)]
+    pub storage_enrollment: StorageEnrollmentMetadata,
 }
 
 impl AgentRegistryRecord {
@@ -240,6 +428,12 @@ pub struct DecideAgentEnrollmentResult {
     pub record: AgentRegistryRecord,
     pub revoked_record: Option<AgentRegistryRecord>,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentEnrollmentExpiryReconciliation {
+    pub expired_token_intents: usize,
+    pub expired_review_enrollments: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -334,13 +528,55 @@ impl AgentRegistryService {
         &self,
         request: AgentEnrollmentTokenCreateRequest,
     ) -> CentralResult<CreateAgentEnrollmentTokenResult> {
+        self.create_token_intent_inner(request, None).await
+    }
+
+    pub async fn create_storage_enrollment_intent(
+        &self,
+        request: CreateStorageEnrollmentIntentRequest,
+    ) -> CentralResult<CreateAgentEnrollmentTokenResult> {
+        validate_frozen_descriptor(&request.descriptor, &request.request.pvc_identity_digest)?;
+        validate_token_key_id(&request.token.key_id)?;
+        self.create_token_intent_inner(request.request, Some((request.descriptor, request.token)))
+            .await
+    }
+
+    pub async fn find_by_token_request_id(
+        &self,
+        tenant_id: &TenantId,
+        token_request_id: &RequestId,
+    ) -> CentralResult<Option<AgentRegistryRecord>> {
+        self.repository
+            .get_by_token_request_id(tenant_id, token_request_id)
+            .await
+    }
+
+    pub async fn reconcile_expired_enrollments(
+        &self,
+    ) -> CentralResult<AgentEnrollmentExpiryReconciliation> {
+        self.repository
+            .reconcile_expired_enrollments(self.clock.now())
+            .await
+    }
+
+    async fn create_token_intent_inner(
+        &self,
+        request: AgentEnrollmentTokenCreateRequest,
+        rich_metadata: Option<(FrozenStorageDescriptor, BootstrapTokenMetadata)>,
+    ) -> CentralResult<CreateAgentEnrollmentTokenResult> {
         request.validate()?;
         if let Some(existing) = self
             .repository
             .get_by_token_request_id(&request.tenant_id, &request.token_request_id)
             .await?
         {
-            if token_intent_matches_request(&existing, &request) {
+            let matches = rich_metadata.as_ref().map_or_else(
+                || token_intent_matches_request(&existing, &request),
+                |(descriptor, _token)| {
+                    storage_intent_matches_request(&existing, &request, descriptor)
+                },
+            );
+            if matches {
                 return Ok(CreateAgentEnrollmentTokenResult {
                     record: existing,
                     replayed: true,
@@ -385,6 +621,10 @@ impl AgentRegistryService {
                 || record.enrollment.pvc_identity_digest != request.pvc_identity_digest
                 || record.mount.expected_volume_marker != request.expected_volume_marker
                 || record.mount.desired_access_mode != request.desired_access_mode
+                || rich_metadata.as_ref().is_some_and(|(descriptor, _token)| {
+                    record.storage_enrollment.record_format != AgentRegistryRecordFormat::LegacyV2
+                        && record.storage_enrollment.descriptor.as_ref() != Some(descriptor)
+                })
         }) {
             return Err(error(
                 CentralErrorCode::AgentIdentityMismatch,
@@ -409,18 +649,29 @@ impl AgentRegistryService {
         let owner_generation = current.as_ref().map_or(OwnerGeneration::new(1), |record| {
             record.owner.owner_generation
         });
-        let record = token_intent_record(
+        let mut record = token_intent_record(
             request,
             replaces_enrollment_id,
             mount_generation,
             owner_generation,
         );
+        if let Some((descriptor, token)) = rich_metadata.as_ref() {
+            record.storage_enrollment.descriptor = Some(descriptor.clone());
+            record.storage_enrollment.token_key_id = Some(token.key_id.clone());
+        }
         match self.repository.insert_or_load(record.clone()).await? {
             AgentRegistryInsertOutcome::Inserted(record) => Ok(CreateAgentEnrollmentTokenResult {
                 record,
                 replayed: false,
             }),
-            AgentRegistryInsertOutcome::Existing(existing) if existing == record => {
+            AgentRegistryInsertOutcome::Existing(existing)
+                if rich_metadata.as_ref().map_or_else(
+                    || existing == record,
+                    |(descriptor, _token)| {
+                        storage_intent_matches_record(&existing, &record, descriptor)
+                    },
+                ) =>
+            {
                 Ok(CreateAgentEnrollmentTokenResult {
                     record: existing,
                     replayed: true,
@@ -433,12 +684,141 @@ impl AgentRegistryService {
         }
     }
 
+    /// Compatibility entry point for existing in-process callers.
+    ///
+    /// Network adapters must use [`Self::bootstrap_agent_with_proof`].
     pub async fn bootstrap_agent(
         &self,
         request: AgentBootstrapRequest,
     ) -> CentralResult<BootstrapAgentResult> {
+        self.bootstrap_agent_inner(request, None).await
+    }
+
+    pub async fn bootstrap_agent_with_proof(
+        &self,
+        request: AgentBootstrapRequest,
+    ) -> CentralResult<BootstrapAgentResult> {
+        let credential_evidence = verify_bootstrap_credential(&request)?;
+        self.bootstrap_agent_inner(request, Some(credential_evidence))
+            .await
+    }
+
+    pub async fn bootstrap_storage_enrollment(
+        &self,
+        request: BootstrapStorageEnrollmentRequest,
+    ) -> CentralResult<BootstrapAgentResult> {
+        let credential_evidence = verify_bootstrap_credential(&request.request)?;
+        self.bootstrap_agent_inner(request.request, Some(credential_evidence))
+            .await
+    }
+
+    pub async fn bootstrap_status(
+        &self,
+        request: AgentBootstrapStatusRequest,
+    ) -> CentralResult<AgentBootstrapStatusResponse> {
+        self.bootstrap_status_with_clock_skew(request, AGENT_BOOTSTRAP_STATUS_MAX_CLOCK_SKEW_MS)
+            .await
+    }
+
+    pub async fn bootstrap_status_with_clock_skew(
+        &self,
+        request: AgentBootstrapStatusRequest,
+        max_clock_skew_ms: u64,
+    ) -> CentralResult<AgentBootstrapStatusResponse> {
         request.validate()?;
+        let now = self.clock.now();
+        if now.get().abs_diff(request.signed_at_unix_ms.get()) > max_clock_skew_ms {
+            return Err(error(
+                CentralErrorCode::BootstrapDenied,
+                "Agent bootstrap status proof is outside the accepted clock window",
+            ));
+        }
+        request.verify().map_err(|_| {
+            error(
+                CentralErrorCode::BootstrapDenied,
+                "Agent bootstrap status proof of possession is invalid",
+            )
+        })?;
+        self.repository
+            .expire_stale_review_enrollments(&request.tenant_id, now)
+            .await?;
+        let record = self
+            .repository
+            .get_by_bootstrap_request_id(&request.tenant_id, &request.bootstrap_request_id)
+            .await?
+            .ok_or_else(bootstrap_status_denied)?;
+        require_public_enrollment_metadata(&record)?;
+        let candidate = record
+            .candidate
+            .as_ref()
+            .ok_or_else(bootstrap_status_denied)?;
+        let evidence = candidate
+            .credential_evidence
+            .as_ref()
+            .ok_or_else(legacy_enrollment_reissue)?;
+        if candidate.installation_id != request.installation_id
+            || evidence.algorithm != request.proof.algorithm
+            || evidence.public_key_spki != request.proof.public_key_spki
+        {
+            return Err(bootstrap_status_denied());
+        }
+        let enrollment_id = record.enrollment.enrollment_id.clone();
+        match self
+            .repository
+            .consume_bootstrap_status_signed_at(&enrollment_id, request.signed_at_unix_ms)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if error.code() == CentralErrorCode::ConcurrentUpdate => {
+                return Err(bootstrap_status_denied());
+            }
+            Err(error) => return Err(error),
+        }
+        let record = self
+            .repository
+            .get(&enrollment_id)
+            .await?
+            .ok_or_else(bootstrap_status_denied)?;
+        require_public_enrollment_metadata(&record)?;
+        let (state, agent_id) = match record.enrollment.state {
+            AgentEnrollmentState::PendingApproval => (AgentBootstrapStatusState::Pending, None),
+            AgentEnrollmentState::Approved => (
+                AgentBootstrapStatusState::Approved,
+                Some(record.enrollment.reserved_agent_id.clone()),
+            ),
+            AgentEnrollmentState::Rejected => (AgentBootstrapStatusState::Rejected, None),
+            AgentEnrollmentState::Expired => (AgentBootstrapStatusState::Expired, None),
+            AgentEnrollmentState::TokenIssued | AgentEnrollmentState::Revoked => {
+                return Err(bootstrap_status_denied());
+            }
+        };
+        let response = AgentBootstrapStatusResponse {
+            protocol_version: PROTOCOL_VERSION_V1,
+            bootstrap_request_id: request.bootstrap_request_id,
+            installation_id: request.installation_id,
+            state,
+            enrollment_id: record.enrollment.enrollment_id,
+            agent_id,
+            resource_version: record.resource_version,
+            updated_at_unix_ms: record
+                .storage_enrollment
+                .updated_at_unix_ms
+                .ok_or_else(legacy_enrollment_reissue)?,
+            extensions: Extensions::new(),
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    async fn bootstrap_agent_inner(
+        &self,
+        request: AgentBootstrapRequest,
+        credential_evidence: Option<VerifiedAgentCredentialEvidence>,
+    ) -> CentralResult<BootstrapAgentResult> {
+        request.validate()?;
+        let rich_bootstrap = credential_evidence.is_some();
         let token_digest = ContentDigest::hash(request.bootstrap_token.as_bytes());
+        let bootstrap_signed_payload_digest = ContentDigest::hash(request.signing_bytes()?);
         let mut record = self
             .repository
             .get_by_token_digest(&token_digest)
@@ -449,6 +829,9 @@ impl AgentRegistryService {
                     "bootstrap token is invalid or expired",
                 )
             })?;
+        if rich_bootstrap {
+            require_public_enrollment_metadata(&record)?;
+        }
         if request.tenant_id != record.enrollment.tenant_id
             || request.edge_cluster_id != record.enrollment.edge_cluster_id
             || request.storage_volume_id != record.enrollment.storage_volume_id
@@ -466,6 +849,13 @@ impl AgentRegistryService {
             let previous = record.resource_version.get();
             record.enrollment.state = AgentEnrollmentState::Expired;
             advance_resource_version(&mut record)?;
+            transition_storage_enrollment(
+                &mut record,
+                None,
+                AgentEnrollmentLifecycleAuditKind::Expired,
+                now,
+                None,
+            );
             match self.repository.replace(previous, record).await {
                 Ok(_) => {}
                 Err(concurrent) if concurrent.code() == CentralErrorCode::ConcurrentUpdate => {
@@ -490,15 +880,21 @@ impl AgentRegistryService {
                 "bootstrap token is invalid or expired",
             ));
         }
+        let proof_of_possession_status = credential_evidence
+            .as_ref()
+            .map(|_| AgentProofOfPossessionStatus::Verified);
         let candidate = AgentCandidateRecord {
             bootstrap_request_id: request.bootstrap_request_id,
             installation_id: request.installation_id,
             public_key_fingerprint: request.public_key_fingerprint,
+            bootstrap_signed_payload_digest: Some(bootstrap_signed_payload_digest),
             mount_identity_digest: request.probe.mount_identity_digest,
             agent_version: request.agent_version,
             supported_protocol_versions: request.supported_protocol_versions,
-            capabilities: request.capabilities,
+            capabilities: request.capabilities.into_iter().collect(),
             probe: request.probe,
+            credential_evidence: credential_evidence.map(|verified| verified.evidence),
+            proof_of_possession_status,
         };
         if let Some(existing) = self
             .repository
@@ -539,29 +935,8 @@ impl AgentRegistryService {
                 ));
             }
         }
-        if let Some(existing) = &record.candidate {
-            if existing != &candidate
-                || record.enrollment.bootstrap_request_id.as_ref()
-                    != Some(&candidate.bootstrap_request_id)
-            {
-                return Err(error(
-                    CentralErrorCode::AgentIdentityMismatch,
-                    "bootstrap request identity was reused by another Agent candidate",
-                ));
-            }
-            if matches!(
-                record.enrollment.state,
-                AgentEnrollmentState::PendingApproval | AgentEnrollmentState::Approved
-            ) {
-                return Ok(BootstrapAgentResult {
-                    accepted: bootstrap_accepted(&record, true),
-                    record,
-                });
-            }
-            return Err(error(
-                CentralErrorCode::BootstrapDenied,
-                "bootstrap identity is no longer eligible for approval",
-            ));
+        if record.candidate.is_some() {
+            return resolve_bootstrap_replay(record, &candidate, &token_digest);
         }
         if record.enrollment.state != AgentEnrollmentState::TokenIssued
             || now.get() >= record.enrollment.expires_at_unix_ms.get()
@@ -604,13 +979,35 @@ impl AgentRegistryService {
         record.enrollment.bootstrapped_at_unix_ms = Some(now);
         record.enrollment.review_expires_at_unix_ms = Some(UnixMillis::new(review_expires_at));
         record.mount.mount_identity_digest = Some(candidate.mount_identity_digest);
-        record.candidate = Some(candidate);
+        record.candidate = Some(candidate.clone());
         advance_resource_version(&mut record)?;
-        let record = self.repository.replace(previous, record).await?;
-        Ok(BootstrapAgentResult {
-            accepted: bootstrap_accepted(&record, false),
-            record,
-        })
+        transition_storage_enrollment(
+            &mut record,
+            Some(StorageEnrollmentState::PendingApproval),
+            AgentEnrollmentLifecycleAuditKind::PendingApproval,
+            now,
+            None,
+        );
+        match self.repository.replace(previous, record).await {
+            Ok(record) => Ok(BootstrapAgentResult {
+                accepted: bootstrap_accepted(&record, false),
+                record,
+            }),
+            Err(concurrent) if concurrent.code() == CentralErrorCode::ConcurrentUpdate => {
+                let committed = self
+                    .repository
+                    .get_by_token_digest(&token_digest)
+                    .await?
+                    .ok_or_else(|| {
+                        error(
+                            CentralErrorCode::BootstrapDenied,
+                            "bootstrap token is invalid or expired",
+                        )
+                    })?;
+                resolve_bootstrap_replay(committed, &candidate, &token_digest)
+            }
+            Err(repository_error) => Err(repository_error),
+        }
     }
 
     pub async fn decide_enrollment(
@@ -618,8 +1015,29 @@ impl AgentRegistryService {
         request: AgentEnrollmentApprovalRequest,
         actor: PrincipalRef,
     ) -> CentralResult<DecideAgentEnrollmentResult> {
+        self.decide_enrollment_inner(request, actor, None).await
+    }
+
+    pub async fn decide_storage_enrollment(
+        &self,
+        request: AgentEnrollmentApprovalRequest,
+        actor: PrincipalRef,
+        rejection_reason: Option<String>,
+    ) -> CentralResult<DecideAgentEnrollmentResult> {
+        validate_rejection_reason(request.decision, rejection_reason.as_deref())?;
+        self.decide_enrollment_inner(request, actor, rejection_reason)
+            .await
+    }
+
+    async fn decide_enrollment_inner(
+        &self,
+        request: AgentEnrollmentApprovalRequest,
+        actor: PrincipalRef,
+        rejection_reason: Option<String>,
+    ) -> CentralResult<DecideAgentEnrollmentResult> {
         request.validate()?;
         let mut record = self.load(&request.enrollment_id).await?;
+        require_current_registry_record(&record)?;
         if let Some(existing) = self
             .repository
             .get_by_decision_request_id(&record.enrollment.tenant_id, &request.decision_request_id)
@@ -637,6 +1055,12 @@ impl AgentRegistryService {
                 return Err(error(
                     CentralErrorCode::EnrollmentDecisionConflict,
                     "decision request identity or payload differs from the persisted decision",
+                ));
+            }
+            if lifecycle_rejection_reason(&record) != rejection_reason.as_deref() {
+                return Err(error(
+                    CentralErrorCode::EnrollmentDecisionConflict,
+                    "decision request identity was replayed with another rejection reason",
                 ));
             }
             let revoked_record = if request.decision == AgentEnrollmentDecision::Approve {
@@ -662,6 +1086,13 @@ impl AgentRegistryService {
             let previous = record.resource_version.get();
             record.enrollment.state = AgentEnrollmentState::Expired;
             advance_resource_version(&mut record)?;
+            transition_storage_enrollment(
+                &mut record,
+                Some(StorageEnrollmentState::Expired),
+                AgentEnrollmentLifecycleAuditKind::Expired,
+                now,
+                None,
+            );
             self.repository.replace(previous, record).await?;
             return Err(error(
                 CentralErrorCode::EnrollmentExpired,
@@ -697,6 +1128,13 @@ impl AgentRegistryService {
             record.enrollment.decided_by = Some(actor);
             record.enrollment.decision_request = Some(request);
             advance_resource_version(&mut record)?;
+            transition_storage_enrollment(
+                &mut record,
+                Some(StorageEnrollmentState::Rejected),
+                AgentEnrollmentLifecycleAuditKind::Rejected,
+                now,
+                rejection_reason,
+            );
             record.decision_audit_event = Some(decision_audit_event(&record)?);
             let record = self.repository.replace(previous, record).await?;
             return Ok(DecideAgentEnrollmentResult {
@@ -734,6 +1172,13 @@ impl AgentRegistryService {
                 next_mount_generation,
                 next_owner_generation,
             )?;
+            transition_storage_enrollment(
+                &mut previous_record,
+                None,
+                AgentEnrollmentLifecycleAuditKind::Revoked,
+                now,
+                None,
+            );
             record.enrollment.state = AgentEnrollmentState::Approved;
             record.enrollment.decided_at_unix_ms = Some(now);
             record.enrollment.decided_by = Some(actor);
@@ -745,6 +1190,13 @@ impl AgentRegistryService {
             record.owner.state = VolumeOwnerState::RecoveryRequired;
             record.instance = Some(instance);
             advance_resource_version(&mut record)?;
+            transition_storage_enrollment(
+                &mut record,
+                Some(StorageEnrollmentState::Approved),
+                AgentEnrollmentLifecycleAuditKind::Approved,
+                now,
+                None,
+            );
             record.decision_audit_event = Some(decision_audit_event(&record)?);
             let records = self
                 .repository
@@ -772,6 +1224,13 @@ impl AgentRegistryService {
         record.instance = Some(instance);
         let previous = record.resource_version.get();
         advance_resource_version(&mut record)?;
+        transition_storage_enrollment(
+            &mut record,
+            Some(StorageEnrollmentState::Approved),
+            AgentEnrollmentLifecycleAuditKind::Approved,
+            now,
+            None,
+        );
         record.decision_audit_event = Some(decision_audit_event(&record)?);
         let record = self.repository.replace(previous, record).await?;
         Ok(DecideAgentEnrollmentResult {
@@ -862,6 +1321,7 @@ impl AgentRegistryService {
         }
         let previous = record.resource_version.get();
         advance_resource_version(&mut record)?;
+        touch_storage_enrollment(&mut record, now);
         let record = self.repository.replace(previous, record).await?;
         Ok(OpenAgentSessionResult {
             record,
@@ -886,6 +1346,7 @@ impl AgentRegistryService {
         record.mount.observed_at_unix_ms = None;
         let previous = record.resource_version.get();
         advance_resource_version(&mut record)?;
+        touch_storage_enrollment(&mut record, self.clock.now());
         self.repository.replace(previous, record).await
     }
 
@@ -941,8 +1402,23 @@ impl AgentRegistryService {
             } else {
                 report.health
             };
+        let becomes_enrolled = record.storage_enrollment.state
+            == Some(StorageEnrollmentState::Approved)
+            && record.derived_volume_state(received_at_unix_ms, self.heartbeat_timeout_ms)
+                == DerivedVolumeState::Ready;
         let previous = record.resource_version.get();
         advance_resource_version(&mut record)?;
+        if becomes_enrolled {
+            transition_storage_enrollment(
+                &mut record,
+                Some(StorageEnrollmentState::Enrolled),
+                AgentEnrollmentLifecycleAuditKind::Enrolled,
+                received_at_unix_ms,
+                None,
+            );
+        } else {
+            touch_storage_enrollment(&mut record, received_at_unix_ms);
+        }
         let record = self.repository.replace(previous, record).await?;
         Ok(ReportAgentMountResult {
             record,
@@ -973,8 +1449,16 @@ impl AgentRegistryService {
             ));
         }
         record.owner.state = VolumeOwnerState::Active;
+        let now = self.clock.now();
         let previous = record.resource_version.get();
         advance_resource_version(&mut record)?;
+        transition_storage_enrollment(
+            &mut record,
+            Some(StorageEnrollmentState::Enrolled),
+            AgentEnrollmentLifecycleAuditKind::Enrolled,
+            now,
+            None,
+        );
         self.repository.replace(previous, record).await
     }
 
@@ -984,13 +1468,12 @@ impl AgentRegistryService {
     ) -> CentralResult<AgentRegistryRecord> {
         let mut record = self.load(&request.enrollment_id).await?;
         require_resource_version(&record, request.expected_resource_version)?;
+        let now = self.clock.now();
         let elapsed = match record.enrollment.state {
             AgentEnrollmentState::TokenIssued => {
-                self.clock.now().get() >= record.enrollment.expires_at_unix_ms.get()
+                now.get() >= record.enrollment.expires_at_unix_ms.get()
             }
-            AgentEnrollmentState::PendingApproval => {
-                review_window_elapsed(&record, self.clock.now())?
-            }
+            AgentEnrollmentState::PendingApproval => review_window_elapsed(&record, now)?,
             _ => {
                 return Err(error(
                     CentralErrorCode::InvalidState,
@@ -1007,7 +1490,62 @@ impl AgentRegistryService {
         let previous = record.resource_version.get();
         record.enrollment.state = AgentEnrollmentState::Expired;
         advance_resource_version(&mut record)?;
+        let public_state = record
+            .candidate
+            .as_ref()
+            .map(|_| StorageEnrollmentState::Expired);
+        transition_storage_enrollment(
+            &mut record,
+            public_state,
+            AgentEnrollmentLifecycleAuditKind::Expired,
+            now,
+            None,
+        );
         self.repository.replace(previous, record).await
+    }
+
+    pub async fn query_enrollment(
+        &self,
+        tenant_id: &TenantId,
+        enrollment_id: &AgentEnrollmentId,
+    ) -> CentralResult<AgentRegistryRecord> {
+        self.repository
+            .expire_stale_review_enrollments(tenant_id, self.clock.now())
+            .await?;
+        let record = self
+            .repository
+            .get_for_tenant(tenant_id, enrollment_id)
+            .await?
+            .ok_or_else(enrollment_not_found)?;
+        require_public_enrollment_metadata(&record)?;
+        if record.storage_enrollment.state.is_none() {
+            return Err(enrollment_not_found());
+        }
+        Ok(record)
+    }
+
+    pub async fn list_enrollments(
+        &self,
+        request: AgentEnrollmentListRequest,
+    ) -> CentralResult<AgentEnrollmentListPage> {
+        validate_enrollment_list_request(&request)?;
+        self.repository
+            .expire_stale_review_enrollments(&request.tenant_id, self.clock.now())
+            .await?;
+        let page = self.repository.list_for_tenant(&request).await?;
+        for record in &page.records {
+            require_public_enrollment_metadata(record)?;
+        }
+        Ok(page)
+    }
+
+    pub async fn enrollment_lifecycle_audit_events(
+        &self,
+        tenant_id: &TenantId,
+    ) -> CentralResult<Vec<AgentEnrollmentLifecycleAuditEvent>> {
+        self.repository
+            .enrollment_lifecycle_audit_events(tenant_id)
+            .await
     }
 
     pub async fn volume_state(
@@ -1015,6 +1553,7 @@ impl AgentRegistryService {
         enrollment_id: &AgentEnrollmentId,
     ) -> CentralResult<DerivedVolumeState> {
         let record = self.load(enrollment_id).await?;
+        require_current_registry_record(&record)?;
         Ok(record.derived_volume_state(self.clock.now(), self.heartbeat_timeout_ms))
     }
 
@@ -1038,6 +1577,266 @@ impl AgentRegistryService {
                 )
             })
     }
+}
+
+fn validate_frozen_descriptor(
+    descriptor: &FrozenStorageDescriptor,
+    expected_pvc_identity: &PvcIdentityDigest,
+) -> CentralResult<()> {
+    if descriptor.display_name.trim().is_empty() || descriptor.display_name.chars().count() > 256 {
+        return Err(error(
+            CentralErrorCode::ProtocolInvalid,
+            "Storage enrollment display name must contain 1 to 256 characters",
+        ));
+    }
+    if descriptor.region.is_empty()
+        || descriptor.region.len() > 128
+        || !descriptor
+            .region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(error(
+            CentralErrorCode::ProtocolInvalid,
+            "Storage enrollment region is not a valid resource identifier",
+        ));
+    }
+    let pvc_identity = PvcIdentityDigest::derive(
+        &descriptor.pvc_reference.namespace,
+        &descriptor.pvc_reference.claim_name,
+    )?;
+    if &pvc_identity != expected_pvc_identity {
+        return Err(error(
+            CentralErrorCode::AgentIdentityMismatch,
+            "frozen PVC reference differs from its identity digest",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_token_key_id(key_id: &str) -> CentralResult<()> {
+    if key_id.is_empty()
+        || key_id.len() > 128
+        || !key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(error(
+            CentralErrorCode::ProtocolInvalid,
+            "bootstrap token key ID is not a valid resource identifier",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_credential_evidence(
+    evidence: &AgentCredentialEvidence,
+    expected_fingerprint: &ContentDigest,
+) -> CentralResult<()> {
+    if evidence.algorithm != AgentSignatureAlgorithm::Ed25519 {
+        return Err(error(
+            CentralErrorCode::BootstrapDenied,
+            "Agent credential evidence is not a canonical Ed25519 SPKI proof",
+        ));
+    }
+    if &evidence.public_key_spki.fingerprint() != expected_fingerprint {
+        return Err(error(
+            CentralErrorCode::AgentIdentityMismatch,
+            "Agent public-key fingerprint differs from its SPKI identity",
+        ));
+    }
+    Ok(())
+}
+
+struct VerifiedAgentCredentialEvidence {
+    evidence: AgentCredentialEvidence,
+}
+
+fn verify_bootstrap_credential(
+    request: &AgentBootstrapRequest,
+) -> CentralResult<VerifiedAgentCredentialEvidence> {
+    request.verify().map_err(|_| {
+        error(
+            CentralErrorCode::BootstrapDenied,
+            "Agent bootstrap proof of possession is invalid",
+        )
+    })?;
+    let evidence = credential_evidence_from_bootstrap(request);
+    validate_credential_evidence(&evidence, &request.public_key_fingerprint)?;
+    Ok(VerifiedAgentCredentialEvidence { evidence })
+}
+
+fn credential_evidence_from_bootstrap(request: &AgentBootstrapRequest) -> AgentCredentialEvidence {
+    AgentCredentialEvidence {
+        algorithm: request.proof.algorithm,
+        public_key_spki: request.proof.public_key_spki.clone(),
+        proof_of_possession: request.proof.signature.clone(),
+    }
+}
+
+fn validate_rejection_reason(
+    decision: AgentEnrollmentDecision,
+    reason: Option<&str>,
+) -> CentralResult<()> {
+    if reason.is_some() && decision != AgentEnrollmentDecision::Reject {
+        return Err(error(
+            CentralErrorCode::ProtocolInvalid,
+            "a rejection reason is only valid for a rejected enrollment",
+        ));
+    }
+    if reason.is_some_and(|value| value.is_empty() || value.chars().count() > 2_048) {
+        return Err(error(
+            CentralErrorCode::ProtocolInvalid,
+            "Storage enrollment rejection reason must contain 1 to 2048 characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_enrollment_list_request(request: &AgentEnrollmentListRequest) -> CentralResult<()> {
+    if request.limit == 0 || request.limit > AGENT_ENROLLMENT_MAX_PAGE_SIZE {
+        return Err(error(
+            CentralErrorCode::ProtocolInvalid,
+            "Agent enrollment page size is outside the supported range",
+        ));
+    }
+    if request.query.as_ref().is_some_and(|query| {
+        query.is_empty() || query.chars().count() > AGENT_ENROLLMENT_MAX_QUERY_CHARS
+    }) {
+        return Err(error(
+            CentralErrorCode::ProtocolInvalid,
+            "Agent enrollment query must contain 1 to 256 characters",
+        ));
+    }
+    if request
+        .after
+        .as_ref()
+        .is_some_and(|cursor| cursor.created_at_unix_ms.get() > i64::MAX as u64)
+    {
+        return Err(error(
+            CentralErrorCode::ProtocolInvalid,
+            "Agent enrollment cursor timestamp exceeds the SQLite keyset range",
+        ));
+    }
+    Ok(())
+}
+
+fn require_current_registry_record(record: &AgentRegistryRecord) -> CentralResult<()> {
+    if record.storage_enrollment.record_format == AgentRegistryRecordFormat::CurrentV3 {
+        Ok(())
+    } else {
+        Err(legacy_enrollment_reissue())
+    }
+}
+
+fn require_public_enrollment_metadata(record: &AgentRegistryRecord) -> CentralResult<()> {
+    require_current_registry_record(record)?;
+    let metadata = &record.storage_enrollment;
+    let has_verified_candidate_evidence = record.candidate.as_ref().is_none_or(|candidate| {
+        candidate.credential_evidence.is_some()
+            && candidate.proof_of_possession_status == Some(AgentProofOfPossessionStatus::Verified)
+            && candidate.bootstrap_signed_payload_digest.is_some()
+    });
+    if metadata.descriptor.is_some()
+        && metadata.token_key_id.is_some()
+        && metadata.registration_kind.is_some()
+        && metadata.updated_at_unix_ms.is_some()
+        && has_verified_candidate_evidence
+    {
+        Ok(())
+    } else {
+        Err(legacy_enrollment_reissue())
+    }
+}
+
+pub(crate) fn transition_storage_enrollment(
+    record: &mut AgentRegistryRecord,
+    state: Option<StorageEnrollmentState>,
+    kind: AgentEnrollmentLifecycleAuditKind,
+    occurred_at_unix_ms: UnixMillis,
+    rejection_reason: Option<String>,
+) {
+    if record.storage_enrollment.record_format != AgentRegistryRecordFormat::CurrentV3 {
+        return;
+    }
+    record.storage_enrollment.state = state;
+    record.storage_enrollment.updated_at_unix_ms = Some(occurred_at_unix_ms);
+    append_lifecycle_event(record, kind, occurred_at_unix_ms, rejection_reason);
+}
+
+fn touch_storage_enrollment(record: &mut AgentRegistryRecord, updated_at_unix_ms: UnixMillis) {
+    if record.storage_enrollment.record_format == AgentRegistryRecordFormat::CurrentV3 {
+        record.storage_enrollment.updated_at_unix_ms = Some(updated_at_unix_ms);
+    }
+}
+
+fn append_lifecycle_event(
+    record: &mut AgentRegistryRecord,
+    kind: AgentEnrollmentLifecycleAuditKind,
+    occurred_at_unix_ms: UnixMillis,
+    rejection_reason: Option<String>,
+) {
+    let event_id = format!(
+        "agent-enrollment-lifecycle:{}:{}:{}",
+        record.enrollment.enrollment_id,
+        record.resource_version,
+        lifecycle_kind_name(kind)
+    );
+    record
+        .storage_enrollment
+        .lifecycle_audit_events
+        .push(AgentEnrollmentLifecycleAuditEvent {
+            event_id,
+            kind,
+            tenant_id: record.enrollment.tenant_id.clone(),
+            enrollment_id: record.enrollment.enrollment_id.clone(),
+            resource_version: record.resource_version,
+            occurred_at_unix_ms,
+            rejection_reason,
+        });
+}
+
+const fn lifecycle_kind_name(kind: AgentEnrollmentLifecycleAuditKind) -> &'static str {
+    match kind {
+        AgentEnrollmentLifecycleAuditKind::TokenIssued => "token-issued",
+        AgentEnrollmentLifecycleAuditKind::PendingApproval => "pending-approval",
+        AgentEnrollmentLifecycleAuditKind::Approved => "approved",
+        AgentEnrollmentLifecycleAuditKind::Enrolled => "enrolled",
+        AgentEnrollmentLifecycleAuditKind::Rejected => "rejected",
+        AgentEnrollmentLifecycleAuditKind::Expired => "expired",
+        AgentEnrollmentLifecycleAuditKind::Revoked => "revoked",
+    }
+}
+
+fn lifecycle_rejection_reason(record: &AgentRegistryRecord) -> Option<&str> {
+    record
+        .storage_enrollment
+        .lifecycle_audit_events
+        .iter()
+        .rev()
+        .find(|event| event.kind == AgentEnrollmentLifecycleAuditKind::Rejected)
+        .and_then(|event| event.rejection_reason.as_deref())
+}
+
+fn legacy_enrollment_reissue() -> CentralError {
+    error(
+        CentralErrorCode::LegacyEnrollmentRequiresReissue,
+        "legacy Agent enrollment must be reissued before it can be inspected or approved",
+    )
+}
+
+fn enrollment_not_found() -> CentralError {
+    error(
+        CentralErrorCode::EnrollmentNotFound,
+        "Agent enrollment was not found",
+    )
+}
+
+fn bootstrap_status_denied() -> CentralError {
+    error(
+        CentralErrorCode::BootstrapDenied,
+        "Agent bootstrap status identity is invalid or unavailable",
+    )
 }
 
 pub(crate) fn decision_audit_event(
@@ -1126,7 +1925,13 @@ fn token_intent_record(
     mount_generation: MountGeneration,
     owner_generation: OwnerGeneration,
 ) -> AgentRegistryRecord {
-    AgentRegistryRecord {
+    let registration_kind = if replaces_enrollment_id.is_some() {
+        StorageEnrollmentRegistrationKind::Replacement
+    } else {
+        StorageEnrollmentRegistrationKind::Initial
+    };
+    let created_at_unix_ms = request.created_at_unix_ms;
+    let mut record = AgentRegistryRecord {
         resource_version: ResourceVersion::new(1),
         enrollment: AgentEnrollmentRecord {
             token_id: request.token_id,
@@ -1177,7 +1982,23 @@ fn token_intent_record(
             state: VolumeOwnerState::Inactive,
         },
         decision_audit_event: None,
-    }
+        storage_enrollment: StorageEnrollmentMetadata {
+            record_format: AgentRegistryRecordFormat::CurrentV3,
+            descriptor: None,
+            token_key_id: None,
+            registration_kind: Some(registration_kind),
+            state: None,
+            updated_at_unix_ms: Some(created_at_unix_ms),
+            lifecycle_audit_events: Vec::new(),
+        },
+    };
+    append_lifecycle_event(
+        &mut record,
+        AgentEnrollmentLifecycleAuditKind::TokenIssued,
+        created_at_unix_ms,
+        None,
+    );
+    record
 }
 
 fn token_intent_matches_request(
@@ -1201,6 +2022,39 @@ fn token_intent_matches_request(
         && record.enrollment.extensions == request.extensions
         && record.mount.expected_volume_marker == request.expected_volume_marker
         && record.mount.desired_access_mode == request.desired_access_mode
+}
+
+fn storage_intent_matches_request(
+    record: &AgentRegistryRecord,
+    request: &AgentEnrollmentTokenCreateRequest,
+    descriptor: &FrozenStorageDescriptor,
+) -> bool {
+    record.enrollment.token_request_id == request.token_request_id
+        && record.enrollment.tenant_id == request.tenant_id
+        && record.enrollment.edge_cluster_id == request.edge_cluster_id
+        && record.enrollment.storage_volume_id == request.storage_volume_id
+        && record.enrollment.volume_descriptor_digest == request.volume_descriptor_digest
+        && record.enrollment.pvc_identity_digest == request.pvc_identity_digest
+        && record.mount.expected_volume_marker == request.expected_volume_marker
+        && record.mount.desired_access_mode == request.desired_access_mode
+        && record.storage_enrollment.descriptor.as_ref() == Some(descriptor)
+}
+
+fn storage_intent_matches_record(
+    existing: &AgentRegistryRecord,
+    candidate: &AgentRegistryRecord,
+    descriptor: &FrozenStorageDescriptor,
+) -> bool {
+    existing.enrollment.token_request_id == candidate.enrollment.token_request_id
+        && existing.enrollment.tenant_id == candidate.enrollment.tenant_id
+        && existing.enrollment.edge_cluster_id == candidate.enrollment.edge_cluster_id
+        && existing.enrollment.storage_volume_id == candidate.enrollment.storage_volume_id
+        && existing.enrollment.volume_descriptor_digest
+            == candidate.enrollment.volume_descriptor_digest
+        && existing.enrollment.pvc_identity_digest == candidate.enrollment.pvc_identity_digest
+        && existing.mount.expected_volume_marker == candidate.mount.expected_volume_marker
+        && existing.mount.desired_access_mode == candidate.mount.desired_access_mode
+        && existing.storage_enrollment.descriptor.as_ref() == Some(descriptor)
 }
 
 fn active_instance(agent_id: &AgentId, candidate: AgentCandidateRecord) -> AgentInstanceRecord {
@@ -1259,6 +2113,9 @@ fn validate_replacement_scope(
             "replacement target has no approved Agent identity",
         )
     })?;
+    let descriptor_matches = previous.storage_enrollment.record_format
+        == AgentRegistryRecordFormat::LegacyV2
+        || previous.storage_enrollment.descriptor == replacement.storage_enrollment.descriptor;
     if previous.enrollment.tenant_id != replacement.enrollment.tenant_id
         || previous.enrollment.edge_cluster_id != replacement.enrollment.edge_cluster_id
         || previous.enrollment.storage_volume_id != replacement.enrollment.storage_volume_id
@@ -1268,6 +2125,7 @@ fn validate_replacement_scope(
         || previous.mount.expected_volume_marker != replacement.mount.expected_volume_marker
         || previous.mount.desired_access_mode != replacement.mount.desired_access_mode
         || previous.mount.mount_identity_digest != replacement.mount.mount_identity_digest
+        || !descriptor_matches
     {
         return Err(error(
             CentralErrorCode::AgentIdentityMismatch,
@@ -1359,6 +2217,75 @@ fn bootstrap_accepted(record: &AgentRegistryRecord, replayed: bool) -> AgentBoot
         replayed,
         extensions: Extensions::new(),
     }
+}
+
+fn resolve_bootstrap_replay(
+    record: AgentRegistryRecord,
+    candidate: &AgentCandidateRecord,
+    token_digest: &ContentDigest,
+) -> CentralResult<BootstrapAgentResult> {
+    if !bootstrap_replay_matches(&record, candidate, token_digest) {
+        return Err(error(
+            CentralErrorCode::AgentIdentityMismatch,
+            "bootstrap request identity was reused by another Agent candidate",
+        ));
+    }
+    if matches!(
+        record.enrollment.state,
+        AgentEnrollmentState::PendingApproval | AgentEnrollmentState::Approved
+    ) {
+        Ok(BootstrapAgentResult {
+            accepted: bootstrap_accepted(&record, true),
+            record,
+        })
+    } else {
+        Err(error(
+            CentralErrorCode::BootstrapDenied,
+            "bootstrap identity is no longer eligible for approval",
+        ))
+    }
+}
+
+fn bootstrap_replay_matches(
+    record: &AgentRegistryRecord,
+    candidate: &AgentCandidateRecord,
+    token_digest: &ContentDigest,
+) -> bool {
+    if &record.enrollment.bootstrap_token_digest != token_digest
+        || record.enrollment.bootstrap_request_id.as_ref() != Some(&candidate.bootstrap_request_id)
+    {
+        return false;
+    }
+    let Some(stored) = &record.candidate else {
+        return false;
+    };
+    if stored.bootstrap_request_id != candidate.bootstrap_request_id
+        || stored.installation_id != candidate.installation_id
+        || stored.public_key_fingerprint != candidate.public_key_fingerprint
+    {
+        return false;
+    }
+    match stored.bootstrap_signed_payload_digest {
+        // A valid re-signing does not change request identity; raw signature bytes are evidence,
+        // while the key-bound signed payload digest is the idempotency identity.
+        Some(stored_digest) => candidate.bootstrap_signed_payload_digest == Some(stored_digest),
+        None => legacy_candidate_replay_matches(stored, candidate),
+    }
+}
+
+fn legacy_candidate_replay_matches(
+    stored: &AgentCandidateRecord,
+    candidate: &AgentCandidateRecord,
+) -> bool {
+    stored.credential_evidence.is_none()
+        && stored.proof_of_possession_status.is_none()
+        && candidate.credential_evidence.is_none()
+        && candidate.proof_of_possession_status.is_none()
+        && stored.mount_identity_digest == candidate.mount_identity_digest
+        && stored.agent_version == candidate.agent_version
+        && stored.supported_protocol_versions == candidate.supported_protocol_versions
+        && stored.capabilities == candidate.capabilities
+        && stored.probe == candidate.probe
 }
 
 fn require_resource_version(
@@ -1493,7 +2420,7 @@ pub(crate) fn ensure_immutable_registry_scope(
             candidate.mount_identity_digest == candidate.probe.mount_identity_digest
                 && updated.mount.mount_identity_digest == Some(candidate.mount_identity_digest)
         }
-        (Some(stored), Some(updated)) => stored == updated,
+        (Some(stored), Some(updated)) => candidate_status_transition_matches(stored, updated),
         (Some(_), None) => false,
     };
     let mount_scope_matches = stored.mount.agent_mount_id == updated.mount.agent_mount_id
@@ -1539,6 +2466,21 @@ pub(crate) fn ensure_immutable_registry_scope(
         .is_none()
         || stored.enrollment.replaced_by_enrollment_id
             == updated.enrollment.replaced_by_enrollment_id;
+    let storage_metadata_scope_matches = stored.storage_enrollment.record_format
+        == updated.storage_enrollment.record_format
+        && stored.storage_enrollment.descriptor == updated.storage_enrollment.descriptor
+        && stored.storage_enrollment.token_key_id == updated.storage_enrollment.token_key_id
+        && stored.storage_enrollment.registration_kind
+            == updated.storage_enrollment.registration_kind;
+    let lifecycle_audit_is_append_only = updated
+        .storage_enrollment
+        .lifecycle_audit_events
+        .starts_with(&stored.storage_enrollment.lifecycle_audit_events);
+    let storage_update_time_is_monotonic = stored
+        .storage_enrollment
+        .updated_at_unix_ms
+        .zip(updated.storage_enrollment.updated_at_unix_ms)
+        .is_none_or(|(stored, updated)| updated.get() >= stored.get());
     if !enrollment_scope_matches
         || !mount_scope_matches
         || !owner_scope_matches
@@ -1549,6 +2491,9 @@ pub(crate) fn ensure_immutable_registry_scope(
         || !bootstrap_time_transition_valid
         || !review_expiry_transition_valid
         || !replacement_link_transition_valid
+        || !storage_metadata_scope_matches
+        || !lifecycle_audit_is_append_only
+        || !storage_update_time_is_monotonic
     {
         return Err(error(
             CentralErrorCode::AgentIdentityMismatch,
@@ -1556,6 +2501,23 @@ pub(crate) fn ensure_immutable_registry_scope(
         ));
     }
     Ok(())
+}
+
+fn candidate_status_transition_matches(
+    stored: &AgentCandidateRecord,
+    updated: &AgentCandidateRecord,
+) -> bool {
+    stored.bootstrap_request_id == updated.bootstrap_request_id
+        && stored.installation_id == updated.installation_id
+        && stored.public_key_fingerprint == updated.public_key_fingerprint
+        && stored.bootstrap_signed_payload_digest == updated.bootstrap_signed_payload_digest
+        && stored.mount_identity_digest == updated.mount_identity_digest
+        && stored.agent_version == updated.agent_version
+        && stored.supported_protocol_versions == updated.supported_protocol_versions
+        && stored.capabilities == updated.capabilities
+        && stored.probe == updated.probe
+        && stored.credential_evidence == updated.credential_evidence
+        && stored.proof_of_possession_status == updated.proof_of_possession_status
 }
 
 pub(crate) fn validate_registry_replace_transition(
@@ -1571,6 +2533,13 @@ pub(crate) fn validate_registry_replace_transition(
     }
     let valid = (stored.enrollment.state == AgentEnrollmentState::Approved
         && updated.enrollment.state == AgentEnrollmentState::Approved)
+        || (stored.enrollment.state == updated.enrollment.state
+            && matches!(
+                stored.enrollment.state,
+                AgentEnrollmentState::PendingApproval
+                    | AgentEnrollmentState::Rejected
+                    | AgentEnrollmentState::Expired
+            ))
         || matches!(
             (stored.enrollment.state, updated.enrollment.state),
             (
@@ -1587,6 +2556,11 @@ pub(crate) fn validate_registry_replace_transition(
     if !valid {
         return Err(registry_corruption(
             "Agent registry replace attempted an invalid enrollment state transition",
+        ));
+    }
+    if !storage_enrollment_transition_matches(stored, updated) {
+        return Err(registry_corruption(
+            "Agent enrollment public state and lifecycle audit were not changed atomically",
         ));
     }
     if stored.enrollment.state == AgentEnrollmentState::PendingApproval
@@ -1638,6 +2612,77 @@ pub(crate) fn validate_registry_replace_transition(
         }
     }
     Ok(())
+}
+
+fn storage_enrollment_transition_matches(
+    stored: &AgentRegistryRecord,
+    updated: &AgentRegistryRecord,
+) -> bool {
+    if stored.storage_enrollment.record_format == AgentRegistryRecordFormat::LegacyV2 {
+        return updated.storage_enrollment == stored.storage_enrollment;
+    }
+    let (expected, expected_event) = match (stored.enrollment.state, updated.enrollment.state) {
+        (AgentEnrollmentState::TokenIssued, AgentEnrollmentState::PendingApproval) => (
+            Some(StorageEnrollmentState::PendingApproval),
+            Some(AgentEnrollmentLifecycleAuditKind::PendingApproval),
+        ),
+        (AgentEnrollmentState::TokenIssued, AgentEnrollmentState::Expired) => {
+            (None, Some(AgentEnrollmentLifecycleAuditKind::Expired))
+        }
+        (AgentEnrollmentState::PendingApproval, AgentEnrollmentState::Approved) => (
+            Some(StorageEnrollmentState::Approved),
+            Some(AgentEnrollmentLifecycleAuditKind::Approved),
+        ),
+        (AgentEnrollmentState::PendingApproval, AgentEnrollmentState::Rejected) => (
+            Some(StorageEnrollmentState::Rejected),
+            Some(AgentEnrollmentLifecycleAuditKind::Rejected),
+        ),
+        (AgentEnrollmentState::PendingApproval, AgentEnrollmentState::Expired) => (
+            Some(StorageEnrollmentState::Expired),
+            Some(AgentEnrollmentLifecycleAuditKind::Expired),
+        ),
+        (AgentEnrollmentState::PendingApproval, AgentEnrollmentState::PendingApproval) => {
+            (Some(StorageEnrollmentState::PendingApproval), None)
+        }
+        (AgentEnrollmentState::Rejected, AgentEnrollmentState::Rejected) => {
+            (Some(StorageEnrollmentState::Rejected), None)
+        }
+        (AgentEnrollmentState::Expired, AgentEnrollmentState::Expired)
+            if stored.candidate.is_some() =>
+        {
+            (Some(StorageEnrollmentState::Expired), None)
+        }
+        (AgentEnrollmentState::Approved, AgentEnrollmentState::Approved)
+            if matches!(
+                (
+                    stored.storage_enrollment.state,
+                    updated.storage_enrollment.state
+                ),
+                (
+                    Some(StorageEnrollmentState::Approved),
+                    Some(StorageEnrollmentState::Approved | StorageEnrollmentState::Enrolled)
+                ) | (
+                    Some(StorageEnrollmentState::Enrolled),
+                    Some(StorageEnrollmentState::Enrolled)
+                )
+            ) =>
+        {
+            let event = (stored.storage_enrollment.state != updated.storage_enrollment.state)
+                .then_some(AgentEnrollmentLifecycleAuditKind::Enrolled);
+            (updated.storage_enrollment.state, event)
+        }
+        _ => return false,
+    };
+    if updated.storage_enrollment.state != expected {
+        return false;
+    }
+    match expected_event {
+        Some(kind) => lifecycle_kind_appended(stored, updated, kind),
+        None => {
+            updated.storage_enrollment.lifecycle_audit_events
+                == stored.storage_enrollment.lifecycle_audit_events
+        }
+    }
 }
 
 pub(crate) fn validate_registry_insert(record: &AgentRegistryRecord) -> CentralResult<()> {
@@ -1709,6 +2754,40 @@ pub(crate) fn validate_registry_replacement_transition(
             "Agent replacement records do not form one bidirectional state transition",
         ));
     }
+    let lifecycle_is_atomic = match (
+        stored_previous.storage_enrollment.record_format,
+        stored_replacement.storage_enrollment.record_format,
+    ) {
+        (AgentRegistryRecordFormat::LegacyV2, AgentRegistryRecordFormat::CurrentV3) => {
+            revoked.storage_enrollment == stored_previous.storage_enrollment
+                && replacement.storage_enrollment.state == Some(StorageEnrollmentState::Approved)
+                && lifecycle_kind_appended(
+                    stored_replacement,
+                    replacement,
+                    AgentEnrollmentLifecycleAuditKind::Approved,
+                )
+        }
+        (AgentRegistryRecordFormat::CurrentV3, AgentRegistryRecordFormat::CurrentV3) => {
+            revoked.storage_enrollment.state.is_none()
+                && replacement.storage_enrollment.state == Some(StorageEnrollmentState::Approved)
+                && lifecycle_kind_appended(
+                    stored_previous,
+                    revoked,
+                    AgentEnrollmentLifecycleAuditKind::Revoked,
+                )
+                && lifecycle_kind_appended(
+                    stored_replacement,
+                    replacement,
+                    AgentEnrollmentLifecycleAuditKind::Approved,
+                )
+        }
+        _ => false,
+    };
+    if !lifecycle_is_atomic {
+        return Err(registry_corruption(
+            "Agent replacement status and lifecycle audit were not committed atomically",
+        ));
+    }
 
     let scope_matches = stored_previous.enrollment.tenant_id
         == stored_replacement.enrollment.tenant_id
@@ -1773,6 +2852,22 @@ pub(crate) fn validate_registry_replacement_transition(
     Ok(())
 }
 
+fn lifecycle_kind_appended(
+    stored: &AgentRegistryRecord,
+    updated: &AgentRegistryRecord,
+    kind: AgentEnrollmentLifecycleAuditKind,
+) -> bool {
+    updated.storage_enrollment.lifecycle_audit_events.len()
+        == stored.storage_enrollment.lifecycle_audit_events.len() + 1
+        && updated
+            .storage_enrollment
+            .lifecycle_audit_events
+            .last()
+            .is_some_and(|event| {
+                event.kind == kind && event.resource_version == updated.resource_version
+            })
+}
+
 pub(crate) fn checked_next_registry_resource_version(current: u64) -> CentralResult<u64> {
     current
         .checked_add(1)
@@ -1805,6 +2900,7 @@ pub(crate) fn ensure_registry_marker_invariant(record: &AgentRegistryRecord) -> 
 
 pub(crate) fn validate_registry_record(record: &AgentRegistryRecord) -> CentralResult<()> {
     ensure_registry_marker_invariant(record)?;
+    validate_storage_enrollment_metadata(record)?;
     if record.resource_version.get() == 0
         || record.mount.mount_generation.get() == 0
         || record.owner.owner_generation.get() == 0
@@ -2039,6 +3135,142 @@ pub(crate) fn validate_registry_record(record: &AgentRegistryRecord) -> CentralR
     {
         return Err(registry_corruption(
             "a revoked enrollment must point at its replacement",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_storage_enrollment_metadata(record: &AgentRegistryRecord) -> CentralResult<()> {
+    let metadata = &record.storage_enrollment;
+    if metadata.record_format == AgentRegistryRecordFormat::LegacyV2 {
+        if metadata != &StorageEnrollmentMetadata::default() {
+            return Err(registry_corruption(
+                "legacy Agent enrollment contains partially upgraded public metadata",
+            ));
+        }
+        return Ok(());
+    }
+    let expected_kind = if record.enrollment.replaces_enrollment_id.is_some() {
+        StorageEnrollmentRegistrationKind::Replacement
+    } else {
+        StorageEnrollmentRegistrationKind::Initial
+    };
+    if metadata.registration_kind != Some(expected_kind)
+        || metadata.updated_at_unix_ms.is_none()
+        || metadata.lifecycle_audit_events.is_empty()
+    {
+        return Err(registry_corruption(
+            "current Agent enrollment lacks registration, time, or lifecycle metadata",
+        ));
+    }
+    if let Some(descriptor) = &metadata.descriptor {
+        let pvc_identity = PvcIdentityDigest::derive(
+            &descriptor.pvc_reference.namespace,
+            &descriptor.pvc_reference.claim_name,
+        )
+        .map_err(|_| registry_corruption("frozen PVC descriptor is invalid"))?;
+        if pvc_identity != record.enrollment.pvc_identity_digest {
+            return Err(registry_corruption(
+                "frozen PVC descriptor differs from the enrollment identity",
+            ));
+        }
+    }
+    if metadata
+        .token_key_id
+        .as_ref()
+        .is_some_and(|key_id| validate_token_key_id(key_id).is_err())
+    {
+        return Err(registry_corruption(
+            "persisted bootstrap token key ID is invalid",
+        ));
+    }
+    if let Some(candidate) = &record.candidate {
+        let evidence_is_valid = candidate
+            .credential_evidence
+            .as_ref()
+            .is_none_or(|evidence| {
+                validate_credential_evidence(evidence, &candidate.public_key_fingerprint).is_ok()
+            });
+        let verified_evidence_is_complete = candidate.credential_evidence.is_some()
+            && candidate.proof_of_possession_status == Some(AgentProofOfPossessionStatus::Verified)
+            && candidate.bootstrap_signed_payload_digest.is_some();
+        let has_any_proof_state = candidate.credential_evidence.is_some()
+            || candidate.proof_of_possession_status.is_some();
+        let is_public_enrollment = metadata.descriptor.is_some() || metadata.token_key_id.is_some();
+        if !evidence_is_valid
+            || (has_any_proof_state && !verified_evidence_is_complete)
+            || (is_public_enrollment && !verified_evidence_is_complete)
+        {
+            return Err(registry_corruption(
+                "persisted Agent credential evidence is not server-verified",
+            ));
+        }
+    }
+    let expected_state = match record.enrollment.state {
+        AgentEnrollmentState::TokenIssued => None,
+        AgentEnrollmentState::PendingApproval => Some(StorageEnrollmentState::PendingApproval),
+        AgentEnrollmentState::Approved => match metadata.state {
+            Some(StorageEnrollmentState::Approved | StorageEnrollmentState::Enrolled) => {
+                metadata.state
+            }
+            _ => None,
+        },
+        AgentEnrollmentState::Rejected => Some(StorageEnrollmentState::Rejected),
+        AgentEnrollmentState::Expired if record.candidate.is_some() => {
+            Some(StorageEnrollmentState::Expired)
+        }
+        AgentEnrollmentState::Expired | AgentEnrollmentState::Revoked => None,
+    };
+    if metadata.state != expected_state {
+        return Err(registry_corruption(
+            "Agent enrollment public state differs from its internal lifecycle",
+        ));
+    }
+    if metadata.state.is_some()
+        && record
+            .enrollment
+            .bootstrapped_at_unix_ms
+            .is_none_or(|created_at| created_at.get() > i64::MAX as u64)
+    {
+        return Err(registry_corruption(
+            "Agent enrollment public creation time exceeds the SQLite keyset range",
+        ));
+    }
+    for (index, event) in metadata.lifecycle_audit_events.iter().enumerate() {
+        let expected_event_id = format!(
+            "agent-enrollment-lifecycle:{}:{}:{}",
+            record.enrollment.enrollment_id,
+            event.resource_version,
+            lifecycle_kind_name(event.kind)
+        );
+        if event.event_id != expected_event_id
+            || event.tenant_id != record.enrollment.tenant_id
+            || event.enrollment_id != record.enrollment.enrollment_id
+            || event.resource_version.get() == 0
+            || event.resource_version.get() > record.resource_version.get()
+            || index > 0
+                && metadata.lifecycle_audit_events[index - 1]
+                    .resource_version
+                    .get()
+                    >= event.resource_version.get()
+            || event.rejection_reason.is_some()
+                && (event.kind != AgentEnrollmentLifecycleAuditKind::Rejected
+                    || event
+                        .rejection_reason
+                        .as_ref()
+                        .is_some_and(|reason| reason.is_empty() || reason.chars().count() > 2_048))
+        {
+            return Err(registry_corruption(
+                "Agent enrollment lifecycle audit is malformed or out of order",
+            ));
+        }
+    }
+    if metadata.lifecycle_audit_events.first().is_none_or(|event| {
+        event.kind != AgentEnrollmentLifecycleAuditKind::TokenIssued
+            || event.resource_version.get() != 1
+    }) {
+        return Err(registry_corruption(
+            "Agent enrollment lifecycle audit does not start at token issuance",
         ));
     }
     Ok(())

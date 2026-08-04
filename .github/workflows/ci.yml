@@ -118,6 +118,36 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run default-feature tests
         run: cargo test --workspace --all-targets --locked
+      - name: Test the real Linux mount probe
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mount_root="$(mktemp -d "${RUNNER_TEMP}/neoengram-mount-probe.XXXXXX")"
+          cleanup() {
+            local status=$?
+            trap - EXIT INT TERM
+            if mountpoint --quiet "$mount_root"; then
+              sudo -n umount "$mount_root" || status=1
+            fi
+            rmdir "$mount_root" || status=1
+            exit "$status"
+          }
+          trap cleanup EXIT INT TERM
+
+          sudo -n mount \
+            --types tmpfs \
+            --options "size=16m,mode=0770,uid=$(id -u),gid=$(id -g)" \
+            neoengram-ci "$mount_root"
+          printf 'neoengram-ci-volume\n' > \
+            "$mount_root/.neoengram-volume-marker"
+
+          NEOENGRAM_REAL_MOUNT_PROBE_ROOT="$mount_root" \
+            cargo test --locked -p neoengram-agent \
+              --test linux_mount_probe \
+              detects_real_mount_boundary_and_read_write_capabilities \
+              -- --ignored --exact
 
   test-all-features:
     name: Test all features (Linux)

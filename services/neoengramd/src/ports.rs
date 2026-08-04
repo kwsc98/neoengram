@@ -8,9 +8,11 @@ use neoengram_protocol::{
 };
 
 use crate::{
-    AgentEnrollmentAuditEvent, AgentRegistryRecord, AgentRegistryReplacementRecords, AuditEvent,
-    AuthorizationRequest, CentralResult, DurableObject, IndexKey, IndexPublishOutcome,
-    IndexPublishRequest, JobKey, JobRecord, StagedMetadataBatch,
+    AgentEnrollmentAuditEvent, AgentEnrollmentExpiryReconciliation,
+    AgentEnrollmentLifecycleAuditEvent, AgentEnrollmentListPage, AgentEnrollmentListRequest,
+    AgentRegistryRecord, AgentRegistryReplacementRecords, AuditEvent, AuthorizationRequest,
+    CentralResult, DurableObject, IndexKey, IndexPublishOutcome, IndexPublishRequest, JobKey,
+    JobRecord, StagedMetadataBatch,
 };
 
 /// Result of atomically inserting a job or loading the record already stored at its key.
@@ -47,6 +49,15 @@ pub trait AgentRegistryRepository: Send + Sync {
         &self,
         enrollment_id: &neoengram_protocol::AgentEnrollmentId,
     ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn get_for_tenant(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        enrollment_id: &neoengram_protocol::AgentEnrollmentId,
+    ) -> CentralResult<Option<AgentRegistryRecord>>;
+    async fn list_for_tenant(
+        &self,
+        request: &AgentEnrollmentListRequest,
+    ) -> CentralResult<AgentEnrollmentListPage>;
     async fn get_by_agent(
         &self,
         agent_id: &neoengram_protocol::AgentId,
@@ -96,8 +107,32 @@ pub trait AgentRegistryRepository: Send + Sync {
         pvc_identity_digest: &neoengram_protocol::PvcIdentityDigest,
         now_unix_ms: neoengram_protocol::UnixMillis,
     ) -> CentralResult<usize>;
+    async fn expire_stale_review_enrollments(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        now_unix_ms: neoengram_protocol::UnixMillis,
+    ) -> CentralResult<usize>;
+    /// Atomically expires every stale token intent and pending review in the registry.
+    async fn reconcile_expired_enrollments(
+        &self,
+        now_unix_ms: neoengram_protocol::UnixMillis,
+    ) -> CentralResult<AgentEnrollmentExpiryReconciliation>;
     /// Returns immutable decision audit events persisted in the same CAS aggregates.
     async fn enrollment_audit_events(&self) -> CentralResult<Vec<AgentEnrollmentAuditEvent>>;
+    /// Returns lifecycle events persisted atomically with each enrollment state transition.
+    async fn enrollment_lifecycle_audit_events(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+    ) -> CentralResult<Vec<AgentEnrollmentLifecycleAuditEvent>>;
+    /// Atomically consumes a strictly increasing bootstrap-status signature timestamp.
+    ///
+    /// This is an authentication replay watermark, not an aggregate domain mutation: successful
+    /// consumption must not advance the public ResourceVersion or enrollment update time.
+    async fn consume_bootstrap_status_signed_at(
+        &self,
+        enrollment_id: &neoengram_protocol::AgentEnrollmentId,
+        signed_at_unix_ms: neoengram_protocol::UnixMillis,
+    ) -> CentralResult<()>;
     /// Inserts only a fresh `TokenIssued` intent; later states must use the CAS methods.
     async fn insert_or_load(
         &self,

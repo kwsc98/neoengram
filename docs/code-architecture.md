@@ -1,12 +1,14 @@
 # 源码架构
 
 NeoEngram `0.2.0` 已完成 P0 crate 边界改造：本地 CLI、可复用领域模型、执行端口、文件系统
-适配器、Standalone 应用、wire protocol、Agent 和中心控制状态机分别拥有独立 crate。当前仍以
-本地 format v8 工作流为可运行产品；Agent 与中心仍是无网络 library，中心已提供后端无关
-`AuthorityStore` 和默认 SQLite 单节点权威后端。Vue 3 Web 控制台可通过 MSW 运行多租户资源浏览、
+适配器、Standalone 应用、wire protocol、Agent、中心控制状态机和 HTTP server 分别拥有独立 crate。
+当前仍以本地 format v8 工作流为主要产品；`neoengramd` 保持无网络 library，中心已提供后端无关
+`AuthorityStore` 和默认 SQLite 单节点权威后端。`neoengram-server` 默认通过 Fusen 0.9.0 暴露六个
+system/Job 接口；启用 enrollment 时增加五个公开管理接口，并通过独立 Hyper listener 提供两条 Agent
+bootstrap/status 路由。`neoengram-agentd` 提供可运行的出站 enrollment/polling 进程。Vue 3 Web 控制台可通过 MSW 运行多租户资源浏览、
 StorageVolume 登记与放置选择、Artifact/Playground/Snapshot 创建、Playground Commit 与 Managed
 Add Job 流程，并可查看 Commit 描述、Tags、父 Commit 信息和文件 Diff，但尚未
-连接真实中心。这不代表 HTTP、PostgreSQL、mTLS、真实 S3 或 daemon 已经实现。能力状态和后续路线统一见
+连接完整真实中心。这不代表其余 OpenAPI、PostgreSQL、Agent mTLS、真实 S3 或 HA 已经实现。能力状态和后续路线统一见
 [`implementation-plan.md`](implementation-plan.md)。
 
 ## Workspace 与职责
@@ -21,13 +23,15 @@ crates/
 ├── neoengram-agent/       # 无网络 Agent 状态机、ports、Ledger 和测试适配器
 └── neoengram/             # Clap、cwd 输入、typed Result/progress/diagnostic 的唯一终端渲染入口
 services/
-└── neoengramd/            # 无网络中心状态机、AuthorityStore、InMemory/SQLite 权威后端
+├── neoengramd/            # 无网络中心状态机、ports、datasource/mapper 与 SQLite 权威后端
+├── neoengram-server/      # Fusen 用户 HTTP、Hyper Agent enrollment 与运行时组装
+└── neoengram-agentd/      # Agent enrollment/polling binary、配置、健康与 HTTP client
 apps/
 └── neoengram-web/         # 独立 Vue 3 SPA；公开 OpenAPI 生成类型与 MSW 开发适配器
 ```
 
-除 `neoengram-core` 和 `neoengram` 外，P0 新增 package 均为 workspace-private。Agent 和
-`neoengramd` 当前均为 library-only；需要真实用户 API transport 时再创建 `neoengram-client`，
+除 `neoengram-core` 和 `neoengram` 外，新增 package 均为 workspace-private。Agent 和
+`neoengramd` 保持 library-only；`neoengram-server` 与 `neoengram-agentd` 是 binary/传输适配器。需要公开用户客户端时再创建 `neoengram-client`，
 不提前维护空 client crate。
 
 `neoengram-web` 不属于 Cargo workspace。它只能依赖 `docs/openapi/neoengram-api.yaml` 定义的公开
@@ -66,6 +70,14 @@ scope，服务端仍从认证结果执行 RBAC，不能信任浏览器选择。
   `FailureInjector`。
 - `neoengram-protocol` 只依赖 core 和序列化/Schema/JCS 库，不依赖 engine、CLI、SQLite、文件系统、
   HTTP 或存储 SDK。未知扩展字段可 round-trip，未知消息类型以稳定错误拒绝。
+- `neoengram-server` 的 controller 只绑定 Fusen DTO 并调用 service；service 调用 `neoengramd`
+  `ControlPlane`/ports，不能访问 SQLx。SQLite datasource 只管理连接、锁、schema、迁移和完整性，
+  repository 查询、行映射与 port 实现集中在 mapper。调用方向固定为
+  `controller -> service -> ControlPlane/ports -> mapper -> datasource`。
+- server 默认注册版本查询、live、ready、Job create/query/finalize 六个路由；启用 enrollment 后在
+  Fusen listener 增加五个认证管理路由，并在独立 Hyper listener 增加 bootstrap/status。认证业务接口
+  要求 API version 与经外部 OIDC/JWKS 验证的 Bearer JWT，RBAC 缺省拒绝；Agent listener 使用一次性
+  token 与 Ed25519 proof。`AssignJob`、`ExpireAddJob`、`ResumePublication` 仍是内部方法，不能注册为 HTTP 路由。
 - `neoengram-agent` 的生产依赖只有 core、engine 和 protocol，不依赖 standalone；它对 `neoengramd`
   的 `dev-dependency` 只用于内存组合测试。`neoengramd` 只依赖 core 和 protocol，不依赖 engine、fs
   或 standalone。
@@ -79,7 +91,8 @@ neoengram CLI -> standalone -> engine <- agent
                          ^             ^
                          +---- core ---+
 
-neoengram-web -> public OpenAPI -> neoengramd HTTP adapter (future)
+neoengram-web -> public OpenAPI -> neoengram-server -> neoengramd -> protocol/core
+neoengram-agentd -> neoengram-agent + protocol -> neoengram-server Agent listener
 ```
 
 该图表示 production/runtime 的主要分层方向，不枚举所有直接 manifest 边；例如 CLI 还直接导入
@@ -113,10 +126,12 @@ Prepared 并从 Ledger 重放。Core 是 publication digest 的唯一 canonical 
 assignment identity、result/publication digest、descriptors 和 extensions。Agent 只接受 digest 等于
 Prepared 结果且 revision 为 base + 1 的 Publish decision。失败上报统一使用 protocol `JobFailed`。
 Manifest record 以 `chunk_start` 分片跨页，中心重组完整 Chunk 序列后重新校验 canonical Manifest ID。
-InMemory 与 SQLite 运行同一行为契约。SQLite 是显式路径、单进程、单连接的默认中心权威后端，
+InMemory 与 SQLite 运行同一行为契约。SQLite 是显式路径、单进程、单连接的默认中心权威后端；
+`neoengram-server` 使用 SQLite 时只能部署一个副本。生产 HTTP 明文监听位于受控网络，TLS 必须由
+Ingress/反向代理终止；多副本、HA/RLS 仍需要 PostgreSQL adapter。
 不提供 HA 或数据库级 RLS；PG/MySQL 后端将独立实现 SQL/schema/migration，只复用 ports 与契约测试。
-HTTP/2、HTTP/3、mTLS、OIDC、PostgreSQL、真实 S3、
-NFS fencing 和 daemon 属于后续 adapter/部署阶段，不能放进上述稳定 crate 以伪装成已实现能力。
+HTTP/2、HTTP/3、Agent mTLS/session/Job delivery、PostgreSQL、真实 S3 和 NFS fencing 属于后续
+adapter/部署阶段；当前 enrollment daemon 不能被描述为完整业务 Agent。
 
 本地磁盘布局及事务语义见 [`storage-architecture.md`](storage-architecture.md)；中心与 Agent 的详细
 边界见 [`agent-central-control.md`](agent-central-control.md)。

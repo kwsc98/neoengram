@@ -2,6 +2,7 @@ use std::{fmt, path::Path};
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     sqlite_storage::{storage_corruption, storage_error, LockedSqlite, SqliteDefinition},
@@ -44,8 +45,9 @@ pub struct PrivateKeyMaterial(Vec<u8>);
 
 impl PrivateKeyMaterial {
     pub fn new(bytes: impl Into<Vec<u8>>) -> AgentResult<Self> {
-        let bytes = bytes.into();
+        let mut bytes = bytes.into();
         if bytes.is_empty() || bytes.len() > MAX_PRIVATE_KEY_BYTES {
+            bytes.zeroize();
             return Err(AgentError::new(
                 AgentErrorCode::InvalidState,
                 "Agent private key material has an invalid length",
@@ -57,6 +59,30 @@ impl PrivateKeyMaterial {
     #[must_use]
     pub fn expose_secret(&self) -> &[u8] {
         &self.0
+    }
+
+    fn validate(&self) -> AgentResult<()> {
+        if self.0.is_empty() || self.0.len() > MAX_PRIVATE_KEY_BYTES {
+            return Err(AgentError::new(
+                AgentErrorCode::InvalidState,
+                "Agent private key material has an invalid length",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Zeroize for PrivateKeyMaterial {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for PrivateKeyMaterial {}
+
+impl Drop for PrivateKeyMaterial {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
@@ -111,6 +137,49 @@ impl ApprovedAgentIdentity {
     fn validate(&self) -> AgentResult<()> {
         validate_identifier("approved Agent ID", &self.agent_id)?;
         validate_identifier("approved enrollment ID", &self.enrollment_id)
+    }
+}
+
+/// Terminal enrollment state persisted before an Agent identity can be approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalEnrollmentState {
+    Rejected,
+    Expired,
+}
+
+impl TerminalEnrollmentState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// Durable terminal result for one immutable bootstrap enrollment identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalEnrollmentOutcome {
+    pub state: TerminalEnrollmentState,
+    pub enrollment_id: String,
+}
+
+impl TerminalEnrollmentOutcome {
+    pub fn new(
+        state: TerminalEnrollmentState,
+        enrollment_id: impl Into<String>,
+    ) -> AgentResult<Self> {
+        let value = Self {
+            state,
+            enrollment_id: enrollment_id.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> AgentResult<()> {
+        validate_identifier("terminal enrollment ID", &self.enrollment_id)
     }
 }
 
@@ -179,6 +248,8 @@ pub struct SystemIdentityRecord {
     pub approved: Option<ApprovedAgentIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate: Option<AgentCertificateState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_enrollment: Option<TerminalEnrollmentOutcome>,
 }
 
 impl SystemIdentityRecord {
@@ -190,6 +261,7 @@ impl SystemIdentityRecord {
             private_key: seed.private_key,
             approved: None,
             certificate: None,
+            terminal_enrollment: None,
         }
     }
 
@@ -201,9 +273,17 @@ impl SystemIdentityRecord {
         }
         validate_identifier("bootstrap request ID", &self.bootstrap_request_id)?;
         validate_identifier("installation ID", &self.installation_id)?;
-        PrivateKeyMaterial::new(self.private_key.0.clone())?;
+        self.private_key.validate()?;
         if let Some(approved) = &self.approved {
             approved.validate()?;
+        }
+        if let Some(terminal) = &self.terminal_enrollment {
+            terminal.validate()?;
+            if self.approved.is_some() || self.certificate.is_some() {
+                return Err(storage_corruption(
+                    "Agent terminal enrollment cannot coexist with approval or certificate state",
+                ));
+            }
         }
         if let Some(certificate) = &self.certificate {
             if self.approved.is_none() {
@@ -233,7 +313,7 @@ struct StoredColumns {
     bootstrap_request_id: String,
     installation_id: String,
     revision: String,
-    payload: Vec<u8>,
+    payload: Zeroizing<Vec<u8>>,
 }
 
 impl SqliteSystemIdentityStore {
@@ -305,13 +385,37 @@ impl SqliteSystemIdentityStore {
         if next.approved.as_ref() == Some(&approved) {
             return Ok(next);
         }
-        if next.approved.is_some() {
+        if next.approved.is_some() || next.terminal_enrollment.is_some() {
             return Err(AgentError::new(
                 AgentErrorCode::AssignmentMismatch,
-                "approved Agent identity cannot be rebound",
+                "approved Agent identity conflicts with an existing enrollment outcome",
             ));
         }
         next.approved = Some(approved);
+        self.compare_exchange(expected_revision, next)
+    }
+
+    /// Binds a rejected or expired enrollment once. An exact replay returns the durable result.
+    pub fn bind_terminal_enrollment(
+        &self,
+        expected_revision: u64,
+        terminal: TerminalEnrollmentOutcome,
+    ) -> AgentResult<SystemIdentityRecord> {
+        terminal.validate()?;
+        let mut next = self.required_identity()?;
+        if next.terminal_enrollment.as_ref() == Some(&terminal) {
+            return Ok(next);
+        }
+        if next.terminal_enrollment.is_some()
+            || next.approved.is_some()
+            || next.certificate.is_some()
+        {
+            return Err(AgentError::new(
+                AgentErrorCode::AssignmentMismatch,
+                "terminal enrollment outcome conflicts with existing Agent identity state",
+            ));
+        }
+        next.terminal_enrollment = Some(terminal);
         self.compare_exchange(expected_revision, next)
     }
 
@@ -401,6 +505,10 @@ impl SqliteSystemIdentityStore {
                 .as_ref()
                 .is_some_and(|approved| next.approved.as_ref() != Some(approved))
             || current.certificate.is_some() && next.certificate.is_none()
+            || current
+                .terminal_enrollment
+                .as_ref()
+                .is_some_and(|terminal| next.terminal_enrollment.as_ref() != Some(terminal))
         {
             return Err(AgentError::new(
                 AgentErrorCode::AssignmentMismatch,
@@ -421,7 +529,7 @@ impl SqliteSystemIdentityStore {
                  WHERE singleton = 1 AND revision = ?3",
                 params![
                     next.revision.to_string(),
-                    payload,
+                    payload.as_slice(),
                     expected_revision.to_string()
                 ],
             )
@@ -511,6 +619,7 @@ fn same_record_ignoring_revision(
     same_immutable_seed(left, right)
         && left.approved == right.approved
         && left.certificate == right.certificate
+        && left.terminal_enrollment == right.terminal_enrollment
 }
 
 fn validate_identifier(name: &'static str, value: &str) -> AgentResult<()> {
@@ -527,6 +636,7 @@ fn validate_identifier(name: &'static str, value: &str) -> AgentResult<()> {
 }
 
 fn insert_record(transaction: &Transaction<'_>, record: &SystemIdentityRecord) -> AgentResult<()> {
+    let payload = encode(record)?;
     transaction
         .execute(
             "INSERT INTO system_identity \
@@ -536,7 +646,7 @@ fn insert_record(transaction: &Transaction<'_>, record: &SystemIdentityRecord) -
                 record.bootstrap_request_id,
                 record.installation_id,
                 record.revision.to_string(),
-                encode(record)?,
+                payload.as_slice(),
             ],
         )
         .map_err(storage_error)?;
@@ -561,15 +671,16 @@ fn columns_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredColumns> 
         bootstrap_request_id: row.get(0)?,
         installation_id: row.get(1)?,
         revision: row.get(2)?,
-        payload: row.get(3)?,
+        payload: Zeroizing::new(row.get(3)?),
     })
 }
 
-fn encode(record: &SystemIdentityRecord) -> AgentResult<Vec<u8>> {
+fn encode(record: &SystemIdentityRecord) -> AgentResult<Zeroizing<Vec<u8>>> {
     serde_json::to_vec(&StoredIdentityV1 {
         format: RECORD_FORMAT,
         value: record.clone(),
     })
+    .map(Zeroizing::new)
     .map_err(storage_error)
 }
 

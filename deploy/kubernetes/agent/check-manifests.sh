@@ -57,6 +57,7 @@ done
 
 for expected in \
   'storage_volume_id: volume-example' \
+  'volume_descriptor_digest: replace-with-64-lowercase-hex-descriptor-digest' \
   'region: cn-example-1' \
   'backend_type: pvc' \
   'access_mode: read_write_many' \

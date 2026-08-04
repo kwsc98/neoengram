@@ -202,13 +202,36 @@ const jobContracts = {
   createAddJob: {
     path: "/api/job/add/create",
     successSchema: "#/components/schemas/CreateAddJobResponse",
-    statuses: ["200", "401", "403", "408", "409", "413", "422", "500", "503"],
+    statuses: [
+      "200",
+      "401",
+      "403",
+      "408",
+      "409",
+      "413",
+      "422",
+      "429",
+      "500",
+      "503",
+      "504",
+    ],
     successExamples: ["created", "replayed"],
   },
   queryJob: {
     path: "/api/job/query",
     successSchema: "#/components/schemas/QueryJobResponse",
-    statuses: ["200", "401", "403", "404", "413", "422", "500", "503"],
+    statuses: [
+      "200",
+      "401",
+      "403",
+      "404",
+      "413",
+      "422",
+      "429",
+      "500",
+      "503",
+      "504",
+    ],
     successExamples: ["current", "repeated"],
   },
   finalizeAddJob: {
@@ -223,8 +246,10 @@ const jobContracts = {
       "409",
       "413",
       "422",
+      "429",
       "500",
       "503",
+      "504",
     ],
     successExamples: ["published", "replayed"],
   },
@@ -295,6 +320,33 @@ assert(
     .some((parameter) => parameter.name === "NeoEngram-API-Version"),
   "version query must not require a version header",
 );
+
+for (const operationId of [
+  "queryApiVersion",
+  "createAddJob",
+  "queryJob",
+  "finalizeAddJob",
+  "createStorageEnrollmentToken",
+  "queryStorageEnrollmentList",
+  "queryStorageEnrollment",
+  "approveStorageEnrollment",
+  "rejectStorageEnrollment",
+  "liveProbe",
+  "readyProbe",
+]) {
+  const [path, [method]] = Object.entries(expectedOperations).find(
+    ([, [, candidate]]) => candidate === operationId,
+  );
+  const responses = document.paths[path][method].responses;
+  assert(
+    responses["429"]?.$ref === "#/components/responses/OverloadedProblem",
+    `${operationId} does not declare the public 429 overload response`,
+  );
+  assert(
+    responses["504"]?.$ref === "#/components/responses/RequestTimeoutProblem",
+    `${operationId} does not declare the public 504 timeout response`,
+  );
+}
 
 const createRequest = document.components.schemas.CreateAddJobRequest;
 assert(
@@ -951,27 +1003,86 @@ const storageEnrollmentOperations = {
   createStorageEnrollmentToken: {
     path: "/api/storage/enrollment/token/create",
     permission: "storage.enrollment.create",
-    statuses: ["200", "401", "403", "404", "409", "413", "422", "500", "503"],
+    statuses: [
+      "200",
+      "401",
+      "403",
+      "404",
+      "409",
+      "413",
+      "422",
+      "429",
+      "500",
+      "503",
+      "504",
+    ],
   },
   queryStorageEnrollmentList: {
     path: "/api/storage/enrollment/list/query",
     permission: "storage.enrollment.read",
-    statuses: ["200", "401", "403", "404", "409", "413", "422", "500", "503"],
+    statuses: [
+      "200",
+      "401",
+      "403",
+      "404",
+      "409",
+      "413",
+      "422",
+      "429",
+      "500",
+      "503",
+      "504",
+    ],
   },
   queryStorageEnrollment: {
     path: "/api/storage/enrollment/query",
     permission: "storage.enrollment.read",
-    statuses: ["200", "401", "403", "404", "413", "422", "500", "503"],
+    statuses: [
+      "200",
+      "401",
+      "403",
+      "404",
+      "413",
+      "422",
+      "429",
+      "500",
+      "503",
+      "504",
+    ],
   },
   approveStorageEnrollment: {
     path: "/api/storage/enrollment/approve",
     permission: "storage.enrollment.review",
-    statuses: ["200", "401", "403", "404", "409", "413", "422", "500", "503"],
+    statuses: [
+      "200",
+      "401",
+      "403",
+      "404",
+      "409",
+      "413",
+      "422",
+      "429",
+      "500",
+      "503",
+      "504",
+    ],
   },
   rejectStorageEnrollment: {
     path: "/api/storage/enrollment/reject",
     permission: "storage.enrollment.review",
-    statuses: ["200", "401", "403", "404", "409", "413", "422", "500", "503"],
+    statuses: [
+      "200",
+      "401",
+      "403",
+      "404",
+      "409",
+      "413",
+      "422",
+      "429",
+      "500",
+      "503",
+      "504",
+    ],
   },
 };
 
@@ -1239,6 +1350,7 @@ const enrollmentViewRequiredFields = [
   "state",
   "agent_version",
   "identity_fingerprint",
+  "proof_of_possession_status",
   "probe",
   "resource_version",
   "created_at_unix_ms",
@@ -1260,6 +1372,16 @@ assert(
     "#/components/schemas/StorageEnrollmentAccessMode",
   "StorageEnrollmentView must use the writable enrollment access mode",
 );
+assert(
+  enrollmentView.properties.proof_of_possession_status.$ref ===
+    "#/components/schemas/StorageEnrollmentProofOfPossessionStatus",
+  "StorageEnrollmentView must expose only the server-owned PoP verification status",
+);
+assertSameMembers(
+  document.components.schemas.StorageEnrollmentProofOfPossessionStatus.enum,
+  ["verified"],
+  "Storage enrollment PoP status must not admit a client-asserted or unverified state",
+);
 assertDescriptionIncludes(
   enrollmentView,
   [
@@ -1275,8 +1397,12 @@ assertDescriptionIncludes(
 
 const forbiddenEnrollmentFields = [
   "bootstrap_token",
+  "token_key_id",
   "csr",
   "public_key",
+  "public_key_spki",
+  "proof_of_possession",
+  "signature",
   "certificate",
   "private_key",
   "bootstrap_credential",

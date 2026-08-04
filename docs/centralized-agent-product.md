@@ -1,12 +1,12 @@
 # NeoEngram 中心化 Agent 产品定义
 
-> 状态：基于 2026-07-31 OpenAPI v1 收敛 P0 产品口径；公开契约是 P0 Web 的权威边界。
+> 状态：基于 2026-08-03 OpenAPI v1 收敛 P0 产品口径；公开契约是 P0 Web 的权威边界。
 >
 > 适用对象：产品、设计、前端、OpenAPI、`neoengramd`、Agent 和测试团队。
 >
-> 能力声明：本文描述目标产品和已经验证的交互语义。当前真正可运行的是本地 Standalone、
-> 中心无网络状态机、SQLite authority，以及由 MSW 提供契约响应的 P0 Web 客户端。生产 HTTP、OIDC、Agent
-> transport、真实 NFS/S3 和分布式调度仍未实现。
+> 能力声明：本文描述目标产品和已经验证的交互语义。当前真正可运行的是本地 Standalone、SQLite
+> authority、已注册的用户 HTTP/OIDC/RBAC 纵切，以及 Agent enrollment daemon 与 bootstrap/status
+> transport。P0 Web 的其余 operation 仍由 MSW 提供；Agent 证书/session、真实 NFS/S3 和分布式调度尚未实现。
 
 本文回答三个问题：用户在管理什么、各资源之间是什么关系、中心和 Agent 应如何支撑完整的数据
 生产与交付流程。技术权威边界和实现细节见
@@ -620,7 +620,7 @@ Signed URL、凭证、数据内容或物理绝对路径。
 
 | 产品能力                          | P0 Web 口径   | 备注                                                              |
 | --------------------------------- | ------------- | ----------------------------------------------------------------- |
-| Tenant 切换与创建                 | 公开 API 驱动 | MSW 与真实模式使用相同 query/mutation；生产 OIDC/RBAC 尚未实现    |
+| Tenant 切换与创建                 | 公开 API 驱动 | MSW 与真实模式使用相同 query/mutation；该资源路由尚未接入真实 server |
 | StorageVolume 登记与区域展示      | 公开 API 驱动 | 只展示公开字段，只有 ready Volume 可用于新放置                    |
 | Artifact 创建与详情               | 公开 API 驱动 | 支持空 Artifact 和从同 Tenant 明确 Commit 派生                     |
 | Playground 创建和详情             | 公开 API 驱动 | 单 Volume；文件、变化、元数据和 Profile 来自拆分查询               |
@@ -628,7 +628,7 @@ Signed URL、凭证、数据内容或物理绝对路径。
 | Commit 描述、Tags、parent 和 Diff | 公开 API 驱动 | 消费 ready/idle 候选；Head 由服务端内部冻结并执行 CAS              |
 | Snapshot 单区域交付               | 公开 API 驱动 | 独立 Snapshot ID；同 Commit 可在不同 ready Volume 创建独立资源     |
 | Snapshot 文件和活动详情           | 公开 API 驱动 | ready 后查询逻辑文件；活动、完整性和 Profile 均来自公开 API        |
-| Managed Add Job                   | 公开 API 驱动 | 对应中心/Agent 内存状态机，无真实 transport                        |
+| Managed Add Job                   | 公开 API 驱动 | 用户 create/query/finalize 已联网；Agent assignment/session 尚未联网 |
 | 桌面与移动端                      | E2E 验收      | 覆盖加载、分页、错误和长内容；不以静态业务数据作为成功路径         |
 
 原型是产品需求的可执行说明，不是后端已经完成的证据。P0 页面必须只渲染公开 DTO；Manifest/Chunk、
@@ -652,7 +652,8 @@ graph/diff、Playground、Pre-commit、分页元数据、Snapshot 交付和 Mana
 5. Snapshot 已使用独立 ID、单 Region/Volume 状态模型，并提供创建去重、交付重试、Ready 文件清单、
    完整性、活动和 Dataset Profile。
 
-这些条目表示公开契约和 Web Mock 已对齐，不表示 Rust HTTP 服务、Agent transport 或生产数据面已经实现。
+这些条目表示公开契约和 Web Mock 已对齐；Rust server 只实现已注册的 Job 与 Storage enrollment 纵切，
+Agent 只实现 bootstrap/status，不能据此推断其余公开 API、业务 session 或生产数据面已经完成。
 
 ### P1：完整运营闭环
 

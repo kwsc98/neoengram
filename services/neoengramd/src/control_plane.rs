@@ -17,8 +17,9 @@ use crate::{
     ExpireAddJobRequest, ExpireAddJobResult, FinalizeAddRequest, FinalizeAddResult,
     IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, IndexPublisher,
     JobInsertOutcome, JobRecord, JobRepository, MetadataBatchStager, MetadataBatchSubmission,
-    ObjectCatalog, PublicationCandidate, ReceiveReportRequest, ReceiveReportResult,
-    ResumePublicationRequest, StageMetadataBatchRequest, StageMetadataBatchResult,
+    ObjectCatalog, PublicationCandidate, QueryJobRequest, QueryJobResult, ReceiveReportRequest,
+    ReceiveReportResult, ResumePublicationRequest, StageMetadataBatchRequest,
+    StageMetadataBatchResult,
 };
 
 const CONTROL_ERROR_MESSAGE_LIMIT: usize = 4096;
@@ -111,6 +112,21 @@ impl ControlPlane {
         };
         self.audit(&job, AuditKind::JobCreated, "create").await?;
         Ok(CreateAddJobResult { job, replayed })
+    }
+
+    /// Returns the authoritative Job only when its persisted scope is visible to the actor.
+    pub async fn query_job(&self, request: QueryJobRequest) -> CentralResult<QueryJobResult> {
+        let job = self.load(&request.tenant_id, &request.job_id).await?;
+        if let Err(error) = self
+            .authorize(Actor::Principal(request.actor), Action::QueryJob, &job.spec)
+            .await
+        {
+            if error.code() == CentralErrorCode::Unauthorized {
+                return Err(job_not_found(&request.job_id));
+            }
+            return Err(error);
+        }
+        Ok(QueryJobResult { job })
     }
 
     /// Reserves its delivery identity, persists the assignment, then exposes it in the outbox.
@@ -916,12 +932,10 @@ impl ControlPlane {
         job_id: &neoengram_protocol::JobId,
     ) -> CentralResult<JobRecord> {
         let key = crate::JobKey::new(tenant_id.clone(), job_id.clone());
-        self.jobs.get(&key).await?.ok_or_else(|| {
-            invalid(
-                CentralErrorCode::JobNotFound,
-                format!("managed Add job {job_id} was not found"),
-            )
-        })
+        self.jobs
+            .get(&key)
+            .await?
+            .ok_or_else(|| job_not_found(job_id))
     }
 
     async fn replace(&self, expected: u64, mut job: JobRecord) -> CentralResult<JobRecord> {
@@ -964,6 +978,13 @@ impl ControlPlane {
         let _ = self.audit.record(event).await?;
         Ok(())
     }
+}
+
+fn job_not_found(job_id: &neoengram_protocol::JobId) -> crate::CentralError {
+    invalid(
+        CentralErrorCode::JobNotFound,
+        format!("managed Add job {job_id} was not found"),
+    )
 }
 
 fn bounded_control_error_message(mut message: String) -> String {

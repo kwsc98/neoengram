@@ -6,8 +6,10 @@
 被可靠地暂存、提交、校验与恢复。
 
 项目当前聚焦单机仓库与本地工作流，已经提供 SQLite 元数据、事务化 checkout 和故障恢复
-能力。`0.2.0` 同时完成了中心化架构所需的 crate/protocol/无网络状态机骨架；真实网络、数据库、
-对象存储和协作能力仍属于后续阶段。整体产品目标、当前能力清单和
+能力。`0.2.0` 同时完成了中心化架构所需的 crate/protocol/状态机；独立 server 默认通过 Fusen
+暴露版本、健康和 Managed Add Job 六个接口，启用 enrollment 后再提供五个公开管理接口和独立的
+Agent bootstrap/status listener。`neoengram-agentd` 已能执行出站注册与审批状态轮询；证书、mTLS
+session、Job delivery、其余公开 API、分布式数据库和对象存储仍属于后续阶段。整体产品目标、当前能力清单和
 分布式实现路线统一维护在 [`docs/implementation-plan.md`](docs/implementation-plan.md)。完整
 状态模型、命令行为和命令差异见 [`docs/technical-reference.md`](docs/technical-reference.md)。
 
@@ -404,23 +406,27 @@ neoengram gc
 │   ├── neoengram-agent/             # 无网络 Agent 状态机与测试适配器
 │   └── neoengram/                   # Clap、cwd 输入和唯一终端渲染入口
 ├── services/
-│   └── neoengramd/                  # 无网络中心状态机与内存适配器
+│   ├── neoengramd/                  # 无网络中心状态机、ports 与 SQLite datasource/mapper
+│   ├── neoengram-server/            # Fusen 用户 HTTP、Hyper Agent enrollment 与运行时组装
+│   └── neoengram-agentd/            # 可运行的 Agent enrollment/polling daemon 与健康命令
 ├── apps/
 │   └── neoengram-web/               # Vue 3 用户控制台；首版由 OpenAPI/MSW 驱动
 └── docs/                            # 代码与存储架构说明
 ```
 
 生产依赖主要保持单向：`CLI -> standalone -> engine <- agent`，Standalone 同时依赖 fs；protocol
-只依赖 core，`neoengramd` 只依赖 protocol/core。该简图不枚举 CLI 对 core/engine 的直接类型导入；
-Agent 到 `neoengramd` 的依赖仅存在于 dev/test 组合测试。CLI 之外不渲染终端输出；完整约束见
+只依赖 core，服务端方向固定为 `neoengram-server -> neoengramd -> protocol/core`，Agent 进程方向为
+`neoengram-agentd -> neoengram-agent/protocol`。该简图不枚举 CLI 对 core/engine 的直接类型导入；
+Agent library 到 `neoengramd` 的依赖仅存在于 dev/test 组合测试。CLI 之外不渲染终端输出；完整约束见
 [`docs/code-architecture.md`](docs/code-architecture.md)。
 
 `neoengram-web` 是独立 npm 应用，不进入 Cargo workspace，也不导入 Rust crate、Agent Schema 或
 数据库类型。它只从公开 OpenAPI 生成客户端类型；当前可通过 MSW 运行租户切换/创建、
 StorageVolume 登记与放置选择、无固定放置 Artifact、单 Volume Playground、单区域 Snapshot、
 Playground Commit、资源浏览和
-Commit 描述/Tag、父版本文件 Diff、Managed Add Job，真实联网仍等待
-`neoengramd` HTTP/OIDC adapter。
+Commit 描述/Tag、父版本文件 Diff、Managed Add Job。真实 server 默认实现版本、健康和 Managed
+Add Job 六接口；启用 enrollment 时另实现 token、列表、查询、批准和拒绝五个管理接口，其余 Web
+operation 仍由 MSW 提供。
 
 中心化 Agent 的产品定位、用户角色、资源语义、页面规格、Pre-commit/Commit/Snapshot 主链路和
 OpenAPI 对齐清单见 [`docs/centralized-agent-product.md`](docs/centralized-agent-product.md)；技术权威
@@ -452,9 +458,11 @@ crates.io 解析或 CLI 可从 registry 安装。
 [`docs/implementation-plan.md`](docs/implementation-plan.md)。本文只保留面向用户的使用说明和
 当前存储边界。
 
-当前可运行产品完成的是本地 format v8、多 Workspace 与固定 Commit 只读 FUSE；P0 另提供 protocol、
-Agent 和中心控制面的 library/内存状态机，以及由 MSW 驱动的多租户 Vue 3 Web 控制台。它不包含
-可联网 HTTP、PostgreSQL、mTLS、真实 S3、daemon、生产认证、merge/rebase、
+当前可运行产品完成的是本地 format v8、多 Workspace 与固定 Commit 只读 FUSE；中心另提供 protocol、
+Agent/控制面状态机、SQLite 单节点权威，以及 Fusen 用户 listener 与可选 Hyper Agent enrollment
+listener。`neoengram-agent` binary 已能持久化身份、探测挂载、签名 bootstrap 并轮询审批状态。业务接口
+使用外部 OIDC/JWKS 与默认拒绝 RBAC；SQLite 模式只支持单副本，生产 TLS 由 Ingress/反向代理终止。
+它仍不包含其余 OpenAPI、Agent 证书/session/Job transport、PostgreSQL、真实 S3、HA、merge/rebase、
 `push/fetch/pull/clone` 或服务端 GC。分页、事务、CAS、分层 Merkle Directory 和流式 Commit
 已经落地；CLI 通过结构化 Request/typed Result facade 调用 Standalone，并拥有全部成功文本与
 错误/结果渲染，Standalone 不再暴露通用 `CommandResult`。
@@ -467,7 +475,7 @@ Agent 和中心控制面的 library/内存状态机，以及由 MSW 驱动的多
 所有命令都适用于千万路径。
 
 下一步是继续把 Standalone 过渡物化 view 收敛到 engine 分页 ports，对 SQLite 大规模工作负载做
-基准与调优，并实现 PostgreSQL/HTTP/mTLS/真实 S3 adapters 和 CAS push。目标是
+基准与调优，并实现 PostgreSQL、其余用户 API、Agent session/Job transport、mTLS、真实 S3 adapters 和 CAS push。目标是
 100 TB payload、千万路径和上亿 Chunk 引用下，命令内存由页大小与有界并发决定，而不是随
 仓库总量增长。
 
