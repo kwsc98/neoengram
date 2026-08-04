@@ -27,7 +27,9 @@ export type StorageAccessMode = components['schemas']['StorageAccessMode'];
 export type CreateStorageEnrollmentTokenRequest =
   components['schemas']['CreateStorageEnrollmentTokenRequest'];
 export type CreateStorageEnrollmentTokenResponse =
-  components['schemas']['CreateStorageEnrollmentTokenResponse'];
+  components['schemas']['CreateStorageEnrollmentTokenResponse'] & {
+    volume_descriptor_digest: string;
+  };
 export type QueryStorageEnrollmentListRequest =
   components['schemas']['QueryStorageEnrollmentListRequest'];
 export type QueryStorageEnrollmentListResponse =

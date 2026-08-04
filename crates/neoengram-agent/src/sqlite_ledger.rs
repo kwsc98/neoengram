@@ -249,6 +249,29 @@ impl Ledger for SqliteLedger {
         load_from_connection(&connection, key)
     }
 
+    fn list_active(&self) -> AgentResult<Vec<LedgerRecord>> {
+        let connection = self.storage.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT tenant_id, job_id, request_digest, revision, payload \
+                 FROM ledger_records WHERE tenant_id = ?1 ORDER BY job_id",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![self.tenant_id.as_str()], columns_from_row)
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?;
+        let records = rows
+            .into_iter()
+            .map(decode)
+            .collect::<AgentResult<Vec<_>>>()?;
+        Ok(records
+            .into_iter()
+            .filter(|record| record.state != crate::AgentAssignmentState::Completed)
+            .collect())
+    }
+
     fn compare_exchange(
         &self,
         expected_revision: u64,

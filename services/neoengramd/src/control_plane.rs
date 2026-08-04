@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use neoengram_protocol::{
-    AssignmentOperation, ControlError, DecisionGeneration, ErrorCode, Extensions, JobAssignment,
-    JobDecision, JobFinalized, JobState, PublishDecision, ResourceVersion,
+    AgentId, AssignmentOperation, ControlEnvelope, ControlError, ControlMessage,
+    DecisionGeneration, ErrorCode, Extensions, JobAssignment, JobDecision, JobFinalized, JobState,
+    MessageId, ProtocolVersion, PublishDecision, ResourceVersion, SessionGeneration,
 };
 
 use crate::{
@@ -54,6 +55,90 @@ impl ControlPlane {
             audit: authority.audit(),
             clock,
         }
+    }
+
+    /// Derives the current Agent delivery set from the durable assignment outbox and Job CAS.
+    /// Assignments disappear only after Accepted changes the Job state; decisions disappear only
+    /// after the matching Finalized acknowledgement is persisted.
+    pub async fn poll_agent_messages(
+        &self,
+        agent_id: &AgentId,
+        session_generation: SessionGeneration,
+        limit: usize,
+    ) -> CentralResult<Vec<ControlEnvelope>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut messages = Vec::with_capacity(limit);
+        for assignment in self.outbox.pending_for_agent(agent_id, limit).await? {
+            let AssignmentOperation::Add { input, .. } = &assignment.assignment;
+            let Some(job) = self
+                .jobs
+                .get(&crate::JobKey::new(
+                    input.tenant_id.clone(),
+                    input.job_id.clone(),
+                ))
+                .await?
+            else {
+                continue;
+            };
+            if job.state != JobState::Assigned || job.assignment.as_ref() != Some(input) {
+                continue;
+            }
+            let envelope = ControlEnvelope {
+                protocol_version: ProtocolVersion::V1,
+                message_id: MessageId::new(format!("assignment-{}", input.assignment_id))?,
+                session_generation,
+                resource_version: Some(job.resource_version),
+                request_id: None,
+                trace_id: None,
+                sent_at_unix_ms: self.clock.now(),
+                message: ControlMessage::Assignment(Box::new(assignment)),
+                extensions: Extensions::new(),
+            };
+            envelope.validate()?;
+            messages.push(envelope);
+            if messages.len() == limit {
+                return Ok(messages);
+            }
+        }
+
+        let remaining = limit.saturating_sub(messages.len());
+        for job in self
+            .jobs
+            .list_pending_decisions_for_agent(agent_id, remaining)
+            .await?
+        {
+            let Some(assignment) = &job.assignment else {
+                continue;
+            };
+            let Some(decision) = &job.decision else {
+                continue;
+            };
+            if assignment.agent_id != *agent_id || job.finalized_ack.is_some() {
+                continue;
+            }
+            let envelope = ControlEnvelope {
+                protocol_version: ProtocolVersion::V1,
+                message_id: MessageId::new(format!(
+                    "decision-{}-{}",
+                    decision.job_id, decision.decision_generation
+                ))?,
+                session_generation,
+                resource_version: Some(job.resource_version),
+                request_id: None,
+                trace_id: None,
+                sent_at_unix_ms: self.clock.now(),
+                message: ControlMessage::Decision(decision.clone()),
+                extensions: Extensions::new(),
+            };
+            envelope.validate()?;
+            messages.push(envelope);
+            if messages.len() == limit {
+                break;
+            }
+        }
+        Ok(messages)
     }
 
     /// Creates the authoritative queued job. Reusing a JobId with another digest/spec is rejected.
@@ -265,6 +350,7 @@ impl ControlPlane {
             ));
         }
 
+        let assignment_id = assignment.assignment_id.clone();
         let previous = job.resource_version.get();
         let replayed = match request.report {
             AgentReport::Accepted(report) => {
@@ -462,6 +548,12 @@ impl ControlPlane {
         if !replayed {
             job = self.replace(previous, job).await?;
         }
+        // Every valid report proves delivery. Accepted is the normal acknowledgement; retiring on
+        // later reports also repairs a lost acknowledgement response without leaving a stale row.
+        let _ = self
+            .outbox
+            .retire(&request.tenant_id, &assignment_id)
+            .await?;
         self.audit(&job, AuditKind::ReportReceived, "report")
             .await?;
         Ok(ReceiveReportResult { job, replayed })
@@ -598,6 +690,12 @@ impl ControlPlane {
                     ));
                 }
             }
+            if let Some(assignment) = &job.assignment {
+                let _ = self
+                    .outbox
+                    .retire(&request.tenant_id, &assignment.assignment_id)
+                    .await?;
+            }
             self.audit(&job, AuditKind::AddExpired, "expire").await?;
             return Ok(ExpireAddJobResult {
                 job,
@@ -687,6 +785,12 @@ impl ControlPlane {
         job.decision.clone_from(&decision);
         job.finalized.clone_from(&finalized);
         job = self.replace(previous, job).await?;
+        if let Some(assignment) = &job.assignment {
+            let _ = self
+                .outbox
+                .retire(&request.tenant_id, &assignment.assignment_id)
+                .await?;
+        }
         self.audit(&job, AuditKind::AddExpired, "expire").await?;
         Ok(ExpireAddJobResult {
             job,
@@ -708,6 +812,24 @@ impl ControlPlane {
             &job.spec,
         )
         .await?;
+        self.finalize_loaded(job).await
+    }
+
+    /// Finalizes a Prepared job under the server's recovery authority.
+    ///
+    /// Scheduler recovery must not depend on mutable user RBAC after job creation. Public callers
+    /// continue to use [`Self::finalize_add`], which performs principal authorization.
+    pub async fn finalize_prepared(
+        &self,
+        request: ResumePublicationRequest,
+    ) -> CentralResult<FinalizeAddResult> {
+        let job = self.load(&request.tenant_id, &request.job_id).await?;
+        if job.state != JobState::Prepared {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                format!("cannot internally finalize job in state {:?}", job.state),
+            ));
+        }
         self.finalize_loaded(job).await
     }
 

@@ -2,7 +2,7 @@ use neoengram_core::{
     ChunkingStrategy, ContentDigest, FileRecord, IndexVersion, LogicalPath, Manifest, ManifestId,
 };
 use neoengram_protocol::{
-    ArtifactId, DecimalU64, Extensions, IndexDeltaRecord, JobId, PlaygroundId, TenantId,
+    ArtifactId, DecimalU64, Extensions, IndexDeltaRecord, JobId, PlaygroundId, ProjectId, TenantId,
 };
 use neoengramd::{
     InMemoryIndexPublisher, IndexKey, IndexPublishOutcome, IndexPublishRejection,
@@ -12,6 +12,7 @@ use neoengramd::{
 fn index_key() -> IndexKey {
     IndexKey {
         tenant_id: TenantId::new("tenant-a").expect("valid tenant ID"),
+        project_id: ProjectId::new("project-a").expect("valid project ID"),
         artifact_id: ArtifactId::new("artifact-a").expect("valid artifact ID"),
         playground_id: PlaygroundId::new("playground-a").expect("valid playground ID"),
     }

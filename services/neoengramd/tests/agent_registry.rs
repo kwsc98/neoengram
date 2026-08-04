@@ -2728,6 +2728,7 @@ fn replacement_transition_records(
         state: AgentInstanceState::Active,
         session_generation: None,
         active_boot_id: None,
+        active_session_id: None,
         session_open_expected_resource_version: None,
         session_opened_at_unix_ms: None,
         last_heartbeat_at_unix_ms: None,

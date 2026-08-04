@@ -19,9 +19,15 @@ use tokio::{
 
 mod registry_handler;
 
-pub use registry_handler::RegistryAgentEnrollmentHandler;
+pub use registry_handler::{
+    AgentDataPlaneHandler, RegistryAgentApiHandler, RegistryAgentEnrollmentHandler,
+};
 
 pub const AGENT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+pub const AGENT_MAX_METADATA_PAGE_BODY_BYTES: usize =
+    neoengram_protocol::MAX_METADATA_PAGE_BYTES + AGENT_MAX_REQUEST_BODY_BYTES;
+pub const AGENT_MAX_OBJECT_UPLOAD_BODY_BYTES: usize =
+    (neoengram_protocol::MAX_INLINE_OBJECT_BYTES * 4).div_ceil(3) + AGENT_MAX_REQUEST_BODY_BYTES;
 pub const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const AGENT_MAX_CONCURRENT_REQUESTS: usize = 64;
 const AGENT_OVERLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -45,12 +51,71 @@ impl AgentResourceLimits {
     };
 }
 
+/// Fixed operations exposed by the independent action-style Agent API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAction {
+    EnrollmentBootstrap,
+    EnrollmentStatusQuery,
+    SessionOpen,
+    SessionHeartbeatReport,
+    SessionMessageListQuery,
+    JobReportCreate,
+    JobMetadataBatchStage,
+    JobMetadataPageStage,
+    JobIndexPageQuery,
+    JobObjectMissingQuery,
+    JobObjectUpload,
+    SessionClose,
+}
+
+impl AgentAction {
+    fn from_path(path: &str) -> Option<Self> {
+        match path {
+            neoengram_protocol::AGENT_ENROLLMENT_BOOTSTRAP_PATH => Some(Self::EnrollmentBootstrap),
+            neoengram_protocol::AGENT_ENROLLMENT_STATUS_QUERY_PATH => {
+                Some(Self::EnrollmentStatusQuery)
+            }
+            neoengram_protocol::AGENT_SESSION_OPEN_PATH => Some(Self::SessionOpen),
+            neoengram_protocol::AGENT_SESSION_HEARTBEAT_REPORT_PATH => {
+                Some(Self::SessionHeartbeatReport)
+            }
+            neoengram_protocol::AGENT_SESSION_MESSAGE_LIST_QUERY_PATH => {
+                Some(Self::SessionMessageListQuery)
+            }
+            neoengram_protocol::AGENT_JOB_REPORT_CREATE_PATH => Some(Self::JobReportCreate),
+            neoengram_protocol::AGENT_JOB_METADATA_BATCH_STAGE_PATH => {
+                Some(Self::JobMetadataBatchStage)
+            }
+            neoengram_protocol::AGENT_JOB_METADATA_PAGE_STAGE_PATH => {
+                Some(Self::JobMetadataPageStage)
+            }
+            neoengram_protocol::AGENT_JOB_INDEX_PAGE_QUERY_PATH => Some(Self::JobIndexPageQuery),
+            neoengram_protocol::AGENT_JOB_OBJECT_MISSING_QUERY_PATH => {
+                Some(Self::JobObjectMissingQuery)
+            }
+            neoengram_protocol::AGENT_JOB_OBJECT_UPLOAD_PATH => Some(Self::JobObjectUpload),
+            neoengram_protocol::AGENT_SESSION_CLOSE_PATH => Some(Self::SessionClose),
+            _ => None,
+        }
+    }
+
+    const fn max_body_bytes(self) -> usize {
+        match self {
+            Self::JobMetadataPageStage => AGENT_MAX_METADATA_PAGE_BODY_BYTES,
+            Self::JobObjectUpload => AGENT_MAX_OBJECT_UPLOAD_BODY_BYTES,
+            _ => AGENT_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+}
+
 /// Raw-body application boundary used by the Hyper adapter.
 #[async_trait]
-pub trait AgentEnrollmentHandler: Send + Sync + 'static {
-    async fn bootstrap(&self, body: &[u8]) -> Result<Vec<u8>, AgentHttpError>;
-    async fn bootstrap_status(&self, body: &[u8]) -> Result<Vec<u8>, AgentHttpError>;
+pub trait AgentApiHandler: Send + Sync + 'static {
+    async fn handle(&self, action: AgentAction, body: &[u8]) -> Result<Vec<u8>, AgentHttpError>;
 }
+
+/// Compatibility export for callers migrating from the enrollment-only listener.
+pub use AgentApiHandler as AgentEnrollmentHandler;
 
 /// Sanitized Agent transport failure.
 #[derive(Debug, Clone)]
@@ -101,6 +166,16 @@ impl AgentHttpError {
             StatusCode::UNPROCESSABLE_ENTITY,
             "PROTOCOL_INVALID",
             "Agent request does not satisfy the protocol",
+            false,
+        )
+    }
+
+    #[must_use]
+    pub const fn session_fenced() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "AGENT_SESSION_FENCED",
+            "Agent request belongs to a stale or closed session",
             false,
         )
     }
@@ -167,7 +242,7 @@ pub struct RunningAgentServer {
 impl RunningAgentServer {
     pub async fn start(
         config: AgentListenerConfig,
-        handler: Arc<dyn AgentEnrollmentHandler>,
+        handler: Arc<dyn AgentApiHandler>,
     ) -> Result<Self, AgentServerError> {
         let listener = TcpListener::bind(config.bind)
             .await
@@ -217,7 +292,7 @@ impl Drop for RunningAgentServer {
 
 async fn run_listener(
     listener: TcpListener,
-    handler: Arc<dyn AgentEnrollmentHandler>,
+    handler: Arc<dyn AgentApiHandler>,
     mut shutdown: watch::Receiver<bool>,
     completion: watch::Sender<Option<Result<(), AgentServerError>>>,
     graceful_shutdown_timeout: Duration,
@@ -288,7 +363,7 @@ async fn run_listener(
 
 async fn serve_connection(
     stream: tokio::net::TcpStream,
-    handler: Arc<dyn AgentEnrollmentHandler>,
+    handler: Arc<dyn AgentApiHandler>,
     _permit: OwnedSemaphorePermit,
     mut shutdown: watch::Receiver<bool>,
     request_timeout: Duration,
@@ -320,7 +395,7 @@ async fn serve_connection(
 
 async fn dispatch(
     request: Request<Incoming>,
-    handler: Arc<dyn AgentEnrollmentHandler>,
+    handler: Arc<dyn AgentApiHandler>,
     request_timeout: Duration,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = request.uri().path().to_owned();
@@ -376,13 +451,13 @@ async fn reject_overloaded_connection(
 
 async fn handle_request(
     request: Request<Incoming>,
-    handler: Arc<dyn AgentEnrollmentHandler>,
+    handler: Arc<dyn AgentApiHandler>,
 ) -> Result<Vec<u8>, AgentHttpError> {
     if request.method() != Method::POST {
         return Err(AgentHttpError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             "METHOD_NOT_ALLOWED",
-            "Only POST is supported by Agent enrollment routes",
+            "Only POST is supported by Agent API routes",
             false,
         ));
     }
@@ -394,38 +469,48 @@ async fn handle_request(
             false,
         ));
     }
+    let path = request.uri().path().to_owned();
+    if request.uri().query().is_some() {
+        return Err(AgentHttpError::new(
+            StatusCode::NOT_FOUND,
+            "ROUTE_NOT_FOUND",
+            "Agent route was not found",
+            false,
+        ));
+    }
+    let action = AgentAction::from_path(&path).ok_or_else(|| {
+        AgentHttpError::new(
+            StatusCode::NOT_FOUND,
+            "ROUTE_NOT_FOUND",
+            "Agent route was not found",
+            false,
+        )
+    })?;
+    let max_body_bytes = action.max_body_bytes();
     if request
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > AGENT_MAX_REQUEST_BODY_BYTES)
+        .is_some_and(|length| length > max_body_bytes)
     {
         return Err(payload_too_large());
     }
-    let path = request.uri().path().to_owned();
-    let has_query = request.uri().query().is_some();
-    let body = read_bounded(request.into_body()).await?;
-    match (path.as_str(), has_query) {
-        ("/v1/agents/bootstrap", false) => handler.bootstrap(&body).await,
-        ("/v1/agents/bootstrap/status", false) => handler.bootstrap_status(&body).await,
-        _ => Err(AgentHttpError::new(
-            StatusCode::NOT_FOUND,
-            "ROUTE_NOT_FOUND",
-            "Agent route was not found",
-            false,
-        )),
-    }
+    let body = read_bounded(request.into_body(), max_body_bytes).await?;
+    handler.handle(action, &body).await
 }
 
-async fn read_bounded(mut body: Incoming) -> Result<Vec<u8>, AgentHttpError> {
+async fn read_bounded(
+    mut body: Incoming,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, AgentHttpError> {
     let mut bytes = BytesMut::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| AgentHttpError::protocol_invalid())?;
         let Ok(data) = frame.into_data() else {
             continue;
         };
-        if bytes.len().saturating_add(data.len()) > AGENT_MAX_REQUEST_BODY_BYTES {
+        if bytes.len().saturating_add(data.len()) > max_body_bytes {
             return Err(payload_too_large());
         }
         bytes.extend_from_slice(&data);
@@ -437,7 +522,7 @@ fn payload_too_large() -> AgentHttpError {
     AgentHttpError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
         "PROTOCOL_LIMIT_EXCEEDED",
-        "Agent request body exceeds 64 KiB",
+        "Agent request body exceeds the operation limit",
         false,
     )
 }
@@ -607,15 +692,15 @@ mod tests {
     }
 
     #[async_trait]
-    impl AgentEnrollmentHandler for TestHandler {
-        async fn bootstrap(&self, _body: &[u8]) -> Result<Vec<u8>, AgentHttpError> {
+    impl AgentApiHandler for TestHandler {
+        async fn handle(
+            &self,
+            _action: AgentAction,
+            _body: &[u8],
+        ) -> Result<Vec<u8>, AgentHttpError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             Ok(b"{}".to_vec())
-        }
-
-        async fn bootstrap_status(&self, body: &[u8]) -> Result<Vec<u8>, AgentHttpError> {
-            self.bootstrap(body).await
         }
     }
 
@@ -652,7 +737,7 @@ mod tests {
     ) -> Vec<u8> {
         let mut stream = TcpStream::connect(address).await.unwrap();
         let request = format!(
-            "POST /v1/agents/bootstrap HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n{request_id_headers}content-length: 2\r\nconnection: close\r\n\r\n{{}}"
+            "POST /agent/enrollment/bootstrap HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n{request_id_headers}content-length: 2\r\nconnection: close\r\n\r\n{{}}"
         );
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
@@ -682,7 +767,7 @@ mod tests {
         let (address, shutdown, completion) = start_test_listener(limits, handler.clone()).await;
 
         let mut slow = TcpStream::connect(address).await.unwrap();
-        slow.write_all(b"POST /v1/agents/bootstrap HTTP/1.1\r\nhost: localhost\r\n")
+        slow.write_all(b"POST /agent/enrollment/bootstrap HTTP/1.1\r\nhost: localhost\r\n")
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;

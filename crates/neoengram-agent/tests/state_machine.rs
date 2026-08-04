@@ -1206,6 +1206,10 @@ impl Ledger for FailAwaitingDecisionOnceLedger {
         self.inner.load(key)
     }
 
+    fn list_active(&self) -> neoengram_agent::AgentResult<Vec<LedgerRecord>> {
+        self.inner.list_active()
+    }
+
     fn compare_exchange(
         &self,
         expected_revision: u64,
@@ -1239,6 +1243,10 @@ impl Ledger for FailCompletedOnceLedger {
 
     fn load(&self, key: &AssignmentKey) -> neoengram_agent::AgentResult<Option<LedgerRecord>> {
         self.inner.load(key)
+    }
+
+    fn list_active(&self) -> neoengram_agent::AgentResult<Vec<LedgerRecord>> {
+        self.inner.list_active()
     }
 
     fn compare_exchange(
@@ -1282,6 +1290,10 @@ impl Ledger for RecordingLedger {
 
     fn load(&self, key: &AssignmentKey) -> neoengram_agent::AgentResult<Option<LedgerRecord>> {
         self.inner.load(key)
+    }
+
+    fn list_active(&self) -> neoengram_agent::AgentResult<Vec<LedgerRecord>> {
+        self.inner.list_active()
     }
 
     fn compare_exchange(

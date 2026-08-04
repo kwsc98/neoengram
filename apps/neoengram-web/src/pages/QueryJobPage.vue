@@ -1,15 +1,20 @@
 <script setup lang="ts">
-import { ArrowRight, Delete, Search } from '@element-plus/icons-vue';
+import { ArrowRight, Delete, Plus, Search } from '@element-plus/icons-vue';
 import { computed, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import PageHeading from '@/components/PageHeading.vue';
 import { useRecentJobsStore } from '@/stores/recent-jobs';
+import { useTenantsStore } from '@/stores/tenants';
 
 const route = useRoute();
 const router = useRouter();
 const recent = useRecentJobsStore();
+const tenants = useTenantsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
+const canCreateJob = computed(
+  () => tenants.byId(tenantId.value)?.permissions.includes('job.create') ?? false,
+);
 const jobId = ref('');
 const tenantJobs = computed(() => recent.jobs.filter((item) => item.tenantId === tenantId.value));
 
@@ -27,6 +32,10 @@ async function open(id: string): Promise<void> {
   });
 }
 
+async function createJob(): Promise<void> {
+  await router.push({ name: 'job-create', params: { tenantId: tenantId.value } });
+}
+
 function formatSeen(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }).format(
     new Date(value),
@@ -36,7 +45,11 @@ function formatSeen(value: string): string {
 
 <template>
   <div class="page">
-    <PageHeading title="活动" :description="`查看 ${tenantId} 中的数据扫描、物化和发布任务`" />
+    <PageHeading title="活动" :description="`查看 ${tenantId} 中的数据扫描、物化和发布任务`">
+      <template v-if="canCreateJob" #actions>
+        <el-button type="primary" :icon="Plus" @click="createJob">新建扫描任务</el-button>
+      </template>
+    </PageHeading>
 
     <form class="query-bar query-bar--tenant" @submit.prevent="query">
       <div class="query-tenant">

@@ -29,6 +29,7 @@ import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import { runtimeConfig } from '@/config';
+import { buildAgentConfig, canonicalAgentEndpoint } from '@/features/storage/agent-config';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
 
@@ -116,6 +117,8 @@ const storageVolumesQuery = useQuery({
       ...(search.value ? { query: search.value } : {}),
       ...(cursor.value ? { cursor: cursor.value } : {}),
     }),
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
 });
 
 const enrollmentsQuery = useQuery({
@@ -133,52 +136,27 @@ const enrollmentsQuery = useQuery({
       page_size: 50,
       ...(enrollmentCursor.value ? { cursor: enrollmentCursor.value } : {}),
     }),
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
 });
 
-function centralEndpoint(): string {
-  const configured = runtimeConfig.apiBaseUrl.trim();
-  if (!configured) return globalThis.location.origin;
-  try {
-    return new URL(configured).toString().replace(/\/$/, '');
-  } catch {
-    return globalThis.location.origin;
-  }
-}
-
-const deploymentConfig = computed(() => {
+const deploymentConfigResult = computed(() => {
   const token = tokenResult.value;
   const descriptor = pendingTokenRequest.value;
-  if (!token || !descriptor) return '';
-  return [
-    'schema_version: 1',
-    'protocol_version: 1',
-    `central_endpoint: ${centralEndpoint()}`,
-    `tenant_id: ${descriptor.tenant_id}`,
-    `edge_cluster_id: ${descriptor.edge_cluster_id}`,
-    `storage_volume_id: ${descriptor.storage_volume_id}`,
-    `region: ${descriptor.region}`,
-    'storage:',
-    '  backend_type: pvc',
-    `  access_mode: ${descriptor.access_mode}`,
-    '  mount_path: /volume',
-    '  state_dir: /var/lib/neoengram-agent',
-    '  marker_file: /volume/.neoengram-volume-marker',
-    `  expected_volume_marker: ${descriptor.storage_volume_id}`,
-    '  pvc_reference:',
-    `    namespace: ${descriptor.pvc_reference.namespace}`,
-    `    claim_name: ${descriptor.pvc_reference.claim_name}`,
-    'registration:',
-    '  approval_required: true',
-    `  token_id: ${token.token_id}`,
-    '  bootstrap_token_file: /var/run/secrets/neoengram/bootstrap-token',
-    'session:',
-    '  heartbeat_interval_seconds: 10',
-    '  reconnect_max_delay_seconds: 30',
-    'logging:',
-    '  format: json',
-    '  level: info',
-  ].join('\n');
+  if (!token || !descriptor) return { yaml: '', error: '' };
+  try {
+    return {
+      yaml: buildAgentConfig(runtimeConfig.agentEndpoint, descriptor, token),
+      error: '',
+    };
+  } catch (error) {
+    return {
+      yaml: '',
+      error: error instanceof Error ? error.message : 'Agent 配置生成失败',
+    };
+  }
 });
+const deploymentConfig = computed(() => deploymentConfigResult.value.yaml);
 
 watch([tenantId, region, backendType], () => {
   cursor.value = undefined;
@@ -286,6 +264,12 @@ function validateResourceFields(fields: {
 
 async function submitEnrollment(): Promise<void> {
   enrollmentError.value = '';
+  try {
+    canonicalAgentEndpoint(runtimeConfig.agentEndpoint);
+  } catch (error) {
+    enrollmentError.value = error instanceof Error ? error.message : 'Agent endpoint 配置无效';
+    return;
+  }
   if (!validateResourceFields(enrollmentForm)) {
     enrollmentError.value = '请填写合法的 StorageVolume ID、名称、EdgeCluster ID 和 Region';
     return;
@@ -897,6 +881,12 @@ function fingerprintSummary(value: string): string {
             <dt>过期时间</dt>
             <dd>{{ formatTime(tokenResult.expires_at_unix_ms) }}</dd>
           </div>
+          <div>
+            <dt>Descriptor digest</dt>
+            <dd>
+              <code>{{ tokenResult.volume_descriptor_digest }}</code>
+            </dd>
+          </div>
         </dl>
         <div class="deployment-config-heading">
           <strong>Agent 配置</strong>
@@ -909,7 +899,13 @@ function fingerprintSummary(value: string): string {
             />
           </el-tooltip>
         </div>
-        <pre class="deployment-config"><code>{{ deploymentConfig }}</code></pre>
+        <el-alert
+          v-if="deploymentConfigResult.error"
+          :title="deploymentConfigResult.error"
+          type="error"
+          :closable="false"
+        />
+        <pre v-else class="deployment-config"><code>{{ deploymentConfig }}</code></pre>
       </div>
 
       <template #footer>

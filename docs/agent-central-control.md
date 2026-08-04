@@ -1,16 +1,17 @@
 # 中心化多租户控制面与 Agent 架构
 
 > 状态：P0 protocol、Agent/中心状态机和 SQLite 单节点中心权威后端已实现；独立
-> `neoengram-server` 已提供 Fusen 用户 API 与 Hyper Agent enrollment 双 listener，
-> `neoengram-agentd` 已可执行出站 bootstrap/status；业务 session 与完整生产控制面仍为设计。
+> `neoengram-server` 已提供 Fusen 用户 API 与 Hyper Agent action 双 listener；Agent OpenAPI 3.1、
+> Ed25519 签名 session、HTTP/1 短轮询、Job report/metadata/object transport 已进入开发联调实现。
+> `neoengram-agentd` 主循环的端到端装配与完整生产控制面仍需验收。
 >
-> 最后更新：2026-08-03。
+> 最后更新：2026-08-04。
 >
 > 本文统一描述 `neoengramd`、`neoengram-agent`、多租户/多 EdgeCluster 边界、CPU 计算节点、NFS
 > 存储、Volume-bound Agent 和中心 S3 的目标架构。当前 `0.2.0`/format v8 只实现 transport- and
-> storage-independent library、协议、内存适配器、中心 SQLite authority、已注册的用户 API 和 Agent
-> enrollment 纵切；文中其余 HTTP、PostgreSQL、Agent mTLS/session、真实 S3、NFS fencing、Gateway
-> 和业务 Job transport 均是后续实现目标，不是当前可运行能力。
+> storage-independent library、协议、内存适配器、中心 SQLite authority、已注册的用户 API，以及
+> Agent enrollment/session/Job transport 开发 adapter。PostgreSQL、生产 mTLS、真实 S3、NFS fencing、
+> Gateway、HA 与生产部署仍是后续目标，不是当前开发运行能力。
 >
 > 面向产品、交互和公开 API 的资源口径见
 > [`centralized-agent-product.md`](centralized-agent-product.md)。本文中的 Ref、ArtifactPlacement、lease、
@@ -73,12 +74,13 @@ HTTP 框架、数据库 driver、文件系统挂载方式或 S3 SDK。
   暴露 Playground、journal、Agent cache 或 NFS 上的可变目录；
 - Kubernetes 用户 Pod 可以把单个 Snapshot/Playground 的精确目录挂到容器路径；中心只用
   `PodMountBinding` 描述和校验已有挂载关系，实际 I/O 经节点 NFS/CSI 客户端直达 NFS，不经过 Agent；
-- 生产目标中 `neoengram-server` 是用户、CLI、UI 和自动化系统的网络入口，`neoengramd` 保持领域用例
-  边界。分配 Job 时中心先把
+- `neoengram-server` 是用户、CLI、UI、自动化系统和 Agent 的网络 composition root，`neoengramd`
+  保持领域用例边界。分配 Job 时中心先把
   tenant-scoped Assignment ID `reserve` 到不可投递的 outbox 记录，CAS 持久化 Job/Assignment 后才
-  `publish` 为可投递消息；当前只实现 Agent enrollment daemon，尚未实现 HTTP/2、HTTP/3、mTLS 或
-  Assignment/MetadataBatch session；
-- 数据面由 Agent 直接访问 NFS 和中心签发的短期 S3 ticket，大对象 payload 不经过中心 API 进程；
+  `publish` 为可投递消息；开发链路通过独立 Agent OpenAPI 的 HTTP/1 action 短轮询投递，持续重投到
+  Accepted，并通过签名 POST 上报 report 与 MetadataBatch；
+- 开发数据面由 Agent 访问挂载目录和中心 filesystem ObjectStore；生产目标再使用短期 S3 ticket，
+  大对象 payload 不经过公开用户 API listener；
 - 跨集群 checkout 只基于固定 Commit/Snapshot：目标 Agent 从中心 S3 耐久副本读取缺失对象并验证，
   再物化目标 Playground；未来 Gateway/中转对象存储只能优化传输，不能改变权威边界；
 - 第一版禁止跨租户对象去重/硬链接、跨 Artifact hardlink、Agent-to-Agent 直接 Transfer 和隐式共享凭证。
@@ -97,7 +99,7 @@ StorageVolume 负责“Playground 字节和恢复 journal 在哪里”。
 | 主题 | 状态 | 当前结论 |
 | --- | --- | --- |
 | 控制入口 | 已确认 | 用户、CLI、UI 和自动化系统只调用 `neoengramd`，不能直接向 Agent 下发业务命令 |
-| Agent 控制循环 | P0 契约已实现 | ControlEnvelope、hello/heartbeat/assignment/report/failed/decision/finalized 已定义；mTLS/H2/H3 transport 待实现 |
+| Agent 控制循环 | 开发 transport 已实现 | ControlEnvelope、heartbeat/assignment/report/failed/decision/finalized 已定义；独立 OpenAPI action、HTTP/1 短轮询和 generation fencing 已实现，生产 mTLS 待实现 |
 | 领域根 | 已确认 | Artifact 是版本化抽象文件系统；创建时为空或从同 Tenant 另一个 Artifact 的明确 Commit 派生，不能表示 Job 输出或临时传输文件 |
 | 可变/只读视图 | 已确认 | Playground 是单区域读写工作区；Snapshot 有独立 ID、固定一个 Commit 和一个单区域 RO placement；同一 Commit 可有多个 Snapshot |
 | 集群边界 | 已确认 | EdgeCluster 是网络/调度/故障域；跨集群不直连 Agent、不共享 NFS，对象经中心 S3/受控中转传输 |
@@ -120,9 +122,9 @@ StorageVolume 负责“Playground 字节和恢复 journal 在哪里”。
 | Gateway 归属 | 后续研究 | 仅可作为读取/分发优化，不得成为对象或 metadata 权威，不接触 Playground/journal |
 | 用户 Pod 挂载 | 已确认 | 只描述和校验现有 Pod 到精确 Snapshot/Playground 目录的挂载；Pod/NAS/PV/PVC 创建不在范围内，实际 I/O 直达本集群 NFS |
 | NFS 强 fencing | 待原型 | 优先评估 NFSv4 身份/ACL、RW 挂载切换或存储代理强制 token |
-| Agent Ledger | SQLite adapter 已实现 | ledger-first、重放规则、Agent/Tenant 数据库身份绑定与重开恢复已覆盖；daemon 已接 system identity/enrollment，Job Ledger、session 和完整 cache/candidate 接线待实现 |
+| Agent Ledger | SQLite adapter 已实现 | ledger-first、`list_active`、按 Job 保序 outbound queue、Agent/Tenant 数据库身份绑定与重开恢复已覆盖；daemon 的完整生命周期装配仍需验收 |
 | 大型不可变元数据 | 待基准 | v1 优先 PostgreSQL；超出目标规模后可外置 Blob，但中心服务仍保持逻辑权威 |
-| Agent 传输 | Enrollment 纵切已实现 | 独立 Hyper listener 与 `neoengram-agentd` 支持签名 bootstrap/status；H2/H3、mTLS、session routing、heartbeat 和 Job delivery 待实现 |
+| Agent 传输 | 开发 action API 已实现 | 独立 OpenAPI 3.1/Hyper listener 与 reqwest client 支持签名 enrollment、session、heartbeat、poll、report、metadata、Index 和 object operations；生产 mTLS 待实现 |
 | Gateway 产品 | 待验证 | 评估 VersityGW，同时保留受限对象 API 方案 |
 
 这里的“中心管控”指中心拥有命令、Desired State、调度、租约和最终状态的决定权，不要求中心主动
@@ -309,7 +311,7 @@ path、祖先、设备、inode、symlink 和 mount identity 校验拒绝路径�
 
 ### 4.1 可视化架构图
 
-下图表达目标运行时边界；标注为 PostgreSQL、mTLS/H2/H3 和 S3 的节点均需要后续 adapter。交互式
+下图表达目标运行时边界；标注为 PostgreSQL、生产 mTLS 和 S3 的节点均需要后续 adapter。交互式
 HTML 版本仍包含早期 Gateway 探索图，仅供方案研究，若与本节冲突以本节和 P0 不变量为准。
 
 ```mermaid
@@ -368,8 +370,8 @@ flowchart TB
 
     USER -->|"tenant-scoped API"| API
 
-    AGENT_A <-->|"bootstrap/status 已实现<br/>Assignment / MetadataBatch session 待实现"| JOBS
-    AGENT_B <-->|"bootstrap/status 已实现<br/>Assignment / MetadataBatch session 待实现"| JOBS
+    AGENT_A <-->|"签名 POST /agent/*<br/>HTTP/1 短轮询 / report / metadata"| JOBS
+    AGENT_B <-->|"签名 POST /agent/*<br/>HTTP/1 短轮询 / report / metadata"| JOBS
     AGENT_A <-->|"短期 ticket 直传/读取对象"| S3
     AGENT_B <-->|"短期 ticket 直传/读取对象"| S3
 
@@ -406,10 +408,10 @@ flowchart TB
 
 - 蓝色区域是中心控制职责；绿色节点是中心 metadata 与对象 durability 权威。P0 使用内存 adapter，
   未来分别接 PostgreSQL 和 S3；只有中心能完成 `IndexVersion`/Ref CAS；
-- 黄色节点是 Agent 执行器。当前已有 Agent 主动出站的 bootstrap/status 网络流程；领取 Assignment 的
-  mTLS H2/H3 业务 session 仍待实现；
-- 灰色 Agent 状态 PVC 当前保存 system identity 与 health；业务 session 实现后再保存本地恢复
-  Ledger、缓存和临时候选。状态盘丢失后可从中心重建非权威缓存，但 Agent 必须重新注册审批；
+- 黄色节点是 Agent 执行器。开发链路使用 Agent 主动发起、Ed25519 签名的 HTTP/1 action 请求，
+  通过短轮询领取 Assignment/Decision，并独立上报 report、MetadataBatch 和 object；
+- 灰色 Agent 状态 PVC 保存 system identity、health、Job Ledger 和 durable outbound queue；缓存和
+  临时候选仍是非权威可恢复状态。状态盘丢失后可从中心重建非权威缓存，但 Agent 必须重新注册审批；
 - 青色 NFS 区域只保存 Playground、journal 和可重建 cache。不可变对象由 Agent 使用短期 ticket
   直传中心 S3，payload 不经过 `neoengramd` API 进程；
 - 每个用户 Pod 只把本集群 NFS 上一个 Playground/Snapshot 的精确目录挂到 `/workspace`；文件 I/O
@@ -449,7 +451,7 @@ PrepareAdd
 │ Lease & Fencing / IndexVersion & Ref CAS  │
 │ Commit Catalog / Ref CAS / Object Catalog │
 └───────────────────┬────────────────────────┘
-                    │ bootstrap/status 已实现；业务 session 待实现
+                    │ 签名 POST /agent/*；HTTP/1 短轮询与幂等上报
           ┌─────────┴──────────────────────────┐
           ▲                                    ▲
 ┌────────────────────────────────────┐       ┌────────────────────────────────────┐
@@ -469,7 +471,7 @@ PrepareAdd
 
 | 平面 | 内容 | 权威/路径 |
 | --- | --- | --- |
-| 控制面 | Tenant、RBAC、Job、调度、Desired State | 中心权威；SQLite + enrollment transport 已实现，未来 PostgreSQL + Agent business session |
+| 控制面 | Tenant、RBAC、Job、调度、Desired State | 中心权威；SQLite + Agent action transport 用于开发，未来 PostgreSQL + 生产 mTLS |
 | 集群拓扑面 | EdgeCluster、网络域、placement、TransferRoute | 中心 registry；不从 IP/hostname 隐式推断集群 |
 | 发布元数据面 | Playground Index、Commit catalog、Ref、lease/fence | 中心 CAS；P0 内存 publisher，未来 PostgreSQL |
 | 执行元数据面 | Agent Ledger/cache、IndexDelta/Receipt/Job MetadataBatch | 独立 Agent 状态 PVC 或临时 MetadataBatch |
@@ -517,7 +519,7 @@ P0 的 `services/neoengramd` 是 transport/storage-independent library，已实�
 ```text
 services/neoengramd/
 ├── ports/           # 传输无关的中心用例边界
-├── agent_api/       # Agent H2/H3 JSON session、heartbeat、状态/MetadataBatch 上报
+├── agent_api/       # Agent action API、短轮询、heartbeat、状态/MetadataBatch 上报
 ├── identity/        # OIDC/JWKS、Principal、Service identity
 ├── tenancy/         # Tenant/Project/Artifact、RBAC、RLS context
 ├── registry/        # EdgeCluster、ComputeNode、Agent、StorageVolume、Mount、Attachment
@@ -534,8 +536,8 @@ services/neoengramd/
 用户 Web 控制台独立位于 `apps/neoengram-web/`，不嵌入中心 library，也不进入 Cargo workspace。
 它只能调用公开 OpenAPI；首版使用 MSW 模拟已定义 operation，包括 StorageVolume 登记、
 多租户资源创建/浏览、Playground Commit 与 Managed Add Job。真实 server 默认注册版本、健康及
-Job create/query/finalize；启用 enrollment 后再注册五条公开管理路由和独立的 Agent
-bootstrap/status listener。生产静态资源由反向代理与 `/api`、`/health` 组合为同一 origin。
+Job create/query/finalize；启用 Agent listener 后还提供独立 OpenAPI 定义的 `/agent/*` action operations。
+生产静态资源由反向代理与 `/api`、`/health`、`/agent` 组合为同一 origin。
 
 中心负责：
 
@@ -543,7 +545,7 @@ bootstrap/status listener。生产静态资源由反向代理与 `/api`、`/heal
 - 保存 Cluster topology、资源归属和 Volume-bound Agent 绑定，只向目标 Volume 已审批且 mount/capability
   正确的常驻 Agent 调度；
 - 先建立不可投递的 Assignment reservation，持久化 Job/Assignment 后再 publish，并通过目标 Agent
-  已建立的 JSON 双向流交付；
+  的 message list action 持续投递到 Accepted；
 - 签发、续期和撤销租约，生成单调 fencing token；
 - 接收 Agent 分页上报的 Manifest、IndexDelta、ObjectReceipt MetadataBatch；
 - 把结构化候选导入 PostgreSQL staging，验证 expected IndexVersion、对象依赖和租户归属；
@@ -648,8 +650,8 @@ claimed -> accepted -> running -> prepared -> awaiting_decision
 
 错误/恢复分支包含 `failed_reported` 与 `recovering`。内存 Ledger、Fake AddExecutor、Fake
 ObjectTransfer 和 Fake ReportSink 仅用于组合测试；SQLite Ledger adapter 已提供持久 claim/重放与
-重开恢复。当前 daemon 只接入 system identity、mount probe 与 enrollment transport，尚未把 Job Ledger
-接入业务 session。对象传输 port 返回的
+重开恢复，outbound SQLite queue 先持久化 report 再发送并在成功 ack 后删除。session client/driver 已能
+把 Assignment/Decision 接到 Agent core；daemon 主循环的完整装配仍需端到端验收。对象传输 port 返回的
 durable `TransferReceipt` 保存 exact MetadataBatch descriptors/pages；Agent 先持久化 Prepared 并发送
 `JobPrepared`，再调用幂等 `stage_metadata`，全部成功后才进入 `awaiting_decision`。报告或 staging
 响应丢失时状态保持 Prepared，recovery 重放相同材料。Job-scoped 失败统一使用 protocol
@@ -666,15 +668,15 @@ owner generation；持久化到 `Prepared` 后，在首次或恢复重放 `JobPr
 Publish decision 的 Index digest 必须等于 durable Prepared candidate 的 `result_index_digest`，revision
 必须等于 base revision + 1；正常处理、finalize 重试和 recovery 都执行同一校验。
 
-生产 Agent 还需要负责：
+开发联调 Agent 已建立或必须继续保持以下边界：
 
-- 在已实现 bootstrap/status 之后建立到中心 Agent API 的 mTLS H2/H3 JSON session，完成证书使用、
-  heartbeat、Desired State watch 和 Job 领取；
+- 使用已审批 Ed25519 key 对独立 Agent OpenAPI 的每个 POST 签名，打开持久化 session identity，
+  heartbeat，并通过短轮询领取 Job；
 - 校验 EdgeCluster、TenantAssignment、PlaygroundAttachment、AgentMount、IndexVersion、lease 和 capability；
 - 在向中心确认 accepted 前把 Job 写入本地 Ledger；
 - 调用结构化 NeoEngram Engine API，不解析 CLI stdout；
 - 执行稳定扫描、切块、Hash、对象直传与 durability 对账、checkout 和 journal recovery；
-- 生成结构化 IndexDelta、ObjectReceipt 和可分页 MetadataBatch，并通过 Agent session 分页上报中心；
+- 生成结构化 IndexDelta、ObjectReceipt 和可分页 MetadataBatch，并通过独立 action operations 上报中心；
 - 保存 Job 进度、候选、错误和恢复状态，在断线重连后幂等续传；
 - 主动访问已授权 NFS Playground 和中心 S3 ticket 数据面；
 - 监测 mount、storage 和 Gateway Actual State。
@@ -701,13 +703,14 @@ persist registration_request_id + key pair on agent-state PVC
   -> Central idempotently creates StorageEnrollment(state = pending_approval)
   -> platform operator verifies deployment/PVC evidence out of band; TenantAdmin reviews the public summary
   -> approve or reject; approval creates/binds unavailable StorageVolume and AgentInstance
-  -> approved Agent obtains/renews its node certificate and opens the outbound control session
+  -> approved Agent signs /agent/session/open with its enrolled Ed25519 key
   -> mount/config/session generation valid + heartbeat healthy
   -> Agent/StorageVolume ready
 ```
 
-当前 `neoengram-agentd` 已实现到“approve or reject”后的状态轮询和 approved identity 持久化；证书获取、
-控制 session、heartbeat 以及 Ready 推进尚未实现，因此当前 readiness probe 有意保持失败。
+当前 `neoengram-agentd` 已实现审批状态轮询、approved identity 持久化，以及独立的 session client/driver；
+server 已实现 session open、heartbeat、poll 与 Volume 状态推进。daemon 主循环把这些组件装配为持续 Ready
+生命周期仍需端到端验收，因此 readiness 必须继续 fail closed，而不能仅凭 approved 状态成功。
 
 目标业务 PVC 必须已经由基础设施管理员准备，但 StorageVolume 记录不要求预先存在。TenantAdmin 在
 存储页生成限定到完整 StorageVolume descriptor 的 bootstrap credential；Agent bootstrap 只创建待审批
@@ -727,21 +730,20 @@ token 在 bootstrap 前过期时尚未绑定 candidate，可直接签发新的 t
 approved 请求使用原 request identity 幂等重放。
 
 审批只授予 NeoEngram session、Owner 和 Job 等控制面能力，不授予或撤销 Kubernetes/POSIX 权限。
-单阶段模板中的 Agent 在 bootstrap 前已经挂载 `/volume`；中心拒绝、过期、断开 session 或撤销证书都
+单阶段模板中的 Agent 在 bootstrap 前已经挂载 `/volume`；中心拒绝、过期、断开 session 或撤销 key 都
 不能从内核 mount namespace 移除 PVC。bootstrap 又必须提交真实 mount fingerprint、marker 和 RW 探针，
 因此 0.0.1 不支持审批前禁止数据访问；这需要后续独立的 pre-mount enrollment 状态、契约和部署编排。
 
-Pod 重建必须复用独立 agent-state PVC 中的 Agent ID、私钥和注册 request identity；证书在后续 session
-阶段实现后也必须保存在该状态盘。状态盘丢失、
+Pod 重建必须复用独立 agent-state PVC 中的 Agent ID、私钥、注册 request identity、Ledger 和 outbound
+queue。生产证书在引入 mTLS 后也必须保存在该状态盘。状态盘丢失、
 损坏或被明确弃用时，新 Pod 必须生成新的 pending 身份并重新审批，不能仅凭相同 Deployment、PVC 名或
 `/volume` 内容继承旧身份。克隆状态盘启动的第二实例必须因单活动 `session_generation` 被中心拒绝。
-证书撤销、审批撤回和 generation 不匹配立即停止新 Job 与租约续期，但在 cooperative 模式下不能声称
+key 撤销、审批撤回和 generation 不匹配立即停止新 Job 与租约续期，但在 cooperative 模式下不能声称
 已经撤销旧进程的底层 PVC 写权限。
 
 ### 6.3 Agent 本地状态
 
-当前 enrollment daemon 在独立 agent-state PVC 上实际创建以下状态；证书、Job Ledger 和 cache 尚未由
-该 daemon 创建：
+enrollment daemon 在独立 agent-state PVC 上创建 system identity 与 health 状态：
 
 ```text
 /var/lib/neoengram-agent/
@@ -754,21 +756,23 @@ Pod 重建必须复用独立 agent-state PVC 中的 Agent ID、私钥和注册 r
 - `system.sqlite3` 保存 installation/request identity、签名私钥和已审批 Agent identity；
 - `system.lock` 保证同一 system identity 数据目录只被一个 daemon 进程打开；
 - `bootstrap-status-clock.json` 保存签名 status 请求的单调时间水位；
-- `runtime-health.json` 是 startup/liveness/readiness 命令读取的 daemon health record；当前
-  enrollment-only 构建的 readiness 始终失败。
+- `runtime-health.json` 是 startup/liveness/readiness 命令读取的 daemon health record；readiness 只有在
+  session generation、mount recovery 和 heartbeat 全部有效后才能成功。
 
-Job business session 接线后，未来状态盘再增加以下按 Tenant 隔离的 Ledger/cache/candidate 布局：
+Job/session 组件使用以下按 Tenant 隔离的 Ledger/outbound/cache/candidate 布局：
 
 ```text
 /var/lib/neoengram-agent/tenants/<tenant-id>/
 ├── ledger.sqlite3
+├── outbound.sqlite3
 ├── object-cache.sqlite3                         # 可选、可重建
 ├── playgrounds/<playground-id>/cache.sqlite3  # 可选、可重建
 └── jobs/<job-id>/candidate.sqlite3             # 可选、临时
 ```
 
-- 每个 Tenant 将使用独立 `ledger.sqlite3` 保存本节点已接受 Job、幂等摘要、阶段和恢复线索，避免
+- 每个 Tenant 使用独立 `ledger.sqlite3` 保存本节点已接受 Job、幂等摘要、阶段和恢复线索，避免
   SQLite 缺少 RLS 导致的跨租户误读，并缩小损坏范围；
+- `outbound.sqlite3` 按入队顺序持久化 Job report；中心成功 ack 后才删除，重启后继续重放；
 - Playground `cache.sqlite3` 只缓存某个中心 IndexVersion、文件 fingerprint 和分页数据，可随时删除
   并从中心重建；它不是该 Playground 的完整 MetadataStore；
 - 大 Job 可使用独立 `candidate.sqlite3` 对 IndexDelta/Manifest 进行分页、排序和断点恢复。中心拉取并
@@ -1219,6 +1223,7 @@ Commit 发布也在中心事务内完成 immutable catalog insert 和 Ref CAS。
 ├── system.sqlite3
 └── tenants/<tenant-id>/
     ├── ledger.sqlite3
+    ├── outbound.sqlite3
     ├── object-cache.sqlite3                     # 可选
     ├── playgrounds/<playground-id>/cache.sqlite3  # 可选
     └── jobs/<job-id>/candidate.sqlite3          # 可选
@@ -1228,6 +1233,7 @@ Commit 发布也在中心事务内完成 immutable catalog insert 和 Ref CAS。
 | --- | --- | --- | --- |
 | `system.sqlite3` | AgentInstance | Agent identity、配置版本、Mount inventory、worker 状态 | 否 |
 | Tenant `ledger.sqlite3` | TenantAssignment | 本节点 Job、request digest、阶段、恢复线索、MetadataBatch 索引 | 否 |
+| Tenant `outbound.sqlite3` | AgentInstance + Tenant | 按 Job 保序、等待中心 ack 的 durable reports | 否 |
 | Playground `cache.sqlite3` | 可删除 | 某 IndexVersion 的分页缓存、fingerprint、扫描加速数据 | 否 |
 | Job `candidate.sqlite3` | 短期/TTL | 大型 Delta/Manifest 的排序、分页、digest 和断点恢复 | 否 |
 
@@ -1275,8 +1281,8 @@ chunk ordinal 重组并验证无缺口、metadata 一致以及完整 canonical M
 `ObjectCatalog` 的 Durable 状态允许 finalize，后续读取仍按完整性策略重新验证对象。
 
 控制权仍在中心：只有中心可以创建 Assignment、签发 lease/fence、发布 Index/Ref 和决定 Job 最终
-结果。网络连接由 Agent 发起，应用消息统一使用 JSON；HTTP/2 与 HTTP/3 必须实现相同的
-session/resource-version、幂等上报、断线重连和 replay 契约。
+结果。网络请求由 Agent 发起，开发 transport 统一使用 HTTP/1 JSON action POST；任何未来传输升级
+都必须保留相同的 session/resource-version、幂等上报、断线重连和 replay 契约。
 
 ### 10.5 信任边界
 
@@ -1319,7 +1325,7 @@ Agent 绝不能在业务 PVC 上打开 SQLite。把 `journal_mode` 改成 DELETE
 
 ## 11. 中心管控、Agent 发起的协议
 
-### 11.1 公开 API 契约、Agent enrollment 与 session 草案
+### 11.1 公开 API 与独立 Agent OpenAPI 契约
 
 用户/CLI/UI 的首版公开契约见 [`openapi/neoengram-api.yaml`](openapi/neoengram-api.yaml)。它使用
 OpenAPI 3.1、普通 JSON 和模块/子域/动作路径；path 不含版本，认证业务方法通过
@@ -1373,14 +1379,19 @@ POST /api/job/add/finalize
 GET  /health/live
 GET  /health/ready
 
-# 以下 Agent 路径不属于公开 OpenAPI；前两条已由独立 listener 实现，其余仍是草案
-POST /v1/agents/bootstrap                                      # 已实现：幂等申请注册；初始为 pending_approval
-POST /v1/agents/bootstrap/status                               # 已实现：签名查询审批状态
-POST /v1/agents/{agent_id}/sessions/open                       # 认证后建立新的 session generation
-POST /v1/agents/{agent_id}/sessions:connect                    # H2/H3 JSON 双向控制流
-GET  /v1/agents/{agent_id}/jobs/{job_id}/inputs/{input_id}/pages/{page}
-POST /v1/agents/{agent_id}/jobs/{job_id}/metadata-batches
-PUT  /v1/agents/{agent_id}/jobs/{job_id}/metadata-batches/{batch_id}/pages/{page}
+# 独立 Agent OpenAPI；同样是 action/RPC 风格，所有资源 ID 均位于 JSON body
+POST /agent/enrollment/bootstrap
+POST /agent/enrollment/status/query
+POST /agent/session/open
+POST /agent/session/heartbeat/report
+POST /agent/session/message/list/query
+POST /agent/job/report/create
+POST /agent/job/metadata/batch/stage
+POST /agent/job/metadata/page/stage
+POST /agent/job/index/page/query
+POST /agent/job/object/missing/query
+POST /agent/job/object/upload
+POST /agent/session/close
 ```
 
 公开 OpenAPI 已定义但尚未全部实现 Tenant、StorageVolume、Storage enrollment、Project、Artifact、Commit 图、
@@ -1389,59 +1400,70 @@ Playground、Snapshot 的查询，支持 PVC enrollment token/审批、已有 PV
 PV/PVC 或 NFS。仍不承诺 Gateway、Job cancel/list、
 文件树或其他资源 mutation，也不暴露中心内部 `AssignJob`、`ExpireAddJob` 或
 `ResumePublication`。用户 API 与 Agent API 使用不同认证域。用户 API 使用
-OIDC principal 和 Tenant RBAC，身份或授权无法确认时默认拒绝；当前 Agent enrollment 使用一次性 token
-与 Ed25519 proof，后续业务 session 才使用绑定 `AgentInstance/ComputeNode` 的节点证书，并只允许访问
-中心已经分配给该 Agent 的 Assignment。Agent
+OIDC principal 和 Tenant RBAC，身份或授权无法确认时默认拒绝；Agent enrollment 使用一次性 token 与
+Ed25519 proof，批准后每个 session action 继续使用绑定 `AgentInstance/installation/boot/session` 的
+Ed25519 request proof，并只允许访问中心已经分配给该 Agent 的 Assignment。Agent
 不能用节点身份代替用户创建业务 Job，也不能读取未分配租户的队列。
 
 bootstrap 请求至少绑定稳定 `registration_request_id`、一次性 credential ID、Tenant、EdgeCluster、
 StorageVolume、Agent 公钥、版本/capability 和 `/volume` mount fingerprint。中心用 request identity + 公钥
-幂等创建 `pending_approval` AgentInstance；Agent bootstrap/status、证书领取和 session 均不在公开
-OpenAPI，TenantAdmin 则通过公开 Storage enrollment API 审批，Agent 不能自批。当前 status 只返回
-审批状态和获批 identity，尚不签发证书；bootstrap token 不能直接连接未来业务 session。Agent 查询
-审批结果或重放 bootstrap 都只使用出站连接。
+幂等创建 `pending_approval` AgentInstance；Agent enrollment/session 均不在公开 OpenAPI，而由独立
+[`openapi/neoengram-agent-api.yaml`](openapi/neoengram-agent-api.yaml) 定义。TenantAdmin 通过公开 Storage
+enrollment API 审批，Agent 不能自批；bootstrap token 不能建立 session。Agent 查询审批结果、打开 session
+或重放任何 operation 都只使用出站请求。
 
-五类 generation 不得混用：`credential_generation` 控制证书轮换/撤销，`session_generation` 保证单活动
+五类 generation 不得混用：`credential_generation` 控制 key/未来证书轮换与撤销，`session_generation` 保证单活动
 连接，`config_generation` 标识已审批 Desired State，`mount_generation` 标识已审批 mount fingerprint
 的变化，`owner_generation` 线性化全卷 RW owner 接管。Pod 普通重建且复用状态 PVC 时不推进 owner
 generation；人工替换 AgentInstance 时必须分别 CAS 推进相关 generation，并在恢复完成前保持 Volume
 unavailable。
 
-heartbeat、Actual State、Assignment、accept、progress、lease renew、publish decision 和 finalize ack 都
-通过 `sessions:connect` 双向流传输。大型 Job input 和 MetadataBatch 页面使用同一 H2/H3 连接上的独立 HTTP
-stream，避免大页面阻塞 heartbeat 和租约续期。Assignment 只能由中心产生；断线重连必须从最后确认的
-resource/page version 继续，不能把重复 delivery 当作新的 Job。
+heartbeat、Actual State、accept、progress、lease renew 和 finalize ack 通过各自 action POST 上报；
+Assignment 与 publish decision 通过 `/agent/session/message/list/query` 短轮询获取。大型 Index、
+MetadataBatch 和 object 使用各自分页或上传 action，避免阻塞 heartbeat。Assignment 只能由中心产生；
+断线重连必须重放本地 durable outbox，并把重复 delivery 识别为同一个 Job。
 
-### 11.2 H2/H3 JSON 流与分帧（未来候选）
+### 11.2 HTTP/1 action 短轮询与请求签名
 
-若后续选择该 transport，Agent 发起一个长生命周期请求：
+Agent 发起普通 JSON POST；URL 只表达 operation，Agent/session/Job 等资源 ID 均放在 body。例如：
 
 ```http
-POST /v1/agents/agent-123/sessions:connect HTTP/2
-Content-Type: application/json-seq
-Accept: application/json-seq
-```
+POST /agent/session/message/list/query HTTP/1.1
+Content-Type: application/json
+Accept: application/json
 
-请求 body 是 Agent 到中心的消息流，响应 body 是中心到 Agent 的消息流。两端必须在请求未结束时并发
-读取和写入，Ingress、Load Balancer 和反向代理必须禁用响应缓冲。应用层使用 RFC 7464 JSON Text
-Sequences：每条消息以 ASCII `RS`（`0x1e`）开始、以 `LF`（`0x0a`）结束，媒体类型为
-`application/json-seq`。
-
-```text
-\x1e{"type":"agent.heartbeat","protocol_version":1,"message_id":"msg-1",...}\n
-\x1e{"type":"job.assignment","protocol_version":1,"message_id":"msg-2",...}\n
+{
+  "protocol_version": 1,
+  "request_id": "req-01",
+  "agent_id": "agent-123",
+  "installation_id": "installation-123",
+  "boot_id": "boot-456",
+  "session_id": "session-789",
+  "session_generation": "12",
+  "signed_at_unix_ms": "1785859200000",
+  "payload": {"max_messages": 32},
+  "proof": {
+    "unsigned_body_digest": "<64 lowercase hex>",
+    "algorithm": "ed25519",
+    "public_key_spki": "<base64url SPKI>",
+    "signature": "<base64url signature>"
+  }
+}
 ```
 
 传输规则：
 
-- HTTP/2 是所有中心和 Agent 必须支持的基线；HTTP/3 通过 ALPN/Alt-Svc 协商，UDP/443 不可用时回退
-  H2，二者不能产生不同业务语义；
-- 不使用 Protobuf、gRPC、WebSocket 或自定义二进制帧；公共消息由版本化 JSON Schema 定义；
-- 控制消息默认不超过 1 MiB；大型 input/MetadataBatch 使用独立分页 HTTP stream，并保留 page digest、
-  总页数和整体 digest；
+- 开发基线是 HTTP/1 短轮询；空 poll 返回 `retry_after_ms=1000`，每次最多返回 32 条消息；
+- 只使用 OpenAPI 3.1 定义的 JSON POST，不使用 REST path parameter、GET/PUT/PATCH/DELETE、Protobuf、
+  gRPC、WebSocket 或自定义二进制帧；
+- 签名绑定 `POST`、canonical path、Agent/installation/boot/session identity、request ID、时间以及未签名
+  body 的 RFC 8785 JCS BLAKE3 digest；允许的时钟偏差为 60 秒；
 - 每个 Agent 同时只有一个有效 `session_generation`。新 session 成功后旧 session 的 heartbeat、续租和
   Job 上报全部拒绝；
-- HTTP PING/QUIC keepalive 只维护连接，不能代替持久化的业务 heartbeat；
+- 同 boot 的精确 open 重放返回原 session；新 boot 只有在旧 heartbeat 超时后才能接管并推进 generation；
+- Assignment 从 durable outbox 派生并重投至 Accepted；Decision 从 Job 权威状态派生并重投至 Finalized ack；
+- MetadataBatch 使用 descriptor/page action 分页并保留 page digest、总页数和整体 digest；inline object
+  使用 base64 JSON 上传，单对象上限 4 MiB；
 - 未知 JSON 字段按兼容规则忽略并保留，未知 `type` 按 capability/version 返回稳定错误；
 - 涉及 request digest 或签名的 JSON 使用 RFC 8785 JCS 规范化，数字严格采用 ECMAScript
   `NumberToString`；所有 raw JSON decode 入口递归拒绝重复 object member，不能依赖 parser 的
@@ -1833,16 +1855,18 @@ VersityGW 是后续缓存/分发候选而非既定依赖。原型必须验证：
 - Range GET、HEAD、并发 GET、multipart 和客户端兼容性；
 - 百万对象、Hash fanout、冷/热缓存、NFS 双跳的吞吐和 p95/p99；
 - 多实例、NFS failover、部分响应、重试、drain 和 active lease；
-- 跨集群出口、DNS/TLS、H2/H3/S3 客户端兼容、route health 和带宽整形；
+- 跨集群出口、DNS/TLS、Agent action API/S3 客户端兼容、route health 和带宽整形；
 - symlink/path escape、root squash、Unix/NFSv4 权限和凭证轮换。
 
 ## 14. 安全模型
 
 ### 14.1 中心与 Agent
 
-- 双向 TLS，证书绑定 EdgeCluster/AgentInstance/ComputeNode，撤销后不得继续调度；
-- Node 证书只证明节点身份，不自动授予全部租户权限；
-- 请求携带短期受保护的 principal/tenant/scope、deadline、nonce/request ID 和协议版本；
+- 开发联调使用 loopback HTTP 和已审批 Ed25519 key 的逐请求签名；签名绑定 method、canonical path、
+  identity、request ID、时间与 body digest，不签发 session bearer token；
+- 生产目标使用双向 TLS，证书绑定 EdgeCluster/AgentInstance/ComputeNode，撤销后不得继续调度；
+- Node key/证书只证明节点身份，不自动授予全部租户权限；
+- 请求携带受保护的 identity/session generation、deadline、request ID 和协议版本；
 - Agent 重复验证 Assignment/Attachment/Mount/IndexVersion/lease/fence；
 - 中心 Agent API 只在受控网络监听；Agent 不暴露入站业务 API，且控制面不与 Gateway 数据 Endpoint
   共用凭证；
@@ -1981,7 +2005,7 @@ final result / recovery / deletion reason
 
 ```text
                          neoengramd
-                    / H2/H3 JSON control \
+                  / signed /agent action POST \
                    v                      v
        EdgeCluster A                      EdgeCluster B
        Agent / NFS / Gateway A            Agent / NFS / Gateway B
@@ -2118,7 +2142,7 @@ Standalone publisher 和中心 `IndexPublisher` 分别拥有最终 CAS；engine/
   以及 Volume Owner/owner generation 约束；
 - 定义 PostgreSQL RLS、复合外键、RBAC、Quota 和 system scope；
 - 已定义 transport-independent ControlEnvelope、JSON Schema、MetadataBatch 上传/staging、IndexVersion
-  CAS、finalize decision 和 lease/fence wire 类型；H2/H3 session 尚未实现；
+  CAS、finalize decision 和 lease/fence wire 类型；开发 HTTP/1 action session 已实现，生产 mTLS 待实现；
 - 明确 Cooperative/Enforced/Dedicated 三种隔离承诺；
 - NFSv4.1/4.2 认证矩阵和故障注入环境留到生产存储 adapter 阶段；
 - 已拆分 Engine/Standalone 结构化 Result 与 CLI-only 输出。
@@ -2321,8 +2345,8 @@ SQLite 模式只允许单 server 副本，生产 TLS 由 Ingress/反向代理终
 16. Tenant suspend/delete 的 retention、legal hold、失败重试和删除证明如何定义？
 17. 是否需要 `CrossTenantCopy`；若需要，双边授权、审计和目标计费如何建模？
 18. 已冻结 JSON Schema/JCS/限额后，未来版本兼容矩阵和在线协商策略如何演进？
-19. H2/H3 双向流经过目标 Ingress/Load Balancer 时，session 路由、连接迁移、背压、断线重放和最长
-    离线窗口如何定义？
+19. `/agent/*` action 短轮询经过目标 Ingress/Load Balancer 时，容量、背压、断线重放和最长离线窗口
+    如何定义；未来是否需要升级底层 HTTP transport？
 20. 中心 PostgreSQL、中心 S3、NFS Playground journal、Agent 配置和 Gateway cache 如何做租户级灾难恢复？
 
 P0 架构与协议不因上述问题回退；生产控制面在这些问题没有原型、测试和验收结论前仍保持设计状态。

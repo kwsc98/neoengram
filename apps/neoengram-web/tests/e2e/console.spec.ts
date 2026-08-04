@@ -116,6 +116,9 @@ test('creates a PVC token and independently approves a pending enrollment', asyn
   await expect(enrollmentDialog.getByLabel('Bootstrap token', { exact: true })).toContainText(
     'ngenr_v1_',
   );
+  const bootstrapToken = await enrollmentDialog
+    .getByLabel('Bootstrap token', { exact: true })
+    .textContent();
   const agentConfig = enrollmentDialog.locator('.deployment-config');
   await expect(agentConfig).toContainText('schema_version: 1');
   await expect(agentConfig).toContainText('protocol_version: 1');
@@ -127,6 +130,7 @@ test('creates a PVC token and independently approves a pending enrollment', asyn
   await expect(agentConfig).toContainText('state_dir: /var/lib/neoengram-agent');
   await expect(agentConfig).toContainText('marker_file: /volume/.neoengram-volume-marker');
   await expect(agentConfig).toContainText(`expected_volume_marker: ${tokenVolumeId}`);
+  await expect(agentConfig).toContainText(`volume_descriptor_digest: ${'d'.repeat(64)}`);
   await expect(agentConfig).toContainText('pvc_reference:');
   await expect(agentConfig).toContainText('registration:');
   await expect(agentConfig).toContainText('approval_required: true');
@@ -134,6 +138,7 @@ test('creates a PVC token and independently approves a pending enrollment', asyn
   await expect(agentConfig).toContainText(
     'bootstrap_token_file: /var/run/secrets/neoengram/bootstrap-token',
   );
+  expect(await agentConfig.textContent()).not.toContain(bootstrapToken);
   await page.goBack();
   await expect(page).toHaveURL(/\/tenants\/tenant-b\/storage-volumes$/);
   await expect(page.getByLabel('Bootstrap token', { exact: true })).toHaveCount(0);
@@ -347,6 +352,26 @@ test('creates an Artifact, Playground, Commit and Snapshot from resource pages',
   await expect(page.getByText('cn-guangzhou', { exact: true }).first()).toBeVisible();
   await expectNoOperatorDetails(page);
   await expectHealthyLayout(page);
+});
+
+test('creates a minimal Playground without Project or Artifact catalog lookups', async ({
+  page,
+}, testInfo) => {
+  const playgroundId = `list-created-${testInfo.project.name}`;
+  await page.goto('/tenants/tenant-a/playgrounds');
+  await page.getByRole('button', { name: '创建 Playground' }).click();
+
+  const dialog = page.getByRole('dialog', { name: '创建 Playground' });
+  await dialog.getByLabel('Project ID').fill('project-vision');
+  await dialog.getByLabel('Artifact ID').fill('road-scenes');
+  await dialog.getByLabel('Playground ID').fill(playgroundId);
+  await dialog.getByLabel('名称').fill('列表创建工作区');
+  await dialog.getByRole('combobox', { name: 'StorageVolume 选择' }).click();
+  await page.getByRole('option', { name: /视觉数据 PVC/ }).click();
+  await dialog.getByRole('button', { name: '创建 Playground' }).click();
+
+  await expect(page).toHaveURL(new RegExp(`/playgrounds/${playgroundId}$`));
+  await expect(page.getByRole('heading', { name: '列表创建工作区' })).toBeVisible();
 });
 
 test('creates an Artifact derived from an explicit source Commit', async ({ page }, testInfo) => {
@@ -797,9 +822,17 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
 });
 
 test('creates, advances, finalizes and replays a Managed Add Job', async ({ page }, testInfo) => {
-  await page.goto('/tenants/tenant-a/jobs/new');
+  await page.goto(
+    '/tenants/tenant-a/jobs/new?project_id=project-vision&artifact_id=road-scenes&playground_id=labeling',
+  );
   await expect(page.getByText('当前租户：tenant-a')).toBeVisible();
   await expect(page.getByLabel('Tenant ID')).toHaveCount(0);
+  await expect(
+    page.locator('.index-version-field').filter({ hasText: 'Expected revision' }).locator('code'),
+  ).toHaveText('31');
+  await expect(
+    page.locator('.index-version-field').filter({ hasText: 'Expected digest' }).locator('code'),
+  ).toHaveText('a'.repeat(64));
   const jobId = await page
     .locator('.el-form-item')
     .filter({ hasText: 'Job ID' })
@@ -844,18 +877,20 @@ test('handles missing, validation, unavailable and invisible Tenant routes', asy
   await page.getByRole('button', { name: '查询', exact: true }).click();
   await expect(page.getByText('未找到可见的 Job')).toBeVisible();
 
-  await page.goto('/tenants/tenant-a/jobs/new');
+  await page.goto(
+    '/tenants/tenant-a/jobs/new?project_id=project-vision&artifact_id=road-scenes&playground_id=labeling',
+  );
   await page
     .locator('.el-form-item')
-    .filter({ hasText: 'Project ID' })
+    .filter({ hasText: 'Job ID' })
     .locator('input')
-    .fill('project-invalid');
+    .fill('invalid job id');
   await page.getByRole('button', { name: '开始扫描' }).click();
-  await expect(page.getByText('请求未通过校验')).toBeVisible();
-  await expect(page.getByText('PROTOCOL_INVALID')).toBeVisible();
+  await expect(page.getByText('请输入合法 Job ID')).toBeVisible();
 
-  await page.goto('/tenants/tenant-unavailable/jobs/new');
-  await page.getByRole('button', { name: '开始扫描' }).click();
+  await page.goto(
+    '/tenants/tenant-unavailable/jobs/new?project_id=project-vision&artifact_id=road-scenes&playground_id=labeling',
+  );
   await expect(page.getByText('中心 authority 暂不可用')).toBeVisible();
   await expect(page.getByRole('button', { name: '重试' })).toBeVisible();
 

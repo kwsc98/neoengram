@@ -9,6 +9,7 @@ mod error;
 mod fakes;
 mod memory;
 mod mount_probe;
+mod outbound;
 mod ports;
 mod single_volume;
 mod sqlite_ledger;
@@ -24,9 +25,13 @@ pub use mount_probe::{
     FilesystemMountObservation, FilesystemMountProbeConfig, MountProbeCondition,
     VOLUME_MARKER_FILE_NAME,
 };
+pub use outbound::{
+    DurableReportSink, QueuedAgentReport, SqliteOutboundReportQueue,
+    SqliteOutboundReportQueueConfig,
+};
 pub use ports::{
     AddExecutor, AssignmentValidator, BasicAssignmentValidator, Clock, Ledger, ObjectTransfer,
-    ReportSink,
+    OutboundReportQueue, ReportSink,
 };
 pub use single_volume::{
     MountStatusCondition, SingleVolumeAgentConfig, SingleVolumeAssignmentValidator,

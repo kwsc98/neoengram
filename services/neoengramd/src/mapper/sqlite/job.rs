@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use neoengram_protocol::TenantId;
+use neoengram_protocol::{AgentId, TenantId};
 use sqlx::{sqlite::SqliteRow, Row};
 
 use super::authority::*;
@@ -18,6 +18,95 @@ impl JobRepository for SqliteAuthorityStore {
         .await
         .map_err(storage_error)?;
         row.map(|row| decode_job_row(key, &row)).transpose()
+    }
+
+    async fn list_recoverable(
+        &self,
+        after: Option<&JobKey>,
+        now: neoengram_protocol::UnixMillis,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = if let Some(after) = after {
+            sqlx::query(
+                "SELECT tenant_id, job_id, state, resource_version, payload FROM control_jobs \
+                 WHERE (tenant_id > ? OR (tenant_id = ? AND job_id > ?)) \
+                   AND state IN ('queued', 'assigned', 'accepted', 'running', 'prepared', \
+                                 'publishing', 'cancel_requested') \
+                 ORDER BY tenant_id, job_id",
+            )
+            .bind(after.tenant_id.as_str())
+            .bind(after.tenant_id.as_str())
+            .bind(after.job_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?
+        } else {
+            sqlx::query(
+                "SELECT tenant_id, job_id, state, resource_version, payload FROM control_jobs \
+                 WHERE state IN ('queued', 'assigned', 'accepted', 'running', 'prepared', \
+                                 'publishing', 'cancel_requested') \
+                 ORDER BY tenant_id, job_id",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?
+        };
+        let mut jobs = Vec::with_capacity(limit.min(rows.len()));
+        for row in rows {
+            let tenant_id = TenantId::new(
+                row.try_get::<String, _>("tenant_id")
+                    .map_err(storage_error)?,
+            )?;
+            let job_id = neoengram_protocol::JobId::new(
+                row.try_get::<String, _>("job_id").map_err(storage_error)?,
+            )?;
+            let job = decode_job_row(&JobKey::new(tenant_id, job_id), &row)?;
+            if crate::mapper_recovery_predicate(&job, now) {
+                jobs.push(job);
+                if jobs.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(jobs)
+    }
+
+    async fn list_pending_decisions_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT tenant_id, job_id, state, resource_version, payload FROM control_jobs \
+             ORDER BY tenant_id, job_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let mut jobs = Vec::with_capacity(limit.min(rows.len()));
+        for row in rows {
+            let tenant_id = TenantId::new(
+                row.try_get::<String, _>("tenant_id")
+                    .map_err(storage_error)?,
+            )?;
+            let job_id = neoengram_protocol::JobId::new(
+                row.try_get::<String, _>("job_id").map_err(storage_error)?,
+            )?;
+            let job = decode_job_row(&JobKey::new(tenant_id, job_id), &row)?;
+            if pending_decision_for_agent(&job, agent_id) {
+                jobs.push(job);
+                if jobs.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(jobs)
     }
 
     async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
@@ -87,6 +176,15 @@ impl JobRepository for SqliteAuthorityStore {
         transaction.commit().await.map_err(storage_error)?;
         Ok(job)
     }
+}
+
+fn pending_decision_for_agent(job: &JobRecord, agent_id: &AgentId) -> bool {
+    job.decision.is_some()
+        && job.finalized_ack.is_none()
+        && job
+            .assignment
+            .as_ref()
+            .is_some_and(|assignment| &assignment.agent_id == agent_id)
 }
 
 fn validate_job_identity(job: &JobRecord) -> CentralResult<()> {

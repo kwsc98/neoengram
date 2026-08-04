@@ -225,7 +225,7 @@ pub struct AgentHeartbeat {
 }
 
 impl AgentHeartbeat {
-    fn validate(&self) -> ProtocolResult<()> {
+    pub fn validate(&self) -> ProtocolResult<()> {
         validate_collection_limit(
             "running_jobs",
             self.running_jobs.len(),

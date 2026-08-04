@@ -13,9 +13,9 @@ use neoengram_protocol::{
 use neoengramd::{
     AgentEnrollmentListCursor, AgentEnrollmentListRequest, AgentProofOfPossessionStatus,
     AgentRegistryRecord, AgentRegistryService, BootstrapTokenMetadata, CentralError,
-    CentralErrorCode, Clock, CreateStorageEnrollmentIntentRequest, FrozenPvcReference,
-    FrozenStorageDescriptor, StorageEnrollmentAccessMode, StorageEnrollmentRegistrationKind,
-    StorageEnrollmentState,
+    CentralErrorCode, Clock, ControlCatalogRepository, CreateStorageEnrollmentIntentRequest,
+    FrozenPvcReference, FrozenStorageDescriptor, StorageEnrollmentAccessMode,
+    StorageEnrollmentRegistrationKind, StorageEnrollmentState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,13 +26,13 @@ use crate::{
         QueryStorageEnrollmentListRequest, QueryStorageEnrollmentListResponse,
         QueryStorageEnrollmentRequest, QueryStorageEnrollmentResponse,
         RejectStorageEnrollmentRequest, RejectStorageEnrollmentResponse,
-        StorageEnrollmentProbeSummary, StorageEnrollmentView, StorageVolumeView,
+        StorageEnrollmentProbeSummary, StorageEnrollmentView,
     },
     error::{application_error, invalid_request, map_central_error, storage_enrollment_not_found},
     identity::{AuthenticatedIdentity, Permission, StaticRbacPolicy},
 };
 
-use super::EnrollmentKeyring;
+use super::{catalog::storage_volume_view, EnrollmentKeyring};
 
 const TOKEN_TTL_MS: u64 = 15 * 60 * 1_000;
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -43,6 +43,7 @@ const CURSOR_PREFIX: &str = "ngcur_v1_";
 /// Public enrollment application service. HTTP types are converted at this boundary only.
 pub struct EnrollmentService {
     registry: Arc<AgentRegistryService>,
+    catalog: Arc<dyn ControlCatalogRepository>,
     policy: Arc<StaticRbacPolicy>,
     keyring: Arc<EnrollmentKeyring>,
     clock: Arc<dyn Clock>,
@@ -52,12 +53,14 @@ impl EnrollmentService {
     #[must_use]
     pub fn new(
         registry: Arc<AgentRegistryService>,
+        catalog: Arc<dyn ControlCatalogRepository>,
         policy: Arc<StaticRbacPolicy>,
         keyring: Arc<EnrollmentKeyring>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             registry,
+            catalog,
             policy,
             keyring,
             clock,
@@ -283,10 +286,15 @@ impl EnrollmentService {
             .await
             .map_err(map_storage_enrollment_error)?;
         let enrollment = record_to_view(&result.record)?;
-        let storage_volume = record_to_volume_view(&result.record)?;
+        let storage_volume = self
+            .catalog
+            .get_storage_volume(&tenant_id, &result.record.enrollment.storage_volume_id)
+            .await
+            .map_err(map_storage_enrollment_error)?
+            .ok_or_else(internal_enrollment_error)?;
         Ok(ApproveStorageEnrollmentResponse {
             enrollment,
-            storage_volume,
+            storage_volume: storage_volume_view(&storage_volume),
             replayed: result.replayed,
         })
     }
@@ -345,6 +353,7 @@ impl EnrollmentService {
         Ok(CreateStorageEnrollmentTokenResponse {
             token_id: record.enrollment.token_id.to_string(),
             bootstrap_token: token,
+            volume_descriptor_digest: record.enrollment.volume_descriptor_digest.to_string(),
             expires_at_unix_ms: record.enrollment.expires_at_unix_ms.to_string(),
             replayed,
         })
@@ -683,28 +692,6 @@ fn probe_matches_descriptor(
             probe.health,
             ResourceHealth::Ready | ResourceHealth::Degraded
         )
-}
-
-fn record_to_volume_view(record: &AgentRegistryRecord) -> Result<StorageVolumeView, Error> {
-    let enrollment = record_to_view(record)?;
-    let reviewed_at = record
-        .enrollment
-        .decided_at_unix_ms
-        .ok_or_else(internal_enrollment_error)?;
-    Ok(StorageVolumeView {
-        tenant_id: enrollment.tenant_id,
-        storage_volume_id: enrollment.storage_volume_id,
-        display_name: enrollment.display_name,
-        edge_cluster_id: enrollment.edge_cluster_id,
-        region: enrollment.region,
-        backend_type: "pvc".to_owned(),
-        access_mode: enrollment.access_mode,
-        pvc_reference: enrollment.pvc_reference,
-        state: "unavailable".to_owned(),
-        resource_version: "1".to_owned(),
-        created_at_unix_ms: reviewed_at.to_string(),
-        updated_at_unix_ms: reviewed_at.to_string(),
-    })
 }
 
 fn parse_tenant(value: &str) -> Result<TenantId, Error> {

@@ -8,19 +8,21 @@ use neoengram_core::{
 };
 use neoengram_protocol::{
     AgentEnrollmentId, AgentId, AgentMountId, ArtifactId, ArtifactPlacementId,
-    AssignmentGeneration, AssignmentId, AssignmentOperation, DecimalU64, DurabilityState,
-    EdgeClusterId, Extensions, IndexDeltaRecord, JobPrepared, JobState, MetadataBatchDescriptor,
-    MetadataBatchId, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope, MountGeneration,
-    ObjectDurabilityReceipt, OwnerGeneration, PlacementGeneration, PlaygroundId, PrincipalId,
-    PrincipalKind, PrincipalRef, ProjectId, RequestId, ResourceVersion, SessionId, StorageVolumeId,
-    TenantId, UnixMillis, WireIndexVersion, WireObjectSpec,
+    AssignmentGeneration, AssignmentId, AssignmentOperation, ControlMessage, DecimalU64,
+    DurabilityState, EdgeClusterId, Extensions, IndexDeltaRecord, JobPrepared, JobState,
+    MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage, MetadataBatchRecords,
+    MetadataBatchScope, MountGeneration, ObjectDurabilityReceipt, OwnerGeneration,
+    PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId,
+    RequestId, ResourceVersion, SessionGeneration, SessionId, StorageVolumeId, TenantId,
+    UnixMillis, WireIndexVersion, WireObjectSpec,
 };
 use neoengramd::{
     open_sqlite_authority, AddJobSpec, AgentEnrollmentAuditEvent, AgentEnrollmentAuditKind,
-    AllowAllAuthorizer, AssignJobRequest, AssignmentTarget, AuditEvent, AuditKind,
+    AgentReport, AllowAllAuthorizer, AssignJobRequest, AssignmentTarget, AuditEvent, AuditKind,
     AuthorityCapabilities, AuthorityStore, CentralErrorCode, ControlPlane, CreateAddJobRequest,
-    FinalizeAddRequest, InMemoryComponents, IndexKey, IndexPublishOutcome, IndexPublishRejection,
-    IndexPublishRequest, JobKey, JobRecord, PublicationCandidate, SqliteAuthorityConfig,
+    ExpireAddJobRequest, FinalizeAddRequest, InMemoryClock, InMemoryComponents, IndexKey,
+    IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, JobKey, JobRecord,
+    PublicationCandidate, ReceiveReportRequest, SqliteAuthorityConfig,
 };
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use tempfile::TempDir;
@@ -35,6 +37,7 @@ struct ContractFixture {
     reserved_assignment: neoengram_protocol::JobAssignment,
     published_version: WireIndexVersion,
     publishing_job: JobRecord,
+    pending_decision_key: JobKey,
 }
 
 #[tokio::test]
@@ -64,7 +67,7 @@ async fn sqlite_reopen_recovers_every_authority_port() {
             .await
             .unwrap();
         let fixture = run_contract(authority.authority_store()).await;
-        assert_eq!(authority.published_assignments().await.unwrap().len(), 1);
+        assert_eq!(authority.published_assignments().await.unwrap().len(), 4);
         assert!(authority.audit_events().await.unwrap().len() >= 3);
         fixture
     };
@@ -73,10 +76,9 @@ async fn sqlite_reopen_recovers_every_authority_port() {
         .await
         .unwrap();
     assert_contract_state(&reopened.authority_store(), &fixture).await;
-    assert_eq!(
-        reopened.published_assignments().await.unwrap(),
-        vec![fixture.assignment.clone()]
-    );
+    let recovered_assignments = reopened.published_assignments().await.unwrap();
+    assert_eq!(recovered_assignments.len(), 4);
+    assert!(recovered_assignments.contains(&fixture.assignment));
     assert!(matches!(
         reopened
             .authority_store()
@@ -86,7 +88,7 @@ async fn sqlite_reopen_recovers_every_authority_port() {
             .unwrap(),
         neoengramd::AssignmentPublishOutcome::Published
     ));
-    assert_eq!(reopened.published_assignments().await.unwrap().len(), 2);
+    assert_eq!(reopened.published_assignments().await.unwrap().len(), 5);
     assert!(reopened.audit_events().await.unwrap().len() >= 3);
     assert_eq!(
         reopened
@@ -125,6 +127,65 @@ async fn sqlite_migrates_v1_authority_without_losing_existing_state() {
     migrated.integrity_check().await.unwrap();
     assert_contract_state(&migrated.authority_store(), &fixture).await;
     assert!(migrated.enrollment_audit_events().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_migrates_v3_indexes_without_losing_project_scope() {
+    let directory = TempDir::new().unwrap();
+    let fixture = {
+        let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+            .await
+            .unwrap();
+        run_contract(authority.authority_store()).await
+    };
+    execute_raw(
+        directory.path(),
+        "PRAGMA foreign_keys = OFF;
+         ALTER TABLE playground_index_records RENAME TO playground_index_records_v4;
+         ALTER TABLE playground_indexes RENAME TO playground_indexes_v4;
+         CREATE TABLE playground_indexes (
+             tenant_id TEXT NOT NULL,
+             artifact_id TEXT NOT NULL,
+             playground_id TEXT NOT NULL,
+             revision TEXT NOT NULL CHECK (revision <> '' AND revision NOT GLOB '*[^0-9]*'),
+             digest BLOB NOT NULL CHECK (length(digest) = 32),
+             PRIMARY KEY (tenant_id, artifact_id, playground_id)
+         ) STRICT;
+         CREATE TABLE playground_index_records (
+             tenant_id TEXT NOT NULL,
+             artifact_id TEXT NOT NULL,
+             playground_id TEXT NOT NULL,
+             path TEXT NOT NULL,
+             manifest_id BLOB NOT NULL CHECK (length(manifest_id) = 32),
+             total_size TEXT NOT NULL CHECK (total_size <> '' AND total_size NOT GLOB '*[^0-9]*'),
+             chunk_count TEXT NOT NULL CHECK (chunk_count <> '' AND chunk_count NOT GLOB '*[^0-9]*'),
+             PRIMARY KEY (tenant_id, artifact_id, playground_id, path),
+             FOREIGN KEY (tenant_id, artifact_id, playground_id)
+                 REFERENCES playground_indexes (tenant_id, artifact_id, playground_id)
+                 ON DELETE CASCADE
+         ) STRICT;
+         INSERT INTO playground_indexes
+             (tenant_id, artifact_id, playground_id, revision, digest)
+             SELECT tenant_id, artifact_id, playground_id, revision, digest
+             FROM playground_indexes_v4;
+         INSERT INTO playground_index_records
+             (tenant_id, artifact_id, playground_id, path, manifest_id, total_size, chunk_count)
+             SELECT tenant_id, artifact_id, playground_id, path, manifest_id, total_size, chunk_count
+             FROM playground_index_records_v4;
+         DROP TABLE playground_index_records_v4;
+         DROP TABLE playground_indexes_v4;
+         UPDATE index_publications
+             SET request_payload = CAST(json_remove(CAST(request_payload AS TEXT),
+                                                     '$.value.index_key.project_id') AS BLOB);
+         PRAGMA user_version = 3",
+    )
+    .await;
+
+    let migrated = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    migrated.integrity_check().await.unwrap();
+    assert_contract_state(&migrated.authority_store(), &fixture).await;
 }
 
 #[tokio::test]
@@ -196,6 +257,18 @@ async fn tenant_scoped_ids_are_isolated_in_both_backends() {
 }
 
 #[tokio::test]
+async fn project_scoped_indexes_are_isolated_in_both_backends() {
+    let memory = InMemoryComponents::new(100);
+    assert_project_index_isolation(memory.authority_store()).await;
+
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    assert_project_index_isolation(sqlite.authority_store()).await;
+}
+
+#[tokio::test]
 async fn sqlite_allows_only_one_authority_instance() {
     let directory = TempDir::new().unwrap();
     let first = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
@@ -221,7 +294,7 @@ async fn sqlite_rejects_wrong_application_id_and_user_version() {
 
     let version_directory = TempDir::new().unwrap();
     initialize_and_close(version_directory.path()).await;
-    execute_raw(version_directory.path(), "PRAGMA user_version = 3").await;
+    execute_raw(version_directory.path(), "PRAGMA user_version = 5").await;
     assert_open_storage_failure(version_directory.path()).await;
 }
 
@@ -279,8 +352,8 @@ async fn sqlite_reports_corrupt_json_and_decimal_records() {
         decimal_directory.path(),
         "PRAGMA ignore_check_constraints = ON; \
          INSERT INTO playground_indexes \
-         (tenant_id, artifact_id, playground_id, revision, digest) \
-         VALUES ('tenant-a', 'artifact-a', 'playground-a', '00', zeroblob(32))",
+         (tenant_id, project_id, artifact_id, playground_id, revision, digest) \
+         VALUES ('tenant-a', 'project-a', 'artifact-a', 'playground-a', '00', zeroblob(32))",
     )
     .await;
     let reopened = open_sqlite_authority(SqliteAuthorityConfig::new(decimal_directory.path()))
@@ -480,8 +553,8 @@ async fn sqlite_u64_max_revision_replays_exhaustion() {
     let empty_digest = IndexVersion::from_snapshot(u64::MAX, &[]).unwrap().digest;
     let sql = format!(
         "INSERT INTO playground_indexes \
-         (tenant_id, artifact_id, playground_id, revision, digest) \
-         VALUES ('tenant-a', 'artifact-a', 'playground-a', '{}', X'{}')",
+         (tenant_id, project_id, artifact_id, playground_id, revision, digest) \
+         VALUES ('tenant-a', 'project-a', 'artifact-a', 'playground-a', '{}', X'{}')",
         u64::MAX,
         empty_digest
     );
@@ -517,6 +590,7 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
     let job_key = JobKey::new(spec.tenant_id.clone(), spec.job_id.clone());
     let index_key = IndexKey {
         tenant_id: spec.tenant_id.clone(),
+        project_id: spec.project_id.clone(),
         artifact_id: spec.artifact_id.clone(),
         playground_id: spec.playground_id.clone(),
     };
@@ -566,6 +640,40 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
             .unwrap()
             .replayed
     );
+    let AssignmentOperation::Add {
+        input: assigned_input,
+        ..
+    } = &assigned.assignment.assignment;
+    assert_eq!(
+        store
+            .outbox()
+            .pending_for_agent(&assigned_input.agent_id, 1)
+            .await
+            .unwrap(),
+        vec![assigned.assignment.clone()]
+    );
+    assert!(matches!(
+        store
+            .outbox()
+            .retire(&assigned_input.tenant_id, &assigned_input.assignment_id)
+            .await
+            .unwrap(),
+        neoengramd::AssignmentRetireOutcome::Retired
+    ));
+    assert!(matches!(
+        store
+            .outbox()
+            .retire(&assigned_input.tenant_id, &assigned_input.assignment_id)
+            .await
+            .unwrap(),
+        neoengramd::AssignmentRetireOutcome::AlreadyRetired
+    ));
+    assert!(store
+        .outbox()
+        .pending_for_agent(&assigned_input.agent_id, 1)
+        .await
+        .unwrap()
+        .is_empty());
     let mut reserved_assignment = assigned.assignment.clone();
     let AssignmentOperation::Add { input, .. } = &mut reserved_assignment.assignment;
     input.assignment_id = AssignmentId::new("assignment-reserved").unwrap();
@@ -681,6 +789,7 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
         .replace(previous, publishing_job.clone())
         .await
         .unwrap();
+    let pending_decision_key = seed_pending_decision_contract(&store).await;
 
     ContractFixture {
         job_key,
@@ -692,6 +801,7 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
         reserved_assignment,
         published_version,
         publishing_job,
+        pending_decision_key,
     }
 }
 
@@ -726,6 +836,112 @@ async fn assert_contract_state(store: &AuthorityStore, fixture: &ContractFixture
             .unwrap(),
         fixture.published_version
     );
+    let AssignmentOperation::Add { input, .. } = &fixture.assignment.assignment;
+    assert!(store
+        .outbox()
+        .pending_for_agent(&input.agent_id, 1)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        store
+            .outbox()
+            .retire(&input.tenant_id, &input.assignment_id)
+            .await
+            .unwrap(),
+        neoengramd::AssignmentRetireOutcome::AlreadyRetired
+    ));
+    let pending = store
+        .jobs()
+        .list_pending_decisions_for_agent(&AgentId::new("agent-decision-target").unwrap(), 1)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].key(), fixture.pending_decision_key);
+}
+
+async fn seed_pending_decision_contract(store: &AuthorityStore) -> JobKey {
+    let clock = Arc::new(InMemoryClock::new(100));
+    let control = ControlPlane::new(Arc::new(AllowAllAuthorizer), store.clone(), clock.clone());
+    let target_agent = AgentId::new("agent-decision-target").unwrap();
+    let definitions = [
+        (
+            "tenant-decision-a",
+            "job-000",
+            "agent-decision-other",
+            false,
+        ),
+        ("tenant-decision-b", "job-000", target_agent.as_str(), true),
+        ("tenant-decision-z", "job-999", target_agent.as_str(), false),
+    ];
+    let mut jobs = Vec::with_capacity(definitions.len());
+    for (index, (tenant, job_id, agent_id, acknowledged)) in definitions.into_iter().enumerate() {
+        let spec = job_spec(tenant, job_id);
+        let mut target = assignment_target();
+        target.assignment_id = AssignmentId::new(format!("assignment-decision-{index}")).unwrap();
+        target.agent_id = AgentId::new(agent_id).unwrap();
+        control
+            .create_add_job(CreateAddJobRequest {
+                actor: spec.principal.clone(),
+                spec: spec.clone(),
+            })
+            .await
+            .unwrap();
+        control
+            .assign_job(AssignJobRequest {
+                actor: spec.principal.clone(),
+                tenant_id: spec.tenant_id.clone(),
+                job_id: spec.job_id.clone(),
+                target: target.clone(),
+            })
+            .await
+            .unwrap();
+        jobs.push((spec, target, acknowledged));
+    }
+
+    clock.set(10_000);
+    let mut expected = None;
+    for (spec, target, acknowledged) in jobs {
+        let expired = control
+            .expire_add_job(ExpireAddJobRequest {
+                actor: spec.principal.clone(),
+                tenant_id: spec.tenant_id.clone(),
+                job_id: spec.job_id.clone(),
+            })
+            .await
+            .unwrap();
+        if acknowledged {
+            control
+                .receive_report(ReceiveReportRequest {
+                    tenant_id: spec.tenant_id,
+                    agent_id: target.agent_id,
+                    report: AgentReport::Finalized(expired.finalized.unwrap()),
+                })
+                .await
+                .unwrap();
+        } else if target.agent_id == target_agent {
+            expected = Some(expired.job.key());
+        }
+    }
+
+    let expected = expected.unwrap();
+    let pending = store
+        .jobs()
+        .list_pending_decisions_for_agent(&target_agent, 1)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].key(), expected);
+    let messages = control
+        .poll_agent_messages(&target_agent, SessionGeneration::new(1), 1)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    let ControlMessage::Decision(decision) = &messages[0].message else {
+        panic!("the target Agent decision must survive unrelated stable prefixes");
+    };
+    assert_eq!(decision.job_id, expected.job_id);
+    expected
 }
 
 async fn assert_tenant_isolation(store: AuthorityStore) {
@@ -961,6 +1177,7 @@ fn durability_receipt(
 fn index_key(tenant: &str) -> IndexKey {
     IndexKey {
         tenant_id: TenantId::new(tenant).unwrap(),
+        project_id: ProjectId::new("project-a").unwrap(),
         artifact_id: ArtifactId::new("artifact-a").unwrap(),
         playground_id: PlaygroundId::new("playground-a").unwrap(),
     }
@@ -987,6 +1204,74 @@ fn publication(
         expected_result_digest: IndexVersion::from_snapshot(1, &records).unwrap().digest,
         manifests: publication_manifests(),
         mutations: publication_mutations(),
+    }
+}
+
+async fn assert_project_index_isolation(store: AuthorityStore) {
+    let project_a = index_key("tenant-a");
+    let mut project_b = project_a.clone();
+    project_b.project_id = ProjectId::new("project-b").unwrap();
+
+    let empty = store.publisher().current_version(&project_a).await.unwrap();
+    assert_eq!(
+        store.publisher().current_version(&project_b).await.unwrap(),
+        empty
+    );
+
+    let publish_a = publication_for_path("job-project-a", &project_a, empty.clone(), "a.bin");
+    let IndexPublishOutcome::Published(published_a) =
+        store.publisher().compare_and_swap(publish_a).await.unwrap()
+    else {
+        panic!("Project A Index publication must succeed");
+    };
+    assert_eq!(
+        store.publisher().current_version(&project_b).await.unwrap(),
+        empty
+    );
+
+    let publish_b = publication_for_path("job-project-b", &project_b, empty, "b.bin");
+    let IndexPublishOutcome::Published(published_b) =
+        store.publisher().compare_and_swap(publish_b).await.unwrap()
+    else {
+        panic!("Project B Index publication must succeed");
+    };
+    assert_eq!(
+        store.publisher().current_version(&project_a).await.unwrap(),
+        published_a
+    );
+    assert_eq!(
+        store.publisher().current_version(&project_b).await.unwrap(),
+        published_b
+    );
+    assert_ne!(published_a.digest, published_b.digest);
+}
+
+fn publication_for_path(
+    job: &str,
+    key: &IndexKey,
+    expected: WireIndexVersion,
+    path: &str,
+) -> IndexPublishRequest {
+    let manifest = publication_manifests().remove(0);
+    let record = FileRecord::from_manifest(LogicalPath::parse(path).unwrap(), &manifest).unwrap();
+    IndexPublishRequest {
+        job_key: JobKey::new(
+            key.tenant_id.clone(),
+            neoengram_protocol::JobId::new(job).unwrap(),
+        ),
+        index_key: key.clone(),
+        expected_index_version: expected,
+        expected_result_digest: IndexVersion::from_snapshot(1, std::slice::from_ref(&record))
+            .unwrap()
+            .digest,
+        manifests: vec![manifest.clone()],
+        mutations: vec![IndexDeltaRecord::Upsert {
+            path: record.path,
+            manifest_id: manifest.canonical_id().unwrap(),
+            total_size: DecimalU64::new(manifest.total_size),
+            chunk_count: DecimalU64::new(manifest.chunk_count().unwrap()),
+            extensions: Extensions::new(),
+        }],
     }
 }
 

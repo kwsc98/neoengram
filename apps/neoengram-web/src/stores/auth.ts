@@ -27,7 +27,7 @@ export const useAuthStore = defineStore('auth', {
     },
     async login(returnTo = window.location.pathname + window.location.search) {
       await getAuthService().login(returnTo);
-      if (getAuthService().mode === 'mock') this.user = await getAuthService().initialize();
+      if (getAuthService().mode !== 'oidc') this.user = await getAuthService().initialize();
     },
     async handleCallback() {
       const result = await getAuthService().handleCallback();

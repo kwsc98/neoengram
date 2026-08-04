@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { Back, CirclePlus, RefreshLeft } from '@element-plus/icons-vue';
-import { useMutation } from '@tanstack/vue-query';
+import { useMutation, useQuery } from '@tanstack/vue-query';
 import { ElMessage } from 'element-plus';
 import { computed, reactive, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { createAddJob } from '@/api/operations';
+import { createAddJob, queryPlayground } from '@/api/operations';
 import type { CreateAddJobRequest } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
@@ -25,19 +25,39 @@ const hasSourcePlayground = computed(() =>
   Object.values(sourcePlayground.value).every((value) => Boolean(value)),
 );
 const form = reactive({
-  projectId: sourcePlayground.value.projectId || 'project-vision',
-  artifactId: sourcePlayground.value.artifactId || 'road-scenes',
-  playgroundId: sourcePlayground.value.playgroundId || 'labeling',
+  projectId: sourcePlayground.value.projectId,
+  artifactId: sourcePlayground.value.artifactId,
+  playgroundId: sourcePlayground.value.playgroundId,
   jobId: `job-${globalThis.crypto.randomUUID()}`,
-  revision: '0',
-  digest: 'a'.repeat(64),
   deadline: new Date(Date.now() + 60 * 60 * 1000),
-  all: false,
-  pathsText: 'dataset/images\ndataset/labels.csv',
+  all: true,
+  pathsText: '',
 });
 const errors = reactive<Record<string, string>>({});
 
 const mutation = useMutation({ mutationFn: createAddJob });
+const hasPlaygroundIdentity = computed(() =>
+  [form.projectId, form.artifactId, form.playgroundId].every((value) => Boolean(value.trim())),
+);
+const playgroundQuery = useQuery({
+  queryKey: computed(() => [
+    'playground',
+    tenantId.value,
+    form.projectId,
+    form.artifactId,
+    form.playgroundId,
+    'job-create',
+  ]),
+  enabled: hasPlaygroundIdentity,
+  queryFn: () =>
+    queryPlayground(tenantId.value, form.projectId, form.artifactId, form.playgroundId),
+});
+const playground = computed(() => playgroundQuery.data.value?.data.playground);
+const playgroundIndexVersionKey = computed(() => {
+  const indexVersion = playground.value?.index_version;
+  return indexVersion ? `${indexVersion.revision}:${indexVersion.digest}` : '';
+});
+let observedIndexVersionKey: string | undefined;
 
 function clearErrors(): void {
   for (const key of Object.keys(errors)) delete errors[key];
@@ -54,8 +74,6 @@ watch(
     form.projectId,
     form.artifactId,
     form.playgroundId,
-    form.revision,
-    form.digest,
     form.deadline instanceof Date ? form.deadline.getTime() : '',
     form.all,
     form.pathsText,
@@ -65,6 +83,18 @@ watch(
     clearErrors();
   },
 );
+
+watch(playgroundIndexVersionKey, (value) => {
+  if (!value) return;
+  if (observedIndexVersionKey === undefined) {
+    observedIndexVersionKey = value;
+    return;
+  }
+  if (value === observedIndexVersionKey) return;
+  observedIndexVersionKey = value;
+  resetJobId();
+  clearErrors();
+});
 
 watch(
   () => form.jobId,
@@ -87,8 +117,21 @@ async function backToPlayground(): Promise<void> {
 async function submit(): Promise<void> {
   if (mutation.isPending.value) return;
   clearErrors();
+  const currentPlayground = playground.value;
+  if (!currentPlayground) {
+    errors.playgroundId = playgroundQuery.isFetching.value
+      ? '正在读取 Playground 权威状态'
+      : '请先选择可查询的 Playground';
+    return;
+  }
   const paths = parsePathLines(form.pathsText);
-  const parsed = createJobFormSchema.safeParse({ ...form, tenantId: tenantId.value, paths });
+  const parsed = createJobFormSchema.safeParse({
+    ...form,
+    tenantId: tenantId.value,
+    revision: currentPlayground.index_version.revision,
+    digest: currentPlayground.index_version.digest,
+    paths,
+  });
   if (!parsed.success) {
     for (const issue of parsed.error.issues)
       errors[String(issue.path[0] ?? 'form')] ??= issue.message;
@@ -101,7 +144,7 @@ async function submit(): Promise<void> {
     artifact_id: parsed.data.artifactId,
     playground_id: parsed.data.playgroundId,
     job_id: parsed.data.jobId,
-    expected_index_version: { revision: parsed.data.revision, digest: parsed.data.digest },
+    expected_index_version: currentPlayground.index_version,
     deadline_unix_ms: String(parsed.data.deadline.getTime()),
     paths: parsed.data.all ? [] : parsed.data.paths,
     all: parsed.data.all,
@@ -136,6 +179,12 @@ async function submit(): Promise<void> {
       :error="mutation.error.value"
       :retrying="mutation.isPending.value"
       @retry="submit"
+    />
+    <ApiProblemAlert
+      v-if="playgroundQuery.error.value"
+      :error="playgroundQuery.error.value"
+      :retrying="playgroundQuery.isFetching.value"
+      @retry="playgroundQuery.refetch"
     />
 
     <form class="job-form" @submit.prevent="submit">
@@ -177,12 +226,14 @@ async function submit(): Promise<void> {
           <el-form-item label="Deadline" :error="errors.deadline">
             <el-date-picker v-model="form.deadline" type="datetime" class="full-width" />
           </el-form-item>
-          <el-form-item label="Expected revision" :error="errors.revision">
-            <el-input v-model="form.revision" />
-          </el-form-item>
-          <el-form-item label="Expected digest" :error="errors.digest">
-            <el-input v-model="form.digest" class="monospace-input" />
-          </el-form-item>
+          <div class="index-version-field">
+            <span>Expected revision</span>
+            <code>{{ playground?.index_version.revision ?? '—' }}</code>
+          </div>
+          <div class="index-version-field">
+            <span>Expected digest</span>
+            <code>{{ playground?.index_version.digest ?? '—' }}</code>
+          </div>
         </div>
       </section>
 
@@ -212,6 +263,7 @@ async function submit(): Promise<void> {
           native-type="submit"
           :icon="CirclePlus"
           :loading="mutation.isPending.value"
+          :disabled="!playground || playgroundQuery.isFetching.value"
         >
           开始扫描
         </el-button>
@@ -219,3 +271,25 @@ async function submit(): Promise<void> {
     </form>
   </div>
 </template>
+
+<style scoped>
+.index-version-field {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+}
+
+.index-version-field > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.index-version-field code {
+  min-height: 32px;
+  padding: 8px 10px;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--line);
+  background: #f7f9f8;
+}
+</style>

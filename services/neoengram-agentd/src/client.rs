@@ -5,6 +5,7 @@ use bytes::Bytes;
 use neoengram_protocol::{
     decode_bounded_unique_json, AgentBootstrapAccepted, AgentBootstrapRequest,
     AgentBootstrapStatusRequest, AgentBootstrapStatusResponse, RequestId,
+    AGENT_ENROLLMENT_BOOTSTRAP_PATH, AGENT_ENROLLMENT_STATUS_QUERY_PATH,
 };
 use reqwest::{
     header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE},
@@ -120,10 +121,10 @@ pub struct ReqwestEnrollmentClient {
 impl ReqwestEnrollmentClient {
     pub fn new(central_endpoint: Url) -> AgentDaemonResult<Self> {
         let bootstrap_url = central_endpoint
-            .join("v1/agents/bootstrap")
+            .join(AGENT_ENROLLMENT_BOOTSTRAP_PATH.trim_start_matches('/'))
             .map_err(|error| AgentDaemonError::Configuration(error.to_string()))?;
         let status_url = central_endpoint
-            .join("v1/agents/bootstrap/status")
+            .join(AGENT_ENROLLMENT_STATUS_QUERY_PATH.trim_start_matches('/'))
             .map_err(|error| AgentDaemonError::Configuration(error.to_string()))?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -420,7 +421,7 @@ mod tests {
                 .position(|window| window == b"\r\n\r\n")
                 .unwrap();
             let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-            assert!(headers.starts_with("POST /v1/agents/bootstrap/status HTTP/1.1\r\n"));
+            assert!(headers.starts_with("POST /agent/enrollment/status/query HTTP/1.1\r\n"));
             let request_id = headers
                 .lines()
                 .find_map(|line| {

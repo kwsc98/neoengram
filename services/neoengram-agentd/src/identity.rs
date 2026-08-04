@@ -1,13 +1,13 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
-use ed25519_dalek::{
-    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey},
-    SigningKey,
-};
 use neoengram_agent::{
     PrivateKeyMaterial, SqliteSystemIdentityStore, SystemIdentityRecord, SystemIdentitySeed,
 };
-use rand_core::OsRng;
+use neoengram_protocol::Ed25519PublicKeySpki;
+use ring::{
+    rand::SystemRandom,
+    signature::{Ed25519KeyPair, KeyPair},
+};
 use uuid::Uuid;
 
 use crate::{AgentDaemonError, AgentDaemonResult};
@@ -23,6 +23,8 @@ pub struct PersistedIdentitySummary {
     pub terminal_enrollment_state: Option<String>,
     pub terminal_enrollment_id: Option<String>,
 }
+
+pub type AgentSigningKey = Arc<Ed25519KeyPair>;
 
 /// Loads and validates the durable identity without exposing its private key material.
 pub fn load_persisted_identity(
@@ -66,14 +68,12 @@ pub fn load_or_create_identity(
         return Ok(identity);
     }
 
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let private_key = signing_key
-        .to_pkcs8_der()
-        .map_err(|_| AgentDaemonError::Identity("failed to encode Ed25519 PKCS#8 key".into()))?;
+    let private_key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| AgentDaemonError::Identity("failed to generate Ed25519 PKCS#8 key".into()))?;
     let seed = SystemIdentitySeed::new(
         format!("bootstrap-{}", Uuid::new_v4().simple()),
         format!("installation-{}", Uuid::new_v4().simple()),
-        PrivateKeyMaterial::new(private_key.as_bytes().to_vec())?,
+        PrivateKeyMaterial::new(private_key.as_ref().to_vec())?,
     )?;
     let identity = store.initialize(seed)?;
     signing_key_from_identity(&identity)?;
@@ -81,18 +81,25 @@ pub fn load_or_create_identity(
 }
 
 /// Parses the persisted PKCS#8 document and rejects any non-Ed25519 or malformed key material.
-pub fn signing_key_from_identity(identity: &SystemIdentityRecord) -> AgentDaemonResult<SigningKey> {
-    SigningKey::from_pkcs8_der(identity.private_key.expose_secret()).map_err(|_| {
-        AgentDaemonError::Identity("persisted Agent key is not valid Ed25519 PKCS#8".into())
-    })
+pub fn signing_key_from_identity(
+    identity: &SystemIdentityRecord,
+) -> AgentDaemonResult<AgentSigningKey> {
+    Ed25519KeyPair::from_pkcs8(identity.private_key.expose_secret())
+        .map(Arc::new)
+        .map_err(|_| {
+            AgentDaemonError::Identity("persisted Agent key is not valid Ed25519 PKCS#8".into())
+        })
 }
 
-pub(crate) fn public_key_spki_der(signing_key: &SigningKey) -> AgentDaemonResult<Vec<u8>> {
-    signing_key
-        .verifying_key()
-        .to_public_key_der()
-        .map(|document| document.as_bytes().to_vec())
-        .map_err(|_| AgentDaemonError::Identity("failed to encode Ed25519 public-key SPKI".into()))
+pub(crate) fn public_key_spki_der(signing_key: &Ed25519KeyPair) -> AgentDaemonResult<Vec<u8>> {
+    let public_key: [u8; 32] = signing_key
+        .public_key()
+        .as_ref()
+        .try_into()
+        .map_err(|_| AgentDaemonError::Identity("Ed25519 public key is not 32 bytes".into()))?;
+    Ok(Ed25519PublicKeySpki::from_public_key_bytes(public_key)
+        .as_der()
+        .to_vec())
 }
 
 #[cfg(test)]
@@ -114,8 +121,11 @@ mod tests {
         let second = load_or_create_identity(&reopened).unwrap();
         assert_eq!(first, second);
         assert_eq!(
-            first_key.verifying_key(),
-            signing_key_from_identity(&second).unwrap().verifying_key()
+            first_key.public_key().as_ref(),
+            signing_key_from_identity(&second)
+                .unwrap()
+                .public_key()
+                .as_ref()
         );
         drop(reopened);
 

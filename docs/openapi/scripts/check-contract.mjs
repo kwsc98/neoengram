@@ -1188,6 +1188,7 @@ const createEnrollmentTokenResponse =
 const createEnrollmentTokenResponseFields = [
   "token_id",
   "bootstrap_token",
+  "volume_descriptor_digest",
   "expires_at_unix_ms",
   "replayed",
 ];

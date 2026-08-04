@@ -18,7 +18,7 @@ use fusen_rs::{
 use neoengram_protocol::{PrincipalKind, UnixMillis};
 use neoengramd::{
     open_sqlite_authority, AgentRegistryService, Clock, ControlPlane, SqliteAuthority,
-    SqliteAuthorityConfig,
+    SqliteAuthorityConfig, TenantRecord,
 };
 use tokio::io::AsyncReadExt;
 use tokio::{
@@ -34,8 +34,10 @@ use crate::{
         RunningAgentServer,
     },
     controller::{
-        JobApiServer, JobController, StorageEnrollmentApiServer, StorageEnrollmentController,
-        SystemApiServer, SystemController,
+        JobApiServer, JobController, PlaygroundApiServer, PlaygroundController,
+        StorageEnrollmentApiServer, StorageEnrollmentController, StorageVolumeApiServer,
+        StorageVolumeController, SystemApiServer, SystemController, TenantApiServer,
+        TenantController,
     },
     error::{application_error, map_central_error, NeoEngramProblemEncoder},
     identity::{
@@ -43,13 +45,15 @@ use crate::{
         OidcConfig, Permission, StaticRbacPolicy, StaticTokenAuthenticator,
     },
     service::{
-        EnrollmentKeyring, EnrollmentService, HealthService, JobService, ReadinessProbe,
+        AgentDataPlaneService, CatalogService, EnrollmentKeyring, EnrollmentService,
+        FilesystemObjectStore, HealthService, JobCoordinator, JobService, ReadinessProbe,
         SystemService,
     },
 };
 
 const MAX_RBAC_DOCUMENT_BYTES: u64 = 1024 * 1024;
 const ENROLLMENT_EXPIRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const JOB_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Command-line and environment configuration for the HTTP server.
 #[derive(Clone, Parser)]
@@ -78,6 +82,10 @@ pub struct Config {
     /// Directory containing the single-process SQLite authority.
     #[arg(long, env = "NEOENGRAM_SERVER_AUTHORITY_DIR")]
     pub authority_dir: PathBuf,
+
+    /// Root for the development filesystem object backend used by Agent uploads.
+    #[arg(long, env = "NEOENGRAM_SERVER_OBJECT_STORE_ROOT")]
+    pub object_store_root: Option<PathBuf>,
 
     /// Immutable deny-by-default RBAC JSON document.
     #[arg(long, env = "NEOENGRAM_SERVER_RBAC_FILE")]
@@ -172,6 +180,7 @@ impl fmt::Debug for Config {
                 &self.agent_enrollment_keyring_file,
             )
             .field("authority_dir", &self.authority_dir)
+            .field("object_store_root", &self.object_store_root)
             .field("rbac_file", &self.rbac_file)
             .field("oidc_issuer", &self.oidc_issuer)
             .field("oidc_audience", &self.oidc_audience)
@@ -214,6 +223,8 @@ pub enum RuntimeError {
     Authority(String),
     #[error("enrollment keyring initialization failed: {0}")]
     EnrollmentKeyring(String),
+    #[error("filesystem object-store initialization failed: {0}")]
+    ObjectStore(String),
     #[error("Fusen server configuration failed: {0}")]
     FusenConfig(String),
     #[error(transparent)]
@@ -229,11 +240,15 @@ pub struct AppState {
     authority: Arc<SqliteAuthority>,
     authenticator: Arc<dyn Authenticator>,
     jobs: Arc<JobService>,
+    catalog: Arc<CatalogService>,
+    object_store: Option<Arc<FilesystemObjectStore>>,
     enrollments: Option<Arc<EnrollmentService>>,
     enrollment_registry: Option<Arc<AgentRegistryService>>,
+    coordinator: Option<Arc<JobCoordinator>>,
     agent_handler: Option<Arc<RegistryAgentEnrollmentHandler>>,
     agent_running: Mutex<Option<RunningAgentServer>>,
     expiry_reconciler: Mutex<Option<EnrollmentExpiryReconciler>>,
+    job_reconciler: Mutex<Option<JobReconciler>>,
     accepting: Arc<AtomicBool>,
 }
 
@@ -258,13 +273,44 @@ impl AppState {
             }
         };
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let authority_store = authority.authority_store();
         let control = Arc::new(ControlPlane::new(
             policy.clone(),
-            authority.authority_store(),
+            authority_store.clone(),
             clock.clone(),
         ));
+        let catalog_repository = authority_store.control_catalog().ok_or_else(|| {
+            RuntimeError::Authority("SQLite authority has no control catalog".to_owned())
+        })?;
+        if config.development {
+            seed_development_tenants(
+                catalog_repository.as_ref(),
+                &config.development_tenants,
+                clock.now(),
+            )
+            .await?;
+        }
+        let catalog = Arc::new(CatalogService::new(
+            catalog_repository.clone(),
+            authority_store.publisher(),
+            policy.clone(),
+            clock.clone(),
+        ));
+        let object_store_root = config.object_store_root.clone().or_else(|| {
+            (config.development && config.agent_enrollment_enabled)
+                .then(|| config.authority_dir.join("objects"))
+        });
+        let object_store = object_store_root
+            .map(|root| {
+                FilesystemObjectStore::open_or_create(root)
+                    .map(Arc::new)
+                    .map_err(|error| RuntimeError::ObjectStore(error.to_string()))
+            })
+            .transpose()?;
         let accepting = Arc::new(AtomicBool::new(false));
-        let (enrollments, enrollment_registry, agent_handler) = if config.agent_enrollment_enabled {
+        let (enrollments, enrollment_registry, agent_handler, coordinator) = if config
+            .agent_enrollment_enabled
+        {
             let keyring_path =
                 config
                     .agent_enrollment_keyring_file
@@ -292,27 +338,62 @@ impl AppState {
             };
             let enrollments = Arc::new(EnrollmentService::new(
                 registry.clone(),
-                policy,
+                catalog_repository,
+                policy.clone(),
                 keyring,
-                clock,
+                clock.clone(),
             ));
-            let agent_handler = Arc::new(RegistryAgentEnrollmentHandler::with_readiness(
+            let filesystem_objects = object_store.clone().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "Agent transport requires the central object-store backend".into(),
+                )
+            })?;
+            let data_plane = Arc::new(AgentDataPlaneService::new(
+                authority.clone(),
+                filesystem_objects,
+                clock.clone(),
+            ));
+            let agent_handler = Arc::new(RegistryAgentEnrollmentHandler::with_transport(
                 registry.clone(),
+                control.clone(),
+                data_plane,
                 accepting.clone(),
             ));
-            (Some(enrollments), Some(registry), Some(agent_handler))
+            let coordinator = Arc::new(
+                JobCoordinator::from_authority(
+                    control.clone(),
+                    &authority_store,
+                    clock.clone(),
+                    30_000,
+                )
+                .map_err(|error| RuntimeError::Authority(error.to_string()))?,
+            );
+            (
+                Some(enrollments),
+                Some(registry),
+                Some(agent_handler),
+                Some(coordinator),
+            )
         } else {
-            (None, None, None)
+            (None, None, None, None)
+        };
+        let jobs = match coordinator.as_ref() {
+            Some(coordinator) => JobService::new(control).with_coordinator(coordinator.clone()),
+            None => JobService::new(control),
         };
         Ok(Self {
             authority,
             authenticator,
-            jobs: Arc::new(JobService::new(control)),
+            jobs: Arc::new(jobs),
+            catalog,
+            object_store,
             enrollments,
             enrollment_registry,
+            coordinator,
             agent_handler,
             agent_running: Mutex::new(None),
             expiry_reconciler: Mutex::new(None),
+            job_reconciler: Mutex::new(None),
             accepting,
         })
     }
@@ -362,6 +443,10 @@ impl AppState {
             .enrollment_registry
             .as_ref()
             .map(|registry| EnrollmentExpiryReconciler::start(registry.clone()));
+        *self.job_reconciler.lock().await = self
+            .coordinator
+            .as_ref()
+            .map(|coordinator| JobReconciler::start(coordinator.clone()));
         self.accepting.store(true, Ordering::Release);
         Ok(running)
     }
@@ -380,6 +465,16 @@ impl AppState {
                 Arc::new(HealthService::new(readiness)),
             )))
             .interface(JobApiServer::new(JobController::new(self.jobs.clone())));
+        builder = builder
+            .interface(TenantApiServer::new(TenantController::new(
+                self.catalog.clone(),
+            )))
+            .interface(StorageVolumeApiServer::new(StorageVolumeController::new(
+                self.catalog.clone(),
+            )))
+            .interface(PlaygroundApiServer::new(PlaygroundController::new(
+                self.catalog.clone(),
+            )));
         if let Some(enrollments) = &self.enrollments {
             builder = builder.interface(StorageEnrollmentApiServer::new(
                 StorageEnrollmentController::new(enrollments.clone()),
@@ -395,6 +490,11 @@ impl AppState {
             .await
             .as_ref()
             .map(RunningAgentServer::local_addr)
+    }
+
+    #[must_use]
+    pub fn object_store(&self) -> Option<Arc<FilesystemObjectStore>> {
+        self.object_store.clone()
     }
 
     async fn agent_handle(&self) -> Option<AgentServerHandle> {
@@ -419,13 +519,51 @@ impl AppState {
         }
     }
 
+    async fn stop_job_reconciler(&self) {
+        if let Some(reconciler) = self.job_reconciler.lock().await.take() {
+            reconciler.shutdown().await;
+        }
+    }
+
     /// Marks the application unavailable and closes its authority connections.
     pub async fn close(&self) {
         self.accepting.store(false, Ordering::Release);
         let _ = self.stop_agent_listener().await;
         self.stop_expiry_reconciler().await;
+        self.stop_job_reconciler().await;
         self.authority.close().await;
     }
+}
+
+async fn seed_development_tenants(
+    catalog: &dyn neoengramd::ControlCatalogRepository,
+    configured: &[String],
+    now: UnixMillis,
+) -> Result<(), RuntimeError> {
+    for tenant in configured.iter().filter(|tenant| tenant.as_str() != "*") {
+        let tenant_id = neoengram_protocol::TenantId::new(tenant.clone())
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        if catalog
+            .get_tenant(&tenant_id)
+            .await
+            .map_err(|error| RuntimeError::Authority(error.to_string()))?
+            .is_some()
+        {
+            continue;
+        }
+        catalog
+            .insert_tenant(TenantRecord {
+                tenant_id,
+                display_name: tenant.clone(),
+                description: None,
+                resource_version: 1,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })
+            .await
+            .map_err(|error| RuntimeError::Authority(error.to_string()))?;
+    }
+    Ok(())
 }
 
 struct EnrollmentExpiryReconciler {
@@ -478,6 +616,55 @@ impl EnrollmentExpiryReconciler {
         let _ = self.shutdown.send(true);
         if let Err(error) = self.task.await {
             tracing::warn!(%error, "Agent enrollment expiry reconciler task failed");
+        }
+    }
+}
+
+struct JobReconciler {
+    shutdown: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl JobReconciler {
+    fn start(coordinator: Arc<JobCoordinator>) -> Self {
+        let (shutdown, mut receiver) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(JOB_RECONCILE_INTERVAL);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    changed = receiver.changed() => {
+                        if changed.is_err() || *receiver.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        match coordinator.reconcile_once().await {
+                            Ok(run) if run.assigned != 0 || run.expired != 0 || run.finalized != 0 => {
+                                tracing::info!(
+                                    examined = run.examined,
+                                    assigned = run.assigned,
+                                    expired = run.expired,
+                                    finalized = run.finalized,
+                                    "Job coordinator recovery pass completed"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, "Job coordinator recovery pass failed");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self { shutdown, task }
+    }
+
+    async fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+        if let Err(error) = self.task.await {
+            tracing::warn!(%error, "Job coordinator task failed");
         }
     }
 }
@@ -535,6 +722,21 @@ fn validate_config(config: &Config) -> Result<(), RuntimeError> {
     if config.authority_dir.as_os_str().is_empty() {
         return Err(RuntimeError::Configuration(
             "authority directory must be explicit".to_owned(),
+        ));
+    }
+    if config
+        .object_store_root
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err(RuntimeError::Configuration(
+            "object-store root must not be empty".to_owned(),
+        ));
+    }
+    if config.agent_enrollment_enabled && !config.development && config.object_store_root.is_none()
+    {
+        return Err(RuntimeError::Configuration(
+            "production Agent uploads require an explicit object-store root".to_owned(),
         ));
     }
     match (
@@ -626,9 +828,15 @@ fn validate_config(config: &Config) -> Result<(), RuntimeError> {
                     Permission::CreateAddJob,
                     Permission::QueryJob,
                     Permission::FinalizeAdd,
+                    Permission::TenantRead,
+                    Permission::TenantCreate,
+                    Permission::StorageRead,
+                    Permission::StorageCreate,
                     Permission::StorageEnrollmentCreate,
                     Permission::StorageEnrollmentRead,
                     Permission::StorageEnrollmentReview,
+                    Permission::PlaygroundRead,
+                    Permission::PlaygroundCreate,
                 ],
             )
             .map_err(RuntimeError::Configuration)?;
@@ -690,9 +898,15 @@ async fn authentication_and_policy(
                         Permission::CreateAddJob,
                         Permission::QueryJob,
                         Permission::FinalizeAdd,
+                        Permission::TenantRead,
+                        Permission::TenantCreate,
+                        Permission::StorageRead,
+                        Permission::StorageCreate,
                         Permission::StorageEnrollmentCreate,
                         Permission::StorageEnrollmentRead,
                         Permission::StorageEnrollmentReview,
+                        Permission::PlaygroundRead,
+                        Permission::PlaygroundCreate,
                     ],
                 )
                 .map_err(RuntimeError::Rbac)?,

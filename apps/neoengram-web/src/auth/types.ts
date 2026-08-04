@@ -4,7 +4,7 @@ export interface AuthUser {
 }
 
 export interface AuthService {
-  readonly mode: 'mock' | 'oidc';
+  readonly mode: 'mock' | 'development' | 'oidc';
   initialize(): Promise<AuthUser | null>;
   getAccessToken(): Promise<string | null>;
   login(returnTo: string): Promise<void>;

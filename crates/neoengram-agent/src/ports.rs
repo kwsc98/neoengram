@@ -1,17 +1,19 @@
 use std::fmt::Debug;
 
 use neoengram_engine::PreparedAdd;
-use neoengram_protocol::AddAssignment;
+use neoengram_protocol::{AddAssignment, MessageId, UnixMillis};
 
 use crate::{
     AgentError, AgentErrorCode, AgentReport, AgentResult, AssignmentKey, ClaimOutcome, LedgerClaim,
-    LedgerRecord, TransferReceipt,
+    LedgerRecord, QueuedAgentReport, TransferReceipt,
 };
 
 /// Durable idempotency ledger. `claim` must atomically key records by tenant, job, and digest.
 pub trait Ledger: Debug + Send + Sync {
     fn claim(&self, claim: LedgerClaim) -> AgentResult<ClaimOutcome>;
     fn load(&self, key: &AssignmentKey) -> AgentResult<Option<LedgerRecord>>;
+    /// Returns every assignment that still requires execution, recovery, or central acknowledgement.
+    fn list_active(&self) -> AgentResult<Vec<LedgerRecord>>;
 
     /// Replaces a record only when its persisted revision equals `expected_revision`.
     fn compare_exchange(
@@ -71,6 +73,20 @@ pub trait ObjectTransfer: Debug + Send + Sync {
 /// Durable or idempotent outbound report channel.
 pub trait ReportSink: Debug + Send + Sync {
     fn send(&self, report: AgentReport) -> AgentResult<()>;
+}
+
+/// Durable ordered channel used by a session transport to survive process and network failure.
+pub trait OutboundReportQueue: Debug + Send + Sync {
+    /// Enqueues an exact report idempotently and returns its stable message identity.
+    fn enqueue(
+        &self,
+        report: AgentReport,
+        enqueued_at_unix_ms: UnixMillis,
+    ) -> AgentResult<QueuedAgentReport>;
+    /// Lists the oldest unacknowledged reports in insertion order.
+    fn list(&self, limit: usize) -> AgentResult<Vec<QueuedAgentReport>>;
+    /// Removes only the exact message that the center acknowledged.
+    fn acknowledge(&self, message_id: &MessageId) -> AgentResult<bool>;
 }
 
 /// Injectable wall clock used for persisted protocol timestamps and deadline validation.

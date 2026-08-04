@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 use fusen_rs::{SensitiveFields, SensitiveShape};
 use serde::{Deserialize, Serialize};
 
+mod catalog;
+pub use catalog::*;
+
 /// Unknown root-level JSON members retained for forward-compatible digesting.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -247,6 +250,7 @@ pub struct PvcReference {
 pub struct CreateStorageEnrollmentTokenResponse {
     pub token_id: String,
     pub bootstrap_token: String,
+    pub volume_descriptor_digest: String,
     pub expires_at_unix_ms: String,
     pub replayed: bool,
 }
@@ -390,7 +394,8 @@ pub struct StorageVolumeView {
     pub region: String,
     pub backend_type: String,
     pub access_mode: String,
-    pub pvc_reference: PvcReference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pvc_reference: Option<PvcReference>,
     pub state: String,
     pub resource_version: String,
     pub created_at_unix_ms: String,

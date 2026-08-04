@@ -2,15 +2,16 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use neoengram_core::ContentDigest;
 use neoengram_protocol::{
-    AgentBootId, AgentBootstrapAccepted, AgentBootstrapProbe, AgentBootstrapRequest,
-    AgentBootstrapStatusRequest, AgentBootstrapStatusResponse, AgentBootstrapStatusState,
-    AgentEnrollmentApprovalRequest, AgentEnrollmentDecision, AgentEnrollmentId,
-    AgentEnrollmentState, AgentEnrollmentTokenCreateRequest, AgentEnrollmentTokenId, AgentId,
-    AgentInstallationId, AgentMountId, AgentMountIdentityDigest, AgentMountStatusReport,
-    AgentSignatureAlgorithm, Ed25519PublicKeySpki, Ed25519Signature, EdgeClusterId, Extensions,
-    MountAccessMode, MountGeneration, OwnerGeneration, PrincipalRef, ProtocolVersion,
-    PvcIdentityDigest, RequestId, ResourceHealth, ResourceVersion, SequenceNumber,
-    SessionGeneration, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId, PROTOCOL_VERSION_V1,
+    AgentAuthenticatedRequest, AgentBootId, AgentBootstrapAccepted, AgentBootstrapProbe,
+    AgentBootstrapRequest, AgentBootstrapStatusRequest, AgentBootstrapStatusResponse,
+    AgentBootstrapStatusState, AgentEnrollmentApprovalRequest, AgentEnrollmentDecision,
+    AgentEnrollmentId, AgentEnrollmentState, AgentEnrollmentTokenCreateRequest,
+    AgentEnrollmentTokenId, AgentId, AgentInstallationId, AgentMountId, AgentMountIdentityDigest,
+    AgentMountStatusReport, AgentSignatureAlgorithm, Ed25519PublicKeySpki, Ed25519Signature,
+    EdgeClusterId, Extensions, MountAccessMode, MountGeneration, OwnerGeneration, PrincipalRef,
+    ProtocolVersion, PvcIdentityDigest, RequestId, ResourceHealth, ResourceVersion, SequenceNumber,
+    SessionGeneration, SessionId, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId,
+    PROTOCOL_VERSION_V1,
 };
 use serde::{Deserialize, Serialize};
 
@@ -315,6 +316,8 @@ pub struct AgentInstanceRecord {
     pub session_generation: Option<SessionGeneration>,
     pub active_boot_id: Option<AgentBootId>,
     #[serde(default)]
+    pub active_session_id: Option<SessionId>,
+    #[serde(default)]
     pub session_open_expected_resource_version: Option<ResourceVersion>,
     pub session_opened_at_unix_ms: Option<UnixMillis>,
     pub last_heartbeat_at_unix_ms: Option<UnixMillis>,
@@ -454,6 +457,7 @@ pub struct OpenAgentSessionRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenAgentSessionResult {
     pub record: AgentRegistryRecord,
+    pub session_id: SessionId,
     pub session_generation: SessionGeneration,
     pub replayed: bool,
 }
@@ -1279,7 +1283,14 @@ impl AgentRegistryService {
                     "active session is missing its generation",
                 )
             })?;
+            let session_id = instance.active_session_id.clone().ok_or_else(|| {
+                error(
+                    CentralErrorCode::Internal,
+                    "active session is missing its session ID",
+                )
+            })?;
             return Ok(OpenAgentSessionResult {
+                session_id,
                 session_generation,
                 record,
                 replayed: true,
@@ -1312,6 +1323,15 @@ impl AgentRegistryService {
         let generation = instance
             .session_generation
             .expect("generation was assigned");
+        let session_id = derive_session_id(
+            &request.agent_id,
+            instance
+                .active_boot_id
+                .as_ref()
+                .expect("boot ID was assigned"),
+            generation,
+        )?;
+        instance.active_session_id = Some(session_id.clone());
         if stale_active_session {
             record.mount.observed_volume_marker = None;
             record.mount.observed_access_mode = None;
@@ -1325,6 +1345,7 @@ impl AgentRegistryService {
         let record = self.repository.replace(previous, record).await?;
         Ok(OpenAgentSessionResult {
             record,
+            session_id,
             session_generation: generation,
             replayed: false,
         })
@@ -1338,6 +1359,7 @@ impl AgentRegistryService {
         require_resource_version(&record, request.expected_resource_version)?;
         let instance = require_session(&mut record, &request.boot_id, request.session_generation)?;
         instance.active_boot_id = None;
+        instance.active_session_id = None;
         instance.session_open_expected_resource_version = None;
         instance.session_opened_at_unix_ms = None;
         instance.last_heartbeat_at_unix_ms = None;
@@ -1348,6 +1370,86 @@ impl AgentRegistryService {
         advance_resource_version(&mut record)?;
         touch_storage_enrollment(&mut record, self.clock.now());
         self.repository.replace(previous, record).await
+    }
+
+    /// Verifies an action request against the approved enrollment key and the durable session
+    /// fence. This method deliberately performs no mutation, so idempotency remains owned by each
+    /// action's application service.
+    pub async fn authenticate_agent_action<T: Serialize>(
+        &self,
+        request: &AgentAuthenticatedRequest<T>,
+        canonical_path: &'static str,
+        require_active_session: bool,
+        max_clock_skew_ms: u64,
+    ) -> CentralResult<AgentRegistryRecord> {
+        request.verify(canonical_path).map_err(|_| {
+            error(
+                CentralErrorCode::AgentIdentityMismatch,
+                "Agent action request proof is invalid",
+            )
+        })?;
+        if require_active_session {
+            request.validate_session().map_err(|_| {
+                error(
+                    CentralErrorCode::AgentIdentityMismatch,
+                    "Agent action request lacks an active session fence",
+                )
+            })?;
+        } else {
+            request.validate_open().map_err(|_| {
+                error(
+                    CentralErrorCode::AgentIdentityMismatch,
+                    "Agent session open request carries an invalid session fence",
+                )
+            })?;
+        }
+        let now = self.clock.now();
+        if now.get().abs_diff(request.signed_at_unix_ms.get()) > max_clock_skew_ms {
+            return Err(error(
+                CentralErrorCode::AgentIdentityMismatch,
+                "Agent action request proof is outside the accepted clock window",
+            ));
+        }
+        let record = self.load_by_agent(&request.agent_id).await?;
+        require_approved(&record)?;
+        let instance = record.instance.as_ref().ok_or_else(|| {
+            error(
+                CentralErrorCode::AgentIdentityMismatch,
+                "approved enrollment has no Agent instance",
+            )
+        })?;
+        let candidate = record.candidate.as_ref().ok_or_else(|| {
+            error(
+                CentralErrorCode::AgentIdentityMismatch,
+                "approved enrollment has no credential evidence",
+            )
+        })?;
+        let evidence = candidate.credential_evidence.as_ref().ok_or_else(|| {
+            error(
+                CentralErrorCode::AgentIdentityMismatch,
+                "approved enrollment has no credential evidence",
+            )
+        })?;
+        if instance.installation_id != request.installation_id
+            || evidence.algorithm != request.proof.possession.algorithm
+            || evidence.public_key_spki != request.proof.possession.public_key_spki
+        {
+            return Err(error(
+                CentralErrorCode::AgentIdentityMismatch,
+                "Agent action credential differs from the approved enrollment",
+            ));
+        }
+        if require_active_session
+            && (instance.active_boot_id.as_ref() != Some(&request.boot_id)
+                || instance.active_session_id.as_ref() != request.session_id.as_ref()
+                || instance.session_generation != request.session_generation)
+        {
+            return Err(error(
+                CentralErrorCode::GenerationMismatch,
+                "Agent action carries a stale session fence",
+            ));
+        }
+        Ok(record)
     }
 
     pub async fn report_mount(
@@ -2068,11 +2170,32 @@ fn active_instance(agent_id: &AgentId, candidate: AgentCandidateRecord) -> Agent
         state: AgentInstanceState::Active,
         session_generation: None,
         active_boot_id: None,
+        active_session_id: None,
         session_open_expected_resource_version: None,
         session_opened_at_unix_ms: None,
         last_heartbeat_at_unix_ms: None,
         last_sequence: None,
     }
+}
+
+fn derive_session_id(
+    agent_id: &AgentId,
+    boot_id: &AgentBootId,
+    session_generation: SessionGeneration,
+) -> CentralResult<SessionId> {
+    #[derive(Serialize)]
+    struct SessionIdentity<'a> {
+        agent_id: &'a AgentId,
+        boot_id: &'a AgentBootId,
+        session_generation: SessionGeneration,
+    }
+
+    let digest = neoengram_protocol::jcs_blake3(&SessionIdentity {
+        agent_id,
+        boot_id,
+        session_generation,
+    })?;
+    Ok(SessionId::new(format!("session-{digest}"))?)
 }
 
 fn validate_bootstrap_probe(
@@ -2161,6 +2284,7 @@ fn revoke_for_replacement(
     })?;
     instance.state = AgentInstanceState::Revoked;
     instance.active_boot_id = None;
+    instance.active_session_id = None;
     instance.session_open_expected_resource_version = None;
     instance.session_opened_at_unix_ms = None;
     instance.last_heartbeat_at_unix_ms = None;
@@ -2928,13 +3052,15 @@ pub(crate) fn validate_registry_record(record: &AgentRegistryRecord) -> CentralR
         let session_metadata_complete = match &instance.active_boot_id {
             Some(_) => {
                 instance.session_generation.is_some()
+                    && instance.active_session_id.is_some()
                     && instance.session_open_expected_resource_version.is_some()
                     && instance.session_opened_at_unix_ms.is_some()
                     && (instance.last_heartbeat_at_unix_ms.is_some()
                         == instance.last_sequence.is_some())
             }
             None => {
-                instance.session_open_expected_resource_version.is_none()
+                instance.active_session_id.is_none()
+                    && instance.session_open_expected_resource_version.is_none()
                     && instance.session_opened_at_unix_ms.is_none()
                     && instance.last_heartbeat_at_unix_ms.is_none()
                     && instance.last_sequence.is_none()

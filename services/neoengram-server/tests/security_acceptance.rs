@@ -569,6 +569,7 @@ fn development_config(authority_dir: PathBuf) -> Config {
         agent_bind: None,
         agent_enrollment_keyring_file: None,
         authority_dir,
+        object_store_root: None,
         rbac_file: None,
         oidc_issuer: None,
         oidc_audience: None,

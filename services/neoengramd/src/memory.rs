@@ -9,18 +9,20 @@ use std::{
 use async_trait::async_trait;
 use neoengram_core::{FileRecord, IndexVersion, LogicalPath, Manifest, ManifestId, ObjectId};
 use neoengram_protocol::{
-    ArtifactId, AssignmentOperation, JobAssignment, MetadataBatchDescriptor, MetadataBatchId,
-    MetadataBatchPage, ObjectDurabilityReceipt, TenantId, UnixMillis, WireIndexVersion,
+    AgentId, ArtifactId, AssignmentOperation, JobAssignment, MetadataBatchDescriptor,
+    MetadataBatchId, MetadataBatchPage, ObjectDurabilityReceipt, TenantId, UnixMillis,
+    WireIndexVersion,
 };
 
 use crate::{
     validation::{durable_from_receipt, invalid, same_index_version},
     AgentEnrollmentAuditEvent, AssignmentOutbox, AssignmentPublishOutcome,
-    AssignmentReserveOutcome, AuditEvent, AuditSink, AuthorityCapabilities, AuthorityStore,
-    AuthorizationRequest, Authorizer, CentralErrorCode, CentralResult, Clock, ControlPlane,
-    DurableObject, InMemoryAgentRegistry, IndexKey, IndexPublishOutcome, IndexPublishRejection,
-    IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobKey, JobRecord, JobRepository,
-    MetadataBatchStager, ObjectCatalog, PublishedIndex, StagedMetadataBatch,
+    AssignmentReserveOutcome, AssignmentRetireOutcome, AuditEvent, AuditSink,
+    AuthorityCapabilities, AuthorityStore, AuthorizationRequest, Authorizer, CentralErrorCode,
+    CentralResult, Clock, ControlPlane, DurableObject, InMemoryAgentRegistry, IndexKey,
+    IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, IndexPublisher,
+    JobInsertOutcome, JobKey, JobRecord, JobRepository, MetadataBatchStager, ObjectCatalog,
+    PublishedIndex, StagedMetadataBatch,
 };
 
 #[derive(Debug, Default)]
@@ -61,6 +63,34 @@ impl InMemoryJobRepository {
 impl JobRepository for InMemoryJobRepository {
     async fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>> {
         Ok(lock(&self.jobs)?.get(key).cloned())
+    }
+
+    async fn list_recoverable(
+        &self,
+        after: Option<&JobKey>,
+        now: UnixMillis,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        Ok(lock(&self.jobs)?
+            .values()
+            .filter(|job| after.is_none_or(|after| job.key() > *after))
+            .filter(|job| crate::mapper_recovery_predicate(job, now))
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_pending_decisions_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>> {
+        Ok(lock(&self.jobs)?
+            .values()
+            .filter(|job| pending_decision_for_agent(job, agent_id))
+            .take(limit)
+            .cloned()
+            .collect())
     }
 
     async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome> {
@@ -106,6 +136,7 @@ pub struct InMemoryAssignmentOutbox {
 struct InMemoryAssignmentReservation {
     assignment: JobAssignment,
     published: bool,
+    retired: bool,
 }
 
 impl InMemoryAssignmentOutbox {
@@ -141,6 +172,7 @@ impl AssignmentOutbox for InMemoryAssignmentOutbox {
             InMemoryAssignmentReservation {
                 assignment,
                 published: false,
+                retired: false,
             },
         );
         Ok(AssignmentReserveOutcome::Reserved)
@@ -174,6 +206,59 @@ impl AssignmentOutbox for InMemoryAssignmentOutbox {
         existing.published = true;
         Ok(AssignmentPublishOutcome::Published)
     }
+
+    async fn retire(
+        &self,
+        tenant_id: &TenantId,
+        assignment_id: &neoengram_protocol::AssignmentId,
+    ) -> CentralResult<AssignmentRetireOutcome> {
+        let mut assignments = lock(&self.assignments)?;
+        let reservation = assignments
+            .get_mut(&(tenant_id.clone(), assignment_id.clone()))
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::Internal,
+                    format!("assignment {assignment_id} is not reserved"),
+                )
+            })?;
+        if !reservation.published {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                format!("assignment {assignment_id} is not published"),
+            ));
+        }
+        if reservation.retired {
+            return Ok(AssignmentRetireOutcome::AlreadyRetired);
+        }
+        reservation.retired = true;
+        Ok(AssignmentRetireOutcome::Retired)
+    }
+
+    async fn pending_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobAssignment>> {
+        Ok(lock(&self.assignments)?
+            .values()
+            .filter(|reservation| reservation.published && !reservation.retired)
+            .filter(|reservation| {
+                let AssignmentOperation::Add { input, .. } = &reservation.assignment.assignment;
+                &input.agent_id == agent_id
+            })
+            .take(limit)
+            .map(|reservation| reservation.assignment.clone())
+            .collect())
+    }
+}
+
+fn pending_decision_for_agent(job: &JobRecord, agent_id: &AgentId) -> bool {
+    job.decision.is_some()
+        && job.finalized_ack.is_none()
+        && job
+            .assignment
+            .as_ref()
+            .is_some_and(|assignment| &assignment.agent_id == agent_id)
 }
 
 #[derive(Debug, Default)]
@@ -748,6 +833,7 @@ pub struct InMemoryComponents {
     pub publisher: Arc<InMemoryIndexPublisher>,
     pub audit: Arc<InMemoryAuditSink>,
     pub agent_registry: Arc<InMemoryAgentRegistry>,
+    pub control_catalog: Arc<crate::InMemoryControlCatalog>,
     pub clock: Arc<InMemoryClock>,
 }
 
@@ -763,6 +849,7 @@ impl InMemoryComponents {
             publisher: Arc::new(InMemoryIndexPublisher::default()),
             audit: Arc::new(InMemoryAuditSink::default()),
             agent_registry: Arc::new(InMemoryAgentRegistry::new()),
+            control_catalog: Arc::new(crate::InMemoryControlCatalog::default()),
             clock: Arc::new(InMemoryClock::new(now_ms)),
         }
     }
@@ -788,6 +875,7 @@ impl InMemoryComponents {
             AuthorityCapabilities::IN_MEMORY,
         )
         .with_agent_registry(self.agent_registry.clone())
+        .with_control_catalog(self.control_catalog.clone())
     }
 }
 

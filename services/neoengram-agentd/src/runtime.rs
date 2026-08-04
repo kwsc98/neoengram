@@ -7,7 +7,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use ed25519_dalek::{Signer, SigningKey};
 use neoengram_agent::{
     ApprovedAgentIdentity, FilesystemMountObservation, FilesystemMountProbeConfig,
     MountProbeCondition, SqliteSystemIdentityStore, SystemIdentityRecord,
@@ -16,19 +15,19 @@ use neoengram_agent::{
 use neoengram_protocol::{
     AgentBootstrapAccepted, AgentBootstrapProof, AgentBootstrapRequest,
     AgentBootstrapStatusRequest, AgentBootstrapStatusResponse, AgentBootstrapStatusState,
-    AgentEnrollmentState, AgentInstallationId, AgentSignatureAlgorithm, Ed25519PublicKeySpki,
-    Ed25519Signature, Extensions, MountAccessMode, RequestId, ResourceHealth, UnixMillis,
-    PROTOCOL_VERSION_V1,
+    AgentEnrollmentState, AgentId, AgentInstallationId, AgentSignatureAlgorithm,
+    Ed25519PublicKeySpki, Ed25519Signature, Extensions, MountAccessMode, RequestId, ResourceHealth,
+    ResourceVersion, UnixMillis, PROTOCOL_VERSION_V1,
 };
-use rand::Rng;
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::time::{self, MissedTickBehavior};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::status_clock::StatusTimestampClock;
 use crate::{
     health::HealthReporter, identity::public_key_spki_der, AgentConfig, AgentDaemonError,
-    AgentDaemonResult, EnrollmentBackoff, EnrollmentClient, EnrollmentClientError,
-    ReqwestEnrollmentClient, RuntimeHealthPhase,
+    AgentDaemonResult, AgentSessionClient, AgentSigningKey, EnrollmentBackoff, EnrollmentClient,
+    EnrollmentClientError, ReqwestAgentSessionClient, ReqwestEnrollmentClient, RuntimeHealthPhase,
 };
 
 const TOKEN_FILE_MAX_BYTES: u64 = 2_050;
@@ -67,6 +66,7 @@ impl MountProbe for FilesystemProbe {
 pub async fn run(config: AgentConfig) -> AgentDaemonResult<()> {
     config.validate()?;
     let client = ReqwestEnrollmentClient::new(config.central_endpoint.clone())?;
+    let session_client = ReqwestAgentSessionClient::new(config.central_endpoint.clone())?;
     let probe = FilesystemProbe::new(&config);
 
     #[cfg(unix)]
@@ -86,7 +86,145 @@ pub async fn run(config: AgentConfig) -> AgentDaemonResult<()> {
         let _ = tokio::signal::ctrl_c().await;
     };
 
-    run_with(config, client, probe, shutdown).await
+    run_with_transports(config, client, session_client, probe, shutdown).await
+}
+
+/// Runs enrollment and the approved Agent session with injectable transports and shutdown.
+///
+/// This is the production lifecycle with process signals replaced by an injected future, allowing
+/// socket-level acceptance tests and embedders to stop the daemon without sending an OS signal.
+pub async fn run_with_transports<C, S, P, F>(
+    config: AgentConfig,
+    enrollment_client: C,
+    session_client: S,
+    probe: P,
+    shutdown: F,
+) -> AgentDaemonResult<()>
+where
+    C: EnrollmentClient + Clone,
+    S: AgentSessionClient + 'static,
+    P: MountProbe + Clone,
+    F: Future<Output = ()> + Send + 'static,
+{
+    config.validate()?;
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = shutdown_sender.send(true);
+    });
+    run_with(
+        config.clone(),
+        enrollment_client.clone(),
+        probe.clone(),
+        wait_for_shutdown(shutdown_receiver.clone()),
+    )
+    .await?;
+    if *shutdown_receiver.borrow() {
+        return Ok(());
+    }
+
+    let store = SqliteSystemIdentityStore::open(&config.storage.state_dir)?;
+    let identity = store.load()?.ok_or_else(|| {
+        AgentDaemonError::Identity("approved Agent identity disappeared".to_owned())
+    })?;
+    let Some(approved) = identity.approved.as_ref() else {
+        return Ok(());
+    };
+    let signing_key = crate::signing_key_from_identity(&identity)?;
+    let Some(resource_version) = query_approved_resource_version(
+        &config,
+        &enrollment_client,
+        &identity,
+        &signing_key,
+        shutdown_receiver.clone(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    if *shutdown_receiver.borrow() {
+        return Ok(());
+    }
+    crate::approved_runtime::run_approved_session(
+        config,
+        session_client,
+        probe,
+        AgentId::new(approved.agent_id.clone()).map_err(protocol_error)?,
+        AgentInstallationId::new(identity.installation_id.clone()).map_err(protocol_error)?,
+        signing_key,
+        resource_version,
+        wait_for_shutdown(shutdown_receiver),
+    )
+    .await
+}
+
+async fn query_approved_resource_version<C: EnrollmentClient>(
+    config: &AgentConfig,
+    client: &C,
+    identity: &SystemIdentityRecord,
+    signing_key: &AgentSigningKey,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> AgentDaemonResult<Option<ResourceVersion>> {
+    let public_key_spki =
+        Ed25519PublicKeySpki::new(public_key_spki_der(signing_key)?).map_err(protocol_error)?;
+    let mut status_clock = StatusTimestampClock::open(&config.storage.state_dir)?;
+    let mut signer = StatusRequestSigner {
+        config,
+        signing_key,
+        public_key_spki: &public_key_spki,
+        status_clock: &mut status_clock,
+    };
+    let mut backoff =
+        EnrollmentBackoff::with_max_delay_seconds(config.session.reconnect_max_delay_seconds);
+    loop {
+        let request = signer.build(identity)?;
+        match client.status(&request).await {
+            Ok(Some(status)) => {
+                status.validate().map_err(protocol_error)?;
+                if status.state != AgentBootstrapStatusState::Approved
+                    || status.agent_id.as_ref().map(|value| value.to_string())
+                        != identity
+                            .approved
+                            .as_ref()
+                            .map(|value| value.agent_id.clone())
+                {
+                    return Err(AgentDaemonError::EnrollmentProtocol(
+                        "approved status query returned another identity or state".to_owned(),
+                    ));
+                }
+                return Ok(Some(status.resource_version));
+            }
+            Ok(None) => {
+                return Err(AgentDaemonError::EnrollmentProtocol(
+                    "approved enrollment disappeared before session open".to_owned(),
+                ));
+            }
+            Err(error) if error.retryable() => {
+                let delay = next_delay(&mut backoff);
+                tokio::select! {
+                    _ = wait_for_shutdown(shutdown.clone()) => {
+                        return Ok(None);
+                    }
+                    _ = time::sleep(delay) => {}
+                }
+            }
+            Err(error) => return Err(enrollment_error(error)),
+        }
+        if *shutdown.borrow_and_update() {
+            return Ok(None);
+        }
+    }
+}
+
+async fn wait_for_shutdown(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
+        }
+    }
 }
 
 /// Runs enrollment with injectable transport, probe, and shutdown for socket-free focused tests.
@@ -135,7 +273,7 @@ where
     reporter.set_phase(initial_phase)?;
 
     if identity.approved.is_some() {
-        return hold_terminal_phase(&mut reporter, &mut shutdown).await;
+        return Ok(());
     }
 
     let mut status_clock = StatusTimestampClock::open(&config.storage.state_dir)?;
@@ -158,6 +296,7 @@ where
         PreflightDisposition::Candidate(status) => {
             match apply_status(&store, &mut identity, status, &mut reporter)? {
                 StatusDisposition::Pending => {}
+                StatusDisposition::Approved => return Ok(()),
                 StatusDisposition::Terminal => {
                     return hold_terminal_phase(&mut reporter, &mut shutdown).await;
                 }
@@ -188,6 +327,7 @@ where
             drop(guarded_request);
             match apply_bootstrap_accepted(&store, &mut identity, accepted, &mut reporter)? {
                 StatusDisposition::Pending => {}
+                StatusDisposition::Approved => return Ok(()),
                 StatusDisposition::Terminal => {
                     return hold_terminal_phase(&mut reporter, &mut shutdown).await;
                 }
@@ -285,6 +425,7 @@ where
         match client.status(&request).await {
             Ok(Some(status)) => match apply_status(store, identity, status, reporter)? {
                 StatusDisposition::Pending => continue,
+                StatusDisposition::Approved => return Ok(()),
                 StatusDisposition::Terminal => {
                     return hold_terminal_phase(reporter, shutdown).await;
                 }
@@ -327,7 +468,7 @@ fn apply_bootstrap_accepted(
                 accepted.enrollment_id.to_string(),
             )?;
             reporter.set_phase(RuntimeHealthPhase::ApprovedWaitingCertificate)?;
-            Ok(StatusDisposition::Terminal)
+            Ok(StatusDisposition::Approved)
         }
         AgentEnrollmentState::Rejected | AgentEnrollmentState::Revoked => {
             bind_terminal(
@@ -391,7 +532,7 @@ fn apply_status(
                 status.enrollment_id.to_string(),
             )?;
             reporter.set_phase(RuntimeHealthPhase::ApprovedWaitingCertificate)?;
-            Ok(StatusDisposition::Terminal)
+            Ok(StatusDisposition::Approved)
         }
         AgentBootstrapStatusState::Rejected => {
             bind_terminal(
@@ -441,7 +582,7 @@ fn bind_terminal(
 fn build_bootstrap_request(
     config: &AgentConfig,
     identity: &SystemIdentityRecord,
-    signing_key: &SigningKey,
+    signing_key: &AgentSigningKey,
     public_key_spki: &Ed25519PublicKeySpki,
     token: Zeroizing<String>,
     probe: neoengram_protocol::AgentBootstrapProbe,
@@ -470,7 +611,7 @@ fn build_bootstrap_request(
 
 struct StatusRequestSigner<'a> {
     config: &'a AgentConfig,
-    signing_key: &'a SigningKey,
+    signing_key: &'a AgentSigningKey,
     public_key_spki: &'a Ed25519PublicKeySpki,
     status_clock: &'a mut StatusTimestampClock,
 }
@@ -497,7 +638,8 @@ impl StatusRequestSigner<'_> {
         };
         let signing_bytes = Zeroizing::new(request.signing_bytes().map_err(protocol_error)?);
         request.proof.signature =
-            Ed25519Signature::from_bytes(self.signing_key.sign(&signing_bytes).to_bytes());
+            Ed25519Signature::new(self.signing_key.sign(&signing_bytes).as_ref().to_vec())
+                .map_err(protocol_error)?;
         request
             .proof
             .verify(&signing_bytes)
@@ -508,11 +650,12 @@ impl StatusRequestSigner<'_> {
 
 fn sign_bootstrap_request(
     request: &mut AgentBootstrapRequest,
-    signing_key: &SigningKey,
+    signing_key: &AgentSigningKey,
 ) -> AgentDaemonResult<()> {
     let signing_bytes = Zeroizing::new(request.signing_bytes().map_err(protocol_error)?);
     request.proof.signature =
-        Ed25519Signature::from_bytes(signing_key.sign(&signing_bytes).to_bytes());
+        Ed25519Signature::new(signing_key.sign(&signing_bytes).as_ref().to_vec())
+            .map_err(protocol_error)?;
     request
         .proof
         .verify(&signing_bytes)
@@ -529,7 +672,9 @@ fn placeholder_proof(public_key_spki: Ed25519PublicKeySpki) -> AgentBootstrapPro
     }
 }
 
-fn validate_bootstrap_probe(observation: &FilesystemMountObservation) -> AgentDaemonResult<()> {
+pub(crate) fn validate_bootstrap_probe(
+    observation: &FilesystemMountObservation,
+) -> AgentDaemonResult<()> {
     let usable_condition = matches!(
         observation.condition,
         MountProbeCondition::Ready | MountProbeCondition::LowFreeSpace
@@ -592,7 +737,12 @@ fn read_bootstrap_token(path: &Path) -> AgentDaemonResult<Zeroizing<String>> {
 }
 
 fn next_delay(backoff: &mut EnrollmentBackoff) -> Duration {
-    let jitter = rand::thread_rng().gen_range(-20..=20);
+    let mut random = [0_u8; 1];
+    let jitter = if SystemRandom::new().fill(&mut random).is_ok() {
+        i32::from(random[0] % 41) - 20
+    } else {
+        0
+    };
     backoff.next_delay_with_jitter(jitter)
 }
 
@@ -650,6 +800,7 @@ fn enrollment_error(error: EnrollmentClientError) -> AgentDaemonError {
 
 enum StatusDisposition {
     Pending,
+    Approved,
     Terminal,
 }
 

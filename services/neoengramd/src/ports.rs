@@ -3,16 +3,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use neoengram_core::ObjectId;
 use neoengram_protocol::{
-    ArtifactId, JobAssignment, MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage,
-    ObjectDurabilityReceipt, TenantId, UnixMillis, WireIndexVersion,
+    AgentId, ArtifactId, JobAssignment, MetadataBatchDescriptor, MetadataBatchId,
+    MetadataBatchPage, ObjectDurabilityReceipt, TenantId, UnixMillis, WireIndexVersion,
 };
 
 use crate::{
     AgentEnrollmentAuditEvent, AgentEnrollmentExpiryReconciliation,
     AgentEnrollmentLifecycleAuditEvent, AgentEnrollmentListPage, AgentEnrollmentListRequest,
     AgentRegistryRecord, AgentRegistryReplacementRecords, AuditEvent, AuthorizationRequest,
-    CentralResult, DurableObject, IndexKey, IndexPublishOutcome, IndexPublishRequest, JobKey,
-    JobRecord, StagedMetadataBatch,
+    CatalogInsertOutcome, CentralResult, DurableObject, IndexKey, IndexPublishOutcome,
+    IndexPublishRequest, JobKey, JobRecord, PlaygroundListPage, PlaygroundListRequest,
+    PlaygroundRecord, StagedMetadataBatch, StorageVolumeListPage, StorageVolumeListRequest,
+    StorageVolumeRecord, TenantListPage, TenantListRequest, TenantRecord,
 };
 
 /// Result of atomically inserting a job or loading the record already stored at its key.
@@ -34,6 +36,13 @@ pub enum AssignmentReserveOutcome {
 pub enum AssignmentPublishOutcome {
     Published,
     AlreadyPublished,
+}
+
+/// Result of durably retiring an assignment after the authoritative Job accepted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentRetireOutcome {
+    Retired,
+    AlreadyRetired,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +161,47 @@ pub trait AgentRegistryRepository: Send + Sync {
     ) -> CentralResult<AgentRegistryReplacementRecords>;
 }
 
+/// Durable control-catalog repository. SQLite composes this with AgentRegistry in one database.
+#[async_trait]
+pub trait ControlCatalogRepository: Send + Sync {
+    async fn get_tenant(&self, tenant_id: &TenantId) -> CentralResult<Option<TenantRecord>>;
+    async fn list_tenants(&self, request: &TenantListRequest) -> CentralResult<TenantListPage>;
+    async fn insert_tenant(
+        &self,
+        record: TenantRecord,
+    ) -> CentralResult<CatalogInsertOutcome<TenantRecord>>;
+
+    async fn get_storage_volume(
+        &self,
+        tenant_id: &TenantId,
+        storage_volume_id: &neoengram_protocol::StorageVolumeId,
+    ) -> CentralResult<Option<StorageVolumeRecord>>;
+    async fn list_storage_volumes(
+        &self,
+        request: &StorageVolumeListRequest,
+    ) -> CentralResult<StorageVolumeListPage>;
+    async fn insert_storage_volume(
+        &self,
+        record: StorageVolumeRecord,
+    ) -> CentralResult<CatalogInsertOutcome<StorageVolumeRecord>>;
+
+    async fn get_playground(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &neoengram_protocol::ProjectId,
+        artifact_id: &neoengram_protocol::ArtifactId,
+        playground_id: &neoengram_protocol::PlaygroundId,
+    ) -> CentralResult<Option<PlaygroundRecord>>;
+    async fn list_playgrounds(
+        &self,
+        request: &PlaygroundListRequest,
+    ) -> CentralResult<PlaygroundListPage>;
+    async fn insert_playground(
+        &self,
+        record: PlaygroundRecord,
+    ) -> CentralResult<CatalogInsertOutcome<PlaygroundRecord>>;
+}
+
 #[async_trait]
 pub trait Authorizer: Send + Sync {
     async fn authorize(&self, request: &AuthorizationRequest) -> CentralResult<()>;
@@ -160,6 +210,22 @@ pub trait Authorizer: Send + Sync {
 #[async_trait]
 pub trait JobRepository: Send + Sync {
     async fn get(&self, key: &JobKey) -> CentralResult<Option<JobRecord>>;
+    /// Lists jobs which still require scheduler, expiry, publication, or delivery recovery work.
+    ///
+    /// Implementations return records strictly after `after` in stable tenant/job ordering and
+    /// apply `limit` after filtering against `now`.
+    async fn list_recoverable(
+        &self,
+        after: Option<&JobKey>,
+        now: UnixMillis,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>>;
+    /// Lists unacknowledged publish decisions for one Agent, applying `limit` after Agent filtering.
+    async fn list_pending_decisions_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobRecord>>;
     /// Atomically inserts `job`, or returns the complete record already stored at the same key.
     async fn insert_or_load(&self, job: JobRecord) -> CentralResult<JobInsertOutcome>;
     async fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord>;
@@ -176,6 +242,25 @@ pub trait AssignmentOutbox: Send + Sync {
 
     /// Makes an exact, durable reservation visible after the authoritative job stores it.
     async fn publish(&self, assignment: JobAssignment) -> CentralResult<AssignmentPublishOutcome>;
+
+    /// Retires a published assignment after the Job CAS records acceptance.
+    ///
+    /// The reservation remains durable so the tenant-scoped AssignmentId cannot be reused.
+    async fn retire(
+        &self,
+        tenant_id: &TenantId,
+        assignment_id: &neoengram_protocol::AssignmentId,
+    ) -> CentralResult<AssignmentRetireOutcome>;
+
+    /// Lists published, non-retired delivery candidates for one Agent in stable assignment order.
+    ///
+    /// The caller must pair these records with the authoritative Job state and deliver only jobs
+    /// which are still `Assigned`. This keeps acknowledgement recovery grounded in the Job CAS.
+    async fn pending_for_agent(
+        &self,
+        agent_id: &AgentId,
+        limit: usize,
+    ) -> CentralResult<Vec<JobAssignment>>;
 }
 
 #[async_trait]
@@ -245,6 +330,7 @@ pub struct AuthorityStore {
     publisher: Arc<dyn IndexPublisher>,
     audit: Arc<dyn AuditSink>,
     agent_registry: Option<Arc<dyn AgentRegistryRepository>>,
+    control_catalog: Option<Arc<dyn ControlCatalogRepository>>,
     capabilities: AuthorityCapabilities,
 }
 
@@ -268,6 +354,7 @@ impl AuthorityStore {
             publisher,
             audit,
             agent_registry: None,
+            control_catalog: None,
             capabilities,
         }
     }
@@ -312,6 +399,18 @@ impl AuthorityStore {
     #[must_use]
     pub fn agent_registry(&self) -> Option<Arc<dyn AgentRegistryRepository>> {
         self.agent_registry.clone()
+    }
+
+    /// Adds the optional Tenant/Volume/Playground control catalog.
+    #[must_use]
+    pub fn with_control_catalog(mut self, catalog: Arc<dyn ControlCatalogRepository>) -> Self {
+        self.control_catalog = Some(catalog);
+        self
+    }
+
+    #[must_use]
+    pub fn control_catalog(&self) -> Option<Arc<dyn ControlCatalogRepository>> {
+        self.control_catalog.clone()
     }
 
     #[must_use]

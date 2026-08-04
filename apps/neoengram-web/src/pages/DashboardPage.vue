@@ -15,6 +15,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { liveProbe, queryApiVersion, queryTenant, readyProbe } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
+import { supportsResourceBrowser } from '@/features/capabilities';
 import { formatTime } from '@/utils/format';
 
 const route = useRoute();
@@ -52,32 +53,40 @@ const refreshing = computed(
     readyQuery.isFetching.value,
 );
 
-const resourceLinks = [
-  {
-    name: 'artifact-list',
-    label: '数据资产',
-    detail: '浏览 Artifact、Commit 与版本 Diff',
-    icon: Box,
-  },
+const resourceLinks = computed(() => [
+  ...(supportsResourceBrowser(version.value?.capabilities)
+    ? [
+        {
+          name: 'artifact-list',
+          label: '数据资产',
+          detail: '浏览 Artifact、Commit 与版本 Diff',
+          icon: Box,
+        },
+      ]
+    : []),
   {
     name: 'playground-list',
     label: '工作区',
     detail: '查看 Playground 与 Pre-commit 状态',
     icon: Collection,
   },
-  {
-    name: 'snapshot-list',
-    label: '快照与交付',
-    detail: '查看固定 Commit 的区域只读视图',
-    icon: DocumentCopy,
-  },
+  ...(supportsResourceBrowser(version.value?.capabilities)
+    ? [
+        {
+          name: 'snapshot-list',
+          label: '快照与交付',
+          detail: '查看固定 Commit 的区域只读视图',
+          icon: DocumentCopy,
+        },
+      ]
+    : []),
   {
     name: 'storage-volume-list',
     label: '存储卷',
     detail: '查看已登记的 StorageVolume 与放置状态',
     icon: TakeawayBox,
   },
-];
+]);
 
 async function refresh(): Promise<void> {
   await Promise.all([

@@ -14,9 +14,26 @@ POST /api/job/add/finalize
 ```
 
 启用 Agent enrollment 时，同一 Fusen 用户 listener 还注册 token create、enrollment list/query、approve
-和 reject 五个公开管理接口；独立 Hyper listener 注册 `/v1/agents/bootstrap` 与
-`/v1/agents/bootstrap/status`。后两条是内部 Agent API，不属于本 OpenAPI。本文档中的其他 operation
-仍是目标契约，不表示已经可调用。
+和 reject 五个公开管理接口。独立 Hyper listener 由另一份 OpenAPI 3.1 契约
+[`neoengram-agent-api.yaml`](neoengram-agent-api.yaml) 定义；它不是公开 Web API。Agent 契约同样采用
+模块/子域/动作命名，全部使用 POST，所有资源 ID 均位于 JSON body：
+
+```text
+POST /agent/enrollment/bootstrap
+POST /agent/enrollment/status/query
+POST /agent/session/open
+POST /agent/session/heartbeat/report
+POST /agent/session/message/list/query
+POST /agent/job/report/create
+POST /agent/job/metadata/batch/stage
+POST /agent/job/metadata/page/stage
+POST /agent/job/index/page/query
+POST /agent/job/object/missing/query
+POST /agent/job/object/upload
+POST /agent/session/close
+```
+
+公开契约中的其他 operation 仍可能是目标契约，不表示已经可调用。
 
 业务接口使用外部 OIDC/JWKS Bearer JWT 和服务端 RBAC，无法确认身份或授权时默认拒绝。SQLite
 运行模式只支持单副本；生产 TLS 由 Ingress/反向代理终止。
@@ -96,9 +113,11 @@ Dataset Profile 是 Playground/Snapshot 派生的只读元数据，不是 Snapsh
 Lease/Mount、容量与底层诊断、Agent/assignment、fencing、Manifest/Chunk、文件内容 digest、对象分布
 和物理路径均不属于 P0 普通用户契约；后续能力必须通过独立 P1 或 operator API 与相应 RBAC 暴露。
 
-Agent API 不属于本 OpenAPI。Agent 的 H2/H3 JSON Text Sequence 双向 session、MetadataBatch 和
-重放规则继续由以下契约定义：
+Agent API 不属于公开 OpenAPI。开发链路使用 Agent 主动发起的 HTTP/1 JSON action 请求：短轮询最多
+返回 32 条消息，空结果返回 `retry_after_ms=1000`；Ed25519 request proof、session generation fencing、
+MetadataBatch 分页和重放规则由以下契约定义：
 
+- [`neoengram-agent-api.yaml`](neoengram-agent-api.yaml)
 - [`../agent-central-control.md`](../agent-central-control.md)
 - [`../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json`](../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json)
 - [`../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json`](../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json)

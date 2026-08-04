@@ -292,7 +292,10 @@ impl Agent {
     pub fn recover(&self, key: &AssignmentKey) -> AgentResult<LedgerRecord> {
         let record = self.load_required(key)?;
         match record.state {
-            AgentAssignmentState::Accepted => self.execute(key),
+            AgentAssignmentState::Accepted => {
+                self.send_accepted(&record)?;
+                self.execute(key)
+            }
             AgentAssignmentState::Prepared => self.report_prepared(record),
             AgentAssignmentState::AwaitingDecision | AgentAssignmentState::Completed => Ok(record),
             AgentAssignmentState::Finalizing => self.finalize(record),
@@ -353,6 +356,26 @@ impl Agent {
     /// Loads one durable assignment snapshot.
     pub fn assignment(&self, key: &AssignmentKey) -> AgentResult<Option<LedgerRecord>> {
         self.ledger.load(key)
+    }
+
+    /// Lists every assignment that still needs execution, replay, or central acknowledgement.
+    pub fn active_assignments(&self) -> AgentResult<Vec<LedgerRecord>> {
+        self.ledger.list_active()
+    }
+
+    /// Replays all durable active assignments in stable Ledger order after process restart.
+    pub fn recover_active(&self) -> AgentResult<Vec<LedgerRecord>> {
+        self.ledger
+            .list_active()?
+            .into_iter()
+            .map(|record| {
+                if record.state == AgentAssignmentState::Claimed {
+                    self.handle_assignment(record.assignment)
+                } else {
+                    self.recover(&record.key)
+                }
+            })
+            .collect()
     }
 
     fn report_prepared(&self, record: LedgerRecord) -> AgentResult<LedgerRecord> {

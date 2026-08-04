@@ -49,6 +49,15 @@ impl Ledger for InMemoryLedger {
         Ok(records.get(key).cloned())
     }
 
+    fn list_active(&self) -> AgentResult<Vec<LedgerRecord>> {
+        let records = self.records.lock().map_err(lock_error)?;
+        Ok(records
+            .values()
+            .filter(|record| record.state != crate::AgentAssignmentState::Completed)
+            .cloned()
+            .collect())
+    }
+
     fn compare_exchange(
         &self,
         expected_revision: u64,

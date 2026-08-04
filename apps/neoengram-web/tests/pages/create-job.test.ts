@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import CreateJobPage from '@/pages/CreateJobPage.vue';
 
-const api = vi.hoisted(() => ({ createAddJob: vi.fn() }));
+const api = vi.hoisted(() => ({ createAddJob: vi.fn(), queryPlayground: vi.fn() }));
 
 vi.mock('@/api/operations', () => api);
 
@@ -34,6 +34,27 @@ function addJobResult() {
 }
 
 async function mountPage() {
+  api.queryPlayground.mockImplementation(
+    (_tenantId: string, projectId: string, artifactId: string, playgroundId: string) =>
+      Promise.resolve({
+        data: {
+          playground: {
+            tenant_id: 'tenant-a',
+            project_id: projectId,
+            artifact_id: artifactId,
+            playground_id: playgroundId,
+            storage_volume_id: 'volume-a',
+            region: 'cn-shanghai',
+            display_name: 'Test playground',
+            index_version: { revision: '7', digest: 'a'.repeat(64) },
+            state: 'ready',
+            created_at_unix_ms: '1785167000000',
+            updated_at_unix_ms: '1785167600000',
+          },
+        },
+        requestId: 'request-query-playground',
+      }),
+  );
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [
@@ -54,7 +75,9 @@ async function mountPage() {
       },
     ],
   });
-  await router.push('/tenants/tenant-a/jobs/new');
+  await router.push(
+    '/tenants/tenant-a/jobs/new?project_id=project-vision&artifact_id=road-scenes&playground_id=labeling',
+  );
   await router.isReady();
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },

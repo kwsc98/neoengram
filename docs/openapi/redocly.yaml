@@ -1,6 +1,8 @@
 apis:
   public@v1:
     root: ./neoengram-api.yaml
+  agent@v1:
+    root: ./neoengram-agent-api.yaml
 
 extends:
   - recommended

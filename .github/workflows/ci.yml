@@ -36,7 +36,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check architecture boundaries
         run: bash .github/check-architecture.sh
-      - name: Check public OpenAPI
+      - name: Check OpenAPI contracts
         run: |
           npm ci --prefix docs/openapi --ignore-scripts
           npm run lint --prefix docs/openapi

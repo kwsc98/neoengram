@@ -1,6 +1,7 @@
 pub(crate) mod agent_registry;
 mod audit;
 pub(crate) mod authority;
+mod catalog;
 mod index;
 mod job;
 mod metadata;

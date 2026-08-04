@@ -7,11 +7,12 @@ use std::{
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use neoengram_agentd::{
-    check_health, load_persisted_identity, run_with, AgentConfig, AgentDaemonResult,
-    FilesystemMountObservation, HealthMode, LoggingConfig, LoggingFormat, MountProbe,
-    MountProbeCondition, PvcReference, RegistrationConfig, ReqwestEnrollmentClient, SessionConfig,
-    StorageAccessMode, StorageBackendType, StorageConfig,
+    check_health, load_persisted_identity, run_with, run_with_transports, AgentConfig,
+    AgentDaemonResult, FilesystemMountObservation, HealthMode, LoggingConfig, LoggingFormat,
+    MountProbe, MountProbeCondition, PvcReference, RegistrationConfig, ReqwestAgentSessionClient,
+    ReqwestEnrollmentClient, SessionConfig, StorageAccessMode, StorageBackendType, StorageConfig,
 };
+use neoengram_core::ObjectId;
 use neoengram_protocol::{
     AgentEnrollmentTokenId, AgentMountIdentityDigest, ContentDigest, EdgeClusterId,
     MountAccessMode, ResourceHealth, StorageVolumeId, TenantId, VolumeMarkerId,
@@ -68,7 +69,7 @@ async fn real_agentd_enrolls_over_both_listeners_and_restarts_without_token() {
     );
     let probe = ReadyProbe::new(VOLUME_ID);
 
-    let (first_shutdown, first_task) = spawn_agent(agent_config.clone(), probe.clone());
+    let (first_shutdown, first_task) = spawn_full_agent(agent_config.clone(), probe.clone());
     let pending = wait_for_pending_enrollment(&client, public_addr, VOLUME_ID).await;
     assert_eq!(pending["state"], "pending_approval");
 
@@ -91,10 +92,10 @@ async fn real_agentd_enrolls_over_both_listeners_and_restarts_without_token() {
     .await;
     assert_eq!(approved["enrollment"]["state"], "approved");
 
-    wait_for_active_phase(&state_dir, "approved_waiting_certificate").await;
+    wait_for_active_phase(&state_dir, "session_ready").await;
     check_health(&state_dir, HealthMode::Startup).unwrap();
     check_health(&state_dir, HealthMode::Live).unwrap();
-    assert!(check_health(&state_dir, HealthMode::Ready).is_err());
+    check_health(&state_dir, HealthMode::Ready).unwrap();
     stop_agent(first_shutdown, first_task).await;
     assert!(check_health(&state_dir, HealthMode::Startup).is_err());
     assert!(check_health(&state_dir, HealthMode::Live).is_err());
@@ -111,11 +112,11 @@ async fn real_agentd_enrolls_over_both_listeners_and_restarts_without_token() {
         .is_some_and(|agent_id| agent_id.starts_with("ngagent_")));
 
     std::fs::remove_file(&token_path).unwrap();
-    let (restart_shutdown, restart_task) = spawn_agent(agent_config, probe);
-    wait_for_active_phase(&state_dir, "approved_waiting_certificate").await;
+    let (restart_shutdown, restart_task) = spawn_full_agent(agent_config, probe);
+    wait_for_active_phase(&state_dir, "session_ready").await;
     check_health(&state_dir, HealthMode::Startup).unwrap();
     check_health(&state_dir, HealthMode::Live).unwrap();
-    assert!(check_health(&state_dir, HealthMode::Ready).is_err());
+    check_health(&state_dir, HealthMode::Ready).unwrap();
     stop_agent(restart_shutdown, restart_task).await;
 
     let restarted = load_persisted_identity(&state_dir).unwrap().unwrap();
@@ -124,6 +125,283 @@ async fn real_agentd_enrolls_over_both_listeners_and_restarts_without_token() {
 
     public_server.shutdown().await.unwrap();
     state.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn real_agentd_scans_uploads_and_publishes_over_http() {
+    const PROJECT_ID: &str = "project-agentd-e2e";
+    const ARTIFACT_ID: &str = "artifact-agentd-e2e";
+    const PLAYGROUND_ID: &str = "playground-agentd-e2e";
+    const JOB_ID: &str = "job-agentd-e2e";
+    const RESTART_JOB_ID: &str = "job-agentd-e2e-after-restart";
+    const SERVER_RESTART_JOB_ID: &str = "job-agentd-e2e-after-server-restart";
+    const FILE_CONTENT: &[u8] = b"real Agent vertical slice\n";
+    const RESTART_FILE_CONTENT: &[u8] = b"real Agent payload after restart\n";
+    const SERVER_RESTART_FILE_CONTENT: &[u8] = b"real payload after authority reopen\n";
+
+    let authority = TempDir::new().unwrap();
+    let keyring_path = authority.path().join("enrollment-keyring.json");
+    write_keyring(&keyring_path);
+    let object_store_root = authority.path().join("central-objects");
+    let mut server_config =
+        development_server_config(authority.path().join("authority"), keyring_path);
+    server_config.object_store_root = Some(object_store_root.clone());
+    let state = AppState::initialize(&server_config).await.unwrap();
+    let public_server = state.start_server(&server_config).await.unwrap();
+    let public_addr = public_server.local_addr();
+    let agent_addr = state.agent_local_addr().await.unwrap();
+    let client = Client::new();
+
+    let intent = enrollment_intent("vertical", VOLUME_ID, "agentd-vertical-data");
+    let token_response = post_public(
+        &client,
+        public_addr,
+        "/api/storage/enrollment/token/create",
+        &intent,
+    )
+    .await;
+    let agent_root = TempDir::new().unwrap();
+    let prepared = prepare_persistent_agent(
+        agent_root.path(),
+        agent_addr,
+        &intent,
+        &token_response,
+        VOLUME_ID,
+        "agentd-vertical-data",
+    );
+    let state_dir = prepared.config.storage.state_dir.clone();
+    let mount_path = prepared.config.storage.mount_path.clone();
+    let token_path = prepared.token_path.clone();
+    let mut agent_config = prepared.config.clone();
+    let agent_probe = prepared.probe.clone();
+    let (agent_shutdown, agent_task) = spawn_full_agent(agent_config.clone(), agent_probe.clone());
+
+    let pending = wait_for_pending_enrollment(&client, public_addr, VOLUME_ID).await;
+    let enrollment_id = pending["storage_enrollment_id"].as_str().unwrap();
+    let approved = post_public(
+        &client,
+        public_addr,
+        "/api/storage/enrollment/approve",
+        &json!({
+            "tenant_id": "tenant-a",
+            "storage_enrollment_id": enrollment_id,
+            "approval_request_id": "approve-agentd-vertical",
+            "expected_resource_version": pending["resource_version"].clone(),
+            "confirm_replacement": false
+        }),
+    )
+    .await;
+    assert_eq!(approved["enrollment"]["state"], "approved");
+
+    wait_for_active_phase(&state_dir, "session_ready").await;
+    wait_for_volume_ready(&client, public_addr, VOLUME_ID).await;
+    check_health(&state_dir, HealthMode::Ready).unwrap();
+
+    let created_playground = post_public(
+        &client,
+        public_addr,
+        "/api/playground/create",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID,
+            "storage_volume_id": VOLUME_ID,
+            "display_name": "Agentd vertical playground"
+        }),
+    )
+    .await;
+    let initial_index = created_playground["playground"]["index_version"].clone();
+    assert_eq!(initial_index["revision"], "0");
+
+    let playground_path = mount_path
+        .join("playgrounds")
+        .join(PROJECT_ID)
+        .join(ARTIFACT_ID)
+        .join(PLAYGROUND_ID);
+    std::fs::create_dir_all(&playground_path).unwrap();
+    std::fs::write(playground_path.join("observed.txt"), FILE_CONTENT).unwrap();
+
+    let created_job = post_public(
+        &client,
+        public_addr,
+        "/api/job/add/create",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID,
+            "job_id": JOB_ID,
+            "expected_index_version": initial_index.clone(),
+            "deadline_unix_ms": deadline_after(Duration::from_secs(60)),
+            "paths": [],
+            "all": true
+        }),
+    )
+    .await;
+    assert_eq!(created_job["job"]["state"], "assigned");
+
+    let succeeded = wait_for_job_succeeded(&client, public_addr, JOB_ID).await;
+    assert_eq!(succeeded["decision"]["outcome"], "publish");
+
+    let object_id = ObjectId::for_bytes(FILE_CONTENT);
+    let object_path = object_store_root
+        .join("tenants/tenant-a/artifacts")
+        .join(ARTIFACT_ID)
+        .join("objects")
+        .join(object_id.to_hex());
+    assert_eq!(std::fs::read(&object_path).unwrap(), FILE_CONTENT);
+
+    let published_playground = post_public(
+        &client,
+        public_addr,
+        "/api/playground/query",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID
+        }),
+    )
+    .await;
+    let published_index = published_playground["playground"]["index_version"].clone();
+    assert_eq!(published_index["revision"], "1");
+    assert_ne!(published_index["digest"], initial_index["digest"]);
+
+    stop_agent(agent_shutdown, agent_task).await;
+    std::fs::remove_file(&token_path).unwrap();
+    let (restart_shutdown, restart_task) =
+        spawn_full_agent(agent_config.clone(), agent_probe.clone());
+    wait_for_active_phase(&state_dir, "session_ready").await;
+    wait_for_volume_ready(&client, public_addr, VOLUME_ID).await;
+
+    std::fs::write(
+        playground_path.join("after-restart.txt"),
+        RESTART_FILE_CONTENT,
+    )
+    .unwrap();
+    let restarted_job = post_public(
+        &client,
+        public_addr,
+        "/api/job/add/create",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID,
+            "job_id": RESTART_JOB_ID,
+            "expected_index_version": published_index.clone(),
+            "deadline_unix_ms": deadline_after(Duration::from_secs(60)),
+            "paths": [],
+            "all": true
+        }),
+    )
+    .await;
+    assert_eq!(restarted_job["job"]["state"], "assigned");
+    wait_for_job_succeeded(&client, public_addr, RESTART_JOB_ID).await;
+
+    let restart_object_id = ObjectId::for_bytes(RESTART_FILE_CONTENT);
+    let restart_object_path = object_store_root
+        .join("tenants/tenant-a/artifacts")
+        .join(ARTIFACT_ID)
+        .join("objects")
+        .join(restart_object_id.to_hex());
+    assert_eq!(
+        std::fs::read(&restart_object_path).unwrap(),
+        RESTART_FILE_CONTENT
+    );
+    let restarted_playground = post_public(
+        &client,
+        public_addr,
+        "/api/playground/query",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID
+        }),
+    )
+    .await;
+    let restarted_index = restarted_playground["playground"]["index_version"].clone();
+    assert_eq!(restarted_index["revision"], "2");
+    assert_ne!(restarted_index["digest"], published_index["digest"]);
+    assert!(!token_path.exists());
+
+    stop_agent(restart_shutdown, restart_task).await;
+    public_server.shutdown().await.unwrap();
+    state.close().await;
+
+    let restarted_state = AppState::initialize(&server_config).await.unwrap();
+    let restarted_public_server = restarted_state.start_server(&server_config).await.unwrap();
+    let restarted_public_addr = restarted_public_server.local_addr();
+    let restarted_agent_addr = restarted_state.agent_local_addr().await.unwrap();
+    agent_config.central_endpoint = Url::parse(&format!("http://{restarted_agent_addr}/")).unwrap();
+    let (server_restart_shutdown, server_restart_task) =
+        spawn_full_agent(agent_config, agent_probe);
+    wait_for_active_phase(&state_dir, "session_ready").await;
+    wait_for_volume_ready(&client, restarted_public_addr, VOLUME_ID).await;
+
+    assert_eq!(std::fs::read(&object_path).unwrap(), FILE_CONTENT);
+    assert_eq!(
+        std::fs::read(&restart_object_path).unwrap(),
+        RESTART_FILE_CONTENT
+    );
+    std::fs::remove_file(playground_path.join("observed.txt")).unwrap();
+    std::fs::write(
+        playground_path.join("after-server-restart.txt"),
+        SERVER_RESTART_FILE_CONTENT,
+    )
+    .unwrap();
+    let server_restarted_job = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/job/add/create",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID,
+            "job_id": SERVER_RESTART_JOB_ID,
+            "expected_index_version": restarted_index.clone(),
+            "deadline_unix_ms": deadline_after(Duration::from_secs(60)),
+            "paths": [],
+            "all": true
+        }),
+    )
+    .await;
+    assert_eq!(server_restarted_job["job"]["state"], "assigned");
+    wait_for_job_succeeded(&client, restarted_public_addr, SERVER_RESTART_JOB_ID).await;
+
+    let server_restart_object_id = ObjectId::for_bytes(SERVER_RESTART_FILE_CONTENT);
+    let server_restart_object_path = object_store_root
+        .join("tenants/tenant-a/artifacts")
+        .join(ARTIFACT_ID)
+        .join("objects")
+        .join(server_restart_object_id.to_hex());
+    assert_eq!(
+        std::fs::read(server_restart_object_path).unwrap(),
+        SERVER_RESTART_FILE_CONTENT
+    );
+    let server_restarted_playground = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/query",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID
+        }),
+    )
+    .await;
+    let server_restarted_index = &server_restarted_playground["playground"]["index_version"];
+    assert_eq!(server_restarted_index["revision"], "3");
+    assert_ne!(server_restarted_index["digest"], restarted_index["digest"]);
+    assert!(!token_path.exists());
+
+    stop_agent(server_restart_shutdown, server_restart_task).await;
+    restarted_public_server.shutdown().await.unwrap();
+    restarted_state.close().await;
 }
 
 /// Manual acceptance test that preserves both Agents' state for inspection.
@@ -457,9 +735,31 @@ fn spawn_agent(
     (shutdown_sender, task)
 }
 
+fn spawn_full_agent(
+    config: AgentConfig,
+    probe: ReadyProbe,
+) -> (oneshot::Sender<()>, JoinHandle<AgentDaemonResult<()>>) {
+    let enrollment_client = ReqwestEnrollmentClient::new(config.central_endpoint.clone()).unwrap();
+    let session_client = ReqwestAgentSessionClient::new(config.central_endpoint.clone()).unwrap();
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        run_with_transports(
+            config,
+            enrollment_client,
+            session_client,
+            probe,
+            async move {
+                let _ = shutdown_receiver.await;
+            },
+        )
+        .await
+    });
+    (shutdown_sender, task)
+}
+
 async fn stop_agent(shutdown: oneshot::Sender<()>, task: JoinHandle<AgentDaemonResult<()>>) {
-    shutdown.send(()).unwrap();
-    timeout(Duration::from_secs(5), task)
+    let _ = shutdown.send(());
+    timeout(Duration::from_secs(10), task)
         .await
         .expect("Agent shutdown timed out")
         .expect("Agent task panicked")
@@ -492,6 +792,58 @@ async fn wait_for_pending_enrollment(
     })
     .await
     .expect("Agent bootstrap did not become pending")
+}
+
+async fn wait_for_volume_ready(
+    client: &Client,
+    public_addr: std::net::SocketAddr,
+    volume_id: &str,
+) {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let response = post_public(
+                client,
+                public_addr,
+                "/api/storage/volume/query",
+                &json!({"tenant_id": "tenant-a", "storage_volume_id": volume_id}),
+            )
+            .await;
+            if response["storage_volume"]["state"] == "ready" {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("Agent heartbeat did not make its Volume Ready");
+}
+
+async fn wait_for_job_succeeded(
+    client: &Client,
+    public_addr: std::net::SocketAddr,
+    job_id: &str,
+) -> Value {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let response = post_public(
+                client,
+                public_addr,
+                "/api/job/query",
+                &json!({"tenant_id": "tenant-a", "job_id": job_id}),
+            )
+            .await;
+            match response["job"]["state"].as_str() {
+                Some("succeeded") => return response["job"].clone(),
+                Some(
+                    state @ ("conflicted" | "rejected" | "failed" | "cancelled" | "timed_out"
+                    | "recovery_required"),
+                ) => panic!("Agent Job entered terminal state {state}: {response}"),
+                _ => sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("Agent Job did not succeed")
 }
 
 async fn wait_for_active_phase(state_dir: &Path, expected: &str) {
@@ -567,6 +919,16 @@ fn descriptor_digest(intent: &Value) -> ContentDigest {
         }
     });
     ContentDigest::hash(serde_json_canonicalizer::to_vec(&material).unwrap())
+}
+
+fn deadline_after(duration: Duration) -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock predates the Unix epoch")
+        .checked_add(duration)
+        .expect("deadline overflows system duration")
+        .as_millis()
+        .to_string()
 }
 
 fn agent_config(
@@ -646,6 +1008,7 @@ fn development_server_config(authority_dir: PathBuf, keyring: PathBuf) -> Server
         agent_bind: Some("127.0.0.1:0".parse().unwrap()),
         agent_enrollment_keyring_file: Some(keyring),
         authority_dir,
+        object_store_root: None,
         rbac_file: None,
         oidc_issuer: None,
         oidc_audience: None,

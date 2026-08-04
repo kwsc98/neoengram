@@ -5,7 +5,6 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ed25519_dalek::{Signer, SigningKey};
 use neoengram_core::ContentDigest;
 use neoengram_protocol::{
     AgentBootstrapAccepted, AgentBootstrapProbe, AgentBootstrapProof, AgentBootstrapRequest,
@@ -16,6 +15,7 @@ use neoengram_protocol::{
 };
 use neoengram_server::{AppState, Config};
 use reqwest::{Client, StatusCode};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
@@ -51,7 +51,7 @@ async fn public_admin_and_agent_pop_registration_survive_restart() {
         .to_owned();
     assert!(bootstrap_token.starts_with("ngenr_v1_"));
 
-    let first_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let first_key = Ed25519KeyPair::from_seed_unchecked(&[7_u8; 32]).unwrap();
     let first_bootstrap = signed_bootstrap(
         &first_key,
         "bootstrap-vision",
@@ -65,7 +65,7 @@ async fn public_admin_and_agent_pop_registration_survive_restart() {
     let tampered = post_agent_raw(
         &client,
         agent_addr,
-        "/v1/agents/bootstrap",
+        "/agent/enrollment/bootstrap",
         serde_json::to_vec(&tampered_bootstrap).unwrap(),
         "agent:tampered-test",
     )
@@ -75,7 +75,7 @@ async fn public_admin_and_agent_pop_registration_survive_restart() {
     let duplicate = post_agent_raw(
         &client,
         agent_addr,
-        "/v1/agents/bootstrap",
+        "/agent/enrollment/bootstrap",
         br#"{"bootstrap_request_id":"a","bootstrap_request_id":"b"}"#.to_vec(),
         "agent:duplicate-test",
     )
@@ -89,7 +89,7 @@ async fn public_admin_and_agent_pop_registration_survive_restart() {
     let oversized = post_agent_raw(
         &client,
         agent_addr,
-        "/v1/agents/bootstrap",
+        "/agent/enrollment/bootstrap",
         vec![b'x'; 64 * 1024 + 1],
         "agent:oversized-test",
     )
@@ -128,7 +128,7 @@ async fn public_admin_and_agent_pop_registration_survive_restart() {
     let replayed_status = post_agent_raw(
         &client,
         agent_addr,
-        "/v1/agents/bootstrap/status",
+        "/agent/enrollment/status/query",
         serde_json::to_vec(&pending_status_request).unwrap(),
         "agent:replayed-status",
     )
@@ -142,7 +142,7 @@ async fn public_admin_and_agent_pop_registration_survive_restart() {
     let stale_status = post_agent_raw(
         &client,
         agent_addr,
-        "/v1/agents/bootstrap/status",
+        "/agent/enrollment/status/query",
         serde_json::to_vec(&signed_status_at(
             &first_key,
             "bootstrap-vision",
@@ -221,7 +221,7 @@ async fn public_admin_and_agent_pop_registration_survive_restart() {
         &second_intent,
     )
     .await;
-    let second_key = SigningKey::from_bytes(&[9_u8; 32]);
+    let second_key = Ed25519KeyPair::from_seed_unchecked(&[9_u8; 32]).unwrap();
     let second_bootstrap = signed_bootstrap(
         &second_key,
         "bootstrap-archive",
@@ -400,7 +400,7 @@ fn descriptor_digest(intent: &Value) -> ContentDigest {
 }
 
 fn signed_bootstrap(
-    key: &SigningKey,
+    key: &Ed25519KeyPair,
     bootstrap_request_id: &str,
     installation_id: &str,
     bootstrap_token: &str,
@@ -408,7 +408,7 @@ fn signed_bootstrap(
     volume_descriptor_digest: ContentDigest,
 ) -> AgentBootstrapRequest {
     let public_key_spki =
-        Ed25519PublicKeySpki::from_public_key_bytes(key.verifying_key().to_bytes());
+        Ed25519PublicKeySpki::from_public_key_bytes(key.public_key().as_ref().try_into().unwrap());
     let mut request = AgentBootstrapRequest {
         bootstrap_request_id: RequestId::new(bootstrap_request_id).unwrap(),
         bootstrap_token: bootstrap_token.to_owned(),
@@ -439,12 +439,12 @@ fn signed_bootstrap(
         extensions: Extensions::new(),
     };
     let signature = key.sign(&request.signing_bytes().unwrap());
-    request.proof.signature = Ed25519Signature::from_bytes(signature.to_bytes());
+    request.proof.signature = Ed25519Signature::new(signature.as_ref().to_vec()).unwrap();
     request
 }
 
 fn signed_status(
-    key: &SigningKey,
+    key: &Ed25519KeyPair,
     bootstrap_request_id: &str,
     installation_id: &str,
 ) -> AgentBootstrapStatusRequest {
@@ -452,13 +452,13 @@ fn signed_status(
 }
 
 fn signed_status_at(
-    key: &SigningKey,
+    key: &Ed25519KeyPair,
     bootstrap_request_id: &str,
     installation_id: &str,
     signed_at_unix_ms: UnixMillis,
 ) -> AgentBootstrapStatusRequest {
     let public_key_spki =
-        Ed25519PublicKeySpki::from_public_key_bytes(key.verifying_key().to_bytes());
+        Ed25519PublicKeySpki::from_public_key_bytes(key.public_key().as_ref().try_into().unwrap());
     let mut request = AgentBootstrapStatusRequest {
         protocol_version: PROTOCOL_VERSION_V1,
         tenant_id: TenantId::new("tenant-a").unwrap(),
@@ -469,7 +469,7 @@ fn signed_status_at(
         extensions: Extensions::new(),
     };
     let signature = key.sign(&request.signing_bytes().unwrap());
-    request.proof.signature = Ed25519Signature::from_bytes(signature.to_bytes());
+    request.proof.signature = Ed25519Signature::new(signature.as_ref().to_vec()).unwrap();
     request
 }
 
@@ -488,7 +488,7 @@ async fn post_agent_bootstrap(
     request: &AgentBootstrapRequest,
 ) -> AgentBootstrapAccepted {
     let response = client
-        .post(format!("http://{address}/v1/agents/bootstrap"))
+        .post(format!("http://{address}/agent/enrollment/bootstrap"))
         .header("x-request-id", "agent:bootstrap-test")
         .json(request)
         .send()
@@ -513,7 +513,7 @@ async fn post_agent_status(
     request: AgentBootstrapStatusRequest,
 ) -> AgentBootstrapStatusResponse {
     let response = client
-        .post(format!("http://{address}/v1/agents/bootstrap/status"))
+        .post(format!("http://{address}/agent/enrollment/status/query"))
         .header("x-request-id", "agent:status-test")
         .json(&request)
         .send()
@@ -654,6 +654,7 @@ fn development_config(authority_dir: PathBuf, keyring: PathBuf) -> Config {
         agent_bind: Some("127.0.0.1:0".parse().unwrap()),
         agent_enrollment_keyring_file: Some(keyring),
         authority_dir,
+        object_store_root: None,
         rbac_file: None,
         oidc_issuer: None,
         oidc_audience: None,
