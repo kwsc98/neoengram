@@ -109,6 +109,28 @@ async fn sqlite_registry_rejects_schema_drift_on_reopen() {
 }
 
 #[tokio::test]
+async fn sqlite_v5_to_v6_rejects_partially_present_snapshot_schema() {
+    let directory = TempDir::new().unwrap();
+    drop(
+        open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+            .await
+            .unwrap(),
+    );
+    execute_registry_raw(
+        directory.path(),
+        "DROP INDEX snapshot_catalog_keyset;
+         PRAGMA user_version = 5;",
+    )
+    .await;
+
+    let error = open_sqlite_agent_registry(SqliteAgentRegistryConfig::new(directory.path()))
+        .await
+        .err()
+        .expect("v5 to v6 migration must reject a partially present Snapshot catalog schema");
+    assert_eq!(error.code(), CentralErrorCode::StorageFailure);
+}
+
+#[tokio::test]
 async fn sqlite_registry_rejects_orphan_status_watermark_on_reopen() {
     let directory = TempDir::new().unwrap();
     drop(

@@ -16,6 +16,7 @@ mod mapper;
 mod memory;
 mod model;
 mod ports;
+mod precommit;
 mod registry_memory;
 mod validation;
 
@@ -35,15 +36,25 @@ pub use mapper::sqlite::authority::{
 pub use memory::{
     AllowAllAuthorizer, DenyAllAuthorizer, InMemoryAssignmentOutbox, InMemoryAuditSink,
     InMemoryClock, InMemoryComponents, InMemoryIndexPublisher, InMemoryJobRepository,
-    InMemoryMetadataBatchStager, InMemoryObjectCatalog,
+    InMemoryMetadataBatchStager, InMemoryObjectCatalog, InMemoryPreCommitRepository,
 };
 pub use model::*;
 pub use ports::*;
+pub use precommit::*;
 pub use registry_memory::InMemoryAgentRegistry;
 
 fn mapper_recovery_predicate(job: &JobRecord, now: neoengram_protocol::UnixMillis) -> bool {
     use neoengram_protocol::JobState;
 
+    if matches!(
+        job.operation,
+        JobOperation::WorkspaceMaterialize | JobOperation::SnapshotMount
+    ) {
+        return matches!(
+            job.state,
+            JobState::Queued | JobState::Assigned | JobState::Accepted | JobState::Running
+        );
+    }
     matches!(
         job.state,
         JobState::Queued | JobState::Prepared | JobState::Publishing

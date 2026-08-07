@@ -2,7 +2,10 @@ use std::{str::FromStr, sync::Arc};
 
 use neoengram_core::{ContentDigest, LogicalPath};
 use neoengram_protocol::{JobFailureStage, JobState, PublishDecision, WireIndexVersion};
-use neoengramd::{ControlPlane, JobRecord};
+use neoengramd::{
+    AuthorityStore, CentralError, CentralErrorCode, CentralResult, ControlCatalogRepository,
+    ControlPlane, IndexPublisher, JobRecord, JobRepository, PreCommitRepository,
+};
 
 use crate::{
     dto::{
@@ -10,9 +13,9 @@ use crate::{
         IndexVersionBody, JobErrorView, JobView, PublicJobDecision, PublicJobFailure,
         PublicJobProgress, QueryJobRequest, QueryJobResponse,
     },
-    error::{invalid_request, map_central_error},
+    error::{application_error, invalid_request, map_central_error},
     identity::AuthenticatedIdentity,
-    service::JobCoordinator,
+    service::{coordinator::validate_job_spec, JobCoordinator},
 };
 
 const RESERVED_ADD_EXTENSIONS: &[&str] = &["actor", "principal", "request_digest"];
@@ -65,16 +68,33 @@ const JOB_VIEW_BLOCKED_EXTENSIONS: &[&str] = &[
 /// Managed Add application service that maps public DTOs to the control plane.
 pub struct JobService {
     control: Arc<ControlPlane>,
+    jobs: Arc<dyn JobRepository>,
+    catalog: Arc<dyn ControlCatalogRepository>,
+    indexes: Arc<dyn IndexPublisher>,
+    precommits: Option<Arc<dyn PreCommitRepository>>,
     coordinator: Option<Arc<JobCoordinator>>,
 }
 
 impl JobService {
-    /// Creates the service from explicit domain and authorization ports.
-    pub fn new(control: Arc<ControlPlane>) -> Self {
-        Self {
+    /// Creates a service whose public create path always validates authority scope.
+    pub fn from_authority(
+        control: Arc<ControlPlane>,
+        authority: &AuthorityStore,
+    ) -> CentralResult<Self> {
+        let catalog = authority.control_catalog().ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::InvalidState,
+                "AuthorityStore has no control catalog composition",
+            )
+        })?;
+        Ok(Self {
             control,
+            jobs: authority.jobs(),
+            catalog,
+            indexes: authority.publisher(),
+            precommits: authority.precommits(),
             coordinator: None,
-        }
+        })
     }
 
     #[must_use]
@@ -90,12 +110,50 @@ impl JobService {
         request: CreateAddJobRequest,
     ) -> Result<CreateAddJobResponse, fusen_rs::Error> {
         let spec = build_add_job_spec(request, identity.principal())?;
-        if let Some(coordinator) = &self.coordinator {
-            coordinator
-                .validate_spec(&spec)
-                .await
-                .map_err(map_central_error)?;
+        self.control
+            .preauthorize_create_add_job(identity.principal(), &spec)
+            .await
+            .map_err(map_central_error)?;
+        if self
+            .jobs
+            .get(&neoengramd::JobKey::new(
+                spec.tenant_id.clone(),
+                spec.job_id.clone(),
+            ))
+            .await
+            .map_err(map_central_error)?
+            .is_none()
+        {
+            if let Some(precommits) = &self.precommits {
+                if precommits
+                    .get_active(
+                        &spec.tenant_id,
+                        &spec.project_id,
+                        &spec.artifact_id,
+                        &spec.playground_id,
+                    )
+                    .await
+                    .map_err(map_central_error)?
+                    .is_some()
+                {
+                    return Err(application_error(
+                        fusen_rs::ErrorCategory::Conflict,
+                        "precommit_already_active",
+                        "PRECOMMIT_ALREADY_ACTIVE",
+                        "the Playground has an active Pre-commit",
+                        false,
+                    ));
+                }
+            }
         }
+        validate_job_spec(
+            self.jobs.as_ref(),
+            self.catalog.as_ref(),
+            self.indexes.as_ref(),
+            &spec,
+        )
+        .await
+        .map_err(map_central_error)?;
         let result = self
             .control
             .create_add_job(neoengramd::CreateAddJobRequest {

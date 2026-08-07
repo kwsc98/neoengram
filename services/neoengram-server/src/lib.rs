@@ -17,12 +17,13 @@ pub use agent_transport::{
     RegistryAgentEnrollmentHandler, RunningAgentServer,
 };
 pub use controller::{
-    JobApi, JobApiClient, JobApiServer, JobController, PlaygroundApi, PlaygroundApiClient,
-    PlaygroundApiServer, PlaygroundController, StorageEnrollmentApi, StorageEnrollmentApiClient,
-    StorageEnrollmentApiServer, StorageEnrollmentController, StorageVolumeApi,
-    StorageVolumeApiClient, StorageVolumeApiServer, StorageVolumeController, SystemApi,
-    SystemApiClient, SystemApiServer, SystemController, TenantApi, TenantApiClient,
-    TenantApiServer, TenantController,
+    ArtifactApi, ArtifactApiClient, ArtifactApiServer, ArtifactController, JobApi, JobApiClient,
+    JobApiServer, JobController, PlaygroundApi, PlaygroundApiClient, PlaygroundApiServer,
+    PlaygroundController, SnapshotApi, SnapshotApiClient, SnapshotApiServer, SnapshotController,
+    StorageEnrollmentApi, StorageEnrollmentApiClient, StorageEnrollmentApiServer,
+    StorageEnrollmentController, StorageVolumeApi, StorageVolumeApiClient, StorageVolumeApiServer,
+    StorageVolumeController, SystemApi, SystemApiClient, SystemApiServer, SystemController,
+    TenantApi, TenantApiClient, TenantApiServer, TenantController,
 };
 pub use error::NeoEngramProblemEncoder;
 pub use identity::{
@@ -32,4 +33,5 @@ pub use runtime::{run, AppState, Config, RuntimeError};
 pub use service::{
     AgentDataPlaneService, CatalogService, CoordinatorRun, EnrollmentKeyring, EnrollmentService,
     HealthService, JobCoordinator, JobService, ReadinessProbe, SystemService,
+    WorkspaceCommitResult, WorkspaceCommitService,
 };

@@ -17,6 +17,26 @@ use crate::{
 
 pub const METADATA_SCHEMA_VERSION_V1: u16 = 1;
 
+/// Object identity and byte length without a physical storage path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WireObjectSpec {
+    #[schemars(
+        with = "String",
+        length(equal = 64),
+        regex(pattern = CONTENT_DIGEST_PATTERN)
+    )]
+    pub object_id: ObjectId,
+    pub size: DecimalU64,
+    #[serde(default, flatten)]
+    pub extensions: Extensions,
+}
+
+impl WireObjectSpec {
+    pub fn validate(&self) -> ProtocolResult<()> {
+        validate_extension_keys(&self.extensions, &["object_id", "size"])
+    }
+}
+
 /// An IndexVersion adapted to the wire's decimal-string integer rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WireIndexVersion {

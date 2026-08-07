@@ -1,9 +1,6 @@
 use schemars::{schema_for, Schema};
 
-use crate::{
-    AgentApiSchema, AgentEnrollmentEnvelope, ControlEnvelope, MetadataProtocolSchema,
-    S3ProtocolSchema,
-};
+use crate::{AgentApiSchema, AgentEnrollmentEnvelope, ControlEnvelope, MetadataProtocolSchema};
 
 /// Restricts a field in a version-specific schema without narrowing the reusable wire scalar.
 pub(crate) fn require_protocol_v1(schema: &mut Schema) {
@@ -32,10 +29,4 @@ pub fn enrollment_schema() -> Schema {
 #[must_use]
 pub fn metadata_schema() -> Schema {
     schema_for!(MetadataProtocolSchema)
-}
-
-/// Generates the complete v1 S3 data-plane JSON Schema.
-#[must_use]
-pub fn s3_schema() -> Schema {
-    schema_for!(S3ProtocolSchema)
 }

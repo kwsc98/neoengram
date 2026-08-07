@@ -1,6 +1,8 @@
+use std::{fs, path::Path};
+
 use neoengram_protocol::{
-    control_schema, enrollment_schema, metadata_schema, s3_schema, DecimalU64, Generation,
-    ProtocolVersion,
+    control_schema, enrollment_schema, metadata_schema, DecimalU64, Generation, ProtocolVersion,
+    WireObjectSpec,
 };
 use serde_json::{json, Value};
 
@@ -18,10 +20,48 @@ fn committed_v1_schemas_match_the_generator() {
         include_str!("../schemas/v1/metadata-batch.schema.json"),
         metadata_schema(),
     );
-    assert_schema(
-        include_str!("../schemas/v1/s3-data-plane.schema.json"),
-        s3_schema(),
+}
+
+#[test]
+fn committed_v1_schema_catalog_does_not_publish_s3_data_plane() {
+    let schema_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("schemas/v1");
+    let mut published = fs::read_dir(schema_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    published.sort();
+
+    assert_eq!(
+        published,
+        [
+            "agent-enrollment.schema.json",
+            "control-envelope.schema.json",
+            "metadata-batch.schema.json",
+        ]
     );
+}
+
+#[test]
+fn wire_object_spec_keeps_its_neutral_serde_and_schema_contract() {
+    let value = json!({
+        "object_id": "22".repeat(32),
+        "size": "12",
+        "future_object_attribute": {"placement": "volume-local"}
+    });
+    let object: WireObjectSpec = serde_json::from_value(value.clone()).unwrap();
+    object.validate().unwrap();
+    assert_eq!(serde_json::to_value(object).unwrap(), value);
+
+    let schema = serde_json::to_value(schemars::schema_for!(WireObjectSpec)).unwrap();
+    assert_eq!(
+        schema.pointer("/properties/object_id/pattern"),
+        Some(&json!("^[0-9a-f]{64}$"))
+    );
+    assert_eq!(
+        schema.pointer("/properties/size/$ref"),
+        Some(&json!("#/$defs/DecimalU64"))
+    );
+    assert_eq!(schema.pointer("/additionalProperties"), Some(&json!(true)));
 }
 
 #[test]
@@ -37,6 +77,10 @@ fn schemas_publish_the_runtime_wire_limits() {
     );
     assert_eq!(
         control.pointer("/$defs/AddAssignment/properties/request_digest/pattern"),
+        Some(&json!("^[0-9a-f]{64}$"))
+    );
+    assert_eq!(
+        control.pointer("/$defs/WorkspaceMaterializeAssignment/properties/request_digest/pattern"),
         Some(&json!("^[0-9a-f]{64}$"))
     );
     assert_eq!(
@@ -134,28 +178,6 @@ fn schemas_publish_the_runtime_wire_limits() {
     );
     assert_eq!(
         metadata.pointer("/$defs/MetadataBatchPage/properties/page_digest/pattern"),
-        Some(&json!("^[0-9a-f]{64}$"))
-    );
-
-    let s3 = serde_json::to_value(s3_schema()).unwrap();
-    assert_eq!(
-        s3.pointer("/anyOf/0/$ref"),
-        Some(&json!("#/$defs/MissingObjectsRequest"))
-    );
-    assert_eq!(
-        s3.pointer("/anyOf/4/$ref"),
-        Some(&json!("#/$defs/ObjectDurabilityReceipt"))
-    );
-    assert_eq!(
-        s3.pointer("/$defs/MissingObjectsRequest/properties/objects/maxItems"),
-        Some(&json!(4096))
-    );
-    assert_eq!(
-        s3.pointer("/$defs/S3ObjectTicket/properties/required_headers/maxProperties"),
-        Some(&json!(64))
-    );
-    assert_eq!(
-        s3.pointer("/$defs/WireObjectSpec/properties/object_id/pattern"),
         Some(&json!("^[0-9a-f]{64}$"))
     );
 }

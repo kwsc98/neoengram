@@ -3,7 +3,7 @@ jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: NeoEngram Agent API
   version: 0.0.1
-  summary: Agent-initiated action API for enrollment, sessions, Jobs, metadata, and objects
+  summary: Agent-initiated action API for enrollment, sessions, Jobs, Index and Manifest pages, and metadata
   description: |
     Contract for the independent Agent listener. Every operation is an action-style POST and all
     resource identities are carried in the JSON body. This API is not exposed by the public Web
@@ -23,9 +23,9 @@ tags:
   - name: Enrollment
     description: One-time enrollment bootstrap and signed approval-status query operations
   - name: Session
-    description: Signed session lifecycle, heartbeat, and short-poll message operations
+    description: Signed HTTP/2 control channel, session lifecycle, and compatibility recovery operations
   - name: Job
-    description: Signed Job report, metadata, Index, and immutable object operations
+    description: Signed Job report, metadata, and authoritative Index and Manifest operations; object bytes stay on the Volume
 x-neoengram-body-security-schemes:
   BootstrapTokenAndEd25519:
     description: >-
@@ -38,6 +38,12 @@ x-neoengram-body-security-schemes:
       An approved Agent Ed25519 proof is required in the JSON body and binds POST, canonical path,
       Agent, installation, boot and optional session identities, request ID, timestamp, and the
       BLAKE3 digest of the unsigned RFC 8785 canonical JSON body.
+  ApprovedAgentEd25519PerFrame:
+    description: >-
+      Every upstream NDJSON frame carries an independent approved-Agent Ed25519 proof. The proof
+      binds POST, /agent/session/channel/open, Agent, installation, boot and optional session
+      identities, request ID, timestamp, sequence, message ID, correlation, frame type, and the
+      complete frame payload through the BLAKE3 digest of the unsigned RFC 8785 canonical JSON body.
 paths:
   /agent/enrollment/bootstrap:
     post:
@@ -111,6 +117,51 @@ paths:
                 $ref: '#/components/schemas/AgentSessionOpenResponse'
         default:
           $ref: '#/components/responses/Problem'
+  /agent/session/channel/open:
+    post:
+      operationId: openAgentSessionChannel
+      tags: [Session]
+      summary: Open an HTTP/2 Agent session channel
+      description: >-
+        Opens one Agent-initiated HTTP/2 full-duplex control channel. Both directions carry
+        LF-delimited JSON frames; HTTP/2 DATA frame boundaries have no application meaning. The
+        first upstream frame must be a signed channel.open and the first downstream frame is its
+        correlated channel.opened response. Later upstream frames remain independently signed and
+        session-fenced; assignments and decisions are delivered on the downstream stream.
+      security: []
+      x-neoengram-body-security: ApprovedAgentEd25519PerFrame
+      x-neoengram-http2-duplex:
+        transport: http2-full-duplex
+        primaryControlTransport: true
+        mediaType: application/x-ndjson
+        h2DataFrameBoundaries: ignored
+        frameDelimiter: LF
+        maxFrameBytes: 1048576
+        delimiterExcludedFromFrameBytes: true
+        finalFrameRequiresDelimiter: true
+        firstUpstreamFrameType: channel.open
+        firstDownstreamFrameType: channel.opened
+        upstreamAuthentication: body-carried-ed25519-proof-per-frame
+      requestBody:
+        required: true
+        description: >-
+          Streaming request body containing AgentChannelUpstreamFrame records. One logical record is
+          one JSON object followed by LF; the schema describes each record, not an H2 DATA frame.
+        content:
+          application/x-ndjson:
+            schema:
+              $ref: '#/components/schemas/AgentChannelUpstreamFrame'
+      responses:
+        '200':
+          description: >-
+            Streaming response body containing AgentChannelDownstreamFrame records until either side
+            closes the channel or a terminal transport/protocol error occurs.
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/AgentChannelDownstreamFrame'
+        default:
+          $ref: '#/components/responses/Problem'
   /agent/session/heartbeat/report:
     post:
       operationId: reportAgentSessionHeartbeat
@@ -136,12 +187,15 @@ paths:
     post:
       operationId: queryAgentSessionMessages
       tags: [Session]
-      summary: Query deliverable session messages
+      summary: Recover deliverable session messages through the compatibility action
       description: >-
-        Short-polls up to 32 assignments or decisions for the fenced session; an empty result asks
-        the Agent to retry after 1000 milliseconds.
+        Compatibility and manual-recovery action only; the primary Agent runtime receives
+        assignments and decisions through the HTTP/2 full-duplex channel. When explicitly invoked,
+        this action short-polls up to 32 messages for the fenced session and an empty result asks the
+        caller to retry after 1000 milliseconds.
       security: []
       x-neoengram-body-security: ApprovedAgentEd25519
+      x-neoengram-compatibility-only: true
       requestBody:
         $ref: '#/components/requestBodies/MessageListQuery'
       responses:
@@ -225,46 +279,26 @@ paths:
                 $ref: '#/components/schemas/AgentIndexPageQueryResponse'
         default:
           $ref: '#/components/responses/Problem'
-  /agent/job/object/missing/query:
+  /agent/job/manifest/page/query:
     post:
-      operationId: queryAgentJobMissingObjects
+      operationId: queryAgentJobManifestPage
       tags: [Job]
-      summary: Query missing immutable objects
+      summary: Query an authoritative Job Manifest page
       description: >-
-        Partitions the Assignment-scoped object specifications into missing and already-durable sets
-        without granting list access to the Tenant object namespace.
+        Returns one immutable page of Manifest chunk references authorized by the Assignment after
+        validating Agent, Job, Artifact, Manifest, and Tenant scope. The response contains metadata
+        only; immutable object payload bytes remain on the user Volume.
       security: []
       x-neoengram-body-security: ApprovedAgentEd25519
       requestBody:
-        $ref: '#/components/requestBodies/ObjectMissingQuery'
+        $ref: '#/components/requestBodies/ManifestPageQuery'
       responses:
         '200':
-          description: Exact partition of requested objects by durability.
+          description: One immutable page of the requested Manifest.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/AgentObjectMissingQueryResponse'
-        default:
-          $ref: '#/components/responses/Problem'
-  /agent/job/object/upload:
-    post:
-      operationId: uploadAgentJobObject
-      tags: [Job]
-      summary: Upload an immutable Job object
-      description: >-
-        Accepts at most 4 MiB of base64-encoded object content, verifies its declared size and BLAKE3
-        identity, and atomically publishes it into the Assignment-scoped central object store.
-      security: []
-      x-neoengram-body-security: ApprovedAgentEd25519
-      requestBody:
-        $ref: '#/components/requestBodies/ObjectUpload'
-      responses:
-        '200':
-          description: Content-verified central durability receipt.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AgentObjectUploadResponse'
+                $ref: '#/components/schemas/AgentManifestPageQueryResponse'
         default:
           $ref: '#/components/responses/Problem'
   /agent/session/close:
@@ -367,7 +401,7 @@ components:
                 properties:
                   payload:
                     $ref: '#/components/schemas/AgentIndexPageQueryPayload'
-    ObjectMissingQuery:
+    ManifestPageQuery:
       required: true
       content:
         application/json:
@@ -377,18 +411,7 @@ components:
               - type: object
                 properties:
                   payload:
-                    $ref: '#/components/schemas/AgentObjectMissingQueryPayload'
-    ObjectUpload:
-      required: true
-      content:
-        application/json:
-          schema:
-            allOf:
-              - $ref: '#/components/schemas/EstablishedSessionRequest'
-              - type: object
-                properties:
-                  payload:
-                    $ref: '#/components/schemas/AgentObjectUploadPayload'
+                    $ref: '#/components/schemas/AgentManifestPageQueryPayload'
     SessionClose:
       required: true
       content:
@@ -426,11 +449,9 @@ components:
       maxLength: 128
       pattern: '^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$'
     DecimalU64:
-      type: string
-      pattern: '^(0|[1-9][0-9]{0,19})$'
+      $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/DecimalU64'
     PositiveDecimalU64:
-      type: string
-      pattern: '^[1-9][0-9]{0,19}$'
+      $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/SessionGeneration'
     Digest:
       type: string
       pattern: '^[0-9a-f]{64}$'
@@ -443,9 +464,9 @@ components:
         algorithm:
           const: ed25519
         public_key_spki:
-          type: string
+          $ref: '../../crates/neoengram-protocol/schemas/v1/agent-enrollment.schema.json#/$defs/Ed25519PublicKeySpki'
         signature:
-          type: string
+          $ref: '../../crates/neoengram-protocol/schemas/v1/agent-enrollment.schema.json#/$defs/Ed25519Signature'
     SignedAgentRequest:
       type: object
       required:
@@ -484,6 +505,217 @@ components:
               $ref: '#/components/schemas/Id'
             session_generation:
               $ref: '#/components/schemas/PositiveDecimalU64'
+    AgentChannelUpstreamFrame:
+      description: One independently signed Agent-to-Server JSON record, limited to 1048576 encoded bytes before its mandatory LF delimiter.
+      oneOf:
+        - $ref: '#/components/schemas/AgentChannelOpenFrame'
+        - $ref: '#/components/schemas/AgentChannelHeartbeatFrame'
+        - $ref: '#/components/schemas/AgentChannelReportFrame'
+        - $ref: '#/components/schemas/AgentChannelCloseFrame'
+    AgentChannelUpstreamPayloadBase:
+      type: object
+      required: [sequence, message_id, type, payload]
+      properties:
+        sequence:
+          $ref: '#/components/schemas/PositiveDecimalU64'
+        message_id:
+          $ref: '#/components/schemas/Id'
+        correlation_id:
+          $ref: '#/components/schemas/Id'
+        type:
+          type: string
+        payload:
+          type: object
+    AgentChannelOpenFrame:
+      allOf:
+        - $ref: '#/components/schemas/SignedAgentRequest'
+        - type: object
+          required: [payload]
+          properties:
+            session_id: false
+            session_generation: false
+            payload:
+              allOf:
+                - $ref: '#/components/schemas/AgentChannelUpstreamPayloadBase'
+                - type: object
+                  properties:
+                    correlation_id: false
+                    sequence:
+                      const: '1'
+                    type:
+                      const: channel.open
+                    payload:
+                      $ref: '#/components/schemas/AgentSessionOpenPayload'
+    AgentChannelHeartbeatFrame:
+      allOf:
+        - $ref: '#/components/schemas/EstablishedSessionRequest'
+        - type: object
+          required: [payload]
+          properties:
+            payload:
+              allOf:
+                - $ref: '#/components/schemas/AgentChannelUpstreamPayloadBase'
+                - type: object
+                  properties:
+                    type:
+                      const: session.heartbeat
+                    payload:
+                      $ref: '#/components/schemas/AgentHeartbeatReportPayload'
+    AgentChannelReportFrame:
+      allOf:
+        - $ref: '#/components/schemas/EstablishedSessionRequest'
+        - type: object
+          required: [payload]
+          properties:
+            payload:
+              allOf:
+                - $ref: '#/components/schemas/AgentChannelUpstreamPayloadBase'
+                - type: object
+                  properties:
+                    type:
+                      const: job.report
+                    payload:
+                      $ref: '#/components/schemas/AgentJobReportCreatePayload'
+    AgentChannelCloseFrame:
+      allOf:
+        - $ref: '#/components/schemas/EstablishedSessionRequest'
+        - type: object
+          required: [payload]
+          properties:
+            payload:
+              allOf:
+                - $ref: '#/components/schemas/AgentChannelUpstreamPayloadBase'
+                - type: object
+                  properties:
+                    type:
+                      const: channel.close
+                    payload:
+                      $ref: '#/components/schemas/AgentSessionClosePayload'
+    AgentChannelDownstreamFrame:
+      description: One Server-to-Agent JSON record, limited to 1048576 encoded bytes before its mandatory LF delimiter.
+      oneOf:
+        - $ref: '#/components/schemas/AgentChannelOpenedFrame'
+        - $ref: '#/components/schemas/AgentChannelAssignmentFrame'
+        - $ref: '#/components/schemas/AgentChannelDecisionFrame'
+        - $ref: '#/components/schemas/AgentChannelAckFrame'
+        - $ref: '#/components/schemas/AgentChannelErrorFrame'
+      discriminator:
+        propertyName: type
+        mapping:
+          channel.opened: '#/components/schemas/AgentChannelOpenedFrame'
+          job.assignment: '#/components/schemas/AgentChannelAssignmentFrame'
+          job.decision: '#/components/schemas/AgentChannelDecisionFrame'
+          channel.ack: '#/components/schemas/AgentChannelAckFrame'
+          protocol.error: '#/components/schemas/AgentChannelErrorFrame'
+    AgentChannelDownstreamBase:
+      type: object
+      required:
+        - protocol_version
+        - sequence
+        - message_id
+        - session_generation
+        - sent_at_unix_ms
+        - type
+        - payload
+      properties:
+        protocol_version:
+          const: 1
+        sequence:
+          $ref: '#/components/schemas/PositiveDecimalU64'
+        message_id:
+          $ref: '#/components/schemas/Id'
+        correlation_id:
+          $ref: '#/components/schemas/Id'
+        session_generation:
+          $ref: '#/components/schemas/PositiveDecimalU64'
+        sent_at_unix_ms:
+          $ref: '#/components/schemas/DecimalU64'
+        type:
+          type: string
+        payload:
+          type: object
+    AgentChannelOpenedFrame:
+      allOf:
+        - $ref: '#/components/schemas/AgentChannelDownstreamBase'
+        - type: object
+          required: [correlation_id]
+          properties:
+            sequence:
+              const: '1'
+            type:
+              const: channel.opened
+            payload:
+              $ref: '#/components/schemas/AgentSessionOpenResponse'
+    AgentChannelAssignmentFrame:
+      allOf:
+        - $ref: '#/components/schemas/AgentChannelDownstreamBase'
+        - type: object
+          properties:
+            correlation_id: false
+            type:
+              const: job.assignment
+            payload:
+              $ref: '#/components/schemas/AgentChannelJobAssignment'
+    AgentChannelDecisionFrame:
+      allOf:
+        - $ref: '#/components/schemas/AgentChannelDownstreamBase'
+        - type: object
+          properties:
+            correlation_id: false
+            type:
+              const: job.decision
+            payload:
+              $ref: '#/components/schemas/AgentChannelJobDecision'
+    AgentChannelAckFrame:
+      allOf:
+        - $ref: '#/components/schemas/AgentChannelDownstreamBase'
+        - type: object
+          required: [correlation_id]
+          properties:
+            type:
+              const: channel.ack
+            payload:
+              $ref: '#/components/schemas/AgentChannelAck'
+    AgentChannelErrorFrame:
+      allOf:
+        - $ref: '#/components/schemas/AgentChannelDownstreamBase'
+        - type: object
+          properties:
+            type:
+              const: protocol.error
+            payload:
+              $ref: '#/components/schemas/AgentChannelControlError'
+    AgentChannelAck:
+      type: object
+      required: [acknowledged_sequence, resource_version, replayed]
+      properties:
+        acknowledged_sequence:
+          $ref: '#/components/schemas/PositiveDecimalU64'
+        resource_version:
+          $ref: '#/components/schemas/DecimalU64'
+        replayed:
+          type: boolean
+    AgentChannelJobAssignment:
+      $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/JobAssignment'
+    AgentChannelJobDecision:
+      $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/JobDecision'
+    AgentChannelControlError:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 96
+          pattern: '^[A-Z][A-Z0-9_]{0,95}$'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        retryable:
+          type: boolean
+        retry_after_ms:
+          $ref: '#/components/schemas/DecimalU64'
     AgentSessionOpenPayload:
       type: object
       required: [mount_identity_digest, expected_resource_version]
@@ -511,8 +743,10 @@ components:
       type: object
       required: [heartbeat, mount_report]
       properties:
-        heartbeat: { type: object, additionalProperties: true }
-        mount_report: { type: object, additionalProperties: true }
+        heartbeat:
+          $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/AgentHeartbeat'
+        mount_report:
+          $ref: '../../crates/neoengram-protocol/schemas/v1/agent-enrollment.schema.json#/$defs/AgentMountStatusReport'
     AgentHeartbeatReportResponse:
       type: object
       required: [protocol_version, request_id, resource_version, received_at_unix_ms, replayed]
@@ -543,7 +777,8 @@ components:
       required: [tenant_id, report]
       properties:
         tenant_id: { $ref: '#/components/schemas/Id' }
-        report: { type: object, additionalProperties: true }
+        report:
+          $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json'
     AgentMetadataBatchStagePayload:
       type: object
       required: [tenant_id, job_id, descriptor]
@@ -560,12 +795,16 @@ components:
         page: { type: object, additionalProperties: true }
     AgentIndexPageQueryPayload:
       type: object
-      required: [tenant_id, job_id, artifact_id, playground_id, index_version, page_number, max_records]
+      required: [tenant_id, job_id, artifact_id, index_version, page_number, max_records]
+      oneOf:
+        - required: [playground_id]
+        - required: [snapshot_id]
       properties:
         tenant_id: { $ref: '#/components/schemas/Id' }
         job_id: { $ref: '#/components/schemas/Id' }
         artifact_id: { $ref: '#/components/schemas/Id' }
         playground_id: { $ref: '#/components/schemas/Id' }
+        snapshot_id: { $ref: '#/components/schemas/Id' }
         index_version: { type: object, additionalProperties: true }
         page_number: { type: integer, minimum: 0 }
         max_records: { type: integer, minimum: 1, maximum: 4096 }
@@ -579,47 +818,32 @@ components:
         page_number: { type: integer, minimum: 0 }
         page_count: { type: integer, minimum: 0 }
         records: { type: array, maxItems: 4096, items: { type: object } }
-    WireObjectSpec:
+    WireChunkingStrategy:
+      $ref: '../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json#/$defs/WireChunkingStrategy'
+    WireChunkRef:
+      $ref: '../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json#/$defs/WireChunkRef'
+    AgentManifestPageQueryPayload:
       type: object
-      required: [object_id, size]
-      properties:
-        object_id: { $ref: '#/components/schemas/Digest' }
-        size: { $ref: '#/components/schemas/DecimalU64' }
-    AgentObjectMissingQueryPayload:
-      type: object
-      required: [tenant_id, project_id, artifact_id, job_id, objects]
+      required: [tenant_id, job_id, artifact_id, manifest_id, page_number, max_chunks]
       properties:
         tenant_id: { $ref: '#/components/schemas/Id' }
-        project_id: { $ref: '#/components/schemas/Id' }
-        artifact_id: { $ref: '#/components/schemas/Id' }
         job_id: { $ref: '#/components/schemas/Id' }
-        objects: { type: array, maxItems: 4096, items: { $ref: '#/components/schemas/WireObjectSpec' } }
-    AgentObjectMissingQueryResponse:
+        artifact_id: { $ref: '#/components/schemas/Id' }
+        manifest_id: { $ref: '#/components/schemas/Digest' }
+        page_number: { type: integer, minimum: 0 }
+        max_chunks: { type: integer, minimum: 1, maximum: 4096 }
+    AgentManifestPageQueryResponse:
       type: object
-      required: [protocol_version, request_id, missing, already_durable]
+      required: [protocol_version, request_id, manifest_id, total_size, chunking, page_number, page_count, chunks]
       properties:
         protocol_version: { const: 1 }
         request_id: { $ref: '#/components/schemas/Id' }
-        missing: { type: array, maxItems: 4096, items: { $ref: '#/components/schemas/WireObjectSpec' } }
-        already_durable: { type: array, maxItems: 4096, items: { $ref: '#/components/schemas/WireObjectSpec' } }
-    AgentObjectUploadPayload:
-      type: object
-      required: [tenant_id, project_id, artifact_id, job_id, object, content_base64]
-      properties:
-        tenant_id: { $ref: '#/components/schemas/Id' }
-        project_id: { $ref: '#/components/schemas/Id' }
-        artifact_id: { $ref: '#/components/schemas/Id' }
-        job_id: { $ref: '#/components/schemas/Id' }
-        object: { $ref: '#/components/schemas/WireObjectSpec' }
-        content_base64: { type: string, minLength: 4, maxLength: 5592408 }
-    AgentObjectUploadResponse:
-      type: object
-      required: [protocol_version, request_id, receipt, replayed]
-      properties:
-        protocol_version: { const: 1 }
-        request_id: { $ref: '#/components/schemas/Id' }
-        receipt: { type: object, additionalProperties: true }
-        replayed: { type: boolean }
+        manifest_id: { $ref: '#/components/schemas/Digest' }
+        total_size: { $ref: '#/components/schemas/DecimalU64' }
+        chunking: { $ref: '#/components/schemas/WireChunkingStrategy' }
+        page_number: { type: integer, minimum: 0 }
+        page_count: { type: integer, minimum: 1 }
+        chunks: { type: array, maxItems: 4096, items: { $ref: '#/components/schemas/WireChunkRef' } }
     AgentSessionClosePayload:
       type: object
       required: [expected_resource_version]

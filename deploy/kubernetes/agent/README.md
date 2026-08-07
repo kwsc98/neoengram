@@ -9,15 +9,21 @@ one business PVC = one StorageVolume = one resident AgentInstance
 The Agent mounts the complete business PVC at `/volume`. Signing and approved identity, bootstrap polling
 watermark, health state, session recovery state, per-Tenant Job Ledger, and durable outbound report queue
 belong on a separate RWO PVC at `/var/lib/neoengram-agent`. The central service, Web application, and Agent
-state databases must not mount the business PVC.
+state databases must not mount the business PVC. Workspaces and immutable Chunk bytes belong to the business
+PVC; the Agent stores each Chunk at
+`/volume/.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects/<object_id>`. The center stores Manifests,
+Index state, and placement evidence, but never receives or persists Chunk payloads.
 
-The repository contains the runnable `neoengram-agent` binary in the `neoengram-agentd` package. The
-development transport is outbound HTTP/1 JSON against the independent Agent OpenAPI: bootstrap, session
-open, heartbeat, message polling, Job reports, MetadataBatch pages, Index pages, object negotiation/upload,
-and close are action-style POST operations under `/agent/*`. Approved Ed25519 keys authenticate each request;
-the bootstrap token never becomes a session credential. Production certificate issuance and mTLS are not
-part of this profile. The example image is only a placeholder and must be replaced with a real, digest-pinned
-build before applying these manifests.
+The repository contains the runnable `neoengram-agent` binary in the `neoengram-agentd` package. The Agent
+initiates the development control connection with the independent OpenAPI action
+`POST /agent/session/channel/open`, then keeps an HTTP/2 full-duplex NDJSON stream open so the center can
+logically invoke the Agent by pushing Assignment and Decision frames downstream. Heartbeat and Job reports
+flow upstream on the same channel. Bootstrap, MetadataBatch pages, and Index pages remain separate
+action-style POST operations under `/agent/*`; there is no center-facing missing-object or object-upload
+operation. The legacy message-list poll is compatibility and manual-recovery only. Approved Ed25519 keys
+authenticate every upstream frame or unary request, and the bootstrap token never becomes a session
+credential. Production certificate issuance, mTLS, and HTTP/3 are not part of this profile. The example image
+is only a placeholder and must be replaced with a real, digest-pinned build before applying these manifests.
 
 ## Preconditions
 
@@ -28,6 +34,9 @@ build before applying these manifests.
   is acceptable only for a same-node POC with enforced co-scheduling; it limits nodes, not application writers.
 - The business volume is a filesystem volume. For NFS, validate NFSv4.1/4.2, hard-mount, locking, rename,
   fsync, permissions, stale-handle, and failover behavior before using it for data.
+- The business PVC must have capacity and inode headroom for both Playground files and immutable Chunk data.
+  A Commit verifies and atomically publishes Chunks into `/volume/.neoengram/objects`; the state PVC is not a
+  payload cache or fallback object store.
 - UID/GID `65532:65532` can traverse and write the prepared business root. The state volume root is owned by
   `65532:65532` with mode `0700`. The template deliberately has no Pod-level `fsGroup`: the Agent verifies
   these permissions but never recursively changes an existing business PVC. Prepare ownership through the
@@ -83,8 +92,9 @@ kubectl -n <namespace> create secret generic neoengram-agent-bootstrap-<volume-s
 The token authenticates only the registration request. It must not authorize a control session, Job,
 Tenant queue, or Volume ownership. The Agent generates its Ed25519 private key and stable registration request
 ID before the first network request and persists both on the state PVC. After approval, the center binds the
-approved Agent identity and the Agent persists that identity on the state PVC. Session requests are signed by
-that approved key; no bearer credential is derived from the bootstrap token.
+approved Agent identity and the Agent persists that identity on the state PVC. Channel frames and unary
+session-scoped actions are signed by that approved key; no bearer credential is derived from the bootstrap
+token.
 
 ## Apply And Approve
 
@@ -101,8 +111,9 @@ Kubernetes API, expose a Service/Ingress, or depend on an Operator. No Service, 
 RoleBinding belongs in this profile.
 
 Cluster operators should additionally apply their namespace default-deny policy and an egress allowlist for
-DNS, the configured center, approved object endpoints, and the business storage service. Those addresses are
-environment-specific, so this directory does not ship a permissive or nonfunctional NetworkPolicy example.
+DNS, the configured center, and the business storage service. The configured center carries control and
+metadata only, not Chunk payloads. Those addresses are environment-specific, so this directory does not ship
+a permissive or nonfunctional NetworkPolicy example.
 
 The center creates an idempotent `pending_approval` Storage enrollment, not a Ready Volume. TenantAdmin
 reviews only the public Volume/PVC scope, Agent version, public-key identity summary, and sanitized probe
@@ -122,6 +133,12 @@ deployment workflow; removing the PVC from this template does not create a valid
 - Keep `replicas: 1`, `strategy.type: Recreate`, and no HPA. Never use a DaemonSet for this profile.
 - Mount the whole business PVC at `/volume`; do not use `subPath` for the Agent.
 - Never put Agent identity, SQLite, WAL/SHM, or Ledger files on `/volume`.
+- Keep immutable Chunks under
+  `/volume/.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects/<object_id>`; never redirect that
+  CAS to the Agent state PVC or a Server filesystem. The Server persists only signed placement evidence and
+  authoritative logical metadata.
+- Cross-Volume copy is a future routed Agent/Gateway data path. Chunk payloads must flow directly between
+  approved data endpoints and must not be proxied through the Server control plane.
 - Reuse the same state PVC for an ordinary Pod restart. A lost or replaced state PVC requires a new
   registration and first approval; it must not inherit an Agent ID from the business volume.
 - If a bootstrapped candidate is rejected or its review window expires, retire that installation identity

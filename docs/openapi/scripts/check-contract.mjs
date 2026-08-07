@@ -5,6 +5,11 @@ const bundleUrl = new URL(
   import.meta.url,
 );
 const document = JSON.parse(readFileSync(bundleUrl, "utf8"));
+const agentBundleUrl = new URL(
+  "../../../target/openapi/neoengram-agent-api.json",
+  import.meta.url,
+);
+const agentDocument = JSON.parse(readFileSync(agentBundleUrl, "utf8"));
 
 function assert(condition, message) {
   if (!condition) {
@@ -27,6 +32,21 @@ function resolveRef(value) {
     .reduce((current, part) => current?.[part], document);
 }
 
+function resolveAgentRef(value) {
+  if (!value?.$ref) {
+    return value;
+  }
+  assert(
+    value.$ref.startsWith("#/"),
+    `external Agent ref remains in bundle: ${value.$ref}`,
+  );
+  return value.$ref
+    .slice(2)
+    .split("/")
+    .map((part) => part.replaceAll("~1", "/").replaceAll("~0", "~"))
+    .reduce((current, part) => current?.[part], agentDocument);
+}
+
 function sorted(values) {
   return [...values].sort();
 }
@@ -47,6 +67,17 @@ function assertDescriptionIncludes(value, fragments, message) {
     );
   }
 }
+
+assertDescriptionIncludes(
+  document.info,
+  ["HTTP/2", "application/x-ndjson", "heartbeat", "MetadataBatch"],
+  "Public API overview must describe the implemented Agent control channel",
+);
+assert(
+  !document.info.description.includes("heartbeat 尚未实现") &&
+    !document.info.description.includes("application/json-seq"),
+  "Public API overview still describes the obsolete Agent transport state",
+);
 
 const expectedOperations = {
   "/api/system/version/query": ["post", "queryApiVersion"],
@@ -651,6 +682,11 @@ assert(
   !createSnapshotRequest.properties.snapshot_id,
   "Snapshot ID must remain server-generated",
 );
+assertDescriptionIncludes(
+  createSnapshotRequest,
+  ["Commit 确属该 Artifact", "不能创建 Artifact", "切换 Commit"],
+  "Snapshot create must preserve Artifact/Commit authority",
+);
 assert(
   !createSnapshotRequest.properties.region &&
     !createSnapshotRequest.properties.purpose &&
@@ -718,6 +754,116 @@ assertSameMembers(
   ["mode", "source_project_id", "source_artifact_id", "source_commit_id"],
   "Derived Artifact lineage scope changed",
 );
+const contentDigest = document.components.schemas.ContentDigest;
+const commitId = document.components.schemas.CommitId;
+assert(
+  commitId.$ref === "#/components/schemas/ContentDigest",
+  "CommitId must alias the canonical ContentDigest schema",
+);
+for (const [schema, field] of [
+  [
+    document.components.schemas.DerivedArtifactInitialization.properties
+      .source_commit_id,
+    "DerivedArtifactInitialization.source_commit_id",
+  ],
+  [
+    document.components.schemas.ArtifactView.properties.head_commit_id,
+    "ArtifactView.head_commit_id",
+  ],
+  [
+    document.components.schemas.CommitGraphView.properties.head_commit_id,
+    "CommitGraphView.head_commit_id",
+  ],
+  [
+    document.components.schemas.CommitNode.properties.commit_id,
+    "CommitNode.commit_id",
+  ],
+  [
+    document.components.schemas.CommitNode.properties.parent_commit_id,
+    "CommitNode.parent_commit_id",
+  ],
+  [
+    document.components.schemas.QueryArtifactCommitDiffRequest.properties
+      .commit_id,
+    "QueryArtifactCommitDiffRequest.commit_id",
+  ],
+  [
+    document.components.schemas.QueryArtifactCommitDiffRequest.properties
+      .base_commit_id,
+    "QueryArtifactCommitDiffRequest.base_commit_id",
+  ],
+  [
+    document.components.schemas.CreatePlaygroundRequest.properties
+      .base_commit_id,
+    "CreatePlaygroundRequest.base_commit_id",
+  ],
+  [
+    document.components.schemas.PlaygroundView.properties.base_commit_id,
+    "PlaygroundView.base_commit_id",
+  ],
+  [
+    document.components.schemas.PlaygroundView.properties.head_commit_id,
+    "PlaygroundView.head_commit_id",
+  ],
+  [
+    document.components.schemas.PreCommitView.properties.committed_commit_id,
+    "PreCommitView.committed_commit_id",
+  ],
+  [
+    document.components.schemas.QuerySnapshotListRequest.properties.commit_id,
+    "QuerySnapshotListRequest.commit_id",
+  ],
+  [
+    document.components.schemas.CreateSnapshotRequest.properties.commit_id,
+    "CreateSnapshotRequest.commit_id",
+  ],
+  [
+    document.components.schemas.SnapshotView.properties.commit_id,
+    "SnapshotView.commit_id",
+  ],
+]) {
+  assert(
+    schema.$ref === "#/components/schemas/CommitId",
+    `${field} must use the shared CommitId schema`,
+  );
+}
+assert(
+  contentDigest.type === "string" &&
+    contentDigest.minLength === 64 &&
+    contentDigest.maxLength === 64 &&
+    contentDigest.pattern === "^[0-9a-f]{64}$",
+  "ContentDigest must remain canonical 64-character lowercase hexadecimal",
+);
+
+const commitIdentityFields = new Set([
+  "commit_id",
+  "head_commit_id",
+  "base_commit_id",
+  "parent_commit_id",
+  "source_commit_id",
+  "committed_commit_id",
+]);
+const canonicalCommitId = /^[0-9a-f]{64}$/;
+function assertCanonicalCommitExamples(value, path = "document") {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) =>
+      assertCanonicalCommitExamples(item, `${path}[${index}]`),
+    );
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const [field, child] of Object.entries(value)) {
+    const childPath = `${path}.${field}`;
+    if (commitIdentityFields.has(field) && typeof child === "string") {
+      assert(
+        canonicalCommitId.test(child),
+        `${childPath} must be a canonical CommitId example`,
+      );
+    }
+    assertCanonicalCommitExamples(child, childPath);
+  }
+}
+assertCanonicalCommitExamples(document.paths);
 
 const commitNode = document.components.schemas.CommitNode;
 assert(
@@ -834,6 +980,25 @@ for (const schemaName of ["PlaygroundView", "SnapshotView"]) {
     `${schemaName} must expose its public storage placement`,
   );
 }
+assertSameMembers(
+  document.components.schemas.PlaygroundView.required.filter((field) =>
+    ["tenant_id", "project_id", "artifact_id"].includes(field),
+  ),
+  ["tenant_id", "project_id", "artifact_id"],
+  "Playground must retain its immutable Artifact source scope",
+);
+assertSameMembers(
+  document.components.schemas.SnapshotView.required.filter((field) =>
+    ["tenant_id", "project_id", "artifact_id", "commit_id"].includes(field),
+  ),
+  ["tenant_id", "project_id", "artifact_id", "commit_id"],
+  "Snapshot must retain its immutable Artifact Commit source scope",
+);
+assertDescriptionIncludes(
+  document.components.schemas.SnapshotView,
+  ["不可变来源 scope", "不拥有或改写 Artifact 数据权威"],
+  "Snapshot view must remain derived from Artifact authority",
+);
 assert(
   !document.components.schemas.ArtifactView.properties.storage_volume_id &&
     !document.components.schemas.ArtifactView.properties.region &&
@@ -1124,8 +1289,8 @@ assert(
   "Storage enrollment decision request identity conflict code drifted",
 );
 assert(
-  storageEnrollmentConflictExamples.replacementConfirmationRequired.value.code ===
-    "STORAGE_ENROLLMENT_REPLACEMENT_CONFIRMATION_REQUIRED",
+  storageEnrollmentConflictExamples.replacementConfirmationRequired.value
+    .code === "STORAGE_ENROLLMENT_REPLACEMENT_CONFIRMATION_REQUIRED",
   "Storage enrollment replacement confirmation conflict code drifted",
 );
 assert(
@@ -1619,4 +1784,254 @@ assert(
   "Tenant create request must not declare actor or principal",
 );
 
-console.log("OpenAPI contract checks passed");
+const expectedAgentOperations = {
+  "/agent/enrollment/bootstrap": "bootstrapAgentEnrollment",
+  "/agent/enrollment/status/query": "queryAgentEnrollmentStatus",
+  "/agent/session/open": "openAgentSession",
+  "/agent/session/channel/open": "openAgentSessionChannel",
+  "/agent/session/heartbeat/report": "reportAgentSessionHeartbeat",
+  "/agent/session/message/list/query": "queryAgentSessionMessages",
+  "/agent/job/report/create": "createAgentJobReport",
+  "/agent/job/metadata/batch/stage": "stageAgentJobMetadataBatch",
+  "/agent/job/metadata/page/stage": "stageAgentJobMetadataPage",
+  "/agent/job/index/page/query": "queryAgentJobIndexPage",
+  "/agent/job/manifest/page/query": "queryAgentJobManifestPage",
+  "/agent/session/close": "closeAgentSession",
+};
+assert(
+  agentDocument.openapi === "3.1.0",
+  "Agent OpenAPI version must be 3.1.0",
+);
+assertSameMembers(
+  Object.keys(agentDocument.paths),
+  Object.keys(expectedAgentOperations),
+  "Agent action path set changed",
+);
+
+for (const [path, operationId] of Object.entries(expectedAgentOperations)) {
+  assert(
+    !path.includes("{"),
+    `Agent action path uses a path parameter: ${path}`,
+  );
+  const pathItem = agentDocument.paths[path];
+  assertSameMembers(
+    Object.keys(pathItem).filter((key) =>
+      [
+        "get",
+        "put",
+        "post",
+        "delete",
+        "patch",
+        "options",
+        "head",
+        "trace",
+      ].includes(key),
+    ),
+    ["post"],
+    `Agent action must be POST-only: ${path}`,
+  );
+  const operation = pathItem.post;
+  assert(
+    operation.operationId === operationId,
+    `Agent operationId changed: ${path}`,
+  );
+  assert(
+    Array.isArray(operation.security) && operation.security.length === 0,
+    `Agent action must declare body-carried security: ${path}`,
+  );
+  assert(
+    typeof operation["x-neoengram-body-security"] === "string",
+    `Agent action omits its body security scheme: ${path}`,
+  );
+  assert(
+    operation.parameters === undefined && pathItem.parameters === undefined,
+    `Agent action input must not use path, query, header, or cookie parameters: ${path}`,
+  );
+  const requestBody = resolveAgentRef(operation.requestBody);
+  assert(
+    requestBody?.required === true,
+    `Agent action request body must be required: ${path}`,
+  );
+}
+
+const channelOperation =
+  agentDocument.paths["/agent/session/channel/open"].post;
+const duplex = channelOperation["x-neoengram-http2-duplex"];
+assert(
+  duplex?.transport === "http2-full-duplex" &&
+    duplex.primaryControlTransport === true &&
+    duplex.mediaType === "application/x-ndjson" &&
+    duplex.h2DataFrameBoundaries === "ignored" &&
+    duplex.frameDelimiter === "LF" &&
+    duplex.maxFrameBytes === 1_048_576 &&
+    duplex.finalFrameRequiresDelimiter === true,
+  "Agent primary control channel transport semantics changed",
+);
+assert(
+  resolveAgentRef(channelOperation.requestBody).content[
+    "application/x-ndjson"
+  ] && channelOperation.responses["200"].content["application/x-ndjson"],
+  "Agent control channel must stream NDJSON in both directions",
+);
+
+const compatibilityPoll =
+  agentDocument.paths["/agent/session/message/list/query"].post;
+assert(
+  compatibilityPoll["x-neoengram-compatibility-only"] === true,
+  "Agent message-list poll must remain compatibility-only",
+);
+assertDescriptionIncludes(
+  compatibilityPoll,
+  [
+    "Compatibility",
+    "manual-recovery",
+    "primary Agent runtime",
+    "HTTP/2 full-duplex",
+  ],
+  "Agent message-list poll could be mistaken for the primary control transport",
+);
+
+const agentDecimalU64 = resolveAgentRef(
+  agentDocument.components.schemas.DecimalU64,
+);
+const agentPositiveDecimalU64 = resolveAgentRef(
+  agentDocument.components.schemas.PositiveDecimalU64,
+);
+const decimalU64Pattern = new RegExp(agentDecimalU64.pattern);
+const positiveDecimalU64Pattern = new RegExp(agentPositiveDecimalU64.pattern);
+assert(
+  agentDecimalU64.type === "string" &&
+    agentDecimalU64.minLength === 1 &&
+    agentDecimalU64.maxLength === 20 &&
+    decimalU64Pattern.test("0") &&
+    decimalU64Pattern.test("18446744073709551615") &&
+    !decimalU64Pattern.test("18446744073709551616") &&
+    !decimalU64Pattern.test("01"),
+  "Agent DecimalU64 must be canonical and capped at u64::MAX",
+);
+assert(
+  agentPositiveDecimalU64.type === "string" &&
+    agentPositiveDecimalU64.minLength === 1 &&
+    agentPositiveDecimalU64.maxLength === 20 &&
+    !positiveDecimalU64Pattern.test("0") &&
+    positiveDecimalU64Pattern.test("1") &&
+    positiveDecimalU64Pattern.test("18446744073709551615") &&
+    !positiveDecimalU64Pattern.test("18446744073709551616"),
+  "Agent positive decimal u64 must reject zero and values above u64::MAX",
+);
+
+const agentProof = agentDocument.components.schemas.AgentRequestProof;
+const ed25519PublicKeySpki = resolveAgentRef(
+  agentProof.properties.public_key_spki,
+);
+const ed25519Signature = resolveAgentRef(agentProof.properties.signature);
+for (const [schema, encodedLength, name] of [
+  [ed25519PublicKeySpki, 59, "Ed25519 SPKI"],
+  [ed25519Signature, 86, "Ed25519 signature"],
+]) {
+  const pattern = new RegExp(schema.pattern);
+  assert(
+    schema.type === "string" &&
+      schema.minLength === encodedLength &&
+      schema.maxLength === encodedLength &&
+      schema.pattern === "^[A-Za-z0-9_-]+$" &&
+      pattern.test("A".repeat(encodedLength)) &&
+      !pattern.test(`${"A".repeat(encodedLength - 1)}=`),
+    `${name} must use exact-length unpadded base64url`,
+  );
+}
+
+const heartbeatPayload =
+  agentDocument.components.schemas.AgentHeartbeatReportPayload;
+const heartbeat = resolveAgentRef(heartbeatPayload.properties.heartbeat);
+assert(
+  heartbeat.type === "object" &&
+    heartbeat.required.includes("agent_id") &&
+    heartbeat.required.includes("sequence") &&
+    heartbeat.properties.agent_id &&
+    heartbeat.properties.sequence,
+  "Agent heartbeat must resolve to the concrete Rust DTO",
+);
+const mountReport = resolveAgentRef(heartbeatPayload.properties.mount_report);
+for (const field of ["installation_id", "boot_id", "session_generation"]) {
+  assert(
+    mountReport.required.includes(field) && mountReport.properties[field],
+    `Agent mount report omits concrete Rust field ${field}`,
+  );
+}
+
+const jobReportPayload =
+  agentDocument.components.schemas.AgentJobReportCreatePayload;
+const controlEnvelope = resolveAgentRef(jobReportPayload.properties.report);
+assert(
+  controlEnvelope.title === "ControlEnvelope" &&
+    controlEnvelope.type === "object" &&
+    Array.isArray(controlEnvelope.oneOf) &&
+    controlEnvelope.oneOf.length > 0,
+  "Agent job report must resolve to the concrete ControlEnvelope union",
+);
+for (const field of [
+  "protocol_version",
+  "message_id",
+  "session_generation",
+  "sent_at_unix_ms",
+]) {
+  assert(
+    controlEnvelope.required.includes(field) &&
+      controlEnvelope.properties[field],
+    `ControlEnvelope report omits concrete Rust field ${field}`,
+  );
+}
+
+const channelAssignment = resolveAgentRef(
+  agentDocument.components.schemas.AgentChannelJobAssignment,
+);
+assertSameMembers(
+  channelAssignment.required,
+  ["assignment"],
+  "Agent channel assignment wrapper changed",
+);
+const assignmentOperation = resolveAgentRef(
+  channelAssignment.properties.assignment,
+);
+assert(
+  assignmentOperation.oneOf?.length > 0,
+  "Agent channel assignment must resolve to a concrete operation union",
+);
+for (const branch of assignmentOperation.oneOf) {
+  assert(
+    branch.required.includes("operation") &&
+      branch.required.includes("input") &&
+      branch.properties.operation &&
+      resolveAgentRef(branch.properties.input)?.type === "object",
+    "Agent assignment operation must require concrete operation and input fields",
+  );
+}
+
+const channelDecision = resolveAgentRef(
+  agentDocument.components.schemas.AgentChannelJobDecision,
+);
+assert(
+  channelDecision.required.includes("decision") &&
+    channelDecision.required.includes("final_state"),
+  "Agent channel decision must expose concrete decision and final_state fields",
+);
+const publishDecision = resolveAgentRef(channelDecision.properties.decision);
+const finalJobState = resolveAgentRef(channelDecision.properties.final_state);
+assert(
+  publishDecision.oneOf?.length > 0 &&
+    publishDecision.oneOf.every(
+      (branch) =>
+        branch.required.includes("outcome") &&
+        typeof branch.properties.outcome?.const === "string",
+    ),
+  "Agent channel decision must resolve to the concrete publish decision union",
+);
+assert(
+  finalJobState.type === "string" &&
+    Array.isArray(finalJobState.enum) &&
+    finalJobState.enum.length > 0,
+  "Agent channel final_state must resolve to the Rust JobState enum",
+);
+
+console.log("Public and Agent OpenAPI contract checks passed");

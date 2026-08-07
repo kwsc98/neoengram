@@ -11,7 +11,6 @@ mod enrollment;
 mod error;
 mod ids;
 mod metadata;
-mod s3;
 mod scalars;
 mod schema;
 mod validation;
@@ -24,9 +23,8 @@ pub use error::{ProtocolError, ProtocolResult};
 pub use ids::*;
 pub use metadata::*;
 pub use neoengram_core::ContentDigest;
-pub use s3::*;
 pub use scalars::*;
-pub use schema::{agent_api_schema, control_schema, enrollment_schema, metadata_schema, s3_schema};
+pub use schema::{agent_api_schema, control_schema, enrollment_schema, metadata_schema};
 pub use validation::decode_bounded_unique_json;
 
 /// The only protocol version emitted by this crate.

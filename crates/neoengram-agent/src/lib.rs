@@ -22,8 +22,8 @@ pub use error::{AgentError, AgentErrorCode, AgentResult};
 pub use fakes::{FakeAddExecutor, FakeClock, FakeObjectTransfer, FakeReportSink};
 pub use memory::InMemoryLedger;
 pub use mount_probe::{
-    FilesystemMountObservation, FilesystemMountProbeConfig, MountProbeCondition,
-    VOLUME_MARKER_FILE_NAME,
+    DevelopmentDirectoryMountProbeConfig, FilesystemMountObservation, FilesystemMountProbeConfig,
+    MountProbeCondition, VOLUME_MARKER_FILE_NAME,
 };
 pub use outbound::{
     DurableReportSink, QueuedAgentReport, SqliteOutboundReportQueue,

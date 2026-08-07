@@ -35,8 +35,9 @@ struct CandidateParts {
 /// Prepares a bounded, non-authoritative managed Add candidate through runtime-neutral ports.
 ///
 /// Object publication is durable before the candidate is sealed. This use case never publishes an
-/// IndexVersion; the caller must negotiate/upload objects and submit the returned metadata to the
-/// central CAS publisher.
+/// IndexVersion; the caller must submit placement evidence and the returned metadata to the
+/// central CAS publisher. The ObjectStore can be Volume-local and is not assumed to be reachable
+/// by the central service.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_add(
     request: &PrepareAddRequest,

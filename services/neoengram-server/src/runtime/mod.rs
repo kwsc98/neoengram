@@ -34,10 +34,10 @@ use crate::{
         RunningAgentServer,
     },
     controller::{
-        JobApiServer, JobController, PlaygroundApiServer, PlaygroundController,
-        StorageEnrollmentApiServer, StorageEnrollmentController, StorageVolumeApiServer,
-        StorageVolumeController, SystemApiServer, SystemController, TenantApiServer,
-        TenantController,
+        ArtifactApiServer, ArtifactController, JobApiServer, JobController, PlaygroundApiServer,
+        PlaygroundController, SnapshotApiServer, SnapshotController, StorageEnrollmentApiServer,
+        StorageEnrollmentController, StorageVolumeApiServer, StorageVolumeController,
+        SystemApiServer, SystemController, TenantApiServer, TenantController,
     },
     error::{application_error, map_central_error, NeoEngramProblemEncoder},
     identity::{
@@ -45,9 +45,8 @@ use crate::{
         OidcConfig, Permission, StaticRbacPolicy, StaticTokenAuthenticator,
     },
     service::{
-        AgentDataPlaneService, CatalogService, EnrollmentKeyring, EnrollmentService,
-        FilesystemObjectStore, HealthService, JobCoordinator, JobService, ReadinessProbe,
-        SystemService,
+        AgentDataPlaneService, CatalogService, EnrollmentKeyring, EnrollmentService, HealthService,
+        JobCoordinator, JobService, ReadinessProbe, SystemService, WorkspaceCommitService,
     },
 };
 
@@ -71,7 +70,7 @@ pub struct Config {
     )]
     pub agent_enrollment_enabled: bool,
 
-    /// Plain HTTP listen address used only by Agent bootstrap/status transport.
+    /// Plain HTTP listen address for Agent enrollment, unary actions, and the H2 control channel.
     #[arg(long, env = "NEOENGRAM_SERVER_AGENT_BIND")]
     pub agent_bind: Option<SocketAddr>,
 
@@ -82,10 +81,6 @@ pub struct Config {
     /// Directory containing the single-process SQLite authority.
     #[arg(long, env = "NEOENGRAM_SERVER_AUTHORITY_DIR")]
     pub authority_dir: PathBuf,
-
-    /// Root for the development filesystem object backend used by Agent uploads.
-    #[arg(long, env = "NEOENGRAM_SERVER_OBJECT_STORE_ROOT")]
-    pub object_store_root: Option<PathBuf>,
 
     /// Immutable deny-by-default RBAC JSON document.
     #[arg(long, env = "NEOENGRAM_SERVER_RBAC_FILE")]
@@ -180,7 +175,6 @@ impl fmt::Debug for Config {
                 &self.agent_enrollment_keyring_file,
             )
             .field("authority_dir", &self.authority_dir)
-            .field("object_store_root", &self.object_store_root)
             .field("rbac_file", &self.rbac_file)
             .field("oidc_issuer", &self.oidc_issuer)
             .field("oidc_audience", &self.oidc_audience)
@@ -223,8 +217,6 @@ pub enum RuntimeError {
     Authority(String),
     #[error("enrollment keyring initialization failed: {0}")]
     EnrollmentKeyring(String),
-    #[error("filesystem object-store initialization failed: {0}")]
-    ObjectStore(String),
     #[error("Fusen server configuration failed: {0}")]
     FusenConfig(String),
     #[error(transparent)]
@@ -241,7 +233,6 @@ pub struct AppState {
     authenticator: Arc<dyn Authenticator>,
     jobs: Arc<JobService>,
     catalog: Arc<CatalogService>,
-    object_store: Option<Arc<FilesystemObjectStore>>,
     enrollments: Option<Arc<EnrollmentService>>,
     enrollment_registry: Option<Arc<AgentRegistryService>>,
     coordinator: Option<Arc<JobCoordinator>>,
@@ -290,23 +281,6 @@ impl AppState {
             )
             .await?;
         }
-        let catalog = Arc::new(CatalogService::new(
-            catalog_repository.clone(),
-            authority_store.publisher(),
-            policy.clone(),
-            clock.clone(),
-        ));
-        let object_store_root = config.object_store_root.clone().or_else(|| {
-            (config.development && config.agent_enrollment_enabled)
-                .then(|| config.authority_dir.join("objects"))
-        });
-        let object_store = object_store_root
-            .map(|root| {
-                FilesystemObjectStore::open_or_create(root)
-                    .map(Arc::new)
-                    .map_err(|error| RuntimeError::ObjectStore(error.to_string()))
-            })
-            .transpose()?;
         let accepting = Arc::new(AtomicBool::new(false));
         let (enrollments, enrollment_registry, agent_handler, coordinator) = if config
             .agent_enrollment_enabled
@@ -338,21 +312,12 @@ impl AppState {
             };
             let enrollments = Arc::new(EnrollmentService::new(
                 registry.clone(),
-                catalog_repository,
+                catalog_repository.clone(),
                 policy.clone(),
                 keyring,
                 clock.clone(),
             ));
-            let filesystem_objects = object_store.clone().ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "Agent transport requires the central object-store backend".into(),
-                )
-            })?;
-            let data_plane = Arc::new(AgentDataPlaneService::new(
-                authority.clone(),
-                filesystem_objects,
-                clock.clone(),
-            ));
+            let data_plane = Arc::new(AgentDataPlaneService::new(authority.clone()));
             let agent_handler = Arc::new(RegistryAgentEnrollmentHandler::with_transport(
                 registry.clone(),
                 control.clone(),
@@ -377,16 +342,37 @@ impl AppState {
         } else {
             (None, None, None, None)
         };
+        let catalog = CatalogService::new(
+            catalog_repository,
+            authority_store.publisher(),
+            policy.clone(),
+            clock.clone(),
+        );
+        let catalog = match authority_store.precommits() {
+            Some(precommits) => catalog.with_precommits(precommits),
+            None => catalog,
+        };
+        let catalog = match coordinator.as_ref() {
+            Some(coordinator) => catalog.with_coordinator(coordinator.clone()),
+            None => catalog,
+        };
+        let workspace_commits =
+            WorkspaceCommitService::from_authority(&authority_store, policy.clone(), clock.clone())
+                .map(Arc::new)
+                .map_err(|error| RuntimeError::Authority(error.to_string()))?;
+        let catalog = catalog.with_workspace_commits(workspace_commits);
+        let catalog = Arc::new(catalog);
+        let jobs = JobService::from_authority(control, &authority_store)
+            .map_err(|error| RuntimeError::Authority(error.to_string()))?;
         let jobs = match coordinator.as_ref() {
-            Some(coordinator) => JobService::new(control).with_coordinator(coordinator.clone()),
-            None => JobService::new(control),
+            Some(coordinator) => jobs.with_coordinator(coordinator.clone()),
+            None => jobs,
         };
         Ok(Self {
             authority,
             authenticator,
             jobs: Arc::new(jobs),
             catalog,
-            object_store,
             enrollments,
             enrollment_registry,
             coordinator,
@@ -472,7 +458,13 @@ impl AppState {
             .interface(StorageVolumeApiServer::new(StorageVolumeController::new(
                 self.catalog.clone(),
             )))
+            .interface(ArtifactApiServer::new(ArtifactController::new(
+                self.catalog.clone(),
+            )))
             .interface(PlaygroundApiServer::new(PlaygroundController::new(
+                self.catalog.clone(),
+            )))
+            .interface(SnapshotApiServer::new(SnapshotController::new(
                 self.catalog.clone(),
             )));
         if let Some(enrollments) = &self.enrollments {
@@ -490,11 +482,6 @@ impl AppState {
             .await
             .as_ref()
             .map(RunningAgentServer::local_addr)
-    }
-
-    #[must_use]
-    pub fn object_store(&self) -> Option<Arc<FilesystemObjectStore>> {
-        self.object_store.clone()
     }
 
     async fn agent_handle(&self) -> Option<AgentServerHandle> {
@@ -724,21 +711,6 @@ fn validate_config(config: &Config) -> Result<(), RuntimeError> {
             "authority directory must be explicit".to_owned(),
         ));
     }
-    if config
-        .object_store_root
-        .as_ref()
-        .is_some_and(|path| path.as_os_str().is_empty())
-    {
-        return Err(RuntimeError::Configuration(
-            "object-store root must not be empty".to_owned(),
-        ));
-    }
-    if config.agent_enrollment_enabled && !config.development && config.object_store_root.is_none()
-    {
-        return Err(RuntimeError::Configuration(
-            "production Agent uploads require an explicit object-store root".to_owned(),
-        ));
-    }
     match (
         config.agent_enrollment_enabled,
         config.agent_bind,
@@ -835,8 +807,12 @@ fn validate_config(config: &Config) -> Result<(), RuntimeError> {
                     Permission::StorageEnrollmentCreate,
                     Permission::StorageEnrollmentRead,
                     Permission::StorageEnrollmentReview,
+                    Permission::ArtifactRead,
+                    Permission::ArtifactCreate,
                     Permission::PlaygroundRead,
                     Permission::PlaygroundCreate,
+                    Permission::SnapshotRead,
+                    Permission::SnapshotCreate,
                 ],
             )
             .map_err(RuntimeError::Configuration)?;
@@ -905,8 +881,12 @@ async fn authentication_and_policy(
                         Permission::StorageEnrollmentCreate,
                         Permission::StorageEnrollmentRead,
                         Permission::StorageEnrollmentReview,
+                        Permission::ArtifactRead,
+                        Permission::ArtifactCreate,
                         Permission::PlaygroundRead,
                         Permission::PlaygroundCreate,
+                        Permission::SnapshotRead,
+                        Permission::SnapshotCreate,
                     ],
                 )
                 .map_err(RuntimeError::Rbac)?,

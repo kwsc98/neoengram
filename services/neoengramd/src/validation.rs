@@ -1,17 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use neoengram_core::{
-    validate_index_mutation_paths, ChunkRef, ChunkingStrategy, Manifest, ManifestId, ObjectId,
+    validate_index_mutation_paths, ChunkRef, ChunkingStrategy, FileRecord, IndexVersion, Manifest,
+    ManifestId, ObjectId,
 };
 use neoengram_protocol::{
-    AddAssignment, AssignmentGeneration, AssignmentId, DurabilityState, IndexDeltaRecord,
-    JobPrepared, JobState, LeaseMode, ManifestRecord, MetadataBatchDescriptor, MetadataBatchKind,
-    MetadataBatchRecords, MetadataPublication, ObjectDurabilityReceipt, WireIndexVersion,
+    AddAssignment, AssignmentGeneration, AssignmentId, IndexDeltaRecord, JobPrepared, JobState,
+    LeaseMode, ManifestRecord, MetadataBatchDescriptor, MetadataBatchKind, MetadataBatchRecords,
+    MetadataPublication, WireIndexVersion,
 };
 
 use crate::{
     AddJobSpec, AssignmentTarget, CentralError, CentralErrorCode, CentralResult, JobRecord,
-    MetadataBatchStager, ObjectCatalog, ValidatedMetadata,
+    MetadataBatchStager, ValidatedMetadata,
 };
 
 pub(crate) fn invalid(code: CentralErrorCode, message: impl Into<String>) -> CentralError {
@@ -20,6 +21,30 @@ pub(crate) fn invalid(code: CentralErrorCode, message: impl Into<String>) -> Cen
 
 pub(crate) fn same_index_version(left: &WireIndexVersion, right: &WireIndexVersion) -> bool {
     left.revision == right.revision && left.digest == right.digest
+}
+
+pub(crate) fn validate_initial_index_snapshot(
+    version: &WireIndexVersion,
+    records: &[FileRecord],
+) -> CentralResult<()> {
+    version.validate()?;
+    let computed =
+        IndexVersion::from_snapshot(version.revision.get(), records).map_err(|error| {
+            invalid(
+                CentralErrorCode::MetadataInvalid,
+                format!("invalid initial Index snapshot: {error}"),
+            )
+        })?;
+    if computed.digest != version.digest {
+        return Err(invalid(
+            CentralErrorCode::MetadataInvalid,
+            format!(
+                "initial Index digest {} differs from canonical records {}",
+                version.digest, computed.digest
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_job_spec(spec: &AddJobSpec, now_ms: u64) -> CentralResult<()> {
@@ -203,7 +228,6 @@ pub(crate) fn validate_terminal_state(state: JobState) -> CentralResult<()> {
 pub(crate) async fn validate_staged_metadata(
     job: &JobRecord,
     stager: &dyn MetadataBatchStager,
-    catalog: &dyn ObjectCatalog,
 ) -> CentralResult<ValidatedMetadata> {
     let assignment = job.assignment.as_ref().ok_or_else(|| {
         invalid(
@@ -222,6 +246,7 @@ pub(crate) async fn validate_staged_metadata(
     let mut manifest_objects: BTreeMap<ObjectId, u64> = BTreeMap::new();
     let mut receipt_objects: BTreeMap<ObjectId, u64> = BTreeMap::new();
     let mut receipt_ids = BTreeSet::new();
+    let mut placements = Vec::new();
     let mut mutations = Vec::new();
     let mut publication_pages = Vec::new();
 
@@ -312,6 +337,7 @@ pub(crate) async fn validate_staged_metadata(
                             record.object_id,
                             record.size.get(),
                         )?;
+                        placements.push(record.clone());
                     }
                 }
             }
@@ -374,26 +400,6 @@ pub(crate) async fn validate_staged_metadata(
         ));
     }
 
-    for (object_id, expected_size) in manifest_objects {
-        let durable = catalog
-            .durable_object(&assignment.tenant_id, &assignment.artifact_id, object_id)
-            .await?
-            .ok_or_else(|| {
-                invalid(
-                    CentralErrorCode::ObjectNotDurable,
-                    format!("object {object_id} is not centrally Durable"),
-                )
-            })?;
-        if durable.size != expected_size
-            || durable.verified_digest.as_bytes() != object_id.as_bytes()
-        {
-            return Err(invalid(
-                CentralErrorCode::ObjectNotDurable,
-                format!("object {object_id} durability metadata does not match its declaration"),
-            ));
-        }
-    }
-
     let publication = MetadataPublication::from_pages(&publication_pages).map_err(|error| {
         invalid(
             CentralErrorCode::MetadataInvalid,
@@ -430,6 +436,7 @@ pub(crate) async fn validate_staged_metadata(
     Ok(ValidatedMetadata {
         manifests: publication.manifests,
         mutations,
+        placements,
     })
 }
 
@@ -556,25 +563,6 @@ fn validate_index_delta_order(mutations: &[IndexDeltaRecord]) -> CentralResult<(
 fn index_delta_path(mutation: &IndexDeltaRecord) -> &neoengram_core::LogicalPath {
     match mutation {
         IndexDeltaRecord::Upsert { path, .. } | IndexDeltaRecord::Delete { path, .. } => path,
-    }
-}
-
-pub(crate) fn durable_from_receipt(
-    receipt: &ObjectDurabilityReceipt,
-) -> CentralResult<Option<crate::DurableObject>> {
-    receipt.validate()?;
-    match &receipt.state {
-        DurabilityState::Durable {
-            verified_digest,
-            storage_version,
-            ..
-        } => Ok(Some(crate::DurableObject {
-            object_id: receipt.object.object_id,
-            size: receipt.object.size.get(),
-            verified_digest: *verified_digest,
-            storage_version: storage_version.clone(),
-        })),
-        DurabilityState::Pending { .. } | DurabilityState::Rejected { .. } => Ok(None),
     }
 }
 

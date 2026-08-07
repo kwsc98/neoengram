@@ -9,20 +9,20 @@ use neoengram_core::{
 use neoengram_protocol::{
     AgentEnrollmentId, AgentId, AgentMountId, ArtifactId, ArtifactPlacementId,
     AssignmentGeneration, AssignmentId, AssignmentOperation, ControlMessage, DecimalU64,
-    DurabilityState, EdgeClusterId, Extensions, IndexDeltaRecord, JobPrepared, JobState,
-    MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage, MetadataBatchRecords,
-    MetadataBatchScope, MountGeneration, ObjectDurabilityReceipt, OwnerGeneration,
-    PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId,
-    RequestId, ResourceVersion, SessionGeneration, SessionId, StorageVolumeId, TenantId,
-    UnixMillis, WireIndexVersion, WireObjectSpec,
+    EdgeClusterId, Extensions, IndexDeltaRecord, JobPrepared, JobState, MetadataBatchDescriptor,
+    MetadataBatchId, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope, MountGeneration,
+    ObjectReceiptId, ObjectReceiptRecord, OwnerGeneration, PlacementGeneration, PlaygroundId,
+    PrincipalId, PrincipalKind, PrincipalRef, ProjectId, RequestId, ResourceVersion,
+    SessionGeneration, StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
 };
 use neoengramd::{
     open_sqlite_authority, AddJobSpec, AgentEnrollmentAuditEvent, AgentEnrollmentAuditKind,
     AgentReport, AllowAllAuthorizer, AssignJobRequest, AssignmentTarget, AuditEvent, AuditKind,
     AuthorityCapabilities, AuthorityStore, CentralErrorCode, ControlPlane, CreateAddJobRequest,
     ExpireAddJobRequest, FinalizeAddRequest, InMemoryClock, InMemoryComponents, IndexKey,
-    IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, JobKey, JobRecord,
-    PublicationCandidate, ReceiveReportRequest, SqliteAuthorityConfig,
+    IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, JobKey, JobOperation,
+    JobRecord, ObjectPlacementEvidence, PublicationCandidate, ReceiveReportRequest,
+    SqliteAuthorityConfig,
 };
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use tempfile::TempDir;
@@ -44,7 +44,7 @@ struct ContractFixture {
 async fn authority_contract_runs_against_in_memory_and_sqlite() {
     let memory = InMemoryComponents::new(100);
     let memory_fixture = run_contract(memory.authority_store()).await;
-    assert_contract_state(&memory.authority_store(), &memory_fixture).await;
+    assert_contract_state(&memory.authority_store(), &memory_fixture, true).await;
 
     let directory = TempDir::new().unwrap();
     let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
@@ -55,8 +55,23 @@ async fn authority_contract_runs_against_in_memory_and_sqlite() {
         AuthorityCapabilities::SQLITE
     );
     let fixture = run_contract(authority.authority_store()).await;
-    assert_contract_state(&authority.authority_store(), &fixture).await;
+    assert_contract_state(&authority.authority_store(), &fixture, true).await;
     authority.integrity_check().await.unwrap();
+    authority.close().await;
+
+    let options = SqliteConnectOptions::new().filename(directory.path().join("authority.sqlite3"));
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    let placement_count: i64 = sqlx::query_scalar("SELECT count(*) FROM object_placements")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    let legacy_durability_count: i64 = sqlx::query_scalar("SELECT count(*) FROM durable_objects")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(placement_count, 1);
+    assert_eq!(legacy_durability_count, 0);
+    connection.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -75,7 +90,7 @@ async fn sqlite_reopen_recovers_every_authority_port() {
     let reopened = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
         .unwrap();
-    assert_contract_state(&reopened.authority_store(), &fixture).await;
+    assert_contract_state(&reopened.authority_store(), &fixture, true).await;
     let recovered_assignments = reopened.published_assignments().await.unwrap();
     assert_eq!(recovered_assignments.len(), 4);
     assert!(recovered_assignments.contains(&fixture.assignment));
@@ -117,7 +132,12 @@ async fn sqlite_migrates_v1_authority_without_losing_existing_state() {
     };
     execute_raw(
         directory.path(),
-        "DROP TABLE agent_enrollment_audit_events; PRAGMA user_version = 1",
+        "DROP TABLE precommit_mutations;
+         DROP TABLE commit_records;
+         DROP TABLE precommit_records;
+         DROP TABLE object_placements;
+         DROP TABLE agent_enrollment_audit_events;
+         PRAGMA user_version = 1",
     )
     .await;
 
@@ -125,7 +145,7 @@ async fn sqlite_migrates_v1_authority_without_losing_existing_state() {
         .await
         .unwrap();
     migrated.integrity_check().await.unwrap();
-    assert_contract_state(&migrated.authority_store(), &fixture).await;
+    assert_contract_state(&migrated.authority_store(), &fixture, false).await;
     assert!(migrated.enrollment_audit_events().await.unwrap().is_empty());
 }
 
@@ -141,6 +161,10 @@ async fn sqlite_migrates_v3_indexes_without_losing_project_scope() {
     execute_raw(
         directory.path(),
         "PRAGMA foreign_keys = OFF;
+         DROP TABLE precommit_mutations;
+         DROP TABLE commit_records;
+         DROP TABLE precommit_records;
+         DROP TABLE object_placements;
          ALTER TABLE playground_index_records RENAME TO playground_index_records_v4;
          ALTER TABLE playground_indexes RENAME TO playground_indexes_v4;
          CREATE TABLE playground_indexes (
@@ -185,7 +209,63 @@ async fn sqlite_migrates_v3_indexes_without_losing_project_scope() {
         .await
         .unwrap();
     migrated.integrity_check().await.unwrap();
-    assert_contract_state(&migrated.authority_store(), &fixture).await;
+    assert_contract_state(&migrated.authority_store(), &fixture, false).await;
+}
+
+#[tokio::test]
+async fn sqlite_v5_migration_preserves_legacy_durability_without_promoting_it() {
+    let directory = TempDir::new().unwrap();
+    let spec = job_spec("tenant-a", "job-legacy-object");
+    let object_id = ObjectId::for_bytes(b"legacy-central-object");
+    initialize_and_close(directory.path()).await;
+    let object_hex = object_id.to_hex();
+    execute_raw(
+        directory.path(),
+        &format!(
+            "INSERT INTO durable_objects \
+             (tenant_id, artifact_id, object_id, size, verified_digest, storage_version) \
+             VALUES ('tenant-a', 'artifact-a', X'{object_hex}', '21', \
+                     X'{object_hex}', 'legacy-version')"
+        ),
+    )
+    .await;
+    execute_raw(
+        directory.path(),
+        "DROP TABLE object_placements; PRAGMA user_version = 5",
+    )
+    .await;
+
+    let migrated = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let objects = migrated.authority_store().objects();
+    assert!(objects
+        .object_placement(
+            &spec.tenant_id,
+            &spec.artifact_id,
+            &StorageVolumeId::new("volume-a").unwrap(),
+            &ArtifactPlacementId::new("placement-a").unwrap(),
+            PlacementGeneration::new(1),
+            object_id,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    migrated.integrity_check().await.unwrap();
+    migrated.close().await;
+    let options = SqliteConnectOptions::new().filename(directory.path().join("authority.sqlite3"));
+    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+    let legacy_count: i64 = sqlx::query_scalar("SELECT count(*) FROM durable_objects")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(legacy_count, 1);
+    assert_eq!(version, 6);
+    connection.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -257,6 +337,19 @@ async fn tenant_scoped_ids_are_isolated_in_both_backends() {
 }
 
 #[tokio::test]
+async fn object_placement_evidence_is_exactly_scoped_in_both_backends() {
+    let memory = InMemoryComponents::new(100);
+    assert_object_placement_scope(memory.authority_store()).await;
+
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    assert_object_placement_scope(sqlite.authority_store()).await;
+    sqlite.integrity_check().await.unwrap();
+}
+
+#[tokio::test]
 async fn project_scoped_indexes_are_isolated_in_both_backends() {
     let memory = InMemoryComponents::new(100);
     assert_project_index_isolation(memory.authority_store()).await;
@@ -294,7 +387,7 @@ async fn sqlite_rejects_wrong_application_id_and_user_version() {
 
     let version_directory = TempDir::new().unwrap();
     initialize_and_close(version_directory.path()).await;
-    execute_raw(version_directory.path(), "PRAGMA user_version = 5").await;
+    execute_raw(version_directory.path(), "PRAGMA user_version = 7").await;
     assert_open_storage_failure(version_directory.path()).await;
 }
 
@@ -619,12 +712,13 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
             .unwrap()
             .replayed
     );
+    let target = assignment_target();
     let assigned = control
         .assign_job(AssignJobRequest {
             actor: spec.principal.clone(),
             tenant_id: spec.tenant_id.clone(),
             job_id: spec.job_id.clone(),
-            target: assignment_target(),
+            target: target.clone(),
         })
         .await
         .unwrap();
@@ -634,7 +728,7 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
                 actor: spec.principal.clone(),
                 tenant_id: spec.tenant_id.clone(),
                 job_id: spec.job_id.clone(),
-                target: assignment_target(),
+                target: target.clone(),
             })
             .await
             .unwrap()
@@ -643,7 +737,10 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
     let AssignmentOperation::Add {
         input: assigned_input,
         ..
-    } = &assigned.assignment.assignment;
+    } = &assigned.assignment.assignment
+    else {
+        panic!("expected managed Add assignment");
+    };
     assert_eq!(
         store
             .outbox()
@@ -674,8 +771,31 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
         .await
         .unwrap()
         .is_empty());
+    assert!(matches!(
+        store
+            .outbox()
+            .reactivate(assigned.assignment.clone())
+            .await
+            .unwrap(),
+        neoengramd::AssignmentPublishOutcome::Published
+    ));
+    assert_eq!(
+        store
+            .outbox()
+            .pending_for_agent(&assigned_input.agent_id, 1)
+            .await
+            .unwrap(),
+        vec![assigned.assignment.clone()]
+    );
+    store
+        .outbox()
+        .retire(&assigned_input.tenant_id, &assigned_input.assignment_id)
+        .await
+        .unwrap();
     let mut reserved_assignment = assigned.assignment.clone();
-    let AssignmentOperation::Add { input, .. } = &mut reserved_assignment.assignment;
+    let AssignmentOperation::Add { input, .. } = &mut reserved_assignment.assignment else {
+        panic!("expected managed Add assignment");
+    };
     input.assignment_id = AssignmentId::new("assignment-reserved").unwrap();
     assert!(matches!(
         store
@@ -717,17 +837,23 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
         .unwrap());
 
     let object_id = ObjectId::for_bytes(b"payload");
-    store
-        .objects()
-        .record_durability(&durability_receipt(&spec, object_id, u64::MAX))
-        .await
-        .unwrap();
-    store
-        .objects()
-        .record_durability(&durability_receipt(&spec, object_id, u64::MAX))
-        .await
-        .unwrap();
-
+    let evidence = ObjectPlacementEvidence {
+        receipt: ObjectReceiptRecord {
+            receipt_id: ObjectReceiptId::new("receipt-contract").unwrap(),
+            tenant_id: spec.tenant_id.clone(),
+            artifact_id: spec.artifact_id.clone(),
+            job_id: spec.job_id.clone(),
+            storage_volume_id: assigned_input.storage_volume_id.clone(),
+            artifact_placement_id: assigned_input.artifact_placement_id.clone(),
+            object_id,
+            size: DecimalU64::new(u64::MAX),
+            verified_at_unix_ms: UnixMillis::new(200),
+            extensions: Extensions::new(),
+        },
+        placement_generation: assigned_input.placement_generation,
+    };
+    store.objects().record_placement(&evidence).await.unwrap();
+    store.objects().record_placement(&evidence).await.unwrap();
     let request = publication(
         "tenant-a",
         "job-a",
@@ -805,7 +931,11 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
     }
 }
 
-async fn assert_contract_state(store: &AuthorityStore, fixture: &ContractFixture) {
+async fn assert_contract_state(
+    store: &AuthorityStore,
+    fixture: &ContractFixture,
+    expect_placement: bool,
+) {
     assert_eq!(
         store.jobs().get(&fixture.job_key).await.unwrap(),
         Some(fixture.publishing_job.clone())
@@ -817,17 +947,26 @@ async fn assert_contract_state(store: &AuthorityStore, fixture: &ContractFixture
         .unwrap()
         .unwrap();
     assert!(batch.is_complete());
-    let durable = store
+    let AssignmentOperation::Add { input, .. } = &fixture.assignment.assignment else {
+        panic!("expected managed Add assignment");
+    };
+    let placement = store
         .objects()
-        .durable_object(
+        .object_placement(
             &fixture.job_key.tenant_id,
             &fixture.index_key.artifact_id,
+            &input.storage_volume_id,
+            &input.artifact_placement_id,
+            input.placement_generation,
             fixture.object_id,
         )
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(durable.size, u64::MAX);
+    if expect_placement {
+        assert_eq!(placement.unwrap().receipt.size.get(), u64::MAX);
+    } else {
+        assert!(placement.is_none());
+    }
     assert_eq!(
         store
             .publisher()
@@ -836,7 +975,6 @@ async fn assert_contract_state(store: &AuthorityStore, fixture: &ContractFixture
             .unwrap(),
         fixture.published_version
     );
-    let AssignmentOperation::Add { input, .. } = &fixture.assignment.assignment;
     assert!(store
         .outbox()
         .pending_for_agent(&input.agent_id, 1)
@@ -954,12 +1092,13 @@ async fn assert_tenant_isolation(store: AuthorityStore) {
             store.clone(),
             Arc::new(neoengramd::InMemoryClock::new(100)),
         );
+        let target = assignment_target();
         control
             .assign_job(AssignJobRequest {
                 actor: spec.principal.clone(),
                 tenant_id: spec.tenant_id.clone(),
                 job_id: spec.job_id.clone(),
-                target: assignment_target(),
+                target: target.clone(),
             })
             .await
             .unwrap();
@@ -978,7 +1117,13 @@ async fn assert_tenant_isolation(store: AuthorityStore) {
         let object_id = ObjectId::for_bytes(b"shared-object");
         store
             .objects()
-            .record_durability(&durability_receipt(&spec, object_id, 13))
+            .record_placement(&placement_evidence(
+                &spec,
+                &target,
+                "shared-receipt",
+                object_id,
+                13,
+            ))
             .await
             .unwrap();
 
@@ -1036,9 +1181,12 @@ async fn assert_tenant_isolation(store: AuthorityStore) {
             .is_complete());
         assert!(store
             .objects()
-            .durable_object(
+            .object_placement(
                 &tenant_id,
                 &ArtifactId::new("artifact-a").unwrap(),
+                &StorageVolumeId::new("volume-a").unwrap(),
+                &ArtifactPlacementId::new("placement-a").unwrap(),
+                PlacementGeneration::new(1),
                 ObjectId::for_bytes(b"shared-object"),
             )
             .await
@@ -1060,9 +1208,14 @@ async fn assert_tenant_isolation(store: AuthorityStore) {
 fn queued_job(spec: AddJobSpec) -> JobRecord {
     JobRecord {
         spec,
+        operation: JobOperation::Add,
+        workspace_spec: None,
+        snapshot_spec: None,
         state: JobState::Queued,
         resource_version: ResourceVersion::new(1),
         assignment: None,
+        workspace_assignment: None,
+        snapshot_assignment: None,
         accepted: None,
         progress: None,
         prepared: None,
@@ -1147,31 +1300,6 @@ fn metadata_batch(spec: &AddJobSpec) -> (MetadataBatchDescriptor, MetadataBatchP
     )
     .unwrap();
     (descriptor, page)
-}
-
-fn durability_receipt(
-    spec: &AddJobSpec,
-    object_id: ObjectId,
-    size: u64,
-) -> ObjectDurabilityReceipt {
-    ObjectDurabilityReceipt {
-        tenant_id: spec.tenant_id.clone(),
-        artifact_id: spec.artifact_id.clone(),
-        session_id: SessionId::new("session-a").unwrap(),
-        job_id: spec.job_id.clone(),
-        object: WireObjectSpec {
-            object_id,
-            size: DecimalU64::new(size),
-            extensions: Extensions::new(),
-        },
-        state: DurabilityState::Durable {
-            verified_digest: object_id.digest(),
-            storage_version: "storage-version-a".to_owned(),
-            extensions: Extensions::new(),
-        },
-        checked_at_unix_ms: UnixMillis::new(200),
-        extensions: Extensions::new(),
-    }
 }
 
 fn index_key(tenant: &str) -> IndexKey {
@@ -1294,6 +1422,95 @@ fn publication_mutations() -> Vec<IndexDeltaRecord> {
         chunk_count: DecimalU64::new(manifest.chunk_count().unwrap()),
         extensions: Extensions::new(),
     }]
+}
+
+fn placement_evidence(
+    spec: &AddJobSpec,
+    target: &AssignmentTarget,
+    receipt_id: &str,
+    object_id: ObjectId,
+    size: u64,
+) -> ObjectPlacementEvidence {
+    ObjectPlacementEvidence {
+        receipt: ObjectReceiptRecord {
+            receipt_id: ObjectReceiptId::new(receipt_id).unwrap(),
+            tenant_id: spec.tenant_id.clone(),
+            artifact_id: spec.artifact_id.clone(),
+            job_id: spec.job_id.clone(),
+            storage_volume_id: target.storage_volume_id.clone(),
+            artifact_placement_id: target.artifact_placement_id.clone(),
+            object_id,
+            size: DecimalU64::new(size),
+            verified_at_unix_ms: UnixMillis::new(500),
+            extensions: Extensions::new(),
+        },
+        placement_generation: target.placement_generation,
+    }
+}
+
+async fn assert_object_placement_scope(store: AuthorityStore) {
+    let object_id = ObjectId::for_bytes(b"volume-owned-object");
+    let evidence = ObjectPlacementEvidence {
+        receipt: ObjectReceiptRecord {
+            receipt_id: ObjectReceiptId::new("receipt-placement-a").unwrap(),
+            tenant_id: TenantId::new("tenant-a").unwrap(),
+            artifact_id: ArtifactId::new("artifact-a").unwrap(),
+            job_id: neoengram_protocol::JobId::new("job-placement-a").unwrap(),
+            storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
+            artifact_placement_id: ArtifactPlacementId::new("placement-a").unwrap(),
+            object_id,
+            size: DecimalU64::new(19),
+            verified_at_unix_ms: UnixMillis::new(500),
+            extensions: Extensions::new(),
+        },
+        placement_generation: PlacementGeneration::new(7),
+    };
+    let objects = store.objects();
+    objects.record_placement(&evidence).await.unwrap();
+    objects.record_placement(&evidence).await.unwrap();
+
+    let found = objects
+        .object_placement(
+            &evidence.receipt.tenant_id,
+            &evidence.receipt.artifact_id,
+            &evidence.receipt.storage_volume_id,
+            &evidence.receipt.artifact_placement_id,
+            evidence.placement_generation,
+            object_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(found, Some(evidence.clone()));
+
+    for (volume, placement, generation) in [
+        ("volume-b", "placement-a", PlacementGeneration::new(7)),
+        ("volume-a", "placement-b", PlacementGeneration::new(7)),
+        ("volume-a", "placement-a", PlacementGeneration::new(8)),
+    ] {
+        assert!(objects
+            .object_placement(
+                &evidence.receipt.tenant_id,
+                &evidence.receipt.artifact_id,
+                &StorageVolumeId::new(volume).unwrap(),
+                &ArtifactPlacementId::new(placement).unwrap(),
+                generation,
+                object_id,
+            )
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    let mut conflicting = evidence.clone();
+    conflicting.receipt.object_id = ObjectId::for_bytes(b"different-object");
+    assert_eq!(
+        objects
+            .record_placement(&conflicting)
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::MetadataInvalid
+    );
 }
 
 async fn initialize_and_close(path: &Path) {

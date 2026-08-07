@@ -654,7 +654,6 @@ fn development_config(authority_dir: PathBuf, keyring: PathBuf) -> Config {
         agent_bind: Some("127.0.0.1:0".parse().unwrap()),
         agent_enrollment_keyring_file: Some(keyring),
         authority_dir,
-        object_store_root: None,
         rbac_file: None,
         oidc_issuer: None,
         oidc_audience: None,

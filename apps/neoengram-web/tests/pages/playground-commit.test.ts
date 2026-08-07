@@ -1,5 +1,6 @@
 import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query';
 import { flushPromises, shallowMount } from '@vue/test-utils';
+import { ElMessageBox } from 'element-plus';
 import { createPinia } from 'pinia';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -10,6 +11,7 @@ import PlaygroundCommitPage from '@/pages/PlaygroundCommitPage.vue';
 const api = vi.hoisted(() => ({
   cancelPlaygroundPreCommit: vi.fn(),
   commitPlayground: vi.fn(),
+  queryApiVersion: vi.fn(),
   queryPlayground: vi.fn(),
   queryPlaygroundChangeList: vi.fn(),
   queryPlaygroundPreCommit: vi.fn(),
@@ -19,7 +21,13 @@ const api = vi.hoisted(() => ({
 
 vi.mock('@/api/operations', () => api);
 
-function playground(activePreCommitId?: string) {
+const headCommitId = 'a'.repeat(64);
+const sourceIndexVersion = { revision: '2', digest: 'sha256:index' };
+
+function playground(
+  activePreCommitId?: string,
+  indexVersion: { revision: string; digest: string } = sourceIndexVersion,
+) {
   return {
     tenant_id: 'tenant-a',
     project_id: 'project-a',
@@ -28,8 +36,8 @@ function playground(activePreCommitId?: string) {
     storage_volume_id: 'volume-a',
     region: 'region-a',
     display_name: 'Playground A',
-    head_commit_id: 'commit-a',
-    index_version: { revision: '2', digest: 'sha256:index' },
+    head_commit_id: headCommitId,
+    index_version: indexVersion,
     state: 'ready' as const,
     ...(activePreCommitId ? { active_precommit_id: activePreCommitId } : {}),
     created_at_unix_ms: '1',
@@ -42,6 +50,14 @@ async function mountPage(
   routedPreCommitId?: string,
   precommitOverrides: Record<string, unknown> = {},
 ) {
+  api.queryApiVersion.mockResolvedValue({
+    data: {
+      api_versions: [1],
+      agent_protocol_versions: [1],
+      capabilities: ['resource_browser'],
+    },
+    requestId: 'request-version',
+  });
   api.queryPlayground.mockResolvedValue({
     data: { playground: playground(activePreCommitId) },
     requestId: 'request-playground',
@@ -62,7 +78,7 @@ async function mountPage(
         checks: [],
         warnings: [],
         blockers: [],
-        source_index_version: { revision: '2', digest: 'sha256:index' },
+        source_index_version: sourceIndexVersion,
         created_at_unix_ms: '1',
         updated_at_unix_ms: '2',
         ...precommitOverrides,
@@ -107,6 +123,11 @@ async function mountPage(
   const wrapper = shallowMount(PlaygroundCommitPage, {
     global: {
       plugins: [createPinia(), [VueQueryPlugin, { queryClient }], router],
+      stubs: {
+        PageHeading: {
+          template: '<section><slot /><slot name="actions" /></section>',
+        },
+      },
     },
   });
   await flushPromises();
@@ -134,11 +155,28 @@ describe('Playground Commit page recovery', () => {
     queryClient.clear();
   });
 
-  it('recovers the active server session and queries its frozen changes', async () => {
+  it('does not query frozen changes while a running Pre-commit has no candidate', async () => {
     const { wrapper, queryClient } = await mountPage('precommit-a');
 
     expect(api.queryPlaygroundPreCommit).toHaveBeenCalledWith('tenant-a', 'precommit-a');
-    expect(api.queryPlaygroundChangeList).toHaveBeenCalledWith(
+    expect(api.queryPlaygroundChangeList).not.toHaveBeenCalled();
+    expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('queries ready candidate changes again under a new key when the candidate changes', async () => {
+    const firstCandidate = { revision: '3', digest: 'sha256:candidate-3' };
+    const secondCandidate = { revision: '4', digest: 'sha256:candidate-4' };
+    const { wrapper, queryClient } = await mountPage('precommit-a', undefined, {
+      state: 'ready',
+      phase: 'idle',
+      candidate_index_version: firstCandidate,
+    });
+
+    expect(api.queryPlaygroundChangeList).toHaveBeenCalledTimes(1);
+    expect(api.queryPlaygroundChangeList).toHaveBeenLastCalledWith(
       expect.objectContaining({
         tenant_id: 'tenant-a',
         project_id: 'project-a',
@@ -147,7 +185,102 @@ describe('Playground Commit page recovery', () => {
         precommit_id: 'precommit-a',
       }),
     );
-    expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
+
+    api.queryPlaygroundPreCommit.mockResolvedValueOnce({
+      data: {
+        precommit: {
+          tenant_id: 'tenant-a',
+          project_id: 'project-a',
+          artifact_id: 'artifact-a',
+          playground_id: 'playground-a',
+          precommit_id: 'precommit-a',
+          precommit_request_id: 'request-a',
+          attempt: 1,
+          state: 'ready',
+          phase: 'idle',
+          progress: { percent: 100, files_completed: '2', bytes_completed: '20' },
+          checks: [],
+          warnings: [],
+          blockers: [],
+          source_index_version: sourceIndexVersion,
+          candidate_index_version: secondCandidate,
+          created_at_unix_ms: '1',
+          updated_at_unix_ms: '3',
+        },
+      },
+      requestId: 'request-precommit-refresh',
+    });
+
+    const refreshButton = wrapper
+      .findAll('el-button, el-button-stub')
+      .find((button) => button.text().trim() === '刷新');
+    expect(refreshButton).toBeDefined();
+    await refreshButton!.trigger('click');
+    await flushPromises();
+
+    expect(api.queryPlaygroundChangeList).toHaveBeenCalledTimes(2);
+    const changeQueryKeys = queryClient
+      .getQueryCache()
+      .getAll()
+      .filter(
+        (query) => query.queryKey[0] === 'playground-changes' && query.state.data !== undefined,
+      )
+      .map((query) => query.queryKey);
+    expect(changeQueryKeys).toHaveLength(2);
+    expect(new Set(changeQueryKeys.map((queryKey) => JSON.stringify(queryKey))).size).toBe(2);
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('refreshes the Playground after cancel and starts redetection from the newer revision', async () => {
+    const nextIndexVersion = { revision: '3', digest: 'sha256:index-3' };
+    const { wrapper, queryClient } = await mountPage('precommit-a', undefined, {
+      state: 'ready',
+      phase: 'idle',
+      candidate_index_version: { revision: '3', digest: 'sha256:candidate-3' },
+    });
+    vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue(undefined as never);
+    api.cancelPlaygroundPreCommit.mockResolvedValue({
+      data: {
+        precommit: { precommit_id: 'precommit-a', state: 'cancelled' },
+        playground: playground(undefined, nextIndexVersion),
+        replayed: false,
+      },
+      requestId: 'request-cancel',
+    });
+    api.queryPlayground.mockResolvedValue({
+      data: { playground: playground(undefined, nextIndexVersion) },
+      requestId: 'request-playground-refresh',
+    });
+    api.startPlaygroundPreCommit.mockResolvedValue({
+      data: {
+        precommit: { precommit_id: 'precommit-b', state: 'running' },
+        playground: playground('precommit-b', nextIndexVersion),
+        replayed: false,
+      },
+      requestId: 'request-start',
+    });
+
+    const redetectButton = wrapper
+      .findAll('el-button, el-button-stub')
+      .find((button) => button.text().trim() === '重新检测');
+    expect(redetectButton).toBeDefined();
+    await redetectButton!.trigger('click');
+    await flushPromises();
+
+    expect(api.cancelPlaygroundPreCommit).toHaveBeenCalledTimes(1);
+    expect(api.startPlaygroundPreCommit).toHaveBeenCalledWith(
+      expect.objectContaining({ expected_index_version: nextIndexVersion }),
+    );
+    const cancelOrder = api.cancelPlaygroundPreCommit.mock.invocationCallOrder[0]!;
+    const refreshedPlaygroundOrder = api.queryPlayground.mock.invocationCallOrder.find(
+      (order) => order > cancelOrder,
+    );
+    const startOrder = api.startPlaygroundPreCommit.mock.invocationCallOrder[0]!;
+    expect(refreshedPlaygroundOrder).toBeDefined();
+    expect(cancelOrder).toBeLessThan(refreshedPlaygroundOrder!);
+    expect(refreshedPlaygroundOrder!).toBeLessThan(startOrder);
 
     wrapper.unmount();
     queryClient.clear();

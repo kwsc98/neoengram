@@ -7,7 +7,9 @@
     "lint": "npm run lint:public && npm run lint:agent",
     "lint:public": "redocly lint --config redocly.yaml neoengram-api.yaml",
     "lint:agent": "redocly lint --config redocly.yaml neoengram-agent-api.yaml",
-    "bundle": "mkdir -p ../../target/openapi && redocly bundle --config redocly.yaml neoengram-api.yaml --output ../../target/openapi/neoengram-api.json",
+    "bundle": "mkdir -p ../../target/openapi && npm run bundle:public && npm run bundle:agent",
+    "bundle:public": "redocly bundle --config redocly.yaml neoengram-api.yaml --output ../../target/openapi/neoengram-api.json",
+    "bundle:agent": "redocly bundle --config redocly.yaml neoengram-agent-api.yaml --output ../../target/openapi/neoengram-agent-api.json",
     "test:contract": "node scripts/check-contract.mjs"
   },
   "devDependencies": {

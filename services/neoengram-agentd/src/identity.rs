@@ -1,9 +1,11 @@
 use std::{path::Path, sync::Arc};
 
 use neoengram_agent::{
-    PrivateKeyMaterial, SqliteSystemIdentityStore, SystemIdentityRecord, SystemIdentitySeed,
+    OutboundReportQueue, PrivateKeyMaterial, SqliteOutboundReportQueue,
+    SqliteOutboundReportQueueConfig, SqliteSystemIdentityStore, SystemIdentityRecord,
+    SystemIdentitySeed,
 };
-use neoengram_protocol::Ed25519PublicKeySpki;
+use neoengram_protocol::{AgentId, Ed25519PublicKeySpki, TenantId};
 use ring::{
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair},
@@ -59,6 +61,32 @@ pub fn load_persisted_identity(
     }))
 }
 
+/// Reports whether a stopped Agent still has durable control reports awaiting acknowledgement.
+///
+/// This diagnostic reuses the Agent's typed storage adapter and identity validation. It therefore
+/// fails if another Agent process still owns either database or if the configured Tenant differs
+/// from the durable outbound scope.
+pub fn has_pending_outbound_reports(
+    state_dir: impl AsRef<Path>,
+    tenant_id: TenantId,
+) -> AgentDaemonResult<bool> {
+    let state_dir = state_dir.as_ref();
+    let identity = load_persisted_identity(state_dir)?
+        .ok_or_else(|| AgentDaemonError::Identity("Agent identity is not initialized".into()))?;
+    let approved_agent_id = identity.approved_agent_id.ok_or_else(|| {
+        AgentDaemonError::Identity("Agent identity has no approved Agent ID".into())
+    })?;
+    let agent_id = AgentId::new(approved_agent_id)
+        .map_err(|error| AgentDaemonError::Identity(error.to_string()))?;
+    let queue = SqliteOutboundReportQueue::open(SqliteOutboundReportQueueConfig::new(
+        state_dir.join("outbound"),
+        agent_id,
+        tenant_id,
+    ))?;
+    queue.integrity_check()?;
+    Ok(!queue.list(1)?.is_empty())
+}
+
 /// Loads the immutable installation identity, creating an Ed25519 PKCS#8 key and stable IDs once.
 pub fn load_or_create_identity(
     store: &SqliteSystemIdentityStore,
@@ -104,6 +132,11 @@ pub(crate) fn public_key_spki_der(signing_key: &Ed25519KeyPair) -> AgentDaemonRe
 
 #[cfg(test)]
 mod tests {
+    use neoengram_agent::{AgentReport, ApprovedAgentIdentity};
+    use neoengram_protocol::{
+        AssignmentGeneration, AssignmentId, Extensions, JobAccepted, JobId, UnixMillis,
+    };
+
     use super::*;
 
     #[test]
@@ -137,5 +170,55 @@ mod tests {
         assert_eq!(summary.approved_enrollment_id, None);
         assert_eq!(summary.terminal_enrollment_state, None);
         assert_eq!(summary.terminal_enrollment_id, None);
+    }
+
+    #[test]
+    fn pending_outbound_diagnostic_uses_the_approved_typed_queue_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteSystemIdentityStore::open(directory.path()).unwrap();
+        let identity = load_or_create_identity(&store).unwrap();
+        store
+            .bind_approved(
+                identity.revision,
+                ApprovedAgentIdentity::new("agent-a", "enrollment-a").unwrap(),
+            )
+            .unwrap();
+        drop(store);
+
+        let tenant_id = TenantId::new("tenant-a").unwrap();
+        assert!(!has_pending_outbound_reports(directory.path(), tenant_id.clone()).unwrap());
+
+        let queue = SqliteOutboundReportQueue::open(SqliteOutboundReportQueueConfig::new(
+            directory.path().join("outbound"),
+            AgentId::new("agent-a").unwrap(),
+            tenant_id.clone(),
+        ))
+        .unwrap();
+        let queued = queue
+            .enqueue(
+                AgentReport::Accepted(JobAccepted {
+                    job_id: JobId::new("job-a").unwrap(),
+                    assignment_id: AssignmentId::new("assignment-a").unwrap(),
+                    assignment_generation: AssignmentGeneration::new(1),
+                    accepted_at_unix_ms: UnixMillis::new(100),
+                    request_digest: neoengram_protocol::ContentDigest::hash(b"assignment-a"),
+                    extensions: Extensions::new(),
+                }),
+                UnixMillis::new(200),
+            )
+            .unwrap();
+        drop(queue);
+
+        assert!(has_pending_outbound_reports(directory.path(), tenant_id.clone()).unwrap());
+
+        let queue = SqliteOutboundReportQueue::open(SqliteOutboundReportQueueConfig::new(
+            directory.path().join("outbound"),
+            AgentId::new("agent-a").unwrap(),
+            tenant_id.clone(),
+        ))
+        .unwrap();
+        assert!(queue.acknowledge(&queued.message_id).unwrap());
+        drop(queue);
+        assert!(!has_pending_outbound_reports(directory.path(), tenant_id).unwrap());
     }
 }

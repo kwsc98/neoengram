@@ -6,7 +6,7 @@ use std::{
 };
 
 use fusen_rs::{RunningServer, ServerState};
-use neoengram_core::{ContentDigest, LogicalPath};
+use neoengram_core::{ContentDigest, IndexVersion, LogicalPath};
 use neoengram_protocol::{
     AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
     DecisionGeneration, EdgeClusterId, Extensions, JobDecision, JobFinalized, JobId, JobState,
@@ -16,8 +16,10 @@ use neoengram_protocol::{
 };
 use neoengram_server::{AppState, Config};
 use neoengramd::{
-    open_sqlite_authority, AddJobSpec, AllowAllAuthorizer, AssignJobRequest, AssignmentTarget,
-    ControlPlane, CreateAddJobRequest, InMemoryClock, SqliteAuthorityConfig,
+    open_sqlite_authority, AddJobSpec, AllowAllAuthorizer, ArtifactInitialization, ArtifactRecord,
+    AssignJobRequest, AssignmentTarget, CatalogPvcReference, ControlPlane, CreateAddJobRequest,
+    InMemoryClock, PlaygroundRecord, PlaygroundState, SqliteAuthorityConfig, StorageAccessMode,
+    StorageBackendType, StorageVolumeRecord, StorageVolumeState, TenantRecord,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -48,6 +50,7 @@ impl RawResponse {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_rejects_every_server_owned_root_field_before_persisting() {
     let authority = TempDir::new().unwrap();
+    seed_job_scopes(authority.path(), &["tenant-a"]).await;
     let config = development_config(authority.path().to_path_buf());
     let (state, running) = start(&config).await;
     let address = running.local_addr();
@@ -97,6 +100,7 @@ async fn create_rejects_every_server_owned_root_field_before_persisting() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_survives_restart_and_job_view_never_exposes_internal_identity_or_leases() {
     let authority = TempDir::new().unwrap();
+    seed_job_scopes(authority.path(), &["tenant-a"]).await;
     let config = development_config(authority.path().to_path_buf());
     let (state, running) = start(&config).await;
     let address = running.local_addr();
@@ -164,6 +168,7 @@ async fn query_survives_restart_and_job_view_never_exposes_internal_identity_or_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_hidden() {
     let authority = TempDir::new().unwrap();
+    seed_job_scopes(authority.path(), &["tenant-a", "tenant-b"]).await;
     let mut seed_config = development_config(authority.path().to_path_buf());
     seed_config.development_tenants = vec!["*".to_owned()];
     let (seed_state, seed_server) = start(&seed_config).await;
@@ -273,6 +278,7 @@ async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successful_finalize_replays_without_exposing_real_assignment_identity() {
     let authority = TempDir::new().unwrap();
+    seed_job_scopes(authority.path(), &["tenant-a"]).await;
     seed_succeeded_job(authority.path()).await;
     let config = development_config(authority.path().to_path_buf());
     let (state, running) = start(&config).await;
@@ -460,6 +466,90 @@ async fn stop(state: AppState, running: RunningServer) {
     state.close().await;
 }
 
+async fn seed_job_scopes(path: &Path, tenants: &[&str]) {
+    let authority = open_sqlite_authority(SqliteAuthorityConfig::new(path))
+        .await
+        .unwrap();
+    let catalog = authority
+        .authority_store()
+        .control_catalog()
+        .expect("SQLite authority must compose the control catalog");
+    let project_id = ProjectId::new("project-a").unwrap();
+    let artifact_id = ArtifactId::new("artifact-a").unwrap();
+    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let storage_volume_id = StorageVolumeId::new("volume-a").unwrap();
+    let now = UnixMillis::new(1_000);
+    for tenant in tenants {
+        let tenant_id = TenantId::new(*tenant).unwrap();
+        catalog
+            .insert_tenant(TenantRecord {
+                tenant_id: tenant_id.clone(),
+                display_name: format!("Tenant {tenant}"),
+                description: None,
+                resource_version: 1,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })
+            .await
+            .unwrap();
+        catalog
+            .insert_artifact(ArtifactRecord {
+                tenant_id: tenant_id.clone(),
+                project_id: project_id.clone(),
+                artifact_id: artifact_id.clone(),
+                display_name: "Artifact A".to_owned(),
+                description: None,
+                initialization: ArtifactInitialization::Empty,
+                head_commit_id: None,
+                resource_version: 1,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })
+            .await
+            .unwrap();
+        catalog
+            .insert_storage_volume(StorageVolumeRecord {
+                tenant_id: tenant_id.clone(),
+                storage_volume_id: storage_volume_id.clone(),
+                display_name: "Volume A".to_owned(),
+                edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
+                region: "cn-shanghai".to_owned(),
+                backend_type: StorageBackendType::Pvc,
+                access_mode: StorageAccessMode::ReadWriteMany,
+                pvc_reference: Some(CatalogPvcReference {
+                    namespace: "neoengram".to_owned(),
+                    claim_name: format!("data-{tenant}"),
+                }),
+                nfs_reference: None,
+                state: StorageVolumeState::Ready,
+                resource_version: 1,
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })
+            .await
+            .unwrap();
+        catalog
+            .insert_playground(PlaygroundRecord {
+                tenant_id,
+                project_id: project_id.clone(),
+                artifact_id: artifact_id.clone(),
+                playground_id: playground_id.clone(),
+                storage_volume_id: storage_volume_id.clone(),
+                region: "cn-shanghai".to_owned(),
+                display_name: "Playground A".to_owned(),
+                base_commit_id: None,
+                head_commit_id: None,
+                state: PlaygroundState::Ready,
+                relative_root: "playgrounds/project-a/artifact-a/playground-a".to_owned(),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+            })
+            .await
+            .unwrap();
+    }
+    authority.close().await;
+}
+
 async fn seed_succeeded_job(path: &Path) {
     let authority = open_sqlite_authority(SqliteAuthorityConfig::new(path))
         .await
@@ -569,7 +659,6 @@ fn development_config(authority_dir: PathBuf) -> Config {
         agent_bind: None,
         agent_enrollment_keyring_file: None,
         authority_dir,
-        object_store_root: None,
         rbac_file: None,
         oidc_issuer: None,
         oidc_audience: None,
@@ -595,6 +684,7 @@ fn protected_headers() -> [(&'static str, &'static str); 3] {
 }
 
 fn add_request(tenant_id: &str, job_id: &str) -> Value {
+    let index = IndexVersion::from_snapshot(0, &[]).unwrap();
     json!({
         "tenant_id": tenant_id,
         "project_id": "project-a",
@@ -602,8 +692,8 @@ fn add_request(tenant_id: &str, job_id: &str) -> Value {
         "playground_id": "playground-a",
         "job_id": job_id,
         "expected_index_version": {
-            "revision": "0",
-            "digest": "0".repeat(64)
+            "revision": index.revision.to_string(),
+            "digest": index.digest.to_string()
         },
         "deadline_unix_ms": "4102444800000",
         "paths": ["dataset/images"],

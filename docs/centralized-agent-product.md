@@ -5,8 +5,8 @@
 > 适用对象：产品、设计、前端、OpenAPI、`neoengramd`、Agent 和测试团队。
 >
 > 能力声明：本文描述目标产品和已经验证的交互语义。当前真正可运行的是本地 Standalone、SQLite
-> authority、已注册的用户 HTTP/OIDC/RBAC 纵切，以及 Agent enrollment daemon 与 bootstrap/status
-> transport。P0 Web 的其余 operation 仍由 MSW 提供；Agent 证书/session、真实 NFS/S3 和分布式调度尚未实现。
+> authority、已注册的用户 HTTP/OIDC/RBAC 纵切，以及 Agent enrollment/session/Job transport
+> 开发纵切。生产 mTLS、完整 NFS 认证、跨 Volume 对象复制和分布式调度尚未实现。
 
 本文回答三个问题：用户在管理什么、各资源之间是什么关系、中心和 Agent 应如何支撑完整的数据
 生产与交付流程。技术权威边界和实现细节见
@@ -70,7 +70,7 @@ NeoEngram 是面向大规模训练数据、模型权重和其他文件型数据�
 | Snapshot 状态   | 主状态表达 `Creating`、`Ready` 或 `Abnormal`；物化、校验等作为 Job/活动阶段展示                         |
 | 元数据          | 中心保存权威 Index 和已发布元数据；用户可以查看文件元数据及可视化 Diff                                  |
 | Job             | Job 是操作产生的异步执行记录，默认从业务动作进入，不要求用户先创建 Job                                  |
-| 数据路径        | Agent 访问区域存储和短期对象票据，业务数据不经过中心 API 进程                                           |
+| 数据路径        | Agent 直接读写获批 StorageVolume 中的 Playground 和对象 CAS，Chunk 不经过中心 API 进程                         |
 | Agent 放置      | 0.0.1 Kubernetes 部署中一个业务 PVC 对应一个 StorageVolume 和一个常驻 AgentInstance                    |
 | Agent 接入      | Agent 只主动出站注册；首次接入必须经 TenantAdmin 在存储页审批，审批前不能成为 Volume Owner 或领取 Job   |
 
@@ -94,8 +94,7 @@ flowchart TB
         WORKFLOW["工作流与状态<br/>Playground · Pre-commit<br/>Snapshot · Job"]
         META["元数据与可视化<br/>Index · File Metadata<br/>Profile · Diff"]
         OPS["调度与治理<br/>Scheduler · Lease<br/>Quota · Audit"]
-        DB[("Authority Store<br/>业务资源 / 状态 / 审计")]
-        S3[("Central S3<br/>不可变 payload 耐久权威")]
+        DB[("Authority Store<br/>业务资源 / 状态 / 审计<br/>Object placement evidence（无 payload）")]
 
         API --> CATALOG
         API --> WORKFLOW
@@ -111,7 +110,7 @@ flowchart TB
     subgraph REGION_A["Region A · EdgeCluster A"]
         direction LR
         AGENT_A["Agent A<br/>受控执行器"]
-        VOLUME_A[("StorageVolume A<br/>PVC / NFS")]
+        VOLUME_A[("StorageVolume A<br/>PVC / NFS<br/>Playground + immutable object CAS")]
         PG_A["Playground<br/>RW · 单 Region / Volume"]
         SS_A["Snapshot A<br/>RO · Commit C1 · 单 Region"]
         POD_A["Business / Training Pod"]
@@ -125,7 +124,7 @@ flowchart TB
     subgraph REGION_B["Region B · EdgeCluster B"]
         direction LR
         AGENT_B["Agent B<br/>受控执行器"]
-        VOLUME_B[("StorageVolume B<br/>PVC / NFS")]
+        VOLUME_B[("StorageVolume B<br/>PVC / NFS<br/>Playground + immutable object CAS")]
         PG_B["Playground<br/>RW · 单 Region / Volume"]
         SS_B["Snapshot B<br/>RO · Commit C1 · 单 Region"]
         POD_B["Business / Training Pod"]
@@ -140,9 +139,6 @@ flowchart TB
     OPS <-->|"Agent 主动建立控制连接<br/>assignment / status"| AGENT_B
     AGENT_A -.->|"Index / metadata / progress"| META
     AGENT_B -.->|"Index / metadata / progress"| META
-    AGENT_A <-->|"短期 ticket · object I/O"| S3
-    AGENT_B <-->|"短期 ticket · object I/O"| S3
-
     classDef entry fill:#ffffff,stroke:#3f4752,color:#17191d,stroke-width:1.5px;
     classDef control fill:#eaf1ff,stroke:#2563eb,color:#172554,stroke-width:1.5px;
     classDef authority fill:#e7f8ec,stroke:#15803d,color:#14532d,stroke-width:2px;
@@ -152,15 +148,16 @@ flowchart TB
 
     class ENTRY,POD_A,POD_B entry;
     class API,CATALOG,WORKFLOW,META,OPS control;
-    class DB,S3 authority;
+    class DB authority;
     class AGENT_A,AGENT_B agent;
     class VOLUME_A,VOLUME_B storage;
     class PG_A,PG_B,SS_A,SS_B view;
 ```
 
-图中的四类路径必须保持分离：UI/CLI 只走中心 API；Agent 通过主动建立的控制连接接收任务并上报
-状态与元数据；不可变对象由 Agent 使用短期票据直接读写中心 S3；业务 Pod 直接访问本区域
-StorageVolume 上的 Playground 或 Snapshot。Region 之间不建立 Agent-to-Agent 或 NFS-to-NFS 数据通道。
+图中的路径必须保持分离：UI/CLI 只走中心 API；Agent 通过主动建立的控制连接接收任务并上报
+状态与元数据；不可变对象由 Agent 写入用户 StorageVolume 上 tenant/artifact 隔离的 CAS；业务 Pod
+直接访问本区域 StorageVolume 上的 Playground 或 Snapshot。当前 Region 之间不建立数据通道；后续
+跨 Volume 复制也必须在数据面直接完成，不得经过中心 API 代理 payload。
 
 ## 3. 用户与角色
 
@@ -511,7 +508,7 @@ Pre-commit 使用正交的 `state + phase`，页面标签不得把 `ready` 当�
 
 | state       | 合法 phase                                            | 页面行为与动作                                             |
 | ----------- | ----------------------------------------------------- | ---------------------------------------------------------- |
-| `running`   | `queued/scanning/hashing/uploading/validating`         | 展示权威进度；可取消；重新检测执行 cancel 后 start         |
+| `running`   | `queued/scanning/hashing/persisting/validating`        | 展示权威进度；可取消；重新检测执行 cancel 后 start         |
 | `ready`     | `idle`                                                | 展示候选、Diff、checks 和 warnings；可 Commit 或重新检测    |
 | `abnormal`  | `idle`                                                | 有 blockers 时显示 Blocked，否则显示失败 issue；可 restart |
 | `cancelled` | `idle`                                                | 候选不可提交；可 restart，或显式 start 新会话              |
@@ -604,7 +601,7 @@ Add、Pre-commit、Commit、Materialize 和 Verify 细分。P0 资源页面和�
 
 内部事件可以关联 `tenant_id`、主体、资源 scope、`request_id`、`trace_id`、`job_id`、Agent/assignment
 身份、结果、错误码和时间；P0 普通用户 DTO 不得回显 Agent/assignment。任何事件都不得记录 JWT、
-Signed URL、凭证、数据内容或物理绝对路径。
+TransferTicket、数据端点凭证、数据内容或物理绝对路径。
 
 ### 11.3 产品指标（P1）
 

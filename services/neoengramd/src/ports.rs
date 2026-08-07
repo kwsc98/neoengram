@@ -4,17 +4,22 @@ use async_trait::async_trait;
 use neoengram_core::ObjectId;
 use neoengram_protocol::{
     AgentId, ArtifactId, JobAssignment, MetadataBatchDescriptor, MetadataBatchId,
-    MetadataBatchPage, ObjectDurabilityReceipt, TenantId, UnixMillis, WireIndexVersion,
+    MetadataBatchPage, PlacementGeneration, StorageVolumeId, TenantId, UnixMillis,
+    WireIndexVersion,
 };
 
 use crate::{
     AgentEnrollmentAuditEvent, AgentEnrollmentExpiryReconciliation,
     AgentEnrollmentLifecycleAuditEvent, AgentEnrollmentListPage, AgentEnrollmentListRequest,
-    AgentRegistryRecord, AgentRegistryReplacementRecords, AuditEvent, AuthorizationRequest,
-    CatalogInsertOutcome, CentralResult, DurableObject, IndexKey, IndexPublishOutcome,
-    IndexPublishRequest, JobKey, JobRecord, PlaygroundListPage, PlaygroundListRequest,
-    PlaygroundRecord, StagedMetadataBatch, StorageVolumeListPage, StorageVolumeListRequest,
-    StorageVolumeRecord, TenantListPage, TenantListRequest, TenantRecord,
+    AgentRegistryRecord, AgentRegistryReplacementRecords, ArtifactListPage, ArtifactListRequest,
+    ArtifactRecord, AuditEvent, AuthorizationRequest, CatalogInsertOutcome, CentralResult,
+    IndexKey, IndexPublishOutcome, IndexPublishRequest, InitializeIndexSnapshotRequest, JobKey,
+    JobRecord, ObjectPlacementEvidence, PlaygroundInsertRequest, PlaygroundListPage,
+    PlaygroundListRequest, PlaygroundRecord, PreCommitCancelRequest, PreCommitCommitOutcome,
+    PreCommitCommitRequest, PreCommitKey, PreCommitMutationOutcome, PreCommitRecord,
+    PreCommitRestartRequest, PreCommitStartRequest, PublishedIndex, StagedMetadataBatch,
+    StorageVolumeListPage, StorageVolumeListRequest, StorageVolumeRecord, TenantListPage,
+    TenantListRequest, TenantRecord,
 };
 
 /// Result of atomically inserting a job or loading the record already stored at its key.
@@ -171,6 +176,21 @@ pub trait ControlCatalogRepository: Send + Sync {
         record: TenantRecord,
     ) -> CentralResult<CatalogInsertOutcome<TenantRecord>>;
 
+    async fn get_artifact(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &neoengram_protocol::ProjectId,
+        artifact_id: &neoengram_protocol::ArtifactId,
+    ) -> CentralResult<Option<ArtifactRecord>>;
+    async fn list_artifacts(
+        &self,
+        request: &ArtifactListRequest,
+    ) -> CentralResult<ArtifactListPage>;
+    async fn insert_artifact(
+        &self,
+        record: ArtifactRecord,
+    ) -> CentralResult<CatalogInsertOutcome<ArtifactRecord>>;
+
     async fn get_storage_volume(
         &self,
         tenant_id: &TenantId,
@@ -199,7 +219,73 @@ pub trait ControlCatalogRepository: Send + Sync {
     async fn insert_playground(
         &self,
         record: PlaygroundRecord,
+    ) -> CentralResult<CatalogInsertOutcome<PlaygroundRecord>> {
+        self.insert_playground_fenced(PlaygroundInsertRequest {
+            record,
+            artifact_head: crate::ArtifactHeadExpectation::Any,
+        })
+        .await
+    }
+
+    /// Inserts a Playground while atomically fencing a Head observation made by the service.
+    /// Implementations must resolve an existing idempotent record before evaluating the fence.
+    async fn insert_playground_fenced(
+        &self,
+        request: PlaygroundInsertRequest,
     ) -> CentralResult<CatalogInsertOutcome<PlaygroundRecord>>;
+
+    /// Atomically advances a Playground lifecycle state. Implementations must treat a replay
+    /// which already observes `next` as idempotent, while rejecting a transition from another
+    /// state. This is the fencing boundary used by asynchronous materialization reports.
+    async fn transition_playground_state(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &neoengram_protocol::ProjectId,
+        artifact_id: &neoengram_protocol::ArtifactId,
+        playground_id: &neoengram_protocol::PlaygroundId,
+        expected: crate::PlaygroundState,
+        next: crate::PlaygroundState,
+        updated_at_unix_ms: UnixMillis,
+    ) -> CentralResult<PlaygroundRecord>;
+
+    /// Atomically advances both authority-derived Head pointers for one committed Playground.
+    /// An exact replay which already observes `commit_id` on both resources succeeds unchanged.
+    async fn advance_playground_commit(
+        &self,
+        request: crate::AdvancePlaygroundCommitRequest,
+    ) -> CentralResult<crate::AdvancePlaygroundCommitOutcome>;
+
+    async fn get_snapshot(
+        &self,
+        tenant_id: &TenantId,
+        snapshot_id: &neoengram_protocol::SnapshotId,
+    ) -> CentralResult<Option<crate::SnapshotRecord>>;
+
+    async fn list_snapshots(
+        &self,
+        request: &crate::SnapshotListRequest,
+    ) -> CentralResult<crate::SnapshotListPage>;
+
+    /// Idempotently inserts a Snapshot while atomically validating its Artifact Head fence,
+    /// Ready Volume binding, request identity, and reusable Commit/Volume placement identity.
+    async fn insert_snapshot_fenced(
+        &self,
+        request: crate::SnapshotInsertRequest,
+    ) -> CentralResult<crate::SnapshotInsertOutcome>;
+
+    /// Advances delivery lifecycle. An exact replay already at `next_state/next_phase` succeeds
+    /// and may advance `updated_at_unix_ms` for a persisted recovery lease; any other state is
+    /// rejected so stale Agent reports cannot overwrite a later result.
+    #[allow(clippy::too_many_arguments)]
+    async fn transition_snapshot_state(
+        &self,
+        tenant_id: &TenantId,
+        snapshot_id: &neoengram_protocol::SnapshotId,
+        expected_state: crate::SnapshotState,
+        next_state: crate::SnapshotState,
+        next_phase: crate::SnapshotPhase,
+        updated_at_unix_ms: UnixMillis,
+    ) -> CentralResult<crate::SnapshotRecord>;
 }
 
 #[async_trait]
@@ -231,6 +317,73 @@ pub trait JobRepository: Send + Sync {
     async fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord>;
 }
 
+/// Durable Pre-commit aggregate and immutable Commit repository.
+///
+/// `commit` consumes a candidate and inserts its Commit in one authority transaction. Updating
+/// Artifact and Playground Head pointers remains a separate control-catalog recovery boundary.
+#[async_trait]
+pub trait PreCommitRepository: Send + Sync {
+    async fn start(
+        &self,
+        request: PreCommitStartRequest,
+    ) -> CentralResult<PreCommitMutationOutcome>;
+    async fn get(&self, key: &PreCommitKey) -> CentralResult<Option<PreCommitRecord>>;
+    /// Returns the current operation for one Playground. Abnormal sessions remain active so the
+    /// user can inspect and restart them; cancelled and committed history is excluded.
+    async fn get_active(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &neoengram_protocol::ProjectId,
+        artifact_id: &ArtifactId,
+        playground_id: &neoengram_protocol::PlaygroundId,
+    ) -> CentralResult<Option<PreCommitRecord>>;
+    /// Stable keyset scan used to recover attempts whose Pre-commit write committed before their
+    /// associated Add Job was created or dispatched.
+    async fn list_running(
+        &self,
+        after: Option<&PreCommitKey>,
+        limit: usize,
+    ) -> CentralResult<Vec<PreCommitRecord>>;
+    /// Lists committed Pre-commits whose immutable Commit is durable but whose Artifact and
+    /// Playground Head publication has not yet been acknowledged.
+    async fn list_unpublished_commits(
+        &self,
+        after: Option<&PreCommitKey>,
+        limit: usize,
+    ) -> CentralResult<Vec<PreCommitRecord>>;
+    async fn restart(
+        &self,
+        request: PreCommitRestartRequest,
+    ) -> CentralResult<PreCommitMutationOutcome>;
+    async fn cancel(
+        &self,
+        request: PreCommitCancelRequest,
+    ) -> CentralResult<PreCommitMutationOutcome>;
+    async fn sync_job(
+        &self,
+        job: JobRecord,
+        published_index: Option<PublishedIndex>,
+        observed_at_unix_ms: UnixMillis,
+    ) -> CentralResult<Option<PreCommitRecord>>;
+    async fn commit(
+        &self,
+        request: PreCommitCommitRequest,
+    ) -> CentralResult<PreCommitCommitOutcome>;
+    async fn get_commit(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &neoengram_protocol::ProjectId,
+        artifact_id: &ArtifactId,
+        commit_id: neoengram_core::CommitId,
+    ) -> CentralResult<Option<crate::CommitRecord>>;
+    async fn acknowledge_head_publication(
+        &self,
+        key: &PreCommitKey,
+        commit_id: neoengram_core::CommitId,
+        published_at_unix_ms: UnixMillis,
+    ) -> CentralResult<PreCommitRecord>;
+}
+
 #[async_trait]
 pub trait AssignmentOutbox: Send + Sync {
     /// Durably claims the tenant-scoped AssignmentId without exposing it for delivery.
@@ -243,7 +396,18 @@ pub trait AssignmentOutbox: Send + Sync {
     /// Makes an exact, durable reservation visible after the authoritative job stores it.
     async fn publish(&self, assignment: JobAssignment) -> CentralResult<AssignmentPublishOutcome>;
 
-    /// Retires a published assignment after the Job CAS records acceptance.
+    /// Makes an exact retired reservation visible again. Durable serving operations use this to
+    /// request a fresh observation from the same fenced Agent without changing assignment identity.
+    async fn reactivate(
+        &self,
+        assignment: JobAssignment,
+    ) -> CentralResult<AssignmentPublishOutcome> {
+        self.publish(assignment).await
+    }
+
+    /// Retires a published assignment after its operation-specific acknowledgement boundary.
+    /// Managed Add retires at Accepted because the Agent ledger owns recovery; Workspace
+    /// materialization retires only after a terminal report so Server redelivery survives restart.
     ///
     /// The reservation remains durable so the tenant-scoped AssignmentId cannot be reused.
     async fn retire(
@@ -254,8 +418,9 @@ pub trait AssignmentOutbox: Send + Sync {
 
     /// Lists published, non-retired delivery candidates for one Agent in stable assignment order.
     ///
-    /// The caller must pair these records with the authoritative Job state and deliver only jobs
-    /// which are still `Assigned`. This keeps acknowledgement recovery grounded in the Job CAS.
+    /// The caller must pair these records with authoritative Job state. Add is deliverable only in
+    /// `Assigned`; Workspace materialization remains deliverable in `Assigned/Accepted/Running`.
+    /// This keeps acknowledgement and execution recovery grounded in the Job CAS.
     async fn pending_for_agent(
         &self,
         agent_id: &AgentId,
@@ -282,18 +447,34 @@ pub trait MetadataBatchStager: Send + Sync {
 
 #[async_trait]
 pub trait ObjectCatalog: Send + Sync {
-    async fn record_durability(&self, receipt: &ObjectDurabilityReceipt) -> CentralResult<()>;
+    /// Persists authenticated Agent evidence for bytes held by one exact Volume placement
+    /// generation. Replays are idempotent; reusing a receipt identity for different evidence is
+    /// rejected.
+    async fn record_placement(&self, evidence: &ObjectPlacementEvidence) -> CentralResult<()>;
 
-    async fn durable_object(
+    async fn object_placement(
         &self,
         tenant_id: &TenantId,
         artifact_id: &ArtifactId,
+        storage_volume_id: &StorageVolumeId,
+        artifact_placement_id: &neoengram_protocol::ArtifactPlacementId,
+        placement_generation: PlacementGeneration,
         object_id: ObjectId,
-    ) -> CentralResult<Option<DurableObject>>;
+    ) -> CentralResult<Option<ObjectPlacementEvidence>>;
 }
 
 #[async_trait]
 pub trait IndexPublisher: Send + Sync {
+    /// Creates one authoritative Playground Index at the exact supplied version and records.
+    ///
+    /// Implementations must validate that `version.digest` is the canonical digest of `records`.
+    /// The absent-to-present transition is atomic; an exact replay returns the stored version,
+    /// while an existing different snapshot returns `ConcurrentUpdate` without mutation.
+    async fn initialize_snapshot(
+        &self,
+        request: InitializeIndexSnapshotRequest,
+    ) -> CentralResult<WireIndexVersion>;
+
     /// On success, atomically publishes the request's canonical Manifests and Index CAS as one
     /// idempotent boundary. Conflict and rejection must publish neither. Repeating an identical
     /// `job_key` request must return the original outcome, including after the CAS completed but
@@ -303,6 +484,18 @@ pub trait IndexPublisher: Send + Sync {
         request: IndexPublishRequest,
     ) -> CentralResult<IndexPublishOutcome>;
     async fn current_version(&self, key: &IndexKey) -> CentralResult<WireIndexVersion>;
+
+    /// Reads the last authoritative logical Index snapshot for a Playground.
+    ///
+    /// This is deliberately a read-only companion to publication. Implementations that do not
+    /// retain logical records may return `InvalidState`; callers must never fall back to the
+    /// Agent's physical worktree for public browsing.
+    async fn published_index(&self, _key: &IndexKey) -> CentralResult<PublishedIndex> {
+        Err(crate::CentralError::new(
+            crate::CentralErrorCode::InvalidState,
+            "this authority backend does not expose logical Index snapshots",
+        ))
+    }
 }
 
 #[async_trait]
@@ -329,6 +522,7 @@ pub struct AuthorityStore {
     objects: Arc<dyn ObjectCatalog>,
     publisher: Arc<dyn IndexPublisher>,
     audit: Arc<dyn AuditSink>,
+    precommits: Option<Arc<dyn PreCommitRepository>>,
     agent_registry: Option<Arc<dyn AgentRegistryRepository>>,
     control_catalog: Option<Arc<dyn ControlCatalogRepository>>,
     capabilities: AuthorityCapabilities,
@@ -353,6 +547,7 @@ impl AuthorityStore {
             objects,
             publisher,
             audit,
+            precommits: None,
             agent_registry: None,
             control_catalog: None,
             capabilities,
@@ -389,6 +584,17 @@ impl AuthorityStore {
         self.audit.clone()
     }
 
+    #[must_use]
+    pub fn with_precommits(mut self, repository: Arc<dyn PreCommitRepository>) -> Self {
+        self.precommits = Some(repository);
+        self
+    }
+
+    #[must_use]
+    pub fn precommits(&self) -> Option<Arc<dyn PreCommitRepository>> {
+        self.precommits.clone()
+    }
+
     /// Adds the optional enrollment/Agent registry vertical slice to this composition root.
     #[must_use]
     pub fn with_agent_registry(mut self, registry: Arc<dyn AgentRegistryRepository>) -> Self {
@@ -401,7 +607,7 @@ impl AuthorityStore {
         self.agent_registry.clone()
     }
 
-    /// Adds the optional Tenant/Volume/Playground control catalog.
+    /// Adds the optional Tenant/Artifact/Volume/Playground control catalog.
     #[must_use]
     pub fn with_control_catalog(mut self, catalog: Arc<dyn ControlCatalogRepository>) -> Self {
         self.control_catalog = Some(catalog);

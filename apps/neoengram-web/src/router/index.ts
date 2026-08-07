@@ -6,11 +6,19 @@ import {
   type RouteRecordRaw,
 } from 'vue-router';
 
+import { queryApiVersion } from '@/api/operations';
 import { isApiProblem } from '@/api/problem';
+import {
+  supportsArtifactCatalog,
+  supportsPlaygroundPreCommit,
+  supportsSnapshotMaterialize,
+} from '@/features/capabilities';
 import { useAuthStore } from '@/stores/auth';
 import { useTenantsStore } from '@/stores/tenants';
 
 const tenantMeta = { requiresAuth: true, requiresTenant: true };
+const snapshotMaterializeMeta = { ...tenantMeta, requiredCapability: 'snapshot_materialize' };
+const playgroundPreCommitMeta = { ...tenantMeta, requiredCapability: 'playground_precommit' };
 
 const routes: RouteRecordRaw[] = [
   {
@@ -59,25 +67,25 @@ const routes: RouteRecordRaw[] = [
     path: '/tenants/:tenantId/snapshots',
     name: 'snapshot-list',
     component: () => import('@/pages/SnapshotListPage.vue'),
-    meta: tenantMeta,
+    meta: snapshotMaterializeMeta,
   },
   {
     path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/playgrounds/:playgroundId/commit',
     name: 'playground-commit',
     component: () => import('@/pages/PlaygroundCommitPage.vue'),
-    meta: tenantMeta,
+    meta: playgroundPreCommitMeta,
   },
   {
     path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/snapshots/new',
     name: 'snapshot-create',
     component: () => import('@/pages/SnapshotCreatePage.vue'),
-    meta: tenantMeta,
+    meta: snapshotMaterializeMeta,
   },
   {
     path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/snapshots/:snapshotId',
     name: 'snapshot-detail',
     component: () => import('@/pages/SnapshotDetailPage.vue'),
-    meta: tenantMeta,
+    meta: snapshotMaterializeMeta,
   },
   {
     path: '/tenants/:tenantId/jobs/new',
@@ -121,7 +129,6 @@ export function createAppRouter(history: RouterHistory = createWebHistory()): Ro
     try {
       await tenants.ensure(tenantId);
       tenants.remember(tenantId);
-      return true;
     } catch (error) {
       if (!isApiProblem(error) || error.status !== 404) return true;
       const page = await tenants.load();
@@ -130,6 +137,40 @@ export function createAppRouter(history: RouterHistory = createWebHistory()): Ro
         ? { name: 'tenant-overview', params: { tenantId: fallback.tenant_id } }
         : { name: 'tenant-entry' };
     }
+
+    const requiredCapability =
+      typeof to.meta.requiredCapability === 'string' ? to.meta.requiredCapability : '';
+    if (!requiredCapability) return true;
+
+    let capabilities: readonly string[] | undefined;
+    try {
+      capabilities = (await queryApiVersion()).data.capabilities;
+    } catch {
+      capabilities = undefined;
+    }
+    if (
+      (requiredCapability === 'snapshot_materialize' &&
+        supportsSnapshotMaterialize(capabilities)) ||
+      (requiredCapability === 'playground_precommit' && supportsPlaygroundPreCommit(capabilities))
+    ) {
+      return true;
+    }
+
+    const projectId = String(to.params.projectId ?? '');
+    const artifactId = String(to.params.artifactId ?? '');
+    const playgroundId = String(to.params.playgroundId ?? '');
+    if (projectId && artifactId && playgroundId) {
+      return {
+        name: 'playground-detail',
+        params: { tenantId, projectId, artifactId, playgroundId },
+      };
+    }
+    if (supportsArtifactCatalog(capabilities) && projectId && artifactId) {
+      return { name: 'artifact-detail', params: { tenantId, projectId, artifactId } };
+    }
+    return supportsArtifactCatalog(capabilities)
+      ? { name: 'artifact-list', params: { tenantId } }
+      : { name: 'tenant-overview', params: { tenantId } };
   });
   return appRouter;
 }

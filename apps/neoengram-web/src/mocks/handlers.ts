@@ -156,7 +156,6 @@ const storageEnrollmentReviewAudit = new Map<string, string>();
 const pvcBindings = new Map<string, PvcBinding>();
 const activePvcOwners = new Map<string, PvcOwner>();
 const artifactCreatePayloads = new Map<string, string>();
-const playgroundCreatePayloads = new Map<string, string>();
 const playgroundQueryCounts = new Map<string, number>();
 const commitRequests = new Map<
   string,
@@ -276,6 +275,20 @@ function fingerprint(value: unknown): string {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36);
+}
+
+function contentDigest(value: unknown): string {
+  const source = stableJson(value);
+  let digest = '';
+  for (let round = 0; round < 8; round += 1) {
+    let hash = 2166136261 ^ round;
+    for (const character of source) {
+      hash ^= character.codePointAt(0) ?? 0;
+      hash = Math.imul(hash, 16777619);
+    }
+    digest += (hash >>> 0).toString(16).padStart(8, '0');
+  }
+  return digest;
 }
 
 function paginate<T>(
@@ -895,6 +908,8 @@ export const handlers = [
         agent_protocol_versions: [1],
         capabilities: [
           'managed_add',
+          'artifact_catalog',
+          'snapshot_materialize',
           'resource_browser',
           'storage_enrollment',
           'tenant_admin',
@@ -1004,7 +1019,6 @@ export const handlers = [
         'artifact.create',
         'playground.create',
         'snapshot.create',
-        'commit.create',
         'job.create',
       ],
     };
@@ -1671,62 +1685,26 @@ export const handlers = [
     const body = (await request.json()) as CreateArtifactRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
-    if (
-      !projects.some(
-        (project) => project.tenant_id === body.tenant_id && project.project_id === body.project_id,
-      )
-    ) {
-      return problem(
-        request,
-        404,
-        'PROJECT_NOT_FOUND',
-        'Project not found',
-        'The requested Project was not found',
-      );
-    }
     const initialization = body.initialization;
-    let sourceCommit: CommitNode | undefined;
     if (initialization.mode === 'derived') {
-      const sourceArtifact = artifacts.find(
-        (artifact) =>
-          artifact.tenant_id === body.tenant_id &&
-          artifact.project_id === initialization.source_project_id &&
-          artifact.artifact_id === initialization.source_artifact_id,
+      return mutationConflict(
+        request,
+        'ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED',
+        'derived Artifact initialization requires authoritative Commit validation',
       );
-      const sourceGraph = sourceArtifact
-        ? commitGraphs.get(
-            resourceKey(
-              sourceArtifact.tenant_id,
-              sourceArtifact.project_id,
-              sourceArtifact.artifact_id,
-            ),
-          )
-        : undefined;
-      sourceCommit = sourceGraph?.nodes.find(
-        (commit) => commit.commit_id === initialization.source_commit_id,
-      );
-      if (!sourceArtifact || !sourceCommit) {
-        return problem(
-          request,
-          404,
-          'SOURCE_COMMIT_NOT_FOUND',
-          'Source Commit not found',
-          'The selected source Artifact or Commit was not found in this Tenant',
-        );
-      }
     }
 
-    const key = resourceKey(body.tenant_id, body.project_id, body.artifact_id);
+    const createKey = resourceKey(body.tenant_id, body.artifact_id);
+    const graphKey = resourceKey(body.tenant_id, body.project_id, body.artifact_id);
     const requestJson = stableJson(body);
     const existing = artifacts.find(
       (artifact) =>
-        artifact.tenant_id === body.tenant_id &&
-        artifact.project_id === body.project_id &&
-        artifact.artifact_id === body.artifact_id,
+        artifact.tenant_id === body.tenant_id && artifact.artifact_id === body.artifact_id,
     );
     if (existing) {
-      const priorRequest = artifactCreatePayloads.get(key);
+      const priorRequest = artifactCreatePayloads.get(createKey);
       const equivalentExisting =
+        existing.project_id === body.project_id &&
         existing.display_name === body.display_name.trim() &&
         existing.description === body.description?.trim() &&
         stableJson(existing.initialization) === stableJson(initialization);
@@ -1745,16 +1723,6 @@ export const handlers = [
     }
 
     const now = Date.now().toString();
-    const rootCommit: CommitNode | undefined =
-      sourceCommit && initialization.mode === 'derived'
-        ? {
-            commit_id: `commit-root-${body.artifact_id}-${Date.now().toString(36)}`,
-            message: `从 ${initialization.source_artifact_id} 派生`,
-            description: `初始化来源 ${initialization.source_artifact_id}@${sourceCommit.commit_id}，后续版本历史独立演进。`,
-            tag_names: [],
-            created_at_unix_ms: now,
-          }
-        : undefined;
     const artifact: ArtifactView = {
       tenant_id: body.tenant_id,
       project_id: body.project_id,
@@ -1762,22 +1730,13 @@ export const handlers = [
       display_name: body.display_name.trim(),
       ...(body.description?.trim() ? { description: body.description.trim() } : {}),
       initialization: structuredClone(initialization),
-      ...(rootCommit ? { head_commit_id: rootCommit.commit_id } : {}),
       resource_version: '1',
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
     artifacts.push(artifact);
-    if (rootCommit) {
-      commitGraphs.set(key, {
-        graph_version: '1',
-        head_commit_id: rootCommit.commit_id,
-        nodes: [rootCommit],
-      });
-    } else {
-      commitGraphs.set(key, { graph_version: '0', nodes: [] });
-    }
-    artifactCreatePayloads.set(key, requestJson);
+    commitGraphs.set(graphKey, { graph_version: '0', nodes: [] });
+    artifactCreatePayloads.set(createKey, requestJson);
     const response: CreateArtifactResponse = { artifact, replayed: false };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
@@ -1966,23 +1925,8 @@ export const handlers = [
     );
     const graph = commitGraphs.get(artifactKey);
     if (!artifact || !graph) return notFound(request, 'Artifact');
-    const storageVolume = resolveStorageVolume(request, body.tenant_id, body.storage_volume_id);
-    if (storageVolume instanceof HttpResponse) return storageVolume;
-    if (
-      body.base_commit_id &&
-      !graph.nodes.some((node) => node.commit_id === body.base_commit_id)
-    ) {
-      return problem(
-        request,
-        404,
-        'COMMIT_NOT_FOUND',
-        'Commit not found',
-        'The requested base Commit was not found',
-      );
-    }
 
     const key = resourceKey(body.tenant_id, body.project_id, body.artifact_id, body.playground_id);
-    const requestJson = stableJson(body);
     const existing = playgrounds.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
@@ -1991,15 +1935,11 @@ export const handlers = [
         item.playground_id === body.playground_id,
     );
     if (existing) {
-      const priorRequest = playgroundCreatePayloads.get(key);
       const equivalentExisting =
         existing.display_name === body.display_name.trim() &&
         existing.storage_volume_id === body.storage_volume_id &&
-        existing.base_commit_id === body.base_commit_id;
-      if (
-        (priorRequest && priorRequest !== requestJson) ||
-        (!priorRequest && !equivalentExisting)
-      ) {
+        (!body.base_commit_id || existing.base_commit_id === body.base_commit_id);
+      if (!equivalentExisting) {
         return mutationConflict(
           request,
           'PLAYGROUND_ID_REUSED',
@@ -2009,8 +1949,25 @@ export const handlers = [
       const response: CreatePlaygroundResponse = { playground: existing, replayed: true };
       return HttpResponse.json(response, { headers: headers(request) });
     }
+    if (
+      body.base_commit_id &&
+      !graph.nodes.some((commit) => commit.commit_id === body.base_commit_id)
+    ) {
+      return problem(
+        request,
+        404,
+        'COMMIT_NOT_FOUND',
+        'Commit not found',
+        'The requested base Commit was not found in the selected Artifact',
+      );
+    }
+    const storageVolume = resolveStorageVolume(request, body.tenant_id, body.storage_volume_id);
+    if (storageVolume instanceof HttpResponse) return storageVolume;
 
-    const baseCommitId = body.base_commit_id ?? graph.head_commit_id;
+    const baseCommitId = body.base_commit_id ?? artifact.head_commit_id;
+    const indexVersion = baseCommitId
+      ? { revision: graph.graph_version, digest: baseCommitId }
+      : { revision: '0', digest: '0'.repeat(64) };
     const now = Date.now().toString();
     const playground = {
       tenant_id: body.tenant_id,
@@ -2021,13 +1978,12 @@ export const handlers = [
       region: storageVolume.region,
       display_name: body.display_name.trim(),
       ...(baseCommitId ? { base_commit_id: baseCommitId, head_commit_id: baseCommitId } : {}),
-      index_version: { revision: '0', digest: '0'.repeat(64) },
+      index_version: indexVersion,
       state: 'creating' as const,
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
     playgrounds.push(playground);
-    playgroundCreatePayloads.set(key, requestJson);
     playgroundQueryCounts.set(key, 0);
     const response: CreatePlaygroundResponse = { playground, replayed: false };
     return HttpResponse.json(response, { headers: headers(request) });
@@ -2471,7 +2427,7 @@ export const handlers = [
 
     const now = Date.now().toString();
     const commit: CommitNode = {
-      commit_id: `commit-${fingerprint({ request: body, at: now })}`,
+      commit_id: contentDigest({ request: body, at: now }),
       ...(playground.head_commit_id ? { parent_commit_id: playground.head_commit_id } : {}),
       message: body.message.trim(),
       ...(body.description?.trim() ? { description: body.description.trim() } : {}),
@@ -3087,7 +3043,6 @@ export function resetMockState(): void {
   pvcBindings.clear();
   activePvcOwners.clear();
   artifactCreatePayloads.clear();
-  playgroundCreatePayloads.clear();
   playgroundQueryCounts.clear();
   commitRequests.clear();
   precommits.clear();

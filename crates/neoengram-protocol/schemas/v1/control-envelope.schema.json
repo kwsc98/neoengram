@@ -471,6 +471,42 @@
             "operation",
             "input"
           ]
+        },
+        {
+          "description": "Creates the server-derived Playground directory below the approved Agent mount.\n\nThis operation deliberately reuses the normal job accepted/progress/failed reports. It\ndoes not enter the managed-Add publication state machine: successful materialization is\nterminal after the Agent reports `job.progress(state=succeeded)`.",
+          "type": "object",
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/WorkspaceMaterializeAssignment"
+            },
+            "operation": {
+              "type": "string",
+              "const": "workspace_materialize"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "operation",
+            "input"
+          ]
+        },
+        {
+          "description": "Mounts one immutable Artifact Commit as a server-derived read-only Snapshot path.",
+          "type": "object",
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/SnapshotMountAssignment"
+            },
+            "operation": {
+              "type": "string",
+              "const": "snapshot_mount"
+            }
+          },
+          "additionalProperties": true,
+          "required": [
+            "operation",
+            "input"
+          ]
         }
       ]
     },
@@ -1256,6 +1292,101 @@
       "minLength": 1,
       "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
     },
+    "SnapshotId": {
+      "description": "A validated snapshot ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "SnapshotMountAssignment": {
+      "description": "Complete immutable placement required to mount one read-only Snapshot.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "agent_mount_id": {
+          "$ref": "#/$defs/AgentMountId"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "commit_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "index_version": {
+          "$ref": "#/$defs/WireIndexVersion"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "owner_generation": {
+          "$ref": "#/$defs/OwnerGeneration"
+        },
+        "principal": {
+          "$ref": "#/$defs/PrincipalRef"
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "relative_root": {
+          "description": "Server-derived path relative to the approved Volume mount.",
+          "type": "string"
+        },
+        "request_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "snapshot_id": {
+          "$ref": "#/$defs/SnapshotId"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "agent_id",
+        "principal",
+        "tenant_id",
+        "project_id",
+        "artifact_id",
+        "snapshot_id",
+        "storage_volume_id",
+        "agent_mount_id",
+        "mount_generation",
+        "owner_generation",
+        "relative_root",
+        "commit_id",
+        "index_version",
+        "request_digest",
+        "deadline_unix_ms"
+      ]
+    },
     "StorageVolumeId": {
       "description": "A validated storage volume ID wire identifier.",
       "type": "string",
@@ -1302,6 +1433,99 @@
       "required": [
         "revision",
         "digest"
+      ]
+    },
+    "WorkspaceMaterializeAssignment": {
+      "description": "Complete immutable scope required to create one server-derived Playground directory.\n\n`relative_root` is carried for explicit protocol observability, but is not trusted by the\nAgent. Validation requires it to equal the canonical path derived from the typed resource\nidentifiers. `base_commit_id` and `base_index_version` are absent only for an empty baseline.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "agent_mount_id": {
+          "$ref": "#/$defs/AgentMountId"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "assignment_generation": {
+          "$ref": "#/$defs/AssignmentGeneration"
+        },
+        "assignment_id": {
+          "$ref": "#/$defs/AssignmentId"
+        },
+        "base_commit_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_index_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WireIndexVersion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "job_id": {
+          "$ref": "#/$defs/JobId"
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "owner_generation": {
+          "$ref": "#/$defs/OwnerGeneration"
+        },
+        "playground_id": {
+          "$ref": "#/$defs/PlaygroundId"
+        },
+        "principal": {
+          "$ref": "#/$defs/PrincipalRef"
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "relative_root": {
+          "description": "Server-derived path relative to the approved Volume mount.",
+          "type": "string"
+        },
+        "request_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "job_id",
+        "assignment_id",
+        "assignment_generation",
+        "agent_id",
+        "principal",
+        "tenant_id",
+        "project_id",
+        "artifact_id",
+        "playground_id",
+        "storage_volume_id",
+        "agent_mount_id",
+        "mount_generation",
+        "owner_generation",
+        "relative_root",
+        "request_digest",
+        "deadline_unix_ms"
       ]
     }
   }

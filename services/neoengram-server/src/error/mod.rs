@@ -81,6 +81,13 @@ pub fn map_central_error(error: CentralError) -> Error {
             false,
             None,
         ),
+        CentralErrorCode::ArtifactNotFound | CentralErrorCode::StorageVolumeNotFound => (
+            ErrorCategory::NotFound,
+            None,
+            "catalog parent resource not found",
+            false,
+            None,
+        ),
         CentralErrorCode::ProtocolInvalid
         | CentralErrorCode::BatchTampered
         | CentralErrorCode::MetadataInvalid => (
@@ -108,6 +115,9 @@ pub fn map_central_error(error: CentralError) -> Error {
         | CentralErrorCode::EnrollmentDecisionConflict
         | CentralErrorCode::EnrollmentProbeFailed
         | CentralErrorCode::VolumeOwnerConflict
+        | CentralErrorCode::ArtifactHeadMismatch
+        | CentralErrorCode::StorageVolumeNotReady
+        | CentralErrorCode::StorageVolumeRegionMismatch
         | CentralErrorCode::AgentIdentityMismatch
         | CentralErrorCode::AgentSessionActive
         | CentralErrorCode::ApprovalRequired
@@ -196,6 +206,13 @@ fn conflict_message(code: CentralErrorCode) -> &'static str {
             "the Job execution identity conflicts with its authoritative state"
         }
         CentralErrorCode::ConcurrentUpdate => "the Job was updated concurrently",
+        CentralErrorCode::ArtifactHeadMismatch => {
+            "the Playground base or head differs from the Artifact head"
+        }
+        CentralErrorCode::StorageVolumeNotReady => "the StorageVolume is not ready",
+        CentralErrorCode::StorageVolumeRegionMismatch => {
+            "the Playground region differs from the StorageVolume region"
+        }
         _ => "the requested operation conflicts with current state",
     }
 }

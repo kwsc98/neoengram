@@ -251,7 +251,11 @@ async fn downgrade_current_authority_to_v2(path: &Path) {
         .foreign_keys(false);
     let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
     sqlx::raw_sql(
-        "ALTER TABLE assignment_outbox RENAME TO assignment_outbox_v4;
+        "DROP TABLE precommit_mutations;
+         DROP TABLE commit_records;
+         DROP TABLE precommit_records;
+         DROP TABLE object_placements;
+         ALTER TABLE assignment_outbox RENAME TO assignment_outbox_v4;
          CREATE TABLE assignment_outbox (
              tenant_id TEXT NOT NULL,
              assignment_id TEXT NOT NULL,

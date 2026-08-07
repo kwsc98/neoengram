@@ -51,4 +51,5 @@ unsafe_code = "deny"
 all = { level = "warn", priority = -1 }
 
 [patch.crates-io]
+fuser = { path = "vendor/fuser" }
 fusen-rs = { path = "vendor/fusen-rs" }

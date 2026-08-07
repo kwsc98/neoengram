@@ -5,11 +5,18 @@ import { ElMessage } from 'element-plus';
 import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { createPlayground, queryPlaygroundList } from '@/api/operations';
+import { createPlayground, queryApiVersion, queryPlaygroundList } from '@/api/operations';
+import type { ArtifactView } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
+import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
+import ArtifactSelect from '@/components/ArtifactSelect.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
+import {
+  supportsArtifactCommitGraph,
+  supportsPlaygroundMaterialize,
+} from '@/features/capabilities';
 import {
   playgroundAvailabilityLabel,
   playgroundAvailabilityTagType,
@@ -22,9 +29,6 @@ const router = useRouter();
 const queryClient = useQueryClient();
 const tenants = useTenantsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
-const canCreatePlayground = computed(
-  () => tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false,
-);
 const projectId = ref(String(route.query.project_id ?? ''));
 const artifactId = ref(String(route.query.artifact_id ?? ''));
 const searchInput = ref(String(route.query.q ?? ''));
@@ -34,13 +38,29 @@ const cursorHistory = ref<string[]>([]);
 const createOpen = ref(false);
 const createError = ref('');
 const createForm = reactive({
-  projectId: '',
-  artifactId: '',
+  artifact: undefined as ArtifactView | undefined,
   playgroundId: '',
   displayName: '',
+  baseCommitId: '',
   storageVolumeId: '',
 });
 const createMutation = useMutation({ mutationFn: createPlayground });
+const versionQuery = useQuery({
+  queryKey: ['system', 'version'],
+  queryFn: queryApiVersion,
+  staleTime: Number.POSITIVE_INFINITY,
+});
+const materializeEnabled = computed(() =>
+  supportsPlaygroundMaterialize(versionQuery.data.value?.data.capabilities),
+);
+const artifactCommitGraphEnabled = computed(() =>
+  supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
+);
+const canCreatePlayground = computed(
+  () =>
+    (tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false) &&
+    materializeEnabled.value,
+);
 
 const playgroundQuery = useQuery({
   queryKey: computed(() => [
@@ -60,6 +80,8 @@ const playgroundQuery = useQuery({
       ...(search.value ? { query: search.value } : {}),
       ...(cursor.value ? { cursor: cursor.value } : {}),
     }),
+  refetchInterval: (query) =>
+    query.state.data?.data.items.some((item) => item.state === 'creating') ? 1_000 : false,
 });
 
 watch(projectId, (value, previous) => {
@@ -91,6 +113,13 @@ watch(artifactId, () => {
   cursorHistory.value = [];
 });
 
+watch(
+  () => createForm.artifact,
+  (artifact) => {
+    createForm.baseCommitId = artifact?.head_commit_id ?? '';
+  },
+);
+
 async function applyFilters(): Promise<void> {
   cursor.value = undefined;
   cursorHistory.value = [];
@@ -117,10 +146,10 @@ function previousPage(): void {
 
 function openCreate(): void {
   Object.assign(createForm, {
-    projectId: projectId.value,
-    artifactId: artifactId.value,
+    artifact: undefined,
     playgroundId: '',
     displayName: '',
+    baseCommitId: '',
     storageVolumeId: '',
   });
   createError.value = '';
@@ -131,14 +160,16 @@ function openCreate(): void {
 async function submitCreate(): Promise<void> {
   createError.value = '';
   const resourceId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+  const artifact = createForm.artifact;
   if (
-    !resourceId.test(createForm.projectId) ||
-    !resourceId.test(createForm.artifactId) ||
+    !artifact ||
+    artifact.tenant_id !== tenantId.value ||
+    (Boolean(artifact.head_commit_id) && !createForm.baseCommitId) ||
     !resourceId.test(createForm.playgroundId) ||
     !createForm.displayName.trim() ||
     !resourceId.test(createForm.storageVolumeId)
   ) {
-    createError.value = '请填写合法的 Project、Artifact、Playground、名称和 StorageVolume';
+    createError.value = '请选择 Artifact，并填写合法的 Playground、名称和 StorageVolume';
     return;
   }
 
@@ -146,11 +177,12 @@ async function submitCreate(): Promise<void> {
   try {
     result = await createMutation.mutateAsync({
       tenant_id: tenantId.value,
-      project_id: createForm.projectId,
-      artifact_id: createForm.artifactId,
+      project_id: artifact.project_id,
+      artifact_id: artifact.artifact_id,
       playground_id: createForm.playgroundId,
       display_name: createForm.displayName.trim(),
       storage_volume_id: createForm.storageVolumeId,
+      ...(createForm.baseCommitId ? { base_commit_id: createForm.baseCommitId } : {}),
     });
   } catch {
     return;
@@ -335,13 +367,25 @@ async function openPlayground(
       <ApiProblemAlert v-if="createMutation.error.value" :error="createMutation.error.value" />
       <el-alert v-if="createError" :title="createError" type="error" :closable="false" />
       <el-form label-position="top" class="dialog-form">
+        <el-form-item label="Artifact" required>
+          <ArtifactSelect
+            v-model="createForm.artifact"
+            :tenant-id="tenantId"
+            :allow-non-empty="materializeEnabled"
+          />
+        </el-form-item>
+        <el-form-item v-if="createForm.artifact" label="Base Commit">
+          <ArtifactCommitSelect
+            v-model="createForm.baseCommitId"
+            :tenant-id="tenantId"
+            :project-id="createForm.artifact.project_id"
+            :artifact-id="createForm.artifact.artifact_id"
+            :head-commit-id="createForm.artifact.head_commit_id"
+            :enabled="createOpen"
+            :allow-history="artifactCommitGraphEnabled"
+          />
+        </el-form-item>
         <div class="dialog-form-grid">
-          <el-form-item label="Project ID" required>
-            <el-input v-model="createForm.projectId" placeholder="project-lab" />
-          </el-form-item>
-          <el-form-item label="Artifact ID" required>
-            <el-input v-model="createForm.artifactId" placeholder="dataset-a" />
-          </el-form-item>
           <el-form-item label="Playground ID" required>
             <el-input v-model="createForm.playgroundId" placeholder="review-august" />
           </el-form-item>

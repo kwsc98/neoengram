@@ -675,7 +675,7 @@
                     <text x="69" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Agent A · RW Owner</text>
                     <text x="69" y="260" fill="hsl(215 16% 47%)" font-size="9">会话 gen 29 · 心跳 4 秒</text>
                     <rect x="290" y="222" width="190" height="50" rx="7" fill="#fff" stroke="hsl(262 45% 80%)"/>
-                    <text x="305" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">S3 Gateway A</text>
+                    <text x="305" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Volume Gateway A</text>
                     <text x="305" y="260" fill="hsl(215 16% 47%)" font-size="9">只读对象根 · 凭证 gen 18</text>
 
                     <rect x="38" y="320" width="472" height="100" rx="9" fill="hsl(165 70% 96%)" stroke="hsl(169 60% 66%)"/>
@@ -701,7 +701,7 @@
                     <text x="621" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Agent B · RW Owner</text>
                     <text x="621" y="260" fill="hsl(215 16% 47%)" font-size="9">会话 gen 42 · 心跳 6 秒</text>
                     <rect x="842" y="222" width="190" height="50" rx="7" fill="#fff" stroke="hsl(262 45% 80%)"/>
-                    <text x="857" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">S3 Gateway B</text>
+                    <text x="857" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Volume Gateway B</text>
                     <text x="857" y="260" fill="hsl(215 16% 47%)" font-size="9">只读对象根 · 凭证 gen 12</text>
 
                     <rect x="590" y="320" width="472" height="100" rx="9" fill="hsl(165 70% 96%)" stroke="hsl(169 60% 66%)"/>
@@ -724,7 +724,7 @@
                   <path d="M937 272V320" fill="none" stroke="hsl(173 91% 30%)" stroke-width="2" marker-end="url(#arrow-io)"/>
                   <path d="M702 450V420" fill="none" stroke="hsl(173 91% 30%)" stroke-width="2" marker-end="url(#arrow-io)"/>
                   <path d="M480 238C525 205 565 205 606 238" fill="none" stroke="hsl(262 60% 55%)" stroke-width="2.4" stroke-dasharray="8 5" marker-end="url(#arrow-transfer)"/>
-                  <text x="548" y="198" text-anchor="middle" fill="hsl(262 60% 55%)" font-size="9" font-weight="700">S3 GET + TransferTicket</text>
+                  <text x="548" y="198" text-anchor="middle" fill="hsl(262 60% 55%)" font-size="9" font-weight="700">Ticket-scoped object stream</text>
                 </svg>
               </div>
               <div class="topo-legend">
@@ -878,7 +878,7 @@
 
       <section class="view" id="view-transfers">
         <div class="page-head">
-          <div><h1>跨集群传输</h1><p>目标 Agent 通过源集群 S3-compatible Gateway 拉取固定 Commit 对象</p></div>
+          <div><h1>跨集群传输</h1><p>目标 Agent 通过获批源 Volume Gateway 直传固定 Commit 对象，Server 不代理 payload</p></div>
           <div class="actions"><button class="button" id="transfer-anomaly" type="button">仅看异常</button></div>
         </div>
         <div class="kpi-strip" id="transfer-kpis"></div>
@@ -907,7 +907,7 @@
         </section>
         <section class="panel">
           <div class="panel-head">
-            <h2>审计事件</h2><span class="sub">不记录鉴权头、Signed URL、NFS/KMS 密钥或数据内容</span><span class="spacer"></span>
+            <h2>审计事件</h2><span class="sub">不记录鉴权头、TransferTicket、Volume/Gateway 密钥或数据内容</span><span class="spacer"></span>
             <input class="filter-input" id="audit-search" placeholder="搜索动作 / 资源 / Trace" aria-label="搜索审计事件">
           </div>
           <div class="panel-body no-pad table-wrap">
@@ -972,7 +972,7 @@
 
   const mounts = [
     { consumer:"agent-a-01", type:"Volume 读写 Owner", volume:"vol-a1", root:"/tenants/t-a/managed", mode:"rw", generation:"42" },
-    { consumer:"gw-a-01", type:"S3 Gateway", volume:"vol-a1", root:"/tenants/t-a/objects", mode:"ro", generation:"18" },
+    { consumer:"gw-a-01", type:"Volume Gateway", volume:"vol-a1", root:"/.neoengram/objects/tenants/t-a", mode:"ro", generation:"18" },
     { consumer:"train-pod-7d9", type:"PodMountBinding", volume:"vol-a1", root:"/views/snapshots/snp-88", mode:"ro", generation:"k8s rv 9912" },
     { consumer:"label-pod-3a2", type:"PodMountBinding", volume:"vol-a1", root:"/views/playgrounds/pg-18", mode:"rw", generation:"k8s rv 9918" },
     { consumer:"agent-b-01", type:"Volume 读写 Owner", volume:"vol-b1", root:"/tenants/t-a/managed", mode:"rw", generation:"66" }
@@ -1107,7 +1107,7 @@
     document.getElementById("cluster-tabs").innerHTML = clusters.map(c => '<button class="cluster-chip ' + (c.id === selectedCluster ? "active" : "") + '" type="button" data-cluster="' + c.id + '">' + c.name + ' · ' + labels[c.state] + '</button>').join("");
     const c = clusters.find(x => x.id === selectedCluster);
     document.getElementById("cluster-zones").innerHTML =
-      '<div class="zone system"><div class="zone-title">系统组件区</div><div class="zone-value">' + c.agents[0] + ' 个 Agent 会话</div><div class="zone-row"><span>Agent 健康</span>' + state(c.agents[1],c.agents[0]) + '</div><div class="zone-row"><span>S3 Gateway</span><span class="mono">' + c.gatewayId + '</span></div><div class="zone-row"><span>控制协议</span><span>H2/H3 JSON 流</span></div><div class="zone-row"><span>运行任务</span><strong>' + c.jobs + '</strong></div><div class="zone-flow">Agent 与 Gateway 都在系统组件区；Agent 主动连接中心。</div></div>' +
+      '<div class="zone system"><div class="zone-title">系统组件区</div><div class="zone-value">' + c.agents[0] + ' 个 Agent 会话</div><div class="zone-row"><span>Agent 健康</span>' + state(c.agents[1],c.agents[0]) + '</div><div class="zone-row"><span>Volume Gateway</span><span class="mono">' + c.gatewayId + '</span></div><div class="zone-row"><span>控制协议</span><span>H2/H3 JSON 流</span></div><div class="zone-row"><span>运行任务</span><strong>' + c.jobs + '</strong></div><div class="zone-flow">Agent 与 Gateway 都在系统组件区；Agent 主动连接中心。</div></div>' +
       '<div class="zone nfs"><div class="zone-title">NFS 区</div><div class="zone-value mono">' + c.volume + '</div><div class="zone-row"><span>挂载健康</span>' + state(c.nfs[1],c.nfs[0]) + '</div><div class="zone-row"><span>I/O p95</span><span class="mono">' + c.nfs[2] + '</span></div><div class="zone-row"><span>Owner 约束</span><span>代次隔离</span></div><div class="zone-row"><span>可见目录</span><span>受管根 / 视图根</span></div><div class="zone-flow">一个 Artifact 在同一集群固定到一个 NFS；一个 NFS 可承载同租户多个 Artifact。</div></div>' +
       '<div class="zone pod"><div class="zone-title">业务 Pod 区</div><div class="zone-value">' + c.pods + ' 个已登记挂载</div><div class="zone-row"><span>视图类型</span><span>Playground / Snapshot</span></div><div class="zone-row"><span>观测新鲜度</span>' + state(c.playground[1],c.playground[0]) + '</div><div class="zone-row"><span>文件 I/O</span><span>Pod 直达本地 NFS</span></div><div class="zone-row"><span>中心职责</span><span>登记绑定关系</span></div><div class="zone-flow">中心不负责创建 Pod、PV、PVC 或 NAS，只观测已有 PodMountBinding。</div></div>';
     const q = document.getElementById("agent-search").value.trim().toLowerCase();
@@ -1201,7 +1201,7 @@
     } else if (type === "transfer") {
       const t = transfers.find(x => x.id === id);
       title = t.id; subtitle = t.source + " → " + t.destination;
-      body = detailRows([["状态",state(t.state)],["固定源",'<span class="mono">' + t.artifact + " / " + t.commit + '</span>'],["源 Gateway",t.gateway],["目标 Agent / Volume",t.agent + " / " + t.volume],["进度",t.bytes + "（" + t.progress + "%）"],["吞吐",t.rate],["重试",String(t.retry)],["Ticket TTL",t.ttl],["Trace",t.trace]]) + timeline([["现在","目标端执行 BLAKE3 校验"],["-24 秒","从已验证边界续传 GET range"],["-3 分钟","中心签发 TransferTicket"],["-3 分钟","源 ObjectLocation 保留 Lease 生效"]]);
+      body = detailRows([["状态",state(t.state)],["固定源",'<span class="mono">' + t.artifact + " / " + t.commit + '</span>'],["源 Gateway",t.gateway],["目标 Agent / Volume",t.agent + " / " + t.volume],["进度",t.bytes + "（" + t.progress + "%）"],["吞吐",t.rate],["重试",String(t.retry)],["Ticket TTL",t.ttl],["Trace",t.trace]]) + timeline([["现在","目标端执行 BLAKE3 校验"],["-24 秒","从已验证 Object 边界恢复直传"],["-3 分钟","中心签发 TransferTicket"],["-3 分钟","源 ObjectLocation 保留 Lease 生效"]]);
     } else if (type === "route") {
       const r = routes.find(x => x.id === id);
       title = r.id; subtitle = r.source + " → " + r.destination;

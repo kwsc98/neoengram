@@ -74,31 +74,37 @@ Workspace Index 与全部 Commit roots 标记对象，再删除未标记对象�
 
 Managed 模式使用不同的权威边界：
 
-- 中心 S3-compatible object store 是不可变对象的耐久权威；
-- NFS 只保存 Playground 文件、durable mutation journal 和可重建 cache/staging；
-- NFS 上不保存托管 Artifact SQLite，也不把对象目录或 Agent cache 当成 durability 证明；
-- Agent 的本地 Ledger/candidate/cache 只支持执行与恢复，不拥有中心 Index 或对象最终状态；
-- 当前 P0 只定义 `ObjectTransfer`/`ObjectCatalog` ports、票据 DTO、receipt 和内存适配器，尚未接入
-  真实 S3 SDK、NFS fencing 或生产数据库。
+- Artifact、Commit、Manifest、Index 和 Ref 由 Server metadata authority 管理；
+- 不可变 Chunk 字节由 Artifact 所在的用户 StorageVolume 持有，布局为
+  `<mount>/.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects/<object_id>`；
+- Agent 在获批 mount 内完成流式写入、size/BLAKE3 复核、`fsync` 和原子发布；Server 不接收、
+  不代理也不保存 Chunk payload；
+- Server `ObjectCatalog` 只权威保存经过身份验证的 Volume placement evidence，并将其绑定到
+  Assignment 的 Tenant、Artifact、StorageVolume、ArtifactPlacement 和 `placement_generation`；
+- Agent 的 identity、Ledger、outbound 和 candidate 位于独立 `state_dir`，不得在业务 Volume 上创建
+  SQLite/WAL；状态盘丢失不会删除 Volume 中的业务对象；
+- 当前 P0 不实现跨 Volume 对象复制、强 storage-side fencing 或生产数据库。未来复制由
+  Agent/Gateway 数据通道在用户 Volume 之间完成，Server 仍只下发计划和记录凭证。
 
 Managed Add 的固定发布闭环为：
 
 ```text
 PrepareAdd
--> missing-object negotiation
--> Agent 使用短期 upload ticket 直传中心 S3
--> 中心验证并记录 object durability
+-> Agent 将新 Chunk 写入 Assignment 指定的 Volume-local CAS
+-> Agent 逐对象复核 size/BLAKE3，执行 durability barrier
 -> Agent 持久化含 exact descriptors/pages 的 TransferReceipt 与 Prepared 状态
 -> Agent 上报 descriptor-bound JobPrepared，中心先持久化报告
 -> Agent 幂等上传 Manifest / ObjectReceipt / IndexDelta MetadataBatch
--> 中心 staging 完整校验并重算 publication digest
+-> 中心 staging 完整校验，绑定 Volume placement evidence 并重算 publication digest
 -> canonical Manifests + expected IndexVersion CAS 原子发布
 -> decision / finalized 幂等确认
 ```
 
-对象 payload 不经过 `neoengramd` API 进程。只有所有所需对象已由中心标记 Durable、批次页完整且
-digest/资源 scope/base version 全部通过，中心才可执行 CAS；上传完成或 Agent receipt 本身都不能
-提前发布 Index。`JobPrepared.publication_digest` 绑定 scope/base/IndexDelta/Manifest/ObjectSpec，
+对象 payload 不经过 Agent listener 或 `neoengramd` API 进程。只有所有所需对象均有当前 Assignment
+精确 Volume/placement generation 的有效凭证、批次页完整且 digest/资源 scope/base version 全部通过，
+中心才可执行 CAS。`ObjectReceipt` 是已审批 Agent 对 Volume 中指定对象执行完整性与耐久化
+校验的证据，不包含物理路径或 payload。`JobPrepared.publication_digest` 绑定
+scope/base/IndexDelta/Manifest/ObjectSpec，
 `candidate_digest` 再覆盖 assignment identity、result/publication digest、ordered MetadataBatch
 descriptors 与 extensions；替换一个仍然有效的 publication 或 descriptor 都会使校验失败。
 Manifest 通过带十进制 `chunk_start` 的 fragment 跨页；单页只校验局部连续性，中心按 Manifest ID 和
@@ -129,7 +135,7 @@ checkout/rm/restore transaction，枚举并清理 active/finalized Engine journa
 
 `export --mode hardlink` 仅适用于 WholeFile + LooseObjectStore 同文件系统：实现复算对象大小和
 BLAKE3，并校验设备号/inode 后 no-replace 发布。它与仓库对象共享 inode，只适用于可信本地用户，
-不构成不可变安全边界，Managed S3/NFS 模式不使用该能力。
+不构成不可变安全边界，Managed Volume 模式当前不使用该导出能力。
 
 ## FUSE 读取路径
 

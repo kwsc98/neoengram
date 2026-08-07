@@ -17,7 +17,7 @@ use crate::{CentralError, CentralErrorCode, CentralResult};
 const DATABASE_FILE_NAME: &str = "agent-registry.sqlite3";
 const LOCK_FILE_NAME: &str = "agent-registry.lock";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f52;
-const SQLITE_SCHEMA_VERSION: i64 = 4;
+const SQLITE_SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE agent_registry_records (
@@ -103,6 +103,45 @@ CREATE TABLE tenant_catalog_records (
 ) STRICT;
 CREATE INDEX tenant_catalog_keyset
     ON tenant_catalog_records (created_at_unix_ms DESC, tenant_id ASC);
+CREATE TABLE artifact_catalog_records (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    description TEXT,
+    initialization_mode TEXT NOT NULL CHECK (initialization_mode IN ('empty', 'derived')),
+    source_project_id TEXT,
+    source_artifact_id TEXT,
+    source_commit_digest BLOB,
+    head_commit_digest BLOB CHECK (
+        head_commit_digest IS NULL OR length(head_commit_digest) = 32
+    ),
+    resource_version TEXT NOT NULL CHECK (
+        resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
+    ),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    PRIMARY KEY (tenant_id, artifact_id),
+    UNIQUE (tenant_id, project_id, artifact_id),
+    CHECK (
+        (initialization_mode = 'empty' AND source_project_id IS NULL
+            AND source_artifact_id IS NULL AND source_commit_digest IS NULL)
+        OR
+        (initialization_mode = 'derived' AND source_project_id IS NOT NULL
+            AND source_artifact_id IS NOT NULL AND length(source_commit_digest) = 32)
+    ),
+    FOREIGN KEY (tenant_id) REFERENCES tenant_catalog_records(tenant_id),
+    FOREIGN KEY (tenant_id, source_project_id, source_artifact_id)
+        REFERENCES artifact_catalog_records(tenant_id, project_id, artifact_id)
+) STRICT;
+CREATE INDEX artifact_catalog_keyset
+    ON artifact_catalog_records (
+        tenant_id, created_at_unix_ms DESC, project_id ASC, artifact_id ASC
+    );
+CREATE INDEX artifact_catalog_filter_keyset
+    ON artifact_catalog_records (
+        tenant_id, project_id, created_at_unix_ms DESC, artifact_id ASC
+    );
 CREATE TABLE storage_volume_catalog_records (
     tenant_id TEXT NOT NULL,
     storage_volume_id TEXT NOT NULL,
@@ -152,12 +191,12 @@ CREATE TABLE playground_catalog_records (
     storage_volume_id TEXT NOT NULL,
     region TEXT NOT NULL,
     display_name TEXT NOT NULL,
-    base_commit_digest BLOB,
-    head_commit_digest BLOB,
-    index_revision TEXT NOT NULL CHECK (
-        index_revision <> '' AND index_revision NOT GLOB '*[^0-9]*'
+    base_commit_digest BLOB CHECK (
+        base_commit_digest IS NULL OR length(base_commit_digest) = 32
     ),
-    index_digest BLOB NOT NULL CHECK (length(index_digest) = 32),
+    head_commit_digest BLOB CHECK (
+        head_commit_digest IS NULL OR length(head_commit_digest) = 32
+    ),
     state TEXT NOT NULL CHECK (state IN ('creating', 'ready', 'abnormal')),
     relative_root TEXT NOT NULL CHECK (
         relative_root <> '' AND substr(relative_root, 1, 1) <> '/'
@@ -165,6 +204,8 @@ CREATE TABLE playground_catalog_records (
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
     PRIMARY KEY (tenant_id, project_id, artifact_id, playground_id),
+    FOREIGN KEY (tenant_id, project_id, artifact_id)
+        REFERENCES artifact_catalog_records(tenant_id, project_id, artifact_id),
     FOREIGN KEY (tenant_id, storage_volume_id)
         REFERENCES storage_volume_catalog_records(tenant_id, storage_volume_id)
 ) STRICT;
@@ -176,6 +217,37 @@ CREATE INDEX playground_catalog_filter_keyset
     ON playground_catalog_records (
         tenant_id, project_id, artifact_id, region, state,
         created_at_unix_ms DESC, playground_id ASC
+    );
+CREATE TABLE snapshot_catalog_records (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    snapshot_request_id TEXT NOT NULL,
+    commit_digest BLOB NOT NULL CHECK (length(commit_digest) = 32),
+    storage_volume_id TEXT NOT NULL,
+    region TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('creating', 'ready', 'abnormal')),
+    phase TEXT NOT NULL CHECK (phase IN ('planning', 'materializing', 'verifying', 'idle')),
+    relative_root TEXT NOT NULL CHECK (
+        relative_root <> '' AND substr(relative_root, 1, 1) <> '/'
+    ),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    PRIMARY KEY (tenant_id, snapshot_id),
+    UNIQUE (tenant_id, snapshot_request_id),
+    UNIQUE (tenant_id, project_id, artifact_id, commit_digest, storage_volume_id),
+    FOREIGN KEY (tenant_id, project_id, artifact_id)
+        REFERENCES artifact_catalog_records(tenant_id, project_id, artifact_id),
+    FOREIGN KEY (tenant_id, storage_volume_id)
+        REFERENCES storage_volume_catalog_records(tenant_id, storage_volume_id)
+) STRICT;
+CREATE INDEX snapshot_catalog_keyset
+    ON snapshot_catalog_records (tenant_id, created_at_unix_ms DESC, snapshot_id ASC);
+CREATE INDEX snapshot_catalog_filter_keyset
+    ON snapshot_catalog_records (
+        tenant_id, project_id, artifact_id, region, state,
+        created_at_unix_ms DESC, snapshot_id ASC
     );
 "#;
 
@@ -267,7 +339,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 4")
+        sqlx::query("PRAGMA user_version = 6")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -282,9 +354,18 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
     match user_version {
         2 => {
             migrate_v2_to_v3(pool).await?;
-            migrate_v3_to_v4(pool).await?;
+            migrate_v3_to_v5(pool).await?;
+            migrate_v5_to_v6(pool).await?;
         }
-        3 => migrate_v3_to_v4(pool).await?,
+        3 => {
+            migrate_v3_to_v5(pool).await?;
+            migrate_v5_to_v6(pool).await?;
+        }
+        4 => {
+            migrate_v4_to_v5(pool).await?;
+            migrate_v5_to_v6(pool).await?;
+        }
+        5 => migrate_v5_to_v6(pool).await?,
         SQLITE_SCHEMA_VERSION => {}
         _ => {
             return Err(storage_corruption(format!(
@@ -330,12 +411,76 @@ async fn migrate_v2_to_v3(pool: &SqlitePool) -> CentralResult<()> {
     transaction.commit().await.map_err(storage_error)
 }
 
-async fn migrate_v3_to_v4(pool: &SqlitePool) -> CentralResult<()> {
+async fn migrate_v3_to_v5(pool: &SqlitePool) -> CentralResult<()> {
     let mut transaction = pool.begin().await.map_err(storage_error)?;
     if catalog_schema_presence(&mut transaction).await? == CatalogSchemaPresence::Absent {
-        create_catalog_schema(&mut transaction).await?;
+        create_catalog_schema_v5(&mut transaction).await?;
     }
-    sqlx::query("PRAGMA user_version = 4")
+    sqlx::query("PRAGMA user_version = 5")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+async fn migrate_v4_to_v5(pool: &SqlitePool) -> CentralResult<()> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    let derived_authority: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT tenant_id, project_id, artifact_id, playground_id \
+         FROM playground_catalog_records LIMIT 1",
+    )
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    if let Some((tenant_id, project_id, artifact_id, playground_id)) = derived_authority {
+        return Err(storage_corruption(format!(
+            "cannot migrate Playground {tenant_id}/{project_id}/{artifact_id}/{playground_id}: Artifact authority cannot be inferred from a derived v4 Playground; export and remove the v4 Playground, create the Artifact explicitly, then recreate the Playground"
+        )));
+    }
+    create_catalog_schema_objects(&mut transaction, "artifact_catalog_").await?;
+    sqlx::query("DROP INDEX playground_catalog_keyset")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("DROP INDEX playground_catalog_filter_keyset")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("ALTER TABLE playground_catalog_records RENAME TO playground_catalog_records_v4")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    create_catalog_schema_objects(&mut transaction, "playground_catalog_").await?;
+    sqlx::query(
+        "INSERT INTO playground_catalog_records \
+         (tenant_id, project_id, artifact_id, playground_id, storage_volume_id, region, \
+          display_name, base_commit_digest, head_commit_digest, \
+          state, relative_root, created_at_unix_ms, updated_at_unix_ms) \
+         SELECT tenant_id, project_id, artifact_id, playground_id, storage_volume_id, region, \
+                display_name, base_commit_digest, head_commit_digest, \
+                state, relative_root, created_at_unix_ms, updated_at_unix_ms \
+         FROM playground_catalog_records_v4",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    sqlx::query("DROP TABLE playground_catalog_records_v4")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("PRAGMA user_version = 5")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+async fn migrate_v5_to_v6(pool: &SqlitePool) -> CentralResult<()> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    if snapshot_catalog_schema_presence(&mut transaction).await? == CatalogSchemaPresence::Absent {
+        create_catalog_schema_objects(&mut transaction, "snapshot_catalog_").await?;
+    }
+    sqlx::query("PRAGMA user_version = 6")
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
@@ -348,14 +493,34 @@ enum CatalogSchemaPresence {
     Current,
 }
 
-async fn create_catalog_schema(transaction: &mut Transaction<'_, Sqlite>) -> CentralResult<()> {
+async fn create_catalog_schema_v5(transaction: &mut Transaction<'_, Sqlite>) -> CentralResult<()> {
     for statement in SCHEMA_SQL
         .split(';')
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
     {
         let (_, name) = schema_object(statement)?;
-        if is_catalog_schema_object(name) {
+        if is_catalog_schema_object(name) && !name.starts_with("snapshot_catalog_") {
+            sqlx::query(statement)
+                .execute(&mut **transaction)
+                .await
+                .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
+async fn create_catalog_schema_objects(
+    transaction: &mut Transaction<'_, Sqlite>,
+    name_prefix: &str,
+) -> CentralResult<()> {
+    for statement in SCHEMA_SQL
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        let (_, name) = schema_object(statement)?;
+        if name.starts_with(name_prefix) {
             sqlx::query(statement)
                 .execute(&mut **transaction)
                 .await
@@ -368,6 +533,30 @@ async fn create_catalog_schema(transaction: &mut Transaction<'_, Sqlite>) -> Cen
 async fn catalog_schema_presence(
     transaction: &mut Transaction<'_, Sqlite>,
 ) -> CentralResult<CatalogSchemaPresence> {
+    schema_presence(
+        transaction,
+        is_catalog_schema_object,
+        "Agent registry control catalog schema is only partially present",
+    )
+    .await
+}
+
+async fn snapshot_catalog_schema_presence(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> CentralResult<CatalogSchemaPresence> {
+    schema_presence(
+        transaction,
+        is_snapshot_catalog_schema_object,
+        "Agent registry Snapshot catalog schema is only partially present",
+    )
+    .await
+}
+
+async fn schema_presence(
+    transaction: &mut Transaction<'_, Sqlite>,
+    includes: fn(&str) -> bool,
+    partial_schema_message: &'static str,
+) -> CentralResult<CatalogSchemaPresence> {
     let mut expected_count = 0_usize;
     let mut present_count = 0_usize;
     for expected_statement in SCHEMA_SQL
@@ -376,7 +565,7 @@ async fn catalog_schema_presence(
         .filter(|statement| !statement.is_empty())
     {
         let (object_type, name) = schema_object(expected_statement)?;
-        if !is_catalog_schema_object(name) {
+        if !includes(name) {
             continue;
         }
         expected_count += 1;
@@ -402,16 +591,20 @@ async fn catalog_schema_presence(
     } else if present_count == expected_count {
         Ok(CatalogSchemaPresence::Current)
     } else {
-        Err(storage_corruption(
-            "Agent registry control catalog schema is only partially present",
-        ))
+        Err(storage_corruption(partial_schema_message))
     }
 }
 
 fn is_catalog_schema_object(name: &str) -> bool {
     name.starts_with("tenant_catalog_")
+        || name.starts_with("artifact_catalog_")
         || name.starts_with("storage_volume_catalog_")
         || name.starts_with("playground_catalog_")
+        || name.starts_with("snapshot_catalog_")
+}
+
+fn is_snapshot_catalog_schema_object(name: &str) -> bool {
+    name.starts_with("snapshot_catalog_")
 }
 
 async fn validate_current_schema(pool: &SqlitePool) -> CentralResult<()> {

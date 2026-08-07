@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use neoengram_protocol::{jcs_blake3, MessageId, TenantId, UnixMillis};
+use neoengram_protocol::{jcs_blake3, JobId, MessageId, TenantId, UnixMillis};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +118,38 @@ impl SqliteOutboundReportQueue {
         self.validate_metadata()
     }
 
+    /// Lists every durable report for one Job in send order.
+    ///
+    /// This is intentionally separate from the bounded transport page. Long-lived observations
+    /// use it to replace only their own older reports without disturbing ordered Job messages.
+    pub fn list_for_job(&self, job_id: &JobId) -> AgentResult<Vec<QueuedAgentReport>> {
+        let connection = self.storage.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, message_id, enqueued_at_unix_ms, payload \
+                 FROM outbound_reports WHERE job_id = ?1 ORDER BY sequence",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![job_id.as_str()], decode_row)
+            .map_err(storage_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|_| storage_corruption("outbound report payload is invalid"))
+    }
+
+    /// Atomically enqueues a newer observation and removes exact reports it supersedes.
+    ///
+    /// The new report is persisted before any supplied identity is removed. Callers must only
+    /// supply observational messages whose semantics are replaced by the new report.
+    pub fn enqueue_superseding(
+        &self,
+        report: AgentReport,
+        enqueued_at_unix_ms: UnixMillis,
+        superseded: &[MessageId],
+    ) -> AgentResult<QueuedAgentReport> {
+        self.persist(report, enqueued_at_unix_ms, superseded)
+    }
+
     fn bind_or_validate_identity(&self) -> AgentResult<()> {
         let mut connection = self.storage.connection()?;
         let transaction = connection
@@ -179,13 +211,12 @@ impl SqliteOutboundReportQueue {
         }
         Ok(())
     }
-}
 
-impl OutboundReportQueue for SqliteOutboundReportQueue {
-    fn enqueue(
+    fn persist(
         &self,
         report: AgentReport,
         enqueued_at_unix_ms: UnixMillis,
+        superseded: &[MessageId],
     ) -> AgentResult<QueuedAgentReport> {
         let message_id = report_message_id(&report)?;
         let job_id = report_job_id(&report);
@@ -224,10 +255,30 @@ impl OutboundReportQueue for SqliteOutboundReportQueue {
                 "outbound message identity resolved to another report",
             ));
         }
+        for stale in superseded {
+            if stale != &message_id {
+                transaction
+                    .execute(
+                        "DELETE FROM outbound_reports WHERE message_id = ?1 AND job_id = ?2",
+                        params![stale.as_str(), job_id.as_str()],
+                    )
+                    .map_err(storage_error)?;
+            }
+        }
         transaction.commit().map_err(storage_error)?;
         drop(connection);
         self.storage.secure_files()?;
         Ok(queued)
+    }
+}
+
+impl OutboundReportQueue for SqliteOutboundReportQueue {
+    fn enqueue(
+        &self,
+        report: AgentReport,
+        enqueued_at_unix_ms: UnixMillis,
+    ) -> AgentResult<QueuedAgentReport> {
+        self.persist(report, enqueued_at_unix_ms, &[])
     }
 
     fn list(&self, limit: usize) -> AgentResult<Vec<QueuedAgentReport>> {
@@ -360,11 +411,15 @@ mod tests {
     use super::*;
 
     fn report() -> AgentReport {
+        report_at("job-a", 100)
+    }
+
+    fn report_at(job_id: &str, accepted_at: u64) -> AgentReport {
         AgentReport::Accepted(JobAccepted {
-            job_id: JobId::new("job-a").unwrap(),
+            job_id: JobId::new(job_id).unwrap(),
             assignment_id: AssignmentId::new("assignment-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
-            accepted_at_unix_ms: UnixMillis::new(100),
+            accepted_at_unix_ms: UnixMillis::new(accepted_at),
             request_digest: "11".repeat(32).parse().unwrap(),
             extensions: Extensions::new(),
         })
@@ -390,5 +445,35 @@ mod tests {
         assert!(reopened.acknowledge(&first.message_id).unwrap());
         assert!(!reopened.acknowledge(&first.message_id).unwrap());
         assert!(reopened.list(32).unwrap().is_empty());
+    }
+
+    #[test]
+    fn superseding_enqueue_replaces_only_exact_reports_for_the_same_job() {
+        let temporary = tempfile::tempdir().unwrap();
+        let queue = SqliteOutboundReportQueue::open(SqliteOutboundReportQueueConfig::new(
+            temporary.path(),
+            neoengram_protocol::AgentId::new("agent-a").unwrap(),
+            TenantId::new("tenant-a").unwrap(),
+        ))
+        .unwrap();
+        let first = queue
+            .enqueue(report_at("job-a", 100), UnixMillis::new(100))
+            .unwrap();
+        let other = queue
+            .enqueue(report_at("job-b", 100), UnixMillis::new(100))
+            .unwrap();
+        let latest = queue
+            .enqueue_superseding(
+                report_at("job-a", 200),
+                UnixMillis::new(200),
+                &[first.message_id.clone(), other.message_id.clone()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            queue.list_for_job(&JobId::new("job-a").unwrap()).unwrap(),
+            vec![latest.clone()]
+        );
+        assert_eq!(queue.list(32).unwrap(), vec![other, latest]);
     }
 }

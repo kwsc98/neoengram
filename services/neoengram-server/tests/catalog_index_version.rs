@@ -14,10 +14,122 @@ use neoengram_server::{
     StaticRbacPolicy,
 };
 use neoengramd::{
-    CatalogPvcReference, ControlCatalogRepository, ControlPlane, InMemoryComponents, IndexKey,
-    IndexPublishOutcome, IndexPublishRequest, IndexPublisher, JobKey, StorageAccessMode,
-    StorageBackendType, StorageVolumeRecord, StorageVolumeState, TenantRecord,
+    ArtifactInitialization, ArtifactRecord, CatalogPvcReference, ControlCatalogRepository,
+    ControlPlane, InMemoryComponents, IndexKey, IndexPublishOutcome, IndexPublishRequest,
+    IndexPublisher, JobKey, JobRepository, StorageAccessMode, StorageBackendType,
+    StorageVolumeRecord, StorageVolumeState, TenantRecord,
 };
+
+#[tokio::test]
+async fn job_authorization_precedes_missing_scope_validation() {
+    let components = InMemoryComponents::new(1_000);
+    let tenant_id = TenantId::new("tenant-a").unwrap();
+    let policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-a",
+            [tenant_id.to_string()],
+            std::iter::empty::<Permission>(),
+        )
+        .unwrap(),
+    );
+    let authority_store = components.authority_store();
+    let control = Arc::new(ControlPlane::new(
+        policy,
+        authority_store.clone(),
+        components.clock.clone(),
+    ));
+    let jobs = JobService::from_authority(control, &authority_store).unwrap();
+    let identity =
+        AuthenticatedIdentity::new("user-a", PrincipalKind::User, "test", "subject-a").unwrap();
+    let index = IndexVersion::from_snapshot(0, &[]).unwrap();
+    let job_id = JobId::new("job-unauthorized-scope").unwrap();
+
+    let error = jobs
+        .create_add_job(
+            &identity,
+            CreateAddJobRequest {
+                tenant_id: tenant_id.to_string(),
+                project_id: "project-missing".to_owned(),
+                artifact_id: "artifact-missing".to_owned(),
+                playground_id: "playground-missing".to_owned(),
+                job_id: job_id.to_string(),
+                expected_index_version: IndexVersionBody {
+                    revision: index.revision.to_string(),
+                    digest: index.digest.to_string(),
+                },
+                deadline_unix_ms: "10000".to_owned(),
+                paths: Vec::new(),
+                all: true,
+                extensions: JsonExtensions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code().as_str(), "authorization_denied");
+    assert!(components
+        .jobs
+        .get(&JobKey::new(tenant_id, job_id))
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn job_scope_validation_does_not_depend_on_agent_scheduling() {
+    let components = InMemoryComponents::new(1_000);
+    let tenant_id = TenantId::new("tenant-a").unwrap();
+    let policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-a",
+            [tenant_id.to_string()],
+            [Permission::CreateAddJob],
+        )
+        .unwrap(),
+    );
+    let authority_store = components.authority_store();
+    let control = Arc::new(ControlPlane::new(
+        policy,
+        authority_store.clone(),
+        components.clock.clone(),
+    ));
+    let jobs = JobService::from_authority(control, &authority_store).unwrap();
+    let identity =
+        AuthenticatedIdentity::new("user-a", PrincipalKind::User, "test", "subject-a").unwrap();
+    let index = IndexVersion::from_snapshot(0, &[]).unwrap();
+
+    let error = jobs
+        .create_add_job(
+            &identity,
+            CreateAddJobRequest {
+                tenant_id: tenant_id.to_string(),
+                project_id: "project-missing".to_owned(),
+                artifact_id: "artifact-missing".to_owned(),
+                playground_id: "playground-missing".to_owned(),
+                job_id: "job-missing-scope".to_owned(),
+                expected_index_version: IndexVersionBody {
+                    revision: index.revision.to_string(),
+                    digest: index.digest.to_string(),
+                },
+                deadline_unix_ms: "10000".to_owned(),
+                paths: Vec::new(),
+                all: true,
+                extensions: JsonExtensions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code().as_str(), "job_not_found");
+    assert!(components
+        .jobs
+        .get(&JobKey::new(
+            tenant_id,
+            JobId::new("job-missing-scope").unwrap()
+        ))
+        .await
+        .unwrap()
+        .is_none());
+}
 
 #[tokio::test]
 async fn playground_responses_use_the_current_published_index_version() {
@@ -33,6 +145,22 @@ async fn playground_responses_use_the_current_published_index_version() {
             tenant_id: tenant_id.clone(),
             display_name: "Tenant A".to_owned(),
             description: None,
+            resource_version: 1,
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+    components
+        .control_catalog
+        .insert_artifact(ArtifactRecord {
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            artifact_id: artifact_id.clone(),
+            display_name: "Artifact A".to_owned(),
+            description: None,
+            initialization: ArtifactInitialization::Empty,
+            head_commit_id: None,
             resource_version: 1,
             created_at_unix_ms: UnixMillis::new(1_000),
             updated_at_unix_ms: UnixMillis::new(1_000),
@@ -95,7 +223,9 @@ async fn playground_responses_use_the_current_published_index_version() {
         )
         .unwrap(),
     );
-    let jobs = JobService::new(control).with_coordinator(coordinator);
+    let jobs = JobService::from_authority(control, &authority_store)
+        .unwrap()
+        .with_coordinator(coordinator);
     let identity =
         AuthenticatedIdentity::new("user-a", PrincipalKind::User, "test", "subject-a").unwrap();
     let create_request = CreatePlaygroundRequest {

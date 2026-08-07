@@ -10,12 +10,82 @@ use sqlx::{Row, SqliteConnection};
 
 use super::authority::*;
 use crate::{
-    validation::{invalid, same_index_version},
+    validation::{invalid, same_index_version, validate_initial_index_snapshot},
     *,
 };
 
 #[async_trait]
 impl IndexPublisher for SqliteAuthorityStore {
+    async fn initialize_snapshot(
+        &self,
+        request: InitializeIndexSnapshotRequest,
+    ) -> CentralResult<WireIndexVersion> {
+        validate_initial_index_snapshot(&request.version, &request.records)?;
+        let records = request
+            .records
+            .into_iter()
+            .map(|record| (record.path.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        let candidate = IndexSnapshot {
+            version: request.version,
+            records,
+        };
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let inserted = sqlx::query(
+            "INSERT INTO playground_indexes \
+             (tenant_id, project_id, artifact_id, playground_id, revision, digest) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (tenant_id, project_id, artifact_id, playground_id) DO NOTHING",
+        )
+        .bind(request.index_key.tenant_id.as_str())
+        .bind(request.index_key.project_id.as_str())
+        .bind(request.index_key.artifact_id.as_str())
+        .bind(request.index_key.playground_id.as_str())
+        .bind(candidate.version.revision.get().to_string())
+        .bind(candidate.version.digest.as_bytes().as_slice())
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+
+        if inserted.rows_affected() == 0 {
+            let existing = load_index(&mut transaction, &request.index_key).await?;
+            if same_index_version(&existing.version, &candidate.version)
+                && existing.records == candidate.records
+            {
+                transaction.commit().await.map_err(storage_error)?;
+                return Ok(existing.version);
+            }
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                format!(
+                    "Index for Playground {} is already initialized with a different snapshot",
+                    request.index_key.playground_id
+                ),
+            ));
+        }
+
+        for record in candidate.records.values() {
+            sqlx::query(
+                "INSERT INTO playground_index_records \
+                 (tenant_id, project_id, artifact_id, playground_id, path, manifest_id, \
+                  total_size, chunk_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(request.index_key.tenant_id.as_str())
+            .bind(request.index_key.project_id.as_str())
+            .bind(request.index_key.artifact_id.as_str())
+            .bind(request.index_key.playground_id.as_str())
+            .bind(record.path.as_str())
+            .bind(record.manifest_id.as_bytes().as_slice())
+            .bind(record.total_size.to_string())
+            .bind(record.chunk_count.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(candidate.version)
+    }
+
     async fn compare_and_swap(
         &self,
         request: IndexPublishRequest,
@@ -295,6 +365,10 @@ impl IndexPublisher for SqliteAuthorityStore {
 
     async fn current_version(&self, key: &IndexKey) -> CentralResult<WireIndexVersion> {
         Ok(self.published_index(key).await?.version)
+    }
+
+    async fn published_index(&self, key: &IndexKey) -> CentralResult<PublishedIndex> {
+        SqliteAuthorityStore::published_index(self, key).await
     }
 }
 
