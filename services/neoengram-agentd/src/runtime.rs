@@ -8,9 +8,9 @@ use std::{
 };
 
 use neoengram_agent::{
-    ApprovedAgentIdentity, FilesystemMountObservation, FilesystemMountProbeConfig,
-    MountProbeCondition, SqliteSystemIdentityStore, SystemIdentityRecord,
-    TerminalEnrollmentOutcome, TerminalEnrollmentState,
+    ApprovedAgentIdentity, DevelopmentDirectoryMountProbeConfig, FilesystemMountObservation,
+    FilesystemMountProbeConfig, MountProbeCondition, SqliteSystemIdentityStore,
+    SystemIdentityRecord, TerminalEnrollmentOutcome, TerminalEnrollmentState,
 };
 use neoengram_protocol::{
     AgentBootstrapAccepted, AgentBootstrapProof, AgentBootstrapRequest,
@@ -63,11 +63,52 @@ impl MountProbe for FilesystemProbe {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DevelopmentDirectoryProbe {
+    config: DevelopmentDirectoryMountProbeConfig,
+}
+
+impl DevelopmentDirectoryProbe {
+    #[must_use]
+    pub fn new(config: &AgentConfig) -> Self {
+        Self {
+            config: DevelopmentDirectoryMountProbeConfig {
+                directory_root: config.storage.mount_path.clone(),
+                expected_volume_marker: config.storage.expected_volume_marker.clone(),
+                volume_descriptor_digest: config.volume_descriptor_digest,
+                hard_minimum_free_bytes: config.storage.hard_minimum_free_bytes,
+                ready_minimum_free_bytes: config.storage.ready_minimum_free_bytes,
+            },
+        }
+    }
+}
+
+impl MountProbe for DevelopmentDirectoryProbe {
+    fn probe(&self) -> FilesystemMountObservation {
+        self.config.probe()
+    }
+}
+
 pub async fn run(config: AgentConfig) -> AgentDaemonResult<()> {
     config.validate()?;
+    let probe = FilesystemProbe::new(&config);
+    run_process(config, probe).await
+}
+
+/// Runs the Agent with an ordinary-directory mount probe for loopback development only.
+pub async fn run_with_development_directory_probe(config: AgentConfig) -> AgentDaemonResult<()> {
+    config.validate()?;
+    crate::config::validate_development_directory_probe_endpoint(&config.central_endpoint)?;
+    let probe = DevelopmentDirectoryProbe::new(&config);
+    run_process(config, probe).await
+}
+
+async fn run_process<P>(config: AgentConfig, probe: P) -> AgentDaemonResult<()>
+where
+    P: MountProbe + Clone,
+{
     let client = ReqwestEnrollmentClient::new(config.central_endpoint.clone())?;
     let session_client = ReqwestAgentSessionClient::new(config.central_endpoint.clone())?;
-    let probe = FilesystemProbe::new(&config);
 
     #[cfg(unix)]
     let shutdown = {
@@ -599,7 +640,7 @@ fn build_bootstrap_request(
         volume_descriptor_digest: config.volume_descriptor_digest,
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         supported_protocol_versions: vec![PROTOCOL_VERSION_V1],
-        capabilities: Vec::new(),
+        capabilities: agent_capabilities(),
         public_key_fingerprint: public_key_spki.fingerprint(),
         proof: placeholder_proof(public_key_spki.clone()),
         probe,
@@ -607,6 +648,19 @@ fn build_bootstrap_request(
     };
     sign_bootstrap_request(&mut request, signing_key)?;
     Ok(request)
+}
+
+fn agent_capabilities() -> Vec<String> {
+    let mut capabilities = vec![
+        "h2_control_channel_v1".to_owned(),
+        "managed_add_v1".to_owned(),
+        "single_volume_v1".to_owned(),
+        "volume_local_cas_v1".to_owned(),
+        "workspace_materialize_v1".to_owned(),
+    ];
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    capabilities.push("snapshot_fuse_mount_v1".to_owned());
+    capabilities
 }
 
 struct StatusRequestSigner<'a> {

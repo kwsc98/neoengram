@@ -2,12 +2,34 @@
 
 [`neoengram-api.yaml`](neoengram-api.yaml) 是面向用户、CLI 和 UI 的公开 API 设计契约。
 `neoengramd` 保持 library-only，独立的 `neoengram-server` 使用 Fusen 0.9.0 提供可监听 HTTP server。
-默认配置注册以下六个接口：
+默认配置注册当前已实现的 system、Tenant、StorageVolume、Artifact、Playground 和 Job
+action API：
 
 ```text
 POST /api/system/version/query
 GET  /health/live
 GET  /health/ready
+POST /api/tenant/list/query
+POST /api/tenant/query
+POST /api/tenant/create
+POST /api/storage/volume/list/query
+POST /api/storage/volume/query
+POST /api/storage/volume/create
+POST /api/artifact/list/query
+POST /api/artifact/query
+POST /api/artifact/create
+POST /api/playground/list/query
+POST /api/playground/query
+POST /api/playground/create
+POST /api/playground/precommit/start
+POST /api/playground/precommit/query
+POST /api/playground/precommit/restart
+POST /api/playground/precommit/cancel
+POST /api/playground/file/list/query
+POST /api/playground/change/list/query
+POST /api/playground/file/metadata/query
+POST /api/playground/dataset/profile/query
+POST /api/playground/commit/create
 POST /api/job/add/create
 POST /api/job/query
 POST /api/job/add/finalize
@@ -22,18 +44,21 @@ POST /api/job/add/finalize
 POST /agent/enrollment/bootstrap
 POST /agent/enrollment/status/query
 POST /agent/session/open
+POST /agent/session/channel/open
 POST /agent/session/heartbeat/report
 POST /agent/session/message/list/query
 POST /agent/job/report/create
 POST /agent/job/metadata/batch/stage
 POST /agent/job/metadata/page/stage
 POST /agent/job/index/page/query
-POST /agent/job/object/missing/query
-POST /agent/job/object/upload
 POST /agent/session/close
 ```
 
-公开契约中的其他 operation 仍可能是目标契约，不表示已经可调用。
+对象字节不会进入 Agent listener。Agent 将不可变 Chunk 直接持久化到获批 StorageVolume 的
+Volume-local CAS，只通过 MetadataBatch 上报 Manifest、IndexDelta 和带 Placement 的 ObjectReceipt。
+
+公开契约中的 Project、Artifact Commit graph/diff 和 Snapshot operation 仍是目标契约，不表示
+当前 Server 已经注册；Web 必须按 `/api/system/version/query` 返回的 capability 隐藏这些入口。
 
 业务接口使用外部 OIDC/JWKS Bearer JWT 和服务端 RBAC，无法确认身份或授权时默认拒绝。SQLite
 运行模式只支持单副本；生产 TLS 由 Ingress/反向代理终止。
@@ -113,9 +138,12 @@ Dataset Profile 是 Playground/Snapshot 派生的只读元数据，不是 Snapsh
 Lease/Mount、容量与底层诊断、Agent/assignment、fencing、Manifest/Chunk、文件内容 digest、对象分布
 和物理路径均不属于 P0 普通用户契约；后续能力必须通过独立 P1 或 operator API 与相应 RBAC 暴露。
 
-Agent API 不属于公开 OpenAPI。开发链路使用 Agent 主动发起的 HTTP/1 JSON action 请求：短轮询最多
-返回 32 条消息，空结果返回 `retry_after_ms=1000`；Ed25519 request proof、session generation fencing、
-MetadataBatch 分页和重放规则由以下契约定义：
+Agent API 不属于公开 Web OpenAPI。开发控制链路由 Agent 主动发起
+`POST /agent/session/channel/open`，使用 HTTP/2 全双工 `application/x-ndjson` 流。H2 DATA 边界没有
+协议语义；每个 JSON 帧以 LF 结束且正文最多 1 MiB。首个上行帧固定为 `channel.open`，首个下行帧
+固定为相关联的 `channel.opened`。每个上行帧都独立携带 Ed25519 proof，并绑定完整 identity、session
+fence、sequence、message ID、correlation、type 和 payload。原有短轮询 action 保留为兼容与人工恢复
+入口，不进入 daemon 主运行链路；MetadataBatch 分页、对象传输和重放规则由以下契约定义：
 
 - [`neoengram-agent-api.yaml`](neoengram-agent-api.yaml)
 - [`../agent-central-control.md`](../agent-central-control.md)
@@ -138,8 +166,9 @@ npm run bundle
 npm run test:contract
 ```
 
-`bundle` 只在仓库 `target/openapi/` 下生成 JSON 检查产物，不提交生成文件；`test:contract`
-基于该 bundle 校验公开路径、认证与版本头、状态映射、示例、u64 编码、ready-only 放置、独立
+`bundle` 只在仓库 `target/openapi/` 下生成 public/Agent JSON 检查产物，不提交生成文件；`test:contract`
+基于这些 bundle 校验公开路径、认证与版本头、状态映射、示例、u64 编码、ready-only 放置、独立
 Snapshot 身份、Pre-commit 会话/attempt 语义、内部 Head CAS、Storage Enrollment token/审批边界、
-Artifact 初始化模型和所有公开资源视图的脱敏边界。
+Artifact 初始化模型和所有公开资源视图的脱敏边界；同时固定 Agent action 路径、body-only 输入、H2
+full-duplex 主控制 channel 和 compatibility-only message-list poll。
 CI 会按以上顺序运行相同命令。

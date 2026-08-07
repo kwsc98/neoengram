@@ -47,6 +47,8 @@ const snapshotQuery = useQuery({
       ...(artifactId.value ? { artifact_id: artifactId.value } : {}),
       ...(cursor.value ? { cursor: cursor.value } : {}),
     }),
+  refetchInterval: (query) =>
+    query.state.data?.data.items.some((snapshot) => snapshot.state === 'creating') ? 1000 : false,
 });
 
 watch(projectId, (value, previous) => {

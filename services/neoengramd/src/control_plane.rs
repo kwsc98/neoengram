@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use neoengram_protocol::{
     AgentId, AssignmentOperation, ControlEnvelope, ControlError, ControlMessage,
-    DecisionGeneration, ErrorCode, Extensions, JobAssignment, JobDecision, JobFinalized, JobState,
-    MessageId, ProtocolVersion, PublishDecision, ResourceVersion, SessionGeneration,
+    DecisionGeneration, ErrorCode, Extensions, IndexRevision, JobAssignment, JobDecision,
+    JobFinalized, JobState, MessageId, PrincipalKind, ProtocolVersion, PublishDecision,
+    ResourceVersion, SessionGeneration, SnapshotMountAssignment, WireIndexVersion,
+    WorkspaceMaterializeAssignment,
 };
 
 use crate::{
@@ -12,15 +14,18 @@ use crate::{
         validate_prepared, validate_report_identity, validate_staged_metadata,
         validate_terminal_state,
     },
-    Action, Actor, AddJobSpec, AgentReport, AssignJobRequest, AssignJobResult, AssignmentOutbox,
-    AuditEvent, AuditKind, AuditSink, AuthorityStore, AuthorizationRequest, Authorizer,
-    CentralErrorCode, CentralResult, Clock, CreateAddJobRequest, CreateAddJobResult,
-    ExpireAddJobRequest, ExpireAddJobResult, FinalizeAddRequest, FinalizeAddResult,
-    IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, IndexPublisher,
-    JobInsertOutcome, JobRecord, JobRepository, MetadataBatchStager, MetadataBatchSubmission,
-    ObjectCatalog, PublicationCandidate, QueryJobRequest, QueryJobResult, ReceiveReportRequest,
-    ReceiveReportResult, ResumePublicationRequest, StageMetadataBatchRequest,
-    StageMetadataBatchResult,
+    Action, Actor, AddJobSpec, AgentReport, AssignJobRequest, AssignJobResult,
+    AssignSnapshotMountRequest, AssignSnapshotMountResult, AssignWorkspaceMaterializationRequest,
+    AssignWorkspaceMaterializationResult, AssignmentOutbox, AuditEvent, AuditKind, AuditSink,
+    AuthorityStore, AuthorizationRequest, Authorizer, CentralErrorCode, CentralResult, Clock,
+    ControlCatalogRepository, CreateAddJobRequest, CreateAddJobResult, CreateSnapshotMountRequest,
+    CreateSnapshotMountResult, CreateWorkspaceMaterializationRequest,
+    CreateWorkspaceMaterializationResult, ExpireAddJobRequest, ExpireAddJobResult,
+    FinalizeAddRequest, FinalizeAddResult, IndexPublishOutcome, IndexPublishRejection,
+    IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobOperation, JobRecord, JobRepository,
+    MetadataBatchStager, MetadataBatchSubmission, ObjectCatalog, PublicationCandidate,
+    QueryJobRequest, QueryJobResult, ReceiveReportRequest, ReceiveReportResult,
+    ResumePublicationRequest, StageMetadataBatchRequest, StageMetadataBatchResult,
 };
 
 const CONTROL_ERROR_MESSAGE_LIMIT: usize = 4096;
@@ -34,6 +39,7 @@ pub struct ControlPlane {
     objects: Arc<dyn ObjectCatalog>,
     publisher: Arc<dyn IndexPublisher>,
     audit: Arc<dyn AuditSink>,
+    catalog: Option<Arc<dyn ControlCatalogRepository>>,
     clock: Arc<dyn Clock>,
 }
 
@@ -53,13 +59,16 @@ impl ControlPlane {
             objects: authority.objects(),
             publisher: authority.publisher(),
             audit: authority.audit(),
+            catalog: authority.control_catalog(),
             clock,
         }
     }
 
     /// Derives the current Agent delivery set from the durable assignment outbox and Job CAS.
-    /// Assignments disappear only after Accepted changes the Job state; decisions disappear only
-    /// after the matching Finalized acknowledgement is persisted.
+    /// Add assignments disappear after Accepted because their execution ledger is Agent-durable.
+    /// Workspace materialization assignments remain deliverable through Accepted/Running and
+    /// disappear only at a terminal outcome, allowing an Agent restart to resume physical checkout.
+    /// Decisions disappear only after the matching Finalized acknowledgement is persisted.
     pub async fn poll_agent_messages(
         &self,
         agent_id: &AgentId,
@@ -71,23 +80,92 @@ impl ControlPlane {
         }
         let mut messages = Vec::with_capacity(limit);
         for assignment in self.outbox.pending_for_agent(agent_id, limit).await? {
-            let AssignmentOperation::Add { input, .. } = &assignment.assignment;
-            let Some(job) = self
-                .jobs
-                .get(&crate::JobKey::new(
-                    input.tenant_id.clone(),
-                    input.job_id.clone(),
-                ))
-                .await?
-            else {
-                continue;
+            let (tenant_id, job_id, assignment_id, valid) = match &assignment.assignment {
+                AssignmentOperation::Add { input, .. } => {
+                    let job = self
+                        .jobs
+                        .get(&crate::JobKey::new(
+                            input.tenant_id.clone(),
+                            input.job_id.clone(),
+                        ))
+                        .await?;
+                    (
+                        input.tenant_id.clone(),
+                        input.job_id.clone(),
+                        input.assignment_id.clone(),
+                        job.is_some_and(|job| {
+                            job.operation == JobOperation::Add
+                                && job.state == JobState::Assigned
+                                && job.assignment.as_ref() == Some(input)
+                        }),
+                    )
+                }
+                AssignmentOperation::WorkspaceMaterialize { input, .. } => {
+                    let job = self
+                        .jobs
+                        .get(&crate::JobKey::new(
+                            input.tenant_id.clone(),
+                            input.job_id.clone(),
+                        ))
+                        .await?;
+                    (
+                        input.tenant_id.clone(),
+                        input.job_id.clone(),
+                        input.assignment_id.clone(),
+                        job.is_some_and(|job| {
+                            job.operation == JobOperation::WorkspaceMaterialize
+                                && matches!(
+                                    job.state,
+                                    JobState::Assigned
+                                        | JobState::Accepted
+                                        | JobState::Running
+                                        | JobState::Succeeded
+                                        | JobState::RecoveryRequired
+                                )
+                                && job.workspace_assignment.as_ref() == Some(input)
+                        }),
+                    )
+                }
+                AssignmentOperation::SnapshotMount { input, .. } => {
+                    let job = self
+                        .jobs
+                        .get(&crate::JobKey::new(
+                            input.tenant_id.clone(),
+                            input.job_id.clone(),
+                        ))
+                        .await?;
+                    (
+                        input.tenant_id.clone(),
+                        input.job_id.clone(),
+                        input.assignment_id.clone(),
+                        job.is_some_and(|job| {
+                            job.operation == JobOperation::SnapshotMount
+                                && matches!(
+                                    job.state,
+                                    JobState::Assigned
+                                        | JobState::Accepted
+                                        | JobState::Running
+                                        | JobState::Succeeded
+                                        | JobState::RecoveryRequired
+                                )
+                                && job.snapshot_assignment.as_ref() == Some(input)
+                        }),
+                    )
+                }
             };
-            if job.state != JobState::Assigned || job.assignment.as_ref() != Some(input) {
+            if !valid {
                 continue;
             }
+            let job = self
+                .jobs
+                .get(&crate::JobKey::new(tenant_id.clone(), job_id.clone()))
+                .await?
+                .ok_or_else(|| {
+                    invalid(CentralErrorCode::JobNotFound, "assignment Job disappeared")
+                })?;
             let envelope = ControlEnvelope {
                 protocol_version: ProtocolVersion::V1,
-                message_id: MessageId::new(format!("assignment-{}", input.assignment_id))?,
+                message_id: MessageId::new(format!("assignment-{assignment_id}"))?,
                 session_generation,
                 resource_version: Some(job.resource_version),
                 request_id: None,
@@ -141,6 +219,16 @@ impl ControlPlane {
         Ok(messages)
     }
 
+    /// Checks Create Add Job authorization without reading or mutating Job authority state.
+    pub async fn preauthorize_create_add_job(
+        &self,
+        actor: &neoengram_protocol::PrincipalRef,
+        spec: &AddJobSpec,
+    ) -> CentralResult<()> {
+        self.authorize(Actor::Principal(actor.clone()), Action::CreateAddJob, spec)
+            .await
+    }
+
     /// Creates the authoritative queued job. Reusing a JobId with another digest/spec is rejected.
     pub async fn create_add_job(
         &self,
@@ -152,28 +240,61 @@ impl ControlPlane {
             &request.spec,
         )
         .await?;
-        let key = crate::JobKey::new(request.spec.tenant_id.clone(), request.spec.job_id.clone());
+        self.persist_add_job(request.spec, "create").await
+    }
+
+    /// Creates the internal Add Job associated with a durable Pre-commit attempt.
+    ///
+    /// Public authorization occurs before the Pre-commit aggregate is persisted. Recovery must
+    /// not depend on that principal retaining mutable RBAC grants, so only this fixed system
+    /// principal may enter the trusted continuation path.
+    pub async fn create_precommit_add_job(
+        &self,
+        spec: AddJobSpec,
+    ) -> CentralResult<CreateAddJobResult> {
+        if spec.principal.kind != PrincipalKind::System
+            || spec.principal.id.as_str() != "precommit-scanner"
+        {
+            return Err(invalid(
+                CentralErrorCode::ProtocolInvalid,
+                "Pre-commit Add Job requires the fixed system principal",
+            ));
+        }
+        self.persist_add_job(spec, "precommit-create").await
+    }
+
+    async fn persist_add_job(
+        &self,
+        spec: AddJobSpec,
+        audit_action: &'static str,
+    ) -> CentralResult<CreateAddJobResult> {
+        let key = crate::JobKey::new(spec.tenant_id.clone(), spec.job_id.clone());
         if let Some(existing) = self.jobs.get(&key).await? {
-            if existing.spec != request.spec {
+            if existing.spec != spec {
                 return Err(invalid(
                     CentralErrorCode::JobIdReused,
                     "JobId already belongs to a different managed Add request",
                 ));
             }
-            self.audit(&existing, AuditKind::JobCreated, "create")
+            self.audit(&existing, AuditKind::JobCreated, audit_action)
                 .await?;
             return Ok(CreateAddJobResult {
                 job: existing,
                 replayed: true,
             });
         }
-        validate_job_spec(&request.spec, self.clock.now().get())?;
+        validate_job_spec(&spec, self.clock.now().get())?;
 
         let job = JobRecord {
-            spec: request.spec.clone(),
+            spec: spec.clone(),
+            operation: JobOperation::Add,
+            workspace_spec: None,
+            snapshot_spec: None,
             state: JobState::Queued,
             resource_version: ResourceVersion::new(1),
             assignment: None,
+            workspace_assignment: None,
+            snapshot_assignment: None,
             accepted: None,
             progress: None,
             prepared: None,
@@ -186,7 +307,7 @@ impl ControlPlane {
         let (job, replayed) = match self.jobs.insert_or_load(job).await? {
             JobInsertOutcome::Inserted(job) => (job, false),
             JobInsertOutcome::Existing(existing) => {
-                if existing.spec != request.spec {
+                if existing.spec != spec {
                     return Err(invalid(
                         CentralErrorCode::JobIdReused,
                         "JobId already belongs to a different managed Add request",
@@ -195,8 +316,688 @@ impl ControlPlane {
                 (existing, true)
             }
         };
-        self.audit(&job, AuditKind::JobCreated, "create").await?;
+        self.audit(&job, AuditKind::JobCreated, audit_action)
+            .await?;
         Ok(CreateAddJobResult { job, replayed })
+    }
+
+    /// Creates the durable infrastructure Job used to materialize a Playground directory.
+    ///
+    /// The record is intentionally stored in the same Job table as managed Add so the existing
+    /// assignment outbox foreign key and recovery scanner cover both operations. Its operation
+    /// discriminant and immutable WorkspaceMaterializeSpec make replay identity explicit.
+    pub async fn create_workspace_materialization(
+        &self,
+        request: CreateWorkspaceMaterializationRequest,
+    ) -> CentralResult<CreateWorkspaceMaterializationResult> {
+        let spec = request.spec;
+        let canonical = WorkspaceMaterializeAssignment::canonical_relative_root(
+            &spec.project_id,
+            &spec.artifact_id,
+            &spec.playground_id,
+        )?;
+        if spec.relative_root != canonical {
+            return Err(invalid(
+                CentralErrorCode::ProtocolInvalid,
+                "WorkspaceMaterialize relative_root is not server-derived",
+            ));
+        }
+        if spec.request_digest != spec.computed_request_digest()? {
+            return Err(invalid(
+                CentralErrorCode::MetadataInvalid,
+                "WorkspaceMaterialize request digest does not bind its immutable spec",
+            ));
+        }
+        if spec.deadline_unix_ms.get() <= self.clock.now().get() {
+            return Err(invalid(
+                CentralErrorCode::DeadlineExceeded,
+                "WorkspaceMaterialize deadline has elapsed",
+            ));
+        }
+
+        // The legacy JobRecord spec is retained for the shared relational identity and audit
+        // schema. It is never exposed or used for materialization validation.
+        let mut legacy_spec = AddJobSpec {
+            job_id: spec.job_id.clone(),
+            principal: spec.principal.clone(),
+            tenant_id: spec.tenant_id.clone(),
+            project_id: spec.project_id.clone(),
+            artifact_id: spec.artifact_id.clone(),
+            playground_id: spec.playground_id.clone(),
+            expected_index_version: WireIndexVersion {
+                revision: IndexRevision::new(0),
+                digest: neoengram_core::ContentDigest::from_bytes([0; 32]),
+                extensions: Extensions::new(),
+            },
+            request_digest: neoengram_core::ContentDigest::from_bytes([0; 32]),
+            deadline_unix_ms: spec.deadline_unix_ms,
+            paths: Vec::new(),
+            all: true,
+            extensions: Extensions::new(),
+        };
+        legacy_spec.request_digest = legacy_spec.computed_request_digest()?;
+        let job = JobRecord {
+            spec: legacy_spec,
+            operation: JobOperation::WorkspaceMaterialize,
+            workspace_spec: Some(spec.clone()),
+            snapshot_spec: None,
+            state: JobState::Queued,
+            resource_version: ResourceVersion::new(1),
+            assignment: None,
+            workspace_assignment: None,
+            snapshot_assignment: None,
+            accepted: None,
+            progress: None,
+            prepared: None,
+            publication_candidate: None,
+            decision: None,
+            finalized: None,
+            finalized_ack: None,
+            failure: None,
+        };
+        let (job, replayed) = match self.jobs.insert_or_load(job).await? {
+            JobInsertOutcome::Inserted(job) => (job, false),
+            JobInsertOutcome::Existing(existing) => {
+                if existing.operation != JobOperation::WorkspaceMaterialize
+                    || existing.workspace_spec.as_ref() != Some(&spec)
+                {
+                    return Err(invalid(
+                        CentralErrorCode::JobIdReused,
+                        "materialization JobId is already bound to another operation",
+                    ));
+                }
+                (existing, true)
+            }
+        };
+        self.audit(&job, AuditKind::JobCreated, "materialize-create")
+            .await?;
+        Ok(CreateWorkspaceMaterializationResult { job, replayed })
+    }
+
+    /// Persists and publishes a server-selected WorkspaceMaterialize assignment.
+    pub async fn assign_workspace_materialization(
+        &self,
+        request: AssignWorkspaceMaterializationRequest,
+    ) -> CentralResult<AssignWorkspaceMaterializationResult> {
+        let mut job = self.load(&request.tenant_id, &request.job_id).await?;
+        if job.operation != JobOperation::WorkspaceMaterialize {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "Job is not a WorkspaceMaterialize operation",
+            ));
+        }
+        let spec = job.workspace_spec.clone().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::Internal,
+                "WorkspaceMaterialize Job has no immutable operation spec",
+            )
+        })?;
+        if spec.storage_volume_id != request.target.storage_volume_id {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "materialization assignment selected a different StorageVolume",
+            ));
+        }
+        let relative_root = spec.relative_root.clone();
+        let assignment = WorkspaceMaterializeAssignment {
+            job_id: spec.job_id.clone(),
+            assignment_id: request.target.assignment_id.clone(),
+            assignment_generation: request.target.assignment_generation,
+            agent_id: request.target.agent_id.clone(),
+            principal: spec.principal.clone(),
+            tenant_id: spec.tenant_id.clone(),
+            project_id: spec.project_id.clone(),
+            artifact_id: spec.artifact_id.clone(),
+            playground_id: spec.playground_id.clone(),
+            storage_volume_id: spec.storage_volume_id.clone(),
+            agent_mount_id: request.target.agent_mount_id.clone(),
+            mount_generation: request.target.mount_generation,
+            owner_generation: request.target.owner_generation,
+            relative_root,
+            base_commit_id: spec.base_commit_id,
+            base_index_version: spec.base_index_version.clone(),
+            request_digest: spec.request_digest,
+            deadline_unix_ms: spec.deadline_unix_ms,
+            extensions: Extensions::new(),
+        };
+        assignment.validate()?;
+        let envelope = JobAssignment {
+            assignment: AssignmentOperation::WorkspaceMaterialize {
+                input: assignment.clone(),
+                extensions: Extensions::new(),
+            },
+            extensions: Extensions::new(),
+        };
+        envelope.validate()?;
+
+        if let Some(existing) = &job.workspace_assignment {
+            if existing != &assignment {
+                return Err(invalid(
+                    CentralErrorCode::JobIdReused,
+                    "materialization Job already has a different assignment",
+                ));
+            }
+            let _ = self.outbox.reserve(envelope.clone()).await?;
+            let _ = self.outbox.publish(envelope.clone()).await?;
+            return Ok(AssignWorkspaceMaterializationResult {
+                job,
+                assignment: envelope,
+                replayed: true,
+            });
+        }
+        if job.state != JobState::Queued {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                format!("cannot assign materialization Job in state {:?}", job.state),
+            ));
+        }
+        let _ = self.outbox.reserve(envelope.clone()).await?;
+        let previous = job.resource_version.get();
+        job.workspace_assignment = Some(assignment.clone());
+        job.state = JobState::Assigned;
+        job.resource_version = ResourceVersion::new(previous.saturating_add(1));
+        job = match self.replace(previous, job).await {
+            Ok(job) => job,
+            Err(error) if error.code() == CentralErrorCode::ConcurrentUpdate => {
+                let persisted = self.load(&request.tenant_id, &request.job_id).await?;
+                if persisted.workspace_assignment.as_ref() != Some(&assignment) {
+                    return Err(error);
+                }
+                let _ = self.outbox.reserve(envelope.clone()).await?;
+                let _ = self.outbox.publish(envelope.clone()).await?;
+                return Ok(AssignWorkspaceMaterializationResult {
+                    job: persisted,
+                    assignment: envelope,
+                    replayed: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let _ = self.outbox.publish(envelope.clone()).await?;
+        self.audit(&job, AuditKind::AssignmentQueued, "materialize-assignment")
+            .await?;
+        Ok(AssignWorkspaceMaterializationResult {
+            job,
+            assignment: envelope,
+            replayed: false,
+        })
+    }
+
+    /// Creates the durable infrastructure Job used to mount a read-only Snapshot.
+    pub async fn create_snapshot_mount(
+        &self,
+        request: CreateSnapshotMountRequest,
+    ) -> CentralResult<CreateSnapshotMountResult> {
+        let spec = request.spec;
+        let canonical = SnapshotMountAssignment::canonical_relative_root(
+            &spec.project_id,
+            &spec.artifact_id,
+            &spec.snapshot_id,
+        )?;
+        if spec.relative_root != canonical {
+            return Err(invalid(
+                CentralErrorCode::ProtocolInvalid,
+                "SnapshotMount relative_root is not server-derived",
+            ));
+        }
+        if spec.request_digest != spec.computed_request_digest()? {
+            return Err(invalid(
+                CentralErrorCode::MetadataInvalid,
+                "SnapshotMount request digest does not bind its immutable spec",
+            ));
+        }
+        if spec.deadline_unix_ms.get() <= self.clock.now().get() {
+            return Err(invalid(
+                CentralErrorCode::DeadlineExceeded,
+                "SnapshotMount deadline has elapsed",
+            ));
+        }
+        let playground_id =
+            neoengram_protocol::PlaygroundId::new(spec.snapshot_id.as_str().to_owned())?;
+        let mut legacy_spec = AddJobSpec {
+            job_id: spec.job_id.clone(),
+            principal: spec.principal.clone(),
+            tenant_id: spec.tenant_id.clone(),
+            project_id: spec.project_id.clone(),
+            artifact_id: spec.artifact_id.clone(),
+            playground_id,
+            expected_index_version: spec.index_version.clone(),
+            request_digest: neoengram_core::ContentDigest::from_bytes([0; 32]),
+            deadline_unix_ms: spec.deadline_unix_ms,
+            paths: Vec::new(),
+            all: true,
+            extensions: Extensions::new(),
+        };
+        legacy_spec.request_digest = legacy_spec.computed_request_digest()?;
+        let job = JobRecord {
+            spec: legacy_spec,
+            operation: JobOperation::SnapshotMount,
+            workspace_spec: None,
+            snapshot_spec: Some(spec.clone()),
+            state: JobState::Queued,
+            resource_version: ResourceVersion::new(1),
+            assignment: None,
+            workspace_assignment: None,
+            snapshot_assignment: None,
+            accepted: None,
+            progress: None,
+            prepared: None,
+            publication_candidate: None,
+            decision: None,
+            finalized: None,
+            finalized_ack: None,
+            failure: None,
+        };
+        let (job, replayed) = match self.jobs.insert_or_load(job).await? {
+            JobInsertOutcome::Inserted(job) => (job, false),
+            JobInsertOutcome::Existing(existing) => {
+                if existing.operation != JobOperation::SnapshotMount
+                    || existing.snapshot_spec.as_ref() != Some(&spec)
+                {
+                    return Err(invalid(
+                        CentralErrorCode::JobIdReused,
+                        "Snapshot mount JobId is already bound to another operation",
+                    ));
+                }
+                (existing, true)
+            }
+        };
+        self.audit(&job, AuditKind::JobCreated, "snapshot-mount-create")
+            .await?;
+        Ok(CreateSnapshotMountResult { job, replayed })
+    }
+
+    /// Persists and publishes a server-selected SnapshotMount assignment.
+    pub async fn assign_snapshot_mount(
+        &self,
+        request: AssignSnapshotMountRequest,
+    ) -> CentralResult<AssignSnapshotMountResult> {
+        let mut job = self.load(&request.tenant_id, &request.job_id).await?;
+        if job.operation != JobOperation::SnapshotMount {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "Job is not a SnapshotMount operation",
+            ));
+        }
+        let spec = job.snapshot_spec.clone().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::Internal,
+                "SnapshotMount Job has no immutable operation spec",
+            )
+        })?;
+        if spec.storage_volume_id != request.target.storage_volume_id {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "Snapshot mount assignment selected a different StorageVolume",
+            ));
+        }
+        let assignment = SnapshotMountAssignment {
+            job_id: spec.job_id.clone(),
+            assignment_id: request.target.assignment_id.clone(),
+            assignment_generation: request.target.assignment_generation,
+            agent_id: request.target.agent_id.clone(),
+            principal: spec.principal.clone(),
+            tenant_id: spec.tenant_id.clone(),
+            project_id: spec.project_id.clone(),
+            artifact_id: spec.artifact_id.clone(),
+            snapshot_id: spec.snapshot_id.clone(),
+            storage_volume_id: spec.storage_volume_id.clone(),
+            agent_mount_id: request.target.agent_mount_id.clone(),
+            mount_generation: request.target.mount_generation,
+            owner_generation: request.target.owner_generation,
+            relative_root: spec.relative_root.clone(),
+            commit_id: spec.commit_id,
+            index_version: spec.index_version.clone(),
+            request_digest: spec.request_digest,
+            deadline_unix_ms: spec.deadline_unix_ms,
+            extensions: Extensions::new(),
+        };
+        assignment.validate()?;
+        let envelope = JobAssignment {
+            assignment: AssignmentOperation::SnapshotMount {
+                input: assignment.clone(),
+                extensions: Extensions::new(),
+            },
+            extensions: Extensions::new(),
+        };
+        envelope.validate()?;
+        if let Some(existing) = &job.snapshot_assignment {
+            if existing == &assignment {
+                // Snapshot serving is a durable responsibility. A heartbeat gap can mark the
+                // catalog Abnormal after this Job succeeded, so make the exact fenced assignment
+                // deliverable again and let the Agent report its durable mount observation.
+                let _ = self.outbox.reserve(envelope.clone()).await?;
+                let _ = self.outbox.reactivate(envelope.clone()).await?;
+                return Ok(AssignSnapshotMountResult {
+                    job,
+                    assignment: envelope,
+                    replayed: true,
+                });
+            }
+            let next_generation = existing
+                .assignment_generation
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::GenerationMismatch,
+                        "assignment generation exhausted",
+                    )
+                })?;
+            if !job.state.is_terminal()
+                || request.target.assignment_generation.get() != next_generation
+                || request.target.assignment_id == existing.assignment_id
+            {
+                return Err(invalid(
+                    CentralErrorCode::AssignmentMismatch,
+                    "Snapshot remount must fence a terminal assignment with its next generation",
+                ));
+            }
+            let snapshot = self
+                .catalog
+                .as_ref()
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::InvalidState,
+                        "ControlPlane has no control catalog for Snapshot state",
+                    )
+                })?
+                .get_snapshot(&spec.tenant_id, &spec.snapshot_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid(CentralErrorCode::JobNotFound, "Snapshot no longer exists")
+                })?;
+            if snapshot.state != crate::SnapshotState::Abnormal {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "Snapshot remount requires an Abnormal catalog state",
+                ));
+            }
+            let previous_assignment_id = existing.assignment_id.clone();
+            let _ = self.outbox.reserve(envelope.clone()).await?;
+            let previous = job.resource_version.get();
+            job.snapshot_assignment = Some(assignment.clone());
+            job.accepted = None;
+            job.progress = None;
+            job.failure = None;
+            job.state = JobState::Assigned;
+            job.resource_version = ResourceVersion::new(previous.saturating_add(1));
+            job = self.replace(previous, job).await?;
+            let _ = self
+                .outbox
+                .retire(&request.tenant_id, &previous_assignment_id)
+                .await?;
+            let _ = self.outbox.publish(envelope.clone()).await?;
+            self.audit(
+                &job,
+                AuditKind::AssignmentQueued,
+                "snapshot-remount-assignment",
+            )
+            .await?;
+            return Ok(AssignSnapshotMountResult {
+                job,
+                assignment: envelope,
+                replayed: false,
+            });
+        }
+        if job.state != JobState::Queued {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                format!("cannot assign SnapshotMount Job in state {:?}", job.state),
+            ));
+        }
+        let _ = self.outbox.reserve(envelope.clone()).await?;
+        let previous = job.resource_version.get();
+        job.snapshot_assignment = Some(assignment.clone());
+        job.state = JobState::Assigned;
+        job.resource_version = ResourceVersion::new(previous.saturating_add(1));
+        job = match self.replace(previous, job).await {
+            Ok(job) => job,
+            Err(error) if error.code() == CentralErrorCode::ConcurrentUpdate => {
+                let persisted = self.load(&request.tenant_id, &request.job_id).await?;
+                if persisted.snapshot_assignment.as_ref() != Some(&assignment) {
+                    return Err(error);
+                }
+                let _ = self.outbox.reserve(envelope.clone()).await?;
+                let _ = self.outbox.publish(envelope.clone()).await?;
+                return Ok(AssignSnapshotMountResult {
+                    job: persisted,
+                    assignment: envelope,
+                    replayed: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let _ = self.outbox.publish(envelope.clone()).await?;
+        self.audit(
+            &job,
+            AuditKind::AssignmentQueued,
+            "snapshot-mount-assignment",
+        )
+        .await?;
+        Ok(AssignSnapshotMountResult {
+            job,
+            assignment: envelope,
+            replayed: false,
+        })
+    }
+
+    pub async fn expire_snapshot_mount(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        job_id: &neoengram_protocol::JobId,
+    ) -> CentralResult<JobRecord> {
+        let mut job = self.load(tenant_id, job_id).await?;
+        if job.operation != JobOperation::SnapshotMount {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "Job is not a SnapshotMount operation",
+            ));
+        }
+        if job.state == JobState::TimedOut {
+            return Ok(job);
+        }
+        if job.spec.deadline_unix_ms.get() > self.clock.now().get() {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "cannot expire SnapshotMount before its deadline",
+            ));
+        }
+        let spec = job.snapshot_spec.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::Internal,
+                "SnapshotMount Job lost its immutable spec",
+            )
+        })?;
+        self.catalog
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "ControlPlane has no control catalog for Snapshot state",
+                )
+            })?
+            .transition_snapshot_state(
+                &spec.tenant_id,
+                &spec.snapshot_id,
+                crate::SnapshotState::Creating,
+                crate::SnapshotState::Abnormal,
+                crate::SnapshotPhase::Idle,
+                self.clock.now(),
+            )
+            .await?;
+        let previous = job.resource_version.get();
+        job.state = JobState::TimedOut;
+        job = self.replace(previous, job).await?;
+        if let Some(assignment) = &job.snapshot_assignment {
+            let _ = self
+                .outbox
+                .retire(tenant_id, &assignment.assignment_id)
+                .await?;
+        }
+        Ok(job)
+    }
+
+    pub async fn recover_snapshot_mount(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        job_id: &neoengram_protocol::JobId,
+    ) -> CentralResult<JobRecord> {
+        let mut job = self.load(tenant_id, job_id).await?;
+        if job.operation != JobOperation::SnapshotMount || job.state.is_terminal() {
+            return Ok(job);
+        }
+        let spec = job.snapshot_spec.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::Internal,
+                "SnapshotMount Job lost its immutable spec",
+            )
+        })?;
+        let snapshot = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "ControlPlane has no control catalog for Snapshot state",
+                )
+            })?
+            .get_snapshot(&spec.tenant_id, &spec.snapshot_id)
+            .await?
+            .ok_or_else(|| invalid(CentralErrorCode::JobNotFound, "Snapshot no longer exists"))?;
+        let recovered_state = match snapshot.state {
+            crate::SnapshotState::Creating => return Ok(job),
+            crate::SnapshotState::Ready => JobState::Succeeded,
+            // Abnormal is also the expected catalog state while a remount assignment is in
+            // flight. Do not repeatedly fence a newly Assigned/Accepted/Running attempt; an
+            // authenticated recovery failure performs the explicit RecoveryRequired CAS.
+            crate::SnapshotState::Abnormal => return Ok(job),
+        };
+        let previous = job.resource_version.get();
+        job.state = recovered_state;
+        job = self.replace(previous, job).await?;
+        if let Some(assignment) = &job.snapshot_assignment {
+            let _ = self
+                .outbox
+                .retire(tenant_id, &assignment.assignment_id)
+                .await?;
+        }
+        Ok(job)
+    }
+
+    /// Marks an elapsed materialization terminal and exposes the failed lifecycle on Playground.
+    pub async fn expire_workspace_materialization(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        job_id: &neoengram_protocol::JobId,
+    ) -> CentralResult<JobRecord> {
+        let mut job = self.load(tenant_id, job_id).await?;
+        if job.operation != JobOperation::WorkspaceMaterialize {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "Job is not a WorkspaceMaterialize operation",
+            ));
+        }
+        if job.state == JobState::TimedOut {
+            return Ok(job);
+        }
+        if job.spec.deadline_unix_ms.get() > self.clock.now().get() {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "cannot expire WorkspaceMaterialize before its deadline",
+            ));
+        }
+        let spec = job.workspace_spec.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::Internal,
+                "WorkspaceMaterialize Job lost its immutable spec",
+            )
+        })?;
+        self.catalog
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "ControlPlane has no control catalog for materialization state",
+                )
+            })?
+            .transition_playground_state(
+                &spec.tenant_id,
+                &spec.project_id,
+                &spec.artifact_id,
+                &spec.playground_id,
+                crate::PlaygroundState::Creating,
+                crate::PlaygroundState::Abnormal,
+                self.clock.now(),
+            )
+            .await?;
+        let previous = job.resource_version.get();
+        job.state = JobState::TimedOut;
+        job = self.replace(previous, job).await?;
+        if let Some(assignment) = &job.workspace_assignment {
+            let _ = self
+                .outbox
+                .retire(tenant_id, &assignment.assignment_id)
+                .await?;
+        }
+        Ok(job)
+    }
+
+    /// Converges the Job side of the cross-database publication after a crash between the
+    /// catalog lifecycle CAS and the Job CAS. No success or failure is fabricated while the
+    /// Playground remains Creating.
+    pub async fn recover_workspace_materialization(
+        &self,
+        tenant_id: &neoengram_protocol::TenantId,
+        job_id: &neoengram_protocol::JobId,
+    ) -> CentralResult<JobRecord> {
+        let mut job = self.load(tenant_id, job_id).await?;
+        if job.operation != JobOperation::WorkspaceMaterialize || job.state.is_terminal() {
+            return Ok(job);
+        }
+        let spec = job.workspace_spec.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::Internal,
+                "WorkspaceMaterialize Job lost its immutable spec",
+            )
+        })?;
+        let playground = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "ControlPlane has no control catalog for materialization state",
+                )
+            })?
+            .get_playground(
+                &spec.tenant_id,
+                &spec.project_id,
+                &spec.artifact_id,
+                &spec.playground_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::JobNotFound,
+                    "materialization Playground no longer exists",
+                )
+            })?;
+        let recovered_state = match playground.state {
+            crate::PlaygroundState::Creating => return Ok(job),
+            crate::PlaygroundState::Ready => JobState::Succeeded,
+            crate::PlaygroundState::Abnormal => JobState::RecoveryRequired,
+        };
+        let previous = job.resource_version.get();
+        job.state = recovered_state;
+        job = self.replace(previous, job).await?;
+        if let Some(assignment) = &job.workspace_assignment {
+            let _ = self
+                .outbox
+                .retire(tenant_id, &assignment.assignment_id)
+                .await?;
+        }
+        Ok(job)
     }
 
     /// Returns the authoritative Job only when its persisted scope is visible to the actor.
@@ -328,9 +1129,40 @@ impl ControlPlane {
         &self,
         request: ReceiveReportRequest,
     ) -> CentralResult<ReceiveReportResult> {
+        self.receive_report_with_session(request, None).await
+    }
+
+    /// Applies a report received over an authenticated Agent session.
+    ///
+    /// Snapshot serving observations additionally bind their original durable report to the
+    /// current session generation, preventing an old success from being re-signed after restart.
+    pub async fn receive_session_report(
+        &self,
+        request: ReceiveReportRequest,
+        session_generation: SessionGeneration,
+    ) -> CentralResult<ReceiveReportResult> {
+        self.receive_report_with_session(request, Some(session_generation))
+            .await
+    }
+
+    async fn receive_report_with_session(
+        &self,
+        request: ReceiveReportRequest,
+        session_generation: Option<SessionGeneration>,
+    ) -> CentralResult<ReceiveReportResult> {
         let mut job = self
             .load(&request.tenant_id, request.report.job_id())
             .await?;
+        if job.is_workspace_materialization() {
+            return self
+                .receive_workspace_materialization_report(job, request)
+                .await;
+        }
+        if job.is_snapshot_mount() {
+            return self
+                .receive_snapshot_mount_report(job, request, session_generation)
+                .await;
+        }
         self.authorize(
             Actor::Agent(request.agent_id.clone()),
             Action::ReceiveReport,
@@ -555,6 +1387,453 @@ impl ControlPlane {
             .retire(&request.tenant_id, &assignment_id)
             .await?;
         self.audit(&job, AuditKind::ReportReceived, "report")
+            .await?;
+        Ok(ReceiveReportResult { job, replayed })
+    }
+
+    async fn receive_workspace_materialization_report(
+        &self,
+        mut job: JobRecord,
+        request: ReceiveReportRequest,
+    ) -> CentralResult<ReceiveReportResult> {
+        let assignment = job.workspace_assignment.clone().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "WorkspaceMaterialize Job has no persisted assignment",
+            )
+        })?;
+        if assignment.agent_id != request.agent_id {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "reporting Agent does not own the WorkspaceMaterialize assignment",
+            ));
+        }
+        let catalog = self.catalog.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "ControlPlane has no control catalog for materialization state",
+            )
+        })?;
+        let assignment_id = assignment.assignment_id.clone();
+        let mut replayed = false;
+        match request.report {
+            AgentReport::Accepted(report) => {
+                report.validate()?;
+                validate_workspace_report_identity(
+                    &assignment,
+                    &report.job_id,
+                    &report.assignment_id,
+                    report.assignment_generation,
+                )?;
+                if report.request_digest != assignment.request_digest {
+                    return Err(invalid(
+                        CentralErrorCode::AssignmentMismatch,
+                        "accepted materialization report carries a different request digest",
+                    ));
+                }
+                // A restarted materializer no longer has the acknowledged report in its local
+                // outbox. Identity and request_digest are the immutable acceptance facts; a new
+                // observation timestamp is therefore a semantic replay, not a conflicting claim.
+                if job.accepted.is_some() {
+                    replayed = true;
+                } else {
+                    if job.state != JobState::Assigned {
+                        return Err(invalid(
+                            CentralErrorCode::InvalidState,
+                            format!("cannot accept materialization Job in state {:?}", job.state),
+                        ));
+                    }
+                    let previous = job.resource_version.get();
+                    job.accepted = Some(report);
+                    job.state = JobState::Accepted;
+                    job = self.replace(previous, job).await?;
+                }
+            }
+            AgentReport::Progress(report) => {
+                report.validate()?;
+                validate_workspace_report_identity(
+                    &assignment,
+                    &report.job_id,
+                    &report.assignment_id,
+                    report.assignment_generation,
+                )?;
+                if job.progress.as_ref() == Some(&report) {
+                    replayed = true;
+                } else {
+                    match report.state {
+                        JobState::Running => {
+                            if !matches!(job.state, JobState::Accepted | JobState::Running) {
+                                return Err(invalid(
+                                    CentralErrorCode::InvalidState,
+                                    format!(
+                                        "cannot apply materialization progress in state {:?}",
+                                        job.state
+                                    ),
+                                ));
+                            }
+                        }
+                        JobState::Succeeded => {
+                            if !matches!(
+                                job.state,
+                                JobState::Accepted | JobState::Running | JobState::Succeeded
+                            ) {
+                                return Err(invalid(
+                                    CentralErrorCode::InvalidState,
+                                    format!(
+                                        "cannot complete materialization Job in state {:?}",
+                                        job.state
+                                    ),
+                                ));
+                            }
+                            catalog
+                                .transition_playground_state(
+                                    &assignment.tenant_id,
+                                    &assignment.project_id,
+                                    &assignment.artifact_id,
+                                    &assignment.playground_id,
+                                    crate::PlaygroundState::Creating,
+                                    crate::PlaygroundState::Ready,
+                                    self.clock.now(),
+                                )
+                                .await?;
+                        }
+                        state => {
+                            return Err(invalid(
+                                CentralErrorCode::InvalidState,
+                                format!(
+                                    "WorkspaceMaterialize progress cannot carry state {state:?}"
+                                ),
+                            ));
+                        }
+                    }
+                    let previous = job.resource_version.get();
+                    job.state = report.state;
+                    job.progress = Some(report);
+                    job = self.replace(previous, job).await?;
+                }
+            }
+            AgentReport::Failed(report) => {
+                report.validate()?;
+                validate_workspace_report_identity(
+                    &assignment,
+                    &report.job_id,
+                    &report.assignment_id,
+                    report.assignment_generation,
+                )?;
+                validate_terminal_state(report.final_state)?;
+                if job.failure.as_ref() == Some(&report) {
+                    replayed = true;
+                } else {
+                    if job.state.is_terminal() && job.state != JobState::RecoveryRequired {
+                        return Err(invalid(
+                            CentralErrorCode::InvalidState,
+                            "materialization Job already has another terminal outcome",
+                        ));
+                    }
+                    catalog
+                        .transition_playground_state(
+                            &assignment.tenant_id,
+                            &assignment.project_id,
+                            &assignment.artifact_id,
+                            &assignment.playground_id,
+                            crate::PlaygroundState::Creating,
+                            crate::PlaygroundState::Abnormal,
+                            self.clock.now(),
+                        )
+                        .await?;
+                    let previous = job.resource_version.get();
+                    job.state = report.final_state;
+                    job.failure = Some(report);
+                    job = self.replace(previous, job).await?;
+                }
+            }
+            AgentReport::Prepared(_) | AgentReport::Finalized(_) => {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "WorkspaceMaterialize does not publish metadata or await a decision",
+                ));
+            }
+        }
+        if job.state.is_terminal() {
+            let _ = self
+                .outbox
+                .retire(&request.tenant_id, &assignment_id)
+                .await?;
+        }
+        self.audit(&job, AuditKind::ReportReceived, "materialize-report")
+            .await?;
+        Ok(ReceiveReportResult { job, replayed })
+    }
+
+    async fn receive_snapshot_mount_report(
+        &self,
+        mut job: JobRecord,
+        request: ReceiveReportRequest,
+        session_generation: Option<SessionGeneration>,
+    ) -> CentralResult<ReceiveReportResult> {
+        let assignment = job.snapshot_assignment.clone().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "SnapshotMount Job has no persisted assignment",
+            )
+        })?;
+        if assignment.agent_id != request.agent_id {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "reporting Agent does not own the SnapshotMount assignment",
+            ));
+        }
+        let catalog = self.catalog.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "ControlPlane has no control catalog for Snapshot state",
+            )
+        })?;
+        let assignment_id = assignment.assignment_id.clone();
+        let mut replayed = false;
+        if let Some(session_generation) = session_generation {
+            validate_snapshot_report_session_generation(&request.report, session_generation)?;
+        }
+        match request.report {
+            AgentReport::Accepted(report) => {
+                report.validate()?;
+                validate_snapshot_report_identity(
+                    &assignment,
+                    &report.job_id,
+                    &report.assignment_id,
+                    report.assignment_generation,
+                )?;
+                if report.request_digest != assignment.request_digest {
+                    return Err(invalid(
+                        CentralErrorCode::AssignmentMismatch,
+                        "accepted SnapshotMount report carries a different request digest",
+                    ));
+                }
+                if job.accepted.is_some() {
+                    replayed = true;
+                } else {
+                    if job.state != JobState::Assigned {
+                        return Err(invalid(
+                            CentralErrorCode::InvalidState,
+                            format!("cannot accept SnapshotMount Job in state {:?}", job.state),
+                        ));
+                    }
+                    let previous = job.resource_version.get();
+                    job.accepted = Some(report);
+                    job.state = JobState::Accepted;
+                    job = self.replace(previous, job).await?;
+                }
+            }
+            AgentReport::Progress(report) => {
+                report.validate()?;
+                validate_snapshot_report_identity(
+                    &assignment,
+                    &report.job_id,
+                    &report.assignment_id,
+                    report.assignment_generation,
+                )?;
+                match report.state {
+                    JobState::Running => {
+                        if !matches!(job.state, JobState::Accepted | JobState::Running) {
+                            return Err(invalid(
+                                CentralErrorCode::InvalidState,
+                                format!(
+                                    "cannot apply SnapshotMount progress in state {:?}",
+                                    job.state
+                                ),
+                            ));
+                        }
+                        let snapshot = catalog
+                            .get_snapshot(&assignment.tenant_id, &assignment.snapshot_id)
+                            .await?
+                            .ok_or_else(|| {
+                                invalid(CentralErrorCode::JobNotFound, "Snapshot no longer exists")
+                            })?;
+                        if snapshot.state == crate::SnapshotState::Creating
+                            && snapshot.phase == crate::SnapshotPhase::Planning
+                        {
+                            let _ = catalog
+                                .transition_snapshot_state(
+                                    &assignment.tenant_id,
+                                    &assignment.snapshot_id,
+                                    crate::SnapshotState::Creating,
+                                    crate::SnapshotState::Creating,
+                                    crate::SnapshotPhase::Materializing,
+                                    self.clock.now(),
+                                )
+                                .await?;
+                        }
+                    }
+                    JobState::Succeeded => {
+                        if report.phase != "mounted" {
+                            return Err(invalid(
+                                CentralErrorCode::InvalidState,
+                                "SnapshotMount success must report phase mounted",
+                            ));
+                        }
+                        if !matches!(
+                            job.state,
+                            JobState::Accepted
+                                | JobState::Running
+                                | JobState::Succeeded
+                                | JobState::RecoveryRequired
+                        ) {
+                            return Err(invalid(
+                                CentralErrorCode::InvalidState,
+                                format!(
+                                    "cannot complete SnapshotMount Job in state {:?}",
+                                    job.state
+                                ),
+                            ));
+                        }
+                        let snapshot = catalog
+                            .get_snapshot(&assignment.tenant_id, &assignment.snapshot_id)
+                            .await?
+                            .ok_or_else(|| {
+                                invalid(CentralErrorCode::JobNotFound, "Snapshot no longer exists")
+                            })?;
+                        match snapshot.state {
+                            crate::SnapshotState::Creating => {
+                                let _ = catalog
+                                    .transition_snapshot_state(
+                                        &assignment.tenant_id,
+                                        &assignment.snapshot_id,
+                                        crate::SnapshotState::Creating,
+                                        crate::SnapshotState::Ready,
+                                        crate::SnapshotPhase::Idle,
+                                        self.clock.now(),
+                                    )
+                                    .await?;
+                            }
+                            crate::SnapshotState::Abnormal => {
+                                // A durable mount descriptor can be remounted by the same fenced
+                                // Agent after restart. Its fresh mounted observation restores the
+                                // catalog without creating a second Snapshot identity.
+                                let _ = catalog
+                                    .transition_snapshot_state(
+                                        &assignment.tenant_id,
+                                        &assignment.snapshot_id,
+                                        crate::SnapshotState::Abnormal,
+                                        crate::SnapshotState::Ready,
+                                        crate::SnapshotPhase::Idle,
+                                        self.clock.now(),
+                                    )
+                                    .await?;
+                            }
+                            crate::SnapshotState::Ready => {}
+                        }
+                    }
+                    state => {
+                        return Err(invalid(
+                            CentralErrorCode::InvalidState,
+                            format!("SnapshotMount progress cannot carry state {state:?}"),
+                        ));
+                    }
+                }
+                if job.progress.as_ref() == Some(&report) {
+                    replayed = true;
+                } else {
+                    let previous = job.resource_version.get();
+                    job.state = report.state;
+                    job.progress = Some(report);
+                    job.failure = None;
+                    job = self.replace(previous, job).await?;
+                }
+            }
+            AgentReport::Failed(report) => {
+                report.validate()?;
+                validate_snapshot_report_identity(
+                    &assignment,
+                    &report.job_id,
+                    &report.assignment_id,
+                    report.assignment_generation,
+                )?;
+                validate_terminal_state(report.final_state)?;
+                let recovery_failure = report
+                    .extensions
+                    .get("snapshot_mount_recovery")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+                if job.failure.as_ref() == Some(&report) {
+                    replayed = true;
+                } else {
+                    let recovery_after_success = recovery_failure
+                        && matches!(job.state, JobState::Succeeded | JobState::RecoveryRequired);
+                    if job.state.is_terminal()
+                        && job.state != JobState::RecoveryRequired
+                        && !recovery_after_success
+                    {
+                        return Err(invalid(
+                            CentralErrorCode::InvalidState,
+                            "SnapshotMount Job already has another terminal outcome",
+                        ));
+                    }
+                    let snapshot = catalog
+                        .get_snapshot(&assignment.tenant_id, &assignment.snapshot_id)
+                        .await?
+                        .ok_or_else(|| {
+                            invalid(CentralErrorCode::JobNotFound, "Snapshot no longer exists")
+                        })?;
+                    match snapshot.state {
+                        crate::SnapshotState::Creating => {
+                            let _ = catalog
+                                .transition_snapshot_state(
+                                    &assignment.tenant_id,
+                                    &assignment.snapshot_id,
+                                    crate::SnapshotState::Creating,
+                                    crate::SnapshotState::Abnormal,
+                                    crate::SnapshotPhase::Idle,
+                                    self.clock.now(),
+                                )
+                                .await?;
+                        }
+                        crate::SnapshotState::Ready if recovery_after_success => {
+                            // The Agent authenticated the same assignment fence but could no
+                            // longer reconstruct its durable read-only mount. Demote the serving
+                            // view and let the coordinator issue a fresh assignment generation.
+                            let _ = catalog
+                                .transition_snapshot_state(
+                                    &assignment.tenant_id,
+                                    &assignment.snapshot_id,
+                                    crate::SnapshotState::Ready,
+                                    crate::SnapshotState::Abnormal,
+                                    crate::SnapshotPhase::Idle,
+                                    self.clock.now(),
+                                )
+                                .await?;
+                        }
+                        crate::SnapshotState::Abnormal => {}
+                        crate::SnapshotState::Ready => {
+                            return Err(invalid(
+                                CentralErrorCode::InvalidState,
+                                "a Ready Snapshot only accepts an explicit mount recovery failure",
+                            ));
+                        }
+                    }
+                    let previous = job.resource_version.get();
+                    job.state = if recovery_after_success {
+                        JobState::RecoveryRequired
+                    } else {
+                        report.final_state
+                    };
+                    job.failure = Some(report);
+                    job = self.replace(previous, job).await?;
+                }
+            }
+            AgentReport::Prepared(_) | AgentReport::Finalized(_) => {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "SnapshotMount does not publish metadata or await a decision",
+                ));
+            }
+        }
+        if job.state.is_terminal() {
+            let _ = self
+                .outbox
+                .retire(&request.tenant_id, &assignment_id)
+                .await?;
+        }
+        self.audit(&job, AuditKind::ReportReceived, "snapshot-mount-report")
             .await?;
         Ok(ReceiveReportResult { job, replayed })
     }
@@ -800,7 +2079,8 @@ impl ControlPlane {
         })
     }
 
-    /// Validates complete staged metadata and central object durability, then performs one CAS.
+    /// Validates complete staged metadata and assigned-Volume placement evidence, then performs
+    /// one CAS.
     pub async fn finalize_add(
         &self,
         request: FinalizeAddRequest,
@@ -894,9 +2174,43 @@ impl ControlPlane {
                     "prepared job already contains a frozen publication candidate",
                 ));
             }
-            let metadata =
-                validate_staged_metadata(&job, self.metadata.as_ref(), self.objects.as_ref())
-                    .await?;
+            let metadata = validate_staged_metadata(&job, self.metadata.as_ref()).await?;
+            for receipt in &metadata.placements {
+                let evidence = crate::ObjectPlacementEvidence {
+                    receipt: receipt.clone(),
+                    placement_generation: assignment.placement_generation,
+                };
+                self.objects.record_placement(&evidence).await?;
+                let placed = self
+                    .objects
+                    .object_placement(
+                        &assignment.tenant_id,
+                        &assignment.artifact_id,
+                        &assignment.storage_volume_id,
+                        &assignment.artifact_placement_id,
+                        assignment.placement_generation,
+                        receipt.object_id,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        invalid(
+                            CentralErrorCode::ObjectNotDurable,
+                            format!(
+                                "object {} has no evidence on the assigned Volume placement generation",
+                                receipt.object_id
+                            ),
+                        )
+                    })?;
+                if placed.receipt.size != receipt.size {
+                    return Err(invalid(
+                        CentralErrorCode::ObjectNotDurable,
+                        format!(
+                            "object {} placement evidence differs from its declaration",
+                            receipt.object_id
+                        ),
+                    ));
+                }
+            }
             // This is the last authority gate before Publishing becomes durable. Once that state
             // and its canonical candidate are persisted, recovery must converge a possibly
             // completed CAS without consulting mutable authority or transient staging again.
@@ -1109,6 +2423,85 @@ fn job_not_found(job_id: &neoengram_protocol::JobId) -> crate::CentralError {
     )
 }
 
+fn validate_workspace_report_identity(
+    assignment: &WorkspaceMaterializeAssignment,
+    job_id: &neoengram_protocol::JobId,
+    assignment_id: &neoengram_protocol::AssignmentId,
+    generation: neoengram_protocol::AssignmentGeneration,
+) -> CentralResult<()> {
+    if job_id != &assignment.job_id || assignment_id != &assignment.assignment_id {
+        return Err(invalid(
+            CentralErrorCode::AssignmentMismatch,
+            "materialization report does not identify the persisted assignment",
+        ));
+    }
+    if generation != assignment.assignment_generation {
+        return Err(invalid(
+            CentralErrorCode::GenerationMismatch,
+            "materialization report carries a stale assignment generation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_report_identity(
+    assignment: &SnapshotMountAssignment,
+    job_id: &neoengram_protocol::JobId,
+    assignment_id: &neoengram_protocol::AssignmentId,
+    generation: neoengram_protocol::AssignmentGeneration,
+) -> CentralResult<()> {
+    if job_id != &assignment.job_id || assignment_id != &assignment.assignment_id {
+        return Err(invalid(
+            CentralErrorCode::AssignmentMismatch,
+            "Snapshot mount report does not identify the persisted assignment",
+        ));
+    }
+    if generation != assignment.assignment_generation {
+        return Err(invalid(
+            CentralErrorCode::GenerationMismatch,
+            "Snapshot mount report carries a stale assignment generation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_report_session_generation(
+    report: &AgentReport,
+    session_generation: SessionGeneration,
+) -> CentralResult<()> {
+    let extensions = match report {
+        AgentReport::Progress(progress)
+            if progress.state == JobState::Succeeded && progress.phase == "mounted" =>
+        {
+            Some(&progress.extensions)
+        }
+        AgentReport::Failed(failed)
+            if failed
+                .extensions
+                .get("snapshot_mount_recovery")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+        {
+            Some(&failed.extensions)
+        }
+        _ => None,
+    };
+    let Some(extensions) = extensions else {
+        return Ok(());
+    };
+    let observed = extensions
+        .get("snapshot_mount_session_generation")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok());
+    if observed != Some(session_generation.get()) {
+        return Err(invalid(
+            CentralErrorCode::GenerationMismatch,
+            "Snapshot mount report was produced under another Agent session generation",
+        ));
+    }
+    Ok(())
+}
+
 fn bounded_control_error_message(mut message: String) -> String {
     if message.trim().is_empty() {
         return "Index publication was rejected by the publisher".to_owned();
@@ -1151,7 +2544,18 @@ fn validate_frozen_publication(
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_control_error_message, CONTROL_ERROR_MESSAGE_LIMIT};
+    use neoengram_protocol::{
+        AssignmentGeneration, AssignmentId, ControlError, DecimalU64, ErrorCode, Extensions,
+        JobFailed, JobFailureStage, JobId, JobProgress, JobState, SessionGeneration, TenantId,
+        UnixMillis,
+    };
+
+    use crate::{AgentReport, CentralErrorCode};
+
+    use super::{
+        bounded_control_error_message, validate_snapshot_report_session_generation,
+        CONTROL_ERROR_MESSAGE_LIMIT,
+    };
 
     #[test]
     fn control_error_messages_are_bounded_on_utf8_boundaries() {
@@ -1164,5 +2568,61 @@ mod tests {
         assert!(!bounded_control_error_message("   ".to_owned())
             .trim()
             .is_empty());
+    }
+
+    #[test]
+    fn snapshot_mounted_report_is_fenced_by_original_session_generation() {
+        let mut extensions = Extensions::new();
+        extensions.insert(
+            "snapshot_mount_session_generation".to_owned(),
+            serde_json::Value::String("7".to_owned()),
+        );
+        let report = AgentReport::Progress(JobProgress {
+            job_id: JobId::new("job-a").unwrap(),
+            assignment_id: AssignmentId::new("assignment-a").unwrap(),
+            assignment_generation: AssignmentGeneration::new(1),
+            state: JobState::Succeeded,
+            phase: "mounted".to_owned(),
+            files_completed: DecimalU64::new(0),
+            bytes_completed: DecimalU64::new(0),
+            retry_after_ms: None,
+            extensions,
+        });
+
+        validate_snapshot_report_session_generation(&report, SessionGeneration::new(7)).unwrap();
+        let stale = validate_snapshot_report_session_generation(&report, SessionGeneration::new(8))
+            .unwrap_err();
+        assert_eq!(stale.code(), CentralErrorCode::GenerationMismatch);
+    }
+
+    #[test]
+    fn snapshot_recovery_report_requires_current_session_generation() {
+        let mut extensions = Extensions::new();
+        extensions.insert(
+            "snapshot_mount_recovery".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        let report = AgentReport::Failed(JobFailed {
+            tenant_id: TenantId::new("tenant-a").unwrap(),
+            job_id: JobId::new("job-a").unwrap(),
+            assignment_id: AssignmentId::new("assignment-a").unwrap(),
+            assignment_generation: AssignmentGeneration::new(1),
+            final_state: JobState::Failed,
+            failed_at_unix_ms: UnixMillis::new(1),
+            stage: JobFailureStage::Execution,
+            error: ControlError {
+                code: ErrorCode::new("SNAPSHOT_OBJECT_UNAVAILABLE").unwrap(),
+                message: "Snapshot object is unavailable".to_owned(),
+                retryable: true,
+                retry_after_ms: None,
+                extensions: Extensions::new(),
+            },
+            extensions,
+        });
+
+        let missing =
+            validate_snapshot_report_session_generation(&report, SessionGeneration::new(8))
+                .unwrap_err();
+        assert_eq!(missing.code(), CentralErrorCode::GenerationMismatch);
     }
 }

@@ -3,12 +3,13 @@
 NeoEngram `0.2.0` 已完成 P0 crate 边界改造：本地 CLI、可复用领域模型、执行端口、文件系统
 适配器、Standalone 应用、wire protocol、Agent、中心控制状态机和 HTTP server 分别拥有独立 crate。
 当前仍以本地 format v8 工作流为主要产品；`neoengramd` 保持无网络 library，中心已提供后端无关
-`AuthorityStore` 和默认 SQLite 单节点权威后端。`neoengram-server` 默认通过 Fusen 0.9.0 暴露六个
-system/Job 接口；启用 enrollment 时增加五个公开管理接口，并通过独立 Hyper listener 提供两条 Agent
-bootstrap/status 路由。`neoengram-agentd` 提供可运行的出站 enrollment/polling 进程。Vue 3 Web 控制台可通过 MSW 运行多租户资源浏览、
+`AuthorityStore` 和默认 SQLite 单节点权威后端。`neoengram-server` 通过 Fusen 0.9.0 暴露已实现的
+system、Tenant、StorageVolume、Enrollment、Playground 和 Job action API，并通过独立 Hyper listener
+提供 Agent OpenAPI。`neoengram-agentd` 提供可运行的出站 enrollment 和 Agent 主动建立的 HTTP/2
+全双工控制 channel。Vue 3 Web 控制台可通过 MSW 运行多租户资源浏览、
 StorageVolume 登记与放置选择、Artifact/Playground/Snapshot 创建、Playground Commit 与 Managed
 Add Job 流程，并可查看 Commit 描述、Tags、父 Commit 信息和文件 Diff，但尚未
-连接完整真实中心。这不代表其余 OpenAPI、PostgreSQL、Agent mTLS、真实 S3 或 HA 已经实现。能力状态和后续路线统一见
+连接完整真实中心。这不代表其余 OpenAPI、PostgreSQL、Agent mTLS、跨 Volume 数据路由或 HA 已经实现。能力状态和后续路线统一见
 [`implementation-plan.md`](implementation-plan.md)。
 
 ## Workspace 与职责
@@ -24,8 +25,8 @@ crates/
 └── neoengram/             # Clap、cwd 输入、typed Result/progress/diagnostic 的唯一终端渲染入口
 services/
 ├── neoengramd/            # 无网络中心状态机、ports、datasource/mapper 与 SQLite 权威后端
-├── neoengram-server/      # Fusen 用户 HTTP、Hyper Agent enrollment 与运行时组装
-└── neoengram-agentd/      # Agent enrollment/polling binary、配置、健康与 HTTP client
+├── neoengram-server/      # Fusen 用户 HTTP、Hyper Agent H2 action channel 与运行时组装
+└── neoengram-agentd/      # Agent enrollment/H2 channel binary、配置、健康与 HTTP client
 apps/
 └── neoengram-web/         # 独立 Vue 3 SPA；公开 OpenAPI 生成类型与 MSW 开发适配器
 ```
@@ -54,7 +55,10 @@ scope，服务端仍从认证结果执行 RBAC，不能信任浏览器选择。
   `execute_mutation`/`finalize_mutation` executor 与 `WorktreeReceipt` 契约已经实现。
 - `neoengram-fs` 把物理路径、loose object、锁和 durable journal 限制在适配器内部，并已提供 Engine
   `Worktree`、`JournalStore` 和 `LockManager` adapters。经该执行边界运行的 mutation 遵循
-  `MutationPlan -> durable journal -> WorktreeReceipt`，权威 Index/ref 发布不藏在文件系统层。
+  `MutationPlan -> durable journal -> WorktreeReceipt`，权威 Index/ref 发布不藏在文件系统层。Managed
+  Agent 使用同一 `LooseObjectStore` 原子能力，把 Chunk 放在业务 Volume 的
+  `.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects/<object_id>`，而不是 Agent state
+  目录或 Server 文件系统。
 - `neoengram-standalone` 拥有 Repository discovery、SQLite、FUSE 和本地最终 CAS。每个命令接收显式
   cwd 和独立 Request，并返回领域化 typed Result；包括只读、`add`/`commit`/`gc`、mutation 和
   lifecycle 全部命令。Standalone 不再暴露通用 `CommandResult`，成功文本不进入应用层；
@@ -74,10 +78,12 @@ scope，服务端仍从认证结果执行 RBAC，不能信任浏览器选择。
   `ControlPlane`/ports，不能访问 SQLx。SQLite datasource 只管理连接、锁、schema、迁移和完整性，
   repository 查询、行映射与 port 实现集中在 mapper。调用方向固定为
   `controller -> service -> ControlPlane/ports -> mapper -> datasource`。
-- server 默认注册版本查询、live、ready、Job create/query/finalize 六个路由；启用 enrollment 后在
-  Fusen listener 增加五个认证管理路由，并在独立 Hyper listener 增加 bootstrap/status。认证业务接口
-  要求 API version 与经外部 OIDC/JWKS 验证的 Bearer JWT，RBAC 缺省拒绝；Agent listener 使用一次性
-  token 与 Ed25519 proof。`AssignJob`、`ExpireAddJob`、`ResumePublication` 仍是内部方法，不能注册为 HTTP 路由。
+- server 在 Fusen listener 注册已实现的公开 action API，并在独立 Hyper listener 注册 Agent
+  enrollment、H2 full-duplex control channel、MetadataBatch 和 Index action。认证业务接口要求 API version 与经外部
+  OIDC/JWKS 验证的 Bearer JWT，RBAC 缺省拒绝；Agent listener 使用一次性 token 与逐帧 Ed25519 proof。
+  Agent 主动建立 channel，但 Assignment/Decision 由 server 权威状态派生并下推；旧 message-list poll
+  仅用于兼容和人工恢复。Server 不提供 Chunk missing/upload payload action；`AssignJob`、
+  `ExpireAddJob`、`ResumePublication` 仍是内部方法，不能注册为 HTTP 路由。
 - `neoengram-agent` 的生产依赖只有 core、engine 和 protocol，不依赖 standalone；它对 `neoengramd`
   的 `dev-dependency` 只用于内存组合测试。`neoengramd` 只依赖 core 和 protocol，不依赖 engine、fs
   或 standalone。
@@ -105,7 +111,9 @@ core 的参数类型和 engine 的错误/故障注入接口。Agent 到 `neoengr
 
 Managed Add 的 engine 输出是 `PreparedAdd { index_delta, manifests, object_specs, statistics }`，只表示
 候选结果，不能直接发布 Index。Standalone 由 SQLite publisher 完成最终 CAS；Managed 模式由
-`neoengramd` 在对象 durability 和 MetadataBatch 完整校验后，把 canonical Manifests 与 expected
+Agent 先把 Chunk 原子写入所分配业务 Volume 的 immutable CAS，再通过 `ObjectReceipt` 上报
+Volume、Artifact placement 和 generation 证据。`neoengramd` 在 placement evidence 与 MetadataBatch
+完整校验后，把 canonical Manifests 与 expected
 `IndexVersion` CAS 作为一个幂等 publication 原子发布；Conflict/Rejected 不写入候选 Manifest。
 `Prepared -> Publishing` 的 Job CAS 同时冻结完整 publication candidate；Publishing recovery 只重放
 该候选，不再依赖 staging、当前 ObjectCatalog、壁钟或可变 ACL。外部 `FinalizeAdd` 始终通过
@@ -118,8 +126,10 @@ Standalone `commit` 已调用 Engine graph builder，并由独立 SQLite publish
 
 当前已实现 Agent Ledger/Assignment 和中心 Create/Assign/Report/Stage/Finalize 的无网络状态机；
 Agent 在持久化 `running` 后通过 `ReportSink` 发出结构化 progress，PreparedAdd 的 IndexDelta、Manifest
-与 ObjectSpec 必须组成闭合引用集。对象传输完成后，Agent 把 exact MetadataBatch descriptors/pages
-写入 durable `TransferReceipt`，持久化 Prepared，再发送 descriptor-bound `JobPrepared`；只有中心先
+与 ObjectSpec 必须组成闭合引用集。Agent 使用 `LooseObjectStore` 完成 Chunk hash/size 校验、fsync 和
+原子发布，随后只把 Manifest、IndexDelta、ObjectReceipt 的 exact MetadataBatch descriptors/pages
+写入 durable `TransferReceipt`，持久化 Prepared，再发送 descriptor-bound `JobPrepared`；Chunk 字节
+不经过 Server。只有中心先
 持久化该报告后才幂等 staging，全部成功才进入 `awaiting_decision`。报告或 staging 响应丢失会保留
 Prepared 并从 Ledger 重放。Core 是 publication digest 的唯一 canonical 实现；Engine、Agent 与中心
 分别重算 scope/base/IndexDelta/Manifest/ObjectSpec，`JobPrepared.candidate_digest` 再绑定
@@ -130,8 +140,11 @@ InMemory 与 SQLite 运行同一行为契约。SQLite 是显式路径、单进�
 `neoengram-server` 使用 SQLite 时只能部署一个副本。生产 HTTP 明文监听位于受控网络，TLS 必须由
 Ingress/反向代理终止；多副本、HA/RLS 仍需要 PostgreSQL adapter。
 不提供 HA 或数据库级 RLS；PG/MySQL 后端将独立实现 SQL/schema/migration，只复用 ports 与契约测试。
-HTTP/2、HTTP/3、Agent mTLS/session/Job delivery、PostgreSQL、真实 S3 和 NFS fencing 属于后续
-adapter/部署阶段；当前 enrollment daemon 不能被描述为完整业务 Agent。
+HTTP/2 Agent session/Job delivery 已由 Agent 主动建立的全双工 action channel 实现；HTTP/3、Agent
+mTLS、PostgreSQL 和 NFS 强 fencing 属于后续 adapter/部署阶段。跨 Volume route 也属于后续数据面：
+应由获批 Agent/Gateway 端点直接传输，Server 只授权/校验路由范围和 placement evidence，不能代理
+Chunk payload。开发 profile 不能被描述为
+具备生产传输安全或 HA 的完整业务 Agent。
 
 本地磁盘布局及事务语义见 [`storage-architecture.md`](storage-architecture.md)；中心与 Agent 的详细
 边界见 [`agent-central-control.md`](agent-central-control.md)。

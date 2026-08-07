@@ -5,12 +5,18 @@ import { ElMessage } from 'element-plus';
 import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { createArtifact, queryArtifactCommitGraph, queryArtifactList } from '@/api/operations';
+import {
+  createArtifact,
+  queryApiVersion,
+  queryArtifactCommitGraph,
+  queryArtifactList,
+} from '@/api/operations';
 import type { ArtifactInitializationMode } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
+import { supportsResourceBrowser } from '@/features/capabilities';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
 
@@ -39,10 +45,23 @@ const canCreate = computed(
   () => tenants.byId(tenantId.value)?.permissions.includes('artifact.create') ?? false,
 );
 const createMutation = useMutation({ mutationFn: createArtifact });
+const versionQuery = useQuery({
+  queryKey: ['system', 'version'],
+  queryFn: queryApiVersion,
+  staleTime: Number.POSITIVE_INFINITY,
+});
+const resourceBrowserEnabled = computed(() =>
+  supportsResourceBrowser(versionQuery.data.value?.data.capabilities),
+);
 const sourceArtifactsQuery = useQuery({
   queryKey: computed(() => ['artifacts', tenantId.value, 'artifact-source-options']),
   queryFn: () => queryArtifactList({ tenant_id: tenantId.value, page_size: 100 }),
-  enabled: computed(() => createOpen.value && createForm.initializationMode === 'derived'),
+  enabled: computed(
+    () =>
+      resourceBrowserEnabled.value &&
+      createOpen.value &&
+      createForm.initializationMode === 'derived',
+  ),
 });
 function artifactOptionKey(project: string, artifact: string): string {
   return `${project}\u0000${artifact}`;
@@ -71,6 +90,7 @@ const sourceCommitQuery = useQuery({
   enabled: computed(
     () =>
       createOpen.value &&
+      resourceBrowserEnabled.value &&
       createForm.initializationMode === 'derived' &&
       Boolean(selectedSourceArtifact.value),
   ),
@@ -215,7 +235,14 @@ async function submitCreate(): Promise<void> {
     </PageHeading>
 
     <form class="resource-toolbar" @submit.prevent="applyFilters">
-      <ProjectFilter v-model="projectId" :tenant-id="tenantId" />
+      <ProjectFilter v-if="resourceBrowserEnabled" v-model="projectId" :tenant-id="tenantId" />
+      <el-input
+        v-else
+        v-model="projectId"
+        aria-label="Project 筛选"
+        clearable
+        placeholder="全部 Project"
+      />
       <el-input v-model="searchInput" clearable placeholder="搜索名称或 Artifact ID" />
       <el-button type="primary" native-type="submit" :icon="Search">查询</el-button>
     </form>
@@ -300,7 +327,12 @@ async function submitCreate(): Promise<void> {
       <el-alert v-if="createError" :title="createError" type="error" :closable="false" />
       <el-form label-position="top" class="dialog-form">
         <el-form-item label="Project">
-          <ProjectFilter v-model="createForm.projectId" :tenant-id="tenantId" />
+          <ProjectFilter
+            v-if="resourceBrowserEnabled"
+            v-model="createForm.projectId"
+            :tenant-id="tenantId"
+          />
+          <el-input v-else v-model="createForm.projectId" placeholder="project-lab" />
         </el-form-item>
         <el-form-item label="Artifact ID">
           <el-input v-model="createForm.artifactId" placeholder="evaluation-set" />
@@ -311,7 +343,7 @@ async function submitCreate(): Promise<void> {
         <el-form-item label="描述">
           <el-input v-model="createForm.description" type="textarea" :rows="3" />
         </el-form-item>
-        <el-form-item label="初始化方式">
+        <el-form-item v-if="resourceBrowserEnabled" label="初始化方式">
           <el-segmented
             v-model="createForm.initializationMode"
             :options="[
@@ -320,7 +352,7 @@ async function submitCreate(): Promise<void> {
             ]"
           />
         </el-form-item>
-        <template v-if="createForm.initializationMode === 'derived'">
+        <template v-if="resourceBrowserEnabled && createForm.initializationMode === 'derived'">
           <el-form-item label="来源 Artifact">
             <el-select
               v-model="createForm.sourceArtifactKey"

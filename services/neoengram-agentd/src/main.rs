@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use neoengram_agentd::{check_health, run, AgentConfig, HealthMode, LoggingFormat};
+use neoengram_agentd::{
+    check_health, run, run_with_development_directory_probe, AgentConfig, HealthMode, LoggingFormat,
+};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -23,6 +25,9 @@ enum Command {
 struct RunArgs {
     #[arg(long)]
     config: PathBuf,
+    /// Treats storage.mount_path as a local directory boundary; loopback endpoints only.
+    #[arg(long)]
+    development_directory_probe: bool,
 }
 
 #[derive(Debug, Args)]
@@ -39,11 +44,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Run(arguments) => {
             let config = AgentConfig::load(arguments.config)?;
             initialize_logging(&config)?;
-            run(config).await?;
+            if arguments.development_directory_probe {
+                run_with_development_directory_probe(config).await?;
+            } else {
+                run(config).await?;
+            }
         }
         Command::Health(arguments) => check_health(arguments.state_dir, arguments.mode)?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn development_directory_probe_is_opt_in() {
+        let cli =
+            Cli::try_parse_from(["neoengram-agent", "run", "--config", "/tmp/agent.yaml"]).unwrap();
+        let Command::Run(arguments) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(!arguments.development_directory_probe);
+
+        let cli = Cli::try_parse_from([
+            "neoengram-agent",
+            "run",
+            "--config",
+            "/tmp/agent.yaml",
+            "--development-directory-probe",
+        ])
+        .unwrap();
+        let Command::Run(arguments) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(arguments.development_directory_probe);
+    }
 }
 
 fn initialize_logging(

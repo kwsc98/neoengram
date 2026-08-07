@@ -1,22 +1,38 @@
-use std::{convert::Infallible, fmt, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    convert::Infallible,
+    fmt,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::{Bytes, BytesMut};
 use http::{
     header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER},
-    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version,
 };
-use http_body_util::{BodyExt, Full};
-use hyper::{body::Incoming, server::conn::http1, service::service_fn};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use http_body_util::{BodyExt, Either, Full};
+use hyper::{
+    body::{Body, Frame, Incoming, SizeHint},
+    service::service_fn,
+};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto,
+};
 use serde::Serialize;
 use tokio::{
     net::TcpListener,
-    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
 
+mod control_channel;
 mod registry_handler;
 
 pub use registry_handler::{
@@ -26,19 +42,20 @@ pub use registry_handler::{
 pub const AGENT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 pub const AGENT_MAX_METADATA_PAGE_BODY_BYTES: usize =
     neoengram_protocol::MAX_METADATA_PAGE_BYTES + AGENT_MAX_REQUEST_BODY_BYTES;
-pub const AGENT_MAX_OBJECT_UPLOAD_BODY_BYTES: usize =
-    (neoengram_protocol::MAX_INLINE_OBJECT_BYTES * 4).div_ceil(3) + AGENT_MAX_REQUEST_BODY_BYTES;
 pub const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const AGENT_MAX_CONCURRENT_REQUESTS: usize = 64;
 const AGENT_OVERLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const JSON_CONTENT_TYPE: &str = "application/json";
+const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
 
 #[derive(Clone, Copy)]
 struct AgentResourceLimits {
     max_connections: usize,
+    max_channels: usize,
+    max_requests: usize,
     request_timeout: Duration,
     overload_response_timeout: Duration,
 }
@@ -46,6 +63,8 @@ struct AgentResourceLimits {
 impl AgentResourceLimits {
     const PRODUCTION: Self = Self {
         max_connections: AGENT_MAX_CONCURRENT_REQUESTS,
+        max_channels: AGENT_MAX_CONCURRENT_REQUESTS,
+        max_requests: AGENT_MAX_CONCURRENT_REQUESTS,
         request_timeout: AGENT_REQUEST_TIMEOUT,
         overload_response_timeout: AGENT_OVERLOAD_RESPONSE_TIMEOUT,
     };
@@ -63,8 +82,7 @@ pub enum AgentAction {
     JobMetadataBatchStage,
     JobMetadataPageStage,
     JobIndexPageQuery,
-    JobObjectMissingQuery,
-    JobObjectUpload,
+    JobManifestPageQuery,
     SessionClose,
 }
 
@@ -90,10 +108,9 @@ impl AgentAction {
                 Some(Self::JobMetadataPageStage)
             }
             neoengram_protocol::AGENT_JOB_INDEX_PAGE_QUERY_PATH => Some(Self::JobIndexPageQuery),
-            neoengram_protocol::AGENT_JOB_OBJECT_MISSING_QUERY_PATH => {
-                Some(Self::JobObjectMissingQuery)
+            neoengram_protocol::AGENT_JOB_MANIFEST_PAGE_QUERY_PATH => {
+                Some(Self::JobManifestPageQuery)
             }
-            neoengram_protocol::AGENT_JOB_OBJECT_UPLOAD_PATH => Some(Self::JobObjectUpload),
             neoengram_protocol::AGENT_SESSION_CLOSE_PATH => Some(Self::SessionClose),
             _ => None,
         }
@@ -102,7 +119,6 @@ impl AgentAction {
     const fn max_body_bytes(self) -> usize {
         match self {
             Self::JobMetadataPageStage => AGENT_MAX_METADATA_PAGE_BODY_BYTES,
-            Self::JobObjectUpload => AGENT_MAX_OBJECT_UPLOAD_BODY_BYTES,
             _ => AGENT_MAX_REQUEST_BODY_BYTES,
         }
     }
@@ -112,6 +128,120 @@ impl AgentAction {
 #[async_trait]
 pub trait AgentApiHandler: Send + Sync + 'static {
     async fn handle(&self, action: AgentAction, body: &[u8]) -> Result<Vec<u8>, AgentHttpError>;
+
+    /// Opens one H2 reverse control channel after consuming and authenticating its first frame.
+    async fn open_control_channel(
+        &self,
+        _body: Incoming,
+    ) -> Result<AgentControlChannel, AgentHttpError> {
+        Err(AgentHttpError::unavailable())
+    }
+}
+
+/// Streaming response frames produced by an authenticated Agent control channel.
+pub struct AgentControlChannel {
+    frames: mpsc::Receiver<Bytes>,
+}
+
+impl AgentControlChannel {
+    /// Creates a channel response backed by a bounded frame receiver.
+    #[must_use]
+    pub fn new(frames: mpsc::Receiver<Bytes>) -> Self {
+        Self { frames }
+    }
+}
+
+impl fmt::Debug for AgentControlChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentControlChannel")
+            .finish_non_exhaustive()
+    }
+}
+
+struct AgentStreamingBody {
+    frames: mpsc::Receiver<Bytes>,
+    _stream_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Body for AgentStreamingBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().frames)
+            .poll_recv(context)
+            .map(|frame| frame.map(|bytes| Ok(Frame::data(bytes))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_closed() && self.frames.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+type AgentResponseBody = Either<Full<Bytes>, AgentStreamingBody>;
+
+enum AgentHandledResponse {
+    Json(Vec<u8>),
+    Channel(AgentControlChannel),
+}
+
+pub(crate) struct AgentNdjsonInput<B> {
+    body: B,
+    decoder: neoengram_protocol::AgentChannelNdjsonDecoder,
+    ready: VecDeque<Vec<u8>>,
+    finished: bool,
+}
+
+impl<B> AgentNdjsonInput<B>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    pub(crate) fn new(body: B) -> Self {
+        Self {
+            body,
+            decoder: neoengram_protocol::AgentChannelNdjsonDecoder::new(),
+            ready: VecDeque::new(),
+            finished: false,
+        }
+    }
+
+    pub(crate) async fn next_line(&mut self) -> Result<Option<Vec<u8>>, AgentHttpError> {
+        if let Some(line) = self.ready.pop_front() {
+            return Ok(Some(line));
+        }
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            let Some(frame) = self.body.frame().await else {
+                self.finished = true;
+                self.decoder
+                    .finish()
+                    .map_err(|_| AgentHttpError::protocol_invalid())?;
+                return Ok(None);
+            };
+            let frame = frame.map_err(|_| AgentHttpError::protocol_invalid())?;
+            let data = frame
+                .into_data()
+                .map_err(|_| AgentHttpError::protocol_invalid())?;
+            self.ready.extend(
+                self.decoder
+                    .push(&data)
+                    .map_err(|_| AgentHttpError::protocol_invalid())?,
+            );
+            if let Some(line) = self.ready.pop_front() {
+                return Ok(Some(line));
+            }
+        }
+    }
 }
 
 /// Compatibility export for callers migrating from the enrollment-only listener.
@@ -298,7 +428,9 @@ async fn run_listener(
     graceful_shutdown_timeout: Duration,
     limits: AgentResourceLimits,
 ) {
-    let semaphore = Arc::new(Semaphore::new(limits.max_connections));
+    let connection_semaphore = Arc::new(Semaphore::new(limits.max_connections));
+    let channel_semaphore = Arc::new(Semaphore::new(limits.max_channels));
+    let request_semaphore = Arc::new(Semaphore::new(limits.max_requests));
     let mut connections = JoinSet::new();
     let terminal = loop {
         tokio::select! {
@@ -312,7 +444,7 @@ async fn run_listener(
                     Ok(accepted) => accepted,
                     Err(error) => break Err(AgentServerError::Runtime(error.to_string())),
                 };
-                let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                let Ok(permit) = connection_semaphore.clone().try_acquire_owned() else {
                     tracing::debug!(
                         limit = limits.max_connections,
                         "Agent HTTP connection rejected because the connection budget is exhausted"
@@ -326,12 +458,16 @@ async fn run_listener(
                 };
                 let handler = handler.clone();
                 let connection_shutdown = shutdown.clone();
+                let channel_semaphore = channel_semaphore.clone();
+                let request_semaphore = request_semaphore.clone();
                 connections.spawn(async move {
                     serve_connection(
                         stream,
                         handler,
                         permit,
                         connection_shutdown,
+                        channel_semaphore,
+                        request_semaphore,
                         limits.request_timeout,
                     )
                     .await;
@@ -366,16 +502,30 @@ async fn serve_connection(
     handler: Arc<dyn AgentApiHandler>,
     _permit: OwnedSemaphorePermit,
     mut shutdown: watch::Receiver<bool>,
+    channel_semaphore: Arc<Semaphore>,
+    request_semaphore: Arc<Semaphore>,
     request_timeout: Duration,
 ) {
     let serve = async {
-        let service =
-            service_fn(move |request| dispatch(request, handler.clone(), request_timeout));
-        let mut builder = http1::Builder::new();
+        let service = service_fn(move |request| {
+            dispatch(
+                request,
+                handler.clone(),
+                channel_semaphore.clone(),
+                request_semaphore.clone(),
+                request_timeout,
+            )
+        });
+        let mut builder = auto::Builder::new(TokioExecutor::new());
         builder
+            .http1()
             .keep_alive(false)
             .timer(TokioTimer::new())
             .header_read_timeout(request_timeout);
+        builder
+            .http2()
+            .timer(TokioTimer::new())
+            .max_concurrent_streams(AGENT_MAX_CONCURRENT_REQUESTS as u32);
         let connection = builder.serve_connection(TokioIo::new(stream), service);
         tokio::pin!(connection);
         tokio::select! {
@@ -396,8 +546,10 @@ async fn serve_connection(
 async fn dispatch(
     request: Request<Incoming>,
     handler: Arc<dyn AgentApiHandler>,
+    channel_semaphore: Arc<Semaphore>,
+    request_semaphore: Arc<Semaphore>,
     request_timeout: Duration,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<AgentResponseBody>, Infallible> {
     let path = request.uri().path().to_owned();
     let request_id = match request_id(request.headers()) {
         Ok(request_id) => request_id,
@@ -406,9 +558,29 @@ async fn dispatch(
             return Ok(problem_response(error, &path, &request_id));
         }
     };
+    let is_channel = path == neoengram_protocol::AGENT_SESSION_CHANNEL_OPEN_PATH;
+    let stream_permit = match if is_channel {
+        channel_semaphore.try_acquire_owned()
+    } else {
+        request_semaphore.try_acquire_owned()
+    } {
+        Ok(permit) => permit,
+        Err(_) => {
+            return Ok(problem_response(
+                AgentHttpError::unavailable().with_retry_after_ms(100),
+                &path,
+                &request_id,
+            ));
+        }
+    };
     let response =
         match tokio::time::timeout(request_timeout, handle_request(request, handler)).await {
-            Ok(Ok(body)) => json_response(StatusCode::OK, body, &request_id),
+            Ok(Ok(AgentHandledResponse::Json(body))) => {
+                json_response(StatusCode::OK, body, &request_id)
+            }
+            Ok(Ok(AgentHandledResponse::Channel(channel))) => {
+                return Ok(channel_response(channel, &request_id, stream_permit));
+            }
             Ok(Err(error)) => problem_response(error, &path, &request_id),
             Err(_) => problem_response(
                 AgentHttpError::new(
@@ -427,7 +599,7 @@ async fn dispatch(
 async fn reject_overloaded_connection(
     stream: tokio::net::TcpStream,
     header_timeout: Duration,
-) -> Result<(), hyper::Error> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let service = service_fn(move |request: Request<Incoming>| async move {
         let path = request.uri().path().to_owned();
         let (error, request_id) = match request_id(request.headers()) {
@@ -439,11 +611,13 @@ async fn reject_overloaded_connection(
         };
         Ok::<_, Infallible>(problem_response(error, &path, &request_id))
     });
-    let mut builder = http1::Builder::new();
+    let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
+        .http1()
         .keep_alive(false)
         .timer(TokioTimer::new())
         .header_read_timeout(header_timeout);
+    builder.http2().timer(TokioTimer::new());
     builder
         .serve_connection(TokioIo::new(stream), service)
         .await
@@ -452,20 +626,12 @@ async fn reject_overloaded_connection(
 async fn handle_request(
     request: Request<Incoming>,
     handler: Arc<dyn AgentApiHandler>,
-) -> Result<Vec<u8>, AgentHttpError> {
+) -> Result<AgentHandledResponse, AgentHttpError> {
     if request.method() != Method::POST {
         return Err(AgentHttpError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             "METHOD_NOT_ALLOWED",
             "Only POST is supported by Agent API routes",
-            false,
-        ));
-    }
-    if !is_json_content_type(request.headers()) {
-        return Err(AgentHttpError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "UNSUPPORTED_MEDIA_TYPE",
-            "Content-Type must be application/json",
             false,
         ));
     }
@@ -475,6 +641,36 @@ async fn handle_request(
             StatusCode::NOT_FOUND,
             "ROUTE_NOT_FOUND",
             "Agent route was not found",
+            false,
+        ));
+    }
+    if path == neoengram_protocol::AGENT_SESSION_CHANNEL_OPEN_PATH {
+        if request.version() != Version::HTTP_2 {
+            return Err(AgentHttpError::new(
+                StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+                "HTTP_VERSION_REQUIRED",
+                "Agent control channels require HTTP/2",
+                false,
+            ));
+        }
+        if !has_content_type(request.headers(), NDJSON_CONTENT_TYPE) {
+            return Err(AgentHttpError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "UNSUPPORTED_MEDIA_TYPE",
+                "Content-Type must be application/x-ndjson",
+                false,
+            ));
+        }
+        return handler
+            .open_control_channel(request.into_body())
+            .await
+            .map(AgentHandledResponse::Channel);
+    }
+    if !is_json_content_type(request.headers()) {
+        return Err(AgentHttpError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "UNSUPPORTED_MEDIA_TYPE",
+            "Content-Type must be application/json",
             false,
         ));
     }
@@ -497,7 +693,10 @@ async fn handle_request(
         return Err(payload_too_large());
     }
     let body = read_bounded(request.into_body(), max_body_bytes).await?;
-    handler.handle(action, &body).await
+    handler
+        .handle(action, &body)
+        .await
+        .map(AgentHandledResponse::Json)
 }
 
 async fn read_bounded(
@@ -528,6 +727,10 @@ fn payload_too_large() -> AgentHttpError {
 }
 
 fn is_json_content_type(headers: &HeaderMap) -> bool {
+    has_content_type(headers, JSON_CONTENT_TYPE)
+}
+
+fn has_content_type(headers: &HeaderMap, expected: &str) -> bool {
     let mut values = headers.get_all(CONTENT_TYPE).iter();
     let Some(value) = values.next().and_then(|value| value.to_str().ok()) else {
         return false;
@@ -536,7 +739,7 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
         && value
             .split(';')
             .next()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case(JSON_CONTENT_TYPE))
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
 }
 
 fn request_id(headers: &HeaderMap) -> Result<String, AgentHttpError> {
@@ -592,7 +795,11 @@ struct ProblemDocument<'a> {
     retry_after_ms: Option<String>,
 }
 
-fn problem_response(error: AgentHttpError, path: &str, request_id: &str) -> Response<Full<Bytes>> {
+fn problem_response(
+    error: AgentHttpError,
+    path: &str,
+    request_id: &str,
+) -> Response<AgentResponseBody> {
     let type_name = error.code.to_ascii_lowercase().replace('_', "-");
     let document = ProblemDocument {
         type_uri: format!("urn:neoengram:problem:{type_name}"),
@@ -616,7 +823,11 @@ fn problem_response(error: AgentHttpError, path: &str, request_id: &str) -> Resp
     response
 }
 
-fn json_response(status: StatusCode, body: Vec<u8>, request_id: &str) -> Response<Full<Bytes>> {
+fn json_response(
+    status: StatusCode,
+    body: Vec<u8>,
+    request_id: &str,
+) -> Response<AgentResponseBody> {
     response(status, JSON_CONTENT_TYPE, body, request_id)
 }
 
@@ -625,8 +836,8 @@ fn response(
     content_type: &'static str,
     body: Vec<u8>,
     request_id: &str,
-) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(body)));
+) -> Response<AgentResponseBody> {
+    let mut response = Response::new(Either::Left(Full::new(Bytes::from(body))));
     *response.status_mut() = status;
     response
         .headers_mut()
@@ -642,6 +853,26 @@ fn response(
     response
 }
 
+fn channel_response(
+    channel: AgentControlChannel,
+    request_id: &str,
+    stream_permit: OwnedSemaphorePermit,
+) -> Response<AgentResponseBody> {
+    let body = AgentStreamingBody {
+        frames: channel.frames,
+        _stream_permit: Some(stream_permit),
+    };
+    let mut response = Response::new(Either::Right(body));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(NDJSON_CONTENT_TYPE));
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(&REQUEST_ID_HEADER, value);
+    }
+    response
+}
+
 fn problem_title(status: StatusCode) -> &'static str {
     match status {
         StatusCode::FORBIDDEN => "Agent bootstrap denied",
@@ -649,6 +880,7 @@ fn problem_title(status: StatusCode) -> &'static str {
         StatusCode::METHOD_NOT_ALLOWED => "Method not allowed",
         StatusCode::PAYLOAD_TOO_LARGE => "Payload too large",
         StatusCode::UNSUPPORTED_MEDIA_TYPE => "Unsupported media type",
+        StatusCode::HTTP_VERSION_NOT_SUPPORTED => "HTTP version not supported",
         StatusCode::UNPROCESSABLE_ENTITY => "Protocol invalid",
         StatusCode::CONFLICT => "Enrollment conflict",
         StatusCode::GATEWAY_TIMEOUT => "Request timeout",
@@ -670,9 +902,11 @@ impl fmt::Debug for RunningAgentServer {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use hyper::client::conn::http2;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
+        sync::Mutex,
     };
 
     use super::*;
@@ -685,10 +919,21 @@ mod tests {
         assert!(!valid_request_id(&"a".repeat(129)));
     }
 
+    #[test]
+    fn manifest_metadata_action_is_routable_without_reintroducing_chunk_actions() {
+        assert_eq!(
+            AgentAction::from_path(neoengram_protocol::AGENT_JOB_MANIFEST_PAGE_QUERY_PATH),
+            Some(AgentAction::JobManifestPageQuery)
+        );
+        assert_eq!(AgentAction::from_path("/agent/job/object/upload"), None);
+    }
+
     #[derive(Default)]
     struct TestHandler {
         calls: AtomicUsize,
         delay: Duration,
+        channel_first_line: Mutex<Option<Vec<u8>>>,
+        channel_sender: Mutex<Option<mpsc::Sender<Bytes>>>,
     }
 
     #[async_trait]
@@ -701,6 +946,25 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             Ok(b"{}".to_vec())
+        }
+
+        async fn open_control_channel(
+            &self,
+            body: Incoming,
+        ) -> Result<AgentControlChannel, AgentHttpError> {
+            let mut input = AgentNdjsonInput::new(body);
+            let first = input
+                .next_line()
+                .await?
+                .ok_or_else(AgentHttpError::protocol_invalid)?;
+            *self.channel_first_line.lock().await = Some(first);
+            let (frames, receiver) = mpsc::channel(1);
+            frames
+                .send(Bytes::from_static(b"{\"type\":\"channel.opened\"}\n"))
+                .await
+                .map_err(|_| AgentHttpError::unavailable())?;
+            *self.channel_sender.lock().await = Some(frames);
+            Ok(AgentControlChannel::new(receiver))
         }
     }
 
@@ -728,16 +992,34 @@ mod tests {
     }
 
     async fn post_raw(address: SocketAddr) -> Vec<u8> {
-        post_raw_with_request_id_headers(address, "x-request-id: agent:test-request\r\n").await
+        post_path_raw(address, "/agent/enrollment/bootstrap").await
+    }
+
+    async fn post_path_raw(address: SocketAddr, path: &str) -> Vec<u8> {
+        post_path_raw_with_request_id_headers(address, path, "x-request-id: agent:test-request\r\n")
+            .await
     }
 
     async fn post_raw_with_request_id_headers(
         address: SocketAddr,
         request_id_headers: &str,
     ) -> Vec<u8> {
+        post_path_raw_with_request_id_headers(
+            address,
+            "/agent/enrollment/bootstrap",
+            request_id_headers,
+        )
+        .await
+    }
+
+    async fn post_path_raw_with_request_id_headers(
+        address: SocketAddr,
+        path: &str,
+        request_id_headers: &str,
+    ) -> Vec<u8> {
         let mut stream = TcpStream::connect(address).await.unwrap();
         let request = format!(
-            "POST /agent/enrollment/bootstrap HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n{request_id_headers}content-length: 2\r\nconnection: close\r\n\r\n{{}}"
+            "POST {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n{request_id_headers}content-length: 2\r\nconnection: close\r\n\r\n{{}}"
         );
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
@@ -757,9 +1039,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_central_object_payload_actions_are_not_routable() {
+        let handler = Arc::new(TestHandler::default());
+        let (address, shutdown, completion) =
+            start_test_listener(AgentResourceLimits::PRODUCTION, handler.clone()).await;
+
+        for path in [
+            "/agent/job/object/missing/query",
+            "/agent/job/object/upload",
+        ] {
+            let response = String::from_utf8(post_path_raw(address, path).await).unwrap();
+            assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+            assert!(response.contains("\"code\":\"ROUTE_NOT_FOUND\""));
+        }
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+
+        stop_test_listener(shutdown, completion).await;
+    }
+
+    #[tokio::test]
     async fn slow_headers_hold_one_connection_budget_and_overflow_gets_problem_details() {
         let limits = AgentResourceLimits {
             max_connections: 1,
+            max_channels: 1,
+            max_requests: 1,
             request_timeout: Duration::from_millis(300),
             overload_response_timeout: Duration::from_millis(100),
         };
@@ -818,12 +1121,16 @@ mod tests {
     async fn request_deadline_returns_problem_details() {
         let limits = AgentResourceLimits {
             max_connections: 1,
+            max_channels: 1,
+            max_requests: 1,
             request_timeout: Duration::from_millis(40),
             overload_response_timeout: Duration::from_millis(100),
         };
         let handler = Arc::new(TestHandler {
             calls: AtomicUsize::new(0),
             delay: Duration::from_millis(200),
+            channel_first_line: Mutex::new(None),
+            channel_sender: Mutex::new(None),
         });
         let (address, shutdown, completion) = start_test_listener(limits, handler.clone()).await;
 
@@ -833,6 +1140,153 @@ mod tests {
         assert!(response.contains("\"code\":\"REQUEST_TIMEOUT\""));
         assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
 
+        stop_test_listener(shutdown, completion).await;
+    }
+
+    #[tokio::test]
+    async fn h2_prior_knowledge_channel_ignores_data_boundaries_and_streams_ndjson() {
+        let handler = Arc::new(TestHandler::default());
+        let (address, shutdown, completion) =
+            start_test_listener(AgentResourceLimits::PRODUCTION, handler.clone()).await;
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut client, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            connection.await.unwrap();
+        });
+        let (request_frames, request_body) = mpsc::channel(2);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "http://{address}{}",
+                neoengram_protocol::AGENT_SESSION_CHANNEL_OPEN_PATH
+            ))
+            .version(Version::HTTP_2)
+            .header(CONTENT_TYPE, NDJSON_CONTENT_TYPE)
+            .body(AgentStreamingBody {
+                frames: request_body,
+                _stream_permit: None,
+            })
+            .unwrap();
+        let response = tokio::spawn(async move { client.send_request(request).await });
+
+        request_frames
+            .send(Bytes::from_static(b"{\"type\":\"channel."))
+            .await
+            .unwrap();
+        request_frames
+            .send(Bytes::from_static(b"open\"}\n"))
+            .await
+            .unwrap();
+
+        let mut response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.version(), Version::HTTP_2);
+        assert_eq!(response.headers()[CONTENT_TYPE], NDJSON_CONTENT_TYPE);
+        let data = response
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(data, Bytes::from_static(b"{\"type\":\"channel.opened\"}\n"));
+        assert_eq!(
+            handler.channel_first_line.lock().await.as_deref(),
+            Some(b"{\"type\":\"channel.open\"}".as_slice())
+        );
+
+        drop(request_frames);
+        drop(response);
+        stop_test_listener(shutdown, completion).await;
+    }
+
+    #[tokio::test]
+    async fn h2_channels_and_unary_requests_have_independent_global_budgets() {
+        let limits = AgentResourceLimits {
+            max_connections: 1,
+            max_channels: 1,
+            max_requests: 1,
+            request_timeout: Duration::from_secs(1),
+            overload_response_timeout: Duration::from_millis(100),
+        };
+        let handler = Arc::new(TestHandler::default());
+        let (address, shutdown, completion) = start_test_listener(limits, handler.clone()).await;
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut client, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            connection.await.unwrap();
+        });
+
+        let (channel_frames, channel_body) = mpsc::channel(1);
+        let channel_request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "http://{address}{}",
+                neoengram_protocol::AGENT_SESSION_CHANNEL_OPEN_PATH
+            ))
+            .version(Version::HTTP_2)
+            .header(CONTENT_TYPE, NDJSON_CONTENT_TYPE)
+            .body(AgentStreamingBody {
+                frames: channel_body,
+                _stream_permit: None,
+            })
+            .unwrap();
+        channel_frames
+            .send(Bytes::from_static(b"{\"type\":\"channel.open\"}\n"))
+            .await
+            .unwrap();
+        let channel_response = client.send_request(channel_request).await.unwrap();
+        assert_eq!(channel_response.status(), StatusCode::OK);
+
+        let (unary_frames, unary_body) = mpsc::channel(1);
+        unary_frames.send(Bytes::from_static(b"{}")).await.unwrap();
+        drop(unary_frames);
+        let unary_request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "http://{address}{}",
+                neoengram_protocol::AGENT_SESSION_OPEN_PATH
+            ))
+            .version(Version::HTTP_2)
+            .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .body(AgentStreamingBody {
+                frames: unary_body,
+                _stream_permit: None,
+            })
+            .unwrap();
+        let unary_response = client.send_request(unary_request).await.unwrap();
+        assert_eq!(unary_response.status(), StatusCode::OK);
+
+        let (second_channel_frames, second_channel_body) = mpsc::channel(1);
+        second_channel_frames
+            .send(Bytes::from_static(b"{\"type\":\"channel.open\"}\n"))
+            .await
+            .unwrap();
+        drop(second_channel_frames);
+        let second_channel_request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "http://{address}{}",
+                neoengram_protocol::AGENT_SESSION_CHANNEL_OPEN_PATH
+            ))
+            .version(Version::HTTP_2)
+            .header(CONTENT_TYPE, NDJSON_CONTENT_TYPE)
+            .body(AgentStreamingBody {
+                frames: second_channel_body,
+                _stream_permit: None,
+            })
+            .unwrap();
+        let overloaded_channel = client.send_request(second_channel_request).await.unwrap();
+        assert_eq!(overloaded_channel.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(channel_frames);
+        drop(channel_response);
+        handler.channel_sender.lock().await.take();
         stop_test_listener(shutdown, completion).await;
     }
 }

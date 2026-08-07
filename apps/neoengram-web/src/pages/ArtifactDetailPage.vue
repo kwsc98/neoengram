@@ -7,6 +7,7 @@ import { useRoute, useRouter } from 'vue-router';
 
 import {
   createPlayground,
+  queryApiVersion,
   queryArtifact,
   queryArtifactCommitDiff,
   queryArtifactCommitGraph,
@@ -15,8 +16,14 @@ import {
 } from '@/api/operations';
 import type { CommitNode } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
+import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
+import {
+  supportsArtifactCommitGraph,
+  supportsPlaygroundMaterialize,
+  supportsSnapshotMaterialize,
+} from '@/features/capabilities';
 import {
   playgroundAvailabilityLabel,
   playgroundAvailabilityTagType,
@@ -28,7 +35,7 @@ import {
 } from '@/features/snapshots/status';
 import { useTenantsStore } from '@/stores/tenants';
 import { commitTagNames } from '@/utils/commit';
-import { formatBytes, formatCount, formatTime, shortId } from '@/utils/format';
+import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
 const route = useRoute();
 const router = useRouter();
@@ -37,14 +44,32 @@ const tenants = useTenantsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
 const projectId = computed(() => String(route.params.projectId ?? ''));
 const artifactId = computed(() => String(route.params.artifactId ?? ''));
-const allowedTabs = ['overview', 'commits', 'playgrounds', 'snapshots'];
-const initialTab = String(route.query.tab ?? 'overview');
-const activeTab = ref(allowedTabs.includes(initialTab) ? initialTab : 'overview');
+const versionQuery = useQuery({
+  queryKey: ['system', 'version'],
+  queryFn: queryApiVersion,
+  staleTime: Number.POSITIVE_INFINITY,
+});
+const artifactCommitGraphEnabled = computed(() =>
+  supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
+);
+const playgroundMaterializeEnabled = computed(() =>
+  supportsPlaygroundMaterialize(versionQuery.data.value?.data.capabilities),
+);
+const snapshotMaterializeEnabled = computed(() =>
+  supportsSnapshotMaterialize(versionQuery.data.value?.data.capabilities),
+);
+const allowedTabs = computed(() => [
+  'overview',
+  ...(artifactCommitGraphEnabled.value ? ['commits'] : []),
+  'playgrounds',
+  ...(snapshotMaterializeEnabled.value ? ['snapshots'] : []),
+]);
+const activeTab = ref('overview');
 const commitNodes = ref<CommitNode[]>([]);
 const nextCommitCursor = ref<string>();
 const loadingMoreCommits = ref(false);
-const selectedCommitId = ref(String(route.query.commit_id ?? ''));
-const commitDetailOpen = ref(Boolean(selectedCommitId.value));
+const selectedCommitId = ref('');
+const commitDetailOpen = ref(false);
 const createPlaygroundOpen = ref(false);
 const mutationError = ref('');
 const playgroundForm = reactive({
@@ -53,11 +78,11 @@ const playgroundForm = reactive({
   baseCommitId: '',
   storageVolumeId: '',
 });
-const canCreatePlayground = computed(
-  () => tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false,
-);
 const canCreateSnapshot = computed(
-  () => tenants.byId(tenantId.value)?.permissions.includes('snapshot.create') ?? false,
+  () =>
+    snapshotMaterializeEnabled.value &&
+    Boolean(artifact.value?.head_commit_id) &&
+    (tenants.byId(tenantId.value)?.permissions.includes('snapshot.create') ?? false),
 );
 const createPlaygroundMutation = useMutation({ mutationFn: createPlayground });
 
@@ -66,11 +91,21 @@ const artifactQuery = useQuery({
   queryFn: () => queryArtifact(tenantId.value, projectId.value, artifactId.value),
 });
 const artifact = computed(() => artifactQuery.data.value?.data.artifact);
+const canCreatePlayground = computed(
+  () =>
+    Boolean(artifact.value) &&
+    (tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false) &&
+    playgroundMaterializeEnabled.value,
+);
 
 const commitQuery = useQuery({
   queryKey: computed(() => ['artifact-commits', tenantId.value, projectId.value, artifactId.value]),
   queryFn: () => queryArtifactCommitGraph(tenantId.value, projectId.value, artifactId.value),
-  enabled: computed(() => activeTab.value === 'overview' || activeTab.value === 'commits'),
+  enabled: computed(
+    () =>
+      artifactCommitGraphEnabled.value &&
+      (activeTab.value === 'overview' || activeTab.value === 'commits'),
+  ),
 });
 const currentCommit = computed(() => {
   const graph = commitQuery.data.value?.data.graph;
@@ -93,7 +128,10 @@ const commitDiffQuery = useQuery({
       artifactId.value,
       selectedCommitId.value,
     ),
-  enabled: computed(() => commitDetailOpen.value && Boolean(selectedCommitId.value)),
+  enabled: computed(
+    () =>
+      artifactCommitGraphEnabled.value && commitDetailOpen.value && Boolean(selectedCommitId.value),
+  ),
 });
 const commitDiff = computed(() => commitDiffQuery.data.value?.data.diff);
 const playgroundQuery = useQuery({
@@ -128,7 +166,13 @@ const snapshotQuery = useQuery({
       artifact_id: artifactId.value,
       page_size: 100,
     }),
-  enabled: computed(() => activeTab.value === 'overview' || activeTab.value === 'snapshots'),
+  enabled: computed(
+    () =>
+      snapshotMaterializeEnabled.value &&
+      (activeTab.value === 'overview' || activeTab.value === 'snapshots'),
+  ),
+  refetchInterval: (query) =>
+    query.state.data?.data.items.some((snapshot) => snapshot.state === 'creating') ? 1000 : false,
 });
 const artifactPlaygrounds = computed(() => playgroundQuery.data.value?.data.items ?? []);
 const artifactSnapshots = computed(() => snapshotQuery.data.value?.data.items ?? []);
@@ -147,26 +191,30 @@ watch(
 );
 
 watch(
-  () => route.query.tab,
-  (tab) => {
+  [() => route.query.tab, () => allowedTabs.value.join(',')],
+  ([tab]) => {
     const value = String(tab ?? 'overview');
-    activeTab.value = allowedTabs.includes(value) ? value : 'overview';
+    activeTab.value = allowedTabs.value.includes(value) ? value : 'overview';
   },
+  { immediate: true },
 );
 
 watch(
-  () => route.query.commit_id,
-  (commitId) => {
-    selectedCommitId.value = String(commitId ?? '');
+  [() => route.query.commit_id, artifactCommitGraphEnabled],
+  ([commitId, enabled]) => {
+    selectedCommitId.value = enabled ? String(commitId ?? '') : '';
     commitDetailOpen.value = Boolean(selectedCommitId.value);
   },
+  { immediate: true },
 );
 
 watch([tenantId, projectId, artifactId], () => {
   commitNodes.value = [];
   nextCommitCursor.value = undefined;
   loadingMoreCommits.value = false;
-  selectedCommitId.value = String(route.query.commit_id ?? '');
+  selectedCommitId.value = artifactCommitGraphEnabled.value
+    ? String(route.query.commit_id ?? '')
+    : '';
   commitDetailOpen.value = Boolean(selectedCommitId.value);
   createPlaygroundOpen.value = false;
   mutationError.value = '';
@@ -244,18 +292,11 @@ async function openSnapshot(snapshotId: string): Promise<void> {
   });
 }
 
-async function loadCommitChoices(): Promise<void> {
-  const result = await queryArtifactCommitGraph(tenantId.value, projectId.value, artifactId.value);
-  commitNodes.value = [...result.data.graph.nodes];
-  nextCommitCursor.value = result.data.graph.next_cursor;
-}
-
-async function showCreatePlayground(): Promise<void> {
+function showCreatePlayground(): void {
   mutationError.value = '';
   playgroundForm.playgroundId = '';
   playgroundForm.displayName = '';
   playgroundForm.storageVolumeId = '';
-  await loadCommitChoices();
   playgroundForm.baseCommitId = artifact.value?.head_commit_id ?? '';
   createPlaygroundOpen.value = true;
 }
@@ -386,13 +427,13 @@ async function showCreateSnapshot(): Promise<void> {
             </div>
             <div class="definition-grid__wide">
               <dt>当前 Commit</dt>
-              <dd v-if="currentCommit" class="commit-identity">
-                <code>{{ currentCommit.commit_id }}</code>
-                <span>{{ currentCommit.message }}</span>
+              <dd v-if="artifact.head_commit_id" class="commit-identity">
+                <code>{{ artifact.head_commit_id }}</code>
+                <span v-if="currentCommit">{{ currentCommit.message }}</span>
               </dd>
               <dd v-else>尚无 Commit</dd>
             </div>
-            <div class="definition-grid__wide">
+            <div v-if="artifactCommitGraphEnabled" class="definition-grid__wide">
               <dt>Tags</dt>
               <dd class="tag-list">
                 <el-tag v-for="tagName in currentCommitTags" :key="tagName" effect="plain">
@@ -405,11 +446,11 @@ async function showCreateSnapshot(): Promise<void> {
               <dt>Playgrounds</dt>
               <dd>{{ artifactPlaygrounds.length }}</dd>
             </div>
-            <div>
+            <div v-if="snapshotMaterializeEnabled">
               <dt>Snapshots</dt>
               <dd>{{ artifactSnapshots.length }}</dd>
             </div>
-            <div class="definition-grid__wide">
+            <div v-if="snapshotMaterializeEnabled" class="definition-grid__wide">
               <dt>可用区域</dt>
               <dd class="tag-list">
                 <el-tag v-for="region in availableRegions" :key="region" effect="plain">
@@ -433,7 +474,7 @@ async function showCreateSnapshot(): Promise<void> {
           </dl>
         </el-tab-pane>
 
-        <el-tab-pane label="版本" name="commits">
+        <el-tab-pane v-if="artifactCommitGraphEnabled" label="版本" name="commits">
           <ApiProblemAlert
             v-if="commitQuery.error.value"
             :error="commitQuery.error.value"
@@ -531,7 +572,7 @@ async function showCreateSnapshot(): Promise<void> {
           </div>
         </el-tab-pane>
 
-        <el-tab-pane label="快照" name="snapshots">
+        <el-tab-pane v-if="snapshotMaterializeEnabled" label="快照" name="snapshots">
           <ApiProblemAlert
             v-if="snapshotQuery.error.value"
             :error="snapshotQuery.error.value"
@@ -597,14 +638,15 @@ async function showCreateSnapshot(): Promise<void> {
           <StorageVolumeFilter v-model="playgroundForm.storageVolumeId" :tenant-id="tenantId" />
         </el-form-item>
         <el-form-item label="Base Commit">
-          <el-select v-model="playgroundForm.baseCommitId" clearable placeholder="空 Playground">
-            <el-option
-              v-for="node in commitNodes"
-              :key="node.commit_id"
-              :label="`${node.message} · ${shortId(node.commit_id, 14)}`"
-              :value="node.commit_id"
-            />
-          </el-select>
+          <ArtifactCommitSelect
+            v-model="playgroundForm.baseCommitId"
+            :tenant-id="tenantId"
+            :project-id="projectId"
+            :artifact-id="artifactId"
+            :head-commit-id="artifact?.head_commit_id"
+            :enabled="createPlaygroundOpen"
+            :allow-history="artifactCommitGraphEnabled"
+          />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -620,6 +662,7 @@ async function showCreateSnapshot(): Promise<void> {
     </el-dialog>
 
     <el-drawer
+      v-if="artifactCommitGraphEnabled"
       v-model="commitDetailOpen"
       title="Commit 详情"
       size="min(720px, 100vw)"

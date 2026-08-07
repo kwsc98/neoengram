@@ -2,13 +2,14 @@
 import { Back, CirclePlus, RefreshLeft } from '@element-plus/icons-vue';
 import { useMutation, useQuery } from '@tanstack/vue-query';
 import { ElMessage } from 'element-plus';
-import { computed, reactive, watch } from 'vue';
+import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { createAddJob, queryPlayground } from '@/api/operations';
-import type { CreateAddJobRequest } from '@/api/types';
+import type { CreateAddJobRequest, PlaygroundView } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
+import PlaygroundSelect from '@/components/PlaygroundSelect.vue';
 import { createJobFormSchema, parsePathLines } from '@/features/jobs/create-form';
 import { useRecentJobsStore } from '@/stores/recent-jobs';
 
@@ -16,18 +17,16 @@ const route = useRoute();
 const router = useRouter();
 const recentJobs = useRecentJobsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
-const sourcePlayground = computed(() => ({
-  projectId: String(route.query.project_id ?? ''),
-  artifactId: String(route.query.artifact_id ?? ''),
-  playgroundId: String(route.query.playground_id ?? ''),
+const sourceScope = computed(() => ({
+  project_id: String(route.query.project_id ?? ''),
+  artifact_id: String(route.query.artifact_id ?? ''),
+  playground_id: String(route.query.playground_id ?? ''),
 }));
-const hasSourcePlayground = computed(() =>
-  Object.values(sourcePlayground.value).every((value) => Boolean(value)),
+const hasSourceScope = computed(() =>
+  Object.values(sourceScope.value).every((value) => Boolean(value)),
 );
+const selectedPlayground = ref<PlaygroundView>();
 const form = reactive({
-  projectId: sourcePlayground.value.projectId,
-  artifactId: sourcePlayground.value.artifactId,
-  playgroundId: sourcePlayground.value.playgroundId,
   jobId: `job-${globalThis.crypto.randomUUID()}`,
   deadline: new Date(Date.now() + 60 * 60 * 1000),
   all: true,
@@ -36,23 +35,67 @@ const form = reactive({
 const errors = reactive<Record<string, string>>({});
 
 const mutation = useMutation({ mutationFn: createAddJob });
-const hasPlaygroundIdentity = computed(() =>
-  [form.projectId, form.artifactId, form.playgroundId].every((value) => Boolean(value.trim())),
-);
+const sourcePlaygroundQuery = useQuery({
+  queryKey: computed(() => [
+    'playground',
+    tenantId.value,
+    sourceScope.value.project_id,
+    sourceScope.value.artifact_id,
+    sourceScope.value.playground_id,
+    'job-create-source',
+  ]),
+  enabled: hasSourceScope,
+  queryFn: () =>
+    queryPlayground(
+      tenantId.value,
+      sourceScope.value.project_id,
+      sourceScope.value.artifact_id,
+      sourceScope.value.playground_id,
+    ),
+});
+const selectedScope = computed(() => {
+  const selected = selectedPlayground.value;
+  if (!selected || selected.tenant_id !== tenantId.value) return undefined;
+  return {
+    project_id: selected.project_id,
+    artifact_id: selected.artifact_id,
+    playground_id: selected.playground_id,
+  };
+});
 const playgroundQuery = useQuery({
   queryKey: computed(() => [
     'playground',
     tenantId.value,
-    form.projectId,
-    form.artifactId,
-    form.playgroundId,
+    selectedScope.value?.project_id ?? '',
+    selectedScope.value?.artifact_id ?? '',
+    selectedScope.value?.playground_id ?? '',
     'job-create',
   ]),
-  enabled: hasPlaygroundIdentity,
+  enabled: computed(() => Boolean(selectedScope.value)),
   queryFn: () =>
-    queryPlayground(tenantId.value, form.projectId, form.artifactId, form.playgroundId),
+    queryPlayground(
+      tenantId.value,
+      selectedScope.value!.project_id,
+      selectedScope.value!.artifact_id,
+      selectedScope.value!.playground_id,
+    ),
+  refetchInterval: 5_000,
 });
-const playground = computed(() => playgroundQuery.data.value?.data.playground);
+const playground = computed(() => {
+  const candidate = playgroundQuery.data.value?.data.playground;
+  const scope = selectedScope.value;
+  if (
+    !candidate ||
+    !scope ||
+    candidate.tenant_id !== tenantId.value ||
+    candidate.project_id !== scope.project_id ||
+    candidate.artifact_id !== scope.artifact_id ||
+    candidate.playground_id !== scope.playground_id
+  ) {
+    return undefined;
+  }
+  return candidate;
+});
 const playgroundIndexVersionKey = computed(() => {
   const indexVersion = playground.value?.index_version;
   return indexVersion ? `${indexVersion.revision}:${indexVersion.digest}` : '';
@@ -71,9 +114,9 @@ function resetJobId(): void {
 watch(
   () => [
     tenantId.value,
-    form.projectId,
-    form.artifactId,
-    form.playgroundId,
+    selectedScope.value?.project_id ?? '',
+    selectedScope.value?.artifact_id ?? '',
+    selectedScope.value?.playground_id ?? '',
     form.deadline instanceof Date ? form.deadline.getTime() : '',
     form.all,
     form.pathsText,
@@ -82,6 +125,34 @@ watch(
     resetJobId();
     clearErrors();
   },
+);
+
+watch(
+  () => sourcePlaygroundQuery.data.value?.data.playground,
+  (candidate) => {
+    const source = sourceScope.value;
+    if (
+      !candidate ||
+      selectedPlayground.value ||
+      candidate.tenant_id !== tenantId.value ||
+      candidate.project_id !== source.project_id ||
+      candidate.artifact_id !== source.artifact_id ||
+      candidate.playground_id !== source.playground_id
+    ) {
+      return;
+    }
+    selectedPlayground.value = candidate;
+  },
+  { immediate: true },
+);
+
+watch(
+  () => [tenantId.value, sourceScope.value] as const,
+  () => {
+    if (route.name !== 'job-create') return;
+    selectedPlayground.value = undefined;
+  },
+  { deep: true },
 );
 
 watch(playgroundIndexVersionKey, (value) => {
@@ -102,14 +173,15 @@ watch(
 );
 
 async function backToPlayground(): Promise<void> {
-  if (!hasSourcePlayground.value) return;
+  const currentPlayground = playground.value;
+  if (!currentPlayground) return;
   await router.push({
     name: 'playground-detail',
     params: {
       tenantId: tenantId.value,
-      projectId: sourcePlayground.value.projectId,
-      artifactId: sourcePlayground.value.artifactId,
-      playgroundId: sourcePlayground.value.playgroundId,
+      projectId: currentPlayground.project_id,
+      artifactId: currentPlayground.artifact_id,
+      playgroundId: currentPlayground.playground_id,
     },
   });
 }
@@ -119,15 +191,18 @@ async function submit(): Promise<void> {
   clearErrors();
   const currentPlayground = playground.value;
   if (!currentPlayground) {
-    errors.playgroundId = playgroundQuery.isFetching.value
+    errors.playground = playgroundQuery.isFetching.value
       ? '正在读取 Playground 权威状态'
-      : '请先选择可查询的 Playground';
+      : '请选择可查询的 Playground';
     return;
   }
   const paths = parsePathLines(form.pathsText);
   const parsed = createJobFormSchema.safeParse({
-    ...form,
     tenantId: tenantId.value,
+    projectId: currentPlayground.project_id,
+    artifactId: currentPlayground.artifact_id,
+    playgroundId: currentPlayground.playground_id,
+    ...form,
     revision: currentPlayground.index_version.revision,
     digest: currentPlayground.index_version.digest,
     paths,
@@ -140,9 +215,9 @@ async function submit(): Promise<void> {
 
   const request: CreateAddJobRequest = {
     tenant_id: tenantId.value,
-    project_id: parsed.data.projectId,
-    artifact_id: parsed.data.artifactId,
-    playground_id: parsed.data.playgroundId,
+    project_id: currentPlayground.project_id,
+    artifact_id: currentPlayground.artifact_id,
+    playground_id: currentPlayground.playground_id,
     job_id: parsed.data.jobId,
     expected_index_version: currentPlayground.index_version,
     deadline_unix_ms: String(parsed.data.deadline.getTime()),
@@ -169,7 +244,7 @@ async function submit(): Promise<void> {
 <template>
   <div class="page page--narrow">
     <PageHeading title="扫描 Playground 变更" :description="`当前租户：${tenantId}`">
-      <template v-if="hasSourcePlayground" #actions>
+      <template v-if="playground" #actions>
         <el-button :icon="Back" @click="backToPlayground">返回 Playground</el-button>
       </template>
     </PageHeading>
@@ -179,6 +254,12 @@ async function submit(): Promise<void> {
       :error="mutation.error.value"
       :retrying="mutation.isPending.value"
       @retry="submit"
+    />
+    <ApiProblemAlert
+      v-if="sourcePlaygroundQuery.error.value"
+      :error="sourcePlaygroundQuery.error.value"
+      :retrying="sourcePlaygroundQuery.isFetching.value"
+      @retry="sourcePlaygroundQuery.refetch"
     />
     <ApiProblemAlert
       v-if="playgroundQuery.error.value"
@@ -195,17 +276,29 @@ async function submit(): Promise<void> {
             <p>系统将读取该 Playground 的当前文件状态并生成新的 IndexVersion</p>
           </div>
         </div>
-        <div class="form-grid form-grid--two">
-          <el-form-item label="Project ID" :error="errors.projectId">
-            <el-input v-model="form.projectId" />
-          </el-form-item>
-          <el-form-item label="Artifact ID" :error="errors.artifactId">
-            <el-input v-model="form.artifactId" />
-          </el-form-item>
-          <el-form-item label="Playground ID" :error="errors.playgroundId">
-            <el-input v-model="form.playgroundId" />
-          </el-form-item>
-        </div>
+        <el-form-item label="Playground" :error="errors.playground" required>
+          <PlaygroundSelect v-model="selectedPlayground" :tenant-id="tenantId" />
+        </el-form-item>
+        <dl v-if="playground" class="scope-summary">
+          <div>
+            <dt>Project</dt>
+            <dd>
+              <code>{{ playground.project_id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Artifact</dt>
+            <dd>
+              <code>{{ playground.artifact_id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Playground</dt>
+            <dd>
+              <code>{{ playground.playground_id }}</code>
+            </dd>
+          </div>
+        </dl>
       </section>
 
       <section class="form-section">
@@ -280,6 +373,34 @@ async function submit(): Promise<void> {
   align-content: start;
 }
 
+.scope-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.scope-summary > div {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.scope-summary dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.scope-summary dd {
+  min-width: 0;
+  margin: 0;
+}
+
+.scope-summary code {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
 .index-version-field > span {
   color: var(--muted);
   font-size: 12px;
@@ -291,5 +412,11 @@ async function submit(): Promise<void> {
   overflow-wrap: anywhere;
   border: 1px solid var(--line);
   background: #f7f9f8;
+}
+
+@media (max-width: 720px) {
+  .scope-summary {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

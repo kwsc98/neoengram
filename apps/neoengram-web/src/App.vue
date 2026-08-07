@@ -19,7 +19,7 @@ import { useRoute, useRouter } from 'vue-router';
 
 import { queryApiVersion } from '@/api/operations';
 import { runtimeConfig } from '@/config';
-import { supportsResourceBrowser } from '@/features/capabilities';
+import { supportsArtifactCatalog, supportsSnapshotMaterialize } from '@/features/capabilities';
 import { useAuthStore } from '@/stores/auth';
 import { useTenantsStore } from '@/stores/tenants';
 
@@ -40,8 +40,11 @@ const versionQuery = useQuery({
   queryFn: queryApiVersion,
   staleTime: Number.POSITIVE_INFINITY,
 });
-const resourceBrowserEnabled = computed(() =>
-  supportsResourceBrowser(versionQuery.data.value?.data.capabilities),
+const artifactCatalogEnabled = computed(() =>
+  supportsArtifactCatalog(versionQuery.data.value?.data.capabilities),
+);
+const snapshotMaterializeEnabled = computed(() =>
+  supportsSnapshotMaterialize(versionQuery.data.value?.data.capabilities),
 );
 
 const navGroups = computed(() => {
@@ -52,11 +55,11 @@ const navGroups = computed(() => {
       label: '数据工作流',
       items: [
         { name: 'tenant-overview', label: '概览', icon: DataAnalysis, params: { tenantId } },
-        ...(resourceBrowserEnabled.value
+        ...(artifactCatalogEnabled.value
           ? [{ name: 'artifact-list', label: '数据资产', icon: Box, params: { tenantId } }]
           : []),
         { name: 'playground-list', label: '工作区', icon: Collection, params: { tenantId } },
-        ...(resourceBrowserEnabled.value
+        ...(snapshotMaterializeEnabled.value
           ? [
               {
                 name: 'snapshot-list',

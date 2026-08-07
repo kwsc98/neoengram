@@ -13,8 +13,9 @@ use crate::{
     ComputeNodeId, DecimalU64, DecisionGeneration, EdgeClusterId, Extensions, FencingToken, JobId,
     LeaseId, MessageId, MetadataBatchDescriptor, MountGeneration, OwnerGeneration,
     PlacementGeneration, PrincipalId, ProjectId, ProtocolError, ProtocolResult, ProtocolVersion,
-    RequestId, ResourceVersion, SessionGeneration, StorageVolumeId, TenantId, TraceId, UnixMillis,
-    WireIndexVersion, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE, PROTOCOL_VERSION_V1,
+    RequestId, ResourceVersion, SessionGeneration, SnapshotId, StorageVolumeId, TenantId, TraceId,
+    UnixMillis, WireIndexVersion, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
+    PROTOCOL_VERSION_V1,
 };
 
 /// One control-stream frame. `message.type` is flattened to the top-level JSON object.
@@ -327,7 +328,7 @@ pub struct JobAssignment {
 }
 
 impl JobAssignment {
-    fn validate(&self) -> ProtocolResult<()> {
+    pub fn validate(&self) -> ProtocolResult<()> {
         self.assignment.validate()?;
         validate_extension_keys(&self.extensions, &["assignment"])
     }
@@ -341,12 +342,36 @@ pub enum AssignmentOperation {
         #[serde(default, flatten)]
         extensions: Extensions,
     },
+    /// Creates the server-derived Playground directory below the approved Agent mount.
+    ///
+    /// This operation deliberately reuses the normal job accepted/progress/failed reports. It
+    /// does not enter the managed-Add publication state machine: successful materialization is
+    /// terminal after the Agent reports `job.progress(state=succeeded)`.
+    WorkspaceMaterialize {
+        input: WorkspaceMaterializeAssignment,
+        #[serde(default, flatten)]
+        extensions: Extensions,
+    },
+    /// Mounts one immutable Artifact Commit as a server-derived read-only Snapshot path.
+    SnapshotMount {
+        input: SnapshotMountAssignment,
+        #[serde(default, flatten)]
+        extensions: Extensions,
+    },
 }
 
 impl AssignmentOperation {
     fn validate(&self) -> ProtocolResult<()> {
         match self {
             Self::Add { input, extensions } => {
+                input.validate()?;
+                validate_extension_keys(extensions, &["operation", "input"])
+            }
+            Self::WorkspaceMaterialize { input, extensions } => {
+                input.validate()?;
+                validate_extension_keys(extensions, &["operation", "input"])
+            }
+            Self::SnapshotMount { input, extensions } => {
                 input.validate()?;
                 validate_extension_keys(extensions, &["operation", "input"])
             }
@@ -521,6 +546,409 @@ impl AddAssignment {
                 "deadline_unix_ms",
                 "paths",
                 "all",
+            ],
+        )
+    }
+}
+
+/// Canonical user-operation fields bound by
+/// [`WorkspaceMaterializeAssignment::request_digest`].
+///
+/// Agent identity, mount identity, and assignment generations are intentionally excluded because
+/// the scheduler chooses them after accepting this immutable operation. The selected Volume and
+/// canonical Playground path remain bound because they are part of the create request itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceMaterializeOperation {
+    pub job_id: JobId,
+    pub principal: PrincipalRef,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub artifact_id: ArtifactId,
+    pub playground_id: crate::PlaygroundId,
+    pub storage_volume_id: StorageVolumeId,
+    /// Server-derived path relative to the approved Volume mount.
+    #[schemars(with = "String")]
+    pub relative_root: LogicalPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub base_commit_id: Option<ContentDigest>,
+    /// Immutable Index snapshot carried by `base_commit_id`. Both fields are present for a
+    /// non-empty baseline and absent for an empty Artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_index_version: Option<WireIndexVersion>,
+    pub deadline_unix_ms: UnixMillis,
+    #[serde(default, flatten)]
+    pub extensions: Extensions,
+}
+
+impl WorkspaceMaterializeOperation {
+    /// Returns the canonical relative directory derived from the resource identity.
+    pub fn canonical_relative_root(
+        project_id: &ProjectId,
+        artifact_id: &ArtifactId,
+        playground_id: &crate::PlaygroundId,
+    ) -> ProtocolResult<LogicalPath> {
+        LogicalPath::parse(format!(
+            "playgrounds/{project_id}/{artifact_id}/{playground_id}"
+        ))
+        .map_err(|error| ProtocolError::InvalidField {
+            field: "relative_root",
+            reason: error.to_string(),
+        })
+    }
+
+    pub fn validate(&self) -> ProtocolResult<()> {
+        self.principal.validate()?;
+        if self.base_commit_id.is_some() != self.base_index_version.is_some() {
+            return Err(ProtocolError::InvalidField {
+                field: "base_index_version",
+                reason: "must be present exactly when base_commit_id is present".to_owned(),
+            });
+        }
+        if let Some(version) = &self.base_index_version {
+            version.validate()?;
+        }
+        let canonical = Self::canonical_relative_root(
+            &self.project_id,
+            &self.artifact_id,
+            &self.playground_id,
+        )?;
+        if self.relative_root != canonical {
+            return Err(ProtocolError::InvalidField {
+                field: "relative_root",
+                reason: format!("must equal the server-derived Playground path {canonical}"),
+            });
+        }
+        validate_extension_keys(
+            &self.extensions,
+            &[
+                "job_id",
+                "principal",
+                "tenant_id",
+                "project_id",
+                "artifact_id",
+                "playground_id",
+                "storage_volume_id",
+                "relative_root",
+                "base_commit_id",
+                "base_index_version",
+                "deadline_unix_ms",
+            ],
+        )
+    }
+
+    /// Returns BLAKE3 over the RFC 8785 canonical JSON form of this operation.
+    pub fn request_digest(&self) -> ProtocolResult<ContentDigest> {
+        self.validate()?;
+        crate::jcs_blake3(self)
+    }
+}
+
+/// Complete immutable scope required to create one server-derived Playground directory.
+///
+/// `relative_root` is carried for explicit protocol observability, but is not trusted by the
+/// Agent. Validation requires it to equal the canonical path derived from the typed resource
+/// identifiers. `base_commit_id` and `base_index_version` are absent only for an empty baseline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceMaterializeAssignment {
+    pub job_id: JobId,
+    pub assignment_id: AssignmentId,
+    pub assignment_generation: AssignmentGeneration,
+    pub agent_id: AgentId,
+    pub principal: PrincipalRef,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub artifact_id: ArtifactId,
+    pub playground_id: crate::PlaygroundId,
+    pub storage_volume_id: StorageVolumeId,
+    pub agent_mount_id: AgentMountId,
+    pub mount_generation: MountGeneration,
+    pub owner_generation: OwnerGeneration,
+    /// Server-derived path relative to the approved Volume mount.
+    #[schemars(with = "String")]
+    pub relative_root: LogicalPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub base_commit_id: Option<ContentDigest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_index_version: Option<WireIndexVersion>,
+    #[schemars(
+        with = "String",
+        length(equal = 64),
+        regex(pattern = CONTENT_DIGEST_PATTERN)
+    )]
+    pub request_digest: ContentDigest,
+    pub deadline_unix_ms: UnixMillis,
+    #[serde(default, flatten)]
+    pub extensions: Extensions,
+}
+
+impl WorkspaceMaterializeAssignment {
+    /// Returns the canonical relative directory derived from the resource identity.
+    pub fn canonical_relative_root(
+        project_id: &ProjectId,
+        artifact_id: &ArtifactId,
+        playground_id: &crate::PlaygroundId,
+    ) -> ProtocolResult<LogicalPath> {
+        WorkspaceMaterializeOperation::canonical_relative_root(
+            project_id,
+            artifact_id,
+            playground_id,
+        )
+    }
+
+    #[must_use]
+    pub fn operation(&self) -> WorkspaceMaterializeOperation {
+        WorkspaceMaterializeOperation {
+            job_id: self.job_id.clone(),
+            principal: self.principal.clone(),
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            artifact_id: self.artifact_id.clone(),
+            playground_id: self.playground_id.clone(),
+            storage_volume_id: self.storage_volume_id.clone(),
+            relative_root: self.relative_root.clone(),
+            base_commit_id: self.base_commit_id,
+            base_index_version: self.base_index_version.clone(),
+            deadline_unix_ms: self.deadline_unix_ms,
+            extensions: self.extensions.clone(),
+        }
+    }
+
+    /// Computes BLAKE3 over the canonical JSON form of the immutable materialize request.
+    pub fn computed_request_digest(&self) -> ProtocolResult<ContentDigest> {
+        self.operation().request_digest()
+    }
+
+    pub fn validate(&self) -> ProtocolResult<()> {
+        for (field, generation) in [
+            ("assignment_generation", self.assignment_generation.get()),
+            ("mount_generation", self.mount_generation.get()),
+            ("owner_generation", self.owner_generation.get()),
+        ] {
+            validate_positive(field, generation)?;
+        }
+        self.operation().validate()?;
+        let computed = self.computed_request_digest()?;
+        if self.request_digest != computed {
+            return Err(ProtocolError::InvalidDigest(format!(
+                "Workspace materialize request digest mismatch: expected {}, observed {}",
+                self.request_digest, computed
+            )));
+        }
+        validate_extension_keys(
+            &self.extensions,
+            &[
+                "job_id",
+                "assignment_id",
+                "assignment_generation",
+                "agent_id",
+                "principal",
+                "tenant_id",
+                "project_id",
+                "artifact_id",
+                "playground_id",
+                "storage_volume_id",
+                "agent_mount_id",
+                "mount_generation",
+                "owner_generation",
+                "relative_root",
+                "base_commit_id",
+                "base_index_version",
+                "request_digest",
+                "deadline_unix_ms",
+            ],
+        )
+    }
+}
+
+/// Canonical user-operation fields bound by [`SnapshotMountAssignment::request_digest`].
+///
+/// The immutable Commit and Index fence are part of the operation. Agent and mount generations
+/// are placement details added later by the scheduler and are deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotMountOperation {
+    pub job_id: JobId,
+    pub principal: PrincipalRef,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub artifact_id: ArtifactId,
+    pub snapshot_id: SnapshotId,
+    pub storage_volume_id: StorageVolumeId,
+    /// Server-derived path relative to the approved Volume mount.
+    #[schemars(with = "String")]
+    pub relative_root: LogicalPath,
+    #[schemars(
+        with = "String",
+        length(equal = 64),
+        regex(pattern = CONTENT_DIGEST_PATTERN)
+    )]
+    pub commit_id: ContentDigest,
+    pub index_version: WireIndexVersion,
+    pub deadline_unix_ms: UnixMillis,
+    #[serde(default, flatten)]
+    pub extensions: Extensions,
+}
+
+impl SnapshotMountOperation {
+    /// Returns the only Snapshot path accepted by the Agent for this resource identity.
+    pub fn canonical_relative_root(
+        project_id: &ProjectId,
+        artifact_id: &ArtifactId,
+        snapshot_id: &SnapshotId,
+    ) -> ProtocolResult<LogicalPath> {
+        LogicalPath::parse(format!(
+            "snapshots/{project_id}/{artifact_id}/{snapshot_id}"
+        ))
+        .map_err(|error| ProtocolError::InvalidField {
+            field: "relative_root",
+            reason: error.to_string(),
+        })
+    }
+
+    pub fn validate(&self) -> ProtocolResult<()> {
+        self.principal.validate()?;
+        self.index_version.validate()?;
+        let canonical =
+            Self::canonical_relative_root(&self.project_id, &self.artifact_id, &self.snapshot_id)?;
+        if self.relative_root != canonical {
+            return Err(ProtocolError::InvalidField {
+                field: "relative_root",
+                reason: format!("must equal the server-derived Snapshot path {canonical}"),
+            });
+        }
+        validate_extension_keys(
+            &self.extensions,
+            &[
+                "job_id",
+                "principal",
+                "tenant_id",
+                "project_id",
+                "artifact_id",
+                "snapshot_id",
+                "storage_volume_id",
+                "relative_root",
+                "commit_id",
+                "index_version",
+                "deadline_unix_ms",
+            ],
+        )
+    }
+
+    /// Returns BLAKE3 over the RFC 8785 canonical JSON form of this operation.
+    pub fn request_digest(&self) -> ProtocolResult<ContentDigest> {
+        self.validate()?;
+        crate::jcs_blake3(self)
+    }
+}
+
+/// Complete immutable placement required to mount one read-only Snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotMountAssignment {
+    pub job_id: JobId,
+    pub assignment_id: AssignmentId,
+    pub assignment_generation: AssignmentGeneration,
+    pub agent_id: AgentId,
+    pub principal: PrincipalRef,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub artifact_id: ArtifactId,
+    pub snapshot_id: SnapshotId,
+    pub storage_volume_id: StorageVolumeId,
+    pub agent_mount_id: AgentMountId,
+    pub mount_generation: MountGeneration,
+    pub owner_generation: OwnerGeneration,
+    /// Server-derived path relative to the approved Volume mount.
+    #[schemars(with = "String")]
+    pub relative_root: LogicalPath,
+    #[schemars(
+        with = "String",
+        length(equal = 64),
+        regex(pattern = CONTENT_DIGEST_PATTERN)
+    )]
+    pub commit_id: ContentDigest,
+    pub index_version: WireIndexVersion,
+    #[schemars(
+        with = "String",
+        length(equal = 64),
+        regex(pattern = CONTENT_DIGEST_PATTERN)
+    )]
+    pub request_digest: ContentDigest,
+    pub deadline_unix_ms: UnixMillis,
+    #[serde(default, flatten)]
+    pub extensions: Extensions,
+}
+
+impl SnapshotMountAssignment {
+    /// Returns the canonical relative directory derived from the resource identity.
+    pub fn canonical_relative_root(
+        project_id: &ProjectId,
+        artifact_id: &ArtifactId,
+        snapshot_id: &SnapshotId,
+    ) -> ProtocolResult<LogicalPath> {
+        SnapshotMountOperation::canonical_relative_root(project_id, artifact_id, snapshot_id)
+    }
+
+    #[must_use]
+    pub fn operation(&self) -> SnapshotMountOperation {
+        SnapshotMountOperation {
+            job_id: self.job_id.clone(),
+            principal: self.principal.clone(),
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            artifact_id: self.artifact_id.clone(),
+            snapshot_id: self.snapshot_id.clone(),
+            storage_volume_id: self.storage_volume_id.clone(),
+            relative_root: self.relative_root.clone(),
+            commit_id: self.commit_id,
+            index_version: self.index_version.clone(),
+            deadline_unix_ms: self.deadline_unix_ms,
+            extensions: self.extensions.clone(),
+        }
+    }
+
+    /// Computes BLAKE3 over the canonical JSON form of the immutable Snapshot request.
+    pub fn computed_request_digest(&self) -> ProtocolResult<ContentDigest> {
+        self.operation().request_digest()
+    }
+
+    pub fn validate(&self) -> ProtocolResult<()> {
+        for (field, generation) in [
+            ("assignment_generation", self.assignment_generation.get()),
+            ("mount_generation", self.mount_generation.get()),
+            ("owner_generation", self.owner_generation.get()),
+        ] {
+            validate_positive(field, generation)?;
+        }
+        self.operation().validate()?;
+        let computed = self.computed_request_digest()?;
+        if self.request_digest != computed {
+            return Err(ProtocolError::InvalidDigest(format!(
+                "Snapshot mount request digest mismatch: expected {}, observed {}",
+                self.request_digest, computed
+            )));
+        }
+        validate_extension_keys(
+            &self.extensions,
+            &[
+                "job_id",
+                "assignment_id",
+                "assignment_generation",
+                "agent_id",
+                "principal",
+                "tenant_id",
+                "project_id",
+                "artifact_id",
+                "snapshot_id",
+                "storage_volume_id",
+                "agent_mount_id",
+                "mount_generation",
+                "owner_generation",
+                "relative_root",
+                "commit_id",
+                "index_version",
+                "request_digest",
+                "deadline_unix_ms",
             ],
         )
     }
@@ -1174,6 +1602,88 @@ mod tests {
         }
     }
 
+    fn workspace_assignment() -> WorkspaceMaterializeAssignment {
+        let project_id = ProjectId::new("project-materialize-1").unwrap();
+        let artifact_id = ArtifactId::new("artifact-materialize-1").unwrap();
+        let playground_id = PlaygroundId::new("playground-materialize-1").unwrap();
+        let relative_root = WorkspaceMaterializeAssignment::canonical_relative_root(
+            &project_id,
+            &artifact_id,
+            &playground_id,
+        )
+        .unwrap();
+        let mut assignment = WorkspaceMaterializeAssignment {
+            job_id: JobId::new("job-materialize-1").unwrap(),
+            assignment_id: AssignmentId::new("assignment-materialize-1").unwrap(),
+            assignment_generation: AssignmentGeneration::new(1),
+            agent_id: AgentId::new("agent-materialize-1").unwrap(),
+            principal: PrincipalRef {
+                kind: PrincipalKind::Service,
+                id: PrincipalId::new("principal-materialize-1").unwrap(),
+                extensions: Extensions::new(),
+            },
+            tenant_id: TenantId::new("tenant-materialize-1").unwrap(),
+            project_id,
+            artifact_id,
+            playground_id,
+            storage_volume_id: StorageVolumeId::new("volume-materialize-1").unwrap(),
+            agent_mount_id: AgentMountId::new("mount-materialize-1").unwrap(),
+            mount_generation: MountGeneration::new(1),
+            owner_generation: OwnerGeneration::new(1),
+            relative_root,
+            base_commit_id: None,
+            base_index_version: None,
+            request_digest: ContentDigest::from_bytes([0; 32]),
+            deadline_unix_ms: UnixMillis::new(1_234_567),
+            extensions: Extensions::new(),
+        };
+        assignment.request_digest = assignment.computed_request_digest().unwrap();
+        assignment
+    }
+
+    fn snapshot_assignment() -> SnapshotMountAssignment {
+        let project_id = ProjectId::new("project-snapshot-1").unwrap();
+        let artifact_id = ArtifactId::new("artifact-snapshot-1").unwrap();
+        let snapshot_id = SnapshotId::new("snapshot-1").unwrap();
+        let relative_root = SnapshotMountAssignment::canonical_relative_root(
+            &project_id,
+            &artifact_id,
+            &snapshot_id,
+        )
+        .unwrap();
+        let mut assignment = SnapshotMountAssignment {
+            job_id: JobId::new("job-snapshot-1").unwrap(),
+            assignment_id: AssignmentId::new("assignment-snapshot-1").unwrap(),
+            assignment_generation: AssignmentGeneration::new(1),
+            agent_id: AgentId::new("agent-snapshot-1").unwrap(),
+            principal: PrincipalRef {
+                kind: PrincipalKind::Service,
+                id: PrincipalId::new("principal-snapshot-1").unwrap(),
+                extensions: Extensions::new(),
+            },
+            tenant_id: TenantId::new("tenant-snapshot-1").unwrap(),
+            project_id,
+            artifact_id,
+            snapshot_id,
+            storage_volume_id: StorageVolumeId::new("volume-snapshot-1").unwrap(),
+            agent_mount_id: AgentMountId::new("mount-snapshot-1").unwrap(),
+            mount_generation: MountGeneration::new(1),
+            owner_generation: OwnerGeneration::new(1),
+            relative_root,
+            commit_id: ContentDigest::from_bytes([0x24; 32]),
+            index_version: WireIndexVersion {
+                revision: crate::IndexRevision::new(4),
+                digest: ContentDigest::from_bytes([0x42; 32]),
+                extensions: Extensions::new(),
+            },
+            request_digest: ContentDigest::from_bytes([0; 32]),
+            deadline_unix_ms: UnixMillis::new(1_234_567),
+            extensions: Extensions::new(),
+        };
+        assignment.request_digest = assignment.computed_request_digest().unwrap();
+        assignment
+    }
+
     #[test]
     fn add_operation_digest_has_a_stable_jcs_golden_vector() {
         assert_eq!(
@@ -1198,6 +1708,115 @@ mod tests {
             tampered.validate(),
             Err(ProtocolError::InvalidDigest(_))
         ));
+    }
+
+    #[test]
+    fn workspace_materialize_assignment_requires_server_derived_relative_root() {
+        let valid = workspace_assignment();
+        valid.validate().unwrap();
+
+        let mut absolute = serde_json::to_value(&valid).unwrap();
+        absolute["relative_root"] = json!("/tmp/playground");
+        assert!(serde_json::from_value::<WorkspaceMaterializeAssignment>(absolute).is_err());
+
+        let mut mismatched = valid.clone();
+        mismatched.relative_root =
+            LogicalPath::parse("playgrounds/other/artifact/playground").unwrap();
+        assert!(matches!(
+            mismatched.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "relative_root",
+                ..
+            })
+        ));
+
+        let mut tampered = valid;
+        tampered.base_commit_id = Some(ContentDigest::from_bytes([0x42; 32]));
+        tampered.base_index_version = Some(canonical_add_operation().expected_index_version);
+        assert!(matches!(
+            tampered.validate(),
+            Err(ProtocolError::InvalidDigest(_))
+        ));
+    }
+
+    #[test]
+    fn workspace_materialize_operation_round_trips_as_a_distinct_assignment_kind() {
+        let input = workspace_assignment();
+        let envelope = ControlEnvelope {
+            protocol_version: PROTOCOL_VERSION_V1,
+            message_id: MessageId::new("msg-materialize-1").unwrap(),
+            session_generation: SessionGeneration::new(1),
+            resource_version: None,
+            request_id: None,
+            trace_id: None,
+            sent_at_unix_ms: UnixMillis::new(10),
+            message: ControlMessage::Assignment(Box::new(JobAssignment {
+                assignment: AssignmentOperation::WorkspaceMaterialize {
+                    input: input.clone(),
+                    extensions: Extensions::new(),
+                },
+                extensions: Extensions::new(),
+            })),
+            extensions: Extensions::new(),
+        };
+        let encoded = serde_json::to_vec(&envelope).unwrap();
+        let decoded = ControlEnvelope::decode_json(&encoded).unwrap();
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn snapshot_mount_assignment_binds_commit_index_and_canonical_root() {
+        let valid = snapshot_assignment();
+        valid.validate().unwrap();
+
+        let mut mismatched = valid.clone();
+        mismatched.relative_root = LogicalPath::parse("snapshots/other/artifact/snapshot").unwrap();
+        assert!(matches!(
+            mismatched.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "relative_root",
+                ..
+            })
+        ));
+
+        let mut commit_tampered = valid.clone();
+        commit_tampered.commit_id = ContentDigest::from_bytes([0x25; 32]);
+        assert!(matches!(
+            commit_tampered.validate(),
+            Err(ProtocolError::InvalidDigest(_))
+        ));
+
+        let mut index_tampered = valid;
+        index_tampered.index_version.revision = crate::IndexRevision::new(5);
+        assert!(matches!(
+            index_tampered.validate(),
+            Err(ProtocolError::InvalidDigest(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_mount_round_trips_as_a_distinct_assignment_kind() {
+        let input = snapshot_assignment();
+        let envelope = ControlEnvelope {
+            protocol_version: PROTOCOL_VERSION_V1,
+            message_id: MessageId::new("msg-snapshot-1").unwrap(),
+            session_generation: SessionGeneration::new(1),
+            resource_version: None,
+            request_id: None,
+            trace_id: None,
+            sent_at_unix_ms: UnixMillis::new(10),
+            message: ControlMessage::Assignment(Box::new(JobAssignment {
+                assignment: AssignmentOperation::SnapshotMount {
+                    input: input.clone(),
+                    extensions: Extensions::new(),
+                },
+                extensions: Extensions::new(),
+            })),
+            extensions: Extensions::new(),
+        };
+        let encoded = serde_json::to_vec(&envelope).unwrap();
+        let decoded = ControlEnvelope::decode_json(&encoded).unwrap();
+        assert_eq!(decoded, envelope);
     }
 
     #[test]
@@ -1340,7 +1959,9 @@ mod tests {
             "future_operation": {"mode": "v2"}
         }))
         .unwrap();
-        let AssignmentOperation::Add { extensions, .. } = &operation;
+        let AssignmentOperation::Add { extensions, .. } = &operation else {
+            panic!("the Add wire fixture must decode as an Add operation");
+        };
         assert_eq!(extensions["future_operation"], json!({"mode": "v2"}));
         assert_eq!(
             serde_json::to_value(operation).unwrap()["future_operation"],

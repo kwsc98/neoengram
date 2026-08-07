@@ -528,6 +528,12 @@ impl AgentRegistryService {
         })
     }
 
+    /// Returns the service clock used for session and heartbeat authority timestamps.
+    #[must_use]
+    pub fn now(&self) -> UnixMillis {
+        self.clock.now()
+    }
+
     pub async fn create_token_intent(
         &self,
         request: AgentEnrollmentTokenCreateRequest,

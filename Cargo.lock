@@ -784,8 +784,6 @@ dependencies = [
 [[package]]
 name = "fuser"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bb29a3ae32279fe3e79a958fe01899f5fb23eadccee919cf88e145b54ed9367"
 dependencies = [
  "libc",
  "log",
@@ -1544,10 +1542,16 @@ name = "neoengram-agentd"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "base64",
+ "blake3",
  "bytes",
  "clap",
  "fs2",
+ "fuser",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
  "neoengram-agent",
  "neoengram-core",
  "neoengram-engine",
@@ -1638,7 +1642,6 @@ dependencies = [
  "neoengram-agentd",
  "neoengram-core",
  "neoengram-engine",
- "neoengram-fs",
  "neoengram-protocol",
  "neoengramd",
  "reqwest",
@@ -2148,6 +2151,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "http-body-util",

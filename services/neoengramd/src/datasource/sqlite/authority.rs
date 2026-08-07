@@ -17,7 +17,7 @@ use crate::{CentralError, CentralErrorCode, CentralResult};
 const DATABASE_FILE_NAME: &str = "authority.sqlite3";
 const LOCK_FILE_NAME: &str = "authority.lock";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f41;
-const SQLITE_SCHEMA_VERSION: i64 = 4;
+const SQLITE_SCHEMA_VERSION: i64 = 6;
 
 const V1_TABLES: &[&str] = &[
     "control_jobs",
@@ -48,6 +48,40 @@ const V2_TABLES: &[&str] = &[
 
 const V3_TABLES: &[&str] = V2_TABLES;
 const V4_TABLES: &[&str] = V3_TABLES;
+const V5_TABLES: &[&str] = &[
+    "control_jobs",
+    "assignment_outbox",
+    "metadata_batch_descriptors",
+    "metadata_batch_pages",
+    "durable_objects",
+    "playground_indexes",
+    "playground_index_records",
+    "immutable_manifests",
+    "index_publications",
+    "audit_events",
+    "agent_enrollment_audit_events",
+    "precommit_records",
+    "precommit_mutations",
+    "commit_records",
+];
+const V6_TABLES: &[&str] = &[
+    "control_jobs",
+    "assignment_outbox",
+    "metadata_batch_descriptors",
+    "metadata_batch_pages",
+    // Retained as read-only legacy evidence. v6 publication never consults this table.
+    "durable_objects",
+    "object_placements",
+    "playground_indexes",
+    "playground_index_records",
+    "immutable_manifests",
+    "index_publications",
+    "audit_events",
+    "agent_enrollment_audit_events",
+    "precommit_records",
+    "precommit_mutations",
+    "commit_records",
+];
 
 const ENROLLMENT_AUDIT_SCHEMA_SQL: &str = r#"
 CREATE TABLE agent_enrollment_audit_events (
@@ -99,6 +133,76 @@ CREATE TABLE playground_index_records (
     FOREIGN KEY (tenant_id, project_id, artifact_id, playground_id)
         REFERENCES playground_indexes (tenant_id, project_id, artifact_id, playground_id)
         ON DELETE CASCADE
+) STRICT;
+"#;
+
+const PRECOMMIT_V5_SCHEMA_SQL: &str = r#"
+CREATE TABLE precommit_records (
+    tenant_id TEXT NOT NULL,
+    precommit_id TEXT NOT NULL,
+    precommit_request_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    playground_id TEXT NOT NULL,
+    current_job_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('running', 'ready', 'abnormal', 'cancelled', 'committed')
+    ),
+    attempt INTEGER NOT NULL CHECK (attempt >= 1 AND attempt <= 2147483647),
+    resource_version TEXT NOT NULL CHECK (
+        resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
+    ),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, precommit_id),
+    UNIQUE (tenant_id, precommit_request_id),
+    UNIQUE (tenant_id, current_job_id)
+) STRICT;
+
+CREATE TABLE precommit_mutations (
+    tenant_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('start', 'restart', 'cancel', 'commit')),
+    precommit_id TEXT NOT NULL,
+    request_payload BLOB NOT NULL,
+    result_payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, request_id),
+    FOREIGN KEY (tenant_id, precommit_id)
+        REFERENCES precommit_records (tenant_id, precommit_id)
+) STRICT;
+
+CREATE TABLE commit_records (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    commit_id BLOB NOT NULL CHECK (length(commit_id) = 32),
+    commit_request_id TEXT NOT NULL,
+    precommit_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, project_id, artifact_id, commit_id),
+    UNIQUE (tenant_id, commit_request_id),
+    FOREIGN KEY (tenant_id, precommit_id)
+        REFERENCES precommit_records (tenant_id, precommit_id)
+) STRICT;
+"#;
+
+const OBJECT_PLACEMENT_V6_SCHEMA_SQL: &str = r#"
+CREATE TABLE object_placements (
+    tenant_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    storage_volume_id TEXT NOT NULL,
+    artifact_placement_id TEXT NOT NULL,
+    placement_generation TEXT NOT NULL CHECK (
+        placement_generation <> '' AND placement_generation NOT GLOB '*[^0-9]*'
+    ),
+    object_id BLOB NOT NULL CHECK (length(object_id) = 32),
+    size TEXT NOT NULL CHECK (size <> '' AND size NOT GLOB '*[^0-9]*'),
+    verified_at_unix_ms TEXT NOT NULL CHECK (
+        verified_at_unix_ms <> '' AND verified_at_unix_ms NOT GLOB '*[^0-9]*'
+    ),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, receipt_id)
 ) STRICT;
 "#;
 
@@ -155,6 +259,25 @@ CREATE TABLE durable_objects (
     verified_digest BLOB NOT NULL CHECK (length(verified_digest) = 32),
     storage_version TEXT NOT NULL CHECK (storage_version <> ''),
     PRIMARY KEY (tenant_id, artifact_id, object_id)
+) STRICT;
+
+CREATE TABLE object_placements (
+    tenant_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    storage_volume_id TEXT NOT NULL,
+    artifact_placement_id TEXT NOT NULL,
+    placement_generation TEXT NOT NULL CHECK (
+        placement_generation <> '' AND placement_generation NOT GLOB '*[^0-9]*'
+    ),
+    object_id BLOB NOT NULL CHECK (length(object_id) = 32),
+    size TEXT NOT NULL CHECK (size <> '' AND size NOT GLOB '*[^0-9]*'),
+    verified_at_unix_ms TEXT NOT NULL CHECK (
+        verified_at_unix_ms <> '' AND verified_at_unix_ms NOT GLOB '*[^0-9]*'
+    ),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, receipt_id)
 ) STRICT;
 
 CREATE TABLE playground_indexes (
@@ -217,6 +340,53 @@ CREATE TABLE agent_enrollment_audit_events (
     occurred_at TEXT NOT NULL CHECK (occurred_at <> '' AND occurred_at NOT GLOB '*[^0-9]*'),
     payload BLOB NOT NULL,
     PRIMARY KEY (tenant_id, event_id)
+) STRICT;
+
+CREATE TABLE precommit_records (
+    tenant_id TEXT NOT NULL,
+    precommit_id TEXT NOT NULL,
+    precommit_request_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    playground_id TEXT NOT NULL,
+    current_job_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('running', 'ready', 'abnormal', 'cancelled', 'committed')
+    ),
+    attempt INTEGER NOT NULL CHECK (attempt >= 1 AND attempt <= 2147483647),
+    resource_version TEXT NOT NULL CHECK (
+        resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
+    ),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, precommit_id),
+    UNIQUE (tenant_id, precommit_request_id),
+    UNIQUE (tenant_id, current_job_id)
+) STRICT;
+
+CREATE TABLE precommit_mutations (
+    tenant_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('start', 'restart', 'cancel', 'commit')),
+    precommit_id TEXT NOT NULL,
+    request_payload BLOB NOT NULL,
+    result_payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, request_id),
+    FOREIGN KEY (tenant_id, precommit_id)
+        REFERENCES precommit_records (tenant_id, precommit_id)
+) STRICT;
+
+CREATE TABLE commit_records (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    commit_id BLOB NOT NULL CHECK (length(commit_id) = 32),
+    commit_request_id TEXT NOT NULL,
+    precommit_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, project_id, artifact_id, commit_id),
+    UNIQUE (tenant_id, commit_request_id),
+    FOREIGN KEY (tenant_id, precommit_id)
+        REFERENCES precommit_records (tenant_id, precommit_id)
 ) STRICT;
 "#;
 
@@ -377,7 +547,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 4")
+        sqlx::query("PRAGMA user_version = 6")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -394,12 +564,25 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             migrate_v1_to_v2(pool).await?;
             migrate_v2_to_v3(pool).await?;
             migrate_v3_to_v4(pool).await?;
+            migrate_v4_to_v5(pool).await?;
+            migrate_v5_to_v6(pool).await?;
         }
         2 => {
             migrate_v2_to_v3(pool).await?;
             migrate_v3_to_v4(pool).await?;
+            migrate_v4_to_v5(pool).await?;
+            migrate_v5_to_v6(pool).await?;
         }
-        3 => migrate_v3_to_v4(pool).await?,
+        3 => {
+            migrate_v3_to_v4(pool).await?;
+            migrate_v4_to_v5(pool).await?;
+            migrate_v5_to_v6(pool).await?;
+        }
+        4 => {
+            migrate_v4_to_v5(pool).await?;
+            migrate_v5_to_v6(pool).await?;
+        }
+        5 => migrate_v5_to_v6(pool).await?,
         SQLITE_SCHEMA_VERSION => {}
         _ => {
             return Err(storage_corruption(format!(
@@ -407,7 +590,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             )));
         }
     }
-    validate_table_set(pool, V4_TABLES).await?;
+    validate_table_set(pool, V6_TABLES).await?;
     validate_current_schema(pool).await
 }
 
@@ -665,6 +848,34 @@ async fn migrate_v3_to_v4(pool: &SqlitePool) -> CentralResult<()> {
         .await
         .map_err(storage_error)?;
     sqlx::query("PRAGMA user_version = 4")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+async fn migrate_v4_to_v5(pool: &SqlitePool) -> CentralResult<()> {
+    validate_table_set(pool, V4_TABLES).await?;
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    sqlx::raw_sql(PRECOMMIT_V5_SCHEMA_SQL)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("PRAGMA user_version = 5")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+async fn migrate_v5_to_v6(pool: &SqlitePool) -> CentralResult<()> {
+    validate_table_set(pool, V5_TABLES).await?;
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    sqlx::raw_sql(OBJECT_PLACEMENT_V6_SCHEMA_SQL)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("PRAGMA user_version = 6")
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;

@@ -19,13 +19,12 @@ fusen-rs = "=0.9.0"
 getrandom = "0.4"
 http = "1.4"
 http-body-util = "0.1"
-hyper = { version = "1.11", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["server", "tokio"] }
+hyper = { version = "1.11", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 jsonwebtoken = { version = "=10.2.0", default-features = false, features = ["rust_crypto"] }
 libc.workspace = true
 neoengram-core.workspace = true
 neoengram-engine.workspace = true
-neoengram-fs.workspace = true
 neoengram-protocol = { path = "../../crates/neoengram-protocol" }
 neoengramd = { path = "../neoengramd" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
@@ -40,6 +39,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2.5", features = ["serde"] }
 
 [dev-dependencies]
+hyper = { version = "1.11", features = ["client", "http2"] }
 neoengram-agentd = { path = "../neoengram-agentd" }
 ring = "0.17.14"
 tempfile.workspace = true

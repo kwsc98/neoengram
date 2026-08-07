@@ -40,10 +40,11 @@ pub trait AddExecutor: Debug + Send + Sync {
     fn prepare_add(&self, assignment: &AddAssignment) -> AgentResult<PreparedAdd>;
 }
 
-/// Negotiates and uploads missing objects, returning durable metadata staging material.
+/// Verifies Volume-local objects and builds durable metadata staging material.
 ///
-/// Every operation may be repeated after an Agent crash. Transfer and staging are idempotent for
-/// the assignment/request digest; finalization additionally binds the central decision generation.
+/// Every operation may be repeated after an Agent crash. Local publication and metadata staging
+/// are idempotent for the assignment/request digest; finalization additionally binds the central
+/// decision generation. Object payload bytes never cross this control-plane port.
 pub trait ObjectTransfer: Debug + Send + Sync {
     fn transfer(
         &self,

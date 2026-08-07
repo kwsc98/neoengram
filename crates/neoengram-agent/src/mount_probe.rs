@@ -1,26 +1,13 @@
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-#[cfg(any(target_os = "linux", test))]
-use std::path::Path;
-#[cfg(any(
-    target_os = "linux",
-    all(
-        test,
-        any(target_vendor = "apple", target_os = "android", target_os = "redox")
-    )
-))]
+#[cfg(unix)]
 use std::{
-    fs::OpenOptions,
-    io::{self, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     sync::atomic::{AtomicU64, Ordering},
 };
-#[cfg(any(target_os = "linux", all(test, unix)))]
-use std::{
-    fs::{self, File},
-    io::Read,
-};
 
-#[cfg(any(target_os = "linux", test))]
 use neoengram_core::ContentDigest;
 use neoengram_protocol::{
     AgentBootstrapProbe, AgentMountIdentityDigest, Extensions, MountAccessMode, ResourceHealth,
@@ -32,13 +19,7 @@ use crate::{AgentError, AgentErrorCode, AgentResult};
 /// Fixed marker name provisioned at the root of every managed data Volume.
 pub const VOLUME_MARKER_FILE_NAME: &str = ".neoengram-volume-marker";
 
-#[cfg(any(
-    target_os = "linux",
-    all(
-        test,
-        any(target_vendor = "apple", target_os = "android", target_os = "redox")
-    )
-))]
+#[cfg(unix)]
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Immutable inputs for a local mount-readiness observation.
@@ -101,6 +82,59 @@ impl FilesystemMountProbeConfig {
             return FilesystemMountObservation::unavailable(MountProbeCondition::InvalidConfig);
         }
         probe_platform(self)
+    }
+}
+
+/// Explicitly opted-in probe inputs for a local development directory.
+///
+/// Unlike [`FilesystemMountProbeConfig`], this probe treats the configured directory itself as
+/// the storage boundary. Callers must additionally constrain the Agent transport to a local
+/// development endpoint before using it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DevelopmentDirectoryMountProbeConfig {
+    pub directory_root: PathBuf,
+    pub expected_volume_marker: VolumeMarkerId,
+    pub volume_descriptor_digest: ContentDigest,
+    pub hard_minimum_free_bytes: u64,
+    pub ready_minimum_free_bytes: u64,
+}
+
+impl std::fmt::Debug for DevelopmentDirectoryMountProbeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DevelopmentDirectoryMountProbeConfig")
+            .field(
+                "directory_root_configured",
+                &!self.directory_root.as_os_str().is_empty(),
+            )
+            .field("expected_volume_marker", &self.expected_volume_marker)
+            .field("free_space_thresholds", &"configured")
+            .finish()
+    }
+}
+
+impl DevelopmentDirectoryMountProbeConfig {
+    pub fn validate(&self) -> AgentResult<()> {
+        self.filesystem_config().validate()
+    }
+
+    /// Probes an ordinary directory for local development use only.
+    #[must_use]
+    pub fn probe(&self) -> FilesystemMountObservation {
+        if self.validate().is_err() {
+            return FilesystemMountObservation::unavailable(MountProbeCondition::InvalidConfig);
+        }
+        probe_development_directory_platform(self)
+    }
+
+    fn filesystem_config(&self) -> FilesystemMountProbeConfig {
+        FilesystemMountProbeConfig {
+            mount_root: self.directory_root.clone(),
+            expected_volume_marker: self.expected_volume_marker.clone(),
+            desired_access_mode: MountAccessMode::ReadWrite,
+            hard_minimum_free_bytes: self.hard_minimum_free_bytes,
+            ready_minimum_free_bytes: self.ready_minimum_free_bytes,
+        }
     }
 }
 
@@ -220,13 +254,7 @@ impl std::fmt::Debug for MountInfoEntry {
     }
 }
 
-#[cfg(any(
-    target_os = "linux",
-    all(
-        test,
-        any(target_vendor = "apple", target_os = "android", target_os = "redox")
-    )
-))]
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReadWriteProbeEvidence {
     rename_supported: bool,
@@ -272,6 +300,72 @@ fn probe_platform(_config: &FilesystemMountProbeConfig) -> FilesystemMountObserv
     FilesystemMountObservation::unavailable(MountProbeCondition::UnsupportedPlatform)
 }
 
+#[cfg(unix)]
+fn probe_development_directory_platform(
+    config: &DevelopmentDirectoryMountProbeConfig,
+) -> FilesystemMountObservation {
+    let configured_metadata = match fs::symlink_metadata(&config.directory_root) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => metadata,
+        _ => {
+            return FilesystemMountObservation::unavailable(MountProbeCondition::NotMountBoundary);
+        }
+    };
+    let root = match fs::canonicalize(&config.directory_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return FilesystemMountObservation::unavailable(MountProbeCondition::NotMountBoundary);
+        }
+    };
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata)
+            if !metadata.file_type().is_symlink()
+                && metadata.is_dir()
+                && metadata.dev() == configured_metadata.dev()
+                && metadata.ino() == configured_metadata.ino() =>
+        {
+            metadata
+        }
+        _ => {
+            return FilesystemMountObservation::unavailable(MountProbeCondition::NotMountBoundary);
+        }
+    };
+    let filesystem = match rustix::fs::statvfs(&root) {
+        Ok(filesystem) => filesystem,
+        Err(_) => {
+            return FilesystemMountObservation::unavailable(
+                MountProbeCondition::FilesystemMetadataUnavailable,
+            );
+        }
+    };
+    let fragment_size = if filesystem.f_frsize == 0 {
+        filesystem.f_bsize
+    } else {
+        filesystem.f_frsize
+    };
+    let available_bytes = filesystem.f_bavail.saturating_mul(fragment_size);
+    let mount_identity_digest = development_directory_identity_digest(
+        &root,
+        &metadata,
+        &config.expected_volume_marker,
+        &config.volume_descriptor_digest,
+    );
+    let filesystem_config = config.filesystem_config();
+    finish_probe_with_filesystem_evidence(
+        &filesystem_config,
+        &root,
+        Some(MountAccessMode::ReadWrite),
+        Some(available_bytes),
+        Some(mount_identity_digest),
+    )
+}
+
+#[cfg(not(unix))]
+fn probe_development_directory_platform(
+    _config: &DevelopmentDirectoryMountProbeConfig,
+) -> FilesystemMountObservation {
+    FilesystemMountObservation::unavailable(MountProbeCondition::UnsupportedPlatform)
+}
+
 #[cfg(target_os = "linux")]
 fn finish_probe(
     config: &FilesystemMountProbeConfig,
@@ -290,6 +384,23 @@ fn finish_probe(
         };
         filesystem.f_bavail.saturating_mul(fragment_size)
     });
+    finish_probe_with_filesystem_evidence(
+        config,
+        root,
+        mount_access_mode(&entry.mount_options),
+        available_bytes,
+        mount_identity_digest,
+    )
+}
+
+#[cfg(unix)]
+fn finish_probe_with_filesystem_evidence(
+    config: &FilesystemMountProbeConfig,
+    root: &Path,
+    access_mode: Option<MountAccessMode>,
+    available_bytes: Option<u64>,
+    mount_identity_digest: Option<AgentMountIdentityDigest>,
+) -> FilesystemMountObservation {
     let observed_volume_marker = match read_marker(root) {
         Ok(marker) => marker,
         Err(()) => {
@@ -297,7 +408,7 @@ fn finish_probe(
                 observed_volume_marker: None,
                 marker_matches: false,
                 mount_boundary_detected: true,
-                access_mode: mount_access_mode(&entry.mount_options),
+                access_mode,
                 rename_supported: false,
                 fsync_supported: false,
                 health: ResourceHealth::Unavailable,
@@ -312,7 +423,7 @@ fn finish_probe(
             observed_volume_marker: Some(observed_volume_marker),
             marker_matches: false,
             mount_boundary_detected: true,
-            access_mode: mount_access_mode(&entry.mount_options),
+            access_mode,
             rename_supported: false,
             fsync_supported: false,
             health: ResourceHealth::Unavailable,
@@ -322,7 +433,7 @@ fn finish_probe(
         };
     }
 
-    let Some(access_mode) = mount_access_mode(&entry.mount_options) else {
+    let Some(access_mode) = access_mode else {
         return FilesystemMountObservation {
             observed_volume_marker: Some(observed_volume_marker),
             marker_matches: true,
@@ -434,7 +545,7 @@ fn finish_probe(
     }
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(unix)]
 fn read_marker(root: &Path) -> Result<VolumeMarkerId, ()> {
     use rustix::fs::{openat, Mode, OFlags, CWD};
 
@@ -511,25 +622,34 @@ fn mount_identity_digest(entry: &MountInfoEntry, fsid: u64) -> AgentMountIdentit
     AgentMountIdentityDigest::new(ContentDigest::hash(material))
 }
 
-#[cfg(any(
-    target_os = "linux",
-    all(
-        test,
-        any(target_vendor = "apple", target_os = "android", target_os = "redox")
-    )
-))]
+#[cfg(unix)]
+fn development_directory_identity_digest(
+    root: &Path,
+    metadata: &fs::Metadata,
+    marker: &VolumeMarkerId,
+    volume_descriptor_digest: &ContentDigest,
+) -> AgentMountIdentityDigest {
+    let path = root.as_os_str().as_bytes();
+    let marker = marker.as_str().as_bytes();
+    let mut material = Vec::with_capacity(path.len() + marker.len() + 96);
+    material.extend_from_slice(b"neoengram-development-directory-identity-v1\0");
+    material.extend_from_slice(&(path.len() as u64).to_le_bytes());
+    material.extend_from_slice(path);
+    material.extend_from_slice(&metadata.dev().to_le_bytes());
+    material.extend_from_slice(&metadata.ino().to_le_bytes());
+    material.extend_from_slice(&(marker.len() as u64).to_le_bytes());
+    material.extend_from_slice(marker);
+    material.extend_from_slice(volume_descriptor_digest.as_bytes());
+    AgentMountIdentityDigest::new(ContentDigest::hash(material))
+}
+
+#[cfg(unix)]
 fn run_read_write_probe(root: &Path) -> ReadWriteProbeEvidence {
     let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     run_read_write_probe_with_sequence(root, sequence)
 }
 
-#[cfg(any(
-    target_os = "linux",
-    all(
-        test,
-        any(target_vendor = "apple", target_os = "android", target_os = "redox")
-    )
-))]
+#[cfg(unix)]
 fn run_read_write_probe_with_sequence(root: &Path, sequence: u64) -> ReadWriteProbeEvidence {
     let prefix = format!(".neoengram-rw-probe-{}-{sequence}", std::process::id());
     let pending = root.join(format!("{prefix}.pending"));
@@ -572,21 +692,7 @@ fn run_read_write_probe_with_sequence(root: &Path, sequence: u64) -> ReadWritePr
     evidence
 }
 
-#[cfg(all(
-    any(
-        target_os = "linux",
-        all(
-            test,
-            any(target_vendor = "apple", target_os = "android", target_os = "redox")
-        )
-    ),
-    any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    )
-))]
+#[cfg(unix)]
 fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     rustix::fs::renameat_with(
         rustix::fs::CWD,
@@ -598,13 +704,7 @@ fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     .map_err(io::Error::from)
 }
 
-#[cfg(any(
-    target_os = "linux",
-    all(
-        test,
-        any(target_vendor = "apple", target_os = "android", target_os = "redox")
-    )
-))]
+#[cfg(unix)]
 fn sync_directory(root: &Path) -> io::Result<()> {
     match File::open(root)?.sync_all() {
         Ok(()) => Ok(()),
@@ -877,6 +977,108 @@ mod tests {
         fs::remove_file(root.path().join(VOLUME_MARKER_FILE_NAME)).unwrap();
         fs::write(root.path().join(VOLUME_MARKER_FILE_NAME), "a".repeat(257)).unwrap();
         assert!(read_marker(root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_directory_probe_accepts_an_opted_in_ordinary_directory() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join(VOLUME_MARKER_FILE_NAME),
+            "volume-development\n",
+        )
+        .unwrap();
+        let config = DevelopmentDirectoryMountProbeConfig {
+            directory_root: root.path().to_path_buf(),
+            expected_volume_marker: VolumeMarkerId::new("volume-development").unwrap(),
+            volume_descriptor_digest: ContentDigest::hash(b"development-volume-descriptor"),
+            hard_minimum_free_bytes: 0,
+            ready_minimum_free_bytes: 0,
+        };
+
+        let first = config.probe();
+        let second = config.probe();
+
+        assert_eq!(first.condition, MountProbeCondition::Ready);
+        assert_eq!(first.health, ResourceHealth::Ready);
+        assert!(first.marker_matches);
+        assert!(first.mount_boundary_detected);
+        assert_eq!(first.access_mode, Some(MountAccessMode::ReadWrite));
+        assert!(first.rename_supported);
+        assert!(first.fsync_supported);
+        assert!(first.available_bytes.is_some());
+        assert_eq!(first.mount_identity_digest, second.mount_identity_digest);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+
+        let mut other_descriptor = config;
+        other_descriptor.volume_descriptor_digest = ContentDigest::hash(b"other-descriptor");
+        assert_ne!(
+            first.mount_identity_digest,
+            other_descriptor.probe().mount_identity_digest
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_directory_probe_rejects_marker_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(VOLUME_MARKER_FILE_NAME), "volume-other\n").unwrap();
+        let config = DevelopmentDirectoryMountProbeConfig {
+            directory_root: root.path().to_path_buf(),
+            expected_volume_marker: VolumeMarkerId::new("volume-expected").unwrap(),
+            volume_descriptor_digest: ContentDigest::hash(b"development-volume-descriptor"),
+            hard_minimum_free_bytes: 0,
+            ready_minimum_free_bytes: 0,
+        };
+
+        let observation = config.probe();
+
+        assert_eq!(observation.condition, MountProbeCondition::MarkerMismatch);
+        assert_eq!(observation.health, ResourceHealth::Unavailable);
+        assert!(!observation.marker_matches);
+        assert!(observation.mount_boundary_detected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_directory_probe_rejects_a_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let actual = parent.path().join("actual");
+        let link = parent.path().join("link");
+        fs::create_dir(&actual).unwrap();
+        fs::write(actual.join(VOLUME_MARKER_FILE_NAME), "volume-development\n").unwrap();
+        symlink(&actual, &link).unwrap();
+        let config = DevelopmentDirectoryMountProbeConfig {
+            directory_root: link,
+            expected_volume_marker: VolumeMarkerId::new("volume-development").unwrap(),
+            volume_descriptor_digest: ContentDigest::hash(b"development-volume-descriptor"),
+            hard_minimum_free_bytes: 0,
+            ready_minimum_free_bytes: 0,
+        };
+
+        let observation = config.probe();
+
+        assert_eq!(observation.condition, MountProbeCondition::NotMountBoundary);
+        assert_eq!(observation.health, ResourceHealth::Unavailable);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn production_filesystem_probe_remains_unsupported_off_linux() {
+        let config = FilesystemMountProbeConfig {
+            mount_root: PathBuf::from("/volume"),
+            expected_volume_marker: VolumeMarkerId::new("volume-a").unwrap(),
+            desired_access_mode: MountAccessMode::ReadWrite,
+            hard_minimum_free_bytes: 0,
+            ready_minimum_free_bytes: 0,
+        };
+
+        assert_eq!(
+            config.probe().condition,
+            MountProbeCondition::UnsupportedPlatform
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use neoengram_core::{ContentDigest, Manifest, ManifestId, ObjectId};
+use neoengram_core::{ContentDigest, Manifest, ManifestId};
 use neoengram_protocol::{ArtifactId, JobAssignment, TenantId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -49,6 +49,7 @@ impl SqliteAuthority {
             self.inner.clone(),
             AuthorityCapabilities::SQLITE,
         )
+        .with_precommits(self.inner.clone())
         .with_agent_registry(self.agent_registry.repository())
         .with_control_catalog(self.agent_registry.catalog_repository())
     }
@@ -194,10 +195,6 @@ pub(super) fn exact_32(bytes: Vec<u8>, field: &str) -> CentralResult<[u8; 32]> {
 
 pub(super) fn digest_from_blob(bytes: Vec<u8>, field: &str) -> CentralResult<ContentDigest> {
     Ok(ContentDigest::from_bytes(exact_32(bytes, field)?))
-}
-
-pub(super) fn object_id_from_blob(bytes: Vec<u8>) -> CentralResult<ObjectId> {
-    Ok(ObjectId::from_bytes(exact_32(bytes, "ObjectId")?))
 }
 
 pub(super) fn manifest_id_from_blob(bytes: Vec<u8>) -> CentralResult<ManifestId> {

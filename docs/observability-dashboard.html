@@ -1690,7 +1690,7 @@ function buildTopoSVG() {
     if (n.h >= 100) {
       svg += `<text x="16" y="80" fill="var(--text-dim)" font-size="10">硬链接版本存储 + playground + commit</text>`;
     }
-    // type + s3 gateway badges (top-right)
+    // Type and Volume Gateway badges (top-right).
     const typeLabel = n.kind === "managed" ? "托管" : (n.kind === "self" ? "自有·接入" : "S3");
     const typeColor = n.kind === "managed" ? "var(--accent)" : (n.kind === "self" ? "var(--archive)" : "var(--dataset)");
     const tw = typeLabel.length * 11 + 14;

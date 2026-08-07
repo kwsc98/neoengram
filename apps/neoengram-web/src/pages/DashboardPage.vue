@@ -15,7 +15,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { liveProbe, queryApiVersion, queryTenant, readyProbe } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
-import { supportsResourceBrowser } from '@/features/capabilities';
+import { supportsArtifactCatalog, supportsSnapshotMaterialize } from '@/features/capabilities';
 import { formatTime } from '@/utils/format';
 
 const route = useRoute();
@@ -54,12 +54,12 @@ const refreshing = computed(
 );
 
 const resourceLinks = computed(() => [
-  ...(supportsResourceBrowser(version.value?.capabilities)
+  ...(supportsArtifactCatalog(version.value?.capabilities)
     ? [
         {
           name: 'artifact-list',
           label: '数据资产',
-          detail: '浏览 Artifact、Commit 与版本 Diff',
+          detail: '管理工作区与快照所依赖的权威数据资产',
           icon: Box,
         },
       ]
@@ -70,7 +70,7 @@ const resourceLinks = computed(() => [
     detail: '查看 Playground 与 Pre-commit 状态',
     icon: Collection,
   },
-  ...(supportsResourceBrowser(version.value?.capabilities)
+  ...(supportsSnapshotMaterialize(version.value?.capabilities)
     ? [
         {
           name: 'snapshot-list',

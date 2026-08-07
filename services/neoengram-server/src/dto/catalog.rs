@@ -1,7 +1,9 @@
 use fusen_rs::SensitiveFields;
 use serde::{Deserialize, Serialize};
 
-use super::{IndexVersionBody, JsonExtensions, PvcReference, StorageVolumeView};
+use super::{
+    IndexVersionBody, JsonExtensions, PvcReference, ResourceIssueSummary, StorageVolumeView,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
@@ -150,6 +152,98 @@ pub struct CreateStorageVolumeResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
+pub struct QueryArtifactListRequest {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub page_size: Option<u16>,
+    #[serde(default)]
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryArtifactListResponse {
+    pub items: Vec<ArtifactView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryArtifactRequest {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryArtifactResponse {
+    pub artifact: ArtifactView,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
+#[sensitive(opaque)]
+pub struct CreateArtifactRequest {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub artifact_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub initialization: ArtifactInitialization,
+    #[serde(default, flatten)]
+    pub extensions: JsonExtensions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+#[sensitive(kind = "enum")]
+pub enum ArtifactInitialization {
+    Empty,
+    Derived {
+        source_project_id: String,
+        source_artifact_id: String,
+        source_commit_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct CreateArtifactResponse {
+    pub artifact: ArtifactView,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct ArtifactView {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub artifact_id: String,
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub initialization: ArtifactInitialization,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_commit_id: Option<String>,
+    pub resource_version: String,
+    pub created_at_unix_ms: String,
+    pub updated_at_unix_ms: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
 pub struct QueryPlaygroundListRequest {
     pub tenant_id: String,
     #[serde(default)]
@@ -234,6 +328,10 @@ pub struct PlaygroundView {
     pub head_commit_id: Option<String>,
     pub index_version: IndexVersionBody,
     pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_precommit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<ResourceIssueSummary>,
     pub created_at_unix_ms: String,
     pub updated_at_unix_ms: String,
 }

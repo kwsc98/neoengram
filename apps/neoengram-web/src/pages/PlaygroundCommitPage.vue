@@ -18,6 +18,7 @@ import { useRoute, useRouter } from 'vue-router';
 import {
   cancelPlaygroundPreCommit,
   commitPlayground,
+  queryApiVersion,
   queryPlayground,
   queryPlaygroundChangeList,
   queryPlaygroundPreCommit,
@@ -36,6 +37,7 @@ import type {
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
+import { supportsResourceBrowser } from '@/features/capabilities';
 import {
   canCommitPreCommit,
   preCommitPhaseLabels,
@@ -50,7 +52,14 @@ type ChangeFilter = 'all' | PlaygroundChangeEntry['change_type'];
 
 interface RedetectOperation {
   cancel: CancelPreCommitRequest;
-  start: StartPreCommitRequest;
+  startScope: {
+    tenant_id: string;
+    project_id: string;
+    artifact_id: string;
+    playground_id: string;
+    precommit_request_id: string;
+  };
+  start?: StartPreCommitRequest;
 }
 
 const route = useRoute();
@@ -70,7 +79,17 @@ const playgroundQuery = useQuery({
   queryKey: playgroundKey,
   queryFn: () =>
     queryPlayground(tenantId.value, projectId.value, artifactId.value, playgroundId.value),
+  refetchInterval: (query) =>
+    query.state.data?.data.playground.active_precommit_id ? 1000 : false,
 });
+const versionQuery = useQuery({
+  queryKey: ['system', 'version'],
+  queryFn: queryApiVersion,
+  staleTime: Number.POSITIVE_INFINITY,
+});
+const resourceBrowserEnabled = computed(() =>
+  supportsResourceBrowser(versionQuery.data.value?.data.capabilities),
+);
 const playground = computed(() => playgroundQuery.data.value?.data.playground);
 const activePreCommitId = computed(() => playground.value?.active_precommit_id ?? '');
 const routedPreCommitId = computed(() => String(route.query.precommit_id ?? ''));
@@ -133,8 +152,8 @@ const frozenChangesQuery = useQuery({
         'precommit',
         currentPreCommitId.value,
         precommit.value?.attempt ?? 0,
-        precommit.value?.source_index_version.revision ?? '',
-        precommit.value?.source_index_version.digest ?? '',
+        precommit.value?.candidate_index_version?.revision ?? '',
+        precommit.value?.candidate_index_version?.digest ?? '',
         changeType.value,
         changePathPrefix.value,
         changeCursor.value ?? '',
@@ -152,7 +171,7 @@ const frozenChangesQuery = useQuery({
       ...(changePathPrefix.value ? { path_prefix: changePathPrefix.value } : {}),
       ...(changeCursor.value ? { cursor: changeCursor.value } : {}),
     }),
-  enabled: computed(() => Boolean(precommit.value)),
+  enabled: computed(() => Boolean(precommit.value?.candidate_index_version)),
 });
 
 const commitDialogOpen = ref(false);
@@ -176,12 +195,24 @@ const restartMutation = useMutation({ mutationFn: restartPlaygroundPreCommit });
 const redetectMutation = useMutation({
   mutationFn: async (operation: RedetectOperation) => {
     await cancelPlaygroundPreCommit(operation.cancel);
+    if (!operation.start) {
+      const latest = await queryPlayground(
+        operation.startScope.tenant_id,
+        operation.startScope.project_id,
+        operation.startScope.artifact_id,
+        operation.startScope.playground_id,
+      );
+      operation.start = {
+        ...operation.startScope,
+        expected_index_version: latest.data.playground.index_version,
+      };
+    }
     return startPlaygroundPreCommit(operation.start);
   },
 });
 
 const hasCommitPermission = computed(
-  () => tenants.byId(tenantId.value)?.permissions.includes('commit.create') ?? false,
+  () => tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false,
 );
 const preCommitReady = computed(() => canCommitPreCommit(precommit.value));
 const canCreateCommit = computed(() => preCommitReady.value && hasCommitPermission.value);
@@ -230,18 +261,25 @@ watch(
     () => precommit.value?.attempt,
     () => precommit.value?.source_index_version.revision,
     () => precommit.value?.source_index_version.digest,
+    () => precommit.value?.candidate_index_version?.revision,
+    () => precommit.value?.candidate_index_version?.digest,
   ],
   () => {
     resetChangeCursor();
     pendingCommitRequest.value = undefined;
     pendingCancelRequest.value = undefined;
     pendingRestartRequest.value = undefined;
-    pendingRedetectOperation.value = undefined;
+    if (
+      pendingRedetectOperation.value &&
+      pendingRedetectOperation.value.cancel.precommit_id !== currentPreCommitId.value
+    ) {
+      pendingRedetectOperation.value = undefined;
+    }
     commitError.value = '';
     commitMutation.reset();
     cancelMutation.reset();
     restartMutation.reset();
-    redetectMutation.reset();
+    if (!pendingRedetectOperation.value) redetectMutation.reset();
   },
 );
 watch(
@@ -329,49 +367,55 @@ async function pinPreCommitInUrl(precommitId: string): Promise<void> {
 
 async function redetectPreCommit(): Promise<void> {
   if (redetectMutation.isPending.value) return;
-  const current = playground.value;
   const currentPreCommit = precommit.value;
-  if (!current || !currentPreCommit || !canRedetect.value) return;
-  try {
-    await ElMessageBox.confirm(
-      '当前候选结果会被取消，并基于最新 IndexVersion 创建新的 Pre-commit。',
-      '重新检测',
-      {
-        confirmButtonText: '重新检测',
-        cancelButtonText: '保留当前结果',
-        type: 'warning',
+  if (!pendingRedetectOperation.value) {
+    if (!currentPreCommit || !canRedetect.value) return;
+    try {
+      await ElMessageBox.confirm(
+        '当前候选结果会被取消，并基于最新 IndexVersion 创建新的 Pre-commit。',
+        '重新检测',
+        {
+          confirmButtonText: '重新检测',
+          cancelButtonText: '保留当前结果',
+          type: 'warning',
+        },
+      );
+    } catch {
+      redetectMutation.reset();
+      return;
+    }
+    pendingRedetectOperation.value = {
+      cancel: {
+        tenant_id: tenantId.value,
+        precommit_id: currentPreCommit.precommit_id,
+        cancel_request_id: `cancel-request-${globalThis.crypto.randomUUID()}`,
       },
-    );
-  } catch {
-    pendingRedetectOperation.value = undefined;
-    redetectMutation.reset();
-    return;
+      startScope: {
+        tenant_id: tenantId.value,
+        project_id: projectId.value,
+        artifact_id: artifactId.value,
+        playground_id: playgroundId.value,
+        precommit_request_id: `precommit-request-${globalThis.crypto.randomUUID()}`,
+      },
+    };
   }
-  pendingRedetectOperation.value ??= {
-    cancel: {
-      tenant_id: tenantId.value,
-      precommit_id: currentPreCommit.precommit_id,
-      cancel_request_id: `cancel-request-${globalThis.crypto.randomUUID()}`,
-    },
-    start: {
-      tenant_id: tenantId.value,
-      project_id: projectId.value,
-      artifact_id: artifactId.value,
-      playground_id: playgroundId.value,
-      precommit_request_id: `precommit-request-${globalThis.crypto.randomUUID()}`,
-      expected_index_version: current.index_version,
-    },
-  };
+  let result: Awaited<ReturnType<typeof startPlaygroundPreCommit>>;
   try {
-    await redetectMutation.mutateAsync(pendingRedetectOperation.value);
+    result = await redetectMutation.mutateAsync(pendingRedetectOperation.value);
   } catch {
     return;
   }
+  const nextPreCommitId = result.data.precommit.precommit_id;
+  retainedPreCommitId.value = nextPreCommitId;
+  queryClient.setQueryData(playgroundKey.value, {
+    data: { playground: result.data.playground },
+    requestId: result.requestId,
+  });
   pendingRedetectOperation.value = undefined;
   pendingCommitRequest.value = undefined;
   commitDialogOpen.value = false;
+  await pinPreCommitInUrl(nextPreCommitId);
   await refreshAuthoritativeState();
-  if (activePreCommitId.value) await pinPreCommitInUrl(activePreCommitId.value);
   await queryClient.invalidateQueries({ queryKey: ['playgrounds', tenantId.value] });
   ElMessage.success('新的 Pre-commit 已发起');
 }
@@ -501,7 +545,7 @@ async function backToPlayground(): Promise<void> {
 }
 
 async function openVersionHistory(): Promise<void> {
-  if (!createdCommit.value) return;
+  if (!resourceBrowserEnabled.value || !createdCommit.value) return;
   await router.push({
     name: 'artifact-detail',
     params: { tenantId: tenantId.value, projectId: projectId.value, artifactId: artifactId.value },
@@ -510,7 +554,7 @@ async function openVersionHistory(): Promise<void> {
 }
 
 async function createSnapshot(): Promise<void> {
-  if (!createdCommit.value) return;
+  if (!resourceBrowserEnabled.value || !createdCommit.value) return;
   await router.push({
     name: 'snapshot-create',
     params: { tenantId: tenantId.value, projectId: projectId.value, artifactId: artifactId.value },
@@ -894,7 +938,7 @@ async function createSnapshot(): Promise<void> {
             <dd>revision {{ createdIndexRevision }}</dd>
           </div>
         </dl>
-        <div class="result-next">
+        <div v-if="resourceBrowserEnabled" class="result-next">
           <div>
             <strong>创建只读 Snapshot</strong>
             <p>选择目标 StorageVolume，将该 Commit 交付到指定 Region。</p>
@@ -905,7 +949,9 @@ async function createSnapshot(): Promise<void> {
         </div>
         <div class="result-actions">
           <el-button @click="backToPlayground">返回 Playground</el-button>
-          <el-button @click="openVersionHistory">查看版本历史</el-button>
+          <el-button v-if="resourceBrowserEnabled" @click="openVersionHistory"
+            >查看版本历史</el-button
+          >
         </div>
       </section>
     </template>

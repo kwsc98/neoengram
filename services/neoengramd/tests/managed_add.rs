@@ -10,15 +10,14 @@ use neoengram_core::{
 };
 use neoengram_protocol::{
     AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
-    ControlError, ControlMessage, DecimalU64, DurabilityState, EdgeClusterId, ErrorCode,
-    Extensions, FencingToken, IndexDeltaRecord, JobAccepted, JobFailed, JobFailureStage,
-    JobPrepared, JobProgress, JobState, LeaseGrant, LeaseId, LeaseMode, ManifestRecord,
-    MetadataBatchDescriptor, MetadataBatchId, MetadataBatchKind, MetadataBatchPage,
-    MetadataBatchRecords, MetadataBatchScope, MetadataPublication, MountGeneration,
-    ObjectDurabilityReceipt, ObjectReceiptId, ObjectReceiptRecord, OwnerGeneration,
+    ControlError, ControlMessage, DecimalU64, EdgeClusterId, ErrorCode, Extensions, FencingToken,
+    IndexDeltaRecord, JobAccepted, JobFailed, JobFailureStage, JobPrepared, JobProgress, JobState,
+    LeaseGrant, LeaseId, LeaseMode, ManifestRecord, MetadataBatchDescriptor, MetadataBatchId,
+    MetadataBatchKind, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope,
+    MetadataPublication, MountGeneration, ObjectReceiptId, ObjectReceiptRecord, OwnerGeneration,
     PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId,
-    PublishDecision, SessionGeneration, SessionId, StorageVolumeId, TenantId, UnixMillis,
-    WireChunkRef, WireChunkingStrategy, WireIndexVersion, WireObjectSpec,
+    PublishDecision, SessionGeneration, StorageVolumeId, TenantId, UnixMillis, WireChunkRef,
+    WireChunkingStrategy, WireIndexVersion,
 };
 use neoengramd::{
     Action, Actor, AddJobSpec, AgentReport, AssignJobRequest, AssignmentOutbox,
@@ -43,8 +42,6 @@ struct Scenario {
     prepared: JobPrepared,
     descriptors: Vec<MetadataBatchDescriptor>,
     pages: Vec<MetadataBatchPage>,
-    object_id: ObjectId,
-    object_size: u64,
 }
 
 impl Scenario {
@@ -100,62 +97,6 @@ impl Scenario {
                 .unwrap();
             assert!(replay.replayed);
         }
-    }
-
-    async fn mark_object_durable(&self) {
-        let objects = self
-            .pages
-            .iter()
-            .filter_map(|page| match &page.records {
-                MetadataBatchRecords::ObjectReceipt(records) => Some(records),
-                MetadataBatchRecords::Manifest(_) | MetadataBatchRecords::IndexDelta(_) => None,
-            })
-            .flatten()
-            .map(|record| (record.object_id, record.size.get()))
-            .collect::<Vec<_>>();
-        for (object_id, object_size) in objects {
-            self.observe_object_spec(
-                object_id,
-                object_size,
-                DurabilityState::Durable {
-                    verified_digest: object_id.digest(),
-                    storage_version: "s3-version-1".to_owned(),
-                    extensions: Extensions::new(),
-                },
-            )
-            .await;
-        }
-    }
-
-    async fn observe_object(&self, state: DurabilityState) {
-        self.observe_object_spec(self.object_id, self.object_size, state)
-            .await;
-    }
-
-    async fn observe_object_spec(
-        &self,
-        object_id: ObjectId,
-        object_size: u64,
-        state: DurabilityState,
-    ) {
-        self.components
-            .objects
-            .record_durability(&ObjectDurabilityReceipt {
-                tenant_id: self.spec.tenant_id.clone(),
-                artifact_id: self.spec.artifact_id.clone(),
-                session_id: SessionId::new("session-a").unwrap(),
-                job_id: self.spec.job_id.clone(),
-                object: WireObjectSpec {
-                    object_id,
-                    size: DecimalU64::new(object_size),
-                    extensions: Extensions::new(),
-                },
-                state,
-                checked_at_unix_ms: UnixMillis::new(400),
-                extensions: Extensions::new(),
-            })
-            .await
-            .unwrap();
     }
 
     fn finalize_request(&self) -> FinalizeAddRequest {
@@ -545,7 +486,9 @@ async fn accepted_assignment_retirement_prevents_stable_prefix_starvation() {
         .await
         .unwrap();
     assert_eq!(pending.len(), 1);
-    let neoengram_protocol::AssignmentOperation::Add { input, .. } = &pending[0].assignment;
+    let neoengram_protocol::AssignmentOperation::Add { input, .. } = &pending[0].assignment else {
+        panic!("the pending managed-Add assignment must remain an Add operation");
+    };
     assert_eq!(input.job_id, second_spec.job_id);
 
     let messages = control
@@ -556,7 +499,9 @@ async fn accepted_assignment_retirement_prevents_stable_prefix_starvation() {
     let ControlMessage::Assignment(assignment) = &messages[0].message else {
         panic!("the next live assignment must not be starved");
     };
-    let neoengram_protocol::AssignmentOperation::Add { input, .. } = &assignment.assignment;
+    let neoengram_protocol::AssignmentOperation::Add { input, .. } = &assignment.assignment else {
+        panic!("the next live managed-Add assignment must remain an Add operation");
+    };
     assert_eq!(input.job_id, second_spec.job_id);
 }
 
@@ -672,7 +617,10 @@ async fn create_and_assign_preserve_digest_bound_operation_extensions() {
         })
         .await
         .unwrap();
-    let neoengram_protocol::AssignmentOperation::Add { input, .. } = assigned.assignment.assignment;
+    let neoengram_protocol::AssignmentOperation::Add { input, .. } = assigned.assignment.assignment
+    else {
+        panic!("the assigned managed-Add Job must remain an Add operation");
+    };
 
     assert_eq!(
         input
@@ -798,7 +746,6 @@ async fn complete_managed_add_is_idempotent_at_every_boundary() {
     );
 
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
     let result = scenario
         .control
         .finalize_add(scenario.finalize_request())
@@ -878,7 +825,6 @@ async fn finalize_reassembles_manifest_fragments_across_metadata_pages() {
     assert_eq!(manifest_pages, 2);
 
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
     let result = scenario
         .control
         .finalize_add(scenario.finalize_request())
@@ -900,7 +846,6 @@ async fn finalize_reassembles_manifest_fragments_across_metadata_pages() {
 async fn finalize_rejects_an_expired_assignment_lease_before_cas() {
     let scenario = scenario_with_expiring_lease().await;
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
     let version_before = scenario
         .components
         .publisher
@@ -981,7 +926,6 @@ async fn finalize_rechecks_the_lease_after_metadata_validation() {
     )
     .await;
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
     let version_before = scenario
         .components
         .publisher
@@ -1245,72 +1189,42 @@ async fn failed_report_rejects_invalid_generation_state_and_tenant_scope() {
 }
 
 #[tokio::test]
-async fn finalize_is_blocked_until_every_declared_object_is_centrally_durable() {
+async fn finalize_records_receipts_on_the_authoritative_assignment_placement() {
     let scenario = scenario().await;
     scenario.stage_all().await;
+    let receipt = scenario
+        .pages
+        .iter()
+        .find_map(|page| match &page.records {
+            MetadataBatchRecords::ObjectReceipt(records) => records.first(),
+            MetadataBatchRecords::Manifest(_) | MetadataBatchRecords::IndexDelta(_) => None,
+        })
+        .unwrap()
+        .clone();
 
-    let error = scenario
+    let result = scenario
         .control
         .finalize_add(scenario.finalize_request())
         .await
-        .unwrap_err();
-    assert_eq!(error.stable_code(), "OBJECT_NOT_DURABLE");
+        .unwrap();
+    assert_eq!(result.job.state, JobState::Succeeded);
     assert_eq!(
         scenario
             .components
-            .jobs
-            .get(&JobKey::new(
-                scenario.spec.tenant_id.clone(),
-                scenario.spec.job_id.clone()
-            ))
+            .objects
+            .object_placement(
+                &scenario.spec.tenant_id,
+                &scenario.spec.artifact_id,
+                &scenario.target.storage_volume_id,
+                &scenario.target.artifact_placement_id,
+                scenario.target.placement_generation,
+                receipt.object_id,
+            )
             .await
             .unwrap()
             .unwrap()
-            .state,
-        JobState::Prepared
-    );
-}
-
-#[tokio::test]
-async fn pending_and_rejected_observations_do_not_downgrade_a_durable_object() {
-    let scenario = scenario().await;
-    scenario.stage_all().await;
-    scenario.mark_object_durable().await;
-    scenario
-        .observe_object(DurabilityState::Pending {
-            extensions: Extensions::new(),
-        })
-        .await;
-    scenario
-        .observe_object(DurabilityState::Rejected {
-            code: "UPLOAD_REJECTED".to_owned(),
-            message: "a later upload attempt was rejected".to_owned(),
-            extensions: Extensions::new(),
-        })
-        .await;
-
-    let durable = scenario
-        .components
-        .objects
-        .durable_object(
-            &scenario.spec.tenant_id,
-            &scenario.spec.artifact_id,
-            scenario.object_id,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(durable.object_id, scenario.object_id);
-    assert_eq!(durable.storage_version, "s3-version-1");
-    assert_eq!(
-        scenario
-            .control
-            .finalize_add(scenario.finalize_request())
-            .await
-            .unwrap()
-            .job
-            .state,
-        JobState::Succeeded
+            .receipt,
+        receipt
     );
 }
 
@@ -1341,7 +1255,6 @@ async fn finalize_rejects_incomplete_and_tampered_batches() {
             .await
             .unwrap();
     }
-    incomplete.mark_object_durable().await;
     let error = incomplete
         .control
         .finalize_add(incomplete.finalize_request())
@@ -1380,7 +1293,6 @@ async fn finalize_rejects_incomplete_and_tampered_batches() {
 async fn finalize_rejects_metadata_not_referenced_by_the_index_delta() {
     let scenario = scenario_with_unreferenced_manifest().await;
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
 
     let error = scenario
         .control
@@ -1411,7 +1323,6 @@ async fn finalize_rejects_metadata_not_referenced_by_the_index_delta() {
 async fn finalize_rejects_index_mutations_outside_the_assignment_scope() {
     let scenario = scenario_with_out_of_scope_mutation().await;
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
 
     let error = scenario
         .control
@@ -1468,7 +1379,6 @@ async fn finalize_rejects_a_different_internally_valid_publication() {
             .unwrap()
     );
     substituted.stage_all().await;
-    substituted.mark_object_durable().await;
 
     let first = substituted
         .control
@@ -1527,7 +1437,6 @@ async fn wrong_result_digest_becomes_a_stable_failed_decision() {
     )
     .await;
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
 
     let first = scenario
         .control
@@ -1585,7 +1494,6 @@ async fn invalid_resulting_snapshot_becomes_a_stable_failed_decision() {
     let scenario = build_scenario(components, control).await;
     assert_eq!(scenario.spec.expected_index_version, base_version);
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
 
     let first = scenario
         .control
@@ -1615,7 +1523,6 @@ async fn invalid_resulting_snapshot_becomes_a_stable_failed_decision() {
 async fn cas_mismatch_becomes_a_stable_conflicted_decision_and_replays() {
     let scenario = scenario().await;
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
     scenario
         .components
         .publisher
@@ -1666,7 +1573,6 @@ async fn publishing_replay_converges_after_terminal_persist_failure_and_deadline
     );
     let scenario = build_scenario(components, control).await;
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
     jobs.arm();
 
     let error = scenario
@@ -1807,7 +1713,6 @@ async fn publishing_recovery_uses_the_frozen_candidate_after_staging_gc_and_revo
     );
     let scenario = build_scenario(components, control).await;
     scenario.stage_all().await;
-    scenario.mark_object_durable().await;
 
     let error = scenario
         .control
@@ -1952,24 +1857,37 @@ struct ExpireLeaseOnObjectRead {
 
 #[async_trait]
 impl ObjectCatalog for ExpireLeaseOnObjectRead {
-    async fn record_durability(&self, receipt: &ObjectDurabilityReceipt) -> CentralResult<()> {
-        self.inner.record_durability(receipt).await
+    async fn record_placement(
+        &self,
+        evidence: &neoengramd::ObjectPlacementEvidence,
+    ) -> CentralResult<()> {
+        self.inner.record_placement(evidence).await
     }
 
-    async fn durable_object(
+    async fn object_placement(
         &self,
         tenant_id: &TenantId,
         artifact_id: &ArtifactId,
+        storage_volume_id: &neoengram_protocol::StorageVolumeId,
+        artifact_placement_id: &neoengram_protocol::ArtifactPlacementId,
+        placement_generation: neoengram_protocol::PlacementGeneration,
         object_id: ObjectId,
-    ) -> CentralResult<Option<neoengramd::DurableObject>> {
-        let object = self
+    ) -> CentralResult<Option<neoengramd::ObjectPlacementEvidence>> {
+        let placement = self
             .inner
-            .durable_object(tenant_id, artifact_id, object_id)
+            .object_placement(
+                tenant_id,
+                artifact_id,
+                storage_volume_id,
+                artifact_placement_id,
+                placement_generation,
+                object_id,
+            )
             .await?;
         if self.armed.swap(false, Ordering::SeqCst) {
             self.clock.set(self.lease_expiry);
         }
-        Ok(object)
+        Ok(placement)
     }
 }
 
@@ -2187,6 +2105,13 @@ impl FailPublisherOnce {
 
 #[async_trait]
 impl IndexPublisher for FailPublisherOnce {
+    async fn initialize_snapshot(
+        &self,
+        request: neoengramd::InitializeIndexSnapshotRequest,
+    ) -> CentralResult<WireIndexVersion> {
+        self.inner.initialize_snapshot(request).await
+    }
+
     async fn compare_and_swap(
         &self,
         request: IndexPublishRequest,
@@ -2546,8 +2471,6 @@ async fn build_scenario_with_candidate_overrides(
     };
     let manifest = Manifest::new(file_size, chunking, chunks.clone()).unwrap();
     let manifest_id = manifest.canonical_id().unwrap();
-    let object_id = chunks[0].object_id;
-    let object_size = chunks[0].size;
     let scope = MetadataBatchScope {
         tenant_id: spec.tenant_id.clone(),
         project_id: spec.project_id.clone(),
@@ -2760,8 +2683,6 @@ async fn build_scenario_with_candidate_overrides(
         prepared,
         descriptors,
         pages,
-        object_id,
-        object_size,
     }
 }
 

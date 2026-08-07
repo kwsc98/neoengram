@@ -750,7 +750,7 @@
             <title id="svg-title">NeoEngram 中心化 Agent 产品架构图</title>
             <desc id="svg-desc">
               Web 和 CLI 访问中央控制面，中央控制面通过出站控制连接调度两个区域
-              Agent。Agent 读写中央 S3 并操作各自区域存储，业务 Pod
+              Agent。Agent 将不可变对象写入各自的用户 StorageVolume，中心只保存位置凭证，业务 Pod
               直接访问区域存储上的 Playground。相同 Commit C1
               在两个区域分别形成独立、单区域 Snapshot；两个区域不直接传输数据。
             </desc>
@@ -977,16 +977,16 @@
             <g class="node authority" transform="translate(788 355)">
               <rect width="374" height="108" rx="5" />
               <text class="node-title" x="187" y="31" text-anchor="middle">
-                Central S3
+                Object Placement Catalog
               </text>
               <text class="node-copy" x="187" y="54" text-anchor="middle">
-                Content-addressed Immutable Objects
+                Volume / Artifact / Generation Evidence
               </text>
               <text class="node-copy" x="187" y="73" text-anchor="middle">
-                Manifest 约束 · Durability Gate
+                Manifest 约束 · Publication Gate
               </text>
               <text class="node-accent" x="187" y="94" text-anchor="middle">
-                不可变 payload 耐久权威
+                只存凭证 · 不存 Chunk payload
               </text>
             </g>
 
@@ -1029,7 +1029,7 @@
                 StorageVolume A
               </text>
               <text class="node-copy" x="95" y="52" text-anchor="middle">
-                PVC / NFS · 区域存储
+                Playground + object CAS
               </text>
             </g>
 
@@ -1109,7 +1109,7 @@
                 StorageVolume B
               </text>
               <text class="node-copy" x="95" y="52" text-anchor="middle">
-                PVC / NFS · 区域存储
+                Playground + object CAS
               </text>
             </g>
 
@@ -1178,7 +1178,7 @@
             <g class="edge-label" transform="translate(523 507)">
               <rect width="286" height="25" rx="3" />
               <text x="143" y="17" text-anchor="middle">
-                短期 object ticket · Agent 直连 Central S3
+                ObjectReceipt · 只上报 placement evidence
               </text>
             </g>
           </svg>
@@ -1208,7 +1208,7 @@
                 Authority Store<br />权威元数据
               </div>
               <div class="mobile-node authority">
-                Central S3<br />不可变 payload
+                Object Placement Catalog<br />只存凭证，无 payload
               </div>
             </div>
             <p style="margin-top: 9px">
@@ -1224,7 +1224,7 @@
               <div class="mobile-nodes">
                 <div class="mobile-node agent">Agent A<br />受控执行器</div>
                 <div class="mobile-node storage">
-                  StorageVolume A<br />PVC / NFS
+                  StorageVolume A<br />PVC / NFS<br />Playground + object CAS
                 </div>
                 <div class="mobile-node view">
                   Playground<br />RW · 单 Region
@@ -1240,7 +1240,7 @@
               <div class="mobile-nodes">
                 <div class="mobile-node agent">Agent B<br />受控执行器</div>
                 <div class="mobile-node storage">
-                  StorageVolume B<br />PVC / NFS
+                  StorageVolume B<br />PVC / NFS<br />Playground + object CAS
                 </div>
                 <div class="mobile-node view">
                   Playground<br />RW · 单 Region
@@ -1280,9 +1280,9 @@
             </p>
           </div>
           <div class="rule">
-            <b>区域间不建立直连</b>
+            <b>跨区复制不经过中心 API</b>
             <p>
-              没有 Agent-to-Agent 或 NFS-to-NFS 通道；跨区内容经中心 S3 交付。
+              当前没有跨区数据通道；后续由受限 route 直达目标 Volume，Server 不代理 Chunk。
             </p>
           </div>
         </div>
@@ -1321,12 +1321,12 @@
                 </td>
               </tr>
               <tr>
-                <td data-label="路径">对象传输</td>
-                <td data-label="方向">Agent ↔ Central S3</td>
+                <td data-label="路径">Volume 对象 I/O</td>
+                <td data-label="方向">Agent ↔ StorageVolume</td>
                 <td data-label="承载内容">
-                  不可变对象、Manifest 约束下的 payload
+                  Tenant/Artifact 隔离的不可变 Chunk payload
                 </td>
-                <td data-label="边界">仅使用短期 ticket；S3 是耐久权威</td>
+                <td data-label="边界">Agent 复核 Hash 并落盘；中心只存 placement evidence</td>
               </tr>
               <tr>
                 <td data-label="路径">业务 I/O</td>

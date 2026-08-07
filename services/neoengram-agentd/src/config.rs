@@ -259,16 +259,34 @@ fn validate_endpoint(endpoint: &Url) -> AgentDaemonResult<()> {
             "central_endpoint must be an origin URL without credentials, path, query, or fragment",
         ));
     }
-    let loopback_http = endpoint.scheme() == "http"
-        && endpoint
-            .host_str()
-            .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost"));
+    let loopback_http = endpoint.scheme() == "http" && has_loopback_host(endpoint);
     if endpoint.scheme() != "https" && !loopback_http {
         return Err(configuration(
             "central_endpoint must use HTTPS (HTTP is allowed only on loopback)",
         ));
     }
     Ok(())
+}
+
+pub(crate) fn validate_development_directory_probe_endpoint(
+    endpoint: &Url,
+) -> AgentDaemonResult<()> {
+    validate_endpoint(endpoint)?;
+    if !has_loopback_host(endpoint) {
+        return Err(configuration(
+            "development directory probe requires a loopback central_endpoint",
+        ));
+    }
+    Ok(())
+}
+
+fn has_loopback_host(endpoint: &Url) -> bool {
+    match endpoint.host() {
+        Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(address)) => address == std::net::Ipv6Addr::LOCALHOST,
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        None => false,
+    }
 }
 
 fn validate_region(region: &str) -> AgentDaemonResult<()> {
@@ -368,6 +386,29 @@ logging:
         let mut config: AgentConfig = serde_yaml::from_str(VALID_CONFIG).unwrap();
         config.central_endpoint = Url::parse("http://central.example/agent").unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn development_directory_probe_accepts_only_loopback_endpoints() {
+        for endpoint in [
+            "http://127.0.0.1:8081/",
+            "http://[::1]:8081/",
+            "https://localhost:8081/",
+        ] {
+            validate_development_directory_probe_endpoint(&Url::parse(endpoint).unwrap()).unwrap();
+        }
+
+        for endpoint in [
+            "https://neoengram.example.internal/",
+            "https://localhost.example:8081/",
+            "http://127.0.0.1:8081/not-an-origin",
+        ] {
+            assert!(
+                validate_development_directory_probe_endpoint(&Url::parse(endpoint).unwrap())
+                    .is_err(),
+                "unexpectedly accepted {endpoint}"
+            );
+        }
     }
 
     #[cfg(unix)]

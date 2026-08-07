@@ -7,21 +7,29 @@ use std::{
 };
 
 use async_trait::async_trait;
-use neoengram_core::{FileRecord, IndexVersion, LogicalPath, Manifest, ManifestId, ObjectId};
+use neoengram_core::{
+    CommitId, FileRecord, IndexVersion, LogicalPath, Manifest, ManifestId, ObjectId,
+};
 use neoengram_protocol::{
-    AgentId, ArtifactId, AssignmentOperation, JobAssignment, MetadataBatchDescriptor,
-    MetadataBatchId, MetadataBatchPage, ObjectDurabilityReceipt, TenantId, UnixMillis,
+    AgentId, ArtifactId, JobAssignment, MetadataBatchDescriptor, MetadataBatchId,
+    MetadataBatchPage, ObjectReceiptId, PlacementGeneration, StorageVolumeId, TenantId, UnixMillis,
     WireIndexVersion,
 };
 
 use crate::{
-    validation::{durable_from_receipt, invalid, same_index_version},
+    apply_cancel, apply_commit, apply_head_publication_ack, apply_job_sync, apply_restart,
+    assignment_identity, build_started, same_cancel_request, same_commit_request,
+    same_restart_request, same_start_request,
+    validation::{invalid, same_index_version, validate_initial_index_snapshot},
     AgentEnrollmentAuditEvent, AssignmentOutbox, AssignmentPublishOutcome,
     AssignmentReserveOutcome, AssignmentRetireOutcome, AuditEvent, AuditSink,
     AuthorityCapabilities, AuthorityStore, AuthorizationRequest, Authorizer, CentralErrorCode,
-    CentralResult, Clock, ControlPlane, DurableObject, InMemoryAgentRegistry, IndexKey,
-    IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, IndexPublisher,
+    CentralResult, Clock, ControlPlane, InMemoryAgentRegistry, IndexKey, IndexPublishOutcome,
+    IndexPublishRejection, IndexPublishRequest, IndexPublisher, InitializeIndexSnapshotRequest,
     JobInsertOutcome, JobKey, JobRecord, JobRepository, MetadataBatchStager, ObjectCatalog,
+    ObjectPlacementEvidence, PreCommitCancelRequest, PreCommitCommitOutcome,
+    PreCommitCommitRequest, PreCommitCommitSnapshot, PreCommitKey, PreCommitMutationOutcome,
+    PreCommitRecord, PreCommitRepository, PreCommitRestartRequest, PreCommitStartRequest,
     PublishedIndex, StagedMetadataBatch,
 };
 
@@ -126,6 +134,428 @@ impl JobRepository for InMemoryJobRepository {
 }
 
 #[derive(Debug, Default)]
+pub struct InMemoryPreCommitRepository {
+    state: Mutex<InMemoryPreCommitState>,
+}
+
+#[derive(Debug, Default)]
+struct InMemoryPreCommitState {
+    precommits: BTreeMap<PreCommitKey, PreCommitRecord>,
+    commits: BTreeMap<
+        (
+            TenantId,
+            neoengram_protocol::ProjectId,
+            ArtifactId,
+            CommitId,
+        ),
+        crate::CommitRecord,
+    >,
+    mutations: BTreeMap<(TenantId, neoengram_protocol::RequestId), InMemoryPreCommitMutation>,
+}
+
+#[derive(Debug, Clone)]
+enum InMemoryPreCommitMutation {
+    Start {
+        request: PreCommitStartRequest,
+        result: PreCommitRecord,
+    },
+    Restart {
+        request: PreCommitRestartRequest,
+        result: PreCommitRecord,
+    },
+    Cancel {
+        request: PreCommitCancelRequest,
+        result: PreCommitRecord,
+    },
+    Commit {
+        request: PreCommitCommitRequest,
+        result: PreCommitCommitSnapshot,
+    },
+}
+
+#[async_trait]
+impl PreCommitRepository for InMemoryPreCommitRepository {
+    async fn start(
+        &self,
+        request: PreCommitStartRequest,
+    ) -> CentralResult<PreCommitMutationOutcome> {
+        let mut state = lock(&self.state)?;
+        let mutation_key = (
+            request.tenant_id.clone(),
+            request.precommit_request_id.clone(),
+        );
+        if let Some(existing) = state.mutations.get(&mutation_key) {
+            return match existing {
+                InMemoryPreCommitMutation::Start {
+                    request: stored,
+                    result,
+                } if same_start_request(stored, &request) => Ok(PreCommitMutationOutcome {
+                    precommit: result.clone(),
+                    replayed: true,
+                }),
+                _ => Err(precommit_request_conflict()),
+            };
+        }
+        let record = build_started(&request)?;
+        if state.precommits.contains_key(&record.key()) {
+            return Err(precommit_request_conflict());
+        }
+        ensure_active_available(&state, &record, None)?;
+        ensure_job_identity_available(&state, &record)?;
+        state.precommits.insert(record.key(), record.clone());
+        state.mutations.insert(
+            mutation_key,
+            InMemoryPreCommitMutation::Start {
+                request,
+                result: record.clone(),
+            },
+        );
+        Ok(PreCommitMutationOutcome {
+            precommit: record,
+            replayed: false,
+        })
+    }
+
+    async fn get(&self, key: &PreCommitKey) -> CentralResult<Option<PreCommitRecord>> {
+        Ok(lock(&self.state)?.precommits.get(key).cloned())
+    }
+
+    async fn get_active(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &neoengram_protocol::ProjectId,
+        artifact_id: &ArtifactId,
+        playground_id: &neoengram_protocol::PlaygroundId,
+    ) -> CentralResult<Option<PreCommitRecord>> {
+        let state = lock(&self.state)?;
+        let mut matches = state.precommits.values().filter(|record| {
+            &record.tenant_id == tenant_id
+                && &record.project_id == project_id
+                && &record.artifact_id == artifact_id
+                && &record.playground_id == playground_id
+                && precommit_is_active(record)
+        });
+        let result = matches.next().cloned();
+        if matches.next().is_some() {
+            return Err(crate::CentralError::new(
+                CentralErrorCode::Internal,
+                "more than one active Pre-commit exists for a Playground",
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn list_running(
+        &self,
+        after: Option<&PreCommitKey>,
+        limit: usize,
+    ) -> CentralResult<Vec<PreCommitRecord>> {
+        Ok(lock(&self.state)?
+            .precommits
+            .iter()
+            .filter(|(key, record)| {
+                after.is_none_or(|after| *key > after)
+                    && record.state == crate::PreCommitState::Running
+            })
+            .take(limit)
+            .map(|(_, record)| record.clone())
+            .collect())
+    }
+
+    async fn list_unpublished_commits(
+        &self,
+        after: Option<&PreCommitKey>,
+        limit: usize,
+    ) -> CentralResult<Vec<PreCommitRecord>> {
+        Ok(lock(&self.state)?
+            .precommits
+            .iter()
+            .filter(|(key, record)| {
+                after.is_none_or(|after| *key > after)
+                    && record.state == crate::PreCommitState::Committed
+                    && record.head_published_at_unix_ms.is_none()
+            })
+            .take(limit)
+            .map(|(_, record)| record.clone())
+            .collect())
+    }
+
+    async fn restart(
+        &self,
+        request: PreCommitRestartRequest,
+    ) -> CentralResult<PreCommitMutationOutcome> {
+        let mut state = lock(&self.state)?;
+        let mutation_key = (
+            request.key.tenant_id.clone(),
+            request.restart_request_id.clone(),
+        );
+        if let Some(existing) = state.mutations.get(&mutation_key) {
+            return match existing {
+                InMemoryPreCommitMutation::Restart {
+                    request: stored,
+                    result,
+                } if same_restart_request(stored, &request) => Ok(PreCommitMutationOutcome {
+                    precommit: result.clone(),
+                    replayed: true,
+                }),
+                _ => Err(precommit_request_conflict()),
+            };
+        }
+        let stored = state
+            .precommits
+            .get(&request.key)
+            .cloned()
+            .ok_or_else(precommit_not_found)?;
+        let restarted = apply_restart(stored, &request)?;
+        ensure_active_available(&state, &restarted, Some(&restarted.key()))?;
+        ensure_job_identity_available(&state, &restarted)?;
+        state.precommits.insert(restarted.key(), restarted.clone());
+        state.mutations.insert(
+            mutation_key,
+            InMemoryPreCommitMutation::Restart {
+                request,
+                result: restarted.clone(),
+            },
+        );
+        Ok(PreCommitMutationOutcome {
+            precommit: restarted,
+            replayed: false,
+        })
+    }
+
+    async fn cancel(
+        &self,
+        request: PreCommitCancelRequest,
+    ) -> CentralResult<PreCommitMutationOutcome> {
+        let mut state = lock(&self.state)?;
+        let mutation_key = (
+            request.key.tenant_id.clone(),
+            request.cancel_request_id.clone(),
+        );
+        if let Some(existing) = state.mutations.get(&mutation_key) {
+            return match existing {
+                InMemoryPreCommitMutation::Cancel {
+                    request: stored,
+                    result,
+                } if same_cancel_request(stored, &request) => Ok(PreCommitMutationOutcome {
+                    precommit: result.clone(),
+                    replayed: true,
+                }),
+                _ => Err(precommit_request_conflict()),
+            };
+        }
+        let stored = state
+            .precommits
+            .get(&request.key)
+            .cloned()
+            .ok_or_else(precommit_not_found)?;
+        let cancelled = apply_cancel(stored, &request)?;
+        state.precommits.insert(cancelled.key(), cancelled.clone());
+        state.mutations.insert(
+            mutation_key,
+            InMemoryPreCommitMutation::Cancel {
+                request,
+                result: cancelled.clone(),
+            },
+        );
+        Ok(PreCommitMutationOutcome {
+            precommit: cancelled,
+            replayed: false,
+        })
+    }
+
+    async fn sync_job(
+        &self,
+        job: JobRecord,
+        published_index: Option<PublishedIndex>,
+        observed_at_unix_ms: UnixMillis,
+    ) -> CentralResult<Option<PreCommitRecord>> {
+        let mut state = lock(&self.state)?;
+        let found = state
+            .precommits
+            .iter()
+            .find(|(_, precommit)| {
+                precommit.tenant_id == job.spec.tenant_id && precommit.job_id == job.spec.job_id
+            })
+            .map(|(key, precommit)| (key.clone(), precommit.clone()));
+        let Some((key, stored)) = found else {
+            return Ok(None);
+        };
+        let base_records = match stored.frozen_head_commit_id {
+            None => Some(Vec::new()),
+            Some(commit_id) => state
+                .commits
+                .get(&(
+                    stored.tenant_id.clone(),
+                    stored.project_id.clone(),
+                    stored.artifact_id.clone(),
+                    commit_id,
+                ))
+                .map(|commit| commit.records.clone()),
+        };
+        let Some(synchronized) = apply_job_sync(
+            stored.clone(),
+            &job,
+            published_index.as_ref(),
+            base_records.as_deref(),
+            observed_at_unix_ms,
+        )?
+        else {
+            return Ok(None);
+        };
+        if synchronized != stored {
+            state.precommits.insert(key, synchronized.clone());
+        }
+        Ok(Some(synchronized))
+    }
+
+    async fn commit(
+        &self,
+        request: PreCommitCommitRequest,
+    ) -> CentralResult<PreCommitCommitOutcome> {
+        let mut state = lock(&self.state)?;
+        let mutation_key = (
+            request.key.tenant_id.clone(),
+            request.commit.commit_request_id.clone(),
+        );
+        if let Some(existing) = state.mutations.get(&mutation_key) {
+            return match existing {
+                InMemoryPreCommitMutation::Commit {
+                    request: stored,
+                    result,
+                } if same_commit_request(stored, &request) => {
+                    Ok(PreCommitCommitOutcome::from_snapshot(result.clone(), true))
+                }
+                _ => Err(precommit_request_conflict()),
+            };
+        }
+        let stored = state
+            .precommits
+            .get(&request.key)
+            .cloned()
+            .ok_or_else(precommit_not_found)?;
+        let consumed = apply_commit(stored, &request)?;
+        let commit_key = (
+            consumed.commit.tenant_id.clone(),
+            consumed.commit.project_id.clone(),
+            consumed.commit.artifact_id.clone(),
+            consumed.commit.commit_id,
+        );
+        if state.commits.contains_key(&commit_key) {
+            return Err(precommit_request_conflict());
+        }
+        state.commits.insert(commit_key, consumed.commit.clone());
+        state.precommits.insert(
+            consumed.consumed_precommit.key(),
+            consumed.consumed_precommit.clone(),
+        );
+        state.mutations.insert(
+            mutation_key,
+            InMemoryPreCommitMutation::Commit {
+                request,
+                result: consumed.clone(),
+            },
+        );
+        Ok(PreCommitCommitOutcome::from_snapshot(consumed, false))
+    }
+
+    async fn get_commit(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &neoengram_protocol::ProjectId,
+        artifact_id: &ArtifactId,
+        commit_id: CommitId,
+    ) -> CentralResult<Option<crate::CommitRecord>> {
+        Ok(lock(&self.state)?
+            .commits
+            .get(&(
+                tenant_id.clone(),
+                project_id.clone(),
+                artifact_id.clone(),
+                commit_id,
+            ))
+            .cloned())
+    }
+
+    async fn acknowledge_head_publication(
+        &self,
+        key: &PreCommitKey,
+        commit_id: CommitId,
+        published_at_unix_ms: UnixMillis,
+    ) -> CentralResult<PreCommitRecord> {
+        let mut state = lock(&self.state)?;
+        let stored = state
+            .precommits
+            .get(key)
+            .cloned()
+            .ok_or_else(precommit_not_found)?;
+        let acknowledged =
+            apply_head_publication_ack(stored.clone(), commit_id, published_at_unix_ms)?;
+        if acknowledged != stored {
+            state.precommits.insert(key.clone(), acknowledged.clone());
+        }
+        Ok(acknowledged)
+    }
+}
+
+fn ensure_job_identity_available(
+    state: &InMemoryPreCommitState,
+    candidate: &PreCommitRecord,
+) -> CentralResult<()> {
+    if state.precommits.values().any(|stored| {
+        stored.key() != candidate.key()
+            && stored.tenant_id == candidate.tenant_id
+            && stored.job_id == candidate.job_id
+    }) {
+        return Err(precommit_request_conflict());
+    }
+    Ok(())
+}
+
+fn ensure_active_available(
+    state: &InMemoryPreCommitState,
+    candidate: &PreCommitRecord,
+    except: Option<&PreCommitKey>,
+) -> CentralResult<()> {
+    if state.precommits.values().any(|stored| {
+        except.is_none_or(|except| stored.key() != *except)
+            && stored.tenant_id == candidate.tenant_id
+            && stored.project_id == candidate.project_id
+            && stored.artifact_id == candidate.artifact_id
+            && stored.playground_id == candidate.playground_id
+            && precommit_is_active(stored)
+    }) {
+        return Err(precommit_request_conflict());
+    }
+    Ok(())
+}
+
+fn precommit_is_active(record: &PreCommitRecord) -> bool {
+    matches!(
+        record.state,
+        crate::PreCommitState::Running
+            | crate::PreCommitState::Ready
+            | crate::PreCommitState::Abnormal
+    )
+}
+
+fn precommit_not_found() -> crate::CentralError {
+    crate::CentralError::new(
+        CentralErrorCode::JobNotFound,
+        "tenant-scoped Pre-commit was not found",
+    )
+    .with_retryable(false)
+}
+
+fn precommit_request_conflict() -> crate::CentralError {
+    crate::CentralError::new(
+        CentralErrorCode::ConcurrentUpdate,
+        "Pre-commit mutation identity was reused with another payload",
+    )
+    .with_retryable(false)
+}
+
+#[derive(Debug, Default)]
 pub struct InMemoryAssignmentOutbox {
     assignments: Mutex<
         BTreeMap<(TenantId, neoengram_protocol::AssignmentId), InMemoryAssignmentReservation>,
@@ -152,9 +582,9 @@ impl InMemoryAssignmentOutbox {
 #[async_trait]
 impl AssignmentOutbox for InMemoryAssignmentOutbox {
     async fn reserve(&self, assignment: JobAssignment) -> CentralResult<AssignmentReserveOutcome> {
-        let AssignmentOperation::Add { input: add, .. } = &assignment.assignment;
+        let (tenant_id, _job_id, assignment_id, _agent_id) = assignment_identity(&assignment);
         let mut assignments = lock(&self.assignments)?;
-        let key = (add.tenant_id.clone(), add.assignment_id.clone());
+        let key = (tenant_id.clone(), assignment_id.clone());
         if let Some(existing) = assignments.get(&key) {
             if existing.assignment == assignment {
                 return Ok(AssignmentReserveOutcome::Existing);
@@ -163,7 +593,7 @@ impl AssignmentOutbox for InMemoryAssignmentOutbox {
                 CentralErrorCode::JobIdReused,
                 format!(
                     "assignment ID {} was reused with another payload",
-                    add.assignment_id
+                    assignment_id
                 ),
             ));
         }
@@ -179,15 +609,15 @@ impl AssignmentOutbox for InMemoryAssignmentOutbox {
     }
 
     async fn publish(&self, assignment: JobAssignment) -> CentralResult<AssignmentPublishOutcome> {
-        let AssignmentOperation::Add { input: add, .. } = &assignment.assignment;
+        let (tenant_id, _job_id, assignment_id, _agent_id) = assignment_identity(&assignment);
         let mut assignments = lock(&self.assignments)?;
-        let key = (add.tenant_id.clone(), add.assignment_id.clone());
+        let key = (tenant_id.clone(), assignment_id.clone());
         let existing = assignments.get_mut(&key).ok_or_else(|| {
             invalid(
                 CentralErrorCode::Internal,
                 format!(
                     "assignment {} must be reserved before publication",
-                    add.assignment_id
+                    assignment_id
                 ),
             )
         })?;
@@ -196,7 +626,7 @@ impl AssignmentOutbox for InMemoryAssignmentOutbox {
                 CentralErrorCode::JobIdReused,
                 format!(
                     "assignment ID {} was reused with another payload",
-                    add.assignment_id
+                    assignment_id
                 ),
             ));
         }
@@ -204,6 +634,34 @@ impl AssignmentOutbox for InMemoryAssignmentOutbox {
             return Ok(AssignmentPublishOutcome::AlreadyPublished);
         }
         existing.published = true;
+        Ok(AssignmentPublishOutcome::Published)
+    }
+
+    async fn reactivate(
+        &self,
+        assignment: JobAssignment,
+    ) -> CentralResult<AssignmentPublishOutcome> {
+        let (tenant_id, _job_id, assignment_id, _agent_id) = assignment_identity(&assignment);
+        let mut assignments = lock(&self.assignments)?;
+        let existing = assignments
+            .get_mut(&(tenant_id.clone(), assignment_id.clone()))
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::Internal,
+                    format!("assignment {assignment_id} must be reserved before reactivation"),
+                )
+            })?;
+        if existing.assignment != assignment {
+            return Err(invalid(
+                CentralErrorCode::JobIdReused,
+                format!("assignment ID {assignment_id} was reused with another payload"),
+            ));
+        }
+        if existing.published && !existing.retired {
+            return Ok(AssignmentPublishOutcome::AlreadyPublished);
+        }
+        existing.published = true;
+        existing.retired = false;
         Ok(AssignmentPublishOutcome::Published)
     }
 
@@ -242,10 +700,7 @@ impl AssignmentOutbox for InMemoryAssignmentOutbox {
         Ok(lock(&self.assignments)?
             .values()
             .filter(|reservation| reservation.published && !reservation.retired)
-            .filter(|reservation| {
-                let AssignmentOperation::Add { input, .. } = &reservation.assignment.assignment;
-                &input.agent_id == agent_id
-            })
+            .filter(|reservation| assignment_identity(&reservation.assignment).3 == agent_id)
             .take(limit)
             .map(|reservation| reservation.assignment.clone())
             .collect())
@@ -362,55 +817,74 @@ impl MetadataBatchStager for InMemoryMetadataBatchStager {
     }
 }
 
-type ObjectKey = (TenantId, ArtifactId, ObjectId);
+type PlacementReceiptKey = (TenantId, ObjectReceiptId);
 
 #[derive(Debug, Default)]
 pub struct InMemoryObjectCatalog {
-    objects: Mutex<BTreeMap<ObjectKey, DurableObject>>,
-}
-
-impl InMemoryObjectCatalog {
-    fn record_durability_inner(&self, receipt: &ObjectDurabilityReceipt) -> CentralResult<()> {
-        let key = (
-            receipt.tenant_id.clone(),
-            receipt.artifact_id.clone(),
-            receipt.object.object_id,
-        );
-        let mut objects = lock(&self.objects)?;
-        // A later upload attempt cannot revoke an earlier proof for immutable content.
-        if let Some(durable) = durable_from_receipt(receipt)? {
-            if let Some(existing) = objects.get(&key) {
-                if existing != &durable {
-                    return Err(invalid(
-                        CentralErrorCode::MetadataInvalid,
-                        format!(
-                            "object {} has conflicting durability metadata",
-                            receipt.object.object_id
-                        ),
-                    ));
-                }
-            } else {
-                objects.insert(key, durable);
-            }
-        }
-        Ok(())
-    }
+    placements: Mutex<BTreeMap<PlacementReceiptKey, ObjectPlacementEvidence>>,
 }
 
 #[async_trait]
 impl ObjectCatalog for InMemoryObjectCatalog {
-    async fn record_durability(&self, receipt: &ObjectDurabilityReceipt) -> CentralResult<()> {
-        self.record_durability_inner(receipt)
+    async fn record_placement(&self, evidence: &ObjectPlacementEvidence) -> CentralResult<()> {
+        let receipt = &evidence.receipt;
+        let key = (receipt.tenant_id.clone(), receipt.receipt_id.clone());
+        let mut placements = lock(&self.placements)?;
+        if let Some(existing) = placements.get(&key) {
+            return if existing == evidence {
+                Ok(())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::MetadataInvalid,
+                    format!(
+                        "object placement receipt {} has conflicting evidence",
+                        receipt.receipt_id
+                    ),
+                ))
+            };
+        }
+        if placements.values().any(|existing| {
+            existing.receipt.tenant_id == receipt.tenant_id
+                && existing.receipt.artifact_id == receipt.artifact_id
+                && existing.receipt.storage_volume_id == receipt.storage_volume_id
+                && existing.receipt.artifact_placement_id == receipt.artifact_placement_id
+                && existing.placement_generation == evidence.placement_generation
+                && existing.receipt.object_id == receipt.object_id
+                && existing.receipt.size != receipt.size
+        }) {
+            return Err(invalid(
+                CentralErrorCode::MetadataInvalid,
+                format!(
+                    "object {} has conflicting placement sizes",
+                    receipt.object_id
+                ),
+            ));
+        }
+        placements.insert(key, evidence.clone());
+        Ok(())
     }
 
-    async fn durable_object(
+    async fn object_placement(
         &self,
         tenant_id: &TenantId,
         artifact_id: &ArtifactId,
+        storage_volume_id: &StorageVolumeId,
+        artifact_placement_id: &neoengram_protocol::ArtifactPlacementId,
+        placement_generation: PlacementGeneration,
         object_id: ObjectId,
-    ) -> CentralResult<Option<DurableObject>> {
-        Ok(lock(&self.objects)?
-            .get(&(tenant_id.clone(), artifact_id.clone(), object_id))
+    ) -> CentralResult<Option<ObjectPlacementEvidence>> {
+        Ok(lock(&self.placements)?
+            .values()
+            .filter(|evidence| {
+                let receipt = &evidence.receipt;
+                &receipt.tenant_id == tenant_id
+                    && &receipt.artifact_id == artifact_id
+                    && &receipt.storage_volume_id == storage_volume_id
+                    && &receipt.artifact_placement_id == artifact_placement_id
+                    && evidence.placement_generation == placement_generation
+                    && receipt.object_id == object_id
+            })
+            .max_by_key(|evidence| evidence.receipt.verified_at_unix_ms)
             .cloned())
     }
 }
@@ -498,6 +972,40 @@ impl InMemoryIndexPublisher {
 
 #[async_trait]
 impl IndexPublisher for InMemoryIndexPublisher {
+    async fn initialize_snapshot(
+        &self,
+        request: InitializeIndexSnapshotRequest,
+    ) -> CentralResult<WireIndexVersion> {
+        validate_initial_index_snapshot(&request.version, &request.records)?;
+        let records = request
+            .records
+            .into_iter()
+            .map(|record| (record.path.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        let snapshot = IndexSnapshot {
+            version: request.version,
+            records,
+        };
+        let mut state = lock(&self.state)?;
+        if let Some(existing) = state.indexes.get(&request.index_key) {
+            if same_index_version(&existing.version, &snapshot.version)
+                && existing.records == snapshot.records
+            {
+                return Ok(existing.version.clone());
+            }
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                format!(
+                    "Index for Playground {} is already initialized with a different snapshot",
+                    request.index_key.playground_id
+                ),
+            ));
+        }
+        let version = snapshot.version.clone();
+        state.indexes.insert(request.index_key, snapshot);
+        Ok(version)
+    }
+
     async fn compare_and_swap(
         &self,
         request: IndexPublishRequest,
@@ -719,6 +1227,10 @@ impl IndexPublisher for InMemoryIndexPublisher {
             .map(|snapshot| snapshot.version.clone())
             .unwrap_or(empty_snapshot()?.version))
     }
+
+    async fn published_index(&self, key: &IndexKey) -> CentralResult<PublishedIndex> {
+        self.snapshot(key)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -832,6 +1344,7 @@ pub struct InMemoryComponents {
     pub objects: Arc<InMemoryObjectCatalog>,
     pub publisher: Arc<InMemoryIndexPublisher>,
     pub audit: Arc<InMemoryAuditSink>,
+    pub precommits: Arc<InMemoryPreCommitRepository>,
     pub agent_registry: Arc<InMemoryAgentRegistry>,
     pub control_catalog: Arc<crate::InMemoryControlCatalog>,
     pub clock: Arc<InMemoryClock>,
@@ -848,6 +1361,7 @@ impl InMemoryComponents {
             objects: Arc::new(InMemoryObjectCatalog::default()),
             publisher: Arc::new(InMemoryIndexPublisher::default()),
             audit: Arc::new(InMemoryAuditSink::default()),
+            precommits: Arc::new(InMemoryPreCommitRepository::default()),
             agent_registry: Arc::new(InMemoryAgentRegistry::new()),
             control_catalog: Arc::new(crate::InMemoryControlCatalog::default()),
             clock: Arc::new(InMemoryClock::new(now_ms)),
@@ -874,6 +1388,7 @@ impl InMemoryComponents {
             self.audit.clone(),
             AuthorityCapabilities::IN_MEMORY,
         )
+        .with_precommits(self.precommits.clone())
         .with_agent_registry(self.agent_registry.clone())
         .with_control_catalog(self.control_catalog.clone())
     }

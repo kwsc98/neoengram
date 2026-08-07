@@ -5,8 +5,8 @@ mod enrollment;
 mod health;
 mod job;
 mod keyring;
-mod object_store;
 mod system;
+mod workspace_commit;
 
 pub use catalog::CatalogService;
 pub use coordinator::{CoordinatorRun, JobCoordinator};
@@ -15,8 +15,5 @@ pub use enrollment::EnrollmentService;
 pub use health::{HealthService, ReadinessProbe};
 pub use job::JobService;
 pub use keyring::{EnrollmentKeyring, KeyringError};
-pub use object_store::{
-    CentralObjectStoreBackend, FilesystemObjectStore, FilesystemObjectStoreError, StoredObject,
-    MAX_FILESYSTEM_OBJECT_BYTES,
-};
 pub use system::SystemService;
+pub use workspace_commit::{WorkspaceCommitResult, WorkspaceCommitService};

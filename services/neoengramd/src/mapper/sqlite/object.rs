@@ -1,91 +1,148 @@
 use async_trait::async_trait;
 use neoengram_core::ObjectId;
-use neoengram_protocol::{ArtifactId, ObjectDurabilityReceipt, TenantId};
-use sqlx::Row;
+use neoengram_protocol::{ArtifactId, PlacementGeneration, StorageVolumeId, TenantId};
 
 use super::authority::*;
-use crate::{
-    validation::{durable_from_receipt, invalid},
-    *,
-};
+use crate::{validation::invalid, *};
 
 #[async_trait]
 impl ObjectCatalog for SqliteAuthorityStore {
-    async fn record_durability(&self, receipt: &ObjectDurabilityReceipt) -> CentralResult<()> {
-        let Some(durable) = durable_from_receipt(receipt)? else {
-            return Ok(());
-        };
+    async fn record_placement(&self, evidence: &ObjectPlacementEvidence) -> CentralResult<()> {
+        let receipt = &evidence.receipt;
+        if evidence.placement_generation.get() == 0 {
+            return Err(invalid(
+                CentralErrorCode::GenerationMismatch,
+                "object placement generation must be greater than zero",
+            ));
+        }
+        let payload = encode(evidence)?;
         let result = sqlx::query(
-            "INSERT OR IGNORE INTO durable_objects \
-             (tenant_id, artifact_id, object_id, size, verified_digest, storage_version) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO object_placements \
+             (tenant_id, receipt_id, artifact_id, job_id, storage_volume_id, \
+              artifact_placement_id, placement_generation, object_id, size, \
+              verified_at_unix_ms, payload) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM object_placements \
+                 WHERE tenant_id = ? AND artifact_id = ? AND storage_volume_id = ? \
+                   AND artifact_placement_id = ? AND placement_generation = ? \
+                   AND object_id = ? AND size <> ? \
+             )",
         )
         .bind(receipt.tenant_id.as_str())
+        .bind(receipt.receipt_id.as_str())
         .bind(receipt.artifact_id.as_str())
-        .bind(durable.object_id.as_bytes().as_slice())
-        .bind(durable.size.to_string())
-        .bind(durable.verified_digest.as_bytes().as_slice())
-        .bind(&durable.storage_version)
+        .bind(receipt.job_id.as_str())
+        .bind(receipt.storage_volume_id.as_str())
+        .bind(receipt.artifact_placement_id.as_str())
+        .bind(evidence.placement_generation.to_string())
+        .bind(receipt.object_id.as_bytes().as_slice())
+        .bind(receipt.size.to_string())
+        .bind(receipt.verified_at_unix_ms.to_string())
+        .bind(payload)
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.artifact_id.as_str())
+        .bind(receipt.storage_volume_id.as_str())
+        .bind(receipt.artifact_placement_id.as_str())
+        .bind(evidence.placement_generation.to_string())
+        .bind(receipt.object_id.as_bytes().as_slice())
+        .bind(receipt.size.to_string())
         .execute(&self.pool)
         .await
         .map_err(storage_error)?;
         if result.rows_affected() == 1 {
             return Ok(());
         }
-        let existing = self
-            .durable_object(&receipt.tenant_id, &receipt.artifact_id, durable.object_id)
+
+        let existing_payload: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT payload FROM object_placements WHERE tenant_id = ? AND receipt_id = ?",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.receipt_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if let Some(existing_payload) = existing_payload {
+            let existing: ObjectPlacementEvidence = decode(&existing_payload)?;
+            return if &existing == evidence {
+                Ok(())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::MetadataInvalid,
+                    format!(
+                        "object placement receipt {} has conflicting evidence",
+                        receipt.receipt_id
+                    ),
+                ))
+            };
+        }
+        if self
+            .object_placement(
+                &receipt.tenant_id,
+                &receipt.artifact_id,
+                &receipt.storage_volume_id,
+                &receipt.artifact_placement_id,
+                evidence.placement_generation,
+                receipt.object_id,
+            )
             .await?
-            .ok_or_else(|| storage_corruption("conflicting durable object disappeared"))?;
-        if existing == durable {
-            Ok(())
-        } else {
+            .is_some()
+        {
             Err(invalid(
                 CentralErrorCode::MetadataInvalid,
                 format!(
-                    "object {} has conflicting durability metadata",
-                    receipt.object.object_id
+                    "object {} has conflicting placement metadata",
+                    receipt.object_id
                 ),
+            ))
+        } else {
+            Err(storage_corruption(
+                "object placement insert was ignored without a stored conflict",
             ))
         }
     }
 
-    async fn durable_object(
+    async fn object_placement(
         &self,
         tenant_id: &TenantId,
         artifact_id: &ArtifactId,
+        storage_volume_id: &StorageVolumeId,
+        artifact_placement_id: &neoengram_protocol::ArtifactPlacementId,
+        placement_generation: PlacementGeneration,
         object_id: ObjectId,
-    ) -> CentralResult<Option<DurableObject>> {
-        let row = sqlx::query(
-            "SELECT object_id, size, verified_digest, storage_version FROM durable_objects \
-             WHERE tenant_id = ? AND artifact_id = ? AND object_id = ?",
+    ) -> CentralResult<Option<ObjectPlacementEvidence>> {
+        let payload: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT payload FROM object_placements \
+             WHERE tenant_id = ? AND artifact_id = ? AND storage_volume_id = ? \
+               AND artifact_placement_id = ? AND placement_generation = ? AND object_id = ? \
+             ORDER BY rowid DESC LIMIT 1",
         )
         .bind(tenant_id.as_str())
         .bind(artifact_id.as_str())
+        .bind(storage_volume_id.as_str())
+        .bind(artifact_placement_id.as_str())
+        .bind(placement_generation.to_string())
         .bind(object_id.as_bytes().as_slice())
         .fetch_optional(&self.pool)
         .await
         .map_err(storage_error)?;
-        row.map(|row| {
-            let stored_object =
-                object_id_from_blob(row.try_get("object_id").map_err(storage_error)?)?;
-            if stored_object != object_id {
-                return Err(storage_corruption(
-                    "durable object identity differs from query key",
-                ));
-            }
-            Ok(DurableObject {
-                object_id: stored_object,
-                size: parse_canonical_u64(
-                    row.try_get("size").map_err(storage_error)?,
-                    "object size",
-                )?,
-                verified_digest: digest_from_blob(
-                    row.try_get("verified_digest").map_err(storage_error)?,
-                    "verified digest",
-                )?,
-                storage_version: row.try_get("storage_version").map_err(storage_error)?,
+        payload
+            .map(|payload| {
+                let evidence: ObjectPlacementEvidence = decode(&payload)?;
+                let receipt = &evidence.receipt;
+                if &receipt.tenant_id != tenant_id
+                    || &receipt.artifact_id != artifact_id
+                    || &receipt.storage_volume_id != storage_volume_id
+                    || &receipt.artifact_placement_id != artifact_placement_id
+                    || evidence.placement_generation != placement_generation
+                    || receipt.object_id != object_id
+                {
+                    return Err(storage_corruption(
+                        "object placement payload differs from its lookup columns",
+                    ));
+                }
+                Ok(evidence)
             })
-        })
-        .transpose()
+            .transpose()
     }
 }

@@ -18,19 +18,18 @@ use neoengram_core::{
 use neoengram_engine::{AddStatistics, ManagedResource, PreparedAdd};
 use neoengram_protocol::{
     AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
-    AssignmentOperation, ControlEnvelope, ControlMessage, DecimalU64, DurabilityState,
-    EdgeClusterId, Extensions, IndexDeltaRecord, JobState, ManifestRecord, MessageId,
-    MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage, MetadataBatchRecords,
-    MetadataBatchScope, MountGeneration, ObjectDurabilityReceipt, ObjectReceiptId,
-    ObjectReceiptRecord, OwnerGeneration, PlacementGeneration, PlaygroundId, PrincipalId,
-    PrincipalKind, PrincipalRef, ProjectId, SessionGeneration, SessionId, StorageVolumeId,
-    TenantId, UnixMillis, WireChunkRef, WireChunkingStrategy, WireObjectSpec, PROTOCOL_VERSION_V1,
+    AssignmentOperation, ControlEnvelope, ControlMessage, DecimalU64, EdgeClusterId, Extensions,
+    IndexDeltaRecord, JobState, ManifestRecord, MessageId, MetadataBatchDescriptor,
+    MetadataBatchId, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope, MountGeneration,
+    ObjectReceiptId, ObjectReceiptRecord, OwnerGeneration, PlacementGeneration, PlaygroundId,
+    PrincipalId, PrincipalKind, PrincipalRef, ProjectId, SessionGeneration, StorageVolumeId,
+    TenantId, UnixMillis, WireChunkRef, WireChunkingStrategy, PROTOCOL_VERSION_V1,
 };
 use neoengramd::{
     AddJobSpec, AgentReport as CentralReport, AssignJobRequest, AssignmentTarget, ControlPlane,
-    CreateAddJobRequest, FinalizeAddRequest, InMemoryComponents, InMemoryObjectCatalog, IndexKey,
-    IndexPublisher, MetadataBatchSubmission, ObjectCatalog, ReceiveReportRequest,
-    ReceiveReportResult, StageMetadataBatchRequest, StageMetadataBatchResult,
+    CreateAddJobRequest, FinalizeAddRequest, InMemoryComponents, IndexKey, IndexPublisher,
+    MetadataBatchSubmission, ObjectCatalog, ReceiveReportRequest, ReceiveReportResult,
+    StageMetadataBatchRequest, StageMetadataBatchResult,
 };
 
 const NOW: u64 = 1_000;
@@ -85,7 +84,10 @@ async fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries()
         .unwrap();
     let AssignmentOperation::Add {
         input: assignment, ..
-    } = assigned.assignment.assignment;
+    } = assigned.assignment.assignment
+    else {
+        panic!("expected managed Add assignment");
+    };
 
     let metadata = metadata_for(&assignment);
     let ledger = Arc::new(InMemoryLedger::new());
@@ -96,9 +98,8 @@ async fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries()
         tenant_id.clone(),
         target.agent_id.clone(),
     ));
-    let transfer = Arc::new(CentralObjectTransfer::new(
+    let transfer = Arc::new(CentralMetadataTransfer::new(
         control.clone(),
-        central.objects.clone(),
         receipt,
         // The first staging attempt commits two descriptors and then loses its response.
         [Some(2), None],
@@ -179,6 +180,31 @@ async fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries()
         .await
         .unwrap();
     assert_eq!(published.job.state, JobState::Succeeded);
+    let object = metadata.prepared.object_specs[0];
+    let placement = central
+        .objects
+        .object_placement(
+            &tenant_id,
+            &artifact_id,
+            &target.storage_volume_id,
+            &target.artifact_placement_id,
+            target.placement_generation,
+            object.id,
+        )
+        .await
+        .unwrap()
+        .expect("finalize records placement evidence from ObjectReceipt metadata");
+    assert_eq!(placement.receipt.object_id, object.id);
+    assert_eq!(placement.receipt.size.get(), object.size);
+    assert_eq!(
+        placement.receipt.storage_volume_id,
+        target.storage_volume_id
+    );
+    assert_eq!(
+        placement.receipt.artifact_placement_id,
+        target.artifact_placement_id
+    );
+    assert_eq!(placement.placement_generation, target.placement_generation);
 
     let completed = agent
         .handle_decision(&tenant_id, published.decision.clone())
@@ -253,7 +279,10 @@ async fn agent_failure_round_trips_over_wire_into_the_control_plane() {
         .unwrap();
     let AssignmentOperation::Add {
         input: assignment, ..
-    } = assigned.assignment.assignment;
+    } = assigned.assignment.assignment
+    else {
+        panic!("expected managed Add assignment");
+    };
 
     let ledger = Arc::new(InMemoryLedger::new());
     let reports = Arc::new(CentralReportSink::new(control, tenant_id, target.agent_id));
@@ -363,25 +392,22 @@ impl ReportSink for CentralReportSink {
     }
 }
 
-struct CentralObjectTransfer {
+struct CentralMetadataTransfer {
     control: Arc<ControlPlane>,
-    objects: Arc<InMemoryObjectCatalog>,
     inner: FakeObjectTransfer,
     fail_after: Mutex<VecDeque<Option<usize>>>,
     staging_attempts: Mutex<usize>,
     staging_results: Mutex<Vec<StageMetadataBatchResult>>,
 }
 
-impl CentralObjectTransfer {
+impl CentralMetadataTransfer {
     fn new(
         control: Arc<ControlPlane>,
-        objects: Arc<InMemoryObjectCatalog>,
         receipt: TransferReceipt,
         fail_after: impl IntoIterator<Item = Option<usize>>,
     ) -> Self {
         Self {
             control,
-            objects,
             inner: FakeObjectTransfer::new(receipt),
             fail_after: Mutex::new(fail_after.into_iter().collect()),
             staging_attempts: Mutex::new(0),
@@ -412,43 +438,23 @@ impl CentralObjectTransfer {
     }
 }
 
-impl fmt::Debug for CentralObjectTransfer {
+impl fmt::Debug for CentralMetadataTransfer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("CentralObjectTransfer")
+            .debug_struct("CentralMetadataTransfer")
             .finish_non_exhaustive()
     }
 }
 
-impl ObjectTransfer for CentralObjectTransfer {
+impl ObjectTransfer for CentralMetadataTransfer {
     fn transfer(
         &self,
         assignment: &neoengram_protocol::AddAssignment,
         prepared: &PreparedAdd,
     ) -> AgentResult<TransferReceipt> {
-        let receipt = self.inner.transfer(assignment, prepared)?;
-        for object in &prepared.object_specs {
-            block_on(self.objects.record_durability(&ObjectDurabilityReceipt {
-                tenant_id: assignment.tenant_id.clone(),
-                artifact_id: assignment.artifact_id.clone(),
-                session_id: SessionId::new("session-e2e").unwrap(),
-                job_id: assignment.job_id.clone(),
-                object: WireObjectSpec {
-                    object_id: object.id,
-                    size: DecimalU64::new(object.size),
-                    extensions: Extensions::new(),
-                },
-                state: DurabilityState::Durable {
-                    verified_digest: object.id.digest(),
-                    storage_version: "s3-e2e-version".to_owned(),
-                    extensions: Extensions::new(),
-                },
-                checked_at_unix_ms: UnixMillis::new(NOW + 10),
-                extensions: Extensions::new(),
-            }))
-            .map_err(transfer_error)?;
-        }
-        Ok(receipt)
+        // The inner transfer represents local PVC verification. The returned durable receipt is
+        // staged as metadata; object bytes and a separate central durability call are unnecessary.
+        self.inner.transfer(assignment, prepared)
     }
 
     fn stage_metadata(

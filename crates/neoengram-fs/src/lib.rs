@@ -39,7 +39,8 @@ fn rename_error(error: io::Error) -> EngineError {
     }
 }
 
-fn sync_directory(path: &Path) -> Result<(), EngineError> {
+/// Flushes directory metadata on platforms that expose a durable directory sync primitive.
+pub fn sync_directory(path: &Path) -> Result<(), EngineError> {
     #[cfg(unix)]
     {
         File::open(path)
@@ -53,7 +54,9 @@ fn sync_directory(path: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), EngineError> {
+/// Atomically renames `source` to `destination` without replacing an existing entry, then
+/// synchronizes the affected parent directories.
+pub fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), EngineError> {
     #[cfg(any(
         target_vendor = "apple",
         target_os = "linux",

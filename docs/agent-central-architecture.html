@@ -847,7 +847,8 @@
       <div class="summary-lead">
         <p>
           Artifact 是版本化抽象文件系统，Commit 构成版本树；Playground 是读写工作区，Snapshot 是固定
-          Commit 的只读快照。所有命令只进入 neoengramd，跨集群对象只通过 S3 Gateway 传输。
+          Commit 的只读快照。所有控制命令只进入 neoengramd，跨集群对象由获批 Agent/Gateway
+          数据端点直传，Chunk payload 不经过 Server。
         </p>
       </div>
       <dl class="summary-fact">
@@ -989,7 +990,7 @@
           <path class="flow data-flow bi-flow cross-cluster-flow" d="M790 632 H720 V750 H490"></path>
 
           <rect class="cross-cluster-label-bg" x="548" y="705" width="344" height="30" rx="4"></rect>
-          <text class="cross-cluster-label" x="720" y="725" text-anchor="middle">唯一跨集群数据通道 · S3 GET + TransferTicket</text>
+          <text class="cross-cluster-label" x="720" y="725" text-anchor="middle">唯一跨集群数据通道 · Ticket-scoped stream</text>
 
           <path class="flow authority-flow" d="M1060 340 V405 H757 V320"></path>
 
@@ -1101,11 +1102,11 @@
             <text class="node-subtitle" x="360" y="937" text-anchor="middle">Agent root RW · Pod exact dir</text>
           </g>
 
-          <g class="node storage-node" data-node="gateway-a" tabindex="0" role="button" aria-label="EdgeCluster A S3-compatible Gateway">
+          <g class="node storage-node" data-node="gateway-a" tabindex="0" role="button" aria-label="EdgeCluster A Volume Gateway">
             <rect x="230" y="700" width="260" height="100" rx="6"></rect>
-            <text class="node-title" x="360" y="726" text-anchor="middle">S3 Gateway A</text>
+            <text class="node-title" x="360" y="726" text-anchor="middle">Volume Gateway A</text>
             <text class="node-subtitle" x="360" y="748" text-anchor="middle">源对象受控出口</text>
-            <text class="node-subtitle" x="360" y="768" text-anchor="middle">tenant-scoped HEAD / GET</text>
+            <text class="node-subtitle" x="360" y="768" text-anchor="middle">Ticket-scoped object stream</text>
             <text class="node-subtitle" x="360" y="788" text-anchor="middle">Volume A objects-only RO</text>
           </g>
 
@@ -1117,11 +1118,11 @@
             <text class="node-subtitle" x="1080" y="937" text-anchor="middle">Agent root RW · Pod exact dir</text>
           </g>
 
-          <g class="node storage-node" data-node="gateway-b" tabindex="0" role="button" aria-label="EdgeCluster B S3-compatible Gateway">
+          <g class="node storage-node" data-node="gateway-b" tabindex="0" role="button" aria-label="EdgeCluster B Volume Gateway">
             <rect x="950" y="700" width="260" height="100" rx="6"></rect>
-            <text class="node-title" x="1080" y="726" text-anchor="middle">S3 Gateway B</text>
+            <text class="node-title" x="1080" y="726" text-anchor="middle">Volume Gateway B</text>
             <text class="node-subtitle" x="1080" y="748" text-anchor="middle">B 作为源集群时启用</text>
-            <text class="node-subtitle" x="1080" y="768" text-anchor="middle">tenant-scoped HEAD / GET</text>
+            <text class="node-subtitle" x="1080" y="768" text-anchor="middle">Ticket-scoped object stream</text>
             <text class="node-subtitle" x="1080" y="788" text-anchor="middle">Volume B objects-only RO</text>
           </g>
         </svg>
@@ -1299,9 +1300,9 @@
           boundary: "Pod/NFS 路径不成为资源身份；一个 Artifact 在 A 最多一个 active placement，跨 Artifact hardlink 和 NFS 别名 Owner 被禁止。"
         },
         "gateway-a": {
-          title: "EdgeCluster A / S3 Gateway A",
-          tags: ["System component", "Source endpoint", "GET / HEAD", "Objects-only RO"],
-          description: "位于系统组件区，只读挂载中间 NFS Volume A 的 Artifact object roots，并把 Ticket 允许的对象暴露给目标 Agent B。",
+          title: "EdgeCluster A / Volume Gateway A",
+          tags: ["System component", "Source endpoint", "Ticket-scoped stream", "Objects-only RO"],
+          description: "位于系统组件区，只读访问 Volume A 的 Artifact object roots，并把 TransferTicket 允许的对象直传给目标 Agent B。",
           boundary: "不挂载或暴露 Playground、SQLite、锁、journal、secret 或整个 NFS export，也不参与 RW ownership。"
         },
         "storage-b": {
@@ -1311,9 +1312,9 @@
           boundary: "Pod 不能直连 Volume A；改变 Artifact 所在 NFS 必须执行 freeze/copy/verify/CAS/drain 迁移。"
         },
         "gateway-b": {
-          title: "EdgeCluster B / S3 Gateway B",
-          tags: ["System component", "Cluster-local", "GET / HEAD", "Objects-only RO"],
-          description: "位于系统组件区，只读挂载中间 NFS Volume B 的 Artifact object roots；当 B 作为源集群时提供受控对象出口。",
+          title: "EdgeCluster B / Volume Gateway B",
+          tags: ["System component", "Cluster-local", "Ticket-scoped stream", "Objects-only RO"],
+          description: "位于系统组件区，只读访问 Volume B 的 Artifact object roots；当 B 作为源集群时提供受控对象出口。",
           boundary: "Gateway 是集群内只读数据出口，不是 RW Agent，也不是所有集群共享的全局 Gateway。"
         }
       };

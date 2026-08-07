@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 
 mod catalog;
 pub use catalog::*;
+mod commit;
+pub use commit::*;
+mod precommit;
+pub use precommit::*;
+mod playground;
+pub use playground::*;
+mod snapshot;
+pub use snapshot::*;
 
 /// Unknown root-level JSON members retained for forward-compatible digesting.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

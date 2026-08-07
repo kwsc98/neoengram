@@ -34,7 +34,14 @@ import {
   startPlaygroundPreCommit,
 } from '@/api/operations';
 import type { PreCommitView } from '@/api/types';
-import { playgrounds, storageVolumes } from '@/mocks/data';
+import {
+  artifacts,
+  commitGraphs,
+  mockCommitIds,
+  playgrounds,
+  snapshots,
+  storageVolumes,
+} from '@/mocks/data';
 
 async function waitForPreCommitTerminal(
   tenantId: string,
@@ -48,6 +55,30 @@ async function waitForPreCommitTerminal(
 }
 
 describe('tenant-scoped public resource operations', () => {
+  it('keeps every resource-browser Commit identity canonical', () => {
+    const commitIds = [
+      ...Object.values(mockCommitIds),
+      ...artifacts.flatMap((artifact) => [
+        artifact.head_commit_id,
+        artifact.initialization.mode === 'derived'
+          ? artifact.initialization.source_commit_id
+          : undefined,
+      ]),
+      ...[...commitGraphs.values()].flatMap((graph) => [
+        graph.head_commit_id,
+        ...graph.nodes.flatMap((node) => [node.commit_id, node.parent_commit_id]),
+      ]),
+      ...playgrounds.flatMap((playground) => [
+        playground.base_commit_id,
+        playground.head_commit_id,
+      ]),
+      ...snapshots.map((snapshot) => snapshot.commit_id),
+    ].filter((commitId): commitId is string => typeof commitId === 'string');
+
+    expect(commitIds.length).toBeGreaterThan(0);
+    expect(commitIds.every((commitId) => /^[0-9a-f]{64}$/.test(commitId))).toBe(true);
+  });
+
   it('queries authorized tenants and creates a replayable Tenant', async () => {
     const list = await queryTenantList();
     expect(list.data.items.map((tenant) => tenant.tenant_id)).toEqual(['tenant-a', 'tenant-b']);
@@ -65,6 +96,46 @@ describe('tenant-scoped public resource operations', () => {
     await expect(createTenant({ ...request, display_name: '另一租户' })).rejects.toMatchObject({
       status: 409,
       code: 'TENANT_ID_REUSED',
+    });
+  });
+
+  it('creates empty Artifacts without a Project catalog and rejects derived initialization', async () => {
+    const emptyRequest = {
+      tenant_id: 'tenant-a',
+      project_id: 'typed-project-without-catalog',
+      artifact_id: 'authoritative-empty',
+      display_name: '权威空数据集',
+      initialization: { mode: 'empty' as const },
+    };
+    const created = await createArtifact(emptyRequest);
+    expect(created.data).toMatchObject({
+      replayed: false,
+      artifact: {
+        project_id: 'typed-project-without-catalog',
+        artifact_id: 'authoritative-empty',
+        initialization: { mode: 'empty' },
+      },
+    });
+    expect(created.data.artifact).not.toHaveProperty('head_commit_id');
+    expect((await createArtifact(emptyRequest)).data.replayed).toBe(true);
+    await expect(
+      createArtifact({ ...emptyRequest, project_id: 'another-project' }),
+    ).rejects.toMatchObject({ status: 409, code: 'ARTIFACT_ID_REUSED' });
+
+    await expect(
+      createArtifact({
+        ...emptyRequest,
+        artifact_id: 'unsupported-derived',
+        initialization: {
+          mode: 'derived' as const,
+          source_project_id: 'project-vision',
+          source_artifact_id: 'road-scenes',
+          source_commit_id: 'b'.repeat(64),
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: 'ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED',
     });
   });
 
@@ -90,7 +161,10 @@ describe('tenant-scoped public resource operations', () => {
     ]);
     expect(
       (await queryArtifact('tenant-a', 'project-vision', 'road-scenes')).data.artifact,
-    ).toMatchObject({ initialization: { mode: 'empty' }, head_commit_id: 'commit-main-3' });
+    ).toMatchObject({
+      initialization: { mode: 'empty' },
+      head_commit_id: mockCommitIds.roadMain3,
+    });
 
     const playgroundPage = await queryPlaygroundList({ tenant_id: 'tenant-a', page_size: 100 });
     const playground = playgroundPage.data.items[0]!;
@@ -111,7 +185,7 @@ describe('tenant-scoped public resource operations', () => {
       (await querySnapshot(snapshot.tenant_id, snapshot.snapshot_id)).data.snapshot,
     ).toMatchObject({ snapshot_id: snapshot.snapshot_id, commit_id: snapshot.commit_id });
     const regionalCopies = snapshotPage.data.items.filter(
-      (item) => item.artifact_id === 'road-scenes' && item.commit_id === 'commit-main-3',
+      (item) => item.artifact_id === 'road-scenes' && item.commit_id === mockCommitIds.roadMain3,
     );
     expect(regionalCopies).toHaveLength(2);
     expect(new Set(regionalCopies.map((item) => item.region))).toEqual(
@@ -128,7 +202,7 @@ describe('tenant-scoped public resource operations', () => {
         playground_id: 'degraded-placement',
         storage_volume_id: 'volume-shanghai-archive',
         display_name: '不可用放置测试',
-        base_commit_id: 'commit-main-3',
+        base_commit_id: mockCommitIds.roadMain3,
       }),
     ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
 
@@ -137,7 +211,7 @@ describe('tenant-scoped public resource operations', () => {
         tenant_id: 'tenant-a',
         project_id: 'project-vision',
         artifact_id: 'road-scenes',
-        commit_id: 'commit-main-2',
+        commit_id: mockCommitIds.roadMain2,
         storage_volume_id: 'volume-shanghai-archive',
         snapshot_request_id: 'snapshot-degraded-placement',
       }),
@@ -157,7 +231,7 @@ describe('tenant-scoped public resource operations', () => {
         playground_id: 'unavailable-placement',
         storage_volume_id: unavailableVolume.storage_volume_id,
         display_name: '不可用放置测试',
-        base_commit_id: 'commit-main-3',
+        base_commit_id: mockCommitIds.roadMain3,
       }),
     ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
 
@@ -166,11 +240,72 @@ describe('tenant-scoped public resource operations', () => {
         tenant_id: 'tenant-a',
         project_id: 'project-vision',
         artifact_id: 'road-scenes',
-        commit_id: 'commit-main-2',
+        commit_id: mockCommitIds.roadMain2,
         storage_volume_id: unavailableVolume.storage_volume_id,
         snapshot_request_id: 'snapshot-unavailable-placement',
       }),
     ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
+  });
+
+  it('derives a Playground from a selected historical Commit or the current Head', async () => {
+    const artifact = artifacts.find(
+      (item) =>
+        item.tenant_id === 'tenant-a' &&
+        item.project_id === 'project-vision' &&
+        item.artifact_id === 'road-scenes',
+    );
+    if (!artifact) throw new Error('expected mock Artifact');
+    const originalHeadCommitId = artifact.head_commit_id;
+
+    await expect(
+      createPlayground({
+        tenant_id: 'tenant-a',
+        project_id: 'project-vision',
+        artifact_id: 'road-scenes',
+        playground_id: 'unknown-base',
+        storage_volume_id: 'volume-shanghai-vision',
+        display_name: '未知基线',
+        base_commit_id: 'f'.repeat(64),
+      }),
+    ).rejects.toMatchObject({
+      status: 404,
+      code: 'COMMIT_NOT_FOUND',
+    });
+
+    const historical = await createPlayground({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'historical-base',
+      storage_volume_id: 'volume-shanghai-vision',
+      display_name: '历史基线',
+      base_commit_id: mockCommitIds.roadMain2,
+    });
+    expect(historical.data.playground).toMatchObject({
+      base_commit_id: mockCommitIds.roadMain2,
+      head_commit_id: mockCommitIds.roadMain2,
+      index_version: { revision: '18', digest: mockCommitIds.roadMain2 },
+    });
+
+    const inheritedRequest = {
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      playground_id: 'current-head',
+      storage_volume_id: 'volume-shanghai-vision',
+      display_name: '当前基线',
+    };
+    const inherited = await createPlayground(inheritedRequest);
+    expect(inherited.data.playground).toMatchObject({
+      base_commit_id: originalHeadCommitId,
+      head_commit_id: originalHeadCommitId,
+      index_version: { revision: '18', digest: originalHeadCommitId },
+    });
+
+    artifact.head_commit_id = mockCommitIds.roadMain2;
+    const replayed = await createPlayground(inheritedRequest);
+    expect(replayed.data.replayed).toBe(true);
+    expect(replayed.data.playground.base_commit_id).toBe(originalHeadCommitId);
   });
 
   it('rejects Commit when the Playground Head changed after Pre-commit start', async () => {
@@ -198,7 +333,7 @@ describe('tenant-scoped public resource operations', () => {
         item.playground_id === playground.playground_id,
     );
     if (!stored) throw new Error('expected mock Playground');
-    stored.head_commit_id = 'commit-main-2';
+    stored.head_commit_id = mockCommitIds.roadMain2;
 
     await expect(
       commitPlayground({
@@ -216,7 +351,7 @@ describe('tenant-scoped public resource operations', () => {
 
   it('returns a single-parent Commit graph and rejects a cursor bound to another filter', async () => {
     const graph = await queryArtifactCommitGraph('tenant-a', 'project-vision', 'road-scenes');
-    expect(graph.data.graph.head_commit_id).toBe('commit-main-3');
+    expect(graph.data.graph.head_commit_id).toBe(mockCommitIds.roadMain3);
     expect(graph.data.graph.nodes.flatMap((node) => node.tag_names)).toContain(
       'occlusion-experiment',
     );
@@ -227,9 +362,9 @@ describe('tenant-scoped public resource operations', () => {
       'tenant-a',
       'project-vision',
       'road-scenes',
-      'commit-main-3',
+      mockCommitIds.roadMain3,
     );
-    expect(diff.data.diff.base_commit?.commit_id).toBe('commit-main-2');
+    expect(diff.data.diff.base_commit?.commit_id).toBe(mockCommitIds.roadMain2);
     expect(diff.data.diff.base_commit?.description).toContain('质量抽检');
     expect(diff.data.diff.changes.map((change) => change.change_type)).toEqual([
       'modified',
@@ -246,7 +381,7 @@ describe('tenant-scoped public resource operations', () => {
     ).rejects.toMatchObject({ status: 409, code: 'CURSOR_INVALID' });
   });
 
-  it('creates derived Artifacts and regional Snapshots while enforcing Playground readiness', async () => {
+  it('creates empty Artifacts and regional Snapshots while enforcing Playground readiness', async () => {
     const storageRequest = {
       tenant_id: 'tenant-a',
       storage_volume_id: 'volume-test-evaluation',
@@ -272,33 +407,21 @@ describe('tenant-scoped public resource operations', () => {
       project_id: 'project-vision',
       artifact_id: 'evaluation-set',
       display_name: '评测数据集',
-      initialization: {
-        mode: 'derived' as const,
-        source_project_id: 'project-vision',
-        source_artifact_id: 'road-scenes',
-        source_commit_id: 'commit-main-2',
-      },
+      initialization: { mode: 'empty' as const },
     };
     const createdArtifact = await createArtifact(artifactRequest);
     expect(createdArtifact.data.replayed).toBe(false);
-    expect(createdArtifact.data.artifact).toMatchObject({
-      initialization: {
-        mode: 'derived',
-        source_project_id: 'project-vision',
-        source_artifact_id: 'road-scenes',
-        source_commit_id: 'commit-main-2',
-      },
-    });
+    expect(createdArtifact.data.artifact).toMatchObject({ initialization: { mode: 'empty' } });
     expect(createdArtifact.data.artifact).not.toHaveProperty('storage_volume_id');
+    expect(createdArtifact.data.artifact).not.toHaveProperty('head_commit_id');
     expect((await createArtifact(artifactRequest)).data.replayed).toBe(true);
-    const derivedGraph = await queryArtifactCommitGraph(
+    const emptyGraph = await queryArtifactCommitGraph(
       'tenant-a',
       'project-vision',
       'evaluation-set',
     );
-    expect(derivedGraph.data.graph.nodes).toHaveLength(1);
-    expect(derivedGraph.data.graph.nodes[0]?.parent_commit_id).toBeUndefined();
-    expect(derivedGraph.data.graph.nodes[0]?.description).toContain('road-scenes@commit-main-2');
+    expect(emptyGraph.data.graph.nodes).toHaveLength(0);
+    expect(emptyGraph.data.graph.head_commit_id).toBeUndefined();
 
     const playgroundRequest = {
       tenant_id: 'tenant-a',
@@ -307,11 +430,12 @@ describe('tenant-scoped public resource operations', () => {
       playground_id: 'review',
       storage_volume_id: 'volume-guangzhou-delivery',
       display_name: '发布前复核',
-      base_commit_id: derivedGraph.data.graph.nodes[0]!.commit_id,
     };
     const createdPlayground = await createPlayground(playgroundRequest);
     expect(createdPlayground.data.playground.region).toBe('cn-guangzhou');
     expect(createdPlayground.data.playground.state).toBe('creating');
+    expect(createdPlayground.data.playground).not.toHaveProperty('base_commit_id');
+    expect(createdPlayground.data.playground).not.toHaveProperty('head_commit_id');
 
     await expect(
       startPlaygroundPreCommit({
@@ -380,6 +504,7 @@ describe('tenant-scoped public resource operations', () => {
     };
     const committed = await commitPlayground(readyCommitRequest);
     expect(committed.data.replayed).toBe(false);
+    expect(committed.data.commit.commit_id).toMatch(/^[0-9a-f]{64}$/);
     expect(committed.data.commit.description).toContain('初始导入范围');
     expect(committed.data.commit.tag_names).toContain('test-baseline');
     expect(committed.data.consumed_precommit.state).toBe('committed');
@@ -394,7 +519,7 @@ describe('tenant-scoped public resource operations', () => {
       'road-scenes',
       committed.data.commit.commit_id,
     );
-    expect(commitDiff.data.diff.base_commit?.commit_id).toBe('commit-main-3');
+    expect(commitDiff.data.diff.base_commit?.commit_id).toBe(mockCommitIds.roadMain3);
     expect(commitDiff.data.diff.summary.files_added).toBe('1');
 
     const duplicateStarted = await startPlaygroundPreCommit({

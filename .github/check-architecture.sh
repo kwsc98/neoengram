@@ -98,7 +98,7 @@ assert_internal_dependencies neoengram-agentd \
   $'neoengram-agent\nneoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol' ''
 assert_internal_dependencies neoengramd $'neoengram-core\nneoengram-protocol' ''
 assert_internal_dependencies neoengram-server \
-  $'neoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol\nneoengramd' \
+  $'neoengram-core\nneoengram-engine\nneoengram-protocol\nneoengramd' \
   'neoengram-agentd'
 
 assert_no_direct_dependency() {
@@ -244,7 +244,7 @@ controller_routes="$({
     services/neoengram-server/src \
     --glob '**/controller.rs' --glob '**/controller/**' || true
 } | LC_ALL=C sort)"
-expected_controller_routes=$'method = "GET", path = "/health/live"\nmethod = "GET", path = "/health/ready"\nmethod = "POST", path = "/api/job/add/create"\nmethod = "POST", path = "/api/job/add/finalize"\nmethod = "POST", path = "/api/job/query"\nmethod = "POST", path = "/api/playground/create"\nmethod = "POST", path = "/api/playground/list/query"\nmethod = "POST", path = "/api/playground/query"\nmethod = "POST", path = "/api/storage/enrollment/approve"\nmethod = "POST", path = "/api/storage/enrollment/list/query"\nmethod = "POST", path = "/api/storage/enrollment/query"\nmethod = "POST", path = "/api/storage/enrollment/reject"\nmethod = "POST", path = "/api/storage/enrollment/token/create"\nmethod = "POST", path = "/api/storage/volume/create"\nmethod = "POST", path = "/api/storage/volume/list/query"\nmethod = "POST", path = "/api/storage/volume/query"\nmethod = "POST", path = "/api/system/version/query"\nmethod = "POST", path = "/api/tenant/create"\nmethod = "POST", path = "/api/tenant/list/query"\nmethod = "POST", path = "/api/tenant/query"'
+expected_controller_routes=$'method = "GET", path = "/health/live"\nmethod = "GET", path = "/health/ready"\nmethod = "POST", path = "/api/artifact/commit/graph/query"\nmethod = "POST", path = "/api/artifact/create"\nmethod = "POST", path = "/api/artifact/list/query"\nmethod = "POST", path = "/api/artifact/query"\nmethod = "POST", path = "/api/job/add/create"\nmethod = "POST", path = "/api/job/add/finalize"\nmethod = "POST", path = "/api/job/query"\nmethod = "POST", path = "/api/playground/change/list/query"\nmethod = "POST", path = "/api/playground/commit/create"\nmethod = "POST", path = "/api/playground/create"\nmethod = "POST", path = "/api/playground/dataset/profile/query"\nmethod = "POST", path = "/api/playground/file/list/query"\nmethod = "POST", path = "/api/playground/file/metadata/query"\nmethod = "POST", path = "/api/playground/list/query"\nmethod = "POST", path = "/api/playground/precommit/cancel"\nmethod = "POST", path = "/api/playground/precommit/query"\nmethod = "POST", path = "/api/playground/precommit/restart"\nmethod = "POST", path = "/api/playground/precommit/start"\nmethod = "POST", path = "/api/playground/query"\nmethod = "POST", path = "/api/snapshot/create"\nmethod = "POST", path = "/api/snapshot/list/query"\nmethod = "POST", path = "/api/snapshot/query"\nmethod = "POST", path = "/api/storage/enrollment/approve"\nmethod = "POST", path = "/api/storage/enrollment/list/query"\nmethod = "POST", path = "/api/storage/enrollment/query"\nmethod = "POST", path = "/api/storage/enrollment/reject"\nmethod = "POST", path = "/api/storage/enrollment/token/create"\nmethod = "POST", path = "/api/storage/volume/create"\nmethod = "POST", path = "/api/storage/volume/list/query"\nmethod = "POST", path = "/api/storage/volume/query"\nmethod = "POST", path = "/api/system/version/query"\nmethod = "POST", path = "/api/tenant/create"\nmethod = "POST", path = "/api/tenant/list/query"\nmethod = "POST", path = "/api/tenant/query"'
 if [[ "$controller_routes" != "$expected_controller_routes" ]]; then
   echo "$controller_routes" >&2
   fail "neoengram-server must register exactly the approved public HTTP routes"
@@ -258,7 +258,8 @@ rg -q '^x-neoengram-body-security-schemes:$' "$agent_openapi" || \
 for security_scheme in \
   BootstrapTokenAndEd25519 \
   InstallationEd25519 \
-  ApprovedAgentEd25519; do
+  ApprovedAgentEd25519 \
+  ApprovedAgentEd25519PerFrame; do
   rg -q "^  ${security_scheme}:$" "$agent_openapi" || \
     fail "Agent OpenAPI is missing body-carried security scheme ${security_scheme}"
 done
@@ -267,28 +268,28 @@ agent_paths=(
   /agent/enrollment/bootstrap
   /agent/enrollment/status/query
   /agent/session/open
+  /agent/session/channel/open
   /agent/session/heartbeat/report
   /agent/session/message/list/query
   /agent/job/report/create
   /agent/job/metadata/batch/stage
   /agent/job/metadata/page/stage
   /agent/job/index/page/query
-  /agent/job/object/missing/query
-  /agent/job/object/upload
+  /agent/job/manifest/page/query
   /agent/session/close
 )
 agent_path_constants=(
   AGENT_ENROLLMENT_BOOTSTRAP_PATH
   AGENT_ENROLLMENT_STATUS_QUERY_PATH
   AGENT_SESSION_OPEN_PATH
+  AGENT_SESSION_CHANNEL_OPEN_PATH
   AGENT_SESSION_HEARTBEAT_REPORT_PATH
   AGENT_SESSION_MESSAGE_LIST_QUERY_PATH
   AGENT_JOB_REPORT_CREATE_PATH
   AGENT_JOB_METADATA_BATCH_STAGE_PATH
   AGENT_JOB_METADATA_PAGE_STAGE_PATH
   AGENT_JOB_INDEX_PAGE_QUERY_PATH
-  AGENT_JOB_OBJECT_MISSING_QUERY_PATH
-  AGENT_JOB_OBJECT_UPLOAD_PATH
+  AGENT_JOB_MANIFEST_PAGE_QUERY_PATH
   AGENT_SESSION_CLOSE_PATH
 )
 for index in "${!agent_paths[@]}"; do
@@ -315,9 +316,41 @@ done
 [[ "$(rg -c '^      x-neoengram-body-security:' "$agent_openapi")" == \
   "${#agent_paths[@]}" ]] || \
   fail "every Agent OpenAPI action must name its body-carried security scheme"
+[[ "$(rg -c '^      requestBody:' "$agent_openapi")" == "${#agent_paths[@]}" ]] || \
+  fail "every Agent OpenAPI action must carry its request, including identities, in the body"
 if rg -n '^  /.*[{}].*:$|^    (get|put|patch|delete):' "$agent_openapi"; then
   fail "Agent OpenAPI must not use path parameters or non-POST methods"
 fi
+if rg -n '^ +parameters:$|^ +in: (path|query|header|cookie)$' "$agent_openapi"; then
+  fail "Agent OpenAPI must not carry identities or action input outside the request body"
+fi
+[[ "$(rg -c '^      x-neoengram-http2-duplex:$' "$agent_openapi")" == "1" ]] || \
+  fail "Agent OpenAPI must define exactly one HTTP/2 full-duplex channel action"
+for channel_contract_line in \
+  '        transport: http2-full-duplex' \
+  '        primaryControlTransport: true' \
+  '        mediaType: application/x-ndjson' \
+  '        h2DataFrameBoundaries: ignored' \
+  '        frameDelimiter: LF' \
+  '        maxFrameBytes: 1048576' \
+  '        delimiterExcludedFromFrameBytes: true' \
+  '        finalFrameRequiresDelimiter: true' \
+  '        firstUpstreamFrameType: channel.open' \
+  '        firstDownstreamFrameType: channel.opened' \
+  '        upstreamAuthentication: body-carried-ed25519-proof-per-frame'; do
+  rg -Fq "$channel_contract_line" "$agent_openapi" || \
+    fail "Agent channel contract is missing: ${channel_contract_line#        }"
+done
+[[ "$(rg -c '^ +application/x-ndjson:$' "$agent_openapi")" == "2" ]] || \
+  fail "Agent channel request and response must both use application/x-ndjson"
+[[ "$(rg -c '^      x-neoengram-compatibility-only: true$' "$agent_openapi")" == "1" ]] || \
+  fail "the legacy message-list query must remain compatibility-only"
+rg -Fq "pub const MAX_AGENT_CHANNEL_FRAME_BYTES: usize = MAX_CONTROL_MESSAGE_BYTES;" \
+  crates/neoengram-protocol/src/agent_api.rs || \
+  fail "Agent protocol must cap channel frames at the control-message limit"
+rg -Fq "pub const MAX_CONTROL_MESSAGE_BYTES: usize = 1024 * 1024;" \
+  crates/neoengram-protocol/src/lib.rs || \
+  fail "Agent channel frame limit must remain exactly 1 MiB"
 if rg -n '/v1/agents|/agents/\{' \
   crates/neoengram-protocol/src/agent_api.rs \
   services/neoengram-agentd/src \

@@ -1,31 +1,42 @@
 use async_trait::async_trait;
 use neoengram_core::ContentDigest;
 use neoengram_protocol::{
-    ArtifactId, EdgeClusterId, IndexRevision, PlaygroundId, ProjectId, StorageVolumeId, TenantId,
-    UnixMillis, WireIndexVersion,
+    ArtifactId, EdgeClusterId, PlaygroundId, ProjectId, RequestId, SnapshotId, StorageVolumeId,
+    TenantId, UnixMillis,
 };
 use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite, Transaction};
 
 use crate::{
-    AgentRegistryRecord, CatalogInsertOutcome, CatalogNfsReference, CatalogPvcReference,
-    CentralError, CentralErrorCode, CentralResult, ControlCatalogRepository, DerivedVolumeState,
-    PlaygroundListCursor, PlaygroundListPage, PlaygroundListRequest, PlaygroundRecord,
-    PlaygroundState, StorageAccessMode, StorageBackendType, StorageEnrollmentAccessMode,
-    StorageVolumeListCursor, StorageVolumeListPage, StorageVolumeListRequest, StorageVolumeRecord,
-    StorageVolumeState, TenantListCursor, TenantListPage, TenantListRequest, TenantRecord,
+    AdvancePlaygroundCommitOutcome, AdvancePlaygroundCommitRequest, AgentRegistryRecord,
+    ArtifactHeadExpectation, ArtifactInitialization, ArtifactListCursor, ArtifactListPage,
+    ArtifactListRequest, ArtifactRecord, CatalogInsertOutcome, CatalogNfsReference,
+    CatalogPvcReference, CentralError, CentralErrorCode, CentralResult, ControlCatalogRepository,
+    DerivedVolumeState, PlaygroundInsertRequest, PlaygroundListCursor, PlaygroundListPage,
+    PlaygroundListRequest, PlaygroundRecord, PlaygroundState, SnapshotInsertOutcome,
+    SnapshotInsertRequest, SnapshotListCursor, SnapshotListPage, SnapshotListRequest,
+    SnapshotPhase, SnapshotRecord, SnapshotState, StorageAccessMode, StorageBackendType,
+    StorageEnrollmentAccessMode, StorageVolumeListCursor, StorageVolumeListPage,
+    StorageVolumeListRequest, StorageVolumeRecord, StorageVolumeState, TenantListCursor,
+    TenantListPage, TenantListRequest, TenantRecord,
 };
 
 use super::agent_registry::SqliteAgentRegistryStore;
 
 const TENANT_COLUMNS: &str =
     "tenant_id, display_name, description, resource_version, created_at_unix_ms, updated_at_unix_ms";
+const ARTIFACT_COLUMNS: &str = "tenant_id, project_id, artifact_id, display_name, description, \
+    initialization_mode, source_project_id, source_artifact_id, source_commit_digest, \
+    head_commit_digest, resource_version, created_at_unix_ms, updated_at_unix_ms";
 const VOLUME_COLUMNS: &str =
     "tenant_id, storage_volume_id, display_name, edge_cluster_id, region, \
     backend_type, access_mode, pvc_namespace, pvc_claim_name, nfs_server, nfs_export_path, state, \
     resource_version, created_at_unix_ms, updated_at_unix_ms";
 const PLAYGROUND_COLUMNS: &str = "tenant_id, project_id, artifact_id, playground_id, \
     storage_volume_id, region, display_name, base_commit_digest, head_commit_digest, \
-    index_revision, index_digest, state, relative_root, created_at_unix_ms, updated_at_unix_ms";
+    state, relative_root, created_at_unix_ms, updated_at_unix_ms";
+const SNAPSHOT_COLUMNS: &str = "tenant_id, project_id, artifact_id, snapshot_id, \
+    snapshot_request_id, commit_digest, storage_volume_id, region, state, phase, relative_root, \
+    created_at_unix_ms, updated_at_unix_ms";
 
 #[async_trait]
 impl ControlCatalogRepository for SqliteAgentRegistryStore {
@@ -132,6 +143,176 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 } else {
                     Err(id_reused(
                         "Tenant ID is already bound to another create request",
+                    ))
+                }
+            }
+            Err(error) => Err(storage_error(error)),
+        }
+    }
+
+    async fn get_artifact(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        artifact_id: &ArtifactId,
+    ) -> CentralResult<Option<ArtifactRecord>> {
+        let sql = format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ?"
+        );
+        sqlx::query(&sql)
+            .bind(tenant_id.as_str())
+            .bind(project_id.as_str())
+            .bind(artifact_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_error)?
+            .map(decode_artifact)
+            .transpose()
+    }
+
+    async fn list_artifacts(
+        &self,
+        request: &ArtifactListRequest,
+    ) -> CentralResult<ArtifactListPage> {
+        validate_limit(request.limit)?;
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records WHERE tenant_id = "
+        ));
+        query.push_bind(request.tenant_id.as_str());
+        if let Some(project_id) = &request.project_id {
+            query
+                .push(" AND project_id = ")
+                .push_bind(project_id.as_str());
+        }
+        if let Some(search) = &request.query {
+            let pattern = format!("%{}%", escape_like(&search.to_lowercase()));
+            query
+                .push(" AND (LOWER(artifact_id) LIKE ")
+                .push_bind(pattern.clone())
+                .push(" ESCAPE '\\' OR LOWER(display_name) LIKE ")
+                .push_bind(pattern)
+                .push(" ESCAPE '\\')");
+        }
+        if let Some(after) = &request.after {
+            let created = as_i64(after.created_at_unix_ms)?;
+            query
+                .push(" AND (created_at_unix_ms < ")
+                .push_bind(created)
+                .push(" OR (created_at_unix_ms = ")
+                .push_bind(created)
+                .push(" AND (project_id > ")
+                .push_bind(after.project_id.as_str())
+                .push(" OR (project_id = ")
+                .push_bind(after.project_id.as_str())
+                .push(" AND artifact_id > ")
+                .push_bind(after.artifact_id.as_str())
+                .push("))))");
+        }
+        query
+            .push(" ORDER BY created_at_unix_ms DESC, project_id ASC, artifact_id ASC LIMIT ")
+            .push_bind(i64::from(request.limit) + 1);
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        artifact_page(rows, request.limit)
+    }
+
+    async fn insert_artifact(
+        &self,
+        record: ArtifactRecord,
+    ) -> CentralResult<CatalogInsertOutcome<ArtifactRecord>> {
+        if let Some(existing) =
+            get_artifact_by_id(self, &record.tenant_id, &record.artifact_id).await?
+        {
+            return if artifact_create_matches(&existing, &record) {
+                Ok(CatalogInsertOutcome::Existing(existing))
+            } else {
+                Err(id_reused(
+                    "Artifact ID is already bound to another create request",
+                ))
+            };
+        }
+        if self.get_tenant(&record.tenant_id).await?.is_none() {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "Artifact Tenant does not exist",
+            )
+            .with_retryable(false));
+        }
+        if let ArtifactInitialization::Derived {
+            source_project_id,
+            source_artifact_id,
+            ..
+        } = &record.initialization
+        {
+            if self
+                .get_artifact(&record.tenant_id, source_project_id, source_artifact_id)
+                .await?
+                .is_none()
+            {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "Artifact initialization source does not exist",
+                )
+                .with_retryable(false));
+            }
+        }
+        let (mode, source_project_id, source_artifact_id, source_commit_digest) =
+            match &record.initialization {
+                ArtifactInitialization::Empty => ("empty", None, None, None),
+                ArtifactInitialization::Derived {
+                    source_project_id,
+                    source_artifact_id,
+                    source_commit_id,
+                } => (
+                    "derived",
+                    Some(source_project_id.as_str()),
+                    Some(source_artifact_id.as_str()),
+                    Some(source_commit_id.as_bytes().as_slice()),
+                ),
+            };
+        let result = sqlx::query(
+            "INSERT INTO artifact_catalog_records \
+             (tenant_id, project_id, artifact_id, display_name, description, initialization_mode, \
+              source_project_id, source_artifact_id, source_commit_digest, head_commit_digest, \
+              resource_version, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.tenant_id.as_str())
+        .bind(record.project_id.as_str())
+        .bind(record.artifact_id.as_str())
+        .bind(&record.display_name)
+        .bind(&record.description)
+        .bind(mode)
+        .bind(source_project_id)
+        .bind(source_artifact_id)
+        .bind(source_commit_digest)
+        .bind(
+            record
+                .head_commit_id
+                .map(|digest| digest.as_bytes().to_vec()),
+        )
+        .bind(record.resource_version.to_string())
+        .bind(as_i64(record.created_at_unix_ms)?)
+        .bind(as_i64(record.updated_at_unix_ms)?)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(CatalogInsertOutcome::Inserted(record)),
+            Err(error) if is_unique(&error) => {
+                let existing = get_artifact_by_id(self, &record.tenant_id, &record.artifact_id)
+                    .await?
+                    .ok_or_else(|| {
+                        storage_error("Artifact uniqueness conflict could not be resolved")
+                    })?;
+                if artifact_create_matches(&existing, &record) {
+                    Ok(CatalogInsertOutcome::Existing(existing))
+                } else {
+                    Err(id_reused(
+                        "Artifact ID is already bound to another create request",
                     ))
                 }
             }
@@ -378,33 +559,111 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         playground_page(rows, request.limit)
     }
 
-    async fn insert_playground(
+    async fn insert_playground_fenced(
         &self,
-        record: PlaygroundRecord,
+        request: PlaygroundInsertRequest,
     ) -> CentralResult<CatalogInsertOutcome<PlaygroundRecord>> {
-        if let Some(existing) = self
-            .get_playground(
-                &record.tenant_id,
-                &record.project_id,
-                &record.artifact_id,
-                &record.playground_id,
-            )
-            .await?
-        {
-            return if playground_create_matches(&existing, &record) {
-                Ok(CatalogInsertOutcome::Existing(existing))
-            } else {
-                Err(id_reused(
+        let PlaygroundInsertRequest {
+            record,
+            artifact_head,
+        } = request;
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let playground_sql = format!(
+            "SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ?"
+        );
+        let existing = sqlx::query(&playground_sql)
+            .bind(record.tenant_id.as_str())
+            .bind(record.project_id.as_str())
+            .bind(record.artifact_id.as_str())
+            .bind(record.playground_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_playground)
+            .transpose()?;
+        if let Some(existing) = existing {
+            if !playground_create_matches_insert(&existing, &record, &artifact_head) {
+                return Err(id_reused(
                     "Playground ID is already bound to another create request",
-                ))
-            };
+                ));
+            }
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(CatalogInsertOutcome::Existing(existing));
+        }
+        let artifact_sql = format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ?"
+        );
+        let artifact = sqlx::query(&artifact_sql)
+            .bind(record.tenant_id.as_str())
+            .bind(record.project_id.as_str())
+            .bind(record.artifact_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_artifact)
+            .transpose()?
+            .ok_or_else(|| {
+                catalog_parent_error(
+                    CentralErrorCode::ArtifactNotFound,
+                    "Playground Artifact does not exist",
+                )
+            })?;
+        if record.base_commit_id != record.head_commit_id {
+            return Err(catalog_parent_error(
+                CentralErrorCode::ArtifactHeadMismatch,
+                "Playground base Commit must match its initial head Commit",
+            ));
+        }
+        if let ArtifactHeadExpectation::Exact(expected) = artifact_head {
+            if record.base_commit_id != expected {
+                return Err(CentralError::new(
+                    CentralErrorCode::ProtocolInvalid,
+                    "fenced Playground base Commit does not match the observed Artifact Head",
+                )
+                .with_retryable(false));
+            }
+            if artifact.head_commit_id != expected {
+                return Err(artifact_head_changed());
+            }
+        }
+        let volume_sql = format!(
+            "SELECT {VOLUME_COLUMNS} FROM storage_volume_catalog_records \
+             WHERE tenant_id = ? AND storage_volume_id = ?"
+        );
+        let volume = sqlx::query(&volume_sql)
+            .bind(record.tenant_id.as_str())
+            .bind(record.storage_volume_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_volume)
+            .transpose()?
+            .ok_or_else(|| {
+                catalog_parent_error(
+                    CentralErrorCode::StorageVolumeNotFound,
+                    "Playground StorageVolume does not exist",
+                )
+            })?;
+        if volume.state != StorageVolumeState::Ready {
+            return Err(catalog_parent_error(
+                CentralErrorCode::StorageVolumeNotReady,
+                "Playground StorageVolume is not ready",
+            ));
+        }
+        if record.region != volume.region {
+            return Err(catalog_parent_error(
+                CentralErrorCode::StorageVolumeRegionMismatch,
+                "Playground region must match the StorageVolume region",
+            ));
         }
         let result = sqlx::query(
             "INSERT INTO playground_catalog_records \
              (tenant_id, project_id, artifact_id, playground_id, storage_volume_id, region, \
-              display_name, base_commit_digest, head_commit_digest, index_revision, index_digest, \
+              display_name, base_commit_digest, head_commit_digest, \
               state, relative_root, created_at_unix_ms, updated_at_unix_ms) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.tenant_id.as_str())
         .bind(record.project_id.as_str())
@@ -423,29 +682,33 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 .head_commit_id
                 .map(|digest| digest.as_bytes().to_vec()),
         )
-        .bind(record.index_version.revision.get().to_string())
-        .bind(record.index_version.digest.as_bytes().as_slice())
         .bind(playground_state_name(record.state))
         .bind(&record.relative_root)
         .bind(as_i64(record.created_at_unix_ms)?)
         .bind(as_i64(record.updated_at_unix_ms)?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await;
         match result {
-            Ok(_) => Ok(CatalogInsertOutcome::Inserted(record)),
+            Ok(_) => {
+                transaction.commit().await.map_err(storage_error)?;
+                Ok(CatalogInsertOutcome::Inserted(record))
+            }
             Err(error) if is_unique(&error) => {
-                let existing = self
-                    .get_playground(
-                        &record.tenant_id,
-                        &record.project_id,
-                        &record.artifact_id,
-                        &record.playground_id,
-                    )
-                    .await?
+                let existing = sqlx::query(&playground_sql)
+                    .bind(record.tenant_id.as_str())
+                    .bind(record.project_id.as_str())
+                    .bind(record.artifact_id.as_str())
+                    .bind(record.playground_id.as_str())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?
+                    .map(decode_playground)
+                    .transpose()?
                     .ok_or_else(|| {
                         storage_error("Playground uniqueness conflict could not be resolved")
                     })?;
-                if playground_create_matches(&existing, &record) {
+                if playground_create_matches_insert(&existing, &record, &artifact_head) {
+                    transaction.commit().await.map_err(storage_error)?;
                     Ok(CatalogInsertOutcome::Existing(existing))
                 } else {
                     Err(id_reused(
@@ -456,6 +719,500 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             Err(error) => Err(storage_error(error)),
         }
     }
+
+    async fn transition_playground_state(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        artifact_id: &ArtifactId,
+        playground_id: &PlaygroundId,
+        expected: PlaygroundState,
+        next: PlaygroundState,
+        updated_at_unix_ms: UnixMillis,
+    ) -> CentralResult<PlaygroundRecord> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let update = sqlx::query(
+            "UPDATE playground_catalog_records SET state = ?, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ? \
+               AND state = ?",
+        )
+        .bind(playground_state_name(next))
+        .bind(as_i64(updated_at_unix_ms)?)
+        .bind(tenant_id.as_str())
+        .bind(project_id.as_str())
+        .bind(artifact_id.as_str())
+        .bind(playground_id.as_str())
+        .bind(playground_state_name(expected))
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+
+        let select = format!(
+            "SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ?"
+        );
+        let record = sqlx::query(&select)
+            .bind(tenant_id.as_str())
+            .bind(project_id.as_str())
+            .bind(artifact_id.as_str())
+            .bind(playground_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_playground)
+            .transpose()?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ArtifactNotFound,
+                    "Playground does not exist",
+                )
+                .with_retryable(false)
+            })?;
+        if update.rows_affected() == 0 && record.state != next {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                format!(
+                    "Playground is in {:?}, expected {:?} for state transition",
+                    record.state, expected
+                ),
+            ));
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(record)
+    }
+
+    async fn advance_playground_commit(
+        &self,
+        request: AdvancePlaygroundCommitRequest,
+    ) -> CentralResult<AdvancePlaygroundCommitOutcome> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let artifact_sql = format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ?"
+        );
+        let mut artifact = sqlx::query(&artifact_sql)
+            .bind(request.tenant_id.as_str())
+            .bind(request.project_id.as_str())
+            .bind(request.artifact_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_artifact)
+            .transpose()?
+            .ok_or_else(|| {
+                catalog_parent_error(
+                    CentralErrorCode::ArtifactNotFound,
+                    "Commit Artifact does not exist",
+                )
+            })?;
+        let playground_sql = format!(
+            "SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ?"
+        );
+        let mut playground = sqlx::query(&playground_sql)
+            .bind(request.tenant_id.as_str())
+            .bind(request.project_id.as_str())
+            .bind(request.artifact_id.as_str())
+            .bind(request.playground_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_playground)
+            .transpose()?
+            .ok_or_else(|| {
+                catalog_parent_error(
+                    CentralErrorCode::ArtifactNotFound,
+                    "Commit Playground does not exist",
+                )
+            })?;
+        if artifact.head_commit_id == Some(request.commit_id)
+            && playground.head_commit_id == Some(request.commit_id)
+        {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(AdvancePlaygroundCommitOutcome {
+                artifact,
+                playground,
+                replayed: true,
+            });
+        }
+        if artifact.head_commit_id != request.expected_head_commit_id
+            || playground.head_commit_id != request.expected_head_commit_id
+        {
+            return Err(catalog_parent_error(
+                CentralErrorCode::ArtifactHeadMismatch,
+                "Artifact or Playground Head changed after Pre-commit",
+            ));
+        }
+        if playground.state != PlaygroundState::Ready {
+            return Err(catalog_parent_error(
+                CentralErrorCode::InvalidState,
+                "only a Ready Playground can publish a Commit",
+            ));
+        }
+        let next_resource_version = artifact.resource_version.checked_add(1).ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "Artifact ResourceVersion is exhausted",
+            )
+        })?;
+        let expected_digest = request
+            .expected_head_commit_id
+            .map(|digest| digest.as_bytes().to_vec());
+        let commit_digest = request.commit_id.as_bytes().to_vec();
+        let artifact_update = sqlx::query(
+            "UPDATE artifact_catalog_records \
+             SET head_commit_digest = ?, resource_version = ?, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? \
+               AND ((head_commit_digest IS NULL AND ? IS NULL) OR head_commit_digest = ?)",
+        )
+        .bind(&commit_digest)
+        .bind(next_resource_version.to_string())
+        .bind(as_i64(request.updated_at_unix_ms)?)
+        .bind(request.tenant_id.as_str())
+        .bind(request.project_id.as_str())
+        .bind(request.artifact_id.as_str())
+        .bind(expected_digest.clone())
+        .bind(expected_digest.clone())
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if artifact_update.rows_affected() != 1 {
+            return Err(catalog_parent_error(
+                CentralErrorCode::ArtifactHeadMismatch,
+                "Artifact Head changed during Commit publication",
+            ));
+        }
+        let playground_update = sqlx::query(
+            "UPDATE playground_catalog_records \
+             SET head_commit_digest = ?, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ? \
+               AND ((head_commit_digest IS NULL AND ? IS NULL) OR head_commit_digest = ?)",
+        )
+        .bind(&commit_digest)
+        .bind(as_i64(request.updated_at_unix_ms)?)
+        .bind(request.tenant_id.as_str())
+        .bind(request.project_id.as_str())
+        .bind(request.artifact_id.as_str())
+        .bind(request.playground_id.as_str())
+        .bind(expected_digest.clone())
+        .bind(expected_digest)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if playground_update.rows_affected() != 1 {
+            return Err(catalog_parent_error(
+                CentralErrorCode::ArtifactHeadMismatch,
+                "Playground Head changed during Commit publication",
+            ));
+        }
+        artifact.head_commit_id = Some(request.commit_id);
+        artifact.resource_version = next_resource_version;
+        artifact.updated_at_unix_ms = request.updated_at_unix_ms;
+        playground.head_commit_id = Some(request.commit_id);
+        playground.updated_at_unix_ms = request.updated_at_unix_ms;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(AdvancePlaygroundCommitOutcome {
+            artifact,
+            playground,
+            replayed: false,
+        })
+    }
+
+    async fn get_snapshot(
+        &self,
+        tenant_id: &TenantId,
+        snapshot_id: &SnapshotId,
+    ) -> CentralResult<Option<SnapshotRecord>> {
+        let sql = format!(
+            "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records \
+             WHERE tenant_id = ? AND snapshot_id = ?"
+        );
+        sqlx::query(&sql)
+            .bind(tenant_id.as_str())
+            .bind(snapshot_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_error)?
+            .map(decode_snapshot)
+            .transpose()
+    }
+
+    async fn list_snapshots(
+        &self,
+        request: &SnapshotListRequest,
+    ) -> CentralResult<SnapshotListPage> {
+        validate_limit(request.limit)?;
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records WHERE tenant_id = "
+        ));
+        query.push_bind(request.tenant_id.as_str());
+        if let Some(project_id) = &request.project_id {
+            query
+                .push(" AND project_id = ")
+                .push_bind(project_id.as_str());
+        }
+        if let Some(artifact_id) = &request.artifact_id {
+            query
+                .push(" AND artifact_id = ")
+                .push_bind(artifact_id.as_str());
+        }
+        if let Some(commit_id) = &request.commit_id {
+            query
+                .push(" AND commit_digest = ")
+                .push_bind(commit_id.as_bytes().as_slice());
+        }
+        if let Some(volume_id) = &request.storage_volume_id {
+            query
+                .push(" AND storage_volume_id = ")
+                .push_bind(volume_id.as_str());
+        }
+        if let Some(region) = &request.region {
+            query.push(" AND region = ").push_bind(region);
+        }
+        if let Some(state) = request.state {
+            query
+                .push(" AND state = ")
+                .push_bind(snapshot_state_name(state));
+        }
+        if let Some(after) = &request.after {
+            let created = as_i64(after.created_at_unix_ms)?;
+            query
+                .push(" AND (created_at_unix_ms < ")
+                .push_bind(created)
+                .push(" OR (created_at_unix_ms = ")
+                .push_bind(created)
+                .push(" AND snapshot_id > ")
+                .push_bind(after.snapshot_id.as_str())
+                .push("))");
+        }
+        query
+            .push(" ORDER BY created_at_unix_ms DESC, snapshot_id ASC LIMIT ")
+            .push_bind(i64::from(request.limit) + 1);
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        snapshot_page(rows, request.limit)
+    }
+
+    async fn insert_snapshot_fenced(
+        &self,
+        request: SnapshotInsertRequest,
+    ) -> CentralResult<SnapshotInsertOutcome> {
+        let SnapshotInsertRequest {
+            record,
+            artifact_head,
+        } = request;
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let request_sql = format!(
+            "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records \
+             WHERE tenant_id = ? AND snapshot_request_id = ?"
+        );
+        if let Some(existing) = sqlx::query(&request_sql)
+            .bind(record.tenant_id.as_str())
+            .bind(record.snapshot_request_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_snapshot)
+            .transpose()?
+        {
+            if !snapshot_request_matches(&existing, &record) {
+                return Err(id_reused(
+                    "Snapshot request ID is already bound to another create request",
+                ));
+            }
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(SnapshotInsertOutcome::ExistingRequest(existing));
+        }
+        let placement_sql = format!(
+            "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? \
+               AND commit_digest = ? AND storage_volume_id = ?"
+        );
+        if let Some(existing) = sqlx::query(&placement_sql)
+            .bind(record.tenant_id.as_str())
+            .bind(record.project_id.as_str())
+            .bind(record.artifact_id.as_str())
+            .bind(record.commit_id.as_bytes().as_slice())
+            .bind(record.storage_volume_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_snapshot)
+            .transpose()?
+        {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(SnapshotInsertOutcome::ExistingPlacement(existing));
+        }
+        let artifact_sql = format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ?"
+        );
+        let artifact = sqlx::query(&artifact_sql)
+            .bind(record.tenant_id.as_str())
+            .bind(record.project_id.as_str())
+            .bind(record.artifact_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_artifact)
+            .transpose()?
+            .ok_or_else(|| {
+                catalog_parent_error(
+                    CentralErrorCode::ArtifactNotFound,
+                    "Snapshot Artifact does not exist",
+                )
+            })?;
+        if let ArtifactHeadExpectation::Exact(expected) = artifact_head {
+            if expected != Some(record.commit_id) {
+                return Err(CentralError::new(
+                    CentralErrorCode::ProtocolInvalid,
+                    "fenced Snapshot Commit does not match the observed Artifact Head",
+                )
+                .with_retryable(false));
+            }
+            if artifact.head_commit_id != expected {
+                return Err(artifact_head_changed());
+            }
+        }
+        let volume_sql = format!(
+            "SELECT {VOLUME_COLUMNS} FROM storage_volume_catalog_records \
+             WHERE tenant_id = ? AND storage_volume_id = ?"
+        );
+        let volume = sqlx::query(&volume_sql)
+            .bind(record.tenant_id.as_str())
+            .bind(record.storage_volume_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_volume)
+            .transpose()?
+            .ok_or_else(|| {
+                catalog_parent_error(
+                    CentralErrorCode::StorageVolumeNotFound,
+                    "Snapshot StorageVolume does not exist",
+                )
+            })?;
+        if volume.state != StorageVolumeState::Ready {
+            return Err(catalog_parent_error(
+                CentralErrorCode::StorageVolumeNotReady,
+                "Snapshot StorageVolume is not ready",
+            ));
+        }
+        if record.region != volume.region {
+            return Err(catalog_parent_error(
+                CentralErrorCode::StorageVolumeRegionMismatch,
+                "Snapshot region must match the StorageVolume region",
+            ));
+        }
+        let result = sqlx::query(
+            "INSERT INTO snapshot_catalog_records \
+             (tenant_id, project_id, artifact_id, snapshot_id, snapshot_request_id, commit_digest, \
+              storage_volume_id, region, state, phase, relative_root, created_at_unix_ms, \
+              updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.tenant_id.as_str())
+        .bind(record.project_id.as_str())
+        .bind(record.artifact_id.as_str())
+        .bind(record.snapshot_id.as_str())
+        .bind(record.snapshot_request_id.as_str())
+        .bind(record.commit_id.as_bytes().as_slice())
+        .bind(record.storage_volume_id.as_str())
+        .bind(&record.region)
+        .bind(snapshot_state_name(record.state))
+        .bind(snapshot_phase_name(record.phase))
+        .bind(&record.relative_root)
+        .bind(as_i64(record.created_at_unix_ms)?)
+        .bind(as_i64(record.updated_at_unix_ms)?)
+        .execute(&mut *transaction)
+        .await;
+        match result {
+            Ok(_) => {
+                transaction.commit().await.map_err(storage_error)?;
+                Ok(SnapshotInsertOutcome::Inserted(record))
+            }
+            Err(error) if is_unique(&error) => Err(id_reused(
+                "Snapshot identity changed during concurrent creation",
+            )),
+            Err(error) => Err(storage_error(error)),
+        }
+    }
+
+    async fn transition_snapshot_state(
+        &self,
+        tenant_id: &TenantId,
+        snapshot_id: &SnapshotId,
+        expected_state: SnapshotState,
+        next_state: SnapshotState,
+        next_phase: SnapshotPhase,
+        updated_at_unix_ms: UnixMillis,
+    ) -> CentralResult<SnapshotRecord> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let update = sqlx::query(
+            "UPDATE snapshot_catalog_records SET state = ?, phase = ?, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND snapshot_id = ? AND state = ?",
+        )
+        .bind(snapshot_state_name(next_state))
+        .bind(snapshot_phase_name(next_phase))
+        .bind(as_i64(updated_at_unix_ms)?)
+        .bind(tenant_id.as_str())
+        .bind(snapshot_id.as_str())
+        .bind(snapshot_state_name(expected_state))
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let select = format!(
+            "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records \
+             WHERE tenant_id = ? AND snapshot_id = ?"
+        );
+        let record = sqlx::query(&select)
+            .bind(tenant_id.as_str())
+            .bind(snapshot_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_snapshot)
+            .transpose()?
+            .ok_or_else(|| {
+                catalog_parent_error(
+                    CentralErrorCode::ArtifactNotFound,
+                    "Snapshot does not exist",
+                )
+            })?;
+        if update.rows_affected() == 0 && (record.state != next_state || record.phase != next_phase)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                format!(
+                    "Snapshot is in {:?}, expected {:?} for state transition",
+                    record.state, expected_state
+                ),
+            ));
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(record)
+    }
+}
+
+async fn get_artifact_by_id(
+    store: &SqliteAgentRegistryStore,
+    tenant_id: &TenantId,
+    artifact_id: &ArtifactId,
+) -> CentralResult<Option<ArtifactRecord>> {
+    let sql = format!(
+        "SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records \
+         WHERE tenant_id = ? AND artifact_id = ?"
+    );
+    sqlx::query(&sql)
+        .bind(tenant_id.as_str())
+        .bind(artifact_id.as_str())
+        .fetch_optional(&store.pool)
+        .await
+        .map_err(storage_error)?
+        .map(decode_artifact)
+        .transpose()
 }
 
 /// Keeps enrollment approval and the public Volume authority in the same SQLite transaction.
@@ -630,6 +1387,26 @@ fn tenant_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<TenantListPage
     Ok(TenantListPage { records, next })
 }
 
+fn artifact_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<ArtifactListPage> {
+    let mut records = rows
+        .into_iter()
+        .map(decode_artifact)
+        .collect::<CentralResult<Vec<_>>>()?;
+    let has_more = records.len() > usize::from(limit);
+    records.truncate(usize::from(limit));
+    let next = has_more.then(|| {
+        let last = records
+            .last()
+            .expect("a non-zero page with more rows has a cursor");
+        ArtifactListCursor {
+            created_at_unix_ms: last.created_at_unix_ms,
+            project_id: last.project_id.clone(),
+            artifact_id: last.artifact_id.clone(),
+        }
+    });
+    Ok(ArtifactListPage { records, next })
+}
+
 fn volume_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<StorageVolumeListPage> {
     let mut records = rows
         .into_iter()
@@ -670,6 +1447,25 @@ fn playground_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<Playground
     Ok(PlaygroundListPage { records, next })
 }
 
+fn snapshot_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<SnapshotListPage> {
+    let mut records = rows
+        .into_iter()
+        .map(decode_snapshot)
+        .collect::<CentralResult<Vec<_>>>()?;
+    let has_more = records.len() > usize::from(limit);
+    records.truncate(usize::from(limit));
+    let next = has_more.then(|| {
+        let last = records
+            .last()
+            .expect("a non-zero page with more rows has a cursor");
+        SnapshotListCursor {
+            created_at_unix_ms: last.created_at_unix_ms,
+            snapshot_id: last.snapshot_id.clone(),
+        }
+    });
+    Ok(SnapshotListPage { records, next })
+}
+
 fn decode_tenant(row: SqliteRow) -> CentralResult<TenantRecord> {
     Ok(TenantRecord {
         tenant_id: TenantId::new(
@@ -682,6 +1478,59 @@ fn decode_tenant(row: SqliteRow) -> CentralResult<TenantRecord> {
         resource_version: parse_u64(
             row.try_get("resource_version").map_err(storage_error)?,
             "Tenant resource version",
+        )?,
+        created_at_unix_ms: unix_ms(row.try_get("created_at_unix_ms").map_err(storage_error)?)?,
+        updated_at_unix_ms: unix_ms(row.try_get("updated_at_unix_ms").map_err(storage_error)?)?,
+    })
+}
+
+fn decode_artifact(row: SqliteRow) -> CentralResult<ArtifactRecord> {
+    let mode: String = row.try_get("initialization_mode").map_err(storage_error)?;
+    let source_project_id: Option<String> =
+        row.try_get("source_project_id").map_err(storage_error)?;
+    let source_artifact_id: Option<String> =
+        row.try_get("source_artifact_id").map_err(storage_error)?;
+    let source_commit_digest: Option<Vec<u8>> =
+        row.try_get("source_commit_digest").map_err(storage_error)?;
+    let initialization = match (
+        mode.as_str(),
+        source_project_id,
+        source_artifact_id,
+        source_commit_digest,
+    ) {
+        ("empty", None, None, None) => ArtifactInitialization::Empty,
+        ("derived", Some(project_id), Some(artifact_id), Some(commit_digest)) => {
+            ArtifactInitialization::Derived {
+                source_project_id: parse_id(project_id, ProjectId::new)?,
+                source_artifact_id: parse_id(artifact_id, ArtifactId::new)?,
+                source_commit_id: exact_digest(commit_digest, "source Commit digest")?,
+            }
+        }
+        _ => return Err(corruption("stored Artifact initialization is invalid")),
+    };
+    Ok(ArtifactRecord {
+        tenant_id: parse_id(
+            row.try_get("tenant_id").map_err(storage_error)?,
+            TenantId::new,
+        )?,
+        project_id: parse_id(
+            row.try_get("project_id").map_err(storage_error)?,
+            ProjectId::new,
+        )?,
+        artifact_id: parse_id(
+            row.try_get("artifact_id").map_err(storage_error)?,
+            ArtifactId::new,
+        )?,
+        display_name: row.try_get("display_name").map_err(storage_error)?,
+        description: row.try_get("description").map_err(storage_error)?,
+        initialization,
+        head_commit_id: optional_digest(
+            row.try_get("head_commit_digest").map_err(storage_error)?,
+            "head Commit digest",
+        )?,
+        resource_version: parse_u64(
+            row.try_get("resource_version").map_err(storage_error)?,
+            "Artifact resource version",
         )?,
         created_at_unix_ms: unix_ms(row.try_get("created_at_unix_ms").map_err(storage_error)?)?,
         updated_at_unix_ms: unix_ms(row.try_get("updated_at_unix_ms").map_err(storage_error)?)?,
@@ -743,10 +1592,6 @@ fn decode_volume(row: SqliteRow) -> CentralResult<StorageVolumeRecord> {
 }
 
 fn decode_playground(row: SqliteRow) -> CentralResult<PlaygroundRecord> {
-    let digest = exact_digest(
-        row.try_get("index_digest").map_err(storage_error)?,
-        "Index digest",
-    )?;
     Ok(PlaygroundRecord {
         tenant_id: parse_id(
             row.try_get("tenant_id").map_err(storage_error)?,
@@ -778,15 +1623,46 @@ fn decode_playground(row: SqliteRow) -> CentralResult<PlaygroundRecord> {
             row.try_get("head_commit_digest").map_err(storage_error)?,
             "head Commit digest",
         )?,
-        index_version: WireIndexVersion {
-            revision: IndexRevision::new(parse_u64(
-                row.try_get("index_revision").map_err(storage_error)?,
-                "Index revision",
-            )?),
-            digest,
-            extensions: Default::default(),
-        },
         state: parse_playground_state(row.try_get("state").map_err(storage_error)?)?,
+        relative_root: row.try_get("relative_root").map_err(storage_error)?,
+        created_at_unix_ms: unix_ms(row.try_get("created_at_unix_ms").map_err(storage_error)?)?,
+        updated_at_unix_ms: unix_ms(row.try_get("updated_at_unix_ms").map_err(storage_error)?)?,
+    })
+}
+
+fn decode_snapshot(row: SqliteRow) -> CentralResult<SnapshotRecord> {
+    Ok(SnapshotRecord {
+        tenant_id: parse_id(
+            row.try_get("tenant_id").map_err(storage_error)?,
+            TenantId::new,
+        )?,
+        project_id: parse_id(
+            row.try_get("project_id").map_err(storage_error)?,
+            ProjectId::new,
+        )?,
+        artifact_id: parse_id(
+            row.try_get("artifact_id").map_err(storage_error)?,
+            ArtifactId::new,
+        )?,
+        snapshot_id: parse_id(
+            row.try_get("snapshot_id").map_err(storage_error)?,
+            SnapshotId::new,
+        )?,
+        snapshot_request_id: parse_id(
+            row.try_get("snapshot_request_id").map_err(storage_error)?,
+            RequestId::new,
+        )?,
+        commit_id: exact_digest(
+            row.try_get("commit_digest").map_err(storage_error)?,
+            "Snapshot Commit digest",
+        )?,
+        storage_volume_id: parse_id(
+            row.try_get("storage_volume_id").map_err(storage_error)?,
+            StorageVolumeId::new,
+        )?,
+        region: row.try_get("region").map_err(storage_error)?,
+        state: parse_snapshot_state(row.try_get("state").map_err(storage_error)?)?,
+        phase: parse_snapshot_phase(row.try_get("phase").map_err(storage_error)?)?,
         relative_root: row.try_get("relative_root").map_err(storage_error)?,
         created_at_unix_ms: unix_ms(row.try_get("created_at_unix_ms").map_err(storage_error)?)?,
         updated_at_unix_ms: unix_ms(row.try_get("updated_at_unix_ms").map_err(storage_error)?)?,
@@ -823,6 +1699,15 @@ fn tenant_create_matches(left: &TenantRecord, right: &TenantRecord) -> bool {
         && left.description == right.description
 }
 
+fn artifact_create_matches(left: &ArtifactRecord, right: &ArtifactRecord) -> bool {
+    left.tenant_id == right.tenant_id
+        && left.project_id == right.project_id
+        && left.artifact_id == right.artifact_id
+        && left.display_name == right.display_name
+        && left.description == right.description
+        && left.initialization == right.initialization
+}
+
 fn volume_create_matches(left: &StorageVolumeRecord, right: &StorageVolumeRecord) -> bool {
     left.tenant_id == right.tenant_id
         && left.storage_volume_id == right.storage_volume_id
@@ -835,15 +1720,38 @@ fn volume_create_matches(left: &StorageVolumeRecord, right: &StorageVolumeRecord
         && left.nfs_reference == right.nfs_reference
 }
 
-fn playground_create_matches(left: &PlaygroundRecord, right: &PlaygroundRecord) -> bool {
-    left.tenant_id == right.tenant_id
-        && left.project_id == right.project_id
-        && left.artifact_id == right.artifact_id
-        && left.playground_id == right.playground_id
-        && left.storage_volume_id == right.storage_volume_id
-        && left.display_name == right.display_name
-        && left.base_commit_id == right.base_commit_id
-        && left.relative_root == right.relative_root
+fn playground_create_matches_insert(
+    existing: &PlaygroundRecord,
+    requested: &PlaygroundRecord,
+    artifact_head: &ArtifactHeadExpectation,
+) -> bool {
+    let commit_selection_matches = match artifact_head {
+        ArtifactHeadExpectation::Any => {
+            existing.base_commit_id == requested.base_commit_id
+                && existing.head_commit_id == requested.head_commit_id
+        }
+        ArtifactHeadExpectation::Exact(_) => true,
+    };
+    existing.tenant_id == requested.tenant_id
+        && existing.project_id == requested.project_id
+        && existing.artifact_id == requested.artifact_id
+        && existing.playground_id == requested.playground_id
+        && existing.storage_volume_id == requested.storage_volume_id
+        && existing.region == requested.region
+        && existing.display_name == requested.display_name
+        && existing.relative_root == requested.relative_root
+        && commit_selection_matches
+}
+
+fn snapshot_request_matches(existing: &SnapshotRecord, requested: &SnapshotRecord) -> bool {
+    existing.tenant_id == requested.tenant_id
+        && existing.project_id == requested.project_id
+        && existing.artifact_id == requested.artifact_id
+        && existing.snapshot_request_id == requested.snapshot_request_id
+        && existing.commit_id == requested.commit_id
+        && existing.storage_volume_id == requested.storage_volume_id
+        && existing.region == requested.region
+        && existing.relative_root == requested.relative_root
 }
 
 fn validate_limit(limit: u16) -> CentralResult<()> {
@@ -931,6 +1839,42 @@ fn parse_playground_state(value: String) -> CentralResult<PlaygroundState> {
     }
 }
 
+fn snapshot_state_name(value: SnapshotState) -> &'static str {
+    match value {
+        SnapshotState::Creating => "creating",
+        SnapshotState::Ready => "ready",
+        SnapshotState::Abnormal => "abnormal",
+    }
+}
+
+fn parse_snapshot_state(value: String) -> CentralResult<SnapshotState> {
+    match value.as_str() {
+        "creating" => Ok(SnapshotState::Creating),
+        "ready" => Ok(SnapshotState::Ready),
+        "abnormal" => Ok(SnapshotState::Abnormal),
+        _ => Err(corruption("stored Snapshot state is invalid")),
+    }
+}
+
+fn snapshot_phase_name(value: SnapshotPhase) -> &'static str {
+    match value {
+        SnapshotPhase::Planning => "planning",
+        SnapshotPhase::Materializing => "materializing",
+        SnapshotPhase::Verifying => "verifying",
+        SnapshotPhase::Idle => "idle",
+    }
+}
+
+fn parse_snapshot_phase(value: String) -> CentralResult<SnapshotPhase> {
+    match value.as_str() {
+        "planning" => Ok(SnapshotPhase::Planning),
+        "materializing" => Ok(SnapshotPhase::Materializing),
+        "verifying" => Ok(SnapshotPhase::Verifying),
+        "idle" => Ok(SnapshotPhase::Idle),
+        _ => Err(corruption("stored Snapshot phase is invalid")),
+    }
+}
+
 fn parse_u64(value: String, field: &str) -> CentralResult<u64> {
     if value.is_empty()
         || (value.len() > 1 && value.starts_with('0'))
@@ -980,6 +1924,18 @@ fn is_unique(error: &sqlx::Error) -> bool {
 
 fn id_reused(message: &'static str) -> CentralError {
     CentralError::new(CentralErrorCode::InvalidState, message).with_retryable(false)
+}
+
+fn catalog_parent_error(code: CentralErrorCode, message: &'static str) -> CentralError {
+    CentralError::new(code, message).with_retryable(false)
+}
+
+fn artifact_head_changed() -> CentralError {
+    CentralError::new(
+        CentralErrorCode::ArtifactHeadMismatch,
+        "Artifact Head changed before Playground creation",
+    )
+    .with_retryable(true)
 }
 
 fn storage_error(error: impl std::fmt::Display) -> CentralError {

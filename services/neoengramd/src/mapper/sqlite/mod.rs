@@ -7,3 +7,4 @@ mod job;
 mod metadata;
 mod object;
 mod outbox;
+mod precommit;

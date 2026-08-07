@@ -808,10 +808,18 @@ pub enum Permission {
     StorageEnrollmentRead,
     #[serde(rename = "storage.enrollment.review")]
     StorageEnrollmentReview,
+    #[serde(rename = "artifact.read")]
+    ArtifactRead,
+    #[serde(rename = "artifact.create")]
+    ArtifactCreate,
     #[serde(rename = "playground.read")]
     PlaygroundRead,
     #[serde(rename = "playground.create")]
     PlaygroundCreate,
+    #[serde(rename = "snapshot.read")]
+    SnapshotRead,
+    #[serde(rename = "snapshot.create")]
+    SnapshotCreate,
 }
 
 impl Permission {
@@ -828,8 +836,12 @@ impl Permission {
             Self::StorageEnrollmentCreate => "storage.enrollment.create",
             Self::StorageEnrollmentRead => "storage.enrollment.read",
             Self::StorageEnrollmentReview => "storage.enrollment.review",
+            Self::ArtifactRead => "artifact.read",
+            Self::ArtifactCreate => "artifact.create",
             Self::PlaygroundRead => "playground.read",
             Self::PlaygroundCreate => "playground.create",
+            Self::SnapshotRead => "snapshot.read",
+            Self::SnapshotCreate => "snapshot.create",
         }
     }
 }
@@ -1035,6 +1047,19 @@ impl Authorizer for StaticRbacPolicy {
         {
             // Agent transport authenticates the signed session and exact assignment scope before
             // entering the control plane. RBAC has no principal binding for Agent identities.
+            return Ok(());
+        }
+        if matches!(request.actor, Actor::Principal(ref principal)
+            if principal.kind == PrincipalKind::System
+                && principal.id.as_str() == "precommit-scanner")
+            && matches!(
+                request.action,
+                Action::CreateAddJob | Action::AssignJob | Action::ExpireAddJob
+            )
+        {
+            // The public start/restart operation has already passed Tenant-scoped RBAC before
+            // this fixed identity is persisted. Durable continuation cannot depend on later RBAC
+            // edits or on the initiating user still being present.
             return Ok(());
         }
         let Actor::Principal(principal) = &request.actor else {

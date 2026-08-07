@@ -7,17 +7,19 @@ use std::{
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use neoengram_agentd::{
-    check_health, load_persisted_identity, run_with, run_with_transports, AgentConfig,
-    AgentDaemonResult, FilesystemMountObservation, HealthMode, LoggingConfig, LoggingFormat,
-    MountProbe, MountProbeCondition, PvcReference, RegistrationConfig, ReqwestAgentSessionClient,
-    ReqwestEnrollmentClient, SessionConfig, StorageAccessMode, StorageBackendType, StorageConfig,
+    check_health, has_pending_outbound_reports, load_persisted_identity, run_with,
+    run_with_transports, AgentConfig, AgentDaemonResult, FilesystemMountObservation, HealthMode,
+    LoggingConfig, LoggingFormat, MountProbe, MountProbeCondition, PvcReference,
+    RegistrationConfig, ReqwestAgentSessionClient, ReqwestEnrollmentClient, SessionConfig,
+    StorageAccessMode, StorageBackendType, StorageConfig,
 };
 use neoengram_core::ObjectId;
 use neoengram_protocol::{
-    AgentEnrollmentTokenId, AgentMountIdentityDigest, ContentDigest, EdgeClusterId,
+    AgentEnrollmentTokenId, AgentMountIdentityDigest, ContentDigest, EdgeClusterId, JobId,
     MountAccessMode, ResourceHealth, StorageVolumeId, TenantId, VolumeMarkerId,
 };
 use neoengram_server::{AppState, Config as ServerConfig};
+use neoengramd::{open_sqlite_authority, JobKey, PreCommitId, PreCommitKey, SqliteAuthorityConfig};
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -58,6 +60,13 @@ async fn real_agentd_enrolls_over_both_listeners_and_restarts_without_token() {
     let agent_root = TempDir::new().unwrap();
     let state_dir = agent_root.path().join("state");
     let token_path = agent_root.path().join("bootstrap-token");
+    let mount_path = agent_root.path().join("volume");
+    std::fs::create_dir(&mount_path).unwrap();
+    std::fs::write(
+        mount_path.join(".neoengram-volume-marker"),
+        format!("{VOLUME_ID}\n"),
+    )
+    .unwrap();
     std::fs::write(&token_path, bootstrap_token).unwrap();
     let agent_config = agent_config(
         agent_root.path(),
@@ -128,24 +137,25 @@ async fn real_agentd_enrolls_over_both_listeners_and_restarts_without_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn real_agentd_scans_uploads_and_publishes_over_http() {
+async fn real_agentd_scans_volume_cas_and_publishes_over_h2() {
     const PROJECT_ID: &str = "project-agentd-e2e";
     const ARTIFACT_ID: &str = "artifact-agentd-e2e";
     const PLAYGROUND_ID: &str = "playground-agentd-e2e";
+    const DERIVED_PLAYGROUND_ID: &str = "playground-agentd-derived";
     const JOB_ID: &str = "job-agentd-e2e";
     const RESTART_JOB_ID: &str = "job-agentd-e2e-after-restart";
     const SERVER_RESTART_JOB_ID: &str = "job-agentd-e2e-after-server-restart";
     const FILE_CONTENT: &[u8] = b"real Agent vertical slice\n";
     const RESTART_FILE_CONTENT: &[u8] = b"real Agent payload after restart\n";
     const SERVER_RESTART_FILE_CONTENT: &[u8] = b"real payload after authority reopen\n";
+    const PRECOMMIT_FILE_CONTENT: &[u8] = b"real workspace payload committed through Pre-commit\n";
+    const SECOND_COMMIT_FILE_CONTENT: &[u8] =
+        b"real workspace payload modified after the first Commit\n";
 
     let authority = TempDir::new().unwrap();
     let keyring_path = authority.path().join("enrollment-keyring.json");
     write_keyring(&keyring_path);
-    let object_store_root = authority.path().join("central-objects");
-    let mut server_config =
-        development_server_config(authority.path().join("authority"), keyring_path);
-    server_config.object_store_root = Some(object_store_root.clone());
+    let server_config = development_server_config(authority.path().join("authority"), keyring_path);
     let state = AppState::initialize(&server_config).await.unwrap();
     let public_server = state.start_server(&server_config).await.unwrap();
     let public_addr = public_server.local_addr();
@@ -171,6 +181,7 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
     );
     let state_dir = prepared.config.storage.state_dir.clone();
     let mount_path = prepared.config.storage.mount_path.clone();
+    let volume_object_root = mount_path.join(".neoengram/objects");
     let token_path = prepared.token_path.clone();
     let mut agent_config = prepared.config.clone();
     let agent_probe = prepared.probe.clone();
@@ -197,6 +208,21 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
     wait_for_volume_ready(&client, public_addr, VOLUME_ID).await;
     check_health(&state_dir, HealthMode::Ready).unwrap();
 
+    let created_artifact = post_public(
+        &client,
+        public_addr,
+        "/api/artifact/create",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "display_name": "Agentd vertical artifact",
+            "initialization": { "mode": "empty" }
+        }),
+    )
+    .await;
+    assert_eq!(created_artifact["artifact"]["head_commit_id"], Value::Null);
+
     let created_playground = post_public(
         &client,
         public_addr,
@@ -211,7 +237,11 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
         }),
     )
     .await;
-    let initial_index = created_playground["playground"]["index_version"].clone();
+    assert_eq!(created_playground["playground"]["state"], "creating");
+    let ready_playground =
+        wait_for_playground_ready(&client, public_addr, PROJECT_ID, ARTIFACT_ID, PLAYGROUND_ID)
+            .await;
+    let initial_index = ready_playground["index_version"].clone();
     assert_eq!(initial_index["revision"], "0");
 
     let playground_path = mount_path
@@ -219,7 +249,7 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
         .join(PROJECT_ID)
         .join(ARTIFACT_ID)
         .join(PLAYGROUND_ID);
-    std::fs::create_dir_all(&playground_path).unwrap();
+    assert!(playground_path.is_dir());
     std::fs::write(playground_path.join("observed.txt"), FILE_CONTENT).unwrap();
 
     let created_job = post_public(
@@ -245,12 +275,14 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
     assert_eq!(succeeded["decision"]["outcome"], "publish");
 
     let object_id = ObjectId::for_bytes(FILE_CONTENT);
-    let object_path = object_store_root
+    let object_path = volume_object_root
         .join("tenants/tenant-a/artifacts")
         .join(ARTIFACT_ID)
         .join("objects")
         .join(object_id.to_hex());
     assert_eq!(std::fs::read(&object_path).unwrap(), FILE_CONTENT);
+    assert_no_chunk_payload_files(authority.path());
+    assert_no_chunk_payload_files(&state_dir);
 
     let published_playground = post_public(
         &client,
@@ -269,6 +301,7 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
     assert_ne!(published_index["digest"], initial_index["digest"]);
 
     stop_agent(agent_shutdown, agent_task).await;
+    assert_agent_outbound_empty(&state_dir);
     std::fs::remove_file(&token_path).unwrap();
     let (restart_shutdown, restart_task) =
         spawn_full_agent(agent_config.clone(), agent_probe.clone());
@@ -301,7 +334,7 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
     wait_for_job_succeeded(&client, public_addr, RESTART_JOB_ID).await;
 
     let restart_object_id = ObjectId::for_bytes(RESTART_FILE_CONTENT);
-    let restart_object_path = object_store_root
+    let restart_object_path = volume_object_root
         .join("tenants/tenant-a/artifacts")
         .join(ARTIFACT_ID)
         .join("objects")
@@ -328,6 +361,7 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
     assert!(!token_path.exists());
 
     stop_agent(restart_shutdown, restart_task).await;
+    assert_agent_outbound_empty(&state_dir);
     public_server.shutdown().await.unwrap();
     state.close().await;
 
@@ -373,7 +407,7 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
     wait_for_job_succeeded(&client, restarted_public_addr, SERVER_RESTART_JOB_ID).await;
 
     let server_restart_object_id = ObjectId::for_bytes(SERVER_RESTART_FILE_CONTENT);
-    let server_restart_object_path = object_store_root
+    let server_restart_object_path = volume_object_root
         .join("tenants/tenant-a/artifacts")
         .join(ARTIFACT_ID)
         .join("objects")
@@ -399,9 +433,379 @@ async fn real_agentd_scans_uploads_and_publishes_over_http() {
     assert_ne!(server_restarted_index["digest"], restarted_index["digest"]);
     assert!(!token_path.exists());
 
+    std::fs::write(
+        playground_path.join("commit-candidate.txt"),
+        PRECOMMIT_FILE_CONTENT,
+    )
+    .unwrap();
+    let started_precommit = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/precommit/start",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID,
+            "precommit_request_id": "precommit-request-agentd-e2e",
+            "expected_index_version": server_restarted_index.clone()
+        }),
+    )
+    .await;
+    assert_eq!(started_precommit["precommit"]["state"], "running");
+    assert_eq!(started_precommit["replayed"], false);
+    let precommit_id = started_precommit["precommit"]["precommit_id"]
+        .as_str()
+        .expect("Pre-commit response omitted precommit_id")
+        .to_owned();
+    let ready_precommit =
+        wait_for_precommit_ready(&client, restarted_public_addr, precommit_id.as_str()).await;
+    assert_eq!(ready_precommit["phase"], "idle");
+    assert_eq!(ready_precommit["blockers"], json!([]));
+    let candidate_index = ready_precommit["candidate_index_version"].clone();
+    assert_eq!(candidate_index["revision"], "4");
+    assert_ne!(candidate_index["digest"], server_restarted_index["digest"]);
+
+    let precommit_object_id = ObjectId::for_bytes(PRECOMMIT_FILE_CONTENT);
+    let precommit_object_path = volume_object_root
+        .join("tenants/tenant-a/artifacts")
+        .join(ARTIFACT_ID)
+        .join("objects")
+        .join(precommit_object_id.to_hex());
+    assert_eq!(
+        std::fs::read(precommit_object_path).unwrap(),
+        PRECOMMIT_FILE_CONTENT
+    );
+
+    let commit_request = json!({
+        "tenant_id": "tenant-a",
+        "project_id": PROJECT_ID,
+        "artifact_id": ARTIFACT_ID,
+        "playground_id": PLAYGROUND_ID,
+        "commit_request_id": "commit-request-agentd-e2e",
+        "precommit_id": precommit_id,
+        "expected_candidate_index_version": candidate_index,
+        "message": "Commit the real Agent workspace",
+        "description": "Created by the real Server-Agent vertical slice",
+        "tag_names": ["agentd-e2e"]
+    });
+    let committed = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/commit/create",
+        &commit_request,
+    )
+    .await;
+    assert_eq!(committed["replayed"], false);
+    assert_eq!(committed["commit"]["parent_commit_id"], Value::Null);
+    assert_eq!(committed["consumed_precommit"]["state"], "committed");
+    assert_eq!(
+        committed["consumed_precommit"]["candidate_index_version"],
+        commit_request["expected_candidate_index_version"]
+    );
+    let commit_id = committed["commit"]["commit_id"]
+        .as_str()
+        .expect("Commit response omitted commit_id")
+        .to_owned();
+    assert_eq!(
+        committed["consumed_precommit"]["committed_commit_id"],
+        commit_id
+    );
+    assert_eq!(committed["playground"]["head_commit_id"], commit_id);
+    assert_eq!(committed["playground"]["active_precommit_id"], Value::Null);
+
+    let committed_artifact = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/artifact/query",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID
+        }),
+    )
+    .await;
+    let committed_playground = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/query",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID
+        }),
+    )
+    .await;
+    assert_eq!(committed_artifact["artifact"]["head_commit_id"], commit_id);
+    assert_eq!(
+        committed_playground["playground"]["head_commit_id"],
+        commit_id
+    );
+    assert_eq!(
+        committed_playground["playground"]["index_version"],
+        commit_request["expected_candidate_index_version"]
+    );
+    assert_eq!(
+        committed_playground["playground"]["active_precommit_id"],
+        Value::Null
+    );
+
+    let commit_replay = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/commit/create",
+        &commit_request,
+    )
+    .await;
+    assert_eq!(commit_replay["replayed"], true);
+    assert_eq!(commit_replay["commit"], committed["commit"]);
+    assert_eq!(
+        commit_replay["consumed_precommit"]["committed_commit_id"],
+        commit_id
+    );
+
+    std::fs::write(
+        playground_path.join("commit-candidate.txt"),
+        SECOND_COMMIT_FILE_CONTENT,
+    )
+    .unwrap();
+    std::fs::remove_file(playground_path.join("after-restart.txt")).unwrap();
+    assert_eq!(
+        std::fs::read(playground_path.join("after-server-restart.txt")).unwrap(),
+        SERVER_RESTART_FILE_CONTENT
+    );
+
+    let second_started_precommit = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/precommit/start",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID,
+            "precommit_request_id": "precommit-request-agentd-e2e-second",
+            "expected_index_version": committed_playground["playground"]["index_version"].clone()
+        }),
+    )
+    .await;
+    assert_eq!(second_started_precommit["precommit"]["state"], "running");
+    assert_eq!(second_started_precommit["replayed"], false);
+    let second_precommit_id = second_started_precommit["precommit"]["precommit_id"]
+        .as_str()
+        .expect("second Pre-commit response omitted precommit_id")
+        .to_owned();
+    let second_ready_precommit =
+        wait_for_precommit_ready(&client, restarted_public_addr, second_precommit_id.as_str())
+            .await;
+    assert_eq!(second_ready_precommit["phase"], "idle");
+    assert_eq!(second_ready_precommit["blockers"], json!([]));
+    let second_candidate_index = second_ready_precommit["candidate_index_version"].clone();
+    assert_eq!(second_candidate_index["revision"], "5");
+    assert_ne!(
+        second_candidate_index["digest"],
+        committed_playground["playground"]["index_version"]["digest"]
+    );
+
+    let frozen_changes = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/change/list/query",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID,
+            "precommit_id": second_precommit_id,
+            "page_size": 100
+        }),
+    )
+    .await;
+    assert_eq!(frozen_changes["source"], "precommit");
+    assert_eq!(
+        frozen_changes["precommit_id"],
+        second_started_precommit["precommit"]["precommit_id"]
+    );
+    assert_eq!(frozen_changes["summary"]["files_added"], "0");
+    assert_eq!(frozen_changes["summary"]["files_modified"], "1");
+    assert_eq!(frozen_changes["summary"]["files_deleted"], "1");
+    let frozen_change_items = frozen_changes["items"]
+        .as_array()
+        .expect("frozen change list omitted items");
+    assert_eq!(frozen_change_items.len(), 2, "{frozen_changes}");
+    assert!(frozen_change_items.iter().any(|item| {
+        item["path"] == "commit-candidate.txt" && item["change_type"] == "modified"
+    }));
+    assert!(frozen_change_items
+        .iter()
+        .any(|item| { item["path"] == "after-restart.txt" && item["change_type"] == "deleted" }));
+    assert!(!frozen_change_items
+        .iter()
+        .any(|item| item["path"] == "after-server-restart.txt"));
+
+    let second_object_id = ObjectId::for_bytes(SECOND_COMMIT_FILE_CONTENT);
+    let second_object_path = volume_object_root
+        .join("tenants/tenant-a/artifacts")
+        .join(ARTIFACT_ID)
+        .join("objects")
+        .join(second_object_id.to_hex());
+    assert_eq!(
+        std::fs::read(second_object_path).unwrap(),
+        SECOND_COMMIT_FILE_CONTENT
+    );
+
+    let second_commit_request = json!({
+        "tenant_id": "tenant-a",
+        "project_id": PROJECT_ID,
+        "artifact_id": ARTIFACT_ID,
+        "playground_id": PLAYGROUND_ID,
+        "commit_request_id": "commit-request-agentd-e2e-second",
+        "precommit_id": second_precommit_id,
+        "expected_candidate_index_version": second_candidate_index,
+        "message": "Commit a second real Agent workspace revision",
+        "description": "Modifies and deletes tracked files after the root Commit",
+        "tag_names": ["agentd-e2e", "second"]
+    });
+    let second_committed = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/commit/create",
+        &second_commit_request,
+    )
+    .await;
+    assert_eq!(second_committed["replayed"], false);
+    assert_eq!(second_committed["commit"]["parent_commit_id"], commit_id);
+    assert_eq!(second_committed["consumed_precommit"]["state"], "committed");
+    let second_commit_id = second_committed["commit"]["commit_id"]
+        .as_str()
+        .expect("second Commit response omitted commit_id")
+        .to_owned();
+    assert_ne!(second_commit_id, commit_id);
+    assert_eq!(
+        second_committed["playground"]["head_commit_id"],
+        second_commit_id
+    );
+    assert_eq!(
+        second_committed["playground"]["active_precommit_id"],
+        Value::Null
+    );
+
+    let second_committed_artifact = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/artifact/query",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID
+        }),
+    )
+    .await;
+    let second_committed_playground = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/query",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": PLAYGROUND_ID
+        }),
+    )
+    .await;
+    assert_eq!(
+        second_committed_artifact["artifact"]["head_commit_id"],
+        second_commit_id
+    );
+    assert_eq!(
+        second_committed_playground["playground"]["head_commit_id"],
+        second_commit_id
+    );
+    assert_eq!(
+        second_committed_playground["playground"]["index_version"],
+        second_commit_request["expected_candidate_index_version"]
+    );
+
+    let second_commit_replay = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/commit/create",
+        &second_commit_request,
+    )
+    .await;
+    assert_eq!(second_commit_replay["replayed"], true);
+    assert_eq!(second_commit_replay["commit"], second_committed["commit"]);
+
+    let derived = post_public(
+        &client,
+        restarted_public_addr,
+        "/api/playground/create",
+        &json!({
+            "tenant_id": "tenant-a",
+            "project_id": PROJECT_ID,
+            "artifact_id": ARTIFACT_ID,
+            "playground_id": DERIVED_PLAYGROUND_ID,
+            "storage_volume_id": VOLUME_ID,
+            "display_name": "Materialized from the Artifact Head"
+        }),
+    )
+    .await;
+    assert_eq!(derived["playground"]["state"], "creating", "{derived}");
+    assert_eq!(derived["playground"]["base_commit_id"], second_commit_id);
+    assert_eq!(derived["playground"]["head_commit_id"], second_commit_id);
+    let ready_derived = wait_for_playground_ready(
+        &client,
+        restarted_public_addr,
+        PROJECT_ID,
+        ARTIFACT_ID,
+        DERIVED_PLAYGROUND_ID,
+    )
+    .await;
+    assert_eq!(
+        ready_derived["index_version"],
+        second_commit_request["expected_candidate_index_version"]
+    );
+    let derived_path = mount_path
+        .join("playgrounds")
+        .join(PROJECT_ID)
+        .join(ARTIFACT_ID)
+        .join(DERIVED_PLAYGROUND_ID);
+    assert_eq!(
+        std::fs::read(derived_path.join("commit-candidate.txt")).unwrap(),
+        SECOND_COMMIT_FILE_CONTENT
+    );
+    assert_eq!(
+        std::fs::read(derived_path.join("after-server-restart.txt")).unwrap(),
+        SERVER_RESTART_FILE_CONTENT
+    );
+    let mut derived_entries = std::fs::read_dir(&derived_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    derived_entries.sort();
+    assert_eq!(
+        derived_entries,
+        vec![
+            "after-server-restart.txt".to_owned(),
+            "commit-candidate.txt".to_owned()
+        ]
+    );
+
+    // Cover the 500 ms durable Decision delivery pass and the Agent's 100 ms report pass.
+    sleep(Duration::from_secs(1)).await;
     stop_agent(server_restart_shutdown, server_restart_task).await;
+    assert_agent_outbound_empty(&state_dir);
     restarted_public_server.shutdown().await.unwrap();
     restarted_state.close().await;
+    assert_finalized_acks(
+        &server_config.authority_dir,
+        &[JOB_ID, RESTART_JOB_ID, SERVER_RESTART_JOB_ID],
+        &[precommit_id.as_str(), second_precommit_id.as_str()],
+    )
+    .await;
+    assert_no_chunk_payload_files(authority.path());
+    assert_no_chunk_payload_files(&state_dir);
 }
 
 /// Manual acceptance test that preserves both Agents' state for inspection.
@@ -766,6 +1170,37 @@ async fn stop_agent(shutdown: oneshot::Sender<()>, task: JoinHandle<AgentDaemonR
         .expect("Agent shutdown failed");
 }
 
+fn assert_agent_outbound_empty(state_dir: &Path) {
+    assert!(
+        !has_pending_outbound_reports(state_dir, TenantId::new("tenant-a").unwrap()).unwrap(),
+        "stopped Agent retained unacknowledged reports"
+    );
+}
+
+fn assert_no_chunk_payload_files(root: &Path) {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "chunk payload escaped the Volume CAS: {}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
 async fn wait_for_pending_enrollment(
     client: &Client,
     public_addr: std::net::SocketAddr,
@@ -818,6 +1253,38 @@ async fn wait_for_volume_ready(
     .expect("Agent heartbeat did not make its Volume Ready");
 }
 
+async fn wait_for_playground_ready(
+    client: &Client,
+    public_addr: std::net::SocketAddr,
+    project_id: &str,
+    artifact_id: &str,
+    playground_id: &str,
+) -> Value {
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let response = post_public(
+                client,
+                public_addr,
+                "/api/playground/query",
+                &json!({
+                    "tenant_id": "tenant-a",
+                    "project_id": project_id,
+                    "artifact_id": artifact_id,
+                    "playground_id": playground_id
+                }),
+            )
+            .await;
+            match response["playground"]["state"].as_str() {
+                Some("ready") => return response["playground"].clone(),
+                Some("abnormal") => panic!("Playground materialization failed: {response}"),
+                _ => sleep(Duration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .expect("Agent did not materialize the Playground")
+}
+
 async fn wait_for_job_succeeded(
     client: &Client,
     public_addr: std::net::SocketAddr,
@@ -846,6 +1313,85 @@ async fn wait_for_job_succeeded(
     .expect("Agent Job did not succeed")
 }
 
+async fn wait_for_precommit_ready(
+    client: &Client,
+    public_addr: std::net::SocketAddr,
+    precommit_id: &str,
+) -> Value {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let response = post_public(
+                client,
+                public_addr,
+                "/api/playground/precommit/query",
+                &json!({
+                    "tenant_id": "tenant-a",
+                    "precommit_id": precommit_id
+                }),
+            )
+            .await;
+            match response["precommit"]["state"].as_str() {
+                Some("ready") => return response["precommit"].clone(),
+                Some(state @ ("abnormal" | "cancelled" | "committed")) => {
+                    panic!("Pre-commit entered unexpected state {state}: {response}")
+                }
+                _ => sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("Agent did not produce a ready Pre-commit")
+}
+
+async fn assert_finalized_acks(authority_dir: &Path, job_ids: &[&str], precommit_ids: &[&str]) {
+    let authority = open_sqlite_authority(SqliteAuthorityConfig::new(authority_dir))
+        .await
+        .expect("failed to reopen the stopped authority");
+    let store = authority.authority_store();
+    let jobs = store.jobs();
+    for job_id in job_ids {
+        let key = JobKey::new(
+            TenantId::new("tenant-a").unwrap(),
+            JobId::new(*job_id).unwrap(),
+        );
+        let job = jobs
+            .get(&key)
+            .await
+            .expect("failed to query the stopped authority")
+            .expect("published Job disappeared from the stopped authority");
+        assert!(
+            job.finalized_ack.is_some(),
+            "Agent did not durably acknowledge the final Decision for Job {job_id}"
+        );
+    }
+    let precommits = store
+        .precommits()
+        .expect("stopped authority omitted the Pre-commit repository");
+    for precommit_id in precommit_ids {
+        let precommit = precommits
+            .get(&PreCommitKey::new(
+                TenantId::new("tenant-a").unwrap(),
+                PreCommitId::new(*precommit_id).unwrap(),
+            ))
+            .await
+            .expect("failed to query the stopped Pre-commit authority")
+            .expect("committed Pre-commit disappeared from the stopped authority");
+        let job = jobs
+            .get(&JobKey::new(
+                TenantId::new("tenant-a").unwrap(),
+                precommit.job_id,
+            ))
+            .await
+            .expect("failed to query the stopped Pre-commit Job authority")
+            .expect("Pre-commit Job disappeared from the stopped authority");
+        assert!(
+            job.finalized_ack.is_some(),
+            "Agent did not durably acknowledge the final Decision for Pre-commit {precommit_id}"
+        );
+    }
+    authority.close().await;
+}
+
 async fn wait_for_active_phase(state_dir: &Path, expected: &str) {
     timeout(Duration::from_secs(10), async {
         loop {
@@ -861,7 +1407,13 @@ async fn wait_for_active_phase(state_dir: &Path, expected: &str) {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("Agent did not enter active phase {expected}"));
+    .unwrap_or_else(|_| {
+        let observed = std::fs::read(state_dir.join(HEALTH_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|document| document["phase"].as_str().map(str::to_owned));
+        panic!("Agent did not enter active phase {expected}; last observed phase was {observed:?}");
+    });
 }
 
 async fn post_public(
@@ -1008,7 +1560,6 @@ fn development_server_config(authority_dir: PathBuf, keyring: PathBuf) -> Server
         agent_bind: Some("127.0.0.1:0".parse().unwrap()),
         agent_enrollment_keyring_file: Some(keyring),
         authority_dir,
-        object_store_root: None,
         rbac_file: None,
         oidc_issuer: None,
         oidc_audience: None,

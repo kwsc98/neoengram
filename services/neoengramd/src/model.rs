@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 
-use neoengram_core::{ContentDigest, FileRecord, LogicalPath, Manifest, ObjectId};
+use neoengram_core::{ContentDigest, FileRecord, LogicalPath, Manifest};
 use neoengram_protocol::{
     AddAssignment, AddOperation, AgentId, AgentMountId, ArtifactId, ArtifactPlacementId,
     AssignmentGeneration, AssignmentId, EdgeClusterId, Extensions, JobAccepted, JobAssignment,
     JobDecision, JobFailed, JobFinalized, JobId, JobPrepared, JobProgress, JobState, LeaseGrant,
-    MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage, MountGeneration, OwnerGeneration,
-    PlacementGeneration, PlaygroundId, PrincipalRef, ProjectId, ResourceVersion, StorageVolumeId,
-    TenantId, UnixMillis, WireIndexVersion,
+    MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage, MountGeneration,
+    ObjectReceiptRecord, OwnerGeneration, PlacementGeneration, PlaygroundId, PrincipalRef,
+    ProjectId, ResourceVersion, SnapshotId, SnapshotMountAssignment, SnapshotMountOperation,
+    StorageVolumeId, TenantId, UnixMillis, WireIndexVersion, WorkspaceMaterializeAssignment,
+    WorkspaceMaterializeOperation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -89,13 +91,113 @@ pub struct AssignmentTarget {
     pub lease: Option<LeaseGrant>,
 }
 
+/// Immutable scope for the infrastructure WorkspaceMaterialize operation. A non-empty baseline
+/// binds the exact Commit Index while the side effect remains the server-derived directory below
+/// the approved Volume mount.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceMaterializeSpec {
+    pub job_id: JobId,
+    pub principal: PrincipalRef,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub artifact_id: ArtifactId,
+    pub playground_id: PlaygroundId,
+    pub storage_volume_id: StorageVolumeId,
+    pub relative_root: LogicalPath,
+    pub base_commit_id: Option<ContentDigest>,
+    #[serde(default)]
+    pub base_index_version: Option<WireIndexVersion>,
+    pub request_digest: ContentDigest,
+    pub deadline_unix_ms: UnixMillis,
+}
+
+impl WorkspaceMaterializeSpec {
+    #[must_use]
+    pub fn operation(&self) -> WorkspaceMaterializeOperation {
+        WorkspaceMaterializeOperation {
+            job_id: self.job_id.clone(),
+            principal: self.principal.clone(),
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            artifact_id: self.artifact_id.clone(),
+            playground_id: self.playground_id.clone(),
+            storage_volume_id: self.storage_volume_id.clone(),
+            relative_root: self.relative_root.clone(),
+            base_commit_id: self.base_commit_id,
+            base_index_version: self.base_index_version.clone(),
+            deadline_unix_ms: self.deadline_unix_ms,
+            extensions: Extensions::new(),
+        }
+    }
+
+    pub fn computed_request_digest(&self) -> neoengram_protocol::ProtocolResult<ContentDigest> {
+        self.operation().request_digest()
+    }
+}
+
+/// Immutable authority scope for mounting one Artifact Commit as a read-only Snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotMountSpec {
+    pub job_id: JobId,
+    pub principal: PrincipalRef,
+    pub tenant_id: TenantId,
+    pub project_id: ProjectId,
+    pub artifact_id: ArtifactId,
+    pub snapshot_id: SnapshotId,
+    pub storage_volume_id: StorageVolumeId,
+    pub relative_root: LogicalPath,
+    pub commit_id: ContentDigest,
+    pub index_version: WireIndexVersion,
+    pub request_digest: ContentDigest,
+    pub deadline_unix_ms: UnixMillis,
+}
+
+impl SnapshotMountSpec {
+    #[must_use]
+    pub fn operation(&self) -> SnapshotMountOperation {
+        SnapshotMountOperation {
+            job_id: self.job_id.clone(),
+            principal: self.principal.clone(),
+            tenant_id: self.tenant_id.clone(),
+            project_id: self.project_id.clone(),
+            artifact_id: self.artifact_id.clone(),
+            snapshot_id: self.snapshot_id.clone(),
+            storage_volume_id: self.storage_volume_id.clone(),
+            relative_root: self.relative_root.clone(),
+            commit_id: self.commit_id,
+            index_version: self.index_version.clone(),
+            deadline_unix_ms: self.deadline_unix_ms,
+            extensions: Extensions::new(),
+        }
+    }
+
+    pub fn computed_request_digest(&self) -> neoengram_protocol::ProtocolResult<ContentDigest> {
+        self.operation().request_digest()
+    }
+}
+
 /// Durable authoritative record. Assignment and prepared metadata are persisted before side effects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRecord {
     pub spec: AddJobSpec,
+    /// Distinguishes managed Add publication from an infrastructure operation which happens to
+    /// share the durable Job delivery ledger. This is persisted with the Job payload and is part
+    /// of idempotency; callers must never infer it from a free-form extension.
+    #[serde(default)]
+    pub operation: JobOperation,
+    #[serde(default)]
+    pub workspace_spec: Option<WorkspaceMaterializeSpec>,
+    #[serde(default)]
+    pub snapshot_spec: Option<SnapshotMountSpec>,
     pub state: JobState,
     pub resource_version: ResourceVersion,
     pub assignment: Option<AddAssignment>,
+    /// Assignment for the non-public WorkspaceMaterialize operation. Exactly one assignment
+    /// field is populated according to `operation`.
+    #[serde(default)]
+    pub workspace_assignment: Option<WorkspaceMaterializeAssignment>,
+    #[serde(default)]
+    pub snapshot_assignment: Option<SnapshotMountAssignment>,
     pub accepted: Option<JobAccepted>,
     pub progress: Option<JobProgress>,
     pub prepared: Option<JobPrepared>,
@@ -104,6 +206,87 @@ pub struct JobRecord {
     pub finalized: Option<JobFinalized>,
     pub finalized_ack: Option<JobFinalized>,
     pub failure: Option<JobFailed>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum JobOperation {
+    #[default]
+    Add,
+    WorkspaceMaterialize,
+    SnapshotMount,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateWorkspaceMaterializationRequest {
+    pub spec: WorkspaceMaterializeSpec,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateWorkspaceMaterializationResult {
+    pub job: JobRecord,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssignWorkspaceMaterializationRequest {
+    pub tenant_id: TenantId,
+    pub job_id: JobId,
+    pub target: WorkspaceMaterializeTarget,
+}
+
+/// Server-selected owner/mount fencing values for a materialization assignment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceMaterializeTarget {
+    pub assignment_id: AssignmentId,
+    pub assignment_generation: AssignmentGeneration,
+    pub agent_id: AgentId,
+    pub storage_volume_id: StorageVolumeId,
+    pub agent_mount_id: AgentMountId,
+    pub mount_generation: MountGeneration,
+    pub owner_generation: OwnerGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssignWorkspaceMaterializationResult {
+    pub job: JobRecord,
+    pub assignment: JobAssignment,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSnapshotMountRequest {
+    pub spec: SnapshotMountSpec,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSnapshotMountResult {
+    pub job: JobRecord,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssignSnapshotMountRequest {
+    pub tenant_id: TenantId,
+    pub job_id: JobId,
+    pub target: SnapshotMountTarget,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotMountTarget {
+    pub assignment_id: AssignmentId,
+    pub assignment_generation: AssignmentGeneration,
+    pub agent_id: AgentId,
+    pub storage_volume_id: StorageVolumeId,
+    pub agent_mount_id: AgentMountId,
+    pub mount_generation: MountGeneration,
+    pub owner_generation: OwnerGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssignSnapshotMountResult {
+    pub job: JobRecord,
+    pub assignment: JobAssignment,
+    pub replayed: bool,
 }
 
 /// Canonical publication material frozen atomically with `Prepared -> Publishing`.
@@ -133,6 +316,16 @@ impl JobRecord {
             artifact_id: self.spec.artifact_id.clone(),
             playground_id: self.spec.playground_id.clone(),
         }
+    }
+
+    #[must_use]
+    pub const fn is_workspace_materialization(&self) -> bool {
+        matches!(self.operation, JobOperation::WorkspaceMaterialize)
+    }
+
+    #[must_use]
+    pub const fn is_snapshot_mount(&self) -> bool {
+        matches!(self.operation, JobOperation::SnapshotMount)
     }
 }
 
@@ -221,6 +414,33 @@ impl AgentReport {
             Self::Finalized(report) => &report.job_id,
             Self::Failed(report) => &report.job_id,
         }
+    }
+}
+
+/// Common delivery identity shared by every formal AssignmentOperation variant.
+#[must_use]
+pub fn assignment_identity(
+    assignment: &JobAssignment,
+) -> (&TenantId, &JobId, &AssignmentId, &AgentId) {
+    match &assignment.assignment {
+        neoengram_protocol::AssignmentOperation::Add { input, .. } => (
+            &input.tenant_id,
+            &input.job_id,
+            &input.assignment_id,
+            &input.agent_id,
+        ),
+        neoengram_protocol::AssignmentOperation::WorkspaceMaterialize { input, .. } => (
+            &input.tenant_id,
+            &input.job_id,
+            &input.assignment_id,
+            &input.agent_id,
+        ),
+        neoengram_protocol::AssignmentOperation::SnapshotMount { input, .. } => (
+            &input.tenant_id,
+            &input.job_id,
+            &input.assignment_id,
+            &input.agent_id,
+        ),
     }
 }
 
@@ -317,12 +537,15 @@ impl StagedMetadataBatch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DurableObject {
-    pub object_id: ObjectId,
-    pub size: u64,
-    pub verified_digest: ContentDigest,
-    pub storage_version: String,
+/// Durable evidence that immutable object bytes exist on an Agent-owned Volume placement.
+///
+/// The Agent supplies the receipt through its authenticated metadata stream. The control plane
+/// binds it to the authoritative placement generation from the persisted Assignment so evidence
+/// from a fenced placement can never satisfy a later publication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectPlacementEvidence {
+    pub receipt: ObjectReceiptRecord,
+    pub placement_generation: PlacementGeneration,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -333,6 +556,17 @@ pub struct IndexPublishRequest {
     pub expected_result_digest: ContentDigest,
     pub manifests: Vec<Manifest>,
     pub mutations: Vec<neoengram_protocol::IndexDeltaRecord>,
+}
+
+/// One exact authoritative Index snapshot used to initialize a newly derived Playground.
+///
+/// Initialization is create-only: an exact replay succeeds, while an already initialized key
+/// with any different version or records is a concurrent update.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InitializeIndexSnapshotRequest {
+    pub index_key: IndexKey,
+    pub version: WireIndexVersion,
+    pub records: Vec<FileRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +631,7 @@ pub struct AgentEnrollmentAuditEvent {
 pub(crate) struct ValidatedMetadata {
     pub manifests: Vec<Manifest>,
     pub mutations: Vec<neoengram_protocol::IndexDeltaRecord>,
+    pub placements: Vec<ObjectReceiptRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -354,8 +354,10 @@ export interface paths {
         put?: never;
         /**
          * 创建 Artifact
-         * @description 在指定 Tenant/Project 下创建空 Artifact，或从同 Tenant 另一 Artifact 的明确 Commit 派生。
-         *     Artifact 本身不选择 StorageVolume 或 Region；资源身份使相同请求可幂等重放。
+         * @description 在指定 Tenant/Project 下创建空 Artifact。Artifact 本身不选择 StorageVolume 或 Region；
+         *     `artifact_id` 在 Tenant 内唯一，Project 是其唯一归属。资源身份使相同请求可幂等重放。
+         *     `derived` 初始化保留给 Commit authority 闭环，当前服务无法验证来源 Commit 归属时以
+         *     `ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED` 返回 409。
          */
         post: operations["createArtifact"];
         delete?: never;
@@ -375,8 +377,9 @@ export interface paths {
         put?: never;
         /**
          * 查询 Artifact Commit 图
-         * @description 分页返回单 parent Commit 节点、公开 Tags 和当前 head Commit。Cursor 绑定 graph version 与完整 scope；
-         *     公开节点不包含 root directory、Manifest、Chunk 或存储信息。
+         * @description 从当前 Head 沿单 parent 权威链分页返回 Commit 节点和公开 Tags。Cursor 绑定 Artifact
+         *     resource version、Head 与完整 scope；Head 变化后旧 Cursor 返回 409。公开节点不包含 root
+         *     directory、Manifest、Chunk 或存储信息。
          */
         post: operations["queryArtifactCommitGraph"];
         delete?: never;
@@ -459,8 +462,11 @@ export interface paths {
         put?: never;
         /**
          * 创建 Playground
-         * @description 在 Artifact 下创建受管可写 Playground，并可固定初始 base Commit。所选 StorageVolume 必须
-         *     属于同一 Tenant 且 `state=ready`；`degraded` 或 `unavailable` 均拒绝新放置并返回 409。
+         * @description 在已存在的权威 Artifact 下创建受管可写 Playground。显式 `base_commit_id` 可以选择当前
+         *     Head 或该 Artifact 的任一历史 Commit；省略时服务端冻结创建瞬间的当前 Head。所选 Commit
+         *     的权威 Index 会先初始化为 Playground Index，再由目标 StorageVolume 的 Agent 异步物化；
+         *     完成前 Playground 保持 `state=creating`。所选 StorageVolume 必须属于同一 Tenant 且
+         *     `state=ready`；`degraded` 或 `unavailable` 均拒绝新放置并返回 409。
          */
         post: operations["createPlayground"];
         delete?: never;
@@ -1242,7 +1248,10 @@ export interface components {
              */
             mode: "empty";
         };
-        /** @description 来源 Artifact 必须属于当前 Tenant，来源 Commit 必须属于显式来源 Project/Artifact。 */
+        /**
+         * @description 保留的派生初始化形态。来源 Artifact 必须属于当前 Tenant，来源 Commit 必须属于显式来源
+         *     Project/Artifact；当前 capability 无法验证 Commit 归属，因此 create 会稳定返回 409。
+         */
         DerivedArtifactInitialization: {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -1259,7 +1268,8 @@ export interface components {
         };
         /**
          * @description Artifact 是不绑定 Region 或 StorageVolume 的版本化逻辑数据资产。初始化血缘只暴露
-         *     同 Tenant 的逻辑来源，不暴露 ArtifactPlacement、Manifest 或物理对象位置。
+         *     同 Tenant 的逻辑来源，不暴露 ArtifactPlacement、Manifest 或物理对象位置。`artifact_id`
+         *     在 Tenant 内唯一，`project_id` 表示其唯一业务归属。
          */
         ArtifactView: {
             tenant_id: components["schemas"]["TenantId"];
@@ -1355,8 +1365,9 @@ export interface components {
             playground: components["schemas"]["PlaygroundView"];
         };
         /**
-         * @description 创建请求必须明确选择同 Tenant、`state=ready` 的 StorageVolume；Region 由 Volume 派生，不能
-         *     由调用方另行指定。
+         * @description 创建请求必须引用同 Tenant/Project 下已存在的 Artifact，并明确选择同 Tenant、`state=ready`
+         *     的 StorageVolume。Playground 是该 Artifact 某个固定 Commit 的可写派生视图，不能创建或
+         *     重定义 Artifact；Region 由 Volume 派生，不能由调用方另行指定。
          */
         CreatePlaygroundRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -1365,8 +1376,12 @@ export interface components {
             playground_id: components["schemas"]["PlaygroundId"];
             storage_volume_id: components["schemas"]["StorageVolumeId"];
             display_name: components["schemas"]["DisplayName"];
-            /** @description 可选的 canonical Commit 内容摘要；最小开发闭环不校验 Commit 记录存在。 */
-            base_commit_id?: components["schemas"]["ContentDigest"];
+            /**
+             * @description 可选的 canonical Commit 内容摘要。显式值必须属于请求 scope 指定的 Artifact，可以是
+             *     当前 Head 或历史 Commit；省略时服务端冻结创建瞬间的当前 Head。空 Artifact 必须省略，
+             *     且服务端不会为其伪造 base Commit。
+             */
+            base_commit_id?: components["schemas"]["CommitId"];
         } & {
             [key: string]: unknown;
         };
@@ -1377,8 +1392,9 @@ export interface components {
         /** @enum {string} */
         PlaygroundState: "creating" | "ready" | "abnormal";
         /**
-         * @description Playground 的 Region 始终由所选 StorageVolume 派生。主状态只表达工作区可用性；
-         *     scanning、hashing、uploading 和 validating 仅属于独立 Pre-commit 流程。
+         * @description Playground 的 `tenant_id + project_id + artifact_id` 是不可变来源 scope，Region 始终由所选
+         *     StorageVolume 派生。主状态只表达工作区可用性；scanning、hashing、uploading 和 validating
+         *     仅属于独立 Pre-commit 流程。
          */
         PlaygroundView: {
             tenant_id: components["schemas"]["TenantId"];
@@ -1388,8 +1404,8 @@ export interface components {
             storage_volume_id: components["schemas"]["StorageVolumeId"];
             region: components["schemas"]["RegionName"];
             display_name: components["schemas"]["DisplayName"];
-            base_commit_id?: components["schemas"]["ContentDigest"];
-            head_commit_id?: components["schemas"]["ContentDigest"];
+            base_commit_id?: components["schemas"]["CommitId"];
+            head_commit_id?: components["schemas"]["CommitId"];
             index_version: components["schemas"]["IndexVersion"];
             state: components["schemas"]["PlaygroundState"];
             active_precommit_id?: components["schemas"]["PreCommitId"];
@@ -1696,8 +1712,10 @@ export interface components {
             snapshot: components["schemas"]["SnapshotView"];
         };
         /**
-         * @description 选择同 Tenant、`state=ready` 的 StorageVolume 为固定 Commit 创建 Snapshot。Region 由 Volume
-         *     派生；用途、保留策略和 Dataset Profile 不属于本请求。
+         * @description 选择同 Tenant、`state=ready` 的 StorageVolume，为指定 Artifact 的固定 Commit 创建 Snapshot。
+         *     服务端必须验证 Project/Artifact 存在且 Commit 确属该 Artifact；Snapshot 不能创建 Artifact、
+         *     改写 Artifact Head 或在创建后切换 Commit。Region 由 Volume 派生；用途、保留策略和
+         *     Dataset Profile 不属于本请求。
          */
         CreateSnapshotRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -1767,7 +1785,11 @@ export interface components {
         SnapshotState: "creating" | "ready" | "abnormal";
         /** @enum {string} */
         SnapshotPhase: "planning" | "materializing" | "verifying" | "idle";
-        /** @description 独立身份、固定 Commit、单 StorageVolume 和单 Region 的只读交付资源。 */
+        /**
+         * @description 独立身份、固定 Artifact Commit、单 StorageVolume 和单 Region 的只读交付资源。
+         *     `tenant_id + project_id + artifact_id + commit_id` 是不可变来源 scope；Snapshot 只是该 Commit
+         *     的交付视图，不拥有或改写 Artifact 数据权威。
+         */
         SnapshotView: {
             snapshot_id: components["schemas"]["SnapshotId"];
             tenant_id: components["schemas"]["TenantId"];
@@ -1957,7 +1979,7 @@ export interface components {
         ProjectId: components["schemas"]["ResourceId"];
         ArtifactId: components["schemas"]["ResourceId"];
         PlaygroundId: components["schemas"]["ResourceId"];
-        CommitId: components["schemas"]["ResourceId"];
+        CommitId: components["schemas"]["ContentDigest"];
         PreCommitId: components["schemas"]["ResourceId"];
         SnapshotId: components["schemas"]["ResourceId"];
         JobId: components["schemas"]["ResourceId"];
@@ -2408,6 +2430,8 @@ export interface operations {
                      *         1
                      *       ],
                      *       "capabilities": [
+                     *         "artifact_catalog",
+                     *         "artifact_commit_graph",
                      *         "managed_add",
                      *         "sqlite_authority"
                      *       ]
@@ -3331,7 +3355,7 @@ export interface operations {
                      *           "initialization": {
                      *             "mode": "empty"
                      *           },
-                     *           "head_commit_id": "commit-main-3",
+                     *           "head_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *           "resource_version": "18",
                      *           "created_at_unix_ms": "1785167000000",
                      *           "updated_at_unix_ms": "1785167600000"
@@ -3405,7 +3429,7 @@ export interface operations {
                      *         "initialization": {
                      *           "mode": "empty"
                      *         },
-                     *         "head_commit_id": "commit-main-3",
+                     *         "head_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *         "resource_version": "18",
                      *         "created_at_unix_ms": "1785167000000",
                      *         "updated_at_unix_ms": "1785167600000"
@@ -3456,10 +3480,7 @@ export interface operations {
                  *       "artifact_id": "evaluation-set",
                  *       "display_name": "评测数据集",
                  *       "initialization": {
-                 *         "mode": "derived",
-                 *         "source_project_id": "project-vision",
-                 *         "source_artifact_id": "road-scenes",
-                 *         "source_commit_id": "commit-main-3"
+                 *         "mode": "empty"
                  *       }
                  *     }
                  */
@@ -3535,11 +3556,11 @@ export interface operations {
                      * @example {
                      *       "graph": {
                      *         "graph_version": "18",
-                     *         "head_commit_id": "commit-main-3",
+                     *         "head_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *         "nodes": [
                      *           {
-                     *             "commit_id": "commit-main-3",
-                     *             "parent_commit_id": "commit-main-2",
+                     *             "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *             "parent_commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                      *             "message": "补充夜间道路场景",
                      *             "tag_names": [
                      *               "dataset/v4",
@@ -3548,13 +3569,13 @@ export interface operations {
                      *             "created_at_unix_ms": "1785167600000"
                      *           },
                      *           {
-                     *             "commit_id": "commit-exp-2",
-                     *             "parent_commit_id": "commit-main-2",
-                     *             "message": "实验标注集",
+                     *             "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                     *             "parent_commit_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                     *             "message": "完成首轮质量复核",
                      *             "tag_names": [
-                     *               "occlusion-experiment"
+                     *               "v1.0"
                      *             ],
-                     *             "created_at_unix_ms": "1785167500000"
+                     *             "created_at_unix_ms": "1785067400000"
                      *           }
                      *         ]
                      *       }
@@ -3603,7 +3624,7 @@ export interface operations {
                  *       "tenant_id": "tenant-a",
                  *       "project_id": "project-vision",
                  *       "artifact_id": "road-scenes",
-                 *       "commit_id": "commit-main-3"
+                 *       "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                  *     }
                  */
                 "application/json": components["schemas"]["QueryArtifactCommitDiffRequest"];
@@ -3621,8 +3642,8 @@ export interface operations {
                      * @example {
                      *       "diff": {
                      *         "base_commit": {
-                     *           "commit_id": "commit-main-2",
-                     *           "parent_commit_id": "commit-root-1",
+                     *           "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                     *           "parent_commit_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                      *           "message": "完成首轮质量复核",
                      *           "description": "完成白天场景的质量抽检和标签修订。",
                      *           "tag_names": [
@@ -3631,8 +3652,8 @@ export interface operations {
                      *           "created_at_unix_ms": "1785067400000"
                      *         },
                      *         "target_commit": {
-                     *           "commit_id": "commit-main-3",
-                     *           "parent_commit_id": "commit-main-2",
+                     *           "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *           "parent_commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                      *           "message": "补充夜间道路场景",
                      *           "description": "增加夜间和低照度样本，并更新场景索引。",
                      *           "tag_names": [
@@ -4707,7 +4728,7 @@ export interface operations {
                      *           "tenant_id": "tenant-a",
                      *           "project_id": "project-vision",
                      *           "artifact_id": "road-scenes",
-                     *           "commit_id": "commit-main-3",
+                     *           "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *           "storage_volume_id": "volume-shanghai-archive",
                      *           "region": "cn-shanghai",
                      *           "message": "补充夜间道路场景",
@@ -4793,7 +4814,7 @@ export interface operations {
                      *         "tenant_id": "tenant-a",
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
-                     *         "commit_id": "commit-main-3",
+                     *         "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *         "storage_volume_id": "volume-shanghai-archive",
                      *         "region": "cn-shanghai",
                      *         "message": "补充夜间道路场景",
@@ -4858,7 +4879,7 @@ export interface operations {
                  *       "tenant_id": "tenant-a",
                  *       "project_id": "project-vision",
                  *       "artifact_id": "road-scenes",
-                 *       "commit_id": "commit-main-3",
+                 *       "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                  *       "storage_volume_id": "volume-shanghai-archive",
                  *       "snapshot_request_id": "snapshot-request-main3-shanghai"
                  *     }
@@ -4881,7 +4902,7 @@ export interface operations {
                      *         "tenant_id": "tenant-a",
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
-                     *         "commit_id": "commit-main-3",
+                     *         "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *         "storage_volume_id": "volume-shanghai-archive",
                      *         "region": "cn-shanghai",
                      *         "message": "补充夜间道路场景",
@@ -4968,7 +4989,7 @@ export interface operations {
                      *         "tenant_id": "tenant-a",
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
-                     *         "commit_id": "commit-main-2",
+                     *         "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                      *         "storage_volume_id": "volume-shanghai-vision",
                      *         "region": "cn-shanghai",
                      *         "message": "完成首轮质量复核",
