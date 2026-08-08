@@ -87,12 +87,14 @@ impl FilesystemMountProbeConfig {
 
 /// Explicitly opted-in probe inputs for a local development directory.
 ///
-/// Unlike [`FilesystemMountProbeConfig`], this probe treats the configured directory itself as
-/// the storage boundary. Callers must additionally constrain the Agent transport to a local
-/// development endpoint before using it.
+/// Unlike [`FilesystemMountProbeConfig`], this probe treats an ordinary directory as the storage
+/// boundary. `directory_root` pins the resolved storage directory, while `identity_root` retains
+/// the stable development entry path used in the mount identity. Callers must additionally
+/// constrain the Agent transport to a local development endpoint before using it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DevelopmentDirectoryMountProbeConfig {
     pub directory_root: PathBuf,
+    pub identity_root: PathBuf,
     pub expected_volume_marker: VolumeMarkerId,
     pub volume_descriptor_digest: ContentDigest,
     pub hard_minimum_free_bytes: u64,
@@ -107,6 +109,10 @@ impl std::fmt::Debug for DevelopmentDirectoryMountProbeConfig {
                 "directory_root_configured",
                 &!self.directory_root.as_os_str().is_empty(),
             )
+            .field(
+                "identity_root_configured",
+                &!self.identity_root.as_os_str().is_empty(),
+            )
             .field("expected_volume_marker", &self.expected_volume_marker)
             .field("free_space_thresholds", &"configured")
             .finish()
@@ -115,7 +121,19 @@ impl std::fmt::Debug for DevelopmentDirectoryMountProbeConfig {
 
 impl DevelopmentDirectoryMountProbeConfig {
     pub fn validate(&self) -> AgentResult<()> {
-        self.filesystem_config().validate()
+        self.filesystem_config().validate()?;
+        if !self.identity_root.is_absolute()
+            || self
+                .identity_root
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Err(AgentError::new(
+                AgentErrorCode::ScopeMismatch,
+                "development identity root must be an absolute normalized path",
+            ));
+        }
+        Ok(())
     }
 
     /// Probes an ordinary directory for local development use only.
@@ -344,7 +362,7 @@ fn probe_development_directory_platform(
     };
     let available_bytes = filesystem.f_bavail.saturating_mul(fragment_size);
     let mount_identity_digest = development_directory_identity_digest(
-        &root,
+        &config.identity_root,
         &metadata,
         &config.expected_volume_marker,
         &config.volume_descriptor_digest,
@@ -990,6 +1008,7 @@ mod tests {
         .unwrap();
         let config = DevelopmentDirectoryMountProbeConfig {
             directory_root: root.path().to_path_buf(),
+            identity_root: root.path().to_path_buf(),
             expected_volume_marker: VolumeMarkerId::new("volume-development").unwrap(),
             volume_descriptor_digest: ContentDigest::hash(b"development-volume-descriptor"),
             hard_minimum_free_bytes: 0,
@@ -1025,6 +1044,7 @@ mod tests {
         fs::write(root.path().join(VOLUME_MARKER_FILE_NAME), "volume-other\n").unwrap();
         let config = DevelopmentDirectoryMountProbeConfig {
             directory_root: root.path().to_path_buf(),
+            identity_root: root.path().to_path_buf(),
             expected_volume_marker: VolumeMarkerId::new("volume-expected").unwrap(),
             volume_descriptor_digest: ContentDigest::hash(b"development-volume-descriptor"),
             hard_minimum_free_bytes: 0,
@@ -1041,27 +1061,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn development_directory_probe_rejects_a_symlink_root() {
+    fn development_directory_probe_preserves_identity_when_root_becomes_a_symlink() {
         use std::os::unix::fs::symlink;
 
         let parent = tempfile::tempdir().unwrap();
         let actual = parent.path().join("actual");
         let link = parent.path().join("link");
-        fs::create_dir(&actual).unwrap();
-        fs::write(actual.join(VOLUME_MARKER_FILE_NAME), "volume-development\n").unwrap();
-        symlink(&actual, &link).unwrap();
-        let config = DevelopmentDirectoryMountProbeConfig {
-            directory_root: link,
+        fs::create_dir(&link).unwrap();
+        fs::write(link.join(VOLUME_MARKER_FILE_NAME), "volume-development\n").unwrap();
+        let before_config = DevelopmentDirectoryMountProbeConfig {
+            directory_root: link.clone(),
+            identity_root: link.clone(),
             expected_volume_marker: VolumeMarkerId::new("volume-development").unwrap(),
             volume_descriptor_digest: ContentDigest::hash(b"development-volume-descriptor"),
             hard_minimum_free_bytes: 0,
             ready_minimum_free_bytes: 0,
         };
 
-        let observation = config.probe();
+        let before = before_config.probe();
+        fs::rename(&link, &actual).unwrap();
+        symlink(&actual, &link).unwrap();
+        let after_config = DevelopmentDirectoryMountProbeConfig {
+            directory_root: actual,
+            identity_root: link,
+            ..before_config
+        };
+        let after = after_config.probe();
 
-        assert_eq!(observation.condition, MountProbeCondition::NotMountBoundary);
-        assert_eq!(observation.health, ResourceHealth::Unavailable);
+        assert_eq!(before.condition, MountProbeCondition::Ready);
+        assert_eq!(after.condition, MountProbeCondition::Ready);
+        assert_eq!(before.mount_identity_digest, after.mount_identity_digest);
     }
 
     #[cfg(not(target_os = "linux"))]

@@ -2,7 +2,7 @@ use std::{
     fs,
     future::Future,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -11,6 +11,7 @@ use neoengram_agent::{
     ApprovedAgentIdentity, DevelopmentDirectoryMountProbeConfig, FilesystemMountObservation,
     FilesystemMountProbeConfig, MountProbeCondition, SqliteSystemIdentityStore,
     SystemIdentityRecord, TerminalEnrollmentOutcome, TerminalEnrollmentState,
+    VOLUME_MARKER_FILE_NAME,
 };
 use neoengram_protocol::{
     AgentBootstrapAccepted, AgentBootstrapProof, AgentBootstrapRequest,
@@ -70,10 +71,11 @@ pub struct DevelopmentDirectoryProbe {
 
 impl DevelopmentDirectoryProbe {
     #[must_use]
-    pub fn new(config: &AgentConfig) -> Self {
+    pub fn new(config: &AgentConfig, identity_root: PathBuf) -> Self {
         Self {
             config: DevelopmentDirectoryMountProbeConfig {
                 directory_root: config.storage.mount_path.clone(),
+                identity_root,
                 expected_volume_marker: config.storage.expected_volume_marker.clone(),
                 volume_descriptor_digest: config.volume_descriptor_digest,
                 hard_minimum_free_bytes: config.storage.hard_minimum_free_bytes,
@@ -96,11 +98,63 @@ pub async fn run(config: AgentConfig) -> AgentDaemonResult<()> {
 }
 
 /// Runs the Agent with an ordinary-directory mount probe for loopback development only.
-pub async fn run_with_development_directory_probe(config: AgentConfig) -> AgentDaemonResult<()> {
+pub async fn run_with_development_directory_probe(
+    mut config: AgentConfig,
+) -> AgentDaemonResult<()> {
     config.validate()?;
     crate::config::validate_development_directory_probe_endpoint(&config.central_endpoint)?;
-    let probe = DevelopmentDirectoryProbe::new(&config);
+    let identity_root = resolve_development_storage_root(&mut config)?;
+    let probe = DevelopmentDirectoryProbe::new(&config, identity_root);
     run_process(config, probe).await
+}
+
+fn resolve_development_storage_root(config: &mut AgentConfig) -> AgentDaemonResult<PathBuf> {
+    let configured = config.storage.mount_path.clone();
+    let configured_parent = configured.parent().ok_or_else(|| {
+        AgentDaemonError::MountProbe(
+            "development storage root must have an ordinary parent directory".to_owned(),
+        )
+    })?;
+    let configured_name = configured.file_name().ok_or_else(|| {
+        AgentDaemonError::MountProbe(
+            "development storage root must name an ordinary directory".to_owned(),
+        )
+    })?;
+    let identity_parent = fs::canonicalize(configured_parent).map_err(|error| {
+        AgentDaemonError::MountProbe(format!(
+            "development storage root parent could not be resolved: {error}"
+        ))
+    })?;
+    let identity_root = identity_parent.join(configured_name);
+    let resolved = fs::canonicalize(&configured).map_err(|error| {
+        AgentDaemonError::MountProbe(format!(
+            "development storage root could not be resolved: {error}"
+        ))
+    })?;
+    let metadata = fs::symlink_metadata(&resolved).map_err(|error| {
+        AgentDaemonError::MountProbe(format!(
+            "resolved development storage root could not be inspected: {error}"
+        ))
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(AgentDaemonError::MountProbe(
+            "development storage root must resolve to an ordinary directory".to_owned(),
+        ));
+    }
+    let confirmed = fs::canonicalize(&configured).map_err(|error| {
+        AgentDaemonError::MountProbe(format!(
+            "development storage root could not be confirmed: {error}"
+        ))
+    })?;
+    if confirmed != resolved {
+        return Err(AgentDaemonError::MountProbe(
+            "development storage root changed while it was being resolved".to_owned(),
+        ));
+    }
+    config.storage.mount_path = resolved;
+    config.storage.marker_file = config.storage.mount_path.join(VOLUME_MARKER_FILE_NAME);
+    config.validate()?;
+    Ok(identity_root)
 }
 
 async fn run_process<P>(config: AgentConfig, probe: P) -> AgentDaemonResult<()>
@@ -1061,6 +1115,76 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             ready_probe()
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_runtime_uses_the_resolved_storage_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("actual-volume");
+        let entry = directory.path().join("desktop-entry");
+        let other = directory.path().join("other-volume");
+        fs::create_dir(&actual).unwrap();
+        fs::create_dir(&other).unwrap();
+        symlink(&actual, &entry).unwrap();
+        let mut config = test_config(directory.path(), directory.path().join("bootstrap-token"));
+        config.storage.mount_path = entry.clone();
+        config.storage.marker_file = entry.join(VOLUME_MARKER_FILE_NAME);
+        fs::write(
+            actual.join(VOLUME_MARKER_FILE_NAME),
+            format!("{}\n", config.storage.expected_volume_marker),
+        )
+        .unwrap();
+
+        let identity_root = resolve_development_storage_root(&mut config).unwrap();
+        let resolved = actual.canonicalize().unwrap();
+        let expected_identity_root = entry
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(entry.file_name().unwrap());
+        let probe = DevelopmentDirectoryProbe::new(&config, identity_root.clone());
+        let before = probe.probe();
+        fs::remove_file(&entry).unwrap();
+        symlink(&other, &entry).unwrap();
+        let after = probe.probe();
+
+        assert_eq!(config.storage.mount_path, resolved);
+        assert_eq!(identity_root, expected_identity_root);
+        assert_eq!(
+            config.storage.marker_file,
+            resolved.join(VOLUME_MARKER_FILE_NAME)
+        );
+        assert_eq!(before.condition, MountProbeCondition::Ready);
+        assert_eq!(after.condition, MountProbeCondition::Ready);
+        assert_eq!(before.mount_identity_digest, after.mount_identity_digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_runtime_identity_matches_legacy_canonical_path() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let actual_parent = directory.path().join("actual-parent");
+        let linked_parent = directory.path().join("linked-parent");
+        let actual = actual_parent.join("volume");
+        let entry = linked_parent.join("volume");
+        fs::create_dir(&actual_parent).unwrap();
+        fs::create_dir(&actual).unwrap();
+        symlink(&actual_parent, &linked_parent).unwrap();
+        let mut config = test_config(directory.path(), directory.path().join("bootstrap-token"));
+        config.storage.mount_path = entry.clone();
+        config.storage.marker_file = entry.join(VOLUME_MARKER_FILE_NAME);
+
+        let identity_root = resolve_development_storage_root(&mut config).unwrap();
+        let legacy_canonical_root = entry.canonicalize().unwrap();
+
+        assert_eq!(identity_root, legacy_canonical_root);
+        assert_eq!(config.storage.mount_path, legacy_canonical_root);
     }
 
     #[tokio::test]
