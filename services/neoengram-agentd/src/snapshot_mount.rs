@@ -690,6 +690,9 @@ mod platform {
         #[cfg(target_os = "macos")]
         let options = {
             let mut options = options;
+            // FSKit issues bootstrap requests such as STATFS as uid 0 before the mount is live.
+            // fuser still enforces RootAndOwner in userspace when this maps to allow_other.
+            options.push(MountOption::AllowRoot);
             options.push(MountOption::CUSTOM("backend=fskit".to_owned()));
             options.push(MountOption::CUSTOM("quiet".to_owned()));
             options
@@ -1280,10 +1283,12 @@ mod platform {
         #[cfg(target_os = "macos")]
         use neoengram_agent::AgentErrorCode;
 
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        use super::snapshot_mount_options;
+
         #[cfg(target_os = "macos")]
         use super::{
-            classify_macos_mount_error, macos_mount_line_matches, snapshot_mount_options,
-            MACFUSE_FSKIT_UNAVAILABLE,
+            classify_macos_mount_error, macos_mount_line_matches, MACFUSE_FSKIT_UNAVAILABLE,
         };
 
         #[test]
@@ -1295,12 +1300,21 @@ mod platform {
         #[test]
         fn macos_snapshot_mount_uses_fskit_backend() {
             let options = snapshot_mount_options();
+            assert!(options.contains(&fuser::MountOption::AllowRoot));
             assert!(options.iter().any(
                 |option| matches!(option, fuser::MountOption::CUSTOM(value) if value == "backend=fskit")
             ));
             assert!(options.iter().any(
                 |option| matches!(option, fuser::MountOption::CUSTOM(value) if value == "quiet")
             ));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_snapshot_mount_does_not_require_allow_other() {
+            let options = snapshot_mount_options();
+            assert!(!options.contains(&fuser::MountOption::AllowRoot));
+            assert!(!options.contains(&fuser::MountOption::AllowOther));
         }
 
         #[cfg(target_os = "macos")]
