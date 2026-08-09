@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Render a copy with an external Secret manager/provisioner before applying. The checked-in
+# resources are intentionally example-only and contain no usable activation material.
+resources:
+  - configmap.yaml
+  - secret.example.yaml
+  - activation-secret.example.yaml
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+  - networkpolicy.yaml

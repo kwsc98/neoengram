@@ -2,7 +2,7 @@
 
 [`neoengram-api.yaml`](neoengram-api.yaml) 是面向用户、CLI 和 UI 的公开 API 设计契约。
 `neoengramd` 保持 library-only，独立的 `neoengram-server` 使用 Fusen 0.9.0 提供可监听 HTTP server。
-默认配置注册当前已实现的 system、Tenant、StorageVolume、Artifact、Playground 和 Job
+默认配置注册当前已实现的 system、Tenant、StorageVolume、Artifact、Playground、Snapshot 和 Job
 action API：
 
 ```text
@@ -35,10 +35,33 @@ POST /api/job/query
 POST /api/job/add/finalize
 ```
 
+Gateway 控制面管理接口已加入同一 Fusen listener。它们是 operator/管理 API，不是数据面或 Agent
+业务帧入口；调用需要 `gateway.manage` 权限。Replica activation 响应中的 activation token 只展示
+一次，Gateway 不保存明文 token：
+
+```text
+POST /api/gateway/pool/create
+POST /api/gateway/pool/query
+POST /api/gateway/pool/list/query
+POST /api/gateway/pool/update
+POST /api/gateway/pool/drain
+POST /api/gateway/replica/create
+POST /api/gateway/replica/activate
+POST /api/gateway/replica/list/query
+POST /api/gateway/replica/drain
+POST /api/gateway/replica/revoke
+```
+
+这些接口只管理 Central 权威的 GatewayPool/Replica 状态、证书激活和排空；它们不让 Gateway 挂载
+Volume，也不把 Gateway 变成 metadata 或 Chunk authority。跨集群 Transfer 和只读 S3 API 尚未注册，
+分别属于后续 G2/G3 里程碑。
+
 启用 Agent enrollment 时，同一 Fusen 用户 listener 还注册 token create、enrollment list/query、approve
-和 reject 五个公开管理接口。独立 Hyper listener 由另一份 OpenAPI 3.1 契约
-[`neoengram-agent-api.yaml`](neoengram-agent-api.yaml) 定义；它不是公开 Web API。Agent 契约同样采用
-模块/子域/动作命名，全部使用 POST，所有资源 ID 均位于 JSON body：
+和 reject 五个公开管理接口。另一份 OpenAPI 3.1 契约
+[`neoengram-agent-api.yaml`](neoengram-agent-api.yaml) 定义 Gateway 内部转发使用的 Agent action
+边界；它不是公开 Web API。生产目标中 Agent 只连接本集群 Gateway，Central 不暴露 Agent listener。
+`--agent-bind` 对应的独立 Hyper listener 仅限 loopback 迁移测试。Agent 契约同样采用模块/子域/动作
+命名，全部使用 POST，所有资源 ID 均位于 JSON body：
 
 ```text
 POST /agent/enrollment/bootstrap
@@ -54,11 +77,12 @@ POST /agent/job/index/page/query
 POST /agent/session/close
 ```
 
-对象字节不会进入 Agent listener。Agent 将不可变 Chunk 直接持久化到获批 StorageVolume 的
-Volume-local CAS，只通过 MetadataBatch 上报 Manifest、IndexDelta 和带 Placement 的 ObjectReceipt。
+对象字节不会进入 Gateway/Central 控制链路。Agent 将不可变 Chunk 直接持久化到获批 StorageVolume
+的 Volume-local CAS，只通过 MetadataBatch 上报 Manifest、IndexDelta 和带 Placement 的 ObjectReceipt。
 
-公开契约中的 Project、Artifact Commit graph/diff 和 Snapshot operation 仍是目标契约，不表示
-当前 Server 已经注册；Web 必须按 `/api/system/version/query` 返回的 capability 隐藏这些入口。
+公开契约中的 Project、Artifact commit diff，以及 Snapshot delivery/file/activity/profile 等 operation
+仍是目标契约，不表示当前 Server 已经注册；Artifact commit graph 与 Snapshot list/query/create
+基础 action 已注册。Web 必须按 `/api/system/version/query` 返回的 capability 隐藏未注册入口。
 
 业务接口使用外部 OIDC/JWKS Bearer JWT 和服务端 RBAC，无法确认身份或授权时默认拒绝。SQLite
 运行模式只支持单副本；生产 TLS 由 Ingress/反向代理终止。

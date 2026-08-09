@@ -31,7 +31,7 @@ use tokio::runtime::Handle;
 
 use crate::{
     AgentDaemonError, AgentDaemonResult, AgentRequestSigner, AgentSessionClient, AgentSessionFence,
-    AuthoritativeIndexSnapshot, ExecutionBridge, SnapshotMountManager,
+    AuthoritativeIndexSnapshot, CentralCommandTrustBundle, ExecutionBridge, SnapshotMountManager,
     WorkspaceMaterializationFile, WorkspaceMaterializationSnapshot, WorkspaceMaterializer,
 };
 
@@ -747,6 +747,7 @@ pub struct AgentSessionTransport<C> {
     processor: Arc<dyn AgentMessageProcessor>,
     fence: SharedSessionFence,
     resource_version: SharedResourceVersion,
+    command_trust_bundle: Option<Arc<CentralCommandTrustBundle>>,
 }
 
 impl<C> std::fmt::Debug for AgentSessionTransport<C> {
@@ -757,6 +758,10 @@ impl<C> std::fmt::Debug for AgentSessionTransport<C> {
             .field("signer", &self.signer)
             .field("fence", &self.fence)
             .field("resource_version", &self.resource_version.get().ok())
+            .field(
+                "command_verification_enabled",
+                &self.command_trust_bundle.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -801,7 +806,15 @@ impl<C: AgentSessionClient> AgentSessionTransport<C> {
             processor,
             fence,
             resource_version,
+            command_trust_bundle: None,
         }
+    }
+
+    /// Enables fail-closed Central signature verification for polled Assignment/Decision messages.
+    #[must_use]
+    pub fn with_command_trust_bundle(mut self, bundle: Arc<CentralCommandTrustBundle>) -> Self {
+        self.command_trust_bundle = Some(bundle);
+        self
     }
 
     #[must_use]
@@ -890,6 +903,7 @@ impl<C: AgentSessionClient> AgentSessionTransport<C> {
                 request_id: None,
                 trace_id: None,
                 sent_at_unix_ms: queued_report.enqueued_at_unix_ms,
+                central_signature: None,
                 message: queued_report.report.into_control_message(),
                 extensions: Extensions::new(),
             };
@@ -945,6 +959,12 @@ impl<C: AgentSessionClient> AgentSessionTransport<C> {
                 return Err(AgentDaemonError::Session(
                     "center returned a message for another session generation".to_owned(),
                 ));
+            }
+            if let Some(bundle) = &self.command_trust_bundle {
+                bundle.verify_envelope_if_command(
+                    envelope,
+                    UnixMillis::new(system_now().map_err(session_error)?),
+                )?;
             }
             match &envelope.message {
                 ControlMessage::Assignment(assignment) => {

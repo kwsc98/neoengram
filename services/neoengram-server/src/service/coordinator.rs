@@ -2369,6 +2369,7 @@ mod tests {
             },
             decision_audit_event: None,
             storage_enrollment: StorageEnrollmentMetadata::default(),
+            workload_certificate: None,
         }
     }
 

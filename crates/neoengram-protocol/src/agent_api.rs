@@ -7,11 +7,12 @@ use crate::validation::{
 use crate::{
     domain_separated_jcs_bytes, jcs_blake3, AgentBootId, AgentBootstrapProof, AgentHeartbeat,
     AgentId, AgentInstallationId, AgentMountIdentityDigest, AgentMountStatusReport,
-    ControlEnvelope, ControlError, ControlMessage, DecimalU64, Extensions, IndexDeltaRecord,
-    JobAssignment, JobDecision, JobId, MessageId, MetadataBatchDescriptor, MetadataBatchPage,
-    ProtocolError, ProtocolResult, ProtocolVersion, RequestId, ResourceVersion, SequenceNumber,
-    SessionGeneration, SessionId, TenantId, UnixMillis, WireChunkRef, WireChunkingStrategy,
-    WireIndexVersion, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE, PROTOCOL_VERSION_V1,
+    CentralSignedPayload, ControlEnvelope, ControlError, ControlMessage, DecimalU64, Extensions,
+    IndexDeltaRecord, JobAssignment, JobDecision, JobId, MessageId, MetadataBatchDescriptor,
+    MetadataBatchPage, ProtocolError, ProtocolResult, ProtocolVersion, RequestId, ResourceVersion,
+    SequenceNumber, SessionGeneration, SessionId, TenantId, UnixMillis, WireChunkRef,
+    WireChunkingStrategy, WireIndexVersion, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
+    PROTOCOL_VERSION_V1,
 };
 use neoengram_core::ManifestId;
 
@@ -617,6 +618,9 @@ impl AgentChannelAck {
 /// Agent-to-Server messages carried in one NDJSON request stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "payload")]
+// Keep wire variants concrete: boxing would alter the public protocol DTO API and does not change
+// the bounded, frame-oriented transport allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum AgentChannelUpstreamMessage {
     #[serde(rename = "channel.open")]
     Open(AgentSessionOpenPayload),
@@ -862,6 +866,10 @@ pub struct AgentChannelDownstreamFrame {
     pub correlation_id: Option<MessageId>,
     pub session_generation: SessionGeneration,
     pub sent_at_unix_ms: UnixMillis,
+    /// Optional Central command signature. Assignment and Decision deliveries must carry one
+    /// when the Agent is running with a production command trust bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub central_signature: Option<CentralSignedPayload>,
     #[serde(flatten)]
     pub message: AgentChannelDownstreamMessage,
     #[serde(default, flatten)]
@@ -890,6 +898,16 @@ impl AgentChannelDownstreamFrame {
             Some(self.session_generation),
             &self.extensions,
         )?;
+        if let Some(signature) = &self.central_signature {
+            let expected = self.central_command_payload_bytes()?;
+            signature.validate()?;
+            if signature.payload.as_bytes() != expected {
+                return Err(invalid_channel_field(
+                    "central_signature",
+                    "Central command signature payload does not match the channel frame",
+                ));
+            }
+        }
         match &self.message {
             AgentChannelDownstreamMessage::Opened(payload) => {
                 if self.sequence.get() != 1 {
@@ -961,6 +979,34 @@ impl AgentChannelDownstreamFrame {
         validate_channel_encoded_size(self)
     }
 
+    /// Returns the canonical unsigned bytes that Central signs for an Assignment or Decision
+    /// channel delivery. The Gateway may relay these bytes but must not reconstruct them.
+    pub fn central_command_payload_bytes(&self) -> ProtocolResult<Vec<u8>> {
+        if !matches!(
+            &self.message,
+            AgentChannelDownstreamMessage::Assignment(_)
+                | AgentChannelDownstreamMessage::Decision(_)
+        ) {
+            return Err(invalid_channel_field(
+                "message",
+                "only Assignment and Decision frames may carry a Central signature",
+            ));
+        }
+        domain_separated_jcs_bytes(
+            "neoengram-central-command-channel-v1",
+            &CentralChannelCommandSigningInput {
+                protocol_version: self.protocol_version,
+                sequence: self.sequence,
+                message_id: &self.message_id,
+                correlation_id: self.correlation_id.as_ref(),
+                session_generation: self.session_generation,
+                sent_at_unix_ms: self.sent_at_unix_ms,
+                message: &self.message,
+                extensions: &self.extensions,
+            },
+        )
+    }
+
     pub fn validate_sequence_after(&self, previous: Option<SequenceNumber>) -> ProtocolResult<()> {
         validate_next_channel_sequence(self.sequence, previous)
     }
@@ -975,6 +1021,19 @@ impl AgentChannelDownstreamFrame {
             ))
         }
     }
+}
+
+#[derive(Serialize)]
+struct CentralChannelCommandSigningInput<'a> {
+    protocol_version: ProtocolVersion,
+    sequence: SequenceNumber,
+    message_id: &'a MessageId,
+    correlation_id: Option<&'a MessageId>,
+    session_generation: SessionGeneration,
+    sent_at_unix_ms: UnixMillis,
+    message: &'a AgentChannelDownstreamMessage,
+    #[serde(flatten)]
+    extensions: &'a Extensions,
 }
 
 /// Incremental LF boundary decoder. It deliberately ignores HTTP/2 DATA frame boundaries.
@@ -1106,6 +1165,7 @@ fn validate_channel_frame_common(
             "correlation_id",
             "session_generation",
             "sent_at_unix_ms",
+            "central_signature",
             "proof",
             "type",
             "payload",
@@ -1290,6 +1350,58 @@ mod tests {
         frame
     }
 
+    fn central_decision_frame() -> AgentChannelDownstreamFrame {
+        AgentChannelDownstreamFrame {
+            protocol_version: PROTOCOL_VERSION_V1,
+            sequence: SequenceNumber::new(7),
+            message_id: MessageId::new("central-decision-message-1").unwrap(),
+            correlation_id: None,
+            session_generation: SessionGeneration::new(3),
+            sent_at_unix_ms: UnixMillis::new(300),
+            central_signature: None,
+            message: AgentChannelDownstreamMessage::Decision(JobDecision {
+                job_id: JobId::new("central-decision-job-1").unwrap(),
+                assignment_id: crate::AssignmentId::new("central-decision-assignment-1").unwrap(),
+                assignment_generation: crate::AssignmentGeneration::new(2),
+                decision_generation: crate::DecisionGeneration::new(4),
+                decision: crate::PublishDecision::Publish {
+                    published_index_version: WireIndexVersion {
+                        revision: crate::IndexRevision::new(5),
+                        digest: ContentDigest::from_bytes([0x45; 32]),
+                        extensions: Extensions::new(),
+                    },
+                    extensions: Extensions::new(),
+                },
+                final_state: crate::JobState::Succeeded,
+                extensions: Extensions::new(),
+            }),
+            extensions: Extensions::new(),
+        }
+    }
+
+    fn sign_downstream_command(frame: &mut AgentChannelDownstreamFrame, key_pair: &Ed25519KeyPair) {
+        let payload =
+            crate::GatewayOpaqueBytes::new(frame.central_command_payload_bytes().unwrap()).unwrap();
+        let mut signature = CentralSignedPayload {
+            key_id: "central-channel-key-test".to_owned(),
+            certificate_generation: crate::CertificateGeneration::new(2),
+            signed_at_unix_ms: UnixMillis::new(300),
+            expires_at_unix_ms: UnixMillis::new(400),
+            payload_digest: ContentDigest::hash(payload.as_bytes()),
+            payload,
+            signature: Ed25519Signature::from_bytes([0; 64]),
+            extensions: Extensions::new(),
+        };
+        signature.signature = Ed25519Signature::new(
+            key_pair
+                .sign(&signature.signing_bytes().unwrap())
+                .as_ref()
+                .to_vec(),
+        )
+        .unwrap();
+        frame.central_signature = Some(signature);
+    }
+
     #[test]
     fn proof_binds_path_and_every_unsigned_request_member() {
         let document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
@@ -1448,6 +1560,55 @@ mod tests {
     }
 
     #[test]
+    fn downstream_central_signature_binds_canonical_channel_delivery() {
+        let document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key_pair = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
+        let public_key = Ed25519PublicKeySpki::from_public_key_bytes(
+            key_pair.public_key().as_ref().try_into().unwrap(),
+        );
+        let mut frame = central_decision_frame();
+        frame.validate().unwrap();
+        let payload = frame.central_command_payload_bytes().unwrap();
+        assert!(payload.starts_with(b"neoengram-central-command-channel-v1\0"));
+        assert_eq!(
+            ContentDigest::hash(&payload).to_string(),
+            "1e2b7f497b8df1a84f1ac0c0dacf13bf2e3ee3390c29db2b621f6a0c42ea9bc3"
+        );
+        sign_downstream_command(&mut frame, &key_pair);
+        frame.validate().unwrap();
+        frame
+            .central_signature
+            .as_ref()
+            .unwrap()
+            .verify(&public_key)
+            .unwrap();
+
+        let mut tampered = frame.clone();
+        tampered.sequence = SequenceNumber::new(8);
+        assert!(tampered.validate().is_err());
+        let mut tampered = frame.clone();
+        tampered.session_generation = SessionGeneration::new(4);
+        assert!(tampered.validate().is_err());
+        let mut tampered = frame.clone();
+        let AgentChannelDownstreamMessage::Decision(decision) = &mut tampered.message else {
+            panic!("expected Decision frame");
+        };
+        decision.decision_generation = crate::DecisionGeneration::new(5);
+        assert!(tampered.validate().is_err());
+
+        let mut tampered = frame;
+        tampered.central_signature.as_mut().unwrap().signature =
+            Ed25519Signature::from_bytes([0; 64]);
+        tampered.validate().unwrap();
+        assert!(tampered
+            .central_signature
+            .as_ref()
+            .unwrap()
+            .verify(&public_key)
+            .is_err());
+    }
+
+    #[test]
     fn channel_ndjson_decoder_ignores_h2_data_boundaries() {
         let document = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
         let key_pair = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
@@ -1493,6 +1654,7 @@ mod tests {
             correlation_id: Some(MessageId::new("heartbeat-a").unwrap()),
             session_generation: SessionGeneration::new(3),
             sent_at_unix_ms: UnixMillis::new(20),
+            central_signature: None,
             message: AgentChannelDownstreamMessage::Ack(AgentChannelAck {
                 acknowledged_sequence: SequenceNumber::new(2),
                 resource_version: ResourceVersion::new(9),

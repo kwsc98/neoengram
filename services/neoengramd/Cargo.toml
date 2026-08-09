@@ -21,6 +21,7 @@ neoengram-protocol = { path = "../../crates/neoengram-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, optional = true }
+url = "2.5"
 
 [dev-dependencies]
 ring = "0.17.14"

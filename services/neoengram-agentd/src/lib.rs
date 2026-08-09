@@ -6,6 +6,7 @@
 mod approved_runtime;
 mod backoff;
 mod client;
+mod command_trust;
 mod config;
 mod durability;
 mod error;
@@ -18,9 +19,11 @@ mod session_client;
 mod session_runtime;
 mod snapshot_mount;
 mod status_clock;
+mod tls;
 
 pub use backoff::EnrollmentBackoff;
 pub use client::{EnrollmentClient, EnrollmentClientError, ReqwestEnrollmentClient};
+pub use command_trust::CentralCommandTrustBundle;
 pub use config::{
     AgentConfig, LoggingConfig, LoggingFormat, PvcReference, RegistrationConfig, SessionConfig,
     StorageAccessMode, StorageBackendType, StorageConfig,

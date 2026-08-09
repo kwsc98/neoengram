@@ -9,13 +9,13 @@ use crate::validation::{
     validate_nonempty_limited, validate_positive, CONTENT_DIGEST_PATTERN,
 };
 use crate::{
-    AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
-    ComputeNodeId, DecimalU64, DecisionGeneration, EdgeClusterId, Extensions, FencingToken, JobId,
-    LeaseId, MessageId, MetadataBatchDescriptor, MountGeneration, OwnerGeneration,
-    PlacementGeneration, PrincipalId, ProjectId, ProtocolError, ProtocolResult, ProtocolVersion,
-    RequestId, ResourceVersion, SessionGeneration, SnapshotId, StorageVolumeId, TenantId, TraceId,
-    UnixMillis, WireIndexVersion, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
-    PROTOCOL_VERSION_V1,
+    domain_separated_jcs_bytes, AgentId, AgentMountId, ArtifactId, ArtifactPlacementId,
+    AssignmentGeneration, AssignmentId, CentralSignedPayload, ComputeNodeId, DecimalU64,
+    DecisionGeneration, EdgeClusterId, Extensions, FencingToken, JobId, LeaseId, MessageId,
+    MetadataBatchDescriptor, MountGeneration, OwnerGeneration, PlacementGeneration, PrincipalId,
+    ProjectId, ProtocolError, ProtocolResult, ProtocolVersion, RequestId, ResourceVersion,
+    SessionGeneration, SnapshotId, StorageVolumeId, TenantId, TraceId, UnixMillis,
+    WireIndexVersion, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE, PROTOCOL_VERSION_V1,
 };
 
 /// One control-stream frame. `message.type` is flattened to the top-level JSON object.
@@ -32,6 +32,11 @@ pub struct ControlEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<TraceId>,
     pub sent_at_unix_ms: UnixMillis,
+    /// Optional Central KMS/HSM-backed signature. It is required by production Agent runtimes for
+    /// Assignment and Decision messages; development transports may omit it while no signer is
+    /// configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub central_signature: Option<CentralSignedPayload>,
     #[serde(flatten)]
     pub message: ControlMessage,
     #[serde(default, flatten)]
@@ -84,11 +89,23 @@ impl ControlEnvelope {
                 "request_id",
                 "trace_id",
                 "sent_at_unix_ms",
+                "central_signature",
                 "type",
                 "payload",
             ],
         )?;
         self.message.validate()?;
+        if let Some(signature) = &self.central_signature {
+            let expected = self.central_command_payload_bytes()?;
+            signature.validate()?;
+            if signature.payload.as_bytes() != expected {
+                return Err(ProtocolError::InvalidField {
+                    field: "central_signature",
+                    reason: "Central command signature payload does not match the envelope"
+                        .to_owned(),
+                });
+            }
+        }
         let encoded = serde_json::to_vec(self)?;
         if encoded.len() > MAX_CONTROL_MESSAGE_BYTES {
             return Err(ProtocolError::LimitExceeded {
@@ -99,6 +116,50 @@ impl ControlEnvelope {
         }
         Ok(())
     }
+
+    /// Returns the canonical, unsigned bytes that Central signs for an Assignment or Decision.
+    /// The bytes intentionally exclude `central_signature` itself and include all routing/fence
+    /// fields that an intermediary could otherwise alter.
+    pub fn central_command_payload_bytes(&self) -> ProtocolResult<Vec<u8>> {
+        if !matches!(
+            &self.message,
+            ControlMessage::Assignment(_) | ControlMessage::Decision(_)
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "message",
+                reason: "only Assignment and Decision messages may carry a Central signature"
+                    .to_owned(),
+            });
+        }
+        domain_separated_jcs_bytes(
+            "neoengram-central-command-v1",
+            &CentralCommandSigningInput {
+                protocol_version: self.protocol_version,
+                message_id: &self.message_id,
+                session_generation: self.session_generation,
+                resource_version: self.resource_version,
+                request_id: self.request_id.as_ref(),
+                trace_id: self.trace_id.as_ref(),
+                sent_at_unix_ms: self.sent_at_unix_ms,
+                message: &self.message,
+                extensions: &self.extensions,
+            },
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct CentralCommandSigningInput<'a> {
+    protocol_version: ProtocolVersion,
+    message_id: &'a MessageId,
+    session_generation: SessionGeneration,
+    resource_version: Option<ResourceVersion>,
+    request_id: Option<&'a RequestId>,
+    trace_id: Option<&'a TraceId>,
+    sent_at_unix_ms: UnixMillis,
+    message: &'a ControlMessage,
+    #[serde(flatten)]
+    extensions: &'a Extensions,
 }
 
 /// All v1 messages carried by the bidirectional control stream.
@@ -1543,6 +1604,10 @@ impl JobState {
 
 #[cfg(test)]
 mod tests {
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
     use serde_json::json;
 
     use super::*;
@@ -1684,6 +1749,52 @@ mod tests {
         assignment
     }
 
+    fn central_assignment_envelope() -> ControlEnvelope {
+        let operation = canonical_add_operation();
+        let request_digest = operation.request_digest().unwrap();
+        let assignment = assignment_for(&operation, request_digest);
+        ControlEnvelope {
+            protocol_version: PROTOCOL_VERSION_V1,
+            message_id: MessageId::new("central-command-message-1").unwrap(),
+            session_generation: SessionGeneration::new(4),
+            resource_version: Some(ResourceVersion::new(9)),
+            request_id: Some(RequestId::new("central-command-request-1").unwrap()),
+            trace_id: Some(TraceId::new("central-command-trace-1").unwrap()),
+            sent_at_unix_ms: UnixMillis::new(100),
+            central_signature: None,
+            message: ControlMessage::Assignment(Box::new(JobAssignment {
+                assignment: AssignmentOperation::Add {
+                    input: assignment,
+                    extensions: Extensions::new(),
+                },
+                extensions: Extensions::new(),
+            })),
+            extensions: Extensions::new(),
+        }
+    }
+
+    fn sign_central_payload(payload: Vec<u8>, key_pair: &Ed25519KeyPair) -> CentralSignedPayload {
+        let payload = crate::GatewayOpaqueBytes::new(payload).unwrap();
+        let mut signed = CentralSignedPayload {
+            key_id: "central-key-test".to_owned(),
+            certificate_generation: crate::CertificateGeneration::new(1),
+            signed_at_unix_ms: UnixMillis::new(100),
+            expires_at_unix_ms: UnixMillis::new(200),
+            payload_digest: ContentDigest::hash(payload.as_bytes()),
+            payload,
+            signature: crate::Ed25519Signature::from_bytes([0; 64]),
+            extensions: Extensions::new(),
+        };
+        signed.signature = crate::Ed25519Signature::new(
+            key_pair
+                .sign(&signed.signing_bytes().unwrap())
+                .as_ref()
+                .to_vec(),
+        )
+        .unwrap();
+        signed
+    }
+
     #[test]
     fn add_operation_digest_has_a_stable_jcs_golden_vector() {
         assert_eq!(
@@ -1693,6 +1804,61 @@ mod tests {
                 .to_string(),
             "9afc191146651a38b3162d79f95699b5060ef4f1df53996cae3f19bc5f7b8866"
         );
+    }
+
+    #[test]
+    fn central_command_payload_is_canonical_and_binds_every_envelope_field() {
+        let mut envelope = central_assignment_envelope();
+        envelope.validate().unwrap();
+        let payload = envelope.central_command_payload_bytes().unwrap();
+        assert!(payload.starts_with(b"neoengram-central-command-v1\0"));
+        assert_eq!(
+            ContentDigest::hash(&payload).to_string(),
+            "fa1f6cd78fa166c8bc3b0b33d78c64b38abef2e1e53c72d85d048cba7c11d2b0"
+        );
+
+        // JCS sorts extension members independently of insertion order.
+        let mut first = envelope.clone();
+        first.extensions.insert("z_extension".to_owned(), json!(1));
+        first.extensions.insert("a_extension".to_owned(), json!(2));
+        let mut second = envelope.clone();
+        second.extensions.insert("a_extension".to_owned(), json!(2));
+        second.extensions.insert("z_extension".to_owned(), json!(1));
+        assert_eq!(
+            first.central_command_payload_bytes().unwrap(),
+            second.central_command_payload_bytes().unwrap()
+        );
+
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let key_pair = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
+        let public_key = crate::Ed25519PublicKeySpki::from_public_key_bytes(
+            key_pair.public_key().as_ref().try_into().unwrap(),
+        );
+        envelope.central_signature = Some(sign_central_payload(payload, &key_pair));
+        envelope.validate().unwrap();
+        envelope
+            .central_signature
+            .as_ref()
+            .unwrap()
+            .verify(&public_key)
+            .unwrap();
+
+        let mut tampered = envelope.clone();
+        tampered.sent_at_unix_ms = UnixMillis::new(101);
+        assert!(tampered.validate().is_err());
+        let mut tampered = envelope.clone();
+        tampered.extensions.insert("future".to_owned(), json!(true));
+        assert!(tampered.validate().is_err());
+        let mut tampered = envelope;
+        tampered.central_signature.as_mut().unwrap().signature =
+            crate::Ed25519Signature::from_bytes([0; 64]);
+        tampered.validate().unwrap();
+        assert!(tampered
+            .central_signature
+            .as_ref()
+            .unwrap()
+            .verify(&public_key)
+            .is_err());
     }
 
     #[test]
@@ -1750,6 +1916,7 @@ mod tests {
             request_id: None,
             trace_id: None,
             sent_at_unix_ms: UnixMillis::new(10),
+            central_signature: None,
             message: ControlMessage::Assignment(Box::new(JobAssignment {
                 assignment: AssignmentOperation::WorkspaceMaterialize {
                     input: input.clone(),
@@ -1805,6 +1972,7 @@ mod tests {
             request_id: None,
             trace_id: None,
             sent_at_unix_ms: UnixMillis::new(10),
+            central_signature: None,
             message: ControlMessage::Assignment(Box::new(JobAssignment {
                 assignment: AssignmentOperation::SnapshotMount {
                     input: input.clone(),
@@ -1854,6 +2022,7 @@ mod tests {
             request_id: None,
             trace_id: None,
             sent_at_unix_ms: UnixMillis::new(1235),
+            central_signature: None,
             message: ControlMessage::Failed(test_job_failed()),
             extensions: Extensions::new(),
         };

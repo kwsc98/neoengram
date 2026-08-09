@@ -1,5 +1,10 @@
 # format v8 存储架构
 
+> 本文同时记录当前 format v8/Managed 存储实现和已确认的 Synapse Gateway 目标边界。
+> Gateway Registry、管理面、H2/mTLS 控制 tunnel 和一跳 Replica forwarding 已进入 G1，但跨集群对象传输与 S3 尚未实现，
+> Gateway 也没有任何 Volume/CAS I/O 能力；其专项设计见
+> [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。
+
 NeoEngram `0.2.0` 的本地仓库格式是 v8。开发期升级允许破坏兼容性：实现明确拒绝 v7 和其他旧
 格式，不读取、不迁移，也不提供自动回退。format v8 将可移植内容模型和规范 digest 收敛到
 `neoengram-core`，把本地 SQLite/文件系统实现留在 `neoengram-standalone` 与 `neoengram-fs`。
@@ -83,8 +88,9 @@ Managed 模式使用不同的权威边界：
   Assignment 的 Tenant、Artifact、StorageVolume、ArtifactPlacement 和 `placement_generation`；
 - Agent 的 identity、Ledger、outbound 和 candidate 位于独立 `state_dir`，不得在业务 Volume 上创建
   SQLite/WAL；状态盘丢失不会删除 Volume 中的业务对象；
-- 当前 P0 不实现跨 Volume 对象复制、强 storage-side fencing 或生产数据库。未来复制由
-  Agent/Gateway 数据通道在用户 Volume 之间完成，Server 仍只下发计划和记录凭证。
+- 当前 P0 不实现跨 Volume 对象复制、强 storage-side fencing、Synapse Gateway payload 数据链或生产数据库。目标
+  复制链路固定为源 Agent -> 源 GatewayPool -> 目标 GatewayPool -> 目标 Agent；Server 仍只下发计划
+  和记录凭证，不进入 payload 路径。
 
 Managed Add 的固定发布闭环为：
 
@@ -100,7 +106,7 @@ PrepareAdd
 -> decision / finalized 幂等确认
 ```
 
-对象 payload 不经过 Agent listener 或 `neoengramd` API 进程。只有所有所需对象均有当前 Assignment
+对象 payload 不经过 Central/Gateway 控制 listener 或 `neoengramd` API 进程。只有所有所需对象均有当前 Assignment
 精确 Volume/placement generation 的有效凭证、批次页完整且 digest/资源 scope/base version 全部通过，
 中心才可执行 CAS。`ObjectReceipt` 是已审批 Agent 对 Volume 中指定对象执行完整性与耐久化
 校验的证据，不包含物理路径或 payload。`JobPrepared.publication_digest` 绑定
@@ -111,6 +117,25 @@ Manifest 通过带十进制 `chunk_start` 的 fragment 跨页；单页只校验�
 chunk ordinal 重组，拒绝缺口、重复和 metadata 变化，再复算完整 canonical Manifest ID。成功
 publisher 在同一原子边界持久化这些 canonical Manifests 与新 IndexVersion，因此 staging TTL 清理后
 Index 仍可解析；Conflict/Rejected 不发布候选 Manifest。
+
+### Synapse Gateway 存储边界
+
+2026-08-09 已确认每个 EdgeCluster 使用一个多副本 GatewayPool 作为控制入口和后续数据/S3 入口。
+这项网络拓扑调整不改变任何存储权威：
+
+- Gateway Replica 不挂载业务 PVC、NFS export 或 StorageVolume；
+- Gateway 不读取或写入 Volume CAS、Playground、journal、Agent Ledger 或 candidate database；
+- 所有 Manifest 驱动的 Chunk I/O、Hash 复核、`fsync`、durability barrier 和原子发布仍在 Volume
+  Owner Agent 执行；
+- Gateway 的多副本和跨 Replica forwarding 只提供入口可用性，不构成对象或 metadata 副本；
+- Gateway 可以流式转发后续的跨集群对象和只读 S3 响应，但不得把 payload 缓存为可恢复业务副本；
+- Central `ObjectCatalog` 仍只接受 Agent 的签名 placement evidence，不能用“流量经过 Gateway”替代
+  Volume durability 证明；
+- GatewayPool 整体不可用时，控制/传输/S3 失败关闭，本地 Volume 数据和已完成 durability 的对象不受损。
+
+后续只读 S3 是 Gateway 暴露固定 Commit/Snapshot 的访问协议，不是 `ObjectStoreKind`、中心归档后端或
+新的 durability authority。S3 `LIST` 查询 Central metadata，`GET`/Range 由 owning Agent 根据 Manifest
+读取 Volume CAS；内部对象目录不映射为公开 Bucket 或 Key。
 
 ## 一致性、锁与 mutation
 

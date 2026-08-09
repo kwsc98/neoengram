@@ -391,6 +391,16 @@
         "bootstrap_request_id": {
           "$ref": "#/$defs/RequestId"
         },
+        "certificate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentWorkloadCertificateBundle"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "enrollment_id": {
           "$ref": "#/$defs/AgentEnrollmentId"
         },
@@ -665,6 +675,100 @@
       "enum": [
         "ed25519"
       ]
+    },
+    "AgentWorkloadCertificateBundle": {
+      "description": "Versioned, Central-issued Agent mTLS credential delivered with approved enrollment status.\n\nThe identity URI and all generation fields are signed by the enclosing HTTPS/mTLS channel and\nare checked against the Agent's configured cluster and persisted Ed25519 public key before the\ncertificate is installed. Certificate bytes are public material; the private key never leaves\nthe Agent's durable identity store.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "certificate_bundle_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "certificate_generation": {
+          "$ref": "#/$defs/CertificateGeneration"
+        },
+        "edge_cluster_id": {
+          "$ref": "#/$defs/EdgeClusterId"
+        },
+        "enrollment_id": {
+          "$ref": "#/$defs/AgentEnrollmentId"
+        },
+        "identity_uri": {
+          "type": "string",
+          "maxLength": 512,
+          "minLength": 1
+        },
+        "issuer_chain_der": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentWorkloadCertificateDer"
+          }
+        },
+        "leaf_certificate_der": {
+          "$ref": "#/$defs/AgentWorkloadCertificateDer"
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "not_after_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "not_before_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "owner_generation": {
+          "$ref": "#/$defs/OwnerGeneration"
+        },
+        "public_key_fingerprint": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "renew_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "session_generation": {
+          "$ref": "#/$defs/SessionGeneration"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "certificate_bundle_version",
+        "edge_cluster_id",
+        "agent_id",
+        "enrollment_id",
+        "identity_uri",
+        "public_key_fingerprint",
+        "certificate_generation",
+        "session_generation",
+        "mount_generation",
+        "owner_generation",
+        "not_before_unix_ms",
+        "not_after_unix_ms",
+        "renew_at_unix_ms",
+        "leaf_certificate_der",
+        "issuer_chain_der"
+      ]
+    },
+    "AgentWorkloadCertificateDer": {
+      "description": "Bounded DER bytes transported in an Agent workload certificate bundle.\n\nThe wire form is canonical unpadded base64url. Keeping this wrapper separate from the much\nlarger Gateway opaque-payload type prevents an enrollment response from being used as an\nunbounded data channel.",
+      "type": "string",
+      "maxLength": 87382,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "CertificateGeneration": {
+      "description": "A certificate generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
     },
     "Ed25519PublicKeySpki": {
       "description": "Canonical RFC 8410 Ed25519 SubjectPublicKeyInfo DER, encoded as base64url without padding.",

@@ -32,9 +32,9 @@ use crate::{
     snapshot_mount::SnapshotRecoveryOutcome,
     AgentConfig, AgentDaemonError, AgentDaemonResult, AgentMessageProcessor, AgentRequestSigner,
     AgentSessionBinding, AgentSessionClient, AgentSessionClientError, AgentSessionFence,
-    AgentSigningKey, CoreAgentMessageProcessor, ExecutionBridge, FilesystemExecution, MountProbe,
-    RuntimeHealthPhase, SessionExecutionBridge, SharedResourceVersion, SharedSessionFence,
-    SnapshotMountManager, WorkspaceMaterializer,
+    AgentSigningKey, CentralCommandTrustBundle, CoreAgentMessageProcessor, ExecutionBridge,
+    FilesystemExecution, MountProbe, RuntimeHealthPhase, SessionExecutionBridge,
+    SharedResourceVersion, SharedSessionFence, SnapshotMountManager, WorkspaceMaterializer,
 };
 
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
@@ -110,12 +110,13 @@ impl Clock for RuntimeClock {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_approved_session<C, P, F>(
     config: AgentConfig,
-    client: C,
+    client: Arc<C>,
     probe: P,
     agent_id: AgentId,
     installation_id: AgentInstallationId,
     signing_key: AgentSigningKey,
     initial_resource_version: ResourceVersion,
+    command_trust_bundle: Option<Arc<CentralCommandTrustBundle>>,
     shutdown: F,
 ) -> AgentDaemonResult<()>
 where
@@ -138,7 +139,6 @@ where
         boot_id.clone(),
         signing_key,
     )?);
-    let client = Arc::new(client);
     let fence = SharedSessionFence::default();
     let resource_version = SharedResourceVersion::new(initial_resource_version);
     let reports = Arc::new(SqliteOutboundReportQueue::open(
@@ -338,6 +338,7 @@ where
             &mut dispatcher,
             &mut heartbeat_sequence,
             config.session.heartbeat_interval_seconds,
+            command_trust_bundle.as_deref(),
             &mut reporter,
         )
         .await?
@@ -570,6 +571,7 @@ impl PendingAck {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_with_backoff<C, F>(
     client: Arc<C>,
     signer: Arc<AgentRequestSigner>,
@@ -713,6 +715,7 @@ async fn run_channel<P, F>(
     dispatcher: &mut AgentWorkDispatcher,
     heartbeat_sequence: &mut u64,
     heartbeat_interval_seconds: u64,
+    command_trust_bundle: Option<&CentralCommandTrustBundle>,
     reporter: &mut HealthReporter,
 ) -> AgentDaemonResult<ChannelExit>
 where
@@ -745,12 +748,13 @@ where
                     &mut seen_commands,
                     dispatcher,
                     volume.tenant_id.clone(),
+                    command_trust_bundle,
                 ).await?;
                 send_close(channel, signer.as_ref(), &established, resource_version,
                     &mut upstream_sequence, &mut pending).await?;
                 let closed = wait_for_close_ack(channel, &mut downstream_sequence,
                     established.session_generation, reports, resource_version, &mut pending,
-                    &mut seen_commands, dispatcher).await;
+                    &mut seen_commands, dispatcher, command_trust_bundle).await;
                 if matches!(closed, Ok(ChannelExit::Shutdown)) {
                     fence.replace(None)?;
                 }
@@ -784,7 +788,7 @@ where
                 }
                 handle_downstream(frame, &mut downstream_sequence,
                     established.session_generation, reports, resource_version, &mut pending,
-                    &mut seen_commands, dispatcher).await?;
+                    &mut seen_commands, dispatcher, command_trust_bundle).await?;
             }
             _ = heartbeat.tick() => {
                 enqueue_snapshot_health_failures(snapshot_mounts, reports, snapshot_clock)?;
@@ -836,6 +840,7 @@ async fn flush_outbound_reports(
     seen_commands: &mut BTreeSet<MessageId>,
     dispatcher: &AgentWorkDispatcher,
     tenant_id: TenantId,
+    command_trust_bundle: Option<&CentralCommandTrustBundle>,
 ) -> AgentDaemonResult<()> {
     loop {
         send_queued_reports(
@@ -860,6 +865,7 @@ async fn flush_outbound_reports(
             pending,
             seen_commands,
             dispatcher,
+            command_trust_bundle,
         )
         .await?;
     }
@@ -875,6 +881,7 @@ async fn drain_pending_acks(
     pending: &mut BTreeMap<MessageId, PendingAck>,
     seen_commands: &mut BTreeSet<MessageId>,
     dispatcher: &AgentWorkDispatcher,
+    command_trust_bundle: Option<&CentralCommandTrustBundle>,
 ) -> AgentDaemonResult<()> {
     time::timeout(CHANNEL_ACTION_TIMEOUT, async {
         while !pending.is_empty() {
@@ -896,6 +903,7 @@ async fn drain_pending_acks(
                 pending,
                 seen_commands,
                 dispatcher,
+                command_trust_bundle,
             )
             .await?;
         }
@@ -970,6 +978,7 @@ async fn send_queued_reports(
             request_id: None,
             trace_id: None,
             sent_at_unix_ms: queued.enqueued_at_unix_ms,
+            central_signature: None,
             message: queued.report.clone().into_control_message(),
             extensions: Extensions::new(),
         };
@@ -1013,11 +1022,15 @@ async fn handle_downstream(
     pending: &mut BTreeMap<MessageId, PendingAck>,
     seen_commands: &mut BTreeSet<MessageId>,
     dispatcher: &AgentWorkDispatcher,
+    command_trust_bundle: Option<&CentralCommandTrustBundle>,
 ) -> AgentDaemonResult<()> {
     frame
         .validate_sequence_after(Some(*previous_sequence))
         .and_then(|()| frame.validate_session_generation(generation))
         .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+    if let Some(bundle) = command_trust_bundle {
+        bundle.verify_downstream_if_command(&frame, UnixMillis::new(now_unix_ms()?))?;
+    }
     *previous_sequence = frame.sequence;
     match frame.message {
         AgentChannelDownstreamMessage::Opened(_) => Err(AgentDaemonError::Session(
@@ -1145,6 +1158,7 @@ async fn send_close(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_close_ack(
     channel: &mut AgentChannelConnection,
     previous_sequence: &mut SequenceNumber,
@@ -1154,6 +1168,7 @@ async fn wait_for_close_ack(
     pending: &mut BTreeMap<MessageId, PendingAck>,
     seen_commands: &mut BTreeSet<MessageId>,
     dispatcher: &AgentWorkDispatcher,
+    command_trust_bundle: Option<&CentralCommandTrustBundle>,
 ) -> AgentDaemonResult<ChannelExit> {
     time::timeout(CHANNEL_ACTION_TIMEOUT, async {
         loop {
@@ -1179,6 +1194,7 @@ async fn wait_for_close_ack(
                 pending,
                 seen_commands,
                 dispatcher,
+                command_trust_bundle,
             )
             .await?;
             if is_close_ack {
@@ -1292,11 +1308,15 @@ mod tests {
     use neoengram_core::{ContentDigest, IndexVersion};
     use neoengram_protocol::{
         AgentChannelAck, AgentChannelUpstreamFrame, AgentInstallationId, AgentMountId, ArtifactId,
-        AssignmentGeneration, AssignmentId, JobId, MountGeneration, OwnerGeneration, PrincipalId,
-        PrincipalKind, PrincipalRef, ProjectId, SessionId, SnapshotId, SnapshotMountAssignment,
-        StorageVolumeId,
+        AssignmentGeneration, AssignmentId, AssignmentOperation, CentralSignedPayload,
+        CertificateGeneration, Ed25519PublicKeySpki, Ed25519Signature, GatewayOpaqueBytes,
+        JobAssignment, JobId, MountGeneration, OwnerGeneration, PrincipalId, PrincipalKind,
+        PrincipalRef, ProjectId, SessionId, SnapshotId, SnapshotMountAssignment, StorageVolumeId,
     };
-    use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair as _},
+    };
 
     use super::*;
 
@@ -1382,6 +1402,148 @@ mod tests {
         fn now_unix_ms(&self) -> AgentResult<u64> {
             Ok(self.0.fetch_add(1, Ordering::SeqCst))
         }
+    }
+
+    #[derive(Debug)]
+    struct CountingProcessor(Arc<AtomicU64>);
+
+    #[async_trait]
+    impl AgentMessageProcessor for CountingProcessor {
+        async fn handle_assignment(&self, _assignment: JobAssignment) -> AgentDaemonResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn recover_assignment(
+            &self,
+            _record: neoengram_agent::LedgerRecord,
+        ) -> AgentDaemonResult<()> {
+            Ok(())
+        }
+
+        async fn handle_decision(
+            &self,
+            _tenant_id: &TenantId,
+            _decision: JobDecision,
+        ) -> AgentDaemonResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn signed_assignment_frame(
+        key: &Ed25519KeyPair,
+        now_unix_ms: u64,
+    ) -> AgentChannelDownstreamFrame {
+        let mut frame = AgentChannelDownstreamFrame {
+            protocol_version: ProtocolVersion::V1,
+            sequence: SequenceNumber::new(2),
+            message_id: MessageId::new("signed-assignment-frame").unwrap(),
+            correlation_id: None,
+            session_generation: SessionGeneration::new(3),
+            sent_at_unix_ms: UnixMillis::new(now_unix_ms),
+            central_signature: None,
+            message: AgentChannelDownstreamMessage::Assignment(Box::new(JobAssignment {
+                assignment: AssignmentOperation::SnapshotMount {
+                    input: snapshot_assignment(),
+                    extensions: Extensions::new(),
+                },
+                extensions: Extensions::new(),
+            })),
+            extensions: Extensions::new(),
+        };
+        let payload =
+            GatewayOpaqueBytes::new(frame.central_command_payload_bytes().unwrap()).unwrap();
+        let mut signed = CentralSignedPayload {
+            key_id: "central-command-a".to_owned(),
+            certificate_generation: CertificateGeneration::new(1),
+            signed_at_unix_ms: UnixMillis::new(now_unix_ms),
+            expires_at_unix_ms: UnixMillis::new(now_unix_ms + 30_000),
+            payload_digest: ContentDigest::hash(payload.as_bytes()),
+            payload,
+            signature: Ed25519Signature::from_bytes([0; 64]),
+            extensions: Extensions::new(),
+        };
+        signed.signature =
+            Ed25519Signature::new(key.sign(&signed.signing_bytes().unwrap()).as_ref().to_vec())
+                .unwrap();
+        frame.central_signature = Some(signed);
+        frame
+    }
+
+    #[tokio::test]
+    async fn central_signature_is_checked_before_assignment_dispatch() {
+        let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap();
+        let public_key = Ed25519PublicKeySpki::from_public_key_bytes(
+            key.public_key().as_ref().try_into().unwrap(),
+        );
+        let bundle = crate::command_trust::CentralCommandTrustBundle::from_test_keys(vec![(
+            "central-command-a".to_owned(),
+            CertificateGeneration::new(1),
+            public_key,
+            crate::command_trust::TrustKeyState::Active,
+        )])
+        .unwrap();
+        let dispatched = Arc::new(AtomicU64::new(0));
+        let shared_fence = SharedSessionFence::default();
+        shared_fence
+            .replace(Some(AgentSessionFence {
+                session_id: SessionId::new("session-a").unwrap(),
+                session_generation: SessionGeneration::new(3),
+            }))
+            .unwrap();
+        let processor = Arc::new(CountingProcessor(Arc::clone(&dispatched)));
+        let dispatcher =
+            spawn_work_dispatcher(TenantId::new("tenant-a").unwrap(), processor, shared_fence);
+        let queue = AckQueue::default();
+        let resource_version = SharedResourceVersion::new(ResourceVersion::new(1));
+        let mut previous = SequenceNumber::new(1);
+        let mut pending = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let now = now_unix_ms().unwrap();
+        let unsigned = {
+            let mut frame = signed_assignment_frame(&key, now);
+            frame.central_signature = None;
+            frame
+        };
+        assert!(handle_downstream(
+            unsigned,
+            &mut previous,
+            SessionGeneration::new(3),
+            &queue,
+            &resource_version,
+            &mut pending,
+            &mut seen,
+            &dispatcher,
+            Some(&bundle),
+        )
+        .await
+        .is_err());
+        assert_eq!(previous, SequenceNumber::new(1));
+        assert!(seen.is_empty());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+
+        handle_downstream(
+            signed_assignment_frame(&key, now),
+            &mut previous,
+            SessionGeneration::new(3),
+            &queue,
+            &resource_version,
+            &mut pending,
+            &mut seen,
+            &dispatcher,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dispatched.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1649,6 +1811,7 @@ mod tests {
                 correlation_id: Some(durable_id.clone()),
                 session_generation: generation,
                 sent_at_unix_ms: UnixMillis::new(20),
+                central_signature: None,
                 message: AgentChannelDownstreamMessage::Ack(AgentChannelAck {
                     acknowledged_sequence: SequenceNumber::new(2),
                     resource_version: ResourceVersion::new(4),
@@ -1697,6 +1860,7 @@ mod tests {
             &mut seen_commands,
             &dispatcher,
             TenantId::new("tenant-a").unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -1730,6 +1894,7 @@ mod tests {
                 correlation_id: Some(heartbeat_id.clone()),
                 session_generation: generation,
                 sent_at_unix_ms: UnixMillis::new(20),
+                central_signature: None,
                 message: AgentChannelDownstreamMessage::Ack(AgentChannelAck {
                     acknowledged_sequence: SequenceNumber::new(2),
                     resource_version: ResourceVersion::new(4),
@@ -1774,6 +1939,7 @@ mod tests {
             &mut pending,
             &mut seen_commands,
             &dispatcher,
+            None,
         )
         .await
         .unwrap();

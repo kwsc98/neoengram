@@ -9,17 +9,21 @@ use neoengram_protocol::{
 };
 
 use crate::{
-    AgentEnrollmentAuditEvent, AgentEnrollmentExpiryReconciliation,
-    AgentEnrollmentLifecycleAuditEvent, AgentEnrollmentListPage, AgentEnrollmentListRequest,
-    AgentRegistryRecord, AgentRegistryReplacementRecords, ArtifactListPage, ArtifactListRequest,
-    ArtifactRecord, AuditEvent, AuthorizationRequest, CatalogInsertOutcome, CentralResult,
-    IndexKey, IndexPublishOutcome, IndexPublishRequest, InitializeIndexSnapshotRequest, JobKey,
-    JobRecord, ObjectPlacementEvidence, PlaygroundInsertRequest, PlaygroundListPage,
-    PlaygroundListRequest, PlaygroundRecord, PreCommitCancelRequest, PreCommitCommitOutcome,
-    PreCommitCommitRequest, PreCommitKey, PreCommitMutationOutcome, PreCommitRecord,
-    PreCommitRestartRequest, PreCommitStartRequest, PublishedIndex, StagedMetadataBatch,
-    StorageVolumeListPage, StorageVolumeListRequest, StorageVolumeRecord, TenantListPage,
-    TenantListRequest, TenantRecord,
+    AcquireAgentRouteLeaseRequest, AcquireAgentSessionRouteRequest, AgentEnrollmentAuditEvent,
+    AgentEnrollmentExpiryReconciliation, AgentEnrollmentLifecycleAuditEvent,
+    AgentEnrollmentListPage, AgentEnrollmentListRequest, AgentRegistryRecord,
+    AgentRegistryReplacementRecords, AgentRouteLease, AgentRouteLeaseAcquireOutcome,
+    AgentRouteLeaseListRequest, AgentRouteLeaseMutationOutcome, AgentSessionRouteAcquireOutcome,
+    ArtifactListPage, ArtifactListRequest, ArtifactRecord, AuditEvent, AuthorizationRequest,
+    CatalogInsertOutcome, CentralResult, GatewayInsertOutcome, GatewayPoolListRequest,
+    GatewayPoolRecord, GatewayReplicaListRequest, GatewayReplicaRecord, IndexKey,
+    IndexPublishOutcome, IndexPublishRequest, InitializeIndexSnapshotRequest, JobKey, JobRecord,
+    ObjectPlacementEvidence, PlaygroundInsertRequest, PlaygroundListPage, PlaygroundListRequest,
+    PlaygroundRecord, PreCommitCancelRequest, PreCommitCommitOutcome, PreCommitCommitRequest,
+    PreCommitKey, PreCommitMutationOutcome, PreCommitRecord, PreCommitRestartRequest,
+    PreCommitStartRequest, PublishedIndex, ReleaseAgentRouteLeaseRequest,
+    RenewAgentRouteLeaseRequest, StagedMetadataBatch, StorageVolumeListPage,
+    StorageVolumeListRequest, StorageVolumeRecord, TenantListPage, TenantListRequest, TenantRecord,
 };
 
 /// Result of atomically inserting a job or loading the record already stored at its key.
@@ -166,6 +170,80 @@ pub trait AgentRegistryRepository: Send + Sync {
     ) -> CentralResult<AgentRegistryReplacementRecords>;
 }
 
+/// Central-authoritative Gateway resources and Agent route-generation watermarks.
+#[async_trait]
+pub trait GatewayRegistryRepository: Send + Sync {
+    async fn get_pool(
+        &self,
+        gateway_pool_id: &neoengram_protocol::GatewayPoolId,
+    ) -> CentralResult<Option<GatewayPoolRecord>>;
+    async fn get_pool_by_edge_cluster(
+        &self,
+        edge_cluster_id: &neoengram_protocol::EdgeClusterId,
+    ) -> CentralResult<Option<GatewayPoolRecord>>;
+    async fn list_pools(
+        &self,
+        request: &GatewayPoolListRequest,
+    ) -> CentralResult<Vec<GatewayPoolRecord>>;
+    async fn insert_pool(
+        &self,
+        record: GatewayPoolRecord,
+    ) -> CentralResult<GatewayInsertOutcome<GatewayPoolRecord>>;
+    async fn replace_pool(
+        &self,
+        expected_resource_version: u64,
+        record: GatewayPoolRecord,
+    ) -> CentralResult<GatewayPoolRecord>;
+
+    async fn get_replica(
+        &self,
+        gateway_replica_id: &neoengram_protocol::GatewayReplicaId,
+    ) -> CentralResult<Option<GatewayReplicaRecord>>;
+    async fn get_replica_by_activation_token_digest(
+        &self,
+        token_digest: &neoengram_core::ContentDigest,
+    ) -> CentralResult<Option<GatewayReplicaRecord>>;
+    async fn list_replicas(
+        &self,
+        request: &GatewayReplicaListRequest,
+    ) -> CentralResult<Vec<GatewayReplicaRecord>>;
+    async fn insert_replica(
+        &self,
+        record: GatewayReplicaRecord,
+    ) -> CentralResult<GatewayInsertOutcome<GatewayReplicaRecord>>;
+    async fn replace_replica(
+        &self,
+        expected_resource_version: u64,
+        record: GatewayReplicaRecord,
+    ) -> CentralResult<GatewayReplicaRecord>;
+
+    async fn get_agent_route(
+        &self,
+        agent_id: &neoengram_protocol::AgentId,
+    ) -> CentralResult<Option<AgentRouteLease>>;
+    async fn list_agent_routes(
+        &self,
+        request: &AgentRouteLeaseListRequest,
+    ) -> CentralResult<Vec<AgentRouteLease>>;
+    async fn acquire_agent_route(
+        &self,
+        request: AcquireAgentRouteLeaseRequest,
+    ) -> CentralResult<AgentRouteLeaseAcquireOutcome>;
+    /// Opens the Agent session and acquires its route in one repository transaction.
+    async fn acquire_agent_session_route(
+        &self,
+        request: AcquireAgentSessionRouteRequest,
+    ) -> CentralResult<AgentSessionRouteAcquireOutcome>;
+    async fn renew_agent_route(
+        &self,
+        request: RenewAgentRouteLeaseRequest,
+    ) -> CentralResult<AgentRouteLeaseMutationOutcome>;
+    async fn release_agent_route(
+        &self,
+        request: ReleaseAgentRouteLeaseRequest,
+    ) -> CentralResult<AgentRouteLeaseMutationOutcome>;
+}
+
 /// Durable control-catalog repository. SQLite composes this with AgentRegistry in one database.
 #[async_trait]
 pub trait ControlCatalogRepository: Send + Sync {
@@ -237,6 +315,7 @@ pub trait ControlCatalogRepository: Send + Sync {
     /// Atomically advances a Playground lifecycle state. Implementations must treat a replay
     /// which already observes `next` as idempotent, while rejecting a transition from another
     /// state. This is the fencing boundary used by asynchronous materialization reports.
+    #[allow(clippy::too_many_arguments)]
     async fn transition_playground_state(
         &self,
         tenant_id: &TenantId,
@@ -524,6 +603,7 @@ pub struct AuthorityStore {
     audit: Arc<dyn AuditSink>,
     precommits: Option<Arc<dyn PreCommitRepository>>,
     agent_registry: Option<Arc<dyn AgentRegistryRepository>>,
+    gateway_registry: Option<Arc<dyn GatewayRegistryRepository>>,
     control_catalog: Option<Arc<dyn ControlCatalogRepository>>,
     capabilities: AuthorityCapabilities,
 }
@@ -549,6 +629,7 @@ impl AuthorityStore {
             audit,
             precommits: None,
             agent_registry: None,
+            gateway_registry: None,
             control_catalog: None,
             capabilities,
         }
@@ -605,6 +686,17 @@ impl AuthorityStore {
     #[must_use]
     pub fn agent_registry(&self) -> Option<Arc<dyn AgentRegistryRepository>> {
         self.agent_registry.clone()
+    }
+
+    #[must_use]
+    pub fn with_gateway_registry(mut self, registry: Arc<dyn GatewayRegistryRepository>) -> Self {
+        self.gateway_registry = Some(registry);
+        self
+    }
+
+    #[must_use]
+    pub fn gateway_registry(&self) -> Option<Arc<dyn GatewayRegistryRepository>> {
+        self.gateway_registry.clone()
     }
 
     /// Adds the optional Tenant/Artifact/Volume/Playground control catalog.

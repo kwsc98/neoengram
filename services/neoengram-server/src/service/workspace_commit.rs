@@ -269,8 +269,8 @@ impl WorkspaceCommitService {
             });
             let graph = build_commit_graph(
                 &BuildCommitGraphRequest {
-                    expected_index_version: reader.version.clone(),
-                    parent: precommit.frozen_head_commit_id.map(Into::into),
+                    expected_index_version: reader.version,
+                    parent: precommit.frozen_head_commit_id,
                     message: request.message.clone(),
                     created_at_unix_ms: created_at_unix_ms.get(),
                 },

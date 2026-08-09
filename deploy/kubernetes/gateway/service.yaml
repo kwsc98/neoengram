@@ -1,0 +1,99 @@
+# The Pool Service is the Agent edge entry point. Replica Services are stable, non-load-balanced
+# addresses for Central's persisted control/bootstrap endpoints and for peer forwarding.
+apiVersion: v1
+kind: Service
+metadata:
+  name: synapse-gateway
+  namespace: synapse-gateway-example
+  annotations:
+    neoengram.io/example-only: "external-provisioner-required"
+  labels:
+    app.kubernetes.io/name: synapse-gateway
+    app.kubernetes.io/component: edge-gateway
+    neoengram.io/edge-cluster: edge-example
+    neoengram.io/gateway-pool: gateway-pool-example
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: synapse-gateway
+    neoengram.io/edge-cluster: edge-example
+    neoengram.io/gateway-pool: gateway-pool-example
+  ports:
+    - name: agent
+      port: 8443
+      targetPort: agent
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: synapse-gateway-gateway-pool-example-r0
+  namespace: synapse-gateway-example
+  annotations:
+    neoengram.io/example-only: "external-provisioner-required"
+    neoengram.io/gateway-replica-id: gateway-pool-example-r0
+  labels:
+    app.kubernetes.io/name: synapse-gateway
+    app.kubernetes.io/component: edge-gateway
+    neoengram.io/edge-cluster: edge-example
+    neoengram.io/gateway-pool: gateway-pool-example
+    neoengram.io/gateway-replica: gateway-pool-example-r0
+spec:
+  type: ClusterIP
+  # Central must reach the server-auth bootstrap listener while the Pod is still
+  # Pending/not Ready; readiness requires an authenticated control session.
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: synapse-gateway
+    neoengram.io/edge-cluster: edge-example
+    neoengram.io/gateway-pool: gateway-pool-example
+    neoengram.io/gateway-replica: gateway-pool-example-r0
+  ports:
+    - name: agent
+      port: 8443
+      targetPort: agent
+      protocol: TCP
+    - name: control
+      port: 9443
+      targetPort: control
+      protocol: TCP
+    - name: peer
+      port: 10443
+      targetPort: peer
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: synapse-gateway-gateway-pool-example-r1
+  namespace: synapse-gateway-example
+  annotations:
+    neoengram.io/example-only: "external-provisioner-required"
+    neoengram.io/gateway-replica-id: gateway-pool-example-r1
+  labels:
+    app.kubernetes.io/name: synapse-gateway
+    app.kubernetes.io/component: edge-gateway
+    neoengram.io/edge-cluster: edge-example
+    neoengram.io/gateway-pool: gateway-pool-example
+    neoengram.io/gateway-replica: gateway-pool-example-r1
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: synapse-gateway
+    neoengram.io/edge-cluster: edge-example
+    neoengram.io/gateway-pool: gateway-pool-example
+    neoengram.io/gateway-replica: gateway-pool-example-r1
+  ports:
+    - name: agent
+      port: 8443
+      targetPort: agent
+      protocol: TCP
+    - name: control
+      port: 9443
+      targetPort: control
+      protocol: TCP
+    - name: peer
+      port: 10443
+      targetPort: peer
+      protocol: TCP

@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::StatusCode;
-use hyper::body::Incoming;
 use neoengram_protocol::{
     decode_bounded_unique_json, AgentActionAcceptedResponse, AgentAuthenticatedRequest,
     AgentBootstrapRequest, AgentBootstrapStatusRequest, AgentChannelAck,
@@ -18,23 +17,29 @@ use neoengram_protocol::{
     AgentJobReportCreatePayload, AgentManifestPageQueryPayload, AgentManifestPageQueryResponse,
     AgentMessageListQueryPayload, AgentMessageListQueryResponse, AgentMetadataBatchStagePayload,
     AgentMetadataPageStagePayload, AgentMetadataStageResponse, AgentSessionClosePayload,
-    AgentSessionCloseResponse, AgentSessionOpenPayload, AgentSessionOpenResponse, ControlError,
-    ControlMessage, DecimalU64, ErrorCode, Extensions, MessageId, ProtocolVersion, SequenceNumber,
-    SessionGeneration, SessionId, UnixMillis, AGENT_JOB_INDEX_PAGE_QUERY_PATH,
-    AGENT_JOB_MANIFEST_PAGE_QUERY_PATH, AGENT_JOB_METADATA_BATCH_STAGE_PATH,
-    AGENT_JOB_METADATA_PAGE_STAGE_PATH, AGENT_JOB_REPORT_CREATE_PATH,
-    AGENT_SESSION_CHANNEL_OPEN_PATH, AGENT_SESSION_CLOSE_PATH, AGENT_SESSION_HEARTBEAT_REPORT_PATH,
-    AGENT_SESSION_MESSAGE_LIST_QUERY_PATH, AGENT_SESSION_OPEN_PATH, MAX_AGENT_POLL_MESSAGES,
+    AgentSessionCloseResponse, AgentSessionOpenPayload, AgentSessionOpenResponse, ControlEnvelope,
+    ControlError, ControlMessage, DecimalU64, ErrorCode, Extensions, GatewayOpaqueBytes, MessageId,
+    ProtocolVersion, SequenceNumber, SessionGeneration, SessionId, UnixMillis,
+    AGENT_JOB_INDEX_PAGE_QUERY_PATH, AGENT_JOB_MANIFEST_PAGE_QUERY_PATH,
+    AGENT_JOB_METADATA_BATCH_STAGE_PATH, AGENT_JOB_METADATA_PAGE_STAGE_PATH,
+    AGENT_JOB_REPORT_CREATE_PATH, AGENT_SESSION_CHANNEL_OPEN_PATH, AGENT_SESSION_CLOSE_PATH,
+    AGENT_SESSION_HEARTBEAT_REPORT_PATH, AGENT_SESSION_MESSAGE_LIST_QUERY_PATH,
+    AGENT_SESSION_OPEN_PATH, MAX_AGENT_POLL_MESSAGES,
 };
 use neoengramd::{
-    AgentRegistryService, BootstrapStorageEnrollmentRequest, CentralError, CentralErrorCode,
-    CloseAgentSessionRequest, ControlPlane, MetadataBatchSubmission, OpenAgentSessionRequest,
+    AcquireAgentSessionRouteRequest, AgentRegistryService, BootstrapStorageEnrollmentRequest,
+    CentralError, CentralErrorCode, CloseAgentSessionRequest, ControlPlane,
+    GatewayRegistryRepository, MetadataBatchSubmission, OpenAgentSessionRequest,
     ReceiveReportRequest, StageMetadataBatchRequest,
 };
 
 use super::{
     control_channel::LiveAgentChannels, AgentAction, AgentApiHandler, AgentControlChannel,
-    AgentHttpError, AgentNdjsonInput, AGENT_MAX_REQUEST_BODY_BYTES,
+    AgentControlInput, AgentHttpError, GatewayAgentRouteContext, RoutedAgentControlChannel,
+    AGENT_MAX_REQUEST_BODY_BYTES,
+};
+use crate::service::{
+    AgentWorkloadCertificateError, AgentWorkloadCertificateService, CentralCommandKeyring,
 };
 
 const AGENT_ACTION_MAX_CLOCK_SKEW_MS: u64 = 60_000;
@@ -64,8 +69,12 @@ pub struct RegistryAgentApiHandler {
     registry: Arc<AgentRegistryService>,
     control: Option<Arc<ControlPlane>>,
     data_plane: Option<Arc<dyn AgentDataPlaneHandler>>,
+    gateway_registry: Option<Arc<dyn GatewayRegistryRepository>>,
     accepting: Arc<AtomicBool>,
     live_channels: LiveAgentChannels,
+    workload_certificate: Option<Arc<AgentWorkloadCertificateService>>,
+    central_command_keyring: Option<Arc<CentralCommandKeyring>>,
+    require_central_command_signatures: bool,
 }
 
 #[derive(Clone)]
@@ -92,8 +101,12 @@ impl RegistryAgentApiHandler {
             registry,
             control: None,
             data_plane: None,
+            gateway_registry: None,
             accepting: Arc::new(AtomicBool::new(true)),
             live_channels: LiveAgentChannels::default(),
+            workload_certificate: None,
+            central_command_keyring: None,
+            require_central_command_signatures: false,
         }
     }
 
@@ -103,8 +116,12 @@ impl RegistryAgentApiHandler {
             registry,
             control: None,
             data_plane: None,
+            gateway_registry: None,
             accepting,
             live_channels: LiveAgentChannels::default(),
+            workload_certificate: None,
+            central_command_keyring: None,
+            require_central_command_signatures: false,
         }
     }
 
@@ -119,9 +136,46 @@ impl RegistryAgentApiHandler {
             registry,
             control: Some(control),
             data_plane: Some(data_plane),
+            gateway_registry: None,
             accepting,
             live_channels: LiveAgentChannels::default(),
+            workload_certificate: None,
+            central_command_keyring: None,
+            require_central_command_signatures: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_gateway_registry(
+        mut self,
+        gateway_registry: Arc<dyn GatewayRegistryRepository>,
+    ) -> Self {
+        self.gateway_registry = Some(gateway_registry);
+        self
+    }
+
+    /// Installs the Central workload-PKI boundary used to prepare approved Agent credentials.
+    #[must_use]
+    pub fn with_workload_certificate_service(
+        mut self,
+        service: Arc<AgentWorkloadCertificateService>,
+    ) -> Self {
+        self.workload_certificate = Some(service);
+        self
+    }
+
+    /// Installs the Central command-signing boundary used for Assignment and Decision delivery.
+    #[must_use]
+    pub fn with_central_command_keyring(mut self, keyring: Arc<CentralCommandKeyring>) -> Self {
+        self.central_command_keyring = Some(keyring);
+        self
+    }
+
+    /// Requires a configured Central command signer whenever a command is delivered.
+    #[must_use]
+    pub fn require_central_command_signatures(mut self) -> Self {
+        self.require_central_command_signatures = true;
+        self
     }
 
     fn require_control(&self) -> Result<&ControlPlane, AgentHttpError> {
@@ -134,6 +188,57 @@ impl RegistryAgentApiHandler {
         self.data_plane
             .as_deref()
             .ok_or_else(AgentHttpError::unavailable)
+    }
+
+    fn command_keyring(&self) -> Result<Option<&CentralCommandKeyring>, AgentHttpError> {
+        match self.central_command_keyring.as_deref() {
+            Some(keyring) => Ok(Some(keyring)),
+            None if self.require_central_command_signatures => Err(AgentHttpError::unavailable()),
+            None => Ok(None),
+        }
+    }
+
+    async fn sign_control_messages(
+        &self,
+        messages: &mut [ControlEnvelope],
+    ) -> Result<(), AgentHttpError> {
+        let mut has_command = false;
+        for envelope in messages.iter_mut() {
+            envelope.central_signature = None;
+            has_command |= matches!(
+                &envelope.message,
+                ControlMessage::Assignment(_) | ControlMessage::Decision(_)
+            );
+        }
+        if !has_command {
+            return Ok(());
+        }
+
+        let Some(keyring) = self.command_keyring()? else {
+            return Ok(());
+        };
+        let signed_at_unix_ms = self.registry.now();
+        for envelope in messages.iter_mut().filter(|envelope| {
+            matches!(
+                &envelope.message,
+                ControlMessage::Assignment(_) | ControlMessage::Decision(_)
+            )
+        }) {
+            let payload = envelope
+                .central_command_payload_bytes()
+                .and_then(GatewayOpaqueBytes::new)
+                .map_err(|_| AgentHttpError::unavailable())?;
+            envelope.central_signature = Some(
+                keyring
+                    .sign(payload, signed_at_unix_ms)
+                    .await
+                    .map_err(|_| AgentHttpError::unavailable())?,
+            );
+            envelope
+                .validate()
+                .map_err(|_| AgentHttpError::unavailable())?;
+        }
+        Ok(())
     }
 
     async fn authenticate<T: serde::Serialize>(
@@ -168,9 +273,16 @@ impl RegistryAgentApiHandler {
             .map_err(|_| AgentHttpError::protocol_invalid())?;
         let response = self
             .registry
-            .bootstrap_status_with_clock_skew(request, AGENT_ACTION_MAX_CLOCK_SKEW_MS)
+            .bootstrap_status_with_clock_skew(request.clone(), AGENT_ACTION_MAX_CLOCK_SKEW_MS)
             .await
             .map_err(map_registry_error)?;
+        let response = match &self.workload_certificate {
+            Some(service) => service
+                .attach_to_status(&request, response)
+                .await
+                .map_err(map_workload_certificate_error)?,
+            None => response,
+        };
         encode(&response)
     }
 
@@ -268,7 +380,7 @@ impl RegistryAgentApiHandler {
         let generation = request
             .session_generation
             .ok_or_else(AgentHttpError::protocol_invalid)?;
-        let messages = self
+        let mut messages = self
             .require_control()?
             .poll_agent_messages(
                 &request.agent_id,
@@ -277,6 +389,7 @@ impl RegistryAgentApiHandler {
             )
             .await
             .map_err(map_registry_error)?;
+        self.sign_control_messages(&mut messages).await?;
         encode(&AgentMessageListQueryResponse {
             protocol_version: ProtocolVersion::V1,
             request_id: request.request_id,
@@ -444,11 +557,21 @@ impl RegistryAgentApiHandler {
         })
     }
 
-    async fn control_channel_open(
+    async fn control_channel_open_internal(
         &self,
-        body: Incoming,
-    ) -> Result<AgentControlChannel, AgentHttpError> {
-        let mut input = AgentNdjsonInput::new(body);
+        mut input: AgentControlInput,
+        route: Option<GatewayAgentRouteContext>,
+    ) -> Result<
+        (
+            AgentControlChannel,
+            Option<(
+                neoengramd::AgentRouteLease,
+                bool,
+                Option<neoengramd::AgentRouteLease>,
+            )>,
+        ),
+        AgentHttpError,
+    > {
         let line = input
             .next_line()
             .await?
@@ -474,17 +597,49 @@ impl RegistryAgentApiHandler {
             .live_channels
             .acquire_fence(frame.request.agent_id.clone())
             .await;
-        let opened = self
-            .registry
-            .open_session(OpenAgentSessionRequest {
-                agent_id: frame.request.agent_id.clone(),
-                installation_id: frame.request.installation_id.clone(),
-                boot_id: frame.request.boot_id.clone(),
-                mount_identity_digest: open.mount_identity_digest,
-                expected_resource_version: open.expected_resource_version,
-            })
-            .await
-            .map_err(map_registry_error)?;
+        let session_request = OpenAgentSessionRequest {
+            agent_id: frame.request.agent_id.clone(),
+            installation_id: frame.request.installation_id.clone(),
+            boot_id: frame.request.boot_id.clone(),
+            mount_identity_digest: open.mount_identity_digest,
+            expected_resource_version: open.expected_resource_version,
+        };
+        let (opened, routed) = match route {
+            Some(route) => {
+                let repository = self
+                    .gateway_registry
+                    .as_ref()
+                    .ok_or_else(AgentHttpError::unavailable)?;
+                let outcome = repository
+                    .acquire_agent_session_route(AcquireAgentSessionRouteRequest {
+                        route_request_id: route.route_request_id,
+                        session: session_request,
+                        gateway_pool_id: route.gateway_pool_id,
+                        gateway_replica_id: route.gateway_replica_id,
+                        connection_id: route.connection_id,
+                        observed_at_unix_ms: route.observed_at_unix_ms,
+                        lease_expires_at_unix_ms: route.lease_expires_at_unix_ms,
+                        heartbeat_timeout_ms: route.heartbeat_timeout_ms,
+                    })
+                    .await
+                    .map_err(map_registry_error)?;
+                (
+                    outcome.session,
+                    Some((
+                        outcome.route.lease,
+                        outcome.route.replayed,
+                        outcome.route.fenced,
+                    )),
+                )
+            }
+            None => (
+                self.registry
+                    .open_session(session_request)
+                    .await
+                    .map_err(map_registry_error)?,
+                None,
+            ),
+        };
         let opened_at_unix_ms = opened
             .record
             .instance
@@ -559,12 +714,21 @@ impl RegistryAgentApiHandler {
                 .unregister(&context.agent_id, registration_id)
                 .await;
         });
-        Ok(AgentControlChannel::new(receiver))
+        Ok((AgentControlChannel::new(receiver), routed))
+    }
+
+    async fn control_channel_open(
+        &self,
+        input: AgentControlInput,
+    ) -> Result<AgentControlChannel, AgentHttpError> {
+        self.control_channel_open_internal(input, None)
+            .await
+            .map(|(channel, _)| channel)
     }
 
     async fn run_control_channel(
         &self,
-        input: &mut AgentNdjsonInput<Incoming>,
+        input: &mut AgentControlInput,
         output: &tokio::sync::mpsc::Sender<Bytes>,
         context: &EstablishedAgentChannel,
         registration_id: u64,
@@ -873,7 +1037,7 @@ impl RegistryAgentApiHandler {
             if !channel_delivery_due(last_delivered, &message_id, now, delivery_policy) {
                 continue;
             }
-            Self::try_send_channel_message(
+            self.try_send_channel_message(
                 output,
                 context,
                 downstream_sequence,
@@ -881,14 +1045,16 @@ impl RegistryAgentApiHandler {
                 None,
                 self.registry.now(),
                 message,
-            )?;
+            )
+            .await?;
             last_delivered.insert(message_id, Instant::now());
         }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn try_send_channel_message(
+    async fn try_send_channel_message(
+        &self,
         output: &tokio::sync::mpsc::Sender<Bytes>,
         context: &EstablishedAgentChannel,
         downstream_sequence: &mut u64,
@@ -897,14 +1063,16 @@ impl RegistryAgentApiHandler {
         sent_at_unix_ms: UnixMillis,
         message: AgentChannelDownstreamMessage,
     ) -> Result<(), AgentHttpError> {
-        let (next, bytes) = encode_channel_message(
-            context,
-            *downstream_sequence,
-            message_id,
-            correlation_id,
-            sent_at_unix_ms,
-            message,
-        )?;
+        let (next, bytes) = self
+            .encode_channel_message(
+                context,
+                *downstream_sequence,
+                message_id,
+                correlation_id,
+                sent_at_unix_ms,
+                message,
+            )
+            .await?;
         output
             .try_send(bytes)
             .map_err(|_| AgentHttpError::unavailable())?;
@@ -987,14 +1155,16 @@ impl RegistryAgentApiHandler {
         sent_at_unix_ms: UnixMillis,
         message: AgentChannelDownstreamMessage,
     ) -> Result<(), AgentHttpError> {
-        let (next, bytes) = encode_channel_message(
-            context,
-            *downstream_sequence,
-            message_id,
-            correlation_id,
-            sent_at_unix_ms,
-            message,
-        )?;
+        let (next, bytes) = self
+            .encode_channel_message(
+                context,
+                *downstream_sequence,
+                message_id,
+                correlation_id,
+                sent_at_unix_ms,
+                message,
+            )
+            .await?;
         output
             .send(bytes)
             .await
@@ -1002,35 +1172,67 @@ impl RegistryAgentApiHandler {
         *downstream_sequence = next;
         Ok(())
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn encode_channel_message(
-    context: &EstablishedAgentChannel,
-    downstream_sequence: u64,
-    message_id: MessageId,
-    correlation_id: Option<MessageId>,
-    sent_at_unix_ms: UnixMillis,
-    message: AgentChannelDownstreamMessage,
-) -> Result<(u64, Bytes), AgentHttpError> {
-    let next = downstream_sequence
-        .checked_add(1)
-        .ok_or_else(AgentHttpError::protocol_invalid)?;
-    let frame = AgentChannelDownstreamFrame {
-        protocol_version: ProtocolVersion::V1,
-        sequence: SequenceNumber::new(next),
-        message_id,
-        correlation_id,
-        session_generation: context.session_generation,
-        sent_at_unix_ms,
-        message,
-        extensions: Extensions::new(),
-    };
-    let bytes = frame
-        .encode_ndjson()
-        .map(Bytes::from)
-        .map_err(|_| AgentHttpError::protocol_invalid())?;
-    Ok((next, bytes))
+    async fn sign_channel_frame(
+        &self,
+        frame: &mut AgentChannelDownstreamFrame,
+    ) -> Result<(), AgentHttpError> {
+        frame.central_signature = None;
+        if !matches!(
+            &frame.message,
+            AgentChannelDownstreamMessage::Assignment(_)
+                | AgentChannelDownstreamMessage::Decision(_)
+        ) {
+            return Ok(());
+        }
+
+        let Some(keyring) = self.command_keyring()? else {
+            return Ok(());
+        };
+        let payload = frame
+            .central_command_payload_bytes()
+            .and_then(GatewayOpaqueBytes::new)
+            .map_err(|_| AgentHttpError::unavailable())?;
+        frame.central_signature = Some(
+            keyring
+                .sign(payload, self.registry.now())
+                .await
+                .map_err(|_| AgentHttpError::unavailable())?,
+        );
+        frame.validate().map_err(|_| AgentHttpError::unavailable())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn encode_channel_message(
+        &self,
+        context: &EstablishedAgentChannel,
+        downstream_sequence: u64,
+        message_id: MessageId,
+        correlation_id: Option<MessageId>,
+        sent_at_unix_ms: UnixMillis,
+        message: AgentChannelDownstreamMessage,
+    ) -> Result<(u64, Bytes), AgentHttpError> {
+        let next = downstream_sequence
+            .checked_add(1)
+            .ok_or_else(AgentHttpError::protocol_invalid)?;
+        let mut frame = AgentChannelDownstreamFrame {
+            protocol_version: ProtocolVersion::V1,
+            sequence: SequenceNumber::new(next),
+            message_id,
+            correlation_id,
+            session_generation: context.session_generation,
+            sent_at_unix_ms,
+            central_signature: None,
+            message,
+            extensions: Extensions::new(),
+        };
+        self.sign_channel_frame(&mut frame).await?;
+        let bytes = frame
+            .encode_ndjson()
+            .map(Bytes::from)
+            .map_err(|_| AgentHttpError::protocol_invalid())?;
+        Ok((next, bytes))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1101,12 +1303,32 @@ impl AgentApiHandler for RegistryAgentApiHandler {
 
     async fn open_control_channel(
         &self,
-        body: Incoming,
+        input: AgentControlInput,
     ) -> Result<AgentControlChannel, AgentHttpError> {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(AgentHttpError::unavailable());
         }
-        self.control_channel_open(body).await
+        self.control_channel_open(input).await
+    }
+
+    async fn open_routed_control_channel(
+        &self,
+        input: AgentControlInput,
+        route: GatewayAgentRouteContext,
+    ) -> Result<RoutedAgentControlChannel, AgentHttpError> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(AgentHttpError::unavailable());
+        }
+        let (channel, routed) = self
+            .control_channel_open_internal(input, Some(route))
+            .await?;
+        let (route, replayed, fenced) = routed.ok_or_else(AgentHttpError::unavailable)?;
+        Ok(RoutedAgentControlChannel {
+            channel,
+            route,
+            replayed,
+            fenced,
+        })
     }
 }
 
@@ -1155,9 +1377,189 @@ fn map_registry_error(error: CentralError) -> AgentHttpError {
     }
 }
 
+fn map_workload_certificate_error(error: AgentWorkloadCertificateError) -> AgentHttpError {
+    match error {
+        AgentWorkloadCertificateError::ConcurrentUpdate => AgentHttpError::new(
+            StatusCode::CONFLICT,
+            "AGENT_CERTIFICATE_CONFLICT",
+            "Agent workload certificate preparation is contended",
+            true,
+        ),
+        AgentWorkloadCertificateError::Registry(error) => map_registry_error(error),
+        AgentWorkloadCertificateError::Pki(_)
+        | AgentWorkloadCertificateError::Issuer(_)
+        | AgentWorkloadCertificateError::InvalidCertificateMaterial
+        | AgentWorkloadCertificateError::MissingCredentialEvidence
+        | AgentWorkloadCertificateError::Protocol(_) => AgentHttpError::unavailable(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use neoengram_protocol::{
+        AgentMountId, ArtifactId, AssignmentGeneration, AssignmentId, AssignmentOperation,
+        CertificateGeneration, ContentDigest, DecisionGeneration, Ed25519PublicKeySpki,
+        Ed25519Signature, JobAssignment, JobDecision, JobState, MountGeneration, OwnerGeneration,
+        PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision,
+        RequestId, ResourceVersion, StorageVolumeId, TenantId, WorkspaceMaterializeAssignment,
+    };
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+
     use super::*;
+    use crate::service::{
+        CentralCommandKeyId, CentralCommandKeyState, CentralCommandSignature,
+        CentralCommandSignatureRequest, CentralCommandSigner, CentralCommandSignerError,
+        CentralCommandTrustBundle, CentralCommandVerificationKey,
+    };
+
+    struct TestCommandSigner {
+        key_pair: Ed25519KeyPair,
+        unavailable: bool,
+    }
+
+    #[async_trait]
+    impl CentralCommandSigner for TestCommandSigner {
+        async fn sign(
+            &self,
+            request: CentralCommandSignatureRequest,
+        ) -> Result<CentralCommandSignature, CentralCommandSignerError> {
+            if self.unavailable {
+                return Err(CentralCommandSignerError::Unavailable(
+                    "test signer unavailable".to_owned(),
+                ));
+            }
+            let signature = Ed25519Signature::new(
+                self.key_pair
+                    .sign(request.signing_bytes())
+                    .as_ref()
+                    .to_vec(),
+            )
+            .map_err(|error| CentralCommandSignerError::Internal(error.to_string()))?;
+            CentralCommandSignature::new(
+                request.key_id().clone(),
+                request.certificate_generation(),
+                signature,
+            )
+            .map_err(|error| CentralCommandSignerError::Internal(error.to_string()))
+        }
+    }
+
+    fn test_command_keyring(unavailable: bool) -> Arc<CentralCommandKeyring> {
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+        let public_key = Ed25519PublicKeySpki::from_public_key_bytes(
+            key_pair.public_key().as_ref().try_into().unwrap(),
+        );
+        let key_id = CentralCommandKeyId::new("central-command-test").unwrap();
+        let generation = CertificateGeneration::new(1);
+        let verification_key = CentralCommandVerificationKey::new(
+            key_id.clone(),
+            generation,
+            public_key,
+            CentralCommandKeyState::Active,
+        )
+        .unwrap();
+        Arc::new(
+            CentralCommandKeyring::new(
+                Arc::new(TestCommandSigner {
+                    key_pair,
+                    unavailable,
+                }),
+                CentralCommandTrustBundle::new(vec![verification_key]).unwrap(),
+                key_id,
+                generation,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn test_handler() -> RegistryAgentApiHandler {
+        RegistryAgentApiHandler::new(Arc::new(AgentRegistryService::new(
+            Arc::new(neoengramd::InMemoryAgentRegistry::new()),
+            Arc::new(neoengramd::InMemoryClock::new(10_000)),
+            30_000,
+        )))
+    }
+
+    fn test_assignment() -> JobAssignment {
+        let project_id = ProjectId::new("project-command-test").unwrap();
+        let artifact_id = ArtifactId::new("artifact-command-test").unwrap();
+        let playground_id = PlaygroundId::new("playground-command-test").unwrap();
+        let relative_root = WorkspaceMaterializeAssignment::canonical_relative_root(
+            &project_id,
+            &artifact_id,
+            &playground_id,
+        )
+        .unwrap();
+        let mut assignment = WorkspaceMaterializeAssignment {
+            job_id: neoengram_protocol::JobId::new("job-command-test").unwrap(),
+            assignment_id: AssignmentId::new("assignment-command-test").unwrap(),
+            assignment_generation: AssignmentGeneration::new(1),
+            agent_id: AgentId::new("agent-test").unwrap(),
+            principal: PrincipalRef {
+                kind: PrincipalKind::Service,
+                id: PrincipalId::new("principal-command-test").unwrap(),
+                extensions: Extensions::new(),
+            },
+            tenant_id: TenantId::new("tenant-command-test").unwrap(),
+            project_id,
+            artifact_id,
+            playground_id,
+            storage_volume_id: StorageVolumeId::new("volume-command-test").unwrap(),
+            agent_mount_id: AgentMountId::new("mount-command-test").unwrap(),
+            mount_generation: MountGeneration::new(1),
+            owner_generation: OwnerGeneration::new(1),
+            relative_root,
+            base_commit_id: None,
+            base_index_version: None,
+            request_digest: ContentDigest::from_bytes([0; 32]),
+            deadline_unix_ms: UnixMillis::new(20_000),
+            extensions: Extensions::new(),
+        };
+        assignment.request_digest = assignment.computed_request_digest().unwrap();
+        JobAssignment {
+            assignment: AssignmentOperation::WorkspaceMaterialize {
+                input: assignment,
+                extensions: Extensions::new(),
+            },
+            extensions: Extensions::new(),
+        }
+    }
+
+    fn test_decision() -> JobDecision {
+        JobDecision {
+            job_id: neoengram_protocol::JobId::new("job-command-test").unwrap(),
+            assignment_id: AssignmentId::new("assignment-command-test").unwrap(),
+            assignment_generation: AssignmentGeneration::new(1),
+            decision_generation: DecisionGeneration::new(1),
+            decision: PublishDecision::Reject {
+                error: ControlError {
+                    code: ErrorCode::new("TEST_REJECTED").unwrap(),
+                    message: "test rejection".to_owned(),
+                    retryable: false,
+                    retry_after_ms: None,
+                    extensions: Extensions::new(),
+                },
+                extensions: Extensions::new(),
+            },
+            final_state: JobState::Rejected,
+            extensions: Extensions::new(),
+        }
+    }
+
+    fn test_control_envelope(message_id: &str, message: ControlMessage) -> ControlEnvelope {
+        ControlEnvelope {
+            protocol_version: ProtocolVersion::V1,
+            message_id: MessageId::new(message_id).unwrap(),
+            session_generation: SessionGeneration::new(1),
+            resource_version: Some(ResourceVersion::new(1)),
+            request_id: None,
+            trace_id: None,
+            sent_at_unix_ms: UnixMillis::new(9_000),
+            central_signature: None,
+            message,
+            extensions: Extensions::new(),
+        }
+    }
 
     fn test_channel_context() -> EstablishedAgentChannel {
         EstablishedAgentChannel {
@@ -1179,38 +1581,277 @@ mod tests {
         })
     }
 
-    #[test]
-    fn failed_downstream_enqueue_does_not_advance_sequence_or_retry_protocol_errors() {
+    #[tokio::test]
+    async fn polled_assignments_and_decisions_receive_verifiable_central_signatures() {
+        let keyring = test_command_keyring(false);
+        let handler = test_handler().with_central_command_keyring(keyring.clone());
+        let mut messages = vec![
+            test_control_envelope(
+                "assignment-command-test",
+                ControlMessage::Assignment(Box::new(test_assignment())),
+            ),
+            test_control_envelope(
+                "decision-command-test",
+                ControlMessage::Decision(test_decision()),
+            ),
+        ];
+
+        handler.sign_control_messages(&mut messages).await.unwrap();
+
+        for envelope in &messages {
+            let signature = envelope.central_signature.as_ref().unwrap();
+            assert_eq!(
+                signature.payload.as_bytes(),
+                envelope.central_command_payload_bytes().unwrap()
+            );
+            keyring
+                .trust_bundle()
+                .verify_at(signature, UnixMillis::new(10_001))
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn development_polling_remains_unsigned_but_required_signing_fails_closed() {
+        let mut development_messages = vec![test_control_envelope(
+            "assignment-development-test",
+            ControlMessage::Assignment(Box::new(test_assignment())),
+        )];
+        test_handler()
+            .sign_control_messages(&mut development_messages)
+            .await
+            .unwrap();
+        assert!(development_messages[0].central_signature.is_none());
+
+        let error = test_handler()
+            .require_central_command_signatures()
+            .sign_control_messages(&mut development_messages)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(development_messages[0].central_signature.is_none());
+    }
+
+    #[tokio::test]
+    async fn h2_assignments_and_decisions_are_signed_while_errors_remain_unsigned() {
+        let keyring = test_command_keyring(false);
+        let handler = test_handler().with_central_command_keyring(keyring.clone());
+        let context = test_channel_context();
+        let (output, mut receiver) = tokio::sync::mpsc::channel(3);
+        let mut sequence = 0;
+        for (message_id, message) in [
+            (
+                "h2-assignment-command-test",
+                AgentChannelDownstreamMessage::Assignment(Box::new(test_assignment())),
+            ),
+            (
+                "h2-decision-command-test",
+                AgentChannelDownstreamMessage::Decision(test_decision()),
+            ),
+        ] {
+            handler
+                .try_send_channel_message(
+                    &output,
+                    &context,
+                    &mut sequence,
+                    MessageId::new(message_id).unwrap(),
+                    None,
+                    UnixMillis::new(9_000),
+                    message,
+                )
+                .await
+                .unwrap();
+        }
+        handler
+            .try_send_channel_message(
+                &output,
+                &context,
+                &mut sequence,
+                MessageId::new("h2-error-test").unwrap(),
+                None,
+                UnixMillis::new(9_000),
+                channel_error("test error".to_owned()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sequence, 3);
+
+        for _ in 0..2 {
+            let bytes = receiver.recv().await.unwrap();
+            let frame =
+                AgentChannelDownstreamFrame::decode_json(&bytes[..bytes.len() - 1]).unwrap();
+            let signature = frame.central_signature.as_ref().unwrap();
+            assert_eq!(
+                signature.payload.as_bytes(),
+                frame.central_command_payload_bytes().unwrap()
+            );
+            keyring
+                .trust_bundle()
+                .verify_at(signature, UnixMillis::new(10_001))
+                .unwrap();
+        }
+        let bytes = receiver.recv().await.unwrap();
+        let frame = AgentChannelDownstreamFrame::decode_json(&bytes[..bytes.len() - 1]).unwrap();
+        assert!(matches!(
+            frame.message,
+            AgentChannelDownstreamMessage::Error(_)
+        ));
+        assert!(frame.central_signature.is_none());
+    }
+
+    #[tokio::test]
+    async fn opened_ack_and_error_frames_are_never_signed() {
+        let handler = test_handler().with_central_command_keyring(test_command_keyring(false));
+        let context = test_channel_context();
+        let (output, mut receiver) = tokio::sync::mpsc::channel(3);
+        let mut sequence = 0;
+        handler
+            .try_send_channel_message(
+                &output,
+                &context,
+                &mut sequence,
+                MessageId::new("opened-test").unwrap(),
+                Some(MessageId::new("open-request-test").unwrap()),
+                UnixMillis::new(10_000),
+                AgentChannelDownstreamMessage::Opened(AgentSessionOpenResponse {
+                    protocol_version: ProtocolVersion::V1,
+                    request_id: RequestId::new("open-request-test").unwrap(),
+                    agent_id: context.agent_id.clone(),
+                    session_id: context.session_id.clone(),
+                    session_generation: context.session_generation,
+                    agent_mount_id: AgentMountId::new("mount-test").unwrap(),
+                    mount_generation: MountGeneration::new(1),
+                    owner_generation: OwnerGeneration::new(1),
+                    resource_version: ResourceVersion::new(1),
+                    opened_at_unix_ms: UnixMillis::new(10_000),
+                    replayed: false,
+                    extensions: Extensions::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        handler
+            .try_send_channel_message(
+                &output,
+                &context,
+                &mut sequence,
+                MessageId::new("ack-test").unwrap(),
+                Some(MessageId::new("heartbeat-test").unwrap()),
+                UnixMillis::new(10_000),
+                AgentChannelDownstreamMessage::Ack(AgentChannelAck {
+                    acknowledged_sequence: SequenceNumber::new(1),
+                    resource_version: ResourceVersion::new(1),
+                    replayed: false,
+                    extensions: Extensions::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        handler
+            .try_send_channel_message(
+                &output,
+                &context,
+                &mut sequence,
+                MessageId::new("error-test").unwrap(),
+                None,
+                UnixMillis::new(10_000),
+                channel_error("test error".to_owned()),
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            let bytes = receiver.recv().await.unwrap();
+            let frame =
+                AgentChannelDownstreamFrame::decode_json(&bytes[..bytes.len() - 1]).unwrap();
+            assert!(frame.central_signature.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_signer_failures_do_not_enqueue_or_advance_the_sequence() {
+        for handler in [
+            test_handler().with_central_command_keyring(test_command_keyring(true)),
+            test_handler().require_central_command_signatures(),
+        ] {
+            let context = test_channel_context();
+            let (output, mut receiver) = tokio::sync::mpsc::channel(1);
+            let mut sequence = 7;
+            let error = handler
+                .try_send_channel_message(
+                    &output,
+                    &context,
+                    &mut sequence,
+                    MessageId::new("h2-unavailable-command-test").unwrap(),
+                    None,
+                    UnixMillis::new(9_000),
+                    AgentChannelDownstreamMessage::Decision(test_decision()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(sequence, 7);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_signer_failure_returns_unavailable_without_unsigned_fallback() {
+        let handler = test_handler().with_central_command_keyring(test_command_keyring(true));
+        let mut messages = vec![test_control_envelope(
+            "decision-unavailable-command-test",
+            ControlMessage::Decision(test_decision()),
+        )];
+
+        let error = handler
+            .sign_control_messages(&mut messages)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(messages[0].central_signature.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_downstream_enqueue_does_not_advance_sequence_or_retry_protocol_errors() {
+        let handler = test_handler();
         let context = test_channel_context();
         let (full_output, _full_receiver) = tokio::sync::mpsc::channel(1);
         full_output
             .try_send(Bytes::from_static(b"already-full"))
             .unwrap();
         let mut sequence = 7;
-        let backpressure = RegistryAgentApiHandler::try_send_channel_message(
-            &full_output,
-            &context,
-            &mut sequence,
-            MessageId::new("message-backpressure").unwrap(),
-            None,
-            UnixMillis::new(1),
-            channel_error("temporary backpressure".to_owned()),
-        )
-        .unwrap_err();
+        let backpressure = handler
+            .try_send_channel_message(
+                &full_output,
+                &context,
+                &mut sequence,
+                MessageId::new("message-backpressure").unwrap(),
+                None,
+                UnixMillis::new(1),
+                channel_error("temporary backpressure".to_owned()),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(backpressure.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(sequence, 7);
 
         let (empty_output, _empty_receiver) = tokio::sync::mpsc::channel(1);
-        let protocol_error = RegistryAgentApiHandler::try_send_channel_message(
-            &empty_output,
-            &context,
-            &mut sequence,
-            MessageId::new("message-oversized").unwrap(),
-            None,
-            UnixMillis::new(1),
-            channel_error("x".repeat(4097)),
-        )
-        .unwrap_err();
+        let protocol_error = handler
+            .try_send_channel_message(
+                &empty_output,
+                &context,
+                &mut sequence,
+                MessageId::new("message-oversized").unwrap(),
+                None,
+                UnixMillis::new(1),
+                channel_error("x".repeat(4097)),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(protocol_error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!protocol_error.retryable);
         assert_eq!(sequence, 7);

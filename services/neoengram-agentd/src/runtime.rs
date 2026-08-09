@@ -4,6 +4,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,6 +26,7 @@ use tokio::time::{self, MissedTickBehavior};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::status_clock::StatusTimestampClock;
+use crate::tls::GatewayServerIdentity;
 use crate::{
     health::HealthReporter, identity::public_key_spki_der, AgentConfig, AgentDaemonError,
     AgentDaemonResult, AgentSessionClient, AgentSigningKey, EnrollmentBackoff, EnrollmentClient,
@@ -33,6 +35,13 @@ use crate::{
 
 const TOKEN_FILE_MAX_BYTES: u64 = 2_050;
 const HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CertificateRenewalWindow {
+    generation: u64,
+    renew_at_unix_ms: u64,
+    not_after_unix_ms: u64,
+}
 
 pub trait MountProbe: Send + Sync {
     fn probe(&self) -> FilesystemMountObservation;
@@ -102,7 +111,7 @@ pub async fn run_with_development_directory_probe(
     mut config: AgentConfig,
 ) -> AgentDaemonResult<()> {
     config.validate()?;
-    crate::config::validate_development_directory_probe_endpoint(&config.central_endpoint)?;
+    crate::config::validate_development_directory_probe_endpoint(&config.gateway_endpoint)?;
     let identity_root = resolve_development_storage_root(&mut config)?;
     let probe = DevelopmentDirectoryProbe::new(&config, identity_root);
     run_process(config, probe).await
@@ -161,8 +170,41 @@ async fn run_process<P>(config: AgentConfig, probe: P) -> AgentDaemonResult<()>
 where
     P: MountProbe + Clone,
 {
-    let client = ReqwestEnrollmentClient::new(config.central_endpoint.clone())?;
-    let session_client = ReqwestAgentSessionClient::new(config.central_endpoint.clone())?;
+    let trust_bundle = crate::tls::GatewayTrustBundle::load(&config.trust_bundle_file)?;
+    let gateway_identity = config
+        .gateway_workload_trust_domain
+        .as_ref()
+        .map(|trust_domain| GatewayServerIdentity {
+            trust_domain: trust_domain.clone(),
+            edge_cluster_id: config.edge_cluster_id.to_string(),
+        });
+    let command_trust_bundle = config
+        .central_command_trust_bundle_file
+        .as_deref()
+        .map(crate::CentralCommandTrustBundle::load)
+        .transpose()?;
+    let client = match gateway_identity.clone() {
+        Some(identity) => ReqwestEnrollmentClient::with_gateway_trust_bundle_deferred_identity(
+            config.gateway_endpoint.clone(),
+            &trust_bundle,
+            identity,
+        )?,
+        None => ReqwestEnrollmentClient::with_gateway_trust_bundle(
+            config.gateway_endpoint.clone(),
+            &trust_bundle,
+        )?,
+    };
+    let session_client = match gateway_identity {
+        Some(identity) => ReqwestAgentSessionClient::with_gateway_trust_bundle_deferred_identity(
+            config.gateway_endpoint.clone(),
+            &trust_bundle,
+            identity,
+        )?,
+        None => ReqwestAgentSessionClient::with_gateway_trust_bundle(
+            config.gateway_endpoint.clone(),
+            &trust_bundle,
+        )?,
+    };
 
     #[cfg(unix)]
     let shutdown = {
@@ -181,7 +223,15 @@ where
         let _ = tokio::signal::ctrl_c().await;
     };
 
-    run_with_transports(config, client, session_client, probe, shutdown).await
+    run_with_transports_with_command_trust(
+        config,
+        client,
+        session_client,
+        probe,
+        shutdown,
+        command_trust_bundle,
+    )
+    .await
 }
 
 /// Runs enrollment and the approved Agent session with injectable transports and shutdown.
@@ -194,6 +244,36 @@ pub async fn run_with_transports<C, S, P, F>(
     session_client: S,
     probe: P,
     shutdown: F,
+) -> AgentDaemonResult<()>
+where
+    C: EnrollmentClient + Clone,
+    S: AgentSessionClient + 'static,
+    P: MountProbe + Clone,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let command_trust_bundle = config
+        .central_command_trust_bundle_file
+        .as_deref()
+        .map(crate::CentralCommandTrustBundle::load)
+        .transpose()?;
+    run_with_transports_with_command_trust(
+        config,
+        enrollment_client,
+        session_client,
+        probe,
+        shutdown,
+        command_trust_bundle,
+    )
+    .await
+}
+
+async fn run_with_transports_with_command_trust<C, S, P, F>(
+    config: AgentConfig,
+    enrollment_client: C,
+    session_client: S,
+    probe: P,
+    shutdown: F,
+    command_trust_bundle: Option<crate::CentralCommandTrustBundle>,
 ) -> AgentDaemonResult<()>
 where
     C: EnrollmentClient + Clone,
@@ -219,17 +299,23 @@ where
     }
 
     let store = SqliteSystemIdentityStore::open(&config.storage.state_dir)?;
-    let identity = store.load()?.ok_or_else(|| {
+    let mut identity = store.load()?.ok_or_else(|| {
         AgentDaemonError::Identity("approved Agent identity disappeared".to_owned())
     })?;
-    let Some(approved) = identity.approved.as_ref() else {
+    let Some(approved) = identity.approved.clone() else {
         return Ok(());
     };
     let signing_key = crate::signing_key_from_identity(&identity)?;
-    let Some(resource_version) = query_approved_resource_version(
+    if identity.certificate.is_some() {
+        enrollment_client
+            .install_workload_identity(&identity)
+            .map_err(enrollment_error)?;
+    }
+    let Some(mut resource_version) = query_approved_resource_version(
         &config,
         &enrollment_client,
-        &identity,
+        &store,
+        &mut identity,
         &signing_key,
         shutdown_receiver.clone(),
     )
@@ -240,23 +326,93 @@ where
     if *shutdown_receiver.borrow() {
         return Ok(());
     }
-    crate::approved_runtime::run_approved_session(
-        config,
-        session_client,
-        probe,
-        AgentId::new(approved.agent_id.clone()).map_err(protocol_error)?,
-        AgentInstallationId::new(identity.installation_id.clone()).map_err(protocol_error)?,
-        signing_key,
-        resource_version,
-        wait_for_shutdown(shutdown_receiver),
-    )
-    .await
+    enrollment_client
+        .install_workload_identity(&identity)
+        .map_err(enrollment_error)?;
+    let session_client = Arc::new(session_client);
+    session_client
+        .install_workload_identity(&identity)
+        .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+    let agent_id = AgentId::new(approved.agent_id).map_err(protocol_error)?;
+    let installation_id =
+        AgentInstallationId::new(identity.installation_id.clone()).map_err(protocol_error)?;
+    let command_trust_bundle = command_trust_bundle.map(Arc::new);
+
+    loop {
+        let Some(renewal_window) = certificate_renewal_window(&identity)? else {
+            return crate::approved_runtime::run_approved_session(
+                config,
+                session_client,
+                probe,
+                agent_id,
+                installation_id,
+                signing_key,
+                resource_version,
+                command_trust_bundle,
+                wait_for_shutdown(shutdown_receiver),
+            )
+            .await;
+        };
+        let (reload_sender, reload_receiver) = tokio::sync::watch::channel(false);
+        let session = crate::approved_runtime::run_approved_session(
+            config.clone(),
+            Arc::clone(&session_client),
+            probe.clone(),
+            agent_id.clone(),
+            installation_id.clone(),
+            Arc::clone(&signing_key),
+            resource_version,
+            command_trust_bundle.clone(),
+            wait_for_shutdown_or_reload(shutdown_receiver.clone(), reload_receiver),
+        );
+        let renewal = renew_workload_certificate(
+            &config,
+            &enrollment_client,
+            session_client.as_ref(),
+            &store,
+            &mut identity,
+            &signing_key,
+            renewal_window,
+            shutdown_receiver.clone(),
+        );
+        tokio::pin!(session);
+        tokio::pin!(renewal);
+        tokio::select! {
+            result = &mut session => return result,
+            result = &mut renewal => {
+                let _ = reload_sender.send(true);
+                match result {
+                    Ok(Some(next_resource_version)) => {
+                        session.await?;
+                        if *shutdown_receiver.borrow() {
+                            return Ok(());
+                        }
+                        resource_version = next_resource_version;
+                    }
+                    Ok(None) => {
+                        session.await?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        if let Err(close_error) = session.await {
+                            tracing::warn!(
+                                error = %close_error,
+                                "failed to close the Agent session after certificate renewal failed"
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn query_approved_resource_version<C: EnrollmentClient>(
     config: &AgentConfig,
     client: &C,
-    identity: &SystemIdentityRecord,
+    store: &SqliteSystemIdentityStore,
+    identity: &mut SystemIdentityRecord,
     signing_key: &AgentSigningKey,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> AgentDaemonResult<Option<ResourceVersion>> {
@@ -275,16 +431,13 @@ async fn query_approved_resource_version<C: EnrollmentClient>(
         let request = signer.build(identity)?;
         match client.status(&request).await {
             Ok(Some(status)) => {
-                status.validate().map_err(protocol_error)?;
-                if status.state != AgentBootstrapStatusState::Approved
-                    || status.agent_id.as_ref().map(|value| value.to_string())
-                        != identity
-                            .approved
-                            .as_ref()
-                            .map(|value| value.agent_id.clone())
-                {
+                validate_approved_status(identity, &status)?;
+                if let Some(certificate) = status.certificate.clone() {
+                    install_certificate_bundle(store, identity, config, certificate)?;
+                }
+                if config.gateway_endpoint.scheme() == "https" && identity.certificate.is_none() {
                     return Err(AgentDaemonError::EnrollmentProtocol(
-                        "approved status query returned another identity or state".to_owned(),
+                        "approved HTTPS Agent status omitted the workload certificate".to_owned(),
                     ));
                 }
                 return Ok(Some(status.resource_version));
@@ -308,6 +461,170 @@ async fn query_approved_resource_version<C: EnrollmentClient>(
         if *shutdown.borrow_and_update() {
             return Ok(None);
         }
+    }
+}
+
+fn certificate_renewal_window(
+    identity: &SystemIdentityRecord,
+) -> AgentDaemonResult<Option<CertificateRenewalWindow>> {
+    let Some(certificate) = identity.certificate.as_ref() else {
+        return Ok(None);
+    };
+    let (Some(renew_at), Some(not_after)) =
+        (certificate.renew_at_unix_ms, certificate.not_after_unix_ms)
+    else {
+        return Ok(None);
+    };
+    if certificate.certificate_generation == 0 || renew_at.get() >= not_after.get() {
+        return Err(AgentDaemonError::Identity(
+            "persisted Agent certificate has an invalid renewal window".to_owned(),
+        ));
+    }
+    Ok(Some(CertificateRenewalWindow {
+        generation: certificate.certificate_generation,
+        renew_at_unix_ms: renew_at.get(),
+        not_after_unix_ms: not_after.get(),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn renew_workload_certificate<C, S>(
+    config: &AgentConfig,
+    enrollment_client: &C,
+    session_client: &S,
+    store: &SqliteSystemIdentityStore,
+    identity: &mut SystemIdentityRecord,
+    signing_key: &AgentSigningKey,
+    window: CertificateRenewalWindow,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> AgentDaemonResult<Option<ResourceVersion>>
+where
+    C: EnrollmentClient,
+    S: AgentSessionClient,
+{
+    if wait_until_or_shutdown(window.renew_at_unix_ms, shutdown.clone()).await? {
+        return Ok(None);
+    }
+    let next_generation = window.generation.checked_add(1).ok_or_else(|| {
+        AgentDaemonError::Identity("Agent workload certificate generation is exhausted".to_owned())
+    })?;
+    let public_key_spki =
+        Ed25519PublicKeySpki::new(public_key_spki_der(signing_key)?).map_err(protocol_error)?;
+    let mut status_clock = StatusTimestampClock::open(&config.storage.state_dir)?;
+    let mut signer = StatusRequestSigner {
+        config,
+        signing_key,
+        public_key_spki: &public_key_spki,
+        status_clock: &mut status_clock,
+    };
+    let mut backoff =
+        EnrollmentBackoff::with_max_delay_seconds(config.session.reconnect_max_delay_seconds);
+
+    loop {
+        if *shutdown.borrow_and_update() {
+            return Ok(None);
+        }
+        if now_unix_ms()? >= window.not_after_unix_ms {
+            return Err(AgentDaemonError::Enrollment(
+                "Agent workload certificate expired before renewal completed".to_owned(),
+            ));
+        }
+        let request = signer.build(identity)?;
+        match enrollment_client.status(&request).await {
+            Ok(Some(status)) => {
+                validate_approved_status(identity, &status)?;
+                let certificate = status.certificate.clone().ok_or_else(|| {
+                    AgentDaemonError::EnrollmentProtocol(
+                        "approved Agent renewal status omitted the workload certificate".to_owned(),
+                    )
+                })?;
+                let generation = certificate.certificate_generation.get();
+                if generation < window.generation {
+                    return Err(AgentDaemonError::EnrollmentProtocol(
+                        "Agent workload certificate renewal moved generation backwards".to_owned(),
+                    ));
+                }
+                if generation > window.generation {
+                    install_certificate_bundle(store, identity, config, certificate)?;
+                    let installed_generation = identity
+                        .certificate
+                        .as_ref()
+                        .map_or(0, |value| value.certificate_generation);
+                    if installed_generation != next_generation {
+                        return Err(AgentDaemonError::Identity(
+                            "Agent workload certificate renewal did not install the next generation"
+                                .to_owned(),
+                        ));
+                    }
+                    enrollment_client
+                        .install_workload_identity(identity)
+                        .map_err(enrollment_error)?;
+                    session_client
+                        .install_workload_identity(identity)
+                        .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+                    return Ok(Some(status.resource_version));
+                }
+            }
+            Ok(None) => {
+                return Err(AgentDaemonError::EnrollmentProtocol(
+                    "approved enrollment disappeared during certificate renewal".to_owned(),
+                ));
+            }
+            Err(error) if error.retryable() => {}
+            Err(error) => return Err(enrollment_error(error)),
+        }
+        let delay = next_delay(&mut backoff);
+        let retry_at =
+            now_unix_ms()?.saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+        if wait_until_or_shutdown(retry_at.min(window.not_after_unix_ms), shutdown.clone()).await? {
+            return Ok(None);
+        }
+    }
+}
+
+fn validate_approved_status(
+    identity: &SystemIdentityRecord,
+    status: &AgentBootstrapStatusResponse,
+) -> AgentDaemonResult<()> {
+    status.validate().map_err(protocol_error)?;
+    let approved = identity.approved.as_ref().ok_or_else(|| {
+        AgentDaemonError::Identity("approved Agent identity disappeared".to_owned())
+    })?;
+    let expected_request_id =
+        RequestId::new(identity.bootstrap_request_id.clone()).map_err(protocol_error)?;
+    let expected_installation_id =
+        AgentInstallationId::new(identity.installation_id.clone()).map_err(protocol_error)?;
+    if status.bootstrap_request_id != expected_request_id
+        || status.installation_id != expected_installation_id
+        || status.state != AgentBootstrapStatusState::Approved
+        || status.agent_id.as_ref().map(AgentId::as_str) != Some(approved.agent_id.as_str())
+        || status.enrollment_id.as_str() != approved.enrollment_id
+    {
+        return Err(AgentDaemonError::EnrollmentProtocol(
+            "approved status query returned another identity or state".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn wait_until_or_shutdown(
+    target_unix_ms: u64,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> AgentDaemonResult<bool> {
+    let delay = Duration::from_millis(target_unix_ms.saturating_sub(now_unix_ms()?));
+    Ok(tokio::select! {
+        _ = wait_for_shutdown(shutdown) => true,
+        _ = time::sleep(delay) => false,
+    })
+}
+
+async fn wait_for_shutdown_or_reload(
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    reload: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::select! {
+        _ = wait_for_shutdown(shutdown) => {}
+        _ = wait_for_shutdown(reload) => {}
     }
 }
 
@@ -367,7 +684,7 @@ where
     };
     reporter.set_phase(initial_phase)?;
 
-    if identity.approved.is_some() {
+    if identity.approved.is_some() && identity.certificate.is_some() {
         return Ok(());
     }
 
@@ -389,7 +706,7 @@ where
     match preflight {
         PreflightDisposition::Shutdown => return Ok(()),
         PreflightDisposition::Candidate(status) => {
-            match apply_status(&store, &mut identity, status, &mut reporter)? {
+            match apply_status(&config, &store, &mut identity, status, &mut reporter)? {
                 StatusDisposition::Pending => {}
                 StatusDisposition::Approved => return Ok(()),
                 StatusDisposition::Terminal => {
@@ -431,6 +748,7 @@ where
     }
 
     poll_status(
+        &config,
         &client,
         &store,
         &mut identity,
@@ -498,6 +816,7 @@ where
 }
 
 async fn poll_status<C, F>(
+    config: &AgentConfig,
     client: &C,
     store: &SqliteSystemIdentityStore,
     identity: &mut SystemIdentityRecord,
@@ -518,7 +837,7 @@ where
         }
         let request = status_signer.build(identity)?;
         match client.status(&request).await {
-            Ok(Some(status)) => match apply_status(store, identity, status, reporter)? {
+            Ok(Some(status)) => match apply_status(config, store, identity, status, reporter)? {
                 StatusDisposition::Pending => continue,
                 StatusDisposition::Approved => return Ok(()),
                 StatusDisposition::Terminal => {
@@ -592,6 +911,7 @@ fn apply_bootstrap_accepted(
 }
 
 fn apply_status(
+    config: &AgentConfig,
     store: &SqliteSystemIdentityStore,
     identity: &mut SystemIdentityRecord,
     status: AgentBootstrapStatusResponse,
@@ -626,6 +946,9 @@ fn apply_status(
                 agent_id.to_string(),
                 status.enrollment_id.to_string(),
             )?;
+            if let Some(certificate) = status.certificate {
+                install_certificate_bundle(store, identity, config, certificate)?;
+            }
             reporter.set_phase(RuntimeHealthPhase::ApprovedWaitingCertificate)?;
             Ok(StatusDisposition::Approved)
         }
@@ -649,6 +972,41 @@ fn apply_status(
             reporter.set_phase(RuntimeHealthPhase::Expired)?;
             Ok(StatusDisposition::Terminal)
         }
+    }
+}
+
+fn install_certificate_bundle(
+    store: &SqliteSystemIdentityStore,
+    identity: &mut SystemIdentityRecord,
+    config: &AgentConfig,
+    bundle: neoengram_protocol::AgentWorkloadCertificateBundle,
+) -> AgentDaemonResult<()> {
+    let certificate = crate::tls::certificate_state_from_bundle(
+        &bundle,
+        identity,
+        config.edge_cluster_id.as_str(),
+    )?;
+    if identity.certificate.as_ref() == Some(&certificate) {
+        return Ok(());
+    }
+    let expected_generation = identity
+        .certificate
+        .as_ref()
+        .map_or(0, |value| value.certificate_generation);
+    match store.install_certificate(identity.revision, expected_generation, certificate) {
+        Ok(next) => {
+            *identity = next;
+            Ok(())
+        }
+        Err(error) if error.code() == neoengram_agent::AgentErrorCode::LedgerConflict => {
+            *identity = store.load()?.ok_or_else(|| {
+                AgentDaemonError::Identity(
+                    "Agent identity disappeared during certificate install".to_owned(),
+                )
+            })?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -912,6 +1270,7 @@ enum StatusDisposition {
     Terminal,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PreflightDisposition {
     Missing,
     Candidate(AgentBootstrapStatusResponse),
@@ -952,8 +1311,10 @@ mod tests {
 
     use async_trait::async_trait;
     use neoengram_protocol::{
-        AgentEnrollmentId, AgentId, AgentMountId, AgentMountIdentityDigest, ContentDigest,
-        MountGeneration, ResourceVersion, StorageVolumeId, VolumeMarkerId,
+        AgentEnrollmentId, AgentId, AgentMountId, AgentMountIdentityDigest,
+        AgentWorkloadCertificateBundle, AgentWorkloadCertificateDer, CertificateGeneration,
+        ContentDigest, MountGeneration, OwnerGeneration, ResourceVersion, SessionGeneration,
+        StorageVolumeId, VolumeMarkerId,
     };
 
     use super::*;
@@ -1079,6 +1440,7 @@ mod tests {
                     agent_id: None,
                     resource_version: ResourceVersion::new(2),
                     updated_at_unix_ms: UnixMillis::new(now_unix_ms().unwrap()),
+                    certificate: None,
                     extensions: Extensions::new(),
                 })),
             }
@@ -1114,6 +1476,43 @@ mod tests {
         fn probe(&self) -> FilesystemMountObservation {
             self.0.fetch_add(1, Ordering::SeqCst);
             ready_probe()
+        }
+    }
+
+    #[derive(Clone)]
+    struct RenewingClient {
+        response: AgentBootstrapStatusResponse,
+        installed_generations: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl EnrollmentClient for RenewingClient {
+        fn install_workload_identity(
+            &self,
+            identity: &SystemIdentityRecord,
+        ) -> Result<(), EnrollmentClientError> {
+            self.installed_generations.lock().unwrap().push(
+                identity
+                    .certificate
+                    .as_ref()
+                    .map_or(0, |certificate| certificate.certificate_generation),
+            );
+            Ok(())
+        }
+
+        async fn bootstrap(
+            &self,
+            _request: &AgentBootstrapRequest,
+        ) -> Result<AgentBootstrapAccepted, EnrollmentClientError> {
+            panic!("approved certificate renewal must not bootstrap")
+        }
+
+        async fn status(
+            &self,
+            request: &AgentBootstrapStatusRequest,
+        ) -> Result<Option<AgentBootstrapStatusResponse>, EnrollmentClientError> {
+            request.verify().unwrap();
+            Ok(Some(self.response.clone()))
         }
     }
 
@@ -1316,6 +1715,148 @@ mod tests {
         after_restart.verify().unwrap();
     }
 
+    #[tokio::test]
+    async fn certificate_renewal_installs_next_generation_and_reloads_clients() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(
+            directory.path(),
+            directory.path().join("unused-bootstrap-token"),
+        );
+        let store = SqliteSystemIdentityStore::open(&config.storage.state_dir).unwrap();
+        let mut identity = crate::load_or_create_identity(&store).unwrap();
+        identity = store
+            .bind_approved(
+                identity.revision,
+                ApprovedAgentIdentity::new("agent-a", "enrollment-a").unwrap(),
+            )
+            .unwrap();
+        let now = now_unix_ms().unwrap();
+        let first = workload_certificate_bundle(&identity, &config, 1, now, now + 60_000);
+        install_certificate_bundle(&store, &mut identity, &config, first).unwrap();
+        let second =
+            workload_certificate_bundle(&identity, &config, 2, now + 30_000, now + 120_000);
+        let response = AgentBootstrapStatusResponse {
+            protocol_version: PROTOCOL_VERSION_V1,
+            bootstrap_request_id: RequestId::new(identity.bootstrap_request_id.clone()).unwrap(),
+            installation_id: AgentInstallationId::new(identity.installation_id.clone()).unwrap(),
+            state: AgentBootstrapStatusState::Approved,
+            enrollment_id: AgentEnrollmentId::new("enrollment-a").unwrap(),
+            agent_id: Some(AgentId::new("agent-a").unwrap()),
+            resource_version: ResourceVersion::new(9),
+            updated_at_unix_ms: UnixMillis::new(now),
+            certificate: Some(second),
+            extensions: Extensions::new(),
+        };
+        let installed_generations = Arc::new(Mutex::new(Vec::new()));
+        let enrollment_client = RenewingClient {
+            response,
+            installed_generations: Arc::clone(&installed_generations),
+        };
+        let session_client =
+            ReqwestAgentSessionClient::new(config.gateway_endpoint.clone()).unwrap();
+        let signing_key = crate::signing_key_from_identity(&identity).unwrap();
+        let window = certificate_renewal_window(&identity).unwrap().unwrap();
+        let (_shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+
+        let renewed = tokio::time::timeout(
+            Duration::from_secs(2),
+            renew_workload_certificate(
+                &config,
+                &enrollment_client,
+                &session_client,
+                &store,
+                &mut identity,
+                &signing_key,
+                window,
+                shutdown_receiver,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(renewed, Some(ResourceVersion::new(9)));
+        assert_eq!(
+            identity
+                .certificate
+                .as_ref()
+                .unwrap()
+                .certificate_generation,
+            2
+        );
+        assert_eq!(*installed_generations.lock().unwrap(), [2]);
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .certificate
+                .unwrap()
+                .certificate_generation,
+            2
+        );
+    }
+
+    fn workload_certificate_bundle(
+        identity: &SystemIdentityRecord,
+        config: &AgentConfig,
+        generation: u64,
+        renew_at_unix_ms: u64,
+        not_after_unix_ms: u64,
+    ) -> AgentWorkloadCertificateBundle {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+            KeyUsagePurpose, SanType, SubjectPublicKeyInfo,
+        };
+
+        let approved = identity.approved.as_ref().unwrap();
+        let identity_uri = [
+            "spiffe://mesh.example.test/workloads/edge-clusters/",
+            config.edge_cluster_id.as_str(),
+            "/agents/",
+            approved.agent_id.as_str(),
+        ]
+        .concat();
+        let issuer_key = KeyPair::generate().unwrap();
+        let mut issuer_parameters = CertificateParams::default();
+        issuer_parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        issuer_parameters.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let issuer = issuer_parameters.self_signed(&issuer_key).unwrap();
+        let signing_key = crate::signing_key_from_identity(identity).unwrap();
+        let public_key_spki =
+            Ed25519PublicKeySpki::new(public_key_spki_der(&signing_key).unwrap()).unwrap();
+        let public_key = SubjectPublicKeyInfo::from_der(public_key_spki.as_der()).unwrap();
+        let mut leaf_parameters = CertificateParams::new(Vec::<String>::new()).unwrap();
+        leaf_parameters
+            .subject_alt_names
+            .push(SanType::URI(identity_uri.clone().try_into().unwrap()));
+        leaf_parameters.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let leaf = leaf_parameters
+            .signed_by(&public_key, &issuer, &issuer_key)
+            .unwrap();
+        AgentWorkloadCertificateBundle {
+            certificate_bundle_version: AgentWorkloadCertificateBundle::VERSION,
+            edge_cluster_id: config.edge_cluster_id.clone(),
+            agent_id: AgentId::new(approved.agent_id.clone()).unwrap(),
+            enrollment_id: AgentEnrollmentId::new(approved.enrollment_id.clone()).unwrap(),
+            identity_uri,
+            public_key_fingerprint: public_key_spki.fingerprint(),
+            certificate_generation: CertificateGeneration::new(generation),
+            session_generation: SessionGeneration::new(1),
+            mount_generation: MountGeneration::new(1),
+            owner_generation: OwnerGeneration::new(1),
+            not_before_unix_ms: UnixMillis::new(renew_at_unix_ms.saturating_sub(1_000).max(1)),
+            not_after_unix_ms: UnixMillis::new(not_after_unix_ms),
+            renew_at_unix_ms: UnixMillis::new(renew_at_unix_ms),
+            leaf_certificate_der: AgentWorkloadCertificateDer::new(leaf.der().to_vec()).unwrap(),
+            issuer_chain_der: vec![AgentWorkloadCertificateDer::new(issuer.der().to_vec()).unwrap()],
+            extensions: Extensions::new(),
+        }
+    }
+
     async fn assert_terminal_restart(
         source: TerminalResponseSource,
         expected_state: TerminalEnrollmentState,
@@ -1403,7 +1944,10 @@ mod tests {
         AgentConfig {
             schema_version: 1,
             protocol_version: 1,
-            central_endpoint: url::Url::parse("http://127.0.0.1:8080/").unwrap(),
+            gateway_endpoint: url::Url::parse("http://127.0.0.1:8080/").unwrap(),
+            trust_bundle_file: root.join("gateway-ca.pem"),
+            gateway_workload_trust_domain: None,
+            central_command_trust_bundle_file: None,
             tenant_id: neoengram_protocol::TenantId::new("tenant-a").unwrap(),
             edge_cluster_id: neoengram_protocol::EdgeClusterId::new("edge-a").unwrap(),
             storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),

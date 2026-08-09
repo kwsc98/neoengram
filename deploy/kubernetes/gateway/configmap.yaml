@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: synapse-gateway-config-gateway-pool-example
+  namespace: synapse-gateway-example
+  annotations:
+    neoengram.io/example-only: "external-provisioner-required"
+  labels:
+    app.kubernetes.io/name: synapse-gateway
+    app.kubernetes.io/component: edge-gateway
+    neoengram.io/edge-cluster: edge-example
+    neoengram.io/gateway-pool: gateway-pool-example
+immutable: true
+data:
+  # The EdgeCluster and Pool identities are immutable for this example. Each
+  # explicit Deployment document supplies its own stable Replica identity.
+  SYNAPSE_GATEWAY_EDGE_CLUSTER_ID: edge-example
+  SYNAPSE_GATEWAY_POOL_ID: gateway-pool-example
+  SYNAPSE_GATEWAY_AGENT_LISTEN: 0.0.0.0:8081
+  SYNAPSE_GATEWAY_CONTROL_LISTEN: 0.0.0.0:8082
+  SYNAPSE_GATEWAY_PEER_LISTEN: 0.0.0.0:8083
+  SYNAPSE_GATEWAY_TLS_CERTIFICATE_FILE: /var/run/secrets/synapse-gateway/listener/tls.crt
+  SYNAPSE_GATEWAY_TLS_PRIVATE_KEY_FILE: /var/run/secrets/synapse-gateway/listener/tls.key
+  SYNAPSE_GATEWAY_TLS_CLIENT_CA_FILE: /var/run/secrets/synapse-gateway/listener/ca.crt
+  # This is a long-lived workload identity boundary, not a bootstrap secret. The
+  # three per-Replica bootstrap path settings live only in each Deployment and
+  # are removed together after certificate promotion.
+  SYNAPSE_GATEWAY_WORKLOAD_TRUST_DOMAIN: mesh.example.test
+  SYNAPSE_GATEWAY_MAX_CONNECTIONS_PER_LISTENER: "1024"
+  SYNAPSE_GATEWAY_MAX_IN_FLIGHT_REQUESTS_PER_LISTENER: "256"
+  SYNAPSE_GATEWAY_MAX_REQUEST_BYTES: "1048576"
+  SYNAPSE_GATEWAY_REQUEST_DEADLINE_MILLIS: "10000"
+  # The preStop helper marks readiness false and leaves 40 seconds of the Pod
+  # termination grace period for SIGTERM shutdown after endpoint propagation.
+  SYNAPSE_GATEWAY_PRE_STOP_DRAIN_SECONDS: "20"
+  SYNAPSE_GATEWAY_LOG: synapse_gateway=info

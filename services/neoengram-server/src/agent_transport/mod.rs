@@ -87,7 +87,7 @@ pub enum AgentAction {
 }
 
 impl AgentAction {
-    fn from_path(path: &str) -> Option<Self> {
+    pub fn from_path(path: &str) -> Option<Self> {
         match path {
             neoengram_protocol::AGENT_ENROLLMENT_BOOTSTRAP_PATH => Some(Self::EnrollmentBootstrap),
             neoengram_protocol::AGENT_ENROLLMENT_STATUS_QUERY_PATH => {
@@ -116,7 +116,7 @@ impl AgentAction {
         }
     }
 
-    const fn max_body_bytes(self) -> usize {
+    pub const fn max_body_bytes(self) -> usize {
         match self {
             Self::JobMetadataPageStage => AGENT_MAX_METADATA_PAGE_BODY_BYTES,
             _ => AGENT_MAX_REQUEST_BODY_BYTES,
@@ -132,9 +132,50 @@ pub trait AgentApiHandler: Send + Sync + 'static {
     /// Opens one H2 reverse control channel after consuming and authenticating its first frame.
     async fn open_control_channel(
         &self,
-        _body: Incoming,
+        _input: AgentControlInput,
     ) -> Result<AgentControlChannel, AgentHttpError> {
         Err(AgentHttpError::unavailable())
+    }
+
+    /// Opens an Agent channel while atomically acquiring its Central-authoritative Gateway route.
+    async fn open_routed_control_channel(
+        &self,
+        _input: AgentControlInput,
+        _route: GatewayAgentRouteContext,
+    ) -> Result<RoutedAgentControlChannel, AgentHttpError> {
+        Err(AgentHttpError::unavailable())
+    }
+}
+
+/// Hop-authenticated route context supplied by one verified Gateway control session.
+#[derive(Debug, Clone)]
+pub struct GatewayAgentRouteContext {
+    pub route_request_id: neoengram_protocol::RequestId,
+    pub gateway_pool_id: neoengram_protocol::GatewayPoolId,
+    pub gateway_replica_id: neoengram_protocol::GatewayReplicaId,
+    pub connection_id: neoengram_protocol::GatewayConnectionId,
+    pub observed_at_unix_ms: neoengram_protocol::UnixMillis,
+    pub lease_expires_at_unix_ms: neoengram_protocol::UnixMillis,
+    pub heartbeat_timeout_ms: u64,
+}
+
+/// Agent channel and the route committed in the same repository transaction as session open.
+pub struct RoutedAgentControlChannel {
+    pub channel: AgentControlChannel,
+    pub route: neoengramd::AgentRouteLease,
+    pub replayed: bool,
+    /// Previous authoritative owner replaced by the atomic session/route acquire, if any.
+    pub fenced: Option<neoengramd::AgentRouteLease>,
+}
+
+impl fmt::Debug for RoutedAgentControlChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RoutedAgentControlChannel")
+            .field("route", &self.route)
+            .field("replayed", &self.replayed)
+            .field("fenced", &self.fenced)
+            .finish_non_exhaustive()
     }
 }
 
@@ -148,6 +189,11 @@ impl AgentControlChannel {
     #[must_use]
     pub fn new(frames: mpsc::Receiver<Bytes>) -> Self {
         Self { frames }
+    }
+
+    /// Receives the next already-bounded NDJSON frame for a transport adapter.
+    pub async fn next_frame(&mut self) -> Option<Bytes> {
+        self.frames.recv().await
     }
 }
 
@@ -193,24 +239,70 @@ enum AgentHandledResponse {
     Channel(AgentControlChannel),
 }
 
-pub(crate) struct AgentNdjsonInput<B> {
-    body: B,
+/// Transport-neutral, bounded input for one Agent full-duplex control channel.
+///
+/// Hyper and Gateway tunnel adapters feed raw chunks through [`AgentControlInputWriter`]. The
+/// decoder deliberately ignores transport frame boundaries and yields LF-delimited protocol
+/// frames, matching the public Agent contract.
+pub struct AgentControlInput {
+    chunks: mpsc::Receiver<Result<Bytes, AgentHttpError>>,
     decoder: neoengram_protocol::AgentChannelNdjsonDecoder,
     ready: VecDeque<Vec<u8>>,
     finished: bool,
 }
 
-impl<B> AgentNdjsonInput<B>
-where
-    B: Body<Data = Bytes> + Unpin,
-{
-    pub(crate) fn new(body: B) -> Self {
-        Self {
-            body,
-            decoder: neoengram_protocol::AgentChannelNdjsonDecoder::new(),
-            ready: VecDeque::new(),
-            finished: false,
-        }
+/// Producer half for [`AgentControlInput`]. Dropping every writer closes the input stream.
+#[derive(Clone)]
+pub struct AgentControlInputWriter {
+    chunks: mpsc::Sender<Result<Bytes, AgentHttpError>>,
+}
+
+pub(crate) enum AgentControlInputTrySendError {
+    Full,
+    Closed,
+}
+
+impl AgentControlInput {
+    /// Creates a bounded transport bridge. `capacity` must be positive.
+    #[must_use]
+    pub fn channel(capacity: usize) -> (AgentControlInputWriter, Self) {
+        assert!(
+            capacity > 0,
+            "Agent control input capacity must be positive"
+        );
+        let (chunks, receiver) = mpsc::channel(capacity);
+        (
+            AgentControlInputWriter { chunks },
+            Self {
+                chunks: receiver,
+                decoder: neoengram_protocol::AgentChannelNdjsonDecoder::new(),
+                ready: VecDeque::new(),
+                finished: false,
+            },
+        )
+    }
+
+    fn from_incoming(mut body: Incoming) -> Self {
+        const INPUT_CHUNK_BUFFER: usize = 8;
+        let (writer, input) = Self::channel(INPUT_CHUNK_BUFFER);
+        tokio::spawn(async move {
+            while let Some(frame) = body.frame().await {
+                let chunk = match frame {
+                    Ok(frame) => match frame.into_data() {
+                        Ok(chunk) => chunk,
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        writer.fail(AgentHttpError::protocol_invalid()).await;
+                        return;
+                    }
+                };
+                if writer.send(chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+        input
     }
 
     pub(crate) async fn next_line(&mut self) -> Result<Option<Vec<u8>>, AgentHttpError> {
@@ -221,17 +313,14 @@ where
             return Ok(None);
         }
         loop {
-            let Some(frame) = self.body.frame().await else {
+            let Some(chunk) = self.chunks.recv().await else {
                 self.finished = true;
                 self.decoder
                     .finish()
                     .map_err(|_| AgentHttpError::protocol_invalid())?;
                 return Ok(None);
             };
-            let frame = frame.map_err(|_| AgentHttpError::protocol_invalid())?;
-            let data = frame
-                .into_data()
-                .map_err(|_| AgentHttpError::protocol_invalid())?;
+            let data = chunk?;
             self.ready.extend(
                 self.decoder
                     .push(&data)
@@ -241,6 +330,32 @@ where
                 return Ok(Some(line));
             }
         }
+    }
+}
+
+impl AgentControlInputWriter {
+    /// Applies bounded backpressure while forwarding one transport chunk.
+    pub async fn send(&self, chunk: Bytes) -> Result<(), AgentHttpError> {
+        self.chunks
+            .send(Ok(chunk))
+            .await
+            .map_err(|_| AgentHttpError::unavailable())
+    }
+
+    /// Attempts one bounded transport write without waiting for a slow Agent consumer.  Gateway
+    /// control readers use this boundary so a full per-Agent queue closes only that stream instead
+    /// of head-of-line blocking heartbeats and unrelated Agent routes on the same Replica.
+    pub(crate) fn try_send(&self, chunk: Bytes) -> Result<(), AgentControlInputTrySendError> {
+        match self.chunks.try_send(Ok(chunk)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(AgentControlInputTrySendError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(AgentControlInputTrySendError::Closed),
+        }
+    }
+
+    /// Terminates the consumer with a sanitized transport failure.
+    pub async fn fail(&self, error: AgentHttpError) {
+        let _ = self.chunks.send(Err(error)).await;
     }
 }
 
@@ -319,6 +434,31 @@ impl AgentHttpError {
             true,
         )
         .with_retry_after_ms(1_000)
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    #[must_use]
+    pub const fn detail(&self) -> &'static str {
+        self.detail
+    }
+
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    #[must_use]
+    pub const fn retry_after_ms(&self) -> Option<u64> {
+        self.retry_after_ms
     }
 }
 
@@ -662,7 +802,7 @@ async fn handle_request(
             ));
         }
         return handler
-            .open_control_channel(request.into_body())
+            .open_control_channel(AgentControlInput::from_incoming(request.into_body()))
             .await
             .map(AgentHandledResponse::Channel);
     }
@@ -950,9 +1090,8 @@ mod tests {
 
         async fn open_control_channel(
             &self,
-            body: Incoming,
+            mut input: AgentControlInput,
         ) -> Result<AgentControlChannel, AgentHttpError> {
-            let mut input = AgentNdjsonInput::new(body);
             let first = input
                 .next_line()
                 .await?

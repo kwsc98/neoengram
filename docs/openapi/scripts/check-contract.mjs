@@ -129,6 +129,19 @@ const expectedOperations = {
     "post",
     "querySnapshotDatasetProfile",
   ],
+  "/api/gateway/pool/create": ["post", "createGatewayPool"],
+  "/api/gateway/pool/query": ["post", "queryGatewayPool"],
+  "/api/gateway/pool/list/query": ["post", "queryGatewayPoolList"],
+  "/api/gateway/pool/update": ["post", "updateGatewayPool"],
+  "/api/gateway/pool/drain": ["post", "drainGatewayPool"],
+  "/api/gateway/replica/create": ["post", "createGatewayReplica"],
+  "/api/gateway/replica/activate": ["post", "activateGatewayReplica"],
+  "/api/gateway/replica/list/query": [
+    "post",
+    "queryGatewayReplicaList",
+  ],
+  "/api/gateway/replica/drain": ["post", "drainGatewayReplica"],
+  "/api/gateway/replica/revoke": ["post", "revokeGatewayReplica"],
   "/api/job/add/create": ["post", "createAddJob"],
   "/api/job/query": ["post", "queryJob"],
   "/api/job/add/finalize": ["post", "finalizeAddJob"],
@@ -628,6 +641,30 @@ const resourceContracts = {
     "QuerySnapshotDatasetProfileRequest",
     "QuerySnapshotDatasetProfileResponse",
   ],
+  createGatewayPool: ["CreateGatewayPoolRequest", "GatewayPoolResponse"],
+  queryGatewayPool: ["QueryGatewayPoolRequest", "GatewayPoolResponse"],
+  queryGatewayPoolList: [
+    "QueryGatewayPoolListRequest",
+    "GatewayPoolListResponse",
+  ],
+  updateGatewayPool: ["UpdateGatewayPoolRequest", "GatewayPoolResponse"],
+  drainGatewayPool: ["DrainGatewayPoolRequest", "GatewayPoolResponse"],
+  createGatewayReplica: [
+    "CreateGatewayReplicaRequest",
+    "CreateGatewayReplicaResponse",
+  ],
+  queryGatewayReplicaList: [
+    "QueryGatewayReplicaListRequest",
+    "GatewayReplicaListResponse",
+  ],
+  drainGatewayReplica: [
+    "MutateGatewayReplicaRequest",
+    "GatewayReplicaResponse",
+  ],
+  revokeGatewayReplica: [
+    "MutateGatewayReplicaRequest",
+    "GatewayReplicaResponse",
+  ],
 };
 
 for (const [operationId, [requestName, responseName]] of Object.entries(
@@ -651,6 +688,49 @@ for (const [operationId, [requestName, responseName]] of Object.entries(
     `${operationId} uses the wrong success DTO`,
   );
 }
+
+assert(
+  document.components.schemas.GatewayPoolId.$ref ===
+    "#/components/schemas/ResourceId" &&
+    document.components.schemas.GatewayReplicaId.$ref ===
+      "#/components/schemas/ResourceId",
+  "Gateway Pool and Replica IDs must remain explicit public schema aliases",
+);
+assertSameMembers(
+  document.components.schemas.PermissionName.enum,
+  [
+    "job.create",
+    "job.read",
+    "job.finalize",
+    "tenant.read",
+    "tenant.create",
+    "tenant.admin",
+    "storage.read",
+    "storage.create",
+    "storage.enrollment.create",
+    "storage.enrollment.read",
+    "storage.enrollment.review",
+    "artifact.read",
+    "artifact.create",
+    "playground.read",
+    "playground.create",
+    "snapshot.read",
+    "snapshot.create",
+    "gateway.read",
+    "gateway.manage",
+  ],
+  "public permission vocabulary changed",
+);
+assertDescriptionIncludes(
+  document.components.schemas.GatewayEndpoint,
+  ["canonical HTTPS origin", "path", "query", "fragment"],
+  "Gateway endpoint must document its canonical origin boundary",
+);
+assert(
+  document.components.schemas.CreateGatewayReplicaResponse.properties
+    .activation_token.readOnly === true,
+  "Gateway activation token must remain response-only",
+);
 
 const snapshotRequest = document.components.schemas.QuerySnapshotRequest;
 assertSameMembers(

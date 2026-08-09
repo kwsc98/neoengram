@@ -7,6 +7,8 @@ mod catalog;
 pub use catalog::*;
 mod commit;
 pub use commit::*;
+mod gateway;
+pub use gateway::*;
 mod precommit;
 pub use precommit::*;
 mod playground;

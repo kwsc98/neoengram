@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>数据物流仓库 · 跨集群版本化数据物流</title>
+<title>数据物流仓库 · 历史交互原型</title>
 <style>
   :root {
     /* light teal palette — aligned with 共绩算力 console reference */
@@ -42,6 +42,8 @@
     color: var(--text);
     font-size: 13px;
     overflow: hidden;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
   }
   ::-webkit-scrollbar { width: 8px; height: 8px; }
   ::-webkit-scrollbar-thumb { background: hsl(214 25% 85%); border-radius: 4px; }
@@ -648,7 +650,8 @@
   .console {
     display: grid;
     grid-template-columns: 232px 1fr;
-    height: 100vh;
+    height: auto;
+    min-height: 0;
     background: var(--bg);
   }
   .plat-sidebar {
@@ -873,6 +876,12 @@
 </style>
 </head>
 <body>
+<div style="padding:10px 16px;border-bottom:1px solid hsl(36 90% 75%);background:hsl(38 95% 94%);color:hsl(30 80% 28%);line-height:1.45;z-index:100">
+  <strong>历史原型：</strong>本页的 Agent 自带公网 S3 endpoint、Volume Gateway、可变 Playground
+  gateway 和 Agent 直连中心不是 Synapse 目标架构。2026-08-09 目标为 Central -> 每集群多副本
+  GatewayPool <- Agent；Gateway 不挂载 Volume。详见
+  <a href="synapse-gateway-architecture.md">Synapse Gateway 架构</a>。
+</div>
 <div class="console">
 
   <!-- ===== Platform Sidebar (NAS console style) ===== -->
@@ -985,7 +994,7 @@
               <span class="lg"><span class="ld" style="background:var(--archive)"></span>自有 NAS（客户集群 · 接入）</span>
               <span class="lg"><span class="ld" style="background:var(--dataset)"></span>S3（推送目标 / 归档）</span>
               <span class="lg"><span class="ld" style="background:var(--sync)"></span>正在运行的 sync 任务</span>
-              <span class="lg"><span class="ld" style="background:var(--ok);border-radius:50%;width:10px;height:10px"></span>S3 网关开（可作 pull 源）</span>
+              <span class="lg"><span class="ld" style="background:var(--ok);border-radius:50%;width:10px;height:10px"></span>历史 mock：Volume Gateway（当前已停用）</span>
             </div>
           </div>
         </div>
@@ -1389,8 +1398,8 @@ const STORE_LABEL = {
   "center-s3": "Center S3 (self-contained)",
   "oss-archive": "OSS Archive (S2)"
 };
-// S3 端点有无：决定该 store 能否作 pull 源 / push 目标（§7.6.1）
-// 托管 NAS 与 S3 目标恒有端点；自有 NAS 按注册时 --s3-endpoint 有无
+// 历史 mock 数据：旧原型的 S3 端点字段不代表当前 Synapse Gateway 能力。
+// 当前目标是每个 EdgeCluster 的多副本 GatewayPool；该页面不执行真实注册或传输。
 const STORE_S3GW = {
   "edge-a-nas": true,
   "edge-b-nas": true,
@@ -1521,12 +1530,12 @@ const STORE_USAGE = [
     controllable:"我们可控 · 跑容器云", agent:"Artifact Agent 常驻", specs:"GPU 4090×8 · NAS 8 TB" },
   { name:"center-nas", label:"Center NAS · 全功能版本仓库", used:5.2, total:10, kind:"nas", versions:14, role:"训练实验 playground · job spec 只挂 NAS 路径",
     controllable:"计算不可控 · NAS 可控", agent:"Artifact Agent 客户端（全功能 · 与边缘同构）", specs:"H200×128 · NAS 10 TB" },
-  { name:"center-train-nas", label:"中心训练 NAS · 自有（接入）", used:4.2, kind:"selfnas", versions:11, role:"客户自建 · 训练数据本地缓存 · gj-agent 接入 · S3 网关开",
-    controllable:"客户自有集群 · 零托管", agent:"gj-agent（客户侧部署 · S3 网关开）", specs:"自有 · 已用 4.2 TB · 无总量配额 · 可作 pull 源" },
-  { name:"factory-nas", label:"边缘数采工厂 NAS · 自有（接入）", used:1.8, kind:"selfnas", versions:7, role:"客户自建 · 工厂产线数采就近落盘 · gj-agent 接入 · 无网关",
-    controllable:"客户自有集群 · 零托管", agent:"gj-agent（客户侧部署 · 无网关 · 仅 push）", specs:"自有 · 已用 1.8 TB · 无总量配额 · 仅 push 出" },
-  { name:"center-s3", label:"Center S3 (self-contained) · 推送目标", used:2.1, kind:"s3", versions:6, role:"S3 client 直读 · RDMA · 无 agent",
-    controllable:"零侵入 · 仅 endpoint+凭证", agent:"无 agent（S3 SDK 直写）", specs:"RDMA · 已用 2.1 TB · 无总量配额" },
+  { name:"center-train-nas", label:"历史 mock：中心训练 NAS · 自有（接入）", used:4.2, kind:"selfnas", versions:11, role:"历史原型数据 · 当前由 GatewayPool 控制面替代",
+    controllable:"历史 mock · 不可部署", agent:"旧 gj-agent 示例（已停用）", specs:"仅用于观测面板演示 · 非当前能力" },
+  { name:"factory-nas", label:"历史 mock：边缘数采工厂 NAS · 自有（接入）", used:1.8, kind:"selfnas", versions:7, role:"历史原型数据 · 当前由 GatewayPool 控制面替代",
+    controllable:"历史 mock · 不可部署", agent:"旧 gj-agent 示例（已停用）", specs:"仅用于观测面板演示 · 非当前能力" },
+  { name:"center-s3", label:"历史 mock：Center S3 (self-contained) · 推送目标", used:2.1, kind:"s3", versions:6, role:"历史 S3 client 直读 · 非当前能力",
+    controllable:"历史 mock · 不可部署", agent:"旧 S3 SDK 示例（已停用）", specs:"仅用于观测面板演示 · 非当前能力" },
   { name:"oss-archive", label:"OSS Archive (S2 内容寻址) · 归档层", used:7.4, kind:"s3", versions:22, role:"跨版本去重 · 长期归档 · MVP 不支持 evict",
     controllable:"第三方 S3 · 客户凭证", agent:"无 agent（S3 SDK 直写）", specs:"归档 · 已用 7.4 TB · 无总量配额" },
 ];
@@ -1579,8 +1588,7 @@ let topoModalState = { scale: 1, tx: 0, ty: 0 }; // modal
 let topoDragCtx = null;
 
 function buildTopoSVG() {
-  // 节点：托管 NAS（我们集群）/ 自有 NAS（客户集群·接入）/ S3（推送目标·归档）
-  // s3gw=true 表示该 NAS 注册时开启了 S3 网关，可作 pull 源；false 只能 push
+  // 历史 mock 拓扑：不代表当前部署或数据路径；当前目标由 Synapse Gateway 架构文档定义。
   const nodes = {
     edgeA:       { x: 20,  y: 250, w: 210, h: 116, label: "Edge A NAS",  sub: "edge-a-nas · 6.8/12 TB",  color: "var(--accent)",   kind: "managed", s3gw: true,  role: "采集/STAA · 数据主住所" },
     centerNas:   { x: 290, y: 250, w: 210, h: 116, label: "Center NAS",  sub: "center-nas · 5.2/10 TB", color: "var(--accent)",   kind: "managed", s3gw: true,  role: "训练实验 · 全功能版本仓库" },
@@ -1690,7 +1698,7 @@ function buildTopoSVG() {
     if (n.h >= 100) {
       svg += `<text x="16" y="80" fill="var(--text-dim)" font-size="10">硬链接版本存储 + playground + commit</text>`;
     }
-    // Type and Volume Gateway badges (top-right).
+    // Historical mock badges; this page is not a current Gateway deployment view.
     const typeLabel = n.kind === "managed" ? "托管" : (n.kind === "self" ? "自有·接入" : "S3");
     const typeColor = n.kind === "managed" ? "var(--accent)" : (n.kind === "self" ? "var(--archive)" : "var(--dataset)");
     const tw = typeLabel.length * 11 + 14;
@@ -1698,7 +1706,7 @@ function buildTopoSVG() {
     svg += `<text x="${n.w - tw/2 - 12}" y="23" fill="${typeColor}" font-size="10" text-anchor="middle" font-weight="600">${typeLabel}</text>`;
     if (n.kind !== "s3") {
       const gw = n.s3gw;
-      const gwLabel = gw ? "S3 网关 开" : "无网关";
+      const gwLabel = gw ? "历史 mock 网关" : "历史 mock 无网关";
       const gwColor = gw ? "var(--ok)" : "var(--text-dim)";
       const gwDot = gw ? "var(--ok)" : "var(--text-dim)";
       const gww = gwLabel.length * 11 + 20;
@@ -2211,9 +2219,9 @@ function renderInspector() {
       <button class="op-btn op-evict op-btn-lg" onclick="openOpModal('evict',{artVer:'${a.name}@${v.v}'})">⊗ evict 自…</button>
       <button class="op-btn op-scrub op-btn-lg" onclick="openOpModal('scrub',{artVer:'${a.name}@${v.v}'})">✓ scrub</button>
       <button class="op-btn op-commit op-btn-lg" onclick="openOpModal('pgCreate',{from:'${a.name}@${v.v}',at:'edge-a-nas'})">＋ 从此版本建 playground</button>
-      <button class="op-btn op-sync op-btn-lg" onclick="openOpModal('artGateway',{artVer:'${a.name}@${v.v}'})">🌐 gateway open（只读）</button>
+      <button class="op-btn op-sync op-btn-lg" onclick="openOpModal('artGateway',{artVer:'${a.name}@${v.v}'})">历史 mock gateway（已停用）</button>
       <button class="op-btn op-evict op-btn-lg" onclick="deleteVersion('${a.id}','${v.v}')">⊗ 删除此版本（软删除）</button>
-      <span class="dim" style="font-size:10px;align-self:center">· GUI 与 CLI 共用 I1；控制面经 I3 下发 Agent</span>
+      <span class="dim" style="font-size:10px;align-self:center">· 历史 mock：当前控制命令经本集群 GatewayPool 转发</span>
     </div>
   `;
   document.getElementById("insp-loc").innerHTML = locHtml;
@@ -2303,7 +2311,7 @@ function renderPlaygrounds() {
       <div class="op-btn-row op-btn-row-lg">
         <button class="op-btn op-commit op-btn-lg" onclick='openOpModal("commit", ${JSON.stringify(commitCtx).replace(/'/g,"&apos;")})'>⬆ commit 为新版本</button>
         <button class="op-btn op-import op-btn-lg" onclick='openOpModal("pgImport", {pgName:"${p.name}"})'>＋ import 追加文件</button>
-        <button class="op-btn op-sync op-btn-lg" onclick='openOpModal("pgGateway", {pgName:"${p.name}"})'>🌐 gateway open（读写）</button>
+        <button class="op-btn op-sync op-btn-lg" onclick='openOpModal("pgGateway", {pgName:"${p.name}"})'>历史 mock gateway（已停用）</button>
         <button class="op-btn op-rm op-btn-lg" onclick='openOpModal("pgRm", {pgName:"${p.name}"})'>⊗ rm</button>
       </div>
     </div>`;
@@ -2643,7 +2651,7 @@ window.addEventListener("resize", () => {
 });
 
 /* ============================================================
- * 操作能力框架（遥控式：GUI 与 CLI 共用 I1，控制面经 I3 下发 Agent）
+ * 历史 mock 操作能力框架；当前控制命令经本集群 GatewayPool 转发。
  * 详见 05-平台架构设计.md §6.0 I1 / §6.1 I3
  * ============================================================ */
 
@@ -2879,10 +2887,10 @@ function renderSpaceForm() {
     <div class="sc-banner" style="background:var(--panel-2);border-color:var(--border)">
       <span class="b-ico" style="background:var(--accent);color:#fff">i</span>
       <div>
-        <div style="margin-bottom:6px">自有 NAS <b>无需在控制台配置</b>。在你自己的集群节点安装客户端（<span class="mono">gj-agent</span> 守护进程 + <span class="mono">gjctl</span> 控制台命令，docker 式架构），用下方命令一次性注册成本受控端点并挂载你的 NAS，控制面会自动发现并纳入该数据空间的物流拓扑。</div>
+        <div style="margin-bottom:6px"><b>历史 mock（当前已停用）</b>：以下 gj-agent/gjctl 注册流程只属于旧原型，不能用于当前 Synapse 部署。当前 Agent 应注册到所属 EdgeCluster 的 GatewayPool。</div>
         <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">该空间专属接入 Token（泄露后可在空间配置中重置）：<span class="cfg-token">${scState.spaceToken}</span></div>
-        <div class="cfg-cmd">gjctl register --token ${scState.spaceToken} --store &lt;your-store-id&gt; --mount /mnt/gj/&lt;your-store-id&gt; [--s3-endpoint &lt;公网 S3 域名&gt;]</div>
-        <div style="font-size:11px;color:var(--text-dim);margin-top:6px"><code>&lt;your-store-id&gt;</code> 由你自定义，注册后即作为该空间的存储后端标识；支持 NFS / S3 / 本地盘等多种后端。<code>--s3-endpoint</code> 可选：填则开启 S3 网关、可作 pull 源（其他 agent 直拉本节点），须填本节点 S3 网关的公网可访问域名（agent 自身发现不了公网入口）；不填则只能 push 出。详见接入文档。</div>
+        <div class="cfg-cmd" aria-disabled="true">历史 mock 命令（不可执行）：gjctl register …</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:6px">旧原型中的 Volume Gateway、Agent 直拉和自带公网 S3 endpoint 均已废弃。Gateway 不挂载 Volume；跨集群传输和 S3 访问属于后续里程碑。</div>
         <div style="margin-top:8px"><a class="btn-link" href="#" onclick="event.preventDefault();showToast('已为你打开接入文档','docs://gongji.cn/agent/register','info')">查看完整接入文档 →</a></div>
       </div>
     </div>
@@ -2933,7 +2941,7 @@ function renderSpaceForm() {
       <div class="sc-summary">共 <b>${scState.managedNas.length}</b> 个托管 NAS · 合计 <b>${(totalCap/1024).toFixed(1)} TB</b> · 预估月费 <b>¥${fee.toLocaleString(undefined,{maximumFractionDigits:0})}</b></div>
     </div>
     <div class="sc-section" id="sc-sec-selfnas">
-      <div class="sc-section-title"><span class="idx">3</span>自有 NAS（接入） <span style="font-weight:400;color:var(--text-dim);font-size:11px">（你的集群 · 部署 gj-agent 对接 · 无总量配额 · 不计费 · 仅引导）</span></div>
+    <div class="sc-section-title"><span class="idx">3</span>自有 NAS（历史 mock） <span style="font-weight:400;color:var(--text-dim);font-size:11px">（旧 gj-agent 流程已停用 · 仅历史演示）</span></div>
       ${selfGuide}
     </div>
     <div class="sc-section" id="sc-sec-archive">
@@ -3179,24 +3187,23 @@ function renderSpaceConfig() {
           <div class="cfg-name" style="width:auto">已用容量</div>
           <div class="cfg-used" style="flex:1;text-align:left">${fmtGB(n.usedGB)}<span style="color:var(--text-dim);margin-left:8px">（自有 NAS 无总量配额 · 不计费）</span></div>
           <div class="cfg-actions">
-            <button class="cfg-mini-btn" onclick="toggleDeployGuide('${n.id}')">${connected?'查看部署指引':'继续部署'}</button>
-            <button class="cfg-mini-btn" onclick="removeNas('${s.id}','${n.id}','self')">断开</button>
+            <button class="cfg-mini-btn" disabled title="历史 mock，当前已停用">历史部署说明</button>
+            <button class="cfg-mini-btn" disabled title="历史 mock，当前已停用">断开（停用）</button>
           </div>
         </div>
         <div id="deploy-guide-${n.id}" style="display:none">
           <ol>
-            <li><b>安装客户端</b>：在数据空间「接入」页获取客户端安装包（<code>gj-agent</code> 守护进程 + <code>gjctl</code> 控制台命令，适配你的集群架构）。</li>
-            <li><b>注册成受控端点</b>：在节点上运行 <code>gjctl register</code>，用该空间的接入 Token 注册——写 bootstrap 配置、启动 daemon、dial out 自注册上报。</li>
-            <li><b>对接 NAS</b>：<code>--mount</code> 声明你的 NAS 路径（NFS / 本地盘 / S3 兼容），daemon 启动后即据此管理版本目录与 playground，控制面自动发现并纳入物流拓扑。</li>
-            <li><b>是否开 S3 网关（可选）</b>：加 <code>--s3-endpoint &lt;公网 S3 域名&gt;</code> 可把本节点注册成「可作 pull 源」的端点——其他集群 agent 可经按需 S3 网关直拉本节点字节；不填则本节点只能向外 push（push 模型），不能被跨集群 pull。填的须是本节点 S3 网关的<b>公网可访问域名</b>（agent 自身发现不了公网入口，须显式声明，控制面据此下发给其他 agent）。能否填取决于你的集群能否对外暴露网关。</li>
-            <li><b>校验连接</b>：回到本页，状态变为「已连接」即接入成功；之后该 NAS 即可参与 sync/evict/归档。</li>
+            <li><b>历史 mock</b>：旧原型曾用 gj-agent/gjctl 直接登记 NAS；该流程当前不可执行。</li>
+            <li><b>当前目标</b>：Agent 通过 GatewayPool 建立控制连接，Central 仍是 metadata authority，Volume Owner Agent 执行 Volume I/O。</li>
+            <li><b>当前未开放</b>：Gateway 不挂载 Volume；跨集群对象传输和只读 S3 访问分别属于 G2/G3，不能通过本页配置。</li>
+            <li><b>验收入口</b>：请以 <code>docs/synapse-gateway-architecture.md</code> 和部署清单为准，本页数据仅用于历史 UI 演示。</li>
           </ol>
           <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">接入 Token（该空间专属，泄露后请重置）：<span class="cfg-token">${spaceToken}</span></div>
-          <div class="cfg-cmd">gjctl register --token ${spaceToken} --store ${n.id} --mount /mnt/gj/${n.id} [--s3-endpoint &lt;公网 S3 域名&gt;]</div>
-          <div class="cfg-actions"><button class="cfg-mini-btn" onclick="showToast('已复制安装命令（mock）','')">复制命令</button><button class="cfg-mini-btn" onclick="showToast('Token 已重置（mock）','','info')">重置 Token</button></div>
+          <div class="cfg-cmd" aria-disabled="true">历史 mock 命令（不可执行）：gjctl register …</div>
+          <div class="cfg-actions"><button class="cfg-mini-btn" disabled>复制命令（停用）</button><button class="cfg-mini-btn" disabled>Token 操作（停用）</button></div>
         </div>
       </div>`;
-  }).join("") || `<div class="cfg-empty">尚未接入自有 NAS · 点击「接入引导」查看部署步骤</div>`;
+  }).join("") || `<div class="cfg-empty">尚未接入自有 NAS · 旧注册流程已停用，请使用 GatewayPool 部署清单</div>`;
 
   // 归档目标（第三方 S3，无总量 → 仅已用；已配置不可编辑，可新增）
   const archives = s.archives || [];
@@ -3226,14 +3233,14 @@ function renderSpaceConfig() {
     </div>
 
     <div class="cfg-section">
-      <div class="cfg-head"><h3>自有 NAS（接入）</h3><span class="sub">在你自己的集群部署 gj-agent 守护进程对接 · 无总量配额 · 不计费 · 仅引导</span><div class="spacer"></div>
+      <div class="cfg-head"><h3>自有 NAS（历史 mock）</h3><span class="sub">旧 gj-agent 流程已停用 · 当前 Agent 通过 GatewayPool 建立控制连接</span><div class="spacer"></div>
         <button class="cfg-mini-btn primary" onclick="toggleSelfNasGuide()">接入引导</button>
       </div>
       <div id="selfnas-guide" style="display:none;padding:12px 16px;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;margin:0 16px 12px">
-        <div style="margin-bottom:6px">自有 NAS <b>无需在控制台配置</b>。在你自己的集群节点安装客户端（<code>gj-agent</code> 守护进程 + <code>gjctl</code> 控制台命令，docker 式架构），用下方命令一次性注册成受控端点并挂载你的 NAS，控制面会自动发现并纳入该数据空间的物流拓扑。</div>
+        <div style="margin-bottom:6px"><b>历史 mock（当前已停用）</b>：旧 gj-agent/gjctl 注册流程不能用于当前 Synapse 部署。当前 Agent 应注册到所属 EdgeCluster 的 GatewayPool。</div>
         <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">该空间专属接入 Token（泄露后可在此重置）：<span class="cfg-token">${spaceToken}</span></div>
-        <div class="cfg-cmd">gjctl register --token ${spaceToken} --store &lt;your-store-id&gt; --mount /mnt/gj/&lt;your-store-id&gt; [--s3-endpoint &lt;公网 S3 域名&gt;]</div>
-        <div style="font-size:11px;color:var(--text-dim);margin-top:6px"><code>&lt;your-store-id&gt;</code> 由你自定义，注册后即作为该空间的存储后端标识；支持 NFS / S3 / 本地盘等多种后端。<code>--s3-endpoint</code> 可选：填则开启 S3 网关、可作 pull 源，须填本节点 S3 网关的公网可访问域名；不填则只能 push 出。</div>
+        <div class="cfg-cmd" aria-disabled="true">历史 mock 命令（不可执行）：gjctl register …</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:6px">旧原型中的 Volume Gateway、Agent 直拉和自带公网 S3 endpoint 均已废弃。Gateway 不挂载 Volume；跨集群传输和 S3 访问属于后续里程碑。</div>
         <div style="margin-top:8px"><a class="btn-link" href="#" onclick="event.preventDefault();showToast('已为你打开接入文档','docs://gongji.cn/agent/register','info')">查看完整接入文档 →</a></div>
       </div>
       <div class="cfg-body">${selfRows}</div>
@@ -3407,8 +3414,8 @@ function openOpPicker() {
     { key: "pgCreate",  name: "playground create",  desc: "一等公民可写工作区（可选 --from 拷贝）" },
     { key: "pgImport",  name: "playground import",  desc: "往 playground 追加文件（不建新版本）" },
     { key: "pgRm",      name: "playground rm",      desc: "清理 playground" },
-    { key: "artGateway",name: "artifact gateway open", desc: "只读 PC 网关（WebDAV/SFTP/Web · sftpgo）" },
-    { key: "pgGateway", name: "playground gateway open", desc: "读写 PC 网关（WebDAV/SFTP/Web · sftpgo）" },
+    { key: "artGateway",name: "历史 mock artifact gateway（已停用）", desc: "旧只读 PC 网关；当前不提供 WebDAV/SFTP/Web 入口" },
+    { key: "pgGateway", name: "历史 mock playground gateway（已停用）", desc: "旧读写 PC 网关；当前不提供可变 Volume Gateway" },
     { key: "policyPause",  name: "policy pause",    desc: "暂停某 artifact 的自动生命周期执行" },
     { key: "policyResume", name: "policy resume",   desc: "恢复自动生命周期执行" },
     { key: "policyDryRun", name: "policy dry-run",  desc: "预览下次执行周期会 evict/sync 哪些版本" },
@@ -3417,7 +3424,7 @@ function openOpPicker() {
     <div class="op-picker-item" onclick="openOpModal('${it.key}', {})">
       <div><div class="pic-name">${it.name}</div><div class="pic-desc">${it.desc}</div></div>
     </div>`).join("")}</div>`;
-  renderModalShell("操作启动器", "选一个动词 · GUI 与 CLI 共用 I1，控制面经 I3 下发 Agent 执行", body, "", false);
+  renderModalShell("操作启动器（历史 mock）", "本页只展示迁移前原型；当前控制命令经本集群 GatewayPool 转发", body, "", false);
   document.getElementById("op-modal").classList.add("open");
 }
 
@@ -3426,6 +3433,13 @@ function openOpModal(opName, ctx) {
   _currentCtx = ctx || {};
   const op = OPERATIONS[opName];
   if (!op) return;
+  if (op.legacy) {
+    renderModalShell(`${op.title}（已停用）`, "历史 mock 操作不可执行；请使用 Synapse Gateway 架构和当前管理 API。",
+      `<div class="danger-block"><div class="b-title">当前能力边界</div><div class="danger-msg">Gateway 不挂载 Volume，也不提供旧原型的 WebDAV/SFTP/Agent 直拉入口。跨集群传输和只读 S3 属于后续里程碑。</div></div>`,
+      `<button class="btn" onclick="closeOpModal()">关闭</button>`, false);
+    document.getElementById("op-modal").classList.add("open");
+    return;
+  }
   const body = renderForm(op, ctx);
   const foot = `<button class="btn" onclick="closeOpModal()">取消</button>
     <button class="btn primary" onclick="submitOp()">${op.submitLabel || "执行"}</button>`;
@@ -3560,7 +3574,7 @@ function renderCmdPreview(cli, i3, op, d, result) {
         </div>
       </div>
       <div class="cmd-preview-note">
-        GUI 与 CLI 共用 <code>I1</code> 垂直层 API；控制面经 <code>I3</code> Agent 协议（dial-out 长连接）下发指令，Agent 在 NAS 上执行字节操作。
+        历史 mock GUI/CLI 操作；当前控制命令经本集群 GatewayPool 的 dial-out 长连接转发，Agent 执行 Volume I/O。
         ${resultNote}
       </div>
     </div>`;
@@ -3864,7 +3878,7 @@ const OPERATIONS = {
     fields: (ctx) => [
       { key:"artId", type:"select_artifact", label:"artifact", required:true, default: ctx.artId || "" },
       { key:"source", type:"text", label:"源（path / s3 URI）", required:true, default: ctx.source || "", placeholder:"/mnt/usb 或 s3://partner/prefix" },
-      { key:"to",     type:"select_store", label:"--at", required:true, default: ctx.to || "", emptyOption:false, hint:"无 S3 端点的 NAS（如 factory-nas）不能接收远程本地路径 ingest；s3:// 源或同位本地 cp 不受此约束" },
+      { key:"to",     type:"select_store", label:"--at（历史 mock）", required:true, default: ctx.to || "", emptyOption:false, hint:"历史原型字段；当前 Gateway 控制面不提供此 ingest 操作" },
       { key:"labels", type:"textarea", label:"--labels", required:false, default: ctx.labels || "", placeholder:"type=dataset,scene=kitchen" },
     ],
     buildCli: d => `gjctl artifact ingest ${d.artId} ${d.source} --at ${d.to}${d.labels?` --labels ${d.labels}`:""}`,
@@ -3873,10 +3887,10 @@ const OPERATIONS = {
       if (!d.artId) return "artifact 必填";
       if (!d.source) return "源必填";
       if (!d.to) return "--at 必填";
-      // 可达性约束（§7.6.1）：远程本地路径 ingest 到无 S3 端点的 NAS 直接拒绝
+      // 历史 mock 校验：当前 Gateway 控制面不提供远程路径 ingest。
       const isRemoteLocal = !/^s3:\/\//i.test(d.source.trim());
       if (isRemoteLocal && !storeHasS3(d.to)) {
-        return `目标 NAS「${d.to}」未开 S3 网关，无法接收远程上传：本地 PC 不能被 pull、无端点 NAS 不能被 push（两头不通）。请改：① 上传至有端点的 store 后 sync 到目标（目标从有端点的源 pull）；或 ② 在目标集群节点本地执行 ingest（NAS 已挂载，走本地 cp）。`;
+        return `历史 mock 操作已停用：目标 NAS「${d.to}」不能通过此页面接收远程上传。请使用 Gateway 架构文档中的已实现控制面流程。`;
       }
       return null;
     },
@@ -3989,8 +4003,9 @@ const OPERATIONS = {
     execute:  d => mutateArtCreate(d.name, d.at, d.labels),
   },
   artGateway: {
+    legacy: true,
     title: "artifact gateway open · 只读 PC 网关",
-    subtitle: "按需起 sftpgo · 输出 WebDAV/SFTP/Web URL + 一次性凭证 · artifact 不可变 → 只读",
+    subtitle: "历史 mock：旧 PC 网关已停用",
     fields: (ctx) => [
       { key:"artVer", type:"text", label:"artifact@版本", required:true, default: ctx.artVer || "", hint:"只读：artifact 版本不可变，URL 有效期内字节恒定" },
     ],
@@ -4000,8 +4015,9 @@ const OPERATIONS = {
     execute:  d => mutateArtGateway(d.artVer),
   },
   pgGateway: {
+    legacy: true,
     title: "playground gateway open · 读写 PC 网关",
-    subtitle: "按需起 sftpgo · 输出 WebDAV/SFTP/Web URL + 一次性凭证 · playground 可变 → 读写",
+    subtitle: "历史 mock：旧可变 Volume Gateway 已停用",
     fields: (ctx) => [
       { key:"pgName", type:"select_pg", label:"playground", required:true, default: ctx.pgName || "" },
     ],

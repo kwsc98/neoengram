@@ -4,6 +4,17 @@
   "description": "One control-stream frame. `message.type` is flattened to the top-level JSON object.",
   "type": "object",
   "properties": {
+    "central_signature": {
+      "description": "Optional Central KMS/HSM-backed signature. It is required by production Agent runtimes for\nAssignment and Decision messages; development transports may omit it while no signer is\nconfigured.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CentralSignedPayload"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "message_id": {
       "$ref": "#/$defs/MessageId"
     },
@@ -510,6 +521,55 @@
         }
       ]
     },
+    "CentralSignedPayload": {
+      "description": "Central-signed bytes carried unchanged through Gateway hops.",
+      "type": "object",
+      "properties": {
+        "certificate_generation": {
+          "$ref": "#/$defs/CertificateGeneration"
+        },
+        "expires_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "key_id": {
+          "type": "string",
+          "maxLength": 1024,
+          "minLength": 1
+        },
+        "payload": {
+          "$ref": "#/$defs/GatewayOpaqueBytes"
+        },
+        "payload_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "signature": {
+          "$ref": "#/$defs/Ed25519Signature"
+        },
+        "signed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "key_id",
+        "certificate_generation",
+        "signed_at_unix_ms",
+        "expires_at_unix_ms",
+        "payload_digest",
+        "payload",
+        "signature"
+      ]
+    },
+    "CertificateGeneration": {
+      "description": "A certificate generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
     "ComputeNodeId": {
       "description": "A validated compute node ID wire identifier.",
       "type": "string",
@@ -563,6 +623,13 @@
       "minLength": 1,
       "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
     },
+    "Ed25519Signature": {
+      "description": "Canonical 64-byte Ed25519 signature, encoded as base64url without padding.",
+      "type": "string",
+      "maxLength": 86,
+      "minLength": 86,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
     "EdgeClusterId": {
       "description": "A validated edge cluster ID wire identifier.",
       "type": "string",
@@ -582,6 +649,13 @@
       "maxLength": 20,
       "minLength": 1,
       "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "GatewayOpaqueBytes": {
+      "description": "Opaque bytes encoded as canonical base64url without padding.",
+      "type": "string",
+      "maxLength": 12582912,
+      "minLength": 0,
+      "pattern": "^[A-Za-z0-9_-]*$"
     },
     "IndexRevision": {
       "description": "A index revision encoded as a canonical decimal JSON string.",

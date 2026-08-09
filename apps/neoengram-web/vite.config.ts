@@ -6,7 +6,6 @@ import { defineConfig, loadEnv } from 'vite';
 export default defineConfig(({ command, mode }) => {
   const env = loadEnv(mode, process.cwd(), 'VITE_');
   const proxyTarget = env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8080';
-  const agentProxyTarget = env.VITE_AGENT_PROXY_TARGET || 'http://127.0.0.1:8081';
   if (
     command === 'build' &&
     (env.VITE_API_MODE === 'mock' ||
@@ -44,7 +43,6 @@ export default defineConfig(({ command, mode }) => {
       strictPort: true,
       proxy: {
         '/api': proxyTarget,
-        '/agent': agentProxyTarget,
         '/health': proxyTarget,
       },
     },

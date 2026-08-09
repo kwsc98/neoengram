@@ -8,8 +8,12 @@ const defaultDevelopmentToken = import.meta.env.DEV ? 'local-development-token' 
 
 export const runtimeConfig = {
   apiBaseUrl: import.meta.env.VITE_API_BASE_URL ?? '',
-  agentEndpoint:
-    import.meta.env.VITE_AGENT_ENDPOINT ?? (import.meta.env.DEV ? 'http://127.0.0.1:8081' : ''),
+  gatewayEndpoint:
+    import.meta.env.VITE_GATEWAY_ENDPOINT ?? (import.meta.env.DEV ? 'http://127.0.0.1:8081' : ''),
+  gatewayWorkloadTrustDomain: import.meta.env.VITE_GATEWAY_WORKLOAD_TRUST_DOMAIN ?? '',
+  // A Web build is provisioned for one GatewayPool/EdgeCluster. Leave this
+  // empty only for the loopback HTTP development profile.
+  gatewayEdgeClusterId: (import.meta.env.VITE_GATEWAY_EDGE_CLUSTER_ID ?? '').trim(),
   apiMode: import.meta.env.VITE_API_MODE ?? defaultApiMode,
   authMode: import.meta.env.VITE_AUTH_MODE ?? defaultAuthMode,
   development: {

@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use neoengram_protocol::{
-    control_schema, enrollment_schema, metadata_schema, DecimalU64, Generation, ProtocolVersion,
-    WireObjectSpec,
+    control_schema, enrollment_schema, gateway_schema, metadata_schema, DecimalU64, Generation,
+    ProtocolVersion, WireObjectSpec,
 };
 use serde_json::{json, Value};
 
@@ -20,6 +20,10 @@ fn committed_v1_schemas_match_the_generator() {
         include_str!("../schemas/v1/metadata-batch.schema.json"),
         metadata_schema(),
     );
+    assert_schema(
+        include_str!("../schemas/v1/gateway-control.schema.json"),
+        gateway_schema(),
+    );
 }
 
 #[test]
@@ -36,6 +40,7 @@ fn committed_v1_schema_catalog_does_not_publish_s3_data_plane() {
         [
             "agent-enrollment.schema.json",
             "control-envelope.schema.json",
+            "gateway-control.schema.json",
             "metadata-batch.schema.json",
         ]
     );
@@ -180,6 +185,92 @@ fn schemas_publish_the_runtime_wire_limits() {
         metadata.pointer("/$defs/MetadataBatchPage/properties/page_digest/pattern"),
         Some(&json!("^[0-9a-f]{64}$"))
     );
+
+    let gateway = serde_json::to_value(gateway_schema()).unwrap();
+    assert_eq!(
+        gateway.pointer("/properties/protocol_version/const"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        gateway.pointer("/properties/hop_count/maximum"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        gateway.pointer("/$defs/GatewayOpaqueBytes/maxLength"),
+        Some(&json!(12_582_912))
+    );
+    assert_eq!(
+        gateway.pointer("/$defs/GatewayOpaqueBytes/pattern"),
+        Some(&json!("^[A-Za-z0-9_-]*$"))
+    );
+    assert_eq!(
+        gateway.pointer("/$defs/GatewayAgentStreamData/properties/chunk/maxLength"),
+        Some(&json!(349_526))
+    );
+    assert_eq!(
+        gateway
+            .pointer("/$defs/GatewayReplicaHello/properties/supported_protocol_versions/maxItems"),
+        Some(&json!(128))
+    );
+    assert_eq!(
+        gateway.pointer("/$defs/GatewayReplicaHello/properties/capabilities/maxItems"),
+        Some(&json!(128))
+    );
+    assert_eq!(
+        gateway.pointer("/$defs/GatewayAgentResponse/properties/status/minimum"),
+        Some(&json!(100))
+    );
+    assert_eq!(
+        gateway.pointer("/$defs/GatewayAgentResponse/properties/status/maximum"),
+        Some(&json!(599))
+    );
+    assert_eq!(
+        gateway.pointer("/$defs/RouteGeneration/pattern"),
+        Some(&json!(positive_decimal_u64_pattern()))
+    );
+    assert_eq!(
+        gateway.pointer("/$defs/GatewayPeerForwardRequest/properties/frame/maxLength"),
+        Some(&json!(1_398_103))
+    );
+    assert_eq!(
+        gateway
+            .pointer("/$defs/GatewayPeerForwardRequest/properties/target_peer_endpoint/maxLength"),
+        Some(&json!(2_048))
+    );
+    assert_eq!(
+        gateway.pointer("/$defs/GatewayPeerDirectory/properties/replicas/maxItems"),
+        Some(&json!(256))
+    );
+    assert_eq!(
+        gateway
+            .pointer("/$defs/GatewayPeerDirectoryEntry/properties/certificate_fingerprint/pattern"),
+        Some(&json!("^[0-9a-f]{64}$"))
+    );
+    for payload in [
+        "GatewayReplicaHello",
+        "GatewayReplicaHeartbeat",
+        "GatewayDrain",
+        "GatewayAgentRequest",
+        "GatewayAgentResponse",
+        "GatewayAgentStreamOpen",
+        "GatewayAgentStreamData",
+        "GatewayAgentStreamEnd",
+        "GatewayRouteLeaseRequest",
+        "GatewayRouteLeaseGranted",
+        "GatewayRouteFence",
+        "GatewayPeerForwardRequest",
+        "GatewayPeerForwardAccepted",
+        "GatewayPeerDirectoryEntry",
+        "GatewayPeerDirectory",
+        "GatewayControlError",
+        "GatewayBackpressure",
+    ] {
+        assert_eq!(
+            gateway.pointer(&format!("/$defs/{payload}/additionalProperties")),
+            Some(&json!(false)),
+            "{payload} must reject unknown message payload fields"
+        );
+    }
 }
 
 #[test]

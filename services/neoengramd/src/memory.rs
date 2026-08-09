@@ -154,6 +154,7 @@ struct InMemoryPreCommitState {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum InMemoryPreCommitMutation {
     Start {
         request: PreCommitStartRequest,
@@ -1346,6 +1347,7 @@ pub struct InMemoryComponents {
     pub audit: Arc<InMemoryAuditSink>,
     pub precommits: Arc<InMemoryPreCommitRepository>,
     pub agent_registry: Arc<InMemoryAgentRegistry>,
+    pub gateway_registry: Arc<crate::InMemoryGatewayRegistry>,
     pub control_catalog: Arc<crate::InMemoryControlCatalog>,
     pub clock: Arc<InMemoryClock>,
 }
@@ -1353,6 +1355,10 @@ pub struct InMemoryComponents {
 impl InMemoryComponents {
     #[must_use]
     pub fn new(now_ms: u64) -> Self {
+        let agent_registry = Arc::new(InMemoryAgentRegistry::new());
+        let gateway_registry = Arc::new(crate::InMemoryGatewayRegistry::with_agent_registry(
+            agent_registry.clone(),
+        ));
         Self {
             authorizer: Arc::new(AllowAllAuthorizer),
             jobs: Arc::new(InMemoryJobRepository::default()),
@@ -1362,7 +1368,8 @@ impl InMemoryComponents {
             publisher: Arc::new(InMemoryIndexPublisher::default()),
             audit: Arc::new(InMemoryAuditSink::default()),
             precommits: Arc::new(InMemoryPreCommitRepository::default()),
-            agent_registry: Arc::new(InMemoryAgentRegistry::new()),
+            agent_registry,
+            gateway_registry,
             control_catalog: Arc::new(crate::InMemoryControlCatalog::default()),
             clock: Arc::new(InMemoryClock::new(now_ms)),
         }
@@ -1390,6 +1397,7 @@ impl InMemoryComponents {
         )
         .with_precommits(self.precommits.clone())
         .with_agent_registry(self.agent_registry.clone())
+        .with_gateway_registry(self.gateway_registry.clone())
         .with_control_catalog(self.control_catalog.clone())
     }
 }

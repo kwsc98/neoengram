@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 mod catalog;
 pub use catalog::*;
+mod gateway;
+pub use gateway::*;
 
 use fusen_rs::{interface, Call, Error, Response};
 

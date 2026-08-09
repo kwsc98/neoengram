@@ -7,11 +7,11 @@ use neoengram_protocol::{
     AgentBootstrapStatusState, AgentEnrollmentApprovalRequest, AgentEnrollmentDecision,
     AgentEnrollmentId, AgentEnrollmentState, AgentEnrollmentTokenCreateRequest,
     AgentEnrollmentTokenId, AgentId, AgentInstallationId, AgentMountId, AgentMountIdentityDigest,
-    AgentMountStatusReport, AgentSignatureAlgorithm, Ed25519PublicKeySpki, Ed25519Signature,
-    EdgeClusterId, Extensions, MountAccessMode, MountGeneration, OwnerGeneration, PrincipalRef,
-    ProtocolVersion, PvcIdentityDigest, RequestId, ResourceHealth, ResourceVersion, SequenceNumber,
-    SessionGeneration, SessionId, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId,
-    PROTOCOL_VERSION_V1,
+    AgentMountStatusReport, AgentSignatureAlgorithm, AgentWorkloadCertificateBundle,
+    Ed25519PublicKeySpki, Ed25519Signature, EdgeClusterId, Extensions, MountAccessMode,
+    MountGeneration, OwnerGeneration, PrincipalRef, ProtocolVersion, PvcIdentityDigest, RequestId,
+    ResourceHealth, ResourceVersion, SequenceNumber, SessionGeneration, SessionId, StorageVolumeId,
+    TenantId, UnixMillis, VolumeMarkerId, PROTOCOL_VERSION_V1,
 };
 use serde::{Deserialize, Serialize};
 
@@ -363,6 +363,9 @@ pub struct AgentRegistryRecord {
     pub decision_audit_event: Option<AgentEnrollmentAuditEvent>,
     #[serde(default)]
     pub storage_enrollment: StorageEnrollmentMetadata,
+    /// Public mTLS material durably prepared for replay through approved status polling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_certificate: Option<AgentWorkloadCertificateBundle>,
 }
 
 impl AgentRegistryRecord {
@@ -814,6 +817,7 @@ impl AgentRegistryService {
                 .storage_enrollment
                 .updated_at_unix_ms
                 .ok_or_else(legacy_enrollment_reissue)?,
+            certificate: record.workload_certificate.clone(),
             extensions: Extensions::new(),
         };
         response.validate()?;
@@ -1254,107 +1258,20 @@ impl AgentRegistryService {
         &self,
         request: OpenAgentSessionRequest,
     ) -> CentralResult<OpenAgentSessionResult> {
-        let mut record = self.load_by_agent(&request.agent_id).await?;
-        require_approved(&record)?;
-        let instance = record.instance.as_ref().ok_or_else(|| {
-            error(
-                CentralErrorCode::AgentIdentityMismatch,
-                "approved enrollment has no Agent instance",
-            )
-        })?;
-        if instance.installation_id != request.installation_id {
-            return Err(error(
-                CentralErrorCode::AgentIdentityMismatch,
-                "session installation differs from bootstrap identity",
-            ));
-        }
-        if record.mount.mount_identity_digest.as_ref() != Some(&request.mount_identity_digest) {
-            return Err(error(
-                CentralErrorCode::AgentIdentityMismatch,
-                "session mount identity differs from the approved bootstrap",
-            ));
-        }
-        if instance.active_boot_id.as_ref() == Some(&request.boot_id) {
-            if instance.session_open_expected_resource_version
-                != Some(request.expected_resource_version)
-            {
-                return Err(error(
-                    CentralErrorCode::ConcurrentUpdate,
-                    "session open replay payload differs from the persisted request",
-                ));
-            }
-            let session_generation = instance.session_generation.ok_or_else(|| {
-                error(
-                    CentralErrorCode::Internal,
-                    "active session is missing its generation",
-                )
-            })?;
-            let session_id = instance.active_session_id.clone().ok_or_else(|| {
-                error(
-                    CentralErrorCode::Internal,
-                    "active session is missing its session ID",
-                )
-            })?;
-            return Ok(OpenAgentSessionResult {
-                session_id,
-                session_generation,
-                record,
-                replayed: true,
-            });
-        }
-        require_resource_version(&record, request.expected_resource_version)?;
-        let now = self.clock.now();
-        let stale_active_session = instance.active_boot_id.is_some()
-            && session_is_stale(instance, now, self.heartbeat_timeout_ms);
-        if instance.active_boot_id.is_some() && !stale_active_session {
-            return Err(error(
-                CentralErrorCode::AgentSessionActive,
-                "another Agent boot already owns the active session",
-            ));
-        }
-        let instance = record
-            .instance
-            .as_mut()
-            .expect("instance was checked above");
-        let next_generation = instance
-            .session_generation
-            .map_or(Some(1), |generation| generation.get().checked_add(1))
-            .ok_or_else(|| error(CentralErrorCode::Internal, "session generation exhausted"))?;
-        instance.session_generation = Some(SessionGeneration::new(next_generation));
-        instance.active_boot_id = Some(request.boot_id);
-        instance.session_open_expected_resource_version = Some(request.expected_resource_version);
-        instance.session_opened_at_unix_ms = Some(now);
-        instance.last_heartbeat_at_unix_ms = None;
-        instance.last_sequence = None;
-        let generation = instance
-            .session_generation
-            .expect("generation was assigned");
-        let session_id = derive_session_id(
-            &request.agent_id,
-            instance
-                .active_boot_id
-                .as_ref()
-                .expect("boot ID was assigned"),
-            generation,
-        )?;
-        instance.active_session_id = Some(session_id.clone());
-        if stale_active_session {
-            record.mount.observed_volume_marker = None;
-            record.mount.observed_access_mode = None;
-            record.mount.reported_health = None;
-            record.mount.health = ResourceHealth::Unknown;
-            record.mount.observed_at_unix_ms = None;
-        }
-        let previous = record.resource_version.get();
-        advance_resource_version(&mut record)?;
-        touch_storage_enrollment(&mut record, now);
-        let record = self.repository.replace(previous, record).await?;
-        Ok(OpenAgentSessionResult {
+        let record = self.load_by_agent(&request.agent_id).await?;
+        let mut result = open_agent_session_against(
             record,
-            session_id,
-            session_generation: generation,
-            replayed: false,
-        })
+            &request,
+            self.clock.now(),
+            self.heartbeat_timeout_ms,
+        )?;
+        if !result.replayed {
+            result.record = self
+                .repository
+                .replace(request.expected_resource_version.get(), result.record)
+                .await?;
+        }
+        Ok(result)
     }
 
     pub async fn close_session(
@@ -1630,6 +1547,115 @@ impl AgentRegistryService {
             return Err(enrollment_not_found());
         }
         Ok(record)
+    }
+
+    /// Atomically installs public Agent workload certificate material for status-query replay.
+    ///
+    /// Certificate issuance remains an adapter concern because the online Intermediate is an
+    /// external KMS/HSM-backed port. This method owns the authoritative identity and generation
+    /// checks before those public bytes become durable Registry state.
+    pub async fn install_workload_certificate(
+        &self,
+        expected_resource_version: ResourceVersion,
+        certificate: AgentWorkloadCertificateBundle,
+    ) -> CentralResult<AgentRegistryRecord> {
+        certificate.validate()?;
+        let mut record = self
+            .repository
+            .get(&certificate.enrollment_id)
+            .await?
+            .ok_or_else(enrollment_not_found)?;
+        if record.workload_certificate.as_ref() == Some(&certificate) {
+            return Ok(record);
+        }
+        if record.resource_version != expected_resource_version {
+            return Err(error(
+                CentralErrorCode::ConcurrentUpdate,
+                "Agent workload certificate ResourceVersion changed",
+            ));
+        }
+        if record.enrollment.state != AgentEnrollmentState::Approved
+            || certificate.edge_cluster_id != record.enrollment.edge_cluster_id
+            || certificate.agent_id != record.enrollment.reserved_agent_id
+            || certificate.enrollment_id != record.enrollment.enrollment_id
+            || certificate.mount_generation != record.mount.mount_generation
+            || certificate.owner_generation != record.owner.owner_generation
+        {
+            return Err(error(
+                CentralErrorCode::AgentIdentityMismatch,
+                "Agent workload certificate differs from its approved Registry identity",
+            ));
+        }
+        let candidate = record.candidate.as_ref().ok_or_else(|| {
+            error(
+                CentralErrorCode::InvalidState,
+                "approved Agent has no credential evidence",
+            )
+        })?;
+        let evidence = candidate
+            .credential_evidence
+            .as_ref()
+            .ok_or_else(legacy_enrollment_reissue)?;
+        if certificate.public_key_fingerprint != evidence.public_key_spki.fingerprint() {
+            return Err(error(
+                CentralErrorCode::AgentIdentityMismatch,
+                "Agent workload certificate public key differs from bootstrap proof",
+            ));
+        }
+        let expected_session_generation = record
+            .instance
+            .as_ref()
+            .and_then(|instance| instance.session_generation)
+            .map_or(1, SessionGeneration::get);
+        let now = self.clock.now().get();
+        if certificate.session_generation.get() != expected_session_generation
+            || certificate.not_before_unix_ms.get() > now
+            || certificate.not_after_unix_ms.get() <= now
+        {
+            return Err(error(
+                CentralErrorCode::AgentIdentityMismatch,
+                "Agent workload certificate session generation or validity is invalid",
+            ));
+        }
+        match record.workload_certificate.as_ref() {
+            None if certificate.certificate_generation.get() != 1 => {
+                return Err(error(
+                    CentralErrorCode::AgentIdentityMismatch,
+                    "initial Agent workload certificate generation must be one",
+                ));
+            }
+            None => {}
+            Some(previous) => {
+                let next_generation = previous
+                    .certificate_generation
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        error(
+                            CentralErrorCode::AgentIdentityMismatch,
+                            "Agent workload certificate generation is exhausted",
+                        )
+                    })?;
+                if certificate.certificate_generation.get() != next_generation
+                    || certificate.identity_uri != previous.identity_uri
+                    || certificate.public_key_fingerprint != previous.public_key_fingerprint
+                    || certificate.mount_generation != previous.mount_generation
+                    || certificate.owner_generation != previous.owner_generation
+                    || certificate.session_generation.get() < previous.session_generation.get()
+                    || certificate.not_after_unix_ms.get() <= previous.not_after_unix_ms.get()
+                {
+                    return Err(error(
+                        CentralErrorCode::AgentIdentityMismatch,
+                        "renewed Agent workload certificate does not advance the bound identity",
+                    ));
+                }
+            }
+        }
+        record.workload_certificate = Some(certificate);
+        advance_resource_version(&mut record)?;
+        self.repository
+            .replace(expected_resource_version.get(), record)
+            .await
     }
 
     pub async fn list_enrollments(
@@ -2099,6 +2125,7 @@ fn token_intent_record(
             updated_at_unix_ms: Some(created_at_unix_ms),
             lifecycle_audit_events: Vec::new(),
         },
+        workload_certificate: None,
     };
     append_lifecycle_event(
         &mut record,
@@ -2289,6 +2316,15 @@ fn revoke_for_replacement(
         )
     })?;
     instance.state = AgentInstanceState::Revoked;
+    if let Some(generation) = instance.session_generation {
+        let next_generation = generation.get().checked_add(1).ok_or_else(|| {
+            error(
+                CentralErrorCode::Internal,
+                "Agent session generation exhausted during replacement",
+            )
+        })?;
+        instance.session_generation = Some(SessionGeneration::new(next_generation));
+    }
     instance.active_boot_id = None;
     instance.active_session_id = None;
     instance.session_open_expected_resource_version = None;
@@ -2416,6 +2452,111 @@ fn legacy_candidate_replay_matches(
         && stored.supported_protocol_versions == candidate.supported_protocol_versions
         && stored.capabilities == candidate.capabilities
         && stored.probe == candidate.probe
+}
+
+pub(crate) fn open_agent_session_against(
+    mut record: AgentRegistryRecord,
+    request: &OpenAgentSessionRequest,
+    now: UnixMillis,
+    heartbeat_timeout_ms: u64,
+) -> CentralResult<OpenAgentSessionResult> {
+    require_approved(&record)?;
+    let instance = record.instance.as_ref().ok_or_else(|| {
+        error(
+            CentralErrorCode::AgentIdentityMismatch,
+            "approved enrollment has no Agent instance",
+        )
+    })?;
+    if instance.installation_id != request.installation_id {
+        return Err(error(
+            CentralErrorCode::AgentIdentityMismatch,
+            "session installation differs from bootstrap identity",
+        ));
+    }
+    if record.mount.mount_identity_digest.as_ref() != Some(&request.mount_identity_digest) {
+        return Err(error(
+            CentralErrorCode::AgentIdentityMismatch,
+            "session mount identity differs from the approved bootstrap",
+        ));
+    }
+    if instance.active_boot_id.as_ref() == Some(&request.boot_id) {
+        if instance.session_open_expected_resource_version
+            != Some(request.expected_resource_version)
+        {
+            return Err(error(
+                CentralErrorCode::ConcurrentUpdate,
+                "session open replay payload differs from the persisted request",
+            ));
+        }
+        let session_generation = instance.session_generation.ok_or_else(|| {
+            error(
+                CentralErrorCode::Internal,
+                "active session is missing its generation",
+            )
+        })?;
+        let session_id = instance.active_session_id.clone().ok_or_else(|| {
+            error(
+                CentralErrorCode::Internal,
+                "active session is missing its session ID",
+            )
+        })?;
+        return Ok(OpenAgentSessionResult {
+            session_id,
+            session_generation,
+            record,
+            replayed: true,
+        });
+    }
+    require_resource_version(&record, request.expected_resource_version)?;
+    let stale_active_session =
+        instance.active_boot_id.is_some() && session_is_stale(instance, now, heartbeat_timeout_ms);
+    if instance.active_boot_id.is_some() && !stale_active_session {
+        return Err(error(
+            CentralErrorCode::AgentSessionActive,
+            "another Agent boot already owns the active session",
+        ));
+    }
+    let instance = record
+        .instance
+        .as_mut()
+        .expect("instance was checked above");
+    let next_generation = instance
+        .session_generation
+        .map_or(Some(1), |generation| generation.get().checked_add(1))
+        .ok_or_else(|| error(CentralErrorCode::Internal, "session generation exhausted"))?;
+    instance.session_generation = Some(SessionGeneration::new(next_generation));
+    instance.active_boot_id = Some(request.boot_id.clone());
+    instance.session_open_expected_resource_version = Some(request.expected_resource_version);
+    instance.session_opened_at_unix_ms = Some(now);
+    instance.last_heartbeat_at_unix_ms = None;
+    instance.last_sequence = None;
+    let generation = instance
+        .session_generation
+        .expect("generation was assigned");
+    let session_id = derive_session_id(
+        &request.agent_id,
+        instance
+            .active_boot_id
+            .as_ref()
+            .expect("boot ID was assigned"),
+        generation,
+    )?;
+    instance.active_session_id = Some(session_id.clone());
+    if stale_active_session {
+        record.mount.observed_volume_marker = None;
+        record.mount.observed_access_mode = None;
+        record.mount.reported_health = None;
+        record.mount.health = ResourceHealth::Unknown;
+        record.mount.observed_at_unix_ms = None;
+    }
+    advance_resource_version(&mut record)?;
+    touch_storage_enrollment(&mut record, now);
+    Ok(OpenAgentSessionResult {
+        record,
+        session_id,
+        session_generation: generation,
+        replayed: false,
+    })
 }
 
 fn require_resource_version(
@@ -2611,6 +2752,38 @@ pub(crate) fn ensure_immutable_registry_scope(
         .updated_at_unix_ms
         .zip(updated.storage_enrollment.updated_at_unix_ms)
         .is_none_or(|(stored, updated)| updated.get() >= stored.get());
+    let workload_certificate_transition_valid =
+        match (&stored.workload_certificate, &updated.workload_certificate) {
+            (None, None | Some(_)) => true,
+            (Some(stored_certificate), Some(updated_certificate)) => {
+                if stored_certificate == updated_certificate {
+                    true
+                } else {
+                    let next_generation = stored_certificate
+                        .certificate_generation
+                        .get()
+                        .checked_add(1);
+                    stored.enrollment.state == AgentEnrollmentState::Approved
+                        && updated.enrollment.state == AgentEnrollmentState::Approved
+                        && next_generation == Some(updated_certificate.certificate_generation.get())
+                        && stored_certificate.edge_cluster_id == updated_certificate.edge_cluster_id
+                        && stored_certificate.agent_id == updated_certificate.agent_id
+                        && stored_certificate.enrollment_id == updated_certificate.enrollment_id
+                        && stored_certificate.identity_uri == updated_certificate.identity_uri
+                        && stored_certificate.public_key_fingerprint
+                            == updated_certificate.public_key_fingerprint
+                        && stored_certificate.mount_generation
+                            == updated_certificate.mount_generation
+                        && stored_certificate.owner_generation
+                            == updated_certificate.owner_generation
+                        && updated_certificate.session_generation.get()
+                            >= stored_certificate.session_generation.get()
+                        && updated_certificate.not_after_unix_ms.get()
+                            > stored_certificate.not_after_unix_ms.get()
+                }
+            }
+            (Some(_), None) => false,
+        };
     if !enrollment_scope_matches
         || !mount_scope_matches
         || !owner_scope_matches
@@ -2624,6 +2797,7 @@ pub(crate) fn ensure_immutable_registry_scope(
         || !storage_metadata_scope_matches
         || !lifecycle_audit_is_append_only
         || !storage_update_time_is_monotonic
+        || !workload_certificate_transition_valid
     {
         return Err(error(
             CentralErrorCode::AgentIdentityMismatch,
@@ -3081,6 +3255,44 @@ pub(crate) fn validate_registry_record(record: &AgentRegistryRecord) -> CentralR
         {
             return Err(registry_corruption(
                 "Agent instance differs from its reserved candidate or session identity",
+            ));
+        }
+    }
+    if let Some(certificate) = &record.workload_certificate {
+        certificate.validate()?;
+        let certificate_generation_scope_matches = match record.enrollment.state {
+            AgentEnrollmentState::Approved => {
+                certificate.mount_generation == record.mount.mount_generation
+                    && certificate.owner_generation == record.owner.owner_generation
+            }
+            // Replacement fencing advances the Volume generations after the old leaf has been
+            // revoked. Retain the public certificate for audit/replay, but never treat its older
+            // mount/owner binding as authority for the new owner.
+            AgentEnrollmentState::Revoked => {
+                certificate.mount_generation.get() <= record.mount.mount_generation.get()
+                    && certificate.owner_generation.get() <= record.owner.owner_generation.get()
+            }
+            _ => false,
+        };
+        let certificate_identity_matches = record.candidate.as_ref().is_some_and(|candidate| {
+            candidate
+                .credential_evidence
+                .as_ref()
+                .is_some_and(|evidence| {
+                    certificate.public_key_fingerprint == evidence.public_key_spki.fingerprint()
+                })
+        }) && certificate.edge_cluster_id
+            == record.enrollment.edge_cluster_id
+            && certificate.agent_id == record.enrollment.reserved_agent_id
+            && certificate.enrollment_id == record.enrollment.enrollment_id
+            && certificate_generation_scope_matches;
+        if !matches!(
+            record.enrollment.state,
+            AgentEnrollmentState::Approved | AgentEnrollmentState::Revoked
+        ) || !certificate_identity_matches
+        {
+            return Err(registry_corruption(
+                "Agent workload certificate differs from its Registry identity",
             ));
         }
     }

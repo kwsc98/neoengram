@@ -4,13 +4,23 @@ NeoEngram `0.2.0` 已完成 P0 crate 边界改造：本地 CLI、可复用领域
 适配器、Standalone 应用、wire protocol、Agent、中心控制状态机和 HTTP server 分别拥有独立 crate。
 当前仍以本地 format v8 工作流为主要产品；`neoengramd` 保持无网络 library，中心已提供后端无关
 `AuthorityStore` 和默认 SQLite 单节点权威后端。`neoengram-server` 通过 Fusen 0.9.0 暴露已实现的
-system、Tenant、StorageVolume、Enrollment、Playground 和 Job action API，并通过独立 Hyper listener
-提供 Agent OpenAPI。`neoengram-agentd` 提供可运行的出站 enrollment 和 Agent 主动建立的 HTTP/2
-全双工控制 channel。Vue 3 Web 控制台可通过 MSW 运行多租户资源浏览、
+system、Tenant、StorageVolume、Enrollment、Artifact、Playground、Snapshot 基础、Job 和 Gateway Registry action API，并保留
+迁移前独立 Hyper Agent listener。旧 Agent 直连纵切已覆盖出站 enrollment 与 HTTP/2 全双工 control
+channel；当前 `neoengram-agentd` 已改为 Gateway-only 配置，Gateway 控制面、运行时 mTLS、下行命令签名
+和一跳 peer forwarding 已接入。Vue 3 Web
+控制台可通过 MSW 运行多租户资源浏览、
 StorageVolume 登记与放置选择、Artifact/Playground/Snapshot 创建、Playground Commit 与 Managed
 Add Job 流程，并可查看 Commit 描述、Tags、父 Commit 信息和文件 Diff，但尚未
-连接完整真实中心。这不代表其余 OpenAPI、PostgreSQL、Agent mTLS、跨 Volume 数据路由或 HA 已经实现。能力状态和后续路线统一见
+连接完整真实中心。这不代表其余 OpenAPI、PostgreSQL、生产凭据签发/轮换、跨 Volume 数据路由或 HA 已经实现。能力状态和后续路线统一见
 [`implementation-plan.md`](implementation-plan.md)。
+
+2026-08-09 已确认 `services/synapse-gateway` 的目标架构。G1 已加入协议、Registry/管理 API、
+三 listener、Central outbound tunnel、工作负载证书校验、端到端命令签名和一跳 peer forwarding，
+Agent 配置也已切到 Gateway-only；双 Replica listener/H2/peer harness 和真实 Registry RouteLease 接管
+契约已分别通过，但完整业务 E2E、外部生产凭据适配、真实集群故障/就绪和切换验收仍未完成。目标状态由
+Central 主动连接每个 EdgeCluster 的 GatewayPool，Agent 只连接本集群 Gateway。Gateway 的完整边界见
+[`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)，在端到端契约测试和部署切换完成前
+不得把部分骨架标记为可用 Gateway 能力。
 
 ## Workspace 与职责
 
@@ -25,8 +35,9 @@ crates/
 └── neoengram/             # Clap、cwd 输入、typed Result/progress/diagnostic 的唯一终端渲染入口
 services/
 ├── neoengramd/            # 无网络中心状态机、ports、datasource/mapper 与 SQLite 权威后端
-├── neoengram-server/      # Fusen 用户 HTTP、Hyper Agent H2 action channel 与运行时组装
-└── neoengram-agentd/      # Agent enrollment/H2 channel binary、配置、健康与 HTTP client
+├── neoengram-server/      # 用户 API + Gateway Registry/session/activation；Registry-driven outbound client
+├── neoengram-agentd/      # Gateway-only endpoint/trust bundle；下行 command trust 校验
+└── synapse-gateway/       # 三 listener + activation + mTLS + 一跳 peer forwarding
 apps/
 └── neoengram-web/         # 独立 Vue 3 SPA；公开 OpenAPI 生成类型与 MSW 开发适配器
 ```
@@ -78,12 +89,16 @@ scope，服务端仍从认证结果执行 RBAC，不能信任浏览器选择。
   `ControlPlane`/ports，不能访问 SQLx。SQLite datasource 只管理连接、锁、schema、迁移和完整性，
   repository 查询、行映射与 port 实现集中在 mapper。调用方向固定为
   `controller -> service -> ControlPlane/ports -> mapper -> datasource`。
-- server 在 Fusen listener 注册已实现的公开 action API，并在独立 Hyper listener 注册 Agent
-  enrollment、H2 full-duplex control channel、MetadataBatch 和 Index action。认证业务接口要求 API version 与经外部
-  OIDC/JWKS 验证的 Bearer JWT，RBAC 缺省拒绝；Agent listener 使用一次性 token 与逐帧 Ed25519 proof。
+- server 在 Fusen listener 注册已实现的公开 action API；Agent action 契约经 Gateway 转发，独立
+  Hyper listener 只作为 loopback 迁移测试适配器。认证业务接口要求 API version 与经外部
+  OIDC/JWKS 验证的 Bearer JWT，RBAC 缺省拒绝；Agent action 使用一次性 token 与逐帧 Ed25519 proof。
   Agent 主动建立 channel，但 Assignment/Decision 由 server 权威状态派生并下推；旧 message-list poll
   仅用于兼容和人工恢复。Server 不提供 Chunk missing/upload payload action；`AssignJob`、
   `ExpireAddJob`、`ResumePublication` 仍是内部方法，不能注册为 HTTP 路由。
+- 目标 `synapse-gateway` 只依赖 protocol/core 以及网络、TLS、签名和观测组件；禁止依赖
+  `neoengramd` datasource/mapper、engine、fs、standalone、Volume adapter 或 authority schema。它不挂载
+  StorageVolume，也不持久化 metadata/object。当前 Hyper Agent listener 在一次性切换完成前仍是迁移
+  基线，不应继续扩展为目标公网 Agent 入口。
 - `neoengram-agent` 的生产依赖只有 core、engine 和 protocol，不依赖 standalone；它对 `neoengramd`
   的 `dev-dependency` 只用于内存组合测试。`neoengramd` 只依赖 core 和 protocol，不依赖 engine、fs
   或 standalone。
@@ -98,7 +113,14 @@ neoengram CLI -> standalone -> engine <- agent
                          +---- core ---+
 
 neoengram-web -> public OpenAPI -> neoengram-server -> neoengramd -> protocol/core
-neoengram-agentd -> neoengram-agent + protocol -> neoengram-server Agent listener
+
+迁移前基线：neoengram-agentd -> neoengram-agent + protocol -> neoengram-server Agent listener
+
+G1 控制面：Agent 配置已切 Gateway-only，Gateway 到 Central 的 H2/mTLS tunnel 和一跳 forwarding 已接入
+
+目标：neoengram-server/Central -> synapse-gateway <- neoengram-agentd
+                                  |
+                                  +-> protocol/core
 ```
 
 该图表示 production/runtime 的主要分层方向，不枚举所有直接 manifest 边；例如 CLI 还直接导入
@@ -140,10 +162,12 @@ InMemory 与 SQLite 运行同一行为契约。SQLite 是显式路径、单进�
 `neoengram-server` 使用 SQLite 时只能部署一个副本。生产 HTTP 明文监听位于受控网络，TLS 必须由
 Ingress/反向代理终止；多副本、HA/RLS 仍需要 PostgreSQL adapter。
 不提供 HA 或数据库级 RLS；PG/MySQL 后端将独立实现 SQL/schema/migration，只复用 ports 与契约测试。
-HTTP/2 Agent session/Job delivery 已由 Agent 主动建立的全双工 action channel 实现；HTTP/3、Agent
-mTLS、PostgreSQL 和 NFS 强 fencing 属于后续 adapter/部署阶段。跨 Volume route 也属于后续数据面：
-应由获批 Agent/Gateway 端点直接传输，Server 只授权/校验路由范围和 placement evidence，不能代理
-Chunk payload。开发 profile 不能被描述为
+HTTP/2 Agent session/Job delivery 已由 Agent 直连 Server 的全双工 action channel 实现；这是迁移前
+开发纵切。目标控制链路改为 H2+mTLS 的 `Central -> GatewayPool <- Agent`，使用 Central 权威
+AgentRouteLease 和最多一跳 Replica forwarding。后续跨 Volume 数据链路固定为源 Agent -> 源 Gateway
+-> 目标 Gateway -> 目标 Agent；Server 只授权/校验路由范围和 placement evidence，不能代理 Chunk
+payload。Gateway 不挂载 Volume。HTTP/3、外部生产凭据 provisioner、PostgreSQL 和 NFS 强 fencing
+属于后续 adapter/部署阶段。开发 profile 不能被描述为
 具备生产传输安全或 HA 的完整业务 Agent。
 
 本地磁盘布局及事务语义见 [`storage-architecture.md`](storage-architecture.md)；中心与 Agent 的详细

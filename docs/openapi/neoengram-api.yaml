@@ -6,18 +6,22 @@ info:
   version: 1.0.0
   summary: NeoEngram 用户、CLI 和 UI 使用的非 REST JSON API 契约
   description: |
-    这是 NeoEngram 中心服务的首版公开 API 设计契约。`neoengram-server` 默认已实现版本、健康和
-    Managed Add Job 六个接口；启用 Agent enrollment 时还实现 token create、enrollment
-    list/query、approve 和 reject。其余 operation 仍是目标契约，不表示已经可以访问。
+    这是 NeoEngram 中心服务的首版公开 API 设计契约。`neoengram-server` 已注册 System、Tenant、
+    StorageVolume、StorageEnrollment、Artifact、Playground、Snapshot、Managed Add Job 和 Gateway
+    Registry 的当前 action；其余 operation 仍是目标契约，不表示已经可以访问。Gateway Registry
+    当前管理 Pool/Replica 资源和显式 activation action；运行时 mTLS 与最多一跳 Replica forwarding 已
+    接入。外部生产 issuer/证书自动切换、完整业务 E2E 和真实集群切换仍待验收；跨集群 payload 与 S3
+    属于后续里程碑。
 
     业务方法使用“模块 / 子域 / 动作”路径，并通过普通 JSON 请求和响应调用；
     路径不包含版本号。除版本查询和健康检查外，调用方必须发送
     `NeoEngram-API-Version: 1` 和 Bearer JWT。
 
-    Agent API 不属于本 OpenAPI。独立 listener 已实现 enrollment action，以及由 Agent 主动发起、
+    Agent API 不属于本 OpenAPI。Gateway edge listener 已实现 enrollment action，以及由 Agent 主动发起、
     逐帧 Ed25519 签名的 HTTP/2 全双工 `application/x-ndjson` control channel；session open、heartbeat、
-    Assignment/Decision 下发和 report 上报均通过该 channel 运行，MetadataBatch 与 object 使用独立
-    action。生产 mTLS 尚未实现。Storage enrollment 仅公开 Tenant 管理员创建一次性 bootstrap token
+    Assignment/Decision 下发和 report 上报均通过 Gateway 转发该 channel，MetadataBatch 与 object 使用
+    独立 action。Gateway/Agent 运行时 mTLS 身份校验已接入；外部生产 issuer/provisioner、证书轮换和
+    一次性切换仍是部署验收门槛。Storage enrollment 仅公开 Tenant 管理员创建一次性 bootstrap token
     和审批 Agent 主动提交的脱敏申请。
 
     本契约只公开 P0 用户资源和脱敏逻辑元数据。Dashboard 聚合、容量与底层诊断、用途与保留
@@ -50,6 +54,8 @@ tags:
     description: 绑定 Artifact Commit 的只读 Snapshot 创建与查询方法
   - name: Job
     description: 用户发起和查询的中心权威 Job 方法
+  - name: Gateway
+    description: 平台管理员管理 EdgeCluster GatewayPool 与 GatewayReplica 的全局方法
   - name: Health
     description: 供进程管理器和负载均衡器调用的标准健康探针
 
@@ -2572,6 +2578,354 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
+  /api/gateway/pool/create:
+    post:
+      tags: [Gateway]
+      operationId: createGatewayPool
+      summary: 创建 GatewayPool
+      description: 为一个 EdgeCluster 创建唯一逻辑 GatewayPool；要求全局 gateway.manage 权限。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateGatewayPoolRequest"
+      responses:
+        "200":
+          description: GatewayPool 已创建或相同定义被重放
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayPoolResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/gateway/pool/query:
+    post:
+      tags: [Gateway]
+      operationId: queryGatewayPool
+      summary: 查询 GatewayPool
+      description: 按稳定 ID 查询 GatewayPool，不返回 Replica credential 或路由租约。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryGatewayPoolRequest"
+      responses:
+        "200":
+          description: GatewayPool 当前视图
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayPoolResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/gateway/pool/list/query:
+    post:
+      tags: [Gateway]
+      operationId: queryGatewayPoolList
+      summary: 分页查询 GatewayPool
+      description: 可按 EdgeCluster 和状态过滤；游标使用上一页最后一个 GatewayPool ID。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryGatewayPoolListRequest"
+      responses:
+        "200":
+          description: GatewayPool 页
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayPoolListResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/gateway/pool/update:
+    post:
+      tags: [Gateway]
+      operationId: updateGatewayPool
+      summary: 更新 GatewayPool
+      description: 使用 expected_resource_version 原子更新入口、副本目标或非 draining 状态。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateGatewayPoolRequest"
+      responses:
+        "200":
+          description: 更新后的 GatewayPool
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayPoolResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/gateway/pool/drain:
+    post:
+      tags: [Gateway]
+      operationId: drainGatewayPool
+      summary: 排空 GatewayPool
+      description: 使用 expected_resource_version 将 Pool 单向切换为 draining。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DrainGatewayPoolRequest"
+      responses:
+        "200":
+          description: Draining GatewayPool
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayPoolResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/gateway/replica/create:
+    post:
+      tags: [Gateway]
+      operationId: createGatewayReplica
+      summary: 创建 GatewayReplica
+      description: activation_token 只在首次成功响应中出现；Central 持久化层只保存摘要。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateGatewayReplicaRequest"
+      responses:
+        "200":
+          description: Pending GatewayReplica；重放响应不再包含 activation_token
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateGatewayReplicaResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/gateway/replica/activate:
+    post:
+      tags: [Gateway]
+      operationId: activateGatewayReplica
+      summary: 激活 GatewayReplica
+      description: |
+        仅允许具有全局 `gateway.manage` 权限的 operator 调用。Central 从 Registry 读取
+        持久化的 bootstrap_endpoint，主动完成 challenge/proof、证书投递和 Pending -> Active
+        原子提交；请求体不得指定或覆盖 endpoint。activation_token 只用于本次动作，不会在
+        Central 日志或持久化 payload 中出现。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ActivateGatewayReplicaRequest"
+      responses:
+        "200":
+          description: 已完成证书投递并激活的 GatewayReplica
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayReplicaResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/gateway/replica/list/query:
+    post:
+      tags: [Gateway]
+      operationId: queryGatewayReplicaList
+      summary: 分页查询 GatewayReplica
+      description: 返回 endpoint、版本、capability 和证书状态，不返回 token 摘要或证书指纹。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryGatewayReplicaListRequest"
+      responses:
+        "200":
+          description: GatewayReplica 页
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayReplicaListResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/gateway/replica/drain:
+    post:
+      tags: [Gateway]
+      operationId: drainGatewayReplica
+      summary: 排空 GatewayReplica
+      description: 使用 expected_resource_version 将 Active Replica 单向切换为 draining。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MutateGatewayReplicaRequest"
+      responses:
+        "200":
+          description: Draining GatewayReplica
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayReplicaResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/gateway/replica/revoke:
+    post:
+      tags: [Gateway]
+      operationId: revokeGatewayReplica
+      summary: 撤销 GatewayReplica
+      description: 原子标记 Replica 与 credential revoked，并提升已有 certificate generation。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MutateGatewayReplicaRequest"
+      responses:
+        "200":
+          description: Revoked GatewayReplica
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayReplicaResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
   /api/job/add/create:
     post:
       tags: [Job]
@@ -3481,6 +3835,381 @@ components:
             minLength: 1
             maxLength: 128
             pattern: "^[a-z][a-z0-9_]{0,127}$"
+
+    CreateGatewayPoolRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - gateway_pool_id
+        - edge_cluster_id
+        - display_name
+        - agent_endpoint
+        - desired_replicas
+        - minimum_ready_replicas
+      properties:
+        gateway_pool_id:
+          $ref: "#/components/schemas/GatewayPoolId"
+        edge_cluster_id:
+          $ref: "#/components/schemas/EdgeClusterId"
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        agent_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        s3_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        desired_replicas:
+          $ref: "#/components/schemas/GatewayReplicaCount"
+        minimum_ready_replicas:
+          $ref: "#/components/schemas/GatewayReplicaCount"
+
+    QueryGatewayPoolRequest:
+      type: object
+      additionalProperties: false
+      required: [gateway_pool_id]
+      properties:
+        gateway_pool_id:
+          $ref: "#/components/schemas/GatewayPoolId"
+
+    QueryGatewayPoolListRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        edge_cluster_id:
+          $ref: "#/components/schemas/EdgeClusterId"
+        state:
+          $ref: "#/components/schemas/GatewayPoolState"
+        after:
+          $ref: "#/components/schemas/GatewayPoolId"
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 255
+
+    UpdateGatewayPoolRequest:
+      type: object
+      additionalProperties: false
+      required: [gateway_pool_id, expected_resource_version]
+      properties:
+        gateway_pool_id:
+          $ref: "#/components/schemas/GatewayPoolId"
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        agent_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        s3_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        clear_s3_endpoint:
+          type: boolean
+        desired_replicas:
+          $ref: "#/components/schemas/GatewayReplicaCount"
+        minimum_ready_replicas:
+          $ref: "#/components/schemas/GatewayReplicaCount"
+        state:
+          type: string
+          enum: [provisioning, ready, disabled]
+
+    DrainGatewayPoolRequest:
+      type: object
+      additionalProperties: false
+      required: [gateway_pool_id, expected_resource_version]
+      properties:
+        gateway_pool_id:
+          $ref: "#/components/schemas/GatewayPoolId"
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+
+    GatewayPoolResponse:
+      type: object
+      additionalProperties: false
+      required: [gateway_pool, replayed]
+      properties:
+        gateway_pool:
+          $ref: "#/components/schemas/GatewayPoolView"
+        replayed:
+          type: boolean
+
+    GatewayPoolListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 255
+          items:
+            $ref: "#/components/schemas/GatewayPoolView"
+        next_after:
+          $ref: "#/components/schemas/GatewayPoolId"
+
+    GatewayPoolView:
+      type: object
+      additionalProperties: false
+      required:
+        - gateway_pool_id
+        - edge_cluster_id
+        - display_name
+        - agent_endpoint
+        - desired_replicas
+        - minimum_ready_replicas
+        - state
+        - config_generation
+        - resource_version
+        - created_at_unix_ms
+        - updated_at_unix_ms
+      properties:
+        gateway_pool_id:
+          $ref: "#/components/schemas/GatewayPoolId"
+        edge_cluster_id:
+          $ref: "#/components/schemas/EdgeClusterId"
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        agent_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        s3_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        desired_replicas:
+          $ref: "#/components/schemas/GatewayReplicaCount"
+        minimum_ready_replicas:
+          $ref: "#/components/schemas/GatewayReplicaCount"
+        state:
+          $ref: "#/components/schemas/GatewayPoolState"
+        config_generation:
+          $ref: "#/components/schemas/PositiveCanonicalU64"
+        resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        created_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        updated_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    CreateGatewayReplicaRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - gateway_replica_id
+        - gateway_pool_id
+        - control_endpoint
+        - peer_endpoint
+        - bootstrap_endpoint
+        - software_version
+        - supported_protocol_versions
+      properties:
+        gateway_replica_id:
+          $ref: "#/components/schemas/GatewayReplicaId"
+        gateway_pool_id:
+          $ref: "#/components/schemas/GatewayPoolId"
+        control_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        peer_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        bootstrap_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        software_version:
+          type: string
+          minLength: 1
+          maxLength: 256
+        supported_protocol_versions:
+          type: array
+          minItems: 1
+          maxItems: 128
+          uniqueItems: true
+          contains:
+            const: 1
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+        capabilities:
+          type: array
+          maxItems: 128
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+
+    QueryGatewayReplicaListRequest:
+      type: object
+      additionalProperties: false
+      required: [gateway_pool_id]
+      properties:
+        gateway_pool_id:
+          $ref: "#/components/schemas/GatewayPoolId"
+        state:
+          $ref: "#/components/schemas/GatewayReplicaState"
+        after:
+          $ref: "#/components/schemas/GatewayReplicaId"
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 255
+
+    MutateGatewayReplicaRequest:
+      type: object
+      additionalProperties: false
+      required: [gateway_replica_id, expected_resource_version]
+      properties:
+        gateway_replica_id:
+          $ref: "#/components/schemas/GatewayReplicaId"
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+
+    ActivateGatewayReplicaRequest:
+      type: object
+      additionalProperties: false
+      required: [gateway_replica_id, expected_resource_version, activation_token]
+      properties:
+        gateway_replica_id:
+          $ref: "#/components/schemas/GatewayReplicaId"
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        activation_token:
+          type: string
+          writeOnly: true
+          minLength: 51
+          maxLength: 51
+          pattern: "^nggw_v1_[A-Za-z0-9_-]{43}$"
+
+    CreateGatewayReplicaResponse:
+      type: object
+      additionalProperties: false
+      required: [gateway_replica, replayed]
+      properties:
+        gateway_replica:
+          $ref: "#/components/schemas/GatewayReplicaView"
+        activation_token:
+          type: string
+          readOnly: true
+          minLength: 51
+          maxLength: 51
+          pattern: "^nggw_v1_[A-Za-z0-9_-]{43}$"
+        replayed:
+          type: boolean
+
+    GatewayReplicaResponse:
+      type: object
+      additionalProperties: false
+      required: [gateway_replica, replayed]
+      properties:
+        gateway_replica:
+          $ref: "#/components/schemas/GatewayReplicaView"
+        replayed:
+          type: boolean
+
+    GatewayReplicaListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 255
+          items:
+            $ref: "#/components/schemas/GatewayReplicaView"
+        next_after:
+          $ref: "#/components/schemas/GatewayReplicaId"
+
+    GatewayReplicaView:
+      type: object
+      additionalProperties: false
+      required:
+        - gateway_replica_id
+        - gateway_pool_id
+        - edge_cluster_id
+        - control_endpoint
+        - peer_endpoint
+        - bootstrap_endpoint
+        - software_version
+        - supported_protocol_versions
+        - capabilities
+        - state
+        - credential_state
+        - resource_version
+        - created_at_unix_ms
+        - updated_at_unix_ms
+      properties:
+        gateway_replica_id:
+          $ref: "#/components/schemas/GatewayReplicaId"
+        gateway_pool_id:
+          $ref: "#/components/schemas/GatewayPoolId"
+        edge_cluster_id:
+          $ref: "#/components/schemas/EdgeClusterId"
+        control_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        peer_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        bootstrap_endpoint:
+          $ref: "#/components/schemas/GatewayEndpoint"
+        software_version:
+          type: string
+          minLength: 1
+          maxLength: 256
+        supported_protocol_versions:
+          type: array
+          minItems: 1
+          maxItems: 128
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+        capabilities:
+          type: array
+          maxItems: 128
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+        last_heartbeat_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        state:
+          $ref: "#/components/schemas/GatewayReplicaState"
+        credential_state:
+          $ref: "#/components/schemas/GatewayCredentialState"
+        certificate_generation:
+          $ref: "#/components/schemas/PositiveCanonicalU64"
+        certificate_not_after_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        created_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        updated_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    GatewayPoolState:
+      type: string
+      enum: [provisioning, ready, draining, disabled]
+
+    GatewayReplicaState:
+      type: string
+      enum: [pending, active, draining, revoked]
+
+    GatewayCredentialState:
+      type: string
+      enum: [pending_activation, pending_certificate_delivery, active, expired, revoked]
+
+    GatewayReplicaCount:
+      type: integer
+      minimum: 1
+      maximum: 65535
+
+    GatewayEndpoint:
+      type: string
+      description: canonical HTTPS origin；不得包含 userinfo、path、query、fragment 或尾随斜杠。
+      format: uri
+      minLength: 9
+      maxLength: 2048
+      pattern: '^https://(?:\[[0-9A-Fa-f:.]+\]|[^@/?#\s:]+)(?::[0-9]{1,5})?$'
 
     QueryTenantListRequest:
       type: object
@@ -5938,6 +6667,10 @@ components:
       $ref: "#/components/schemas/ResourceId"
     EdgeClusterId:
       $ref: "#/components/schemas/ResourceId"
+    GatewayPoolId:
+      $ref: "#/components/schemas/ResourceId"
+    GatewayReplicaId:
+      $ref: "#/components/schemas/ResourceId"
     ProjectId:
       $ref: "#/components/schemas/ResourceId"
     ArtifactId:
@@ -6021,6 +6754,26 @@ components:
       minLength: 3
       maxLength: 128
       pattern: '^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$'
+      enum:
+        - job.create
+        - job.read
+        - job.finalize
+        - tenant.read
+        - tenant.create
+        - tenant.admin
+        - storage.read
+        - storage.create
+        - storage.enrollment.create
+        - storage.enrollment.read
+        - storage.enrollment.review
+        - artifact.read
+        - artifact.create
+        - playground.read
+        - playground.create
+        - snapshot.read
+        - snapshot.create
+        - gateway.read
+        - gateway.manage
 
     TagName:
       type: string
@@ -6056,6 +6809,12 @@ components:
       minLength: 1
       maxLength: 20
       pattern: "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+
+    PositiveCanonicalU64:
+      allOf:
+        - $ref: "#/components/schemas/CanonicalU64"
+        - pattern: "^[1-9][0-9]{0,19}$"
+      description: 大于零且不超过 u64 最大值的 canonical decimal JSON string。
 
     UnixMillis:
       allOf:

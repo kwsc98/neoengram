@@ -15,7 +15,10 @@ data:
   agent.yaml: |
     schema_version: 1
     protocol_version: 1
-    central_endpoint: https://neoengram.example.internal
+    gateway_endpoint: https://synapse-gateway.synapse-gateway-example.svc.cluster.local:8443
+    trust_bundle_file: /etc/neoengram/gateway-ca.pem
+    gateway_workload_trust_domain: mesh.example.test
+    central_command_trust_bundle_file: /etc/neoengram/central-command-trust.json
     tenant_id: tenant-example
     edge_cluster_id: edge-example
     storage_volume_id: volume-example
@@ -41,3 +44,19 @@ data:
     logging:
       format: json
       level: info
+  # Replace this fail-closed marker with the PEM trust bundle for this EdgeCluster's GatewayPool.
+  gateway-ca.pem: |
+    REPLACE_WITH_GATEWAY_POOL_CA_PEM
+  # Replace the public SPKI and lifecycle data with Central's published command key bundle.
+  central-command-trust.json: |
+    {
+      "schema_version": 1,
+      "keys": [
+        {
+          "key_id": "replace-with-central-command-key-id",
+          "certificate_generation": "1",
+          "public_key_spki": "REPLACE_WITH_BASE64URL_NO_PAD_RFC8410_ED25519_SPKI",
+          "state": "active"
+        }
+      ]
+    }

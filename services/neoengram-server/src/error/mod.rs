@@ -81,6 +81,13 @@ pub fn map_central_error(error: CentralError) -> Error {
             false,
             None,
         ),
+        CentralErrorCode::GatewayPoolNotFound | CentralErrorCode::GatewayReplicaNotFound => (
+            ErrorCategory::NotFound,
+            None,
+            "gateway resource not found",
+            false,
+            None,
+        ),
         CentralErrorCode::ArtifactNotFound | CentralErrorCode::StorageVolumeNotFound => (
             ErrorCategory::NotFound,
             None,
@@ -127,6 +134,20 @@ pub fn map_central_error(error: CentralError) -> Error {
             conflict_message(code),
             error.retryable(),
             (code == CentralErrorCode::ConcurrentUpdate).then_some(100),
+        ),
+        CentralErrorCode::GatewayIdentityConflict | CentralErrorCode::GatewayRouteFenced => (
+            ErrorCategory::Conflict,
+            None,
+            conflict_message(code),
+            false,
+            None,
+        ),
+        CentralErrorCode::GatewayRouteUnavailable => (
+            ErrorCategory::Unavailable,
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            "the Gateway route is temporarily unavailable",
+            true,
+            Some(1_000),
         ),
         CentralErrorCode::LegacyEnrollmentRequiresReissue => (
             ErrorCategory::Conflict,

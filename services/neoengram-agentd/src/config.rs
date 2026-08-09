@@ -24,7 +24,14 @@ const MAX_LOG_LEVEL_BYTES: usize = 128;
 pub struct AgentConfig {
     pub schema_version: u16,
     pub protocol_version: u16,
-    pub central_endpoint: Url,
+    pub gateway_endpoint: Url,
+    pub trust_bundle_file: PathBuf,
+    /// SPIFFE trust domain expected in the Gateway server URI SAN.
+    #[serde(default)]
+    pub gateway_workload_trust_domain: Option<String>,
+    /// Public Central command verification keys. Required for every HTTPS runtime.
+    #[serde(default)]
+    pub central_command_trust_bundle_file: Option<PathBuf>,
     pub tenant_id: TenantId,
     pub edge_cluster_id: EdgeClusterId,
     pub storage_volume_id: StorageVolumeId,
@@ -79,7 +86,24 @@ impl AgentConfig {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(configuration("protocol_version must be 1"));
         }
-        validate_endpoint(&self.central_endpoint)?;
+        validate_endpoint(&self.gateway_endpoint)?;
+        validate_absolute_normal_path("trust_bundle_file", &self.trust_bundle_file)?;
+        if self.gateway_endpoint.scheme() == "https" && self.gateway_workload_trust_domain.is_none()
+        {
+            return Err(configuration(
+                "gateway_workload_trust_domain is required for HTTPS",
+            ));
+        }
+        if let Some(trust_domain) = &self.gateway_workload_trust_domain {
+            validate_gateway_trust_domain(trust_domain)?;
+        }
+        if let Some(path) = &self.central_command_trust_bundle_file {
+            validate_absolute_normal_path("central_command_trust_bundle_file", path)?;
+        } else if self.gateway_endpoint.scheme() == "https" {
+            return Err(configuration(
+                "central_command_trust_bundle_file is required for HTTPS",
+            ));
+        }
         validate_region(&self.region)?;
         self.storage.validate(&self.storage_volume_id)?;
         self.registration.validate()?;
@@ -256,16 +280,47 @@ fn validate_endpoint(endpoint: &Url) -> AgentDaemonResult<()> {
         || endpoint.fragment().is_some()
     {
         return Err(configuration(
-            "central_endpoint must be an origin URL without credentials, path, query, or fragment",
+            "gateway_endpoint must be an origin URL without credentials, path, query, or fragment",
         ));
     }
     let loopback_http = endpoint.scheme() == "http" && has_loopback_host(endpoint);
     if endpoint.scheme() != "https" && !loopback_http {
         return Err(configuration(
-            "central_endpoint must use HTTPS (HTTP is allowed only on loopback)",
+            "gateway_endpoint must use HTTPS (HTTP is allowed only on loopback)",
         ));
     }
     Ok(())
+}
+
+fn validate_gateway_trust_domain(value: &str) -> AgentDaemonResult<()> {
+    if value.is_empty() || value.len() > 253 || value.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(configuration(
+            "gateway_workload_trust_domain must be a lowercase DNS name",
+        ));
+    }
+    let valid = value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && label
+                .bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(configuration(
+            "gateway_workload_trust_domain must be a lowercase DNS name",
+        ))
+    }
 }
 
 pub(crate) fn validate_development_directory_probe_endpoint(
@@ -274,7 +329,7 @@ pub(crate) fn validate_development_directory_probe_endpoint(
     validate_endpoint(endpoint)?;
     if !has_loopback_host(endpoint) {
         return Err(configuration(
-            "development directory probe requires a loopback central_endpoint",
+            "development directory probe requires a loopback gateway_endpoint",
         ));
     }
     Ok(())
@@ -282,9 +337,9 @@ pub(crate) fn validate_development_directory_probe_endpoint(
 
 fn has_loopback_host(endpoint: &Url) -> bool {
     match endpoint.host() {
-        Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
-        Some(url::Host::Ipv6(address)) => address == std::net::Ipv6Addr::LOCALHOST,
-        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         None => false,
     }
 }
@@ -330,7 +385,10 @@ mod tests {
     const VALID_CONFIG: &str = r#"
 schema_version: 1
 protocol_version: 1
-central_endpoint: https://neoengram.example.internal
+gateway_endpoint: https://gateway.example.internal
+trust_bundle_file: /etc/neoengram/gateway-ca.pem
+gateway_workload_trust_domain: mesh.example.test
+central_command_trust_bundle_file: /etc/neoengram/central-command-trust.json
 tenant_id: tenant-example
 edge_cluster_id: edge-example
 storage_volume_id: volume-example
@@ -384,8 +442,18 @@ logging:
         assert!(config.validate().is_err());
 
         let mut config: AgentConfig = serde_yaml::from_str(VALID_CONFIG).unwrap();
-        config.central_endpoint = Url::parse("http://central.example/agent").unwrap();
+        config.gateway_endpoint = Url::parse("http://gateway.example/agent").unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn requires_central_command_trust_for_https_but_allows_loopback_http_development() {
+        let mut config: AgentConfig = serde_yaml::from_str(VALID_CONFIG).unwrap();
+        config.central_command_trust_bundle_file = None;
+        assert!(config.validate().is_err());
+
+        config.gateway_endpoint = Url::parse("http://127.0.0.1:8080/").unwrap();
+        config.validate().unwrap();
     }
 
     #[test]
@@ -393,6 +461,7 @@ logging:
         for endpoint in [
             "http://127.0.0.1:8081/",
             "http://[::1]:8081/",
+            "http://LOCALHOST:8081/",
             "https://localhost:8081/",
         ] {
             validate_development_directory_probe_endpoint(&Url::parse(endpoint).unwrap()).unwrap();

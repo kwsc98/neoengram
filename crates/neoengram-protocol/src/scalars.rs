@@ -182,6 +182,16 @@ decimal_string!(
     "decision generation",
     POSITIVE_DECIMAL_U64_PATTERN
 );
+decimal_string!(
+    RouteGeneration,
+    "route generation",
+    POSITIVE_DECIMAL_U64_PATTERN
+);
+decimal_string!(
+    CertificateGeneration,
+    "certificate generation",
+    POSITIVE_DECIMAL_U64_PATTERN
+);
 decimal_string!(ResourceVersion, "resource version");
 decimal_string!(FencingToken, "fencing token", POSITIVE_DECIMAL_U64_PATTERN);
 decimal_string!(IndexRevision, "index revision");

@@ -369,7 +369,7 @@ async fn real_agentd_scans_volume_cas_and_publishes_over_h2() {
     let restarted_public_server = restarted_state.start_server(&server_config).await.unwrap();
     let restarted_public_addr = restarted_public_server.local_addr();
     let restarted_agent_addr = restarted_state.agent_local_addr().await.unwrap();
-    agent_config.central_endpoint = Url::parse(&format!("http://{restarted_agent_addr}/")).unwrap();
+    agent_config.gateway_endpoint = Url::parse(&format!("http://{restarted_agent_addr}/")).unwrap();
     let (server_restart_shutdown, server_restart_task) =
         spawn_full_agent(agent_config, agent_probe);
     wait_for_active_phase(&state_dir, "session_ready").await;
@@ -1128,7 +1128,7 @@ fn spawn_agent(
     config: AgentConfig,
     probe: ReadyProbe,
 ) -> (oneshot::Sender<()>, JoinHandle<AgentDaemonResult<()>>) {
-    let client = ReqwestEnrollmentClient::new(config.central_endpoint.clone()).unwrap();
+    let client = ReqwestEnrollmentClient::new(config.gateway_endpoint.clone()).unwrap();
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
         run_with(config, client, probe, async move {
@@ -1143,8 +1143,8 @@ fn spawn_full_agent(
     config: AgentConfig,
     probe: ReadyProbe,
 ) -> (oneshot::Sender<()>, JoinHandle<AgentDaemonResult<()>>) {
-    let enrollment_client = ReqwestEnrollmentClient::new(config.central_endpoint.clone()).unwrap();
-    let session_client = ReqwestAgentSessionClient::new(config.central_endpoint.clone()).unwrap();
+    let enrollment_client = ReqwestEnrollmentClient::new(config.gateway_endpoint.clone()).unwrap();
+    let session_client = ReqwestAgentSessionClient::new(config.gateway_endpoint.clone()).unwrap();
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let task = tokio::spawn(async move {
         run_with_transports(
@@ -1497,7 +1497,10 @@ fn agent_config(
     AgentConfig {
         schema_version: 1,
         protocol_version: 1,
-        central_endpoint: Url::parse(&format!("http://{agent_addr}/")).unwrap(),
+        gateway_endpoint: Url::parse(&format!("http://{agent_addr}/")).unwrap(),
+        trust_bundle_file: root.join("gateway-ca.pem"),
+        gateway_workload_trust_domain: None,
+        central_command_trust_bundle_file: None,
         tenant_id: TenantId::new("tenant-a").unwrap(),
         edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
         storage_volume_id: StorageVolumeId::new(volume_id).unwrap(),
@@ -1559,6 +1562,10 @@ fn development_server_config(authority_dir: PathBuf, keyring: PathBuf) -> Server
         agent_enrollment_enabled: true,
         agent_bind: Some("127.0.0.1:0".parse().unwrap()),
         agent_enrollment_keyring_file: Some(keyring),
+        gateway_tls_ca_file: None,
+        gateway_tls_client_certificate_file: None,
+        gateway_tls_client_private_key_file: None,
+        gateway_workload_trust_domain: None,
         authority_dir,
         rbac_file: None,
         oidc_issuer: None,

@@ -383,6 +383,11 @@ fn certificate(
         session_generation,
         mount_generation,
         owner_generation,
+        public_key_fingerprint: None,
+        identity_uri: None,
+        not_before_unix_ms: None,
+        not_after_unix_ms: None,
+        renew_at_unix_ms: None,
     }
 }
 
