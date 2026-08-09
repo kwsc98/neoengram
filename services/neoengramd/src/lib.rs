@@ -11,6 +11,8 @@ mod control_plane;
 #[cfg(feature = "authority-sqlite")]
 mod datasource;
 mod error;
+mod gateway_registry;
+mod gateway_registry_memory;
 #[cfg(feature = "authority-sqlite")]
 mod mapper;
 mod memory;
@@ -25,6 +27,8 @@ pub use catalog::*;
 pub use catalog_memory::InMemoryControlCatalog;
 pub use control_plane::ControlPlane;
 pub use error::{CentralError, CentralErrorCode, CentralResult};
+pub use gateway_registry::*;
+pub use gateway_registry_memory::InMemoryGatewayRegistry;
 #[cfg(feature = "authority-sqlite")]
 pub use mapper::sqlite::agent_registry::{
     open_sqlite_agent_registry, SqliteAgentRegistry, SqliteAgentRegistryConfig,

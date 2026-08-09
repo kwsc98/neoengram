@@ -911,6 +911,7 @@ fn report_envelope(
         request_id: None,
         trace_id: Some(TraceId::new(format!("trace-{message_id}")).unwrap()),
         sent_at_unix_ms: UnixMillis::new(NOW_MS),
+        central_signature: None,
         message,
         extensions: Extensions::new(),
     }

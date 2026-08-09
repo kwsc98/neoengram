@@ -1,5 +1,12 @@
 # Kubernetes Volume-bound Agent
 
+These manifests implement the Gateway-only Agent network topology. Each Agent connects to its EdgeCluster's
+multi-replica GatewayPool and has no Central endpoint or fallback. See
+[`docs/synapse-gateway-architecture.md`](../../../docs/synapse-gateway-architecture.md). The checked-in
+Gateway and Agent runtimes implement H2/mTLS identity validation and fail closed until an authenticated
+Central control session and a generation-current Agent route are established. Production certificate
+provisioning, two-replica E2E, and cutover validation remain deployment gates.
+
 This directory defines the 0.0.1 deployment profile for one existing business PVC:
 
 ```text
@@ -15,15 +22,31 @@ PVC; the Agent stores each Chunk at
 Index state, and placement evidence, but never receives or persists Chunk payloads.
 
 The repository contains the runnable `neoengram-agent` binary in the `neoengram-agentd` package. The Agent
-initiates the development control connection with the independent OpenAPI action
-`POST /agent/session/channel/open`, then keeps an HTTP/2 full-duplex NDJSON stream open so the center can
-logically invoke the Agent by pushing Assignment and Decision frames downstream. Heartbeat and Job reports
-flow upstream on the same channel. Bootstrap, MetadataBatch pages, and Index pages remain separate
+initiates the control connection to its configured GatewayPool with the independent OpenAPI action
+`POST /agent/session/channel/open`, then keeps an HTTP/2 full-duplex NDJSON stream open so Central can
+logically invoke the Agent through the Gateway by pushing Assignment and Decision frames downstream.
+Heartbeat and Job reports flow upstream on the same channel. Bootstrap, MetadataBatch pages, and Index pages remain separate
 action-style POST operations under `/agent/*`; there is no center-facing missing-object or object-upload
 operation. The legacy message-list poll is compatibility and manual-recovery only. Approved Ed25519 keys
 authenticate every upstream frame or unary request, and the bootstrap token never becomes a session
-credential. Production certificate issuance, mTLS, and HTTP/3 are not part of this profile. The example image
-is only a placeholder and must be replaced with a real, digest-pinned build before applying these manifests.
+credential. The configured `trust_bundle_file` is the exclusive server-auth trust root for both unary and
+streaming Gateway requests; system roots are not used by the production construction path. Agent workload
+certificate issuance, renewal and production credential provisioning remain deployment responsibilities; runtime
+mTLS identity validation and certificate installation are implemented. The example image is
+only a placeholder and must be replaced with a real, digest-pinned build before applying these manifests.
+
+For HTTPS, CA trust is necessary but not sufficient. Standard TLS verification requires the configured
+`gateway_endpoint` host to appear as a DNS or IP SAN in the serving certificate. The Agent additionally
+requires exactly one workload URI SAN under `gateway_workload_trust_domain`, with the shape
+`spiffe://<trust-domain>/workloads/edge-clusters/<edge_cluster_id>/gateway-pools/<gateway_pool_id>/gateway-replicas/<gateway_replica_id>`.
+The URI must name the configured `edge_cluster_id`; a certificate for an Agent, another EdgeCluster, or a
+different trust domain fails closed even when it chains to the configured CA. Because the Pool Service may
+route to any Replica, every activated Replica certificate must cover the Pool `gateway_endpoint` host as well
+as that Replica's registered bootstrap, control, and peer endpoint hosts.
+
+Central actively connects to registered Gateway replicas, while the Agent still initiates its only active
+edge connection. The Gateway does not mount this business PVC and cannot replace Agent-side hash verification
+or durability barriers.
 
 ## Preconditions
 
@@ -47,6 +70,10 @@ is only a placeholder and must be replaced with a real, digest-pinned build befo
 - A TenantAdmin has issued a 15-minute, one-time bootstrap token scoped to the intended Tenant,
   EdgeCluster, StorageVolume descriptor, access mode, and PVC reference. The platform administrator receives
   it only to deploy this Agent.
+- The EdgeCluster has a Central/provisioner-verified Ready GatewayPool with at least two production
+  replicas and observed readiness/failover evidence, a trusted Pool endpoint, and NetworkPolicy that permits
+  Agent-to-Gateway traffic but denies Agent-to-Central Agent-listener traffic. The declaration `Ready` alone
+  is not proof that `minimum_ready_replicas` is currently satisfied.
 
 ## Prepare The Manifests
 
@@ -68,8 +95,13 @@ state PVC. In particular, set:
   `volume_descriptor_digest`;
 - the public token ID in `registration.token_id` for stable bootstrap lookup/audit;
 - a durable RWO StorageClass for `agent-state-pvc.yaml`;
-- the central HTTPS endpoint; `/agent/*` at that origin must reach the server's separate Agent listener,
-  directly or through a reverse proxy, rather than the public Fusen listener;
+- the local GatewayPool HTTPS endpoint, `gateway_workload_trust_domain`, its PEM CA bundle, and Central's
+  command-signing public key bundle. `/agent/*` at that origin must reach the Gateway Agent listener. The
+  endpoint host must match the Gateway leaf DNS/IP SAN, while the leaf's sole URI SAN must identify a
+  GatewayReplica in this Agent's configured EdgeCluster and trust domain. The Agent rejects missing,
+  malformed, oversized, writable, unknown-generation, wrongly scoped, or revoked trust material and has no
+  Central endpoint fallback. Replace `central-command-trust.json` with strict JSON containing the current
+  and rotating Ed25519 SPKI keys before deploying;
 - a real, digest-pinned Agent image;
 - a new bootstrap token in a local copy of `secret.example.yaml`.
 
@@ -103,17 +135,18 @@ Apply the non-secret resources, create the Secret, then create the Deployment:
 ```sh
 kubectl apply -f agent-state-pvc.yaml
 kubectl apply -f configmap.yaml
+kubectl apply -f networkpolicy.yaml
 kubectl apply -f deployment.yaml
 ```
 
-The Agent initiates all connections to the center. It does not receive a ServiceAccount token, call the
+The Agent initiates all network connections and connects only to the local GatewayPool. It does not receive a ServiceAccount token, call the
 Kubernetes API, expose a Service/Ingress, or depend on an Operator. No Service, Ingress, HPA, Role, or
 RoleBinding belongs in this profile.
 
-Cluster operators should additionally apply their namespace default-deny policy and an egress allowlist for
-DNS, the configured center, and the business storage service. The configured center carries control and
-metadata only, not Chunk payloads. Those addresses are environment-specific, so this directory does not ship
-a permissive or nonfunctional NetworkPolicy example.
+The included NetworkPolicy limits Agent egress to cluster DNS and the selected local GatewayPool's Agent
+listener. It contains no Central destination, so a matching CNI-enforced deployment cannot use the old
+Central Agent endpoint. Adjust namespaces and labels without broadening that authority boundary. The control
+path carries metadata but no Chunk payloads in the first milestone.
 
 The center creates an idempotent `pending_approval` Storage enrollment, not a Ready Volume. TenantAdmin
 reviews only the public Volume/PVC scope, Agent version, public-key identity summary, and sanitized probe
@@ -137,8 +170,9 @@ deployment workflow; removing the PVC from this template does not create a valid
   `/volume/.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects/<object_id>`; never redirect that
   CAS to the Agent state PVC or a Server filesystem. The Server persists only signed placement evidence and
   authoritative logical metadata.
-- Cross-Volume copy is a future routed Agent/Gateway data path. Chunk payloads must flow directly between
-  approved data endpoints and must not be proxied through the Server control plane.
+- Cross-Volume copy is a later Gateway data-plane milestone. Its fixed path is source Agent -> source Gateway
+  -> destination Gateway -> destination Agent; payload must not be proxied through or persisted by Central,
+  and neither Gateway may mount a business Volume.
 - Reuse the same state PVC for an ordinary Pod restart. A lost or replaced state PVC requires a new
   registration and first approval; it must not inherit an Agent ID from the business volume.
 - If a bootstrapped candidate is rejected or its review window expires, retire that installation identity
@@ -150,7 +184,7 @@ deployment workflow; removing the PVC from this template does not create a valid
   of retaining or reusing bootstrap authority. If state is lost, create a fresh Secret and approval request.
 - Startup and liveness check the daemon-owned health record. Readiness must fail closed until an approved,
   generation-current session has completed mount recovery and reported a healthy heartbeat. Loss of the
-  center must not cause destructive restart loops.
+  configured GatewayPool must not cause destructive restart loops.
 - Kubernetes rollout settings and central generations provide cooperative fencing only. They do not stop a
   partitioned or compromised process that still owns RW storage credentials.
 

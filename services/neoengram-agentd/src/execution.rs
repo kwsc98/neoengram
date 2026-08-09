@@ -247,7 +247,7 @@ impl WorkspaceMaterializationSnapshot {
             .iter()
             .map(|file| file.record.clone())
             .collect::<Vec<_>>();
-        AuthoritativeIndexSnapshot::new(version.clone(), records)?;
+        AuthoritativeIndexSnapshot::new(version, records)?;
         for file in &files {
             file.manifest
                 .validate()
@@ -1534,7 +1534,7 @@ mod tests {
         .unwrap();
         let version = IndexVersion::from_snapshot(9, std::slice::from_ref(&record)).unwrap();
         let snapshot = WorkspaceMaterializationSnapshot::new(
-            version.clone(),
+            version,
             vec![WorkspaceMaterializationFile { record, manifest }],
         )
         .unwrap();
@@ -1600,7 +1600,7 @@ mod tests {
                 .unwrap();
         let version = IndexVersion::from_snapshot(1, std::slice::from_ref(&record)).unwrap();
         let snapshot = WorkspaceMaterializationSnapshot::new(
-            version.clone(),
+            version,
             vec![WorkspaceMaterializationFile { record, manifest }],
         )
         .unwrap();

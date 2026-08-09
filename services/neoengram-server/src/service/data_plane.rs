@@ -693,12 +693,7 @@ mod tests {
     fn manifest_pages_expose_only_ordered_object_references() {
         let first = ChunkRef::new(ObjectId::for_bytes(b"ab"), 0, 2).unwrap();
         let second = ChunkRef::new(ObjectId::for_bytes(b"cd"), 2, 2).unwrap();
-        let manifest = Manifest::new(
-            4,
-            ChunkingStrategy::FastCdc,
-            vec![first.clone(), second.clone()],
-        )
-        .unwrap();
+        let manifest = Manifest::new(4, ChunkingStrategy::FastCdc, vec![first, second]).unwrap();
 
         let (page_count, first_page) = page_manifest_chunks(&manifest, 0, 1).unwrap();
         assert_eq!(page_count, 2);

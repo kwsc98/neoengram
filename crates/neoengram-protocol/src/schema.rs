@@ -1,6 +1,9 @@
 use schemars::{schema_for, Schema};
 
-use crate::{AgentApiSchema, AgentEnrollmentEnvelope, ControlEnvelope, MetadataProtocolSchema};
+use crate::{
+    AgentApiSchema, AgentEnrollmentEnvelope, ControlEnvelope, GatewayControlFrame,
+    MetadataProtocolSchema,
+};
 
 /// Restricts a field in a version-specific schema without narrowing the reusable wire scalar.
 pub(crate) fn require_protocol_v1(schema: &mut Schema) {
@@ -29,4 +32,10 @@ pub fn enrollment_schema() -> Schema {
 #[must_use]
 pub fn metadata_schema() -> Schema {
     schema_for!(MetadataProtocolSchema)
+}
+
+/// Generates the complete v1 Gateway control-frame JSON Schema.
+#[must_use]
+pub fn gateway_schema() -> Schema {
+    schema_for!(GatewayControlFrame)
 }

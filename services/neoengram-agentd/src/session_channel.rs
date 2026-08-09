@@ -135,6 +135,7 @@ pub(crate) fn spawn_response_reader(
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum AgentWork {
     Assignment(JobAssignment),
     Recovery(LedgerRecord),
@@ -320,6 +321,7 @@ mod tests {
             correlation_id: None,
             session_generation: SessionGeneration::new(3),
             sent_at_unix_ms: UnixMillis::new(10),
+            central_signature: None,
             message: neoengram_protocol::AgentChannelDownstreamMessage::Error(ControlError {
                 code: ErrorCode::new("TEST_ERROR").unwrap(),
                 message: "test".to_owned(),

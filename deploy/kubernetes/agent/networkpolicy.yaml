@@ -1,0 +1,37 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: neoengram-agent-volume-safe-slug-egress
+  namespace: neoengram-agent-example
+  labels:
+    app.kubernetes.io/name: neoengram-agent
+    app.kubernetes.io/component: storage-agent
+    app.kubernetes.io/instance: volume-safe-slug
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: neoengram-agent
+      app.kubernetes.io/instance: volume-safe-slug
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: synapse-gateway-example
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: synapse-gateway
+              neoengram.io/gateway-pool: gateway-pool-example
+      ports:
+        - protocol: TCP
+          port: 8081
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

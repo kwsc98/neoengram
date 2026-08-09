@@ -8,6 +8,8 @@ use crate::{
     sqlite_storage::{storage_corruption, storage_error, LockedSqlite, SqliteDefinition},
     AgentError, AgentErrorCode, AgentResult,
 };
+use neoengram_core::ContentDigest;
+use neoengram_protocol::UnixMillis;
 
 const DATABASE_FILE: &str = "system.sqlite3";
 const LOCK_FILE: &str = "system.lock";
@@ -191,6 +193,16 @@ pub struct AgentCertificateState {
     pub session_generation: u64,
     pub mount_generation: u64,
     pub owner_generation: u64,
+    #[serde(default)]
+    pub public_key_fingerprint: Option<ContentDigest>,
+    #[serde(default)]
+    pub identity_uri: Option<String>,
+    #[serde(default)]
+    pub not_before_unix_ms: Option<UnixMillis>,
+    #[serde(default)]
+    pub not_after_unix_ms: Option<UnixMillis>,
+    #[serde(default)]
+    pub renew_at_unix_ms: Option<UnixMillis>,
 }
 
 impl fmt::Debug for AgentCertificateState {
@@ -232,6 +244,41 @@ impl AgentCertificateState {
                 AgentErrorCode::GenerationMismatch,
                 "Agent certificate and runtime generations must be positive",
             ));
+        }
+        if let (Some(not_before), Some(not_after), Some(renew_at)) = (
+            self.not_before_unix_ms,
+            self.not_after_unix_ms,
+            self.renew_at_unix_ms,
+        ) {
+            if not_before.get() == 0
+                || not_after.get() <= not_before.get()
+                || renew_at.get() < not_before.get()
+                || renew_at.get() >= not_after.get()
+            {
+                return Err(AgentError::new(
+                    AgentErrorCode::InvalidState,
+                    "Agent certificate validity window is invalid",
+                ));
+            }
+        } else if self.not_before_unix_ms.is_some()
+            || self.not_after_unix_ms.is_some()
+            || self.renew_at_unix_ms.is_some()
+        {
+            return Err(AgentError::new(
+                AgentErrorCode::InvalidState,
+                "Agent certificate validity metadata is incomplete",
+            ));
+        }
+        if let Some(identity_uri) = &self.identity_uri {
+            if identity_uri.is_empty()
+                || identity_uri.len() > 512
+                || identity_uri.bytes().any(|byte| byte.is_ascii_control())
+            {
+                return Err(AgentError::new(
+                    AgentErrorCode::InvalidState,
+                    "Agent certificate identity URI is invalid",
+                ));
+            }
         }
         Ok(())
     }

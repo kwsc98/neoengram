@@ -820,6 +820,10 @@ pub enum Permission {
     SnapshotRead,
     #[serde(rename = "snapshot.create")]
     SnapshotCreate,
+    #[serde(rename = "gateway.read")]
+    GatewayRead,
+    #[serde(rename = "gateway.manage")]
+    GatewayManage,
 }
 
 impl Permission {
@@ -842,6 +846,8 @@ impl Permission {
             Self::PlaygroundCreate => "playground.create",
             Self::SnapshotRead => "snapshot.read",
             Self::SnapshotCreate => "snapshot.create",
+            Self::GatewayRead => "gateway.read",
+            Self::GatewayManage => "gateway.manage",
         }
     }
 }
@@ -975,6 +981,26 @@ impl StaticRbacPolicy {
         tenant_id: &TenantId,
     ) -> Result<(), fusen_rs::Error> {
         if self.is_allowed(identity.principal(), permission, tenant_id) {
+            Ok(())
+        } else {
+            Err(crate::error::permission_denied())
+        }
+    }
+
+    /// Authorizes a control-plane-wide action. Global permissions require an explicit wildcard
+    /// tenant binding so a tenant-scoped role cannot mutate Gateway infrastructure.
+    pub fn authorize_global_identity(
+        &self,
+        identity: &AuthenticatedIdentity,
+        permission: Permission,
+    ) -> Result<(), fusen_rs::Error> {
+        if self
+            .grants
+            .get(identity.principal().id.as_str())
+            .is_some_and(|grant| {
+                grant.permissions.contains(&permission) && grant.tenants.contains("*")
+            })
+        {
             Ok(())
         } else {
             Err(crate::error::permission_denied())

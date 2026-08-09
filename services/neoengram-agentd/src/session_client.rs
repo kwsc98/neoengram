@@ -1,9 +1,15 @@
 use std::{
     convert::Infallible,
     fmt,
+    future::Future,
+    io,
     pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -18,6 +24,7 @@ use hyper::{
     client::conn::http2,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use neoengram_agent::SystemIdentityRecord;
 use neoengram_protocol::{
     decode_bounded_unique_json, AgentActionAcceptedResponse, AgentAuthenticatedRequest,
     AgentBootId, AgentBootstrapProof, AgentChannelUpstreamFrame, AgentChannelUpstreamPayload,
@@ -36,13 +43,24 @@ use neoengram_protocol::{
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use tokio::{net::TcpStream, sync::mpsc, task::JoinHandle};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+    sync::mpsc,
+    task::JoinHandle,
+    time::Sleep,
+};
+use tokio_rustls::TlsConnector;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
     identity::public_key_spki_der,
     session_channel::{channel_buffers, spawn_response_reader, AgentChannelConnection},
+    tls::{
+        gateway_server_certificate_deadline, validate_gateway_server_certificate,
+        GatewayServerIdentity, GatewayTrustBundle,
+    },
     AgentDaemonError, AgentDaemonResult, AgentSigningKey,
 };
 
@@ -52,6 +70,92 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
 const REQUEST_ID_HEADER: &str = "x-request-id";
+
+trait AgentChannelIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> AgentChannelIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+/// I/O guard that makes the server leaf deadline effective inside Hyper's executor-owned H2
+/// socket task. Dropping Hyper's public `Connection` future is insufficient once response streams
+/// hold internal connection references, so expiry must fail the actual TLS stream's reads/writes.
+struct CertificateBoundIo<I> {
+    inner: I,
+    deadline: Option<Pin<Box<Sleep>>>,
+    expired: bool,
+}
+
+impl<I> CertificateBoundIo<I> {
+    fn new(inner: I, deadline: Option<Instant>) -> Self {
+        Self {
+            inner,
+            deadline: deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline.into()))),
+            expired: false,
+        }
+    }
+
+    fn poll_expired(&mut self, context: &mut Context<'_>) -> bool {
+        if !self.expired
+            && self
+                .deadline
+                .as_mut()
+                .is_some_and(|deadline| deadline.as_mut().poll(context).is_ready())
+        {
+            self.expired = true;
+        }
+        self.expired
+    }
+
+    fn expired_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Gateway server certificate expired",
+        )
+    }
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for CertificateBoundIo<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        if this.poll_expired(context) {
+            return Poll::Ready(Err(Self::expired_error()));
+        }
+        Pin::new(&mut this.inner).poll_read(context, buffer)
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for CertificateBoundIo<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.as_mut().get_mut();
+        if this.poll_expired(context) {
+            return Poll::Ready(Err(Self::expired_error()));
+        }
+        Pin::new(&mut this.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        if this.poll_expired(context) {
+            return Poll::Ready(Err(Self::expired_error()));
+        }
+        Pin::new(&mut this.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        if this.poll_expired(context) {
+            return Poll::Ready(Err(Self::expired_error()));
+        }
+        Pin::new(&mut this.inner).poll_shutdown(context)
+    }
+}
 
 struct AgentStreamingBody {
     frames: mpsc::Receiver<Bytes>,
@@ -246,6 +350,14 @@ impl AgentRequestSigner {
 
 #[async_trait]
 pub trait AgentSessionClient: Send + Sync {
+    /// Installs the approved client-auth identity before any HTTPS business/session request.
+    fn install_workload_identity(
+        &self,
+        _identity: &SystemIdentityRecord,
+    ) -> Result<(), AgentSessionClientError> {
+        Ok(())
+    }
+
     async fn connect_channel(
         &self,
         open: &AgentChannelUpstreamFrame,
@@ -291,20 +403,126 @@ pub trait AgentSessionClient: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct ReqwestAgentSessionClient {
-    client: reqwest::Client,
+    client: Arc<RwLock<reqwest::Client>>,
     endpoint: Url,
+    tls_config: Arc<RwLock<Option<Arc<rustls::ClientConfig>>>>,
+    trust_bundle: Option<GatewayTrustBundle>,
+    gateway_identity: Option<GatewayServerIdentity>,
+    has_client_identity: Arc<AtomicBool>,
 }
 
 impl ReqwestAgentSessionClient {
     pub fn new(endpoint: Url) -> AgentDaemonResult<Self> {
+        Self::build(endpoint, None, None, false)
+    }
+
+    pub(crate) fn with_gateway_trust_bundle(
+        endpoint: Url,
+        trust_bundle: &GatewayTrustBundle,
+    ) -> AgentDaemonResult<Self> {
+        Self::build(endpoint, Some(trust_bundle), None, false)
+    }
+
+    // Kept as an explicit strict constructor for embedders that already have a workload
+    // certificate; the daemon's bootstrap lifecycle intentionally uses the deferred variant.
+    #[allow(dead_code)]
+    pub(crate) fn with_gateway_trust_bundle_and_identity(
+        endpoint: Url,
+        trust_bundle: &GatewayTrustBundle,
+        gateway_identity: GatewayServerIdentity,
+    ) -> AgentDaemonResult<Self> {
+        Self::build(endpoint, Some(trust_bundle), Some(gateway_identity), true)
+    }
+
+    /// Builds the pre-certificate session transport without applying the workload URI verifier.
+    /// Session requests remain blocked until `install_workload_identity` installs mTLS.
+    pub(crate) fn with_gateway_trust_bundle_deferred_identity(
+        endpoint: Url,
+        trust_bundle: &GatewayTrustBundle,
+        gateway_identity: GatewayServerIdentity,
+    ) -> AgentDaemonResult<Self> {
+        Self::build(endpoint, Some(trust_bundle), Some(gateway_identity), false)
+    }
+
+    fn build(
+        endpoint: Url,
+        trust_bundle: Option<&GatewayTrustBundle>,
+        gateway_identity: Option<GatewayServerIdentity>,
+        bind_gateway_identity: bool,
+    ) -> AgentDaemonResult<Self> {
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(REQUEST_TIMEOUT)
+            .http2_prior_knowledge()
+            .user_agent(concat!("neoengram-agent/", env!("CARGO_PKG_VERSION")));
+        let tls_config = if let Some(trust_bundle) = trust_bundle {
+            let expected_gateway_identity = bind_gateway_identity
+                .then_some(gateway_identity.as_ref())
+                .flatten();
+            let config = crate::tls::rustls_server_auth_client_config(
+                trust_bundle,
+                expected_gateway_identity,
+                vec![b"h2".to_vec()],
+            )?;
+            builder = builder.tls_backend_preconfigured(config.clone());
+            Some(Arc::new(config))
+        } else {
+            None
+        };
+        let client = builder
+            .build()
+            .map_err(|error| AgentDaemonError::Enrollment(error.to_string()))?;
+        Ok(Self {
+            client: Arc::new(RwLock::new(client)),
+            endpoint,
+            tls_config: Arc::new(RwLock::new(tls_config)),
+            trust_bundle: trust_bundle.cloned(),
+            gateway_identity,
+            has_client_identity: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn replace_identity(&self, identity: &SystemIdentityRecord) -> AgentDaemonResult<()> {
+        if self.endpoint.scheme() != "https" {
+            return Ok(());
+        }
+        let trust_bundle = self.trust_bundle.as_ref().ok_or_else(|| {
+            AgentDaemonError::Configuration(
+                "HTTPS Agent session client has no Gateway trust bundle".to_owned(),
+            )
+        })?;
+        let tls_config = crate::tls::rustls_client_config(
+            trust_bundle,
+            identity,
+            self.gateway_identity.as_ref(),
+            vec![b"h2".to_vec()],
+        )?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(REQUEST_TIMEOUT)
             .http2_prior_knowledge()
             .user_agent(concat!("neoengram-agent/", env!("CARGO_PKG_VERSION")))
+            .tls_backend_preconfigured(tls_config.clone())
             .build()
             .map_err(|error| AgentDaemonError::Enrollment(error.to_string()))?;
-        Ok(Self { client, endpoint })
+        let tls_config = Arc::new(tls_config);
+        *self.client.write().map_err(|_| {
+            AgentDaemonError::Session("Agent session client lock is poisoned".to_owned())
+        })? = client;
+        *self.tls_config.write().map_err(|_| {
+            AgentDaemonError::Session("Agent TLS client lock is poisoned".to_owned())
+        })? = Some(tls_config);
+        self.has_client_identity.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn require_client_identity(&self) -> Result<(), AgentSessionClientError> {
+        if self.endpoint.scheme() == "https" && !self.has_client_identity.load(Ordering::Acquire) {
+            return Err(AgentSessionClientError::protocol(
+                "approved HTTPS Agent request requires an installed workload certificate",
+            ));
+        }
+        Ok(())
     }
 
     async fn post<T: Serialize, R: DeserializeOwned>(
@@ -322,14 +540,21 @@ impl ReqwestAgentSessionClient {
         path: &'static str,
         request: &AgentAuthenticatedRequest<T>,
     ) -> Result<R, AgentSessionClientError> {
+        self.require_client_identity()?;
         let url = self
             .endpoint
             .join(path.trim_start_matches('/'))
             .map_err(|error| AgentSessionClientError::new(false, error.to_string()))?;
         let body = serde_json::to_vec(request)
             .map_err(|error| AgentSessionClientError::new(false, error.to_string()))?;
-        let response = self
+        let client = self
             .client
+            .read()
+            .map_err(|_| {
+                AgentSessionClientError::protocol("Agent session client lock is poisoned")
+            })?
+            .clone();
+        let response = client
             .post(url)
             .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
             .header(
@@ -385,6 +610,7 @@ impl ReqwestAgentSessionClient {
         &self,
         open: &AgentChannelUpstreamFrame,
     ) -> Result<AgentChannelConnection, AgentSessionClientError> {
+        self.require_client_identity()?;
         if !matches!(
             open.request.payload.message,
             neoengram_protocol::AgentChannelUpstreamMessage::Open(_)
@@ -402,12 +628,7 @@ impl ReqwestAgentSessionClient {
             .endpoint
             .join(AGENT_SESSION_CHANNEL_OPEN_PATH.trim_start_matches('/'))
             .map_err(AgentSessionClientError::protocol)?;
-        if url.scheme() != "http" {
-            return Err(AgentSessionClientError::protocol(
-                "Agent control channel currently requires cleartext HTTP/2 prior knowledge",
-            ));
-        }
-        let host = url.host_str().ok_or_else(|| {
+        let host = endpoint_host(&url).ok_or_else(|| {
             AgentSessionClientError::protocol("Agent control channel endpoint has no host")
         })?;
         let port = url.port_or_known_default().ok_or_else(|| {
@@ -420,16 +641,67 @@ impl ReqwestAgentSessionClient {
             )
         })?;
 
-        let stream = tokio::time::timeout(REQUEST_TIMEOUT, TcpStream::connect((host, port)))
-            .await
-            .map_err(|_| {
-                AgentSessionClientError::transport("Agent control channel connection timed out")
-            })?
-            .map_err(|error| {
-                AgentSessionClientError::transport(format!(
-                    "Agent control channel is unavailable: {error}"
-                ))
-            })?;
+        let stream =
+            tokio::time::timeout(REQUEST_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+                .await
+                .map_err(|_| {
+                    AgentSessionClientError::transport("Agent control channel connection timed out")
+                })?
+                .map_err(|error| {
+                    AgentSessionClientError::transport(format!(
+                        "Agent control channel is unavailable: {error}"
+                    ))
+                })?;
+        let (stream, certificate_deadline): (Box<dyn AgentChannelIo>, Option<Instant>) = match url
+            .scheme()
+        {
+            "http" => (Box::new(stream), None),
+            "https" => {
+                let config = self
+                    .tls_config
+                    .read()
+                    .map_err(|_| {
+                        AgentSessionClientError::protocol("Agent TLS client lock is poisoned")
+                    })?
+                    .clone()
+                    .ok_or_else(|| {
+                        AgentSessionClientError::protocol(
+                            "HTTPS Agent control channel requires the configured Gateway trust bundle",
+                        )
+                    })?;
+                let server_name =
+                    rustls::pki_types::ServerName::try_from(host.clone()).map_err(|error| {
+                        AgentSessionClientError::protocol(format!(
+                            "Gateway endpoint has an invalid TLS server name: {error}"
+                        ))
+                    })?;
+                let tls_stream = tokio::time::timeout(
+                    REQUEST_TIMEOUT,
+                    TlsConnector::from(config).connect(server_name, stream),
+                )
+                .await
+                .map_err(|_| AgentSessionClientError::transport("Gateway TLS handshake timed out"))?
+                .map_err(|error| {
+                    AgentSessionClientError::transport(format!(
+                        "Gateway TLS handshake failed: {error}"
+                    ))
+                })?;
+                let peer_certificates = tls_stream.get_ref().1.peer_certificates();
+                if let Some(identity) = &self.gateway_identity {
+                    validate_gateway_server_certificate(peer_certificates, identity)
+                        .map_err(|error| AgentSessionClientError::protocol(error.to_string()))?;
+                }
+                let deadline = gateway_server_certificate_deadline(peer_certificates)
+                    .map_err(|error| AgentSessionClientError::transport(error.to_string()))?;
+                (Box::new(tls_stream), Some(deadline))
+            }
+            _ => {
+                return Err(AgentSessionClientError::protocol(
+                    "Agent control channel requires HTTP or HTTPS",
+                ));
+            }
+        };
+        let stream = CertificateBoundIo::new(stream, certificate_deadline);
         let (mut sender, connection) = tokio::time::timeout(
             REQUEST_TIMEOUT,
             http2::handshake::<_, _, AgentStreamingBody>(
@@ -443,7 +715,9 @@ impl ReqwestAgentSessionClient {
             AgentSessionClientError::transport(format!("Agent HTTP/2 handshake failed: {error}"))
         })?;
         let connection_task = AbortTaskOnDrop::new(tokio::spawn(async move {
-            let _ = connection.await;
+            if let Err(error) = connection.await {
+                tracing::debug!(%error, "Agent Gateway H2 connection driver ended");
+            }
         }));
         let request = Request::builder()
             .method(Method::POST)
@@ -463,16 +737,24 @@ impl ReqwestAgentSessionClient {
                 frames: outgoing_rx,
             })
             .map_err(AgentSessionClientError::protocol)?;
-        let response = tokio::time::timeout(REQUEST_TIMEOUT, sender.send_request(request))
-            .await
-            .map_err(|_| {
-                AgentSessionClientError::transport("Agent control channel response timed out")
-            })?
-            .map_err(|error| {
-                AgentSessionClientError::transport(format!(
-                    "Agent control channel is unavailable: {error}"
-                ))
-            })?;
+        let response = before_server_certificate_expiry(
+            async {
+                tokio::time::timeout(REQUEST_TIMEOUT, sender.send_request(request))
+                    .await
+                    .map_err(|_| {
+                        AgentSessionClientError::transport(
+                            "Agent control channel response timed out",
+                        )
+                    })?
+                    .map_err(|error| {
+                        AgentSessionClientError::transport(format!(
+                            "Agent control channel is unavailable: {error}"
+                        ))
+                    })
+            },
+            certificate_deadline,
+        )
+        .await?;
         let sender_keepalive = tokio::spawn(async move {
             let _sender = sender;
             std::future::pending::<()>().await;
@@ -546,6 +828,14 @@ impl ReqwestAgentSessionClient {
 
 #[async_trait]
 impl AgentSessionClient for ReqwestAgentSessionClient {
+    fn install_workload_identity(
+        &self,
+        identity: &SystemIdentityRecord,
+    ) -> Result<(), AgentSessionClientError> {
+        self.replace_identity(identity)
+            .map_err(AgentSessionClientError::protocol)
+    }
+
     async fn connect_channel(
         &self,
         open: &AgentChannelUpstreamFrame,
@@ -617,6 +907,28 @@ impl AgentSessionClient for ReqwestAgentSessionClient {
         request: &AgentAuthenticatedRequest<AgentSessionClosePayload>,
     ) -> Result<AgentSessionCloseResponse, AgentSessionClientError> {
         self.post(AGENT_SESSION_CLOSE_PATH, request).await
+    }
+}
+
+async fn before_server_certificate_expiry<T, F>(
+    future: F,
+    certificate_deadline: Option<Instant>,
+) -> Result<T, AgentSessionClientError>
+where
+    F: Future<Output = Result<T, AgentSessionClientError>>,
+{
+    if let Some(deadline) = certificate_deadline {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline.into()) => {
+                Err(AgentSessionClientError::transport(
+                    "Gateway server certificate expired",
+                ))
+            }
+            result = future => result,
+        }
+    } else {
+        future.await
     }
 }
 
@@ -704,6 +1016,14 @@ fn protocol_error(error: impl std::fmt::Display) -> AgentSessionClientError {
     AgentSessionClientError::new(false, error.to_string())
 }
 
+fn endpoint_host(endpoint: &Url) -> Option<String> {
+    endpoint.host().map(|host| match host {
+        url::Host::Domain(domain) => domain.to_owned(),
+        url::Host::Ipv4(address) => address.to_string(),
+        url::Host::Ipv6(address) => address.to_string(),
+    })
+}
+
 fn has_content_type(observed: &str, expected: &str) -> bool {
     observed
         .split(';')
@@ -714,8 +1034,9 @@ fn has_content_type(observed: &str, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{future, sync::Arc};
 
+    use http_body_util::Full;
     use hyper::{
         body::Incoming, server::conn::http2 as server_http2, service::service_fn, Response,
     };
@@ -728,6 +1049,28 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    struct PendingResponseBody;
+
+    impl Body for PendingResponseBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+
+        fn is_end_stream(&self) -> bool {
+            false
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::default()
+        }
+    }
 
     fn signed_open() -> AgentChannelUpstreamFrame {
         let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
@@ -767,6 +1110,7 @@ mod tests {
             correlation_id: None,
             session_generation: SessionGeneration::new(1),
             sent_at_unix_ms: UnixMillis::new(11),
+            central_signature: None,
             message: AgentChannelDownstreamMessage::Error(ControlError {
                 code: ErrorCode::new("TEST_FRAME").unwrap(),
                 message: "stream remains bidirectional".to_owned(),
@@ -776,6 +1120,78 @@ mod tests {
             }),
             extensions: Extensions::new(),
         }
+    }
+
+    #[test]
+    fn https_session_fails_closed_before_client_certificate_installation() {
+        let client =
+            ReqwestAgentSessionClient::new(Url::parse("https://gateway.example.test/").unwrap())
+                .unwrap();
+        let error = client.require_client_identity().unwrap_err();
+        assert!(!error.retryable());
+        assert!(error.to_string().contains("workload certificate"));
+
+        let loopback =
+            ReqwestAgentSessionClient::new(Url::parse("http://127.0.0.1:18080/").unwrap()).unwrap();
+        loopback.require_client_identity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn application_work_stops_at_the_gateway_server_certificate_deadline() {
+        let error = before_server_certificate_expiry(
+            future::pending::<Result<(), AgentSessionClientError>>(),
+            Some(Instant::now()),
+        )
+        .await
+        .expect_err("Agent application work must fail closed at the certificate deadline");
+        assert!(error.retryable());
+        assert!(error.to_string().contains("certificate expired"));
+    }
+
+    #[tokio::test]
+    async fn gateway_certificate_deadline_closes_an_active_h2_response_stream() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            server_http2::Builder::new(TokioExecutor::new())
+                .serve_connection(
+                    TokioIo::new(server_io),
+                    service_fn(|_| async {
+                        Ok::<_, Infallible>(Response::new(PendingResponseBody))
+                    }),
+                )
+                .await
+        });
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let (mut sender, connection) = http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(CertificateBoundIo::new(client_io, Some(deadline))),
+        )
+        .await
+        .expect("client H2 handshake");
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("http://gateway.test/agent/session/channel")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .expect("server begins a pending response");
+        let mut body = response.into_body();
+        let closed = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("certificate deadline must wake the active response stream");
+        assert!(closed.is_none() || closed.is_some_and(|frame| frame.is_err()));
+        let _ = tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("certificate-bound driver must finish")
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server must observe the client connection close")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -820,12 +1236,7 @@ mod tests {
                             later_request_tx.send(bytes.to_vec()).await.unwrap();
                             response_tx.send(encoded_response).await.unwrap();
                         }
-                        loop {
-                            match request_body.frame().await {
-                                Some(Ok(_)) => {}
-                                Some(Err(_)) | None => break,
-                            }
-                        }
+                        while let Some(Ok(_)) = request_body.frame().await {}
                         let _ = request_finished_tx.send(()).await;
                     });
 

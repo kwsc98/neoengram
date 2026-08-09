@@ -17,7 +17,7 @@ rg -q '^rust-version = "1\.97\.0"$' Cargo.toml || fail "workspace MSRV must rema
 
 workspace_metadata="$(cargo metadata --no-deps --format-version 1 --locked)"
 
-expected_packages=$'neoengram\nneoengram-agent\nneoengram-agentd\nneoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol\nneoengram-server\nneoengram-standalone\nneoengramd'
+expected_packages=$'neoengram\nneoengram-agent\nneoengram-agentd\nneoengram-core\nneoengram-engine\nneoengram-fs\nneoengram-protocol\nneoengram-server\nneoengram-standalone\nneoengramd\nsynapse-gateway'
 actual_packages="$(
   jq -r '.packages[].name' <<<"$workspace_metadata" | LC_ALL=C sort
 )"
@@ -100,6 +100,7 @@ assert_internal_dependencies neoengramd $'neoengram-core\nneoengram-protocol' ''
 assert_internal_dependencies neoengram-server \
   $'neoengram-core\nneoengram-engine\nneoengram-protocol\nneoengramd' \
   'neoengram-agentd'
+assert_internal_dependencies synapse-gateway 'neoengram-protocol' ''
 
 assert_no_direct_dependency() {
   local package="$1"
@@ -159,6 +160,17 @@ assert_no_fusen_dependency neoengram-agentd
 for dependency in neoengram-server neoengramd; do
   assert_no_direct_dependency neoengram-agentd "$dependency"
 done
+assert_no_fusen_dependency synapse-gateway
+for dependency in \
+  neoengram-agent \
+  neoengram-agentd \
+  neoengram-engine \
+  neoengram-fs \
+  neoengram-server \
+  neoengram-standalone \
+  neoengramd; do
+  assert_no_direct_dependency synapse-gateway "$dependency"
+done
 
 assert_no_binary_target() {
   local package="$1"
@@ -185,6 +197,13 @@ if ! jq -e \
    [.targets[] | select(.name == "neoengram-agent") | .kind[]] | index("bin") != null' \
   >/dev/null <<<"$workspace_metadata"; then
   fail "neoengram-agentd must provide the neoengram-agent binary"
+fi
+
+if ! jq -e \
+  '.packages[] | select(.name == "synapse-gateway") |
+   [.targets[] | select(.name == "synapse-gateway") | .kind[]] | index("bin") != null' \
+  >/dev/null <<<"$workspace_metadata"; then
+  fail "synapse-gateway must provide the Gateway binary"
 fi
 
 if ! jq -e \
@@ -217,6 +236,9 @@ assert_manifest_excludes \
 assert_manifest_excludes \
   services/neoengram-agentd/Cargo.toml \
   'rusqlite|sqlx|diesel'
+assert_manifest_excludes \
+  services/synapse-gateway/Cargo.toml \
+  'neoengram-(agent|agentd|engine|fs|server|standalone)|neoengramd|rusqlite|sqlx|diesel|aws-sdk|fusen'
 rg -q '^fusen-rs = "=0\.9\.0"$' services/neoengram-server/Cargo.toml || \
   fail "neoengram-server must pin fusen-rs exactly to 0.9.0"
 for manifest in \
@@ -245,6 +267,9 @@ controller_routes="$({
     --glob '**/controller.rs' --glob '**/controller/**' || true
 } | LC_ALL=C sort)"
 expected_controller_routes=$'method = "GET", path = "/health/live"\nmethod = "GET", path = "/health/ready"\nmethod = "POST", path = "/api/artifact/commit/graph/query"\nmethod = "POST", path = "/api/artifact/create"\nmethod = "POST", path = "/api/artifact/list/query"\nmethod = "POST", path = "/api/artifact/query"\nmethod = "POST", path = "/api/job/add/create"\nmethod = "POST", path = "/api/job/add/finalize"\nmethod = "POST", path = "/api/job/query"\nmethod = "POST", path = "/api/playground/change/list/query"\nmethod = "POST", path = "/api/playground/commit/create"\nmethod = "POST", path = "/api/playground/create"\nmethod = "POST", path = "/api/playground/dataset/profile/query"\nmethod = "POST", path = "/api/playground/file/list/query"\nmethod = "POST", path = "/api/playground/file/metadata/query"\nmethod = "POST", path = "/api/playground/list/query"\nmethod = "POST", path = "/api/playground/precommit/cancel"\nmethod = "POST", path = "/api/playground/precommit/query"\nmethod = "POST", path = "/api/playground/precommit/restart"\nmethod = "POST", path = "/api/playground/precommit/start"\nmethod = "POST", path = "/api/playground/query"\nmethod = "POST", path = "/api/snapshot/create"\nmethod = "POST", path = "/api/snapshot/list/query"\nmethod = "POST", path = "/api/snapshot/query"\nmethod = "POST", path = "/api/storage/enrollment/approve"\nmethod = "POST", path = "/api/storage/enrollment/list/query"\nmethod = "POST", path = "/api/storage/enrollment/query"\nmethod = "POST", path = "/api/storage/enrollment/reject"\nmethod = "POST", path = "/api/storage/enrollment/token/create"\nmethod = "POST", path = "/api/storage/volume/create"\nmethod = "POST", path = "/api/storage/volume/list/query"\nmethod = "POST", path = "/api/storage/volume/query"\nmethod = "POST", path = "/api/system/version/query"\nmethod = "POST", path = "/api/tenant/create"\nmethod = "POST", path = "/api/tenant/list/query"\nmethod = "POST", path = "/api/tenant/query"'
+expected_controller_routes="$expected_controller_routes"$'\nmethod = "POST", path = "/api/gateway/pool/create"\nmethod = "POST", path = "/api/gateway/pool/drain"\nmethod = "POST", path = "/api/gateway/pool/list/query"\nmethod = "POST", path = "/api/gateway/pool/query"\nmethod = "POST", path = "/api/gateway/pool/update"\nmethod = "POST", path = "/api/gateway/replica/create"\nmethod = "POST", path = "/api/gateway/replica/drain"\nmethod = "POST", path = "/api/gateway/replica/list/query"\nmethod = "POST", path = "/api/gateway/replica/revoke"'
+expected_controller_routes="$expected_controller_routes"$'\nmethod = "POST", path = "/api/gateway/replica/activate"'
+expected_controller_routes="$(LC_ALL=C sort <<<"$expected_controller_routes")"
 if [[ "$controller_routes" != "$expected_controller_routes" ]]; then
   echo "$controller_routes" >&2
   fail "neoengram-server must register exactly the approved public HTTP routes"
@@ -386,7 +411,8 @@ for manifest in \
   crates/neoengram-agent/Cargo.toml \
   services/neoengram-agentd/Cargo.toml \
   services/neoengram-server/Cargo.toml \
-  services/neoengramd/Cargo.toml; do
+  services/neoengramd/Cargo.toml \
+  services/synapse-gateway/Cargo.toml; do
   rg -q '^publish = false$' "$manifest" || fail "$manifest must remain workspace-private"
 done
 
@@ -402,6 +428,23 @@ web=apps/neoengram-web
 [[ ! -e "$web/Cargo.toml" ]] || fail "the Vue Web package must remain outside Cargo"
 [[ "$(<"$web/.node-version")" == "22.12.0" ]] || \
   fail "the Vue Web package must pin Node.js 22.12.0"
+rg -q 'VITE_GATEWAY_ENDPOINT' "$web/env.d.ts" "$web/src/config.ts" || \
+  fail "the Web Agent configuration must use a GatewayPool endpoint"
+for binding_file in \
+  "$web/env.d.ts" \
+  "$web/src/config.ts" \
+  "$web/src/features/storage/agent-config.ts"; do
+  rg -q 'VITE_GATEWAY_EDGE_CLUSTER_ID' "$binding_file" || \
+    fail "$binding_file must enforce the Gateway EdgeCluster binding"
+done
+for binding_doc in "$web/README.md" "$web/.env.example"; do
+  rg -q 'VITE_GATEWAY_EDGE_CLUSTER_ID' "$binding_doc" || \
+    fail "$binding_doc must document the Gateway EdgeCluster binding"
+done
+if rg -n "VITE_AGENT_ENDPOINT|VITE_AGENT_PROXY_TARGET|location /agent/|[\"']/agent[\"']" \
+  "$web/env.d.ts" "$web/src/config.ts" "$web/vite.config.ts" "$web/deploy/nginx.conf"; then
+  fail "the Web/ingress layer must not expose or proxy the internal Agent action API"
+fi
 jq -e \
   '.private == true and .engines.node == ">=22.12.0" and
    .scripts["api:generate"] != null and .scripts["api:check"] != null' \
@@ -459,6 +502,16 @@ business_paths=(
   /api/snapshot/file/list/query
   /api/snapshot/activity/list/query
   /api/snapshot/dataset/profile/query
+  /api/gateway/pool/create
+  /api/gateway/pool/query
+  /api/gateway/pool/list/query
+  /api/gateway/pool/update
+  /api/gateway/pool/drain
+  /api/gateway/replica/create
+  /api/gateway/replica/activate
+  /api/gateway/replica/list/query
+  /api/gateway/replica/drain
+  /api/gateway/replica/revoke
   /api/job/add/create
   /api/job/query
   /api/job/add/finalize
@@ -511,5 +564,6 @@ if [[ "$cli_sources" != "$expected_cli_sources" ]]; then
 fi
 
 bash deploy/kubernetes/agent/check-manifests.sh
+bash deploy/kubernetes/gateway/check-manifests.sh
 
 echo "architecture checks passed"

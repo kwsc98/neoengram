@@ -20,14 +20,19 @@ Pre-commit、带描述和 Tags 的 Playground Commit、单 parent Commit 图、�
 
 真实 API 开发模式使用 `npm run dev`，默认 Bearer token 是 `local-development-token`，需与 Server
 的 `--development-token` 保持一致；可通过 `VITE_DEVELOPMENT_TOKEN` 和
-`VITE_DEVELOPMENT_PRINCIPAL` 覆盖。Vite 将 `/api`、`/health` 代理到
-`http://127.0.0.1:8080`，并将 OpenAPI 风格的 `/agent` action API 代理到
-`http://127.0.0.1:8081`；目标分别由 `VITE_API_PROXY_TARGET` 和
-`VITE_AGENT_PROXY_TARGET` 调整。
+`VITE_DEVELOPMENT_PRINCIPAL` 覆盖。Vite 只将浏览器使用的 `/api`、`/health` 代理到
+`http://127.0.0.1:8080`，目标由 `VITE_API_PROXY_TARGET` 调整。内部 `/agent` action API 不属于
+浏览器接口，也不经 Web 开发服务器代理。
 
-`VITE_AGENT_ENDPOINT` 是写入 Agent YAML 的绝对 origin，默认开发值为
-`http://127.0.0.1:8081`。它不是浏览器 origin，也不能包含 `/agent` 路径。bootstrap token 只在创建
-响应区域显示，不会进入 YAML、localStorage 或 sessionStorage。
+`VITE_GATEWAY_ENDPOINT` 是写入 Agent YAML 的 GatewayPool 绝对 origin，默认开发值为
+`http://127.0.0.1:8081`。它不是浏览器 origin，也不能包含 `/agent` 路径。非 loopback 环境必须使用
+HTTPS。一个 Web 构建只绑定一个 GatewayPool，因此生产或其他 HTTPS 部署还必须配置
+`VITE_GATEWAY_EDGE_CLUSTER_ID`，并且只能为该 EdgeCluster 生成 Agent YAML；用户输入其他
+`edge_cluster_id` 时会在请求接入凭证前失败关闭。`VITE_GATEWAY_WORKLOAD_TRUST_DOMAIN` 也必须配置；
+Web 会把该小写 DNS trust domain 和 `/etc/neoengram/central-command-trust.json` 写入 Agent YAML，
+缺失或格式错误时不会签发接入 token。只有 loopback HTTP 开发配置允许省略 EdgeCluster binding。
+部署时仍须在 YAML 声明的路径投射 Gateway CA 和 Central command public-key bundle。bootstrap token
+只在创建响应区域显示，不会进入 YAML、localStorage 或 sessionStorage。
 
 ## 检查
 
@@ -48,8 +53,8 @@ Query 管理；路由中的 `tenantId` 是当前租户的唯一来源。Pinia �
 
 ## 部署
 
-生产输出是 `dist/` 静态文件，不嵌入 Rust binary。反向代理必须把 `/api`、`/health` 转发到公开
-listener，把 `/agent` 转发到独立 Agent listener，其余未知路径回退到 `index.html`；
+生产输出是 `dist/` 静态文件，不嵌入 Rust binary。反向代理只把 `/api`、`/health` 转发到 Central
+公开 listener，其余未知路径回退到 `index.html`。不得从 Web ingress 暴露内部 `/agent` action；
 [`deploy/nginx.conf`](deploy/nginx.conf) 给出同源部署基线。生产构建禁止
 `VITE_API_MODE=mock`、`VITE_AUTH_MODE=mock`、`VITE_AUTH_MODE=development` 以及任何
 `VITE_DEVELOPMENT_TOKEN`。

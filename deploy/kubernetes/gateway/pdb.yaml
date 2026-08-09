@@ -1,0 +1,18 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: synapse-gateway-gateway-pool-example
+  namespace: synapse-gateway-example
+  annotations:
+    neoengram.io/example-only: "external-provisioner-required"
+  labels:
+    app.kubernetes.io/name: synapse-gateway
+    neoengram.io/edge-cluster: edge-example
+    neoengram.io/gateway-pool: gateway-pool-example
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: synapse-gateway
+      neoengram.io/edge-cluster: edge-example
+      neoengram.io/gateway-pool: gateway-pool-example

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -17,7 +17,7 @@ use crate::{CentralError, CentralErrorCode, CentralResult};
 const DATABASE_FILE_NAME: &str = "agent-registry.sqlite3";
 const LOCK_FILE_NAME: &str = "agent-registry.lock";
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4f52;
-const SQLITE_SCHEMA_VERSION: i64 = 6;
+const SQLITE_SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE agent_registry_records (
@@ -91,6 +91,8 @@ CREATE INDEX agent_registry_tenant_status_keyset
         tenant_id, enrollment_state, registration_kind,
         enrollment_created_at_unix_ms DESC, enrollment_id ASC
     );
+CREATE UNIQUE INDEX gateway_agent_cluster_identity
+    ON agent_registry_records (agent_id, edge_cluster_id);
 CREATE TABLE tenant_catalog_records (
     tenant_id TEXT NOT NULL PRIMARY KEY,
     display_name TEXT NOT NULL,
@@ -249,6 +251,87 @@ CREATE INDEX snapshot_catalog_filter_keyset
         tenant_id, project_id, artifact_id, region, state,
         created_at_unix_ms DESC, snapshot_id ASC
     );
+CREATE TABLE gateway_pool_records (
+    gateway_pool_id TEXT NOT NULL PRIMARY KEY,
+    edge_cluster_id TEXT NOT NULL UNIQUE,
+    agent_endpoint TEXT NOT NULL UNIQUE,
+    s3_endpoint TEXT,
+    state TEXT NOT NULL CHECK (state IN ('provisioning', 'ready', 'draining', 'disabled')),
+    resource_version TEXT NOT NULL CHECK (
+        resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
+    ),
+    payload BLOB NOT NULL,
+    UNIQUE (gateway_pool_id, edge_cluster_id)
+) STRICT;
+CREATE UNIQUE INDEX gateway_pool_s3_endpoint_identity
+    ON gateway_pool_records (s3_endpoint) WHERE s3_endpoint IS NOT NULL;
+CREATE INDEX gateway_pool_state_keyset
+    ON gateway_pool_records (state, gateway_pool_id);
+CREATE TABLE gateway_replica_records (
+    gateway_replica_id TEXT NOT NULL PRIMARY KEY,
+    gateway_pool_id TEXT NOT NULL,
+    edge_cluster_id TEXT NOT NULL,
+    control_endpoint TEXT NOT NULL UNIQUE,
+    peer_endpoint TEXT NOT NULL UNIQUE,
+    bootstrap_endpoint TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'draining', 'revoked')),
+    resource_version TEXT NOT NULL CHECK (
+        resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
+    ),
+    payload BLOB NOT NULL,
+    UNIQUE (gateway_replica_id, gateway_pool_id, edge_cluster_id),
+    FOREIGN KEY (gateway_pool_id, edge_cluster_id)
+        REFERENCES gateway_pool_records (gateway_pool_id, edge_cluster_id)
+) STRICT;
+CREATE INDEX gateway_replica_pool_state_keyset
+    ON gateway_replica_records (gateway_pool_id, state, gateway_replica_id);
+CREATE TABLE gateway_replica_credentials (
+    gateway_replica_id TEXT NOT NULL PRIMARY KEY
+        REFERENCES gateway_replica_records (gateway_replica_id) ON DELETE CASCADE,
+    activation_token_digest BLOB NOT NULL UNIQUE CHECK (length(activation_token_digest) = 32),
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'pending_activation', 'pending_certificate_delivery', 'active', 'expired', 'revoked'
+        )
+    ),
+    certificate_generation TEXT CHECK (
+        certificate_generation IS NULL OR (
+            certificate_generation <> '' AND certificate_generation NOT GLOB '*[^0-9]*'
+        )
+    ),
+    payload BLOB NOT NULL
+) STRICT;
+CREATE INDEX gateway_replica_credential_state
+    ON gateway_replica_credentials (state, gateway_replica_id);
+CREATE TABLE agent_route_leases (
+    agent_id TEXT NOT NULL PRIMARY KEY,
+    edge_cluster_id TEXT NOT NULL,
+    gateway_pool_id TEXT NOT NULL,
+    gateway_replica_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL UNIQUE,
+    session_generation TEXT NOT NULL CHECK (
+        session_generation <> '' AND session_generation NOT GLOB '*[^0-9]*'
+    ),
+    route_generation TEXT NOT NULL CHECK (
+        route_generation <> '' AND route_generation NOT GLOB '*[^0-9]*'
+    ),
+    acquire_request_id TEXT NOT NULL UNIQUE,
+    last_renew_request_id TEXT UNIQUE,
+    release_request_id TEXT UNIQUE,
+    lease_expires_at_unix_ms INTEGER NOT NULL CHECK (lease_expires_at_unix_ms >= 0),
+    released_at_unix_ms INTEGER CHECK (released_at_unix_ms IS NULL OR released_at_unix_ms >= 0),
+    payload BLOB NOT NULL,
+    FOREIGN KEY (agent_id, edge_cluster_id)
+        REFERENCES agent_registry_records (agent_id, edge_cluster_id),
+    FOREIGN KEY (gateway_replica_id, gateway_pool_id, edge_cluster_id)
+        REFERENCES gateway_replica_records (
+            gateway_replica_id, gateway_pool_id, edge_cluster_id
+        )
+) STRICT;
+CREATE INDEX agent_route_owner_keyset
+    ON agent_route_leases (gateway_pool_id, gateway_replica_id, agent_id);
+CREATE INDEX agent_route_expiry_keyset
+    ON agent_route_leases (gateway_pool_id, lease_expires_at_unix_ms, agent_id);
 "#;
 
 pub(crate) struct SqliteAgentRegistryDataSource {
@@ -339,7 +422,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 6")
+        sqlx::query("PRAGMA user_version = 7")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -356,16 +439,23 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             migrate_v2_to_v3(pool).await?;
             migrate_v3_to_v5(pool).await?;
             migrate_v5_to_v6(pool).await?;
+            migrate_v6_to_v7(pool).await?;
         }
         3 => {
             migrate_v3_to_v5(pool).await?;
             migrate_v5_to_v6(pool).await?;
+            migrate_v6_to_v7(pool).await?;
         }
         4 => {
             migrate_v4_to_v5(pool).await?;
             migrate_v5_to_v6(pool).await?;
+            migrate_v6_to_v7(pool).await?;
         }
-        5 => migrate_v5_to_v6(pool).await?,
+        5 => {
+            migrate_v5_to_v6(pool).await?;
+            migrate_v6_to_v7(pool).await?;
+        }
+        6 => migrate_v6_to_v7(pool).await?,
         SQLITE_SCHEMA_VERSION => {}
         _ => {
             return Err(storage_corruption(format!(
@@ -487,6 +577,19 @@ async fn migrate_v5_to_v6(pool: &SqlitePool) -> CentralResult<()> {
     transaction.commit().await.map_err(storage_error)
 }
 
+async fn migrate_v6_to_v7(pool: &SqlitePool) -> CentralResult<()> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    if gateway_schema_presence(&mut transaction).await? == CatalogSchemaPresence::Absent {
+        create_gateway_schema_v7(&mut transaction).await?;
+    }
+    sqlx::query("PRAGMA user_version = 7")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    validate_current_schema_transaction(&mut transaction).await?;
+    transaction.commit().await.map_err(storage_error)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CatalogSchemaPresence {
     Absent,
@@ -530,6 +633,23 @@ async fn create_catalog_schema_objects(
     Ok(())
 }
 
+async fn create_gateway_schema_v7(transaction: &mut Transaction<'_, Sqlite>) -> CentralResult<()> {
+    for statement in SCHEMA_SQL
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        let (_, name) = schema_object(statement)?;
+        if is_gateway_schema_object(name) {
+            sqlx::query(statement)
+                .execute(&mut **transaction)
+                .await
+                .map_err(storage_error)?;
+        }
+    }
+    Ok(())
+}
+
 async fn catalog_schema_presence(
     transaction: &mut Transaction<'_, Sqlite>,
 ) -> CentralResult<CatalogSchemaPresence> {
@@ -548,6 +668,17 @@ async fn snapshot_catalog_schema_presence(
         transaction,
         is_snapshot_catalog_schema_object,
         "Agent registry Snapshot catalog schema is only partially present",
+    )
+    .await
+}
+
+async fn gateway_schema_presence(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> CentralResult<CatalogSchemaPresence> {
+    schema_presence(
+        transaction,
+        is_gateway_schema_object,
+        "Agent registry Gateway schema is only partially present",
     )
     .await
 }
@@ -607,7 +738,43 @@ fn is_snapshot_catalog_schema_object(name: &str) -> bool {
     name.starts_with("snapshot_catalog_")
 }
 
+fn is_gateway_schema_object(name: &str) -> bool {
+    name.starts_with("gateway_") || name.starts_with("agent_route_")
+}
+
 async fn validate_current_schema(pool: &SqlitePool) -> CentralResult<()> {
+    let actual_objects = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT type, name, sql FROM sqlite_schema \
+         WHERE name NOT LIKE 'sqlite_%' \
+         ORDER BY type, name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(storage_error)?;
+    validate_current_schema_objects(actual_objects)
+}
+
+async fn validate_current_schema_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> CentralResult<()> {
+    let actual_objects = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT type, name, sql FROM sqlite_schema \
+         WHERE name NOT LIKE 'sqlite_%' \
+         ORDER BY type, name",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    validate_current_schema_objects(actual_objects)
+}
+
+fn validate_current_schema_objects(
+    actual_objects: Vec<(String, String, String)>,
+) -> CentralResult<()> {
+    let actual_objects = actual_objects
+        .into_iter()
+        .map(|(object_type, name, sql)| ((object_type, name), sql))
+        .collect::<BTreeMap<_, _>>();
     let mut expected_objects = BTreeSet::new();
     for expected_statement in SCHEMA_SQL
         .split(';')
@@ -615,39 +782,20 @@ async fn validate_current_schema(pool: &SqlitePool) -> CentralResult<()> {
         .filter(|statement| !statement.is_empty())
     {
         let (object_type, name) = schema_object(expected_statement)?;
-        expected_objects.insert((object_type, name));
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?")
-                .bind(object_type)
-                .bind(name)
-                .fetch_optional(pool)
-                .await
-                .map_err(storage_error)?;
-        let stored = stored.ok_or_else(|| {
+        let key = (object_type.to_owned(), name.to_owned());
+        expected_objects.insert(key.clone());
+        let stored = actual_objects.get(&key).ok_or_else(|| {
             storage_corruption(format!("Agent registry {object_type} {name} is missing"))
         })?;
-        if normalize_schema_sql(&stored) != normalize_schema_sql(expected_statement) {
+        if normalize_schema_sql(stored) != normalize_schema_sql(expected_statement) {
             return Err(storage_corruption(format!(
                 "Agent registry {object_type} {name} differs from the current schema"
             )));
         }
     }
 
-    let actual_objects = sqlx::query_as::<_, (String, String)>(
-        "SELECT type, name FROM sqlite_schema \
-         WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' \
-         ORDER BY type, name",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(storage_error)?
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    let expected_objects = expected_objects
-        .into_iter()
-        .map(|(object_type, name)| (object_type.to_owned(), name.to_owned()))
-        .collect::<BTreeSet<_>>();
-    if actual_objects != expected_objects {
+    let actual_object_names = actual_objects.keys().cloned().collect::<BTreeSet<_>>();
+    if actual_object_names != expected_objects {
         return Err(storage_corruption(
             "Agent registry table or index set differs from the current schema",
         ));
@@ -692,6 +840,26 @@ async fn validate_integrity(pool: &SqlitePool) -> CentralResult<()> {
     if !violations.is_empty() {
         return Err(storage_corruption(
             "Agent registry foreign-key check failed",
+        ));
+    }
+    let duplicate_replica_endpoint: Option<String> = sqlx::query_scalar(
+        "SELECT endpoint FROM (
+             SELECT control_endpoint AS endpoint FROM gateway_replica_records
+             UNION ALL
+             SELECT peer_endpoint AS endpoint FROM gateway_replica_records
+             UNION ALL
+             SELECT bootstrap_endpoint AS endpoint FROM gateway_replica_records
+         )
+         GROUP BY endpoint
+         HAVING COUNT(*) > 1
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(storage_error)?;
+    if duplicate_replica_endpoint.is_some() {
+        return Err(storage_corruption(
+            "Gateway Replica endpoint roles are duplicated",
         ));
     }
     Ok(())

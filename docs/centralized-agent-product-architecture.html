@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>NeoEngram 中心化 Agent 产品架构</title>
+    <title>NeoEngram 中心化 Agent 产品架构（迁移前参考）</title>
     <style>
       :root {
         color-scheme: light;
@@ -695,18 +695,24 @@
     <header class="topbar">
       <div>
         <p class="title-kicker">NeoEngram / Product Architecture</p>
-        <h1>中心化 Agent 产品架构</h1>
+        <h1>中心化 Agent 产品架构（迁移前参考）</h1>
       </div>
-      <a class="doc-link" href="centralized-agent-product.md">查看产品定义</a>
+      <a class="doc-link" href="synapse-gateway-architecture.md">Gateway 目标架构</a>
     </header>
+
+    <aside style="margin:16px max(24px, calc((100vw - 1520px) / 2)) 0;padding:12px 14px;border:1px solid #e4b866;background:#fff8e8;color:#744210;line-height:1.55" aria-label="迁移说明">
+      <strong>2026-08-09 迁移说明：</strong>本页大图保留迁移前的 Agent-Central 连接，仅作产品背景参考。
+      目标架构为 Central -> 每集群 GatewayPool <- Agent；Gateway 是多副本区域入口，不挂载 Volume，
+      不保存 metadata/object 权威。专项定义以 <a href="synapse-gateway-architecture.md">Synapse Gateway 架构</a> 为准。
+    </aside>
 
     <main>
       <section class="context-bar" aria-label="架构摘要">
         <div class="context-intro">
           <p>
-            中心管理逻辑数据资产、不可变版本与权威元数据；区域 Agent
-            负责扫描、校验、对象传输和物化；业务 Pod 直接访问区域存储上的可写
-            Playground 或只读 Snapshot。
+            中心管理逻辑数据资产、不可变版本与权威元数据，并主动连接区域 GatewayPool；Agent
+            只连接本集群 Gateway，负责扫描、校验和物化；业务 Pod 直接访问区域存储上的可写
+            Playground 或只读 Snapshot。Gateway 不挂载业务 Volume。
           </p>
         </div>
         <div class="context-fact">
@@ -749,8 +755,8 @@
           >
             <title id="svg-title">NeoEngram 中心化 Agent 产品架构图</title>
             <desc id="svg-desc">
-              Web 和 CLI 访问中央控制面，中央控制面通过出站控制连接调度两个区域
-              Agent。Agent 将不可变对象写入各自的用户 StorageVolume，中心只保存位置凭证，业务 Pod
+              Web 和 CLI 访问中央控制面，Central 主动连接两个区域 GatewayPool，Agent 只连接本集群
+              Gateway。Agent 将不可变对象写入各自的用户 StorageVolume，中心只保存位置凭证，业务 Pod
               直接访问区域存储上的 Playground。相同 Commit C1
               在两个区域分别形成独立、单区域 Snapshot；两个区域不直接传输数据。
             </desc>
@@ -1160,7 +1166,7 @@
             <g class="edge-label" transform="translate(574 568)">
               <rect width="332" height="27" rx="3" />
               <text x="166" y="18" text-anchor="middle">
-                Agent 主动建立控制连接 · assignment ↓ / status ↑
+                Central → GatewayPool ← Agent · assignment ↓ / status ↑
               </text>
             </g>
 
@@ -1216,7 +1222,7 @@
             </p>
           </div>
           <div class="mobile-arrow">
-            Agent 主动连接 · assignment ↓ / status ↑
+            Central → GatewayPool ← Agent · assignment ↓ / status ↑
           </div>
           <div class="mobile-regions">
             <div class="mobile-region a">
@@ -1282,7 +1288,7 @@
           <div class="rule">
             <b>跨区复制不经过中心 API</b>
             <p>
-              当前没有跨区数据通道；后续由受限 route 直达目标 Volume，Server 不代理 Chunk。
+              当前没有跨区数据通道；后续固定经源 Agent/Gateway → 目标 Gateway/Agent，Server 不代理 Chunk。
             </p>
           </div>
         </div>
@@ -1311,13 +1317,13 @@
                 <td data-label="边界">认证、RBAC、幂等、审计</td>
               </tr>
               <tr>
-                <td data-label="路径">Agent 控制</td>
-                <td data-label="方向">Agent ↔ Center</td>
+                <td data-label="路径">Gateway 控制</td>
+                <td data-label="方向">Central → GatewayPool ← Agent</td>
                 <td data-label="承载内容">
                   Assignment、状态、进度、Index 和元数据
                 </td>
                 <td data-label="边界">
-                  Agent 主动连接；中心决定授权与最终状态
+                  Central 主动连接 Gateway；Agent 只连接本集群 Gateway；中心决定授权与最终状态
                 </td>
               </tr>
               <tr>

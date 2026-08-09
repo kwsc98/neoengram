@@ -1,11 +1,17 @@
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use neoengram_agent::SystemIdentityRecord;
 use neoengram_protocol::{
     decode_bounded_unique_json, AgentBootstrapAccepted, AgentBootstrapRequest,
     AgentBootstrapStatusRequest, AgentBootstrapStatusResponse, RequestId,
     AGENT_ENROLLMENT_BOOTSTRAP_PATH, AGENT_ENROLLMENT_STATUS_QUERY_PATH,
+    MAX_AGENT_ENROLLMENT_MESSAGE_BYTES,
 };
 use reqwest::{
     header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE},
@@ -17,10 +23,13 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use crate::{AgentDaemonError, AgentDaemonResult};
+use crate::{
+    tls::{GatewayServerIdentity, GatewayTrustBundle},
+    AgentDaemonError, AgentDaemonResult,
+};
 
 const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_AGENT_BODY_BYTES: usize = 64 * 1024;
+const MAX_AGENT_BODY_BYTES: usize = MAX_AGENT_ENROLLMENT_MESSAGE_BYTES;
 const JSON_CONTENT_TYPE: &str = "application/json";
 const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -99,6 +108,14 @@ impl std::error::Error for EnrollmentClientError {}
 
 #[async_trait]
 pub trait EnrollmentClient: Send + Sync {
+    /// Installs the approved client-auth identity for subsequent HTTPS status requests.
+    fn install_workload_identity(
+        &self,
+        _identity: &SystemIdentityRecord,
+    ) -> Result<(), EnrollmentClientError> {
+        Ok(())
+    }
+
     async fn bootstrap(
         &self,
         request: &AgentBootstrapRequest,
@@ -113,31 +130,101 @@ pub trait EnrollmentClient: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct ReqwestEnrollmentClient {
-    client: reqwest::Client,
+    client: Arc<RwLock<reqwest::Client>>,
     bootstrap_url: Url,
     status_url: Url,
+    trust_bundle: Option<GatewayTrustBundle>,
+    gateway_identity: Option<GatewayServerIdentity>,
 }
 
 impl ReqwestEnrollmentClient {
-    pub fn new(central_endpoint: Url) -> AgentDaemonResult<Self> {
-        let bootstrap_url = central_endpoint
+    pub fn new(gateway_endpoint: Url) -> AgentDaemonResult<Self> {
+        Self::build(gateway_endpoint, None, None, false)
+    }
+
+    pub(crate) fn with_gateway_trust_bundle(
+        gateway_endpoint: Url,
+        trust_bundle: &GatewayTrustBundle,
+    ) -> AgentDaemonResult<Self> {
+        Self::build(gateway_endpoint, Some(trust_bundle), None, false)
+    }
+
+    // Kept as an explicit strict constructor for embedders that already have a workload
+    // certificate; the daemon's bootstrap lifecycle intentionally uses the deferred variant.
+    #[allow(dead_code)]
+    pub(crate) fn with_gateway_trust_bundle_and_identity(
+        gateway_endpoint: Url,
+        trust_bundle: &GatewayTrustBundle,
+        gateway_identity: GatewayServerIdentity,
+    ) -> AgentDaemonResult<Self> {
+        Self::build(
+            gateway_endpoint,
+            Some(trust_bundle),
+            Some(gateway_identity),
+            true,
+        )
+    }
+
+    /// Builds the pre-certificate client used by bootstrap and pending status queries. The
+    /// expected Gateway workload identity is retained and becomes mandatory when the Agent
+    /// workload certificate is installed, but the bootstrap certificate is intentionally
+    /// server-auth/DNS-only.
+    pub(crate) fn with_gateway_trust_bundle_deferred_identity(
+        gateway_endpoint: Url,
+        trust_bundle: &GatewayTrustBundle,
+        gateway_identity: GatewayServerIdentity,
+    ) -> AgentDaemonResult<Self> {
+        Self::build(
+            gateway_endpoint,
+            Some(trust_bundle),
+            Some(gateway_identity),
+            false,
+        )
+    }
+
+    fn build(
+        gateway_endpoint: Url,
+        trust_bundle: Option<&GatewayTrustBundle>,
+        gateway_identity: Option<GatewayServerIdentity>,
+        bind_gateway_identity: bool,
+    ) -> AgentDaemonResult<Self> {
+        let bootstrap_url = gateway_endpoint
             .join(AGENT_ENROLLMENT_BOOTSTRAP_PATH.trim_start_matches('/'))
             .map_err(|error| AgentDaemonError::Configuration(error.to_string()))?;
-        let status_url = central_endpoint
+        let status_url = gateway_endpoint
             .join(AGENT_ENROLLMENT_STATUS_QUERY_PATH.trim_start_matches('/'))
             .map_err(|error| AgentDaemonError::Configuration(error.to_string()))?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(AGENT_REQUEST_TIMEOUT)
-            .timeout(AGENT_REQUEST_TIMEOUT)
-            .user_agent(concat!("neoengram-agent/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| AgentDaemonError::Enrollment(error.to_string()))?;
+        let expected_gateway_identity = bind_gateway_identity
+            .then_some(gateway_identity.as_ref())
+            .flatten();
+        let client = build_client(trust_bundle, None, expected_gateway_identity)?;
         Ok(Self {
-            client,
+            client: Arc::new(RwLock::new(client)),
             bootstrap_url,
             status_url,
+            trust_bundle: trust_bundle.cloned(),
+            gateway_identity,
         })
+    }
+
+    fn replace_identity(&self, identity: &SystemIdentityRecord) -> AgentDaemonResult<()> {
+        if self.status_url.scheme() != "https" {
+            return Ok(());
+        }
+        let trust_bundle = self.trust_bundle.as_ref().ok_or_else(|| {
+            AgentDaemonError::Configuration(
+                "HTTPS enrollment client has no Gateway trust bundle".to_owned(),
+            )
+        })?;
+        let client = build_client(
+            Some(trust_bundle),
+            Some(identity),
+            self.gateway_identity.as_ref(),
+        )?;
+        *self.client.write().map_err(|_| {
+            AgentDaemonError::Enrollment("enrollment client lock is poisoned".to_owned())
+        })? = client;
+        Ok(())
     }
 
     async fn post<T: Serialize>(
@@ -154,12 +241,16 @@ impl ReqwestEnrollmentClient {
         if encoded.as_ref().len() > MAX_AGENT_BODY_BYTES {
             return Err(EnrollmentClientError::new(
                 false,
-                "Agent enrollment request exceeds the 64 KiB transport limit",
+                "Agent enrollment request exceeds the transport limit",
             ));
         }
         let encoded = Bytes::from_owner(encoded);
-        let response = self
+        let client = self
             .client
+            .read()
+            .map_err(|_| EnrollmentClientError::new(false, "enrollment client lock is poisoned"))?
+            .clone();
+        let response = client
             .post(url.clone())
             .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
             .header(
@@ -190,7 +281,7 @@ impl ReqwestEnrollmentClient {
             if length > MAX_AGENT_BODY_BYTES {
                 return Err(EnrollmentClientError::new(
                     false,
-                    "Agent listener response exceeds the 64 KiB transport limit",
+                    "Agent listener response exceeds the transport limit",
                 ));
             }
         }
@@ -203,8 +294,43 @@ impl ReqwestEnrollmentClient {
     }
 }
 
+fn build_client(
+    trust_bundle: Option<&GatewayTrustBundle>,
+    identity: Option<&SystemIdentityRecord>,
+    gateway_identity: Option<&GatewayServerIdentity>,
+) -> AgentDaemonResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(AGENT_REQUEST_TIMEOUT)
+        .timeout(AGENT_REQUEST_TIMEOUT)
+        .user_agent(concat!("neoengram-agent/", env!("CARGO_PKG_VERSION")));
+    if let Some(trust_bundle) = trust_bundle {
+        let alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let tls = match identity {
+            Some(identity) => {
+                crate::tls::rustls_client_config(trust_bundle, identity, gateway_identity, alpn)?
+            }
+            None => {
+                crate::tls::rustls_server_auth_client_config(trust_bundle, gateway_identity, alpn)?
+            }
+        };
+        builder = builder.tls_backend_preconfigured(tls);
+    }
+    builder
+        .build()
+        .map_err(|error| AgentDaemonError::Enrollment(error.to_string()))
+}
+
 #[async_trait]
 impl EnrollmentClient for ReqwestEnrollmentClient {
+    fn install_workload_identity(
+        &self,
+        identity: &SystemIdentityRecord,
+    ) -> Result<(), EnrollmentClientError> {
+        self.replace_identity(identity)
+            .map_err(|error| EnrollmentClientError::new(false, error.to_string()))
+    }
+
     async fn bootstrap(
         &self,
         request: &AgentBootstrapRequest,
@@ -275,7 +401,7 @@ async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, Enroll
         if body.len().saturating_add(chunk.len()) > MAX_AGENT_BODY_BYTES {
             return Err(EnrollmentClientError::new(
                 false,
-                "Agent listener response exceeds the 64 KiB transport limit",
+                "Agent listener response exceeds the transport limit",
             ));
         }
         body.extend_from_slice(&chunk);

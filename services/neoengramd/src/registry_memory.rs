@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, MutexGuard},
+};
 
 use async_trait::async_trait;
 use neoengram_core::ContentDigest;
@@ -39,6 +42,70 @@ impl InMemoryAgentRegistry {
             .cloned()
             .collect())
     }
+
+    pub(crate) fn lock_records(
+        &self,
+    ) -> CentralResult<MutexGuard<'_, BTreeMap<AgentEnrollmentId, AgentRegistryRecord>>> {
+        self.records.lock().map_err(lock_error)
+    }
+}
+
+pub(crate) fn replace_record_locked(
+    records: &mut BTreeMap<AgentEnrollmentId, AgentRegistryRecord>,
+    expected_resource_version: u64,
+    record: AgentRegistryRecord,
+) -> CentralResult<AgentRegistryRecord> {
+    let enrollment_id = record.enrollment.enrollment_id.clone();
+    let existing = records.get(&enrollment_id).ok_or_else(|| {
+        CentralError::new(
+            CentralErrorCode::EnrollmentNotFound,
+            "Agent enrollment disappeared during update",
+        )
+    })?;
+    validate_registry_record(&record)?;
+    let next_resource_version = checked_next_registry_resource_version(expected_resource_version)?;
+    if existing.resource_version.get() != expected_resource_version
+        || record.resource_version.get() != next_resource_version
+    {
+        return Err(CentralError::new(
+            CentralErrorCode::ConcurrentUpdate,
+            "Agent registry ResourceVersion changed",
+        ));
+    }
+    ensure_immutable_registry_scope(existing, &record)?;
+    validate_registry_replace_transition(existing, &record)?;
+    if records.values().any(|other| {
+        other.enrollment.enrollment_id != enrollment_id
+            && bootstrap_request_identity_conflicts(other, &record)
+    }) {
+        return Err(CentralError::new(
+            CentralErrorCode::EnrollmentIdReused,
+            "Agent registry request identity is already bound to another enrollment",
+        )
+        .with_retryable(false));
+    }
+    if records.values().any(|other| {
+        other.enrollment.enrollment_id != enrollment_id
+            && decision_request_identity_conflicts(other, &record)
+    }) {
+        return Err(CentralError::new(
+            CentralErrorCode::EnrollmentDecisionConflict,
+            "Agent decision request identity is already bound to another enrollment",
+        )
+        .with_retryable(false));
+    }
+    if records.values().any(|other| {
+        other.enrollment.enrollment_id != enrollment_id
+            && candidate_identity_conflicts(other, &record)
+    }) {
+        return Err(CentralError::new(
+            CentralErrorCode::AgentIdentityMismatch,
+            "Agent candidate identity is already bound to another enrollment",
+        )
+        .with_retryable(false));
+    }
+    records.insert(enrollment_id, record.clone());
+    Ok(record)
 }
 
 #[async_trait]
@@ -573,58 +640,7 @@ impl AgentRegistryRepository for InMemoryAgentRegistry {
         record: AgentRegistryRecord,
     ) -> CentralResult<AgentRegistryRecord> {
         let mut records = self.records.lock().map_err(lock_error)?;
-        let enrollment_id = record.enrollment.enrollment_id.clone();
-        let existing = records.get(&enrollment_id).ok_or_else(|| {
-            CentralError::new(
-                CentralErrorCode::EnrollmentNotFound,
-                "Agent enrollment disappeared during update",
-            )
-        })?;
-        validate_registry_record(&record)?;
-        let next_resource_version =
-            checked_next_registry_resource_version(expected_resource_version)?;
-        if existing.resource_version.get() != expected_resource_version
-            || record.resource_version.get() != next_resource_version
-        {
-            return Err(CentralError::new(
-                CentralErrorCode::ConcurrentUpdate,
-                "Agent registry ResourceVersion changed",
-            ));
-        }
-        ensure_immutable_registry_scope(existing, &record)?;
-        validate_registry_replace_transition(existing, &record)?;
-        if records.values().any(|other| {
-            other.enrollment.enrollment_id != enrollment_id
-                && bootstrap_request_identity_conflicts(other, &record)
-        }) {
-            return Err(CentralError::new(
-                CentralErrorCode::EnrollmentIdReused,
-                "Agent registry request identity is already bound to another enrollment",
-            )
-            .with_retryable(false));
-        }
-        if records.values().any(|other| {
-            other.enrollment.enrollment_id != enrollment_id
-                && decision_request_identity_conflicts(other, &record)
-        }) {
-            return Err(CentralError::new(
-                CentralErrorCode::EnrollmentDecisionConflict,
-                "Agent decision request identity is already bound to another enrollment",
-            )
-            .with_retryable(false));
-        }
-        if records.values().any(|other| {
-            other.enrollment.enrollment_id != enrollment_id
-                && candidate_identity_conflicts(other, &record)
-        }) {
-            return Err(CentralError::new(
-                CentralErrorCode::AgentIdentityMismatch,
-                "Agent candidate identity is already bound to another enrollment",
-            )
-            .with_retryable(false));
-        }
-        records.insert(enrollment_id, record.clone());
-        Ok(record)
+        replace_record_locked(&mut records, expected_resource_version, record)
     }
 
     async fn activate_replacement(

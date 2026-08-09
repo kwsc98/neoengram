@@ -1,26 +1,42 @@
 # NeoEngram Roadmap
 
-> 最后更新：2026-08-06
+> 最后更新：2026-08-10
 >
 > 本文是迭代执行视图，不重新定义产品能力或架构。
 > 能力状态、架构不变量和研究结论以 [`implementation-plan.md`](implementation-plan.md) 为准。
 > 面向用户的产品语义和验收主链路见
 > [`centralized-agent-product.md`](centralized-agent-product.md)。
+> Synapse Gateway 的专项目标架构见
+> [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。
 
 ## 当前基线
 
 - `0.2.0`、format v8 和 P0 crate/protocol/state-machine 改造已完成。
 - Standalone 本地工作流可运行；FUSE 实挂矩阵和大规模基准尚未完成。
-- `neoengramd` 保持无网络 library；`neoengram-server` 提供 Fusen 用户 listener 和独立 Hyper Agent
-  listener，Agent 已主动建立 H2 全双工 action channel；中心具备后端无关 `AuthorityStore`、测试用
-  InMemory 后端和默认 SQLite 权威后端。
+- `neoengramd` 保持无网络 library；`neoengram-server` 提供 Fusen 用户 listener、Gateway Registry
+  action 和迁移前 Hyper Agent listener。旧 Agent 直连 H2 全双工 action channel 已完成开发验证；
+  当前 Agent 配置已 Gateway-only；Gateway H2/mTLS tunnel、RouteLease 和一跳 peer forwarding 已接入，
+  Central peer credential directory（heartbeat 刷新、30 秒 TTL、leaf fingerprint allow-list、control 断链
+  fail-closed）已接入，
+  loopback 双 Replica listener/H2/peer 协议 harness 已通过，但它未接入真实 Central Registry 原子租约、
+  durable outbox、命令签名和完整业务回路；完整双 Replica E2E、生产凭据适配、真实集群
+  readiness/failover 和切换验收未完成。中心具备后端无关 `AuthorityStore`、测试用 InMemory 后端和默认
+  SQLite 权威后端。
 - SQLite 支持单个 server 进程的中心权威持久化；已注册的用户接口使用 OIDC/JWKS 与默认拒绝 RBAC。
-  PostgreSQL/MySQL、生产 Agent mTLS、多副本和分布式 fencing 尚不存在。
+  PostgreSQL/MySQL、生产凭据 provisioner、Central 多副本和跨进程 HA 尚不存在；Gateway/Agent 的运行时
+  mTLS 与 generation fencing 已接入。
 - Managed 模式的 Chunk 字节以业务 StorageVolume 内的 immutable CAS 为耐久落点；Server 只保存
   Manifest/Index 和带 Volume、Artifact placement、generation 的 evidence，不接收或持久化 payload。
 - 0.0.1 Kubernetes 部署剖面已冻结为一个业务 PVC/StorageVolume 对应一个常驻 AgentInstance；Agent
   SQLite 身份/Ledger/outbox adapter、mount probe、可运行的 `neoengram-agentd`、enrollment、H2
   session/Job transport 与 Volume-local CAS 纵切已实现；生产证书签发和真实集群闭环仍待实现。
+- G1 已部分落地：Gateway 协议与强类型 ID、GatewayRegistry/AgentRouteLease 的 InMemory/SQLite v7、
+  管理 API、三 listener H2/mTLS tunnel、Agent/Gateway 部署与 NetworkPolicy 已加入。Agent 配置不再
+  接受 Central fallback；Central outbound connector、Replica activation challenge/proof/证书投递、
+  Central command signing/trust bundle 和一跳 peer forwarding 已实现。命令仅在完整帧尚未进入 owner
+  队列且入队明确返回 Closed 时，才可向一个非 owner Replica 做一次 peer fallback；owner 队列一旦接受，
+  后续 H2 结果不确定时禁止 peer 重放，改由 Central durable outbox 在 Agent 下一会话重投。外部生产
+  issuer/KMS-HSM、完整双 Replica E2E 和维护窗口切换仍未完成，因此 G1 尚不可上线。
 
 ## 迭代规则
 
@@ -28,7 +44,7 @@
 - 每轮开始前写清入口条件、非目标和失败语义，结束时提供测试与容量证据。
 - 安全、租户隔离、幂等、重启恢复、审计和可观测性属于完成条件，不留到最后补齐。
 - 研究项必须记录问题、实验、结论和后续动作；未满足验收条件不得标记完成。
-- Gateway、Pack、跨租户复制和完整文件系统语义不得阻塞首个 Managed 闭环。
+- 跨集群 payload、S3、Pack、跨租户复制和完整文件系统语义不得阻塞 Gateway 控制面首个里程碑。
 
 ## 执行路线
 
@@ -38,10 +54,14 @@
 | R1 | 已完成 | AuthorityStore + SQLite 默认后端，覆盖全部中心权威状态 | P1 / A2 |
 | R2 | 进行中 | 一 PVC 一常驻 Agent：enrollment/审批契约、持久身份/Ledger/outbox、mount probe、可运行 daemon、双 listener、H2 session/Job、部署模板和人工 cooperative takeover；生产证书与集群验收待完成 | A1 / A2 |
 | R3 | 后续 | 把 OIDC/JWKS、RBAC/RLS 扩展到其余只读 Artifact/Commit/Tags/Snapshot API | P1 |
-| R4 | 进行中 | H2 全双工 Agent session、Job delivery 和重连已实现；生产 mTLS、Ingress 背压与断流矩阵待完成 | A1 / A2 |
+| R4 | 进行中 | H2 全双工 Agent session、Job delivery、重连、运行时 mTLS 和有界背压已实现；生产凭据轮换、Ingress 断流矩阵待完成 | A1 / A2 |
 | R5 | 已完成 | Volume-local Chunk CAS、ObjectPlacement evidence 和端到端 Managed Add；Server 零 payload | P2 / A4 |
 | R6 | 后续 | 中心 Commit/Ref CAS、固定 Snapshot 和 DatasetProfile | P1 / P2 |
-| R7 | 后续 | 客户端 push、fetch、clone、授权训练读取与跨 Volume 直传 route；payload 不经过 Server | P2 / P3 |
+| G0 | 已完成 | 冻结 Synapse Gateway 专项架构、权威边界、切换策略和阶段验收 | Gateway docs |
+| G1 | 进行中 | Registry v7、管理面、H2+mTLS 实际隧道、RouteLease、命令签名、入队前最多一次 peer fallback/入队后仅 outbox 重投边界已完成；loopback listener/H2/peer harness 已通过，完整 Central/Registry/outbox/签名双 Replica E2E、外部生产凭据、真实集群 readiness/failover 与一次性切换待完成 | Gateway control |
+| G2 | 后续 | TransferRoute/Ticket/Session；源 Agent -> 源 Gateway -> 目标 Gateway -> 目标 Agent，Server 零 payload | Gateway data |
+| G3 | 后续 | 固定 Commit/Snapshot 的只读 S3：SigV4、LIST/HEAD/GET/Range | Gateway S3 |
+| R7 | 后续 | 客户端 push、fetch、clone 和授权训练读取；跨 Volume payload 复用 G2 数据链路 | P2 / P3 |
 | R8 | 后续 | Playground mutation、Volume Owner、lease，并从人工 cooperative takeover 演进到强 fencing | A3 |
 | R9 | 后续 | 生命周期、GC、HA、灾备、配额和规模优化 | P4 / P5 / A5 |
 | R10 | 研究 | mode、symlink、ACL/xattr、sparse 等文件语义 | P6 |
@@ -73,7 +93,10 @@ PostgreSQL/MySQL 后续实现同一行为契约，但各自拥有独立 SQL、mi
 | R2 | 一次性 bootstrap、首次审批和身份重放模型；一个 PVC/Agent 的 Recreate 部署、独立状态盘恢复和错误 mount 演练 |
 | R4 | H2 JSON sequence 经目标 Ingress 的双向流、背压和重连原型 |
 | R5 | Volume CAS 的 hash/size 校验、原子发布、fsync、receipt 重放和损坏对象恢复证据 |
-| R7 | Agent/Gateway 直连 route 的授权、断点续传、源/目标 placement 校验，以及 Server 零 payload 证据 |
+| G1 | Gateway Registry 契约、Registry-driven Central connector、双 Replica owner/fencing 契约和 listener/H2/peer harness 已有；仍需把这些构件与 durable outbox、mTLS、端到端签名、report/finalize 组成同一条业务 E2E，以及真实集群故障/就绪与切换证据 |
+| G2 | Gateway-to-Gateway route 的授权、断点续传、源/目标 placement 校验，以及 Server/Gateway 零持久 payload 证据 |
+| G3 | SigV4、分页 LIST、Range、LogicalPath 冲突和固定 Commit 一致性证据 |
+| R7 | 必须先完成 G2 数据链路验收；客户端同步协议不再自建 Agent 直连通道 |
 | R8 | 首批 NFS 产品矩阵、强 fencing 方案、旧写者阻断证据及 RW Playground Pod 策略 |
 | R9 | 千万路径 Delta、上亿对象 catalog 和恢复时间的可重复基准 |
 

@@ -68,9 +68,15 @@ impl SqliteAgentRegistry {
         self.inner.clone()
     }
 
+    #[must_use]
+    pub fn gateway_repository(&self) -> Arc<dyn crate::GatewayRegistryRepository> {
+        self.inner.clone()
+    }
+
     pub async fn integrity_check(&self) -> CentralResult<()> {
         self.inner.datasource.integrity_check().await?;
-        validate_records(&self.inner.pool).await
+        validate_records(&self.inner.pool).await?;
+        super::gateway_registry::validate_gateway_records(&self.inner.pool).await
     }
 
     pub async fn readiness_check(&self) -> CentralResult<()> {
@@ -89,6 +95,7 @@ pub async fn open_sqlite_agent_registry(
         Arc::new(SqliteAgentRegistryDataSource::open(&config.path, config.busy_timeout).await?);
     let pool = datasource.pool().clone();
     validate_records(&pool).await?;
+    super::gateway_registry::validate_gateway_records(&pool).await?;
     Ok(SqliteAgentRegistry {
         inner: Arc::new(SqliteAgentRegistryStore { pool, datasource }),
     })
@@ -105,6 +112,8 @@ struct StoredV1<T> {
     format: u32,
     value: T,
 }
+
+const AGENT_RECORD_COLUMNS: &str = "enrollment_id, agent_id, token_id, token_request_id, token_digest, bootstrap_request_id, decision_request_id, installation_id, public_key_fingerprint, tenant_id, edge_cluster_id, storage_volume_id, pvc_identity_digest, pvc_binding_role, resource_version, payload";
 
 #[async_trait]
 impl AgentRegistryRepository for SqliteAgentRegistryStore {
@@ -884,58 +893,20 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
         record: AgentRegistryRecord,
     ) -> CentralResult<AgentRegistryRecord> {
         validate_registry_record(&record)?;
-        let stored = self
-            .get(&record.enrollment.enrollment_id)
-            .await?
-            .ok_or_else(|| missing("Agent enrollment disappeared during update"))?;
-        let next_resource_version =
-            checked_next_registry_resource_version(expected_resource_version)?;
-        if stored.resource_version.get() != expected_resource_version
-            || record.resource_version.get() != next_resource_version
-        {
-            return Err(CentralError::new(
-                CentralErrorCode::ConcurrentUpdate,
-                "Agent registry ResourceVersion changed",
-            ));
-        }
-        ensure_immutable_registry_scope(&stored, &record)?;
-        validate_registry_replace_transition(&stored, &record)?;
-        let payload = encode(&record)?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let result = sqlx::query(
-            "UPDATE agent_registry_records SET bootstrap_request_id = ?, decision_request_id = ?, \
-             installation_id = ?, public_key_fingerprint = ?, pvc_binding_role = ?, \
-             enrollment_state = ?, registration_kind = ?, \
-             enrollment_created_at_unix_ms = ?, display_name = ?, \
-             resource_version = ?, payload = ? \
-             WHERE enrollment_id = ? AND agent_id = ? AND resource_version = ?",
+        let stored = fetch_agent_by_agent_transaction(
+            &mut transaction,
+            &record.enrollment.reserved_agent_id,
         )
-        .bind(optional_request_id(
-            record.enrollment.bootstrap_request_id.as_ref(),
-        ))
-        .bind(decision_request_id(&record))
-        .bind(candidate_installation_id(&record))
-        .bind(candidate_public_key_fingerprint(&record))
-        .bind(pvc_binding_role(&record))
-        .bind(indexed_enrollment_state(&record))
-        .bind(indexed_registration_kind(&record))
-        .bind(indexed_enrollment_created_at(&record)?)
-        .bind(indexed_display_name(&record))
-        .bind(record.resource_version.get().to_string())
-        .bind(payload)
-        .bind(record.enrollment.enrollment_id.as_str())
-        .bind(record.enrollment.reserved_agent_id.as_str())
-        .bind(expected_resource_version.to_string())
-        .execute(&mut *transaction)
-        .await
-        .map_err(registry_update_error)?;
-        if result.rows_affected() != 1 {
-            return Err(CentralError::new(
-                CentralErrorCode::ConcurrentUpdate,
-                "Agent registry ResourceVersion changed",
-            ));
-        }
-        sync_volume_from_registry(&mut transaction, &record).await?;
+        .await?
+        .ok_or_else(|| missing("Agent enrollment disappeared during update"))?;
+        replace_agent_record_transaction(
+            &mut transaction,
+            &stored,
+            expected_resource_version,
+            &record,
+        )
+        .await?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(record)
     }
@@ -1052,6 +1023,74 @@ impl AgentRegistryRepository for SqliteAgentRegistryStore {
             replacement,
         })
     }
+}
+
+pub(super) async fn fetch_agent_by_agent_transaction(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    agent_id: &AgentId,
+) -> CentralResult<Option<AgentRegistryRecord>> {
+    let row = sqlx::query(&format!(
+        "SELECT {AGENT_RECORD_COLUMNS} FROM agent_registry_records WHERE agent_id = ?"
+    ))
+    .bind(agent_id.as_str())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    row.map(decode_row).transpose()
+}
+
+pub(super) async fn replace_agent_record_transaction(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    stored: &AgentRegistryRecord,
+    expected_resource_version: u64,
+    record: &AgentRegistryRecord,
+) -> CentralResult<()> {
+    validate_registry_record(record)?;
+    let next_resource_version = checked_next_registry_resource_version(expected_resource_version)?;
+    if stored.resource_version.get() != expected_resource_version
+        || record.resource_version.get() != next_resource_version
+    {
+        return Err(CentralError::new(
+            CentralErrorCode::ConcurrentUpdate,
+            "Agent registry ResourceVersion changed",
+        ));
+    }
+    ensure_immutable_registry_scope(stored, record)?;
+    validate_registry_replace_transition(stored, record)?;
+    let result = sqlx::query(
+        "UPDATE agent_registry_records SET bootstrap_request_id = ?, decision_request_id = ?, \
+         installation_id = ?, public_key_fingerprint = ?, pvc_binding_role = ?, \
+         enrollment_state = ?, registration_kind = ?, \
+         enrollment_created_at_unix_ms = ?, display_name = ?, \
+         resource_version = ?, payload = ? \
+         WHERE enrollment_id = ? AND agent_id = ? AND resource_version = ?",
+    )
+    .bind(optional_request_id(
+        record.enrollment.bootstrap_request_id.as_ref(),
+    ))
+    .bind(decision_request_id(record))
+    .bind(candidate_installation_id(record))
+    .bind(candidate_public_key_fingerprint(record))
+    .bind(pvc_binding_role(record))
+    .bind(indexed_enrollment_state(record))
+    .bind(indexed_registration_kind(record))
+    .bind(indexed_enrollment_created_at(record)?)
+    .bind(indexed_display_name(record))
+    .bind(record.resource_version.get().to_string())
+    .bind(encode(record)?)
+    .bind(record.enrollment.enrollment_id.as_str())
+    .bind(record.enrollment.reserved_agent_id.as_str())
+    .bind(expected_resource_version.to_string())
+    .execute(&mut **transaction)
+    .await
+    .map_err(registry_update_error)?;
+    if result.rows_affected() != 1 {
+        return Err(CentralError::new(
+            CentralErrorCode::ConcurrentUpdate,
+            "Agent registry ResourceVersion changed",
+        ));
+    }
+    sync_volume_from_registry(transaction, record).await
 }
 
 fn optional_request_id(request_id: Option<&RequestId>) -> Option<&str> {

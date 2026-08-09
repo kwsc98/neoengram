@@ -17,6 +17,11 @@ pub enum CentralErrorCode {
     AgentIdentityMismatch,
     AgentSessionActive,
     VolumeOwnerConflict,
+    GatewayPoolNotFound,
+    GatewayReplicaNotFound,
+    GatewayIdentityConflict,
+    GatewayRouteUnavailable,
+    GatewayRouteFenced,
     ArtifactNotFound,
     StorageVolumeNotFound,
     ArtifactHeadMismatch,
@@ -57,6 +62,11 @@ impl CentralErrorCode {
             Self::AgentIdentityMismatch => "AGENT_IDENTITY_MISMATCH",
             Self::AgentSessionActive => "AGENT_SESSION_ACTIVE",
             Self::VolumeOwnerConflict => "VOLUME_OWNER_CONFLICT",
+            Self::GatewayPoolNotFound => "GATEWAY_POOL_NOT_FOUND",
+            Self::GatewayReplicaNotFound => "GATEWAY_REPLICA_NOT_FOUND",
+            Self::GatewayIdentityConflict => "GATEWAY_IDENTITY_CONFLICT",
+            Self::GatewayRouteUnavailable => "GATEWAY_ROUTE_UNAVAILABLE",
+            Self::GatewayRouteFenced => "GATEWAY_ROUTE_FENCED",
             Self::ArtifactNotFound => "ARTIFACT_NOT_FOUND",
             Self::StorageVolumeNotFound => "STORAGE_VOLUME_NOT_FOUND",
             Self::ArtifactHeadMismatch => "ARTIFACT_HEAD_MISMATCH",
@@ -99,6 +109,7 @@ impl CentralError {
             retryable: matches!(
                 code,
                 CentralErrorCode::ConcurrentUpdate
+                    | CentralErrorCode::GatewayRouteUnavailable
                     | CentralErrorCode::StorageFailure
                     | CentralErrorCode::Internal
             ),

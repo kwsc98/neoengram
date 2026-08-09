@@ -1,17 +1,21 @@
 # NeoEngram 中心化 Agent 产品定义
 
-> 状态：基于 2026-08-03 OpenAPI v1 收敛 P0 产品口径；公开契约是 P0 Web 的权威边界。
+> 状态：基于 2026-08-03 OpenAPI v1 收敛 P0 产品口径，并于 2026-08-09 纳入 Synapse Gateway
+> 目标拓扑；公开契约是 P0 Web 的权威边界。
 >
 > 适用对象：产品、设计、前端、OpenAPI、`neoengramd`、Agent 和测试团队。
 >
 > 能力声明：本文描述目标产品和已经验证的交互语义。当前真正可运行的是本地 Standalone、SQLite
-> authority、已注册的用户 HTTP/OIDC/RBAC 纵切，以及 Agent enrollment/session/Job transport
-> 开发纵切。生产 mTLS、完整 NFS 认证、跨 Volume 对象复制和分布式调度尚未实现。
+> authority 和已注册的用户 HTTP/OIDC/RBAC 纵切；Agent 直连 Server 的 enrollment/session/Job
+> transport 是已验证的迁移前基线。G1 已加入 Gateway Registry/管理面、H2/mTLS 控制面、命令签名和一跳
+> forwarding；双 Replica 协议网络 harness 与 Registry RouteLease 接管契约已分别通过，但完整业务 E2E、
+> 外部生产凭据适配、真实集群故障/就绪与切换验收、完整 NFS 认证、跨 Volume 对象复制和分布式调度尚未实现。
 
 本文回答三个问题：用户在管理什么、各资源之间是什么关系、中心和 Agent 应如何支撑完整的数据
 生产与交付流程。技术权威边界和实现细节见
 [`agent-central-control.md`](agent-central-control.md)，能力状态和研发顺序见
-[`implementation-plan.md`](implementation-plan.md)。
+[`implementation-plan.md`](implementation-plan.md)。Gateway 的专项权威边界见
+[`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。
 
 ## 1. 产品定位
 
@@ -72,7 +76,10 @@ NeoEngram 是面向大规模训练数据、模型权重和其他文件型数据�
 | Job             | Job 是操作产生的异步执行记录，默认从业务动作进入，不要求用户先创建 Job                                  |
 | 数据路径        | Agent 直接读写获批 StorageVolume 中的 Playground 和对象 CAS，Chunk 不经过中心 API 进程                         |
 | Agent 放置      | 0.0.1 Kubernetes 部署中一个业务 PVC 对应一个 StorageVolume 和一个常驻 AgentInstance                    |
-| Agent 接入      | Agent 只主动出站注册；首次接入必须经 TenantAdmin 在存储页审批，审批前不能成为 Volume Owner 或领取 Job   |
+| 区域入口        | 每个 EdgeCluster 一个多副本 GatewayPool；Central 主动连接 Gateway，Agent 只连接本集群 Gateway          |
+| Agent 接入      | Agent 经本集群 Gateway 主动出站注册；首次接入必须经 TenantAdmin 审批，审批前不能成为 Volume Owner 或领取 Job |
+| Gateway 边界    | Gateway 不挂载 Volume、不保存 metadata/object 权威；所有 Volume I/O 仍由 Owner Agent 执行               |
+| S3 暴露         | 后续由 Gateway 暴露固定 Commit/Snapshot 的只读 Access Point；Bucket 不等于 Volume/CAS，首版不支持写入   |
 
 任何实现如果让 Artifact 直接拥有一个存储位置、让一个 Snapshot 同时出现多个 Region、让用户选择
 目标 Ref，或者从 Artifact 之外直接制造普通 Commit，都与本产品定义冲突。同一 Commit 在不同区域交付
@@ -109,11 +116,13 @@ flowchart TB
 
     subgraph REGION_A["Region A · EdgeCluster A"]
         direction LR
+        GW_A["GatewayPool A<br/>多副本区域入口"]
         AGENT_A["Agent A<br/>受控执行器"]
         VOLUME_A[("StorageVolume A<br/>PVC / NFS<br/>Playground + immutable object CAS")]
         PG_A["Playground<br/>RW · 单 Region / Volume"]
         SS_A["Snapshot A<br/>RO · Commit C1 · 单 Region"]
         POD_A["Business / Training Pod"]
+        GW_A <-->|"Agent 主动 H2+mTLS"| AGENT_A
         AGENT_A -->|"scan / materialize / verify"| VOLUME_A
         VOLUME_A --- PG_A
         VOLUME_A --- SS_A
@@ -123,11 +132,13 @@ flowchart TB
 
     subgraph REGION_B["Region B · EdgeCluster B"]
         direction LR
+        GW_B["GatewayPool B<br/>多副本区域入口"]
         AGENT_B["Agent B<br/>受控执行器"]
         VOLUME_B[("StorageVolume B<br/>PVC / NFS<br/>Playground + immutable object CAS")]
         PG_B["Playground<br/>RW · 单 Region / Volume"]
         SS_B["Snapshot B<br/>RO · Commit C1 · 单 Region"]
         POD_B["Business / Training Pod"]
+        GW_B <-->|"Agent 主动 H2+mTLS"| AGENT_B
         AGENT_B -->|"scan / materialize / verify"| VOLUME_B
         VOLUME_B --- PG_B
         VOLUME_B --- SS_B
@@ -135,10 +146,10 @@ flowchart TB
         SS_B -->|"直接 POSIX RO"| POD_B
     end
 
-    OPS <-->|"Agent 主动建立控制连接<br/>assignment / status"| AGENT_A
-    OPS <-->|"Agent 主动建立控制连接<br/>assignment / status"| AGENT_B
-    AGENT_A -.->|"Index / metadata / progress"| META
-    AGENT_B -.->|"Index / metadata / progress"| META
+    OPS -->|"Central 主动 control<br/>H2+mTLS"| GW_A
+    OPS -->|"Central 主动 control<br/>H2+mTLS"| GW_B
+    GW_A -.->|"Index / metadata / progress"| META
+    GW_B -.->|"Index / metadata / progress"| META
     classDef entry fill:#ffffff,stroke:#3f4752,color:#17191d,stroke-width:1.5px;
     classDef control fill:#eaf1ff,stroke:#2563eb,color:#172554,stroke-width:1.5px;
     classDef authority fill:#e7f8ec,stroke:#15803d,color:#14532d,stroke-width:2px;
@@ -149,15 +160,19 @@ flowchart TB
     class ENTRY,POD_A,POD_B entry;
     class API,CATALOG,WORKFLOW,META,OPS control;
     class DB authority;
-    class AGENT_A,AGENT_B agent;
+    class GW_A,GW_B,AGENT_A,AGENT_B agent;
     class VOLUME_A,VOLUME_B storage;
     class PG_A,PG_B,SS_A,SS_B view;
 ```
 
-图中的路径必须保持分离：UI/CLI 只走中心 API；Agent 通过主动建立的控制连接接收任务并上报
-状态与元数据；不可变对象由 Agent 写入用户 StorageVolume 上 tenant/artifact 隔离的 CAS；业务 Pod
-直接访问本区域 StorageVolume 上的 Playground 或 Snapshot。当前 Region 之间不建立数据通道；后续
-跨 Volume 复制也必须在数据面直接完成，不得经过中心 API 代理 payload。
+图中的路径必须保持分离：UI/CLI 只走中心 API；Central 主动连接区域 GatewayPool，Agent 只主动连接
+本集群 Gateway，并通过该链路接收任务、上报状态和元数据；不可变对象由 Agent 写入用户
+StorageVolume 上 tenant/artifact 隔离的 CAS；业务 Pod 直接访问本区域 StorageVolume 上的 Playground
+或 Snapshot。Gateway Registry、管理面、Replica activation、H2/mTLS、命令签名和一跳 forwarding 已进入
+G1；双 Replica listener/H2/peer harness 和真实 Registry RouteLease 接管契约已分别通过，但完整业务
+E2E、外部生产 issuer/KMS-HSM、真实集群故障/就绪与切换尚未完成，控制面仍按失败关闭策略运行；Agent
+直连 Server 只作为迁移前基线。后续跨
+区域复制固定经源 Agent -> 源 Gateway -> 目标 Gateway -> 目标 Agent，不得经过中心 API 代理 payload。
 
 ## 3. 用户与角色
 
@@ -189,7 +204,8 @@ Tenant
 └── Member / RoleBinding / AuditEvent[*]
 
 EdgeCluster
-├── StorageVolume[*] ── AgentInstance[1]       0.0.1：一个业务 PVC/Volume 一个常驻 Agent
+├── GatewayPool[1] ── GatewayReplica[*]          区域控制和后续数据/S3 入口
+├── StorageVolume[*] ── AgentInstance[1]         0.0.1：一个业务 PVC/Volume 一个常驻 Agent
 ├── ComputeNode[*]
 └── Pod / Node[*]                              只表示基础设施运行位置
 ```
@@ -291,8 +307,8 @@ Snapshot；`degraded` 与 `unavailable` 均不可选择，但已有资源的中�
 Agent 不使用 Kubernetes ServiceAccount token，不调用 Kubernetes API，也不依赖 Operator、Service、
 Ingress 或 HPA。
 
-Agent 首次启动时使用一次性 bootstrap credential 主动连接中心，持久化稳定的注册请求身份并进入
-`pending_approval`。TenantAdmin 在存储页核对 Tenant、EdgeCluster、StorageVolume 和脱敏探测摘要后首次
+Agent 首次启动时使用一次性 bootstrap credential 主动连接本集群 GatewayPool，由 Gateway 转发到
+Central，持久化稳定的注册请求身份并进入 `pending_approval`。TenantAdmin 在存储页核对 Tenant、EdgeCluster、StorageVolume 和脱敏探测摘要后首次
 审批；审批完成且 Agent 以获批身份重连、挂载校验和 heartbeat 均正常后，Volume 才能进入 `ready`。
 bootstrap credential 只允许申请注册，不能领取 Job 或直接成为 Volume Owner。普通用户页面仍只展示
 StorageVolume 的公开状态，不展示 Agent、审批、挂载路径或 generation。
@@ -408,6 +424,10 @@ Snapshot 详情包含：
 
 详情页不得把跨区域副本显示成同一 Snapshot 的第二个 Region。
 
+后续只读 S3 Access Point 是 Snapshot/固定 Commit 的另一种读取协议，不是新的数据资产、存储放置或中心
+归档副本。首版只提供 SigV4、预签名读取、LIST、HEAD、GET 和 Range；产品不得展示 PUT、DELETE、
+Multipart、Versioning 或内部 Chunk key。
+
 ### 6.7 活动
 
 P0 只在 Snapshot 详情展示该 Snapshot 的脱敏交付活动，并允许按明确 Job ID 查询公开 Job 状态。
@@ -423,6 +443,7 @@ P0 只在 Snapshot 详情展示该 Snapshot 的脱敏交付活动，并允许按
 
 ```text
 创建/选择 Tenant
+  -> 平台管理员确认所属 EdgeCluster 的 GatewayPool Ready，并核对 observed readiness/failover 证据
   -> 登记一个或多个区域 StorageVolume
   -> 确认 Volume Ready
   -> 创建 Project
@@ -432,6 +453,9 @@ P0 只在 Snapshot 详情展示该 Snapshot 的脱敏交付活动，并允许按
 
 Artifact 创建不依赖存储。空 Artifact 没有初始 Commit；派生 Artifact 获得记录来源血缘的独立 root
 Commit。只有需要可写或只读文件视图时才选择 Volume。
+
+GatewayPool 是平台基础设施，不要求普通租户用户手工选择 Replica。Agent enrollment/status 经本集群
+Gateway 转发，Central 仍执行审批和权限判定；Gateway 的 TLS 身份本身不授予 Tenant 权限。
 
 ### 7.2 数据修改与 Commit
 
@@ -594,6 +618,7 @@ Add、Pre-commit、Commit、Materialize 和 Verify 细分。P0 资源页面和�
 授权结果，包括：
 
 - StorageVolume 登记、停用和内部 ownership 变化；
+- GatewayPool/Replica 创建、激活、drain、撤销、证书轮换和 Agent route generation 变化；
 - Artifact、Playground、Pre-commit、Commit、Tag 和 Snapshot 创建；
 - Pre-commit/Job 重跑、取消和失败；
 - Snapshot 的 P1 Lease、挂载关系、保留和删除；
@@ -611,13 +636,14 @@ TransferTicket、数据端点凭证、数据内容或物理绝对路径。
 - Snapshot Time to Ready、物化吞吐、对象复用率和校验失败率；
 - Playground 元数据新鲜度和 Abnormal 持续时间；
 - StorageVolume 容量、健康和 Owner 切换次数；
+- GatewayPool/Replica readiness、Agent RouteLease/fencing、跨 Replica forwarding 和连接背压；
 - 从失败活动进入正确资源并完成恢复的比例。
 
 ## 12. P0 Web 覆盖与验收口径
 
 | 产品能力                          | P0 Web 口径   | 备注                                                              |
 | --------------------------------- | ------------- | ----------------------------------------------------------------- |
-| Tenant 切换与创建                 | 公开 API 驱动 | MSW 与真实模式使用相同 query/mutation；该资源路由尚未接入真实 server |
+| Tenant 切换与创建                 | 公开 API 驱动 | MSW 与真实模式使用相同 query/mutation；真实 server 已注册对应路由   |
 | StorageVolume 登记与区域展示      | 公开 API 驱动 | 只展示公开字段，只有 ready Volume 可用于新放置                    |
 | Artifact 创建与详情               | 公开 API 驱动 | 支持空 Artifact 和从同 Tenant 明确 Commit 派生                     |
 | Playground 创建和详情             | 公开 API 驱动 | 单 Volume；文件、变化、元数据和 Profile 来自拆分查询               |
@@ -625,7 +651,7 @@ TransferTicket、数据端点凭证、数据内容或物理绝对路径。
 | Commit 描述、Tags、parent 和 Diff | 公开 API 驱动 | 消费 ready/idle 候选；Head 由服务端内部冻结并执行 CAS              |
 | Snapshot 单区域交付               | 公开 API 驱动 | 独立 Snapshot ID；同 Commit 可在不同 ready Volume 创建独立资源     |
 | Snapshot 文件和活动详情           | 公开 API 驱动 | ready 后查询逻辑文件；活动、完整性和 Profile 均来自公开 API        |
-| Managed Add Job                   | 公开 API 驱动 | 用户 create/query/finalize 已联网；Agent assignment/session 尚未联网 |
+| Managed Add Job                   | 公开 API 驱动 | 用户 create/query/finalize 与 Agent session/Job transport 基础纵切已接入；完整 Gateway 双 Replica 业务 E2E 待验收 |
 | 桌面与移动端                      | E2E 验收      | 覆盖加载、分页、错误和长内容；不以静态业务数据作为成功路径         |
 
 原型是产品需求的可执行说明，不是后端已经完成的证据。P0 页面必须只渲染公开 DTO；Manifest/Chunk、
@@ -649,8 +675,9 @@ graph/diff、Playground、Pre-commit、分页元数据、Snapshot 交付和 Mana
 5. Snapshot 已使用独立 ID、单 Region/Volume 状态模型，并提供创建去重、交付重试、Ready 文件清单、
    完整性、活动和 Dataset Profile。
 
-这些条目表示公开契约和 Web Mock 已对齐；Rust server 只实现已注册的 Job 与 Storage enrollment 纵切，
-Agent 只实现 bootstrap/status，不能据此推断其余公开 API、业务 session 或生产数据面已经完成。
+这些条目表示公开契约和 Web Mock 已对齐；Rust server 已注册 Tenant、StorageVolume、Enrollment、Artifact、
+Playground、Snapshot、Job 与 Gateway 管理纵切，Agent 已实现 bootstrap/status、session、Job/metadata transport
+和 Gateway 转发基础链路。它们仍不能证明完整公开 API、生产凭据、双 Replica 业务 E2E、切换或生产数据面已经完成。
 
 ### P1：完整运营闭环
 
@@ -671,8 +698,10 @@ Agent 只实现 bootstrap/status，不能据此推断其余公开 API、业务 s
 
 1. TenantAdmin 为上海和广州两个既有业务 PVC 分别生成一次性 enrollment token；此时尚不创建
    StorageVolume，也不会凭空出现待审批记录；
-2. 平台管理员准备 Volume marker，并为每个 PVC 部署一个使用独立 state PVC 的常驻 Agent；Agent 主动
-   bootstrap 后产生待审批记录，TenantAdmin 审批事务创建或绑定 Unavailable Volume；获批 Agent 的证书、
+2. 平台管理员先确认两个 EdgeCluster 的多副本 GatewayPool 已声明 Ready，并核对 observed
+   readiness/failover 证据，再准备 Volume marker，并为每个
+   PVC 部署一个使用独立 state PVC 的常驻 Agent；Agent 经本集群 Gateway 主动 bootstrap 后产生待审批
+   记录，TenantAdmin 审批事务创建或绑定 Unavailable Volume；获批 Agent 的证书、
    session、健康 RW mount 和 heartbeat 完成后 Volume 才进入 Ready；
 3. Data Producer 创建不带存储位置的空 Artifact；
 4. Producer 选择上海 Volume 创建 Playground；
@@ -690,6 +719,8 @@ Agent 只实现 bootstrap/status，不能据此推断其余公开 API、业务 s
 - Volume 为 `degraded` 或 `unavailable` 时均禁止创建 Playground/Snapshot，但仍可浏览中心元数据；
 - Pre-commit 期间 Agent 失联，状态可恢复且不会产生重复 Commit；
 - Agent 首次注册未审批、被拒绝或凭证已撤销时，Volume 不得 Ready，Agent 不得成为 Owner 或领取 Job；
+- 单个 GatewayReplica 退出时 Agent 可重连同 Pool 其他 Replica；旧 RouteLease 失效或撤销前不得产生
+  第二个活动 owner，GatewayPool 整体不可用时该集群操作失败关闭但 Volume 数据不受损；
 - Agent Pod 重建并复用原状态 PVC 时保持同一 AgentInstance；状态盘丢失时必须创建新的 pending 身份；
 - 人工接管未确认旧 Agent 停止时不得推进 owner generation；cooperative 模式不宣称抵御失陷旧写者；
 - Pre-commit 取消后 Playground 保持 Ready，旧候选不能被提交；
@@ -707,11 +738,12 @@ Agent 只实现 bootstrap/status，不能据此推断其余公开 API、业务 s
 产品纵切应与 [`ROADMAP.md`](ROADMAP.md) 的技术迭代配合，按以下体验顺序验收：
 
 1. **契约对齐**：先冻结本文的资源、放置、状态和身份语义，再修改 OpenAPI 和生成类型；
-2. **只读浏览**：接入真实 Tenant、Storage、Artifact、Commit、Diff、Playground、Snapshot 查询；
-3. **存储与工作区**：完成 StorageVolume 登记、空/派生 Artifact 创建、Playground 创建和真实元数据浏览；
-4. **发布闭环**：完成 Pre-commit、Commit 描述/Tags、parent Diff、冲突和审计；
-5. **交付闭环**：完成独立 Snapshot ID、同 Commit 多区域 Snapshot、单区域物化、校验、读取和失败恢复；
-6. **运营闭环**：完成 Job、审计、权限、配额、保留、删除、可观测性和灾备。
+2. **Gateway 控制面**：完成每集群 GatewayPool、Agent 经 Gateway enrollment/session 和一次性切换；
+3. **只读浏览**：接入真实 Tenant、Storage、Artifact、Commit、Diff、Playground、Snapshot 查询；
+4. **存储与工作区**：完成 StorageVolume 登记、空/派生 Artifact 创建、Playground 创建和真实元数据浏览；
+5. **发布闭环**：完成 Pre-commit、Commit 描述/Tags、parent Diff、冲突和审计；
+6. **交付闭环**：完成独立 Snapshot ID、同 Commit 多区域 Snapshot、单区域物化、校验、读取和失败恢复；
+7. **运营闭环**：完成 Job、审计、权限、配额、保留、删除、可观测性和灾备。
 
 每个纵切都必须同时具备权限、租户隔离、幂等、重启恢复、错误状态、桌面/移动端 E2E 和审计证据，
 不能只以页面可点击作为完成条件。

@@ -171,6 +171,7 @@ impl ControlPlane {
                 request_id: None,
                 trace_id: None,
                 sent_at_unix_ms: self.clock.now(),
+                central_signature: None,
                 message: ControlMessage::Assignment(Box::new(assignment)),
                 extensions: Extensions::new(),
             };
@@ -207,6 +208,7 @@ impl ControlPlane {
                 request_id: None,
                 trace_id: None,
                 sent_at_unix_ms: self.clock.now(),
+                central_signature: None,
                 message: ControlMessage::Decision(decision.clone()),
                 extensions: Extensions::new(),
             };

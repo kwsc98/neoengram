@@ -12,11 +12,19 @@ use crate::validation::{
 };
 use crate::{
     domain_separated_jcs_bytes, AgentBootId, AgentEnrollmentId, AgentEnrollmentTokenId, AgentId,
-    AgentInstallationId, AgentMountId, EdgeClusterId, Extensions, MountAccessMode, MountGeneration,
-    OwnerGeneration, ProtocolError, ProtocolResult, ProtocolVersion, RequestId, ResourceHealth,
-    ResourceVersion, SequenceNumber, SessionGeneration, StorageVolumeId, TenantId, UnixMillis,
-    VolumeMarkerId, MAX_AGENT_ENROLLMENT_MESSAGE_BYTES, PROTOCOL_VERSION_V1,
+    AgentInstallationId, AgentMountId, CertificateGeneration, EdgeClusterId, Extensions,
+    MountAccessMode, MountGeneration, OwnerGeneration, ProtocolError, ProtocolResult,
+    ProtocolVersion, RequestId, ResourceHealth, ResourceVersion, SequenceNumber, SessionGeneration,
+    StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId, MAX_AGENT_ENROLLMENT_MESSAGE_BYTES,
+    PROTOCOL_VERSION_V1,
 };
+
+/// Maximum DER bytes accepted for one Agent workload certificate or issuer-chain entry.
+pub const MAX_AGENT_WORKLOAD_CERTIFICATE_DER_BYTES: usize = 64 * 1024;
+/// Maximum number of certificates carried in an Agent workload certificate chain.
+pub const MAX_AGENT_WORKLOAD_CERTIFICATE_CHAIN_LENGTH: usize = 8;
+/// Maximum UTF-8 bytes in the canonical workload identity URI.
+pub const MAX_AGENT_WORKLOAD_IDENTITY_URI_BYTES: usize = 512;
 
 const BOOTSTRAP_TOKEN_MIN_BYTES: usize = 32;
 const BOOTSTRAP_TOKEN_MAX_BYTES: usize = 2_048;
@@ -1034,6 +1042,209 @@ pub enum AgentBootstrapStatusState {
     Expired,
 }
 
+/// Bounded DER bytes transported in an Agent workload certificate bundle.
+///
+/// The wire form is canonical unpadded base64url. Keeping this wrapper separate from the much
+/// larger Gateway opaque-payload type prevents an enrollment response from being used as an
+/// unbounded data channel.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema)]
+#[schemars(transparent)]
+pub struct AgentWorkloadCertificateDer(
+    #[schemars(
+        with = "String",
+        length(min = 1, max = 87382),
+        regex(pattern = BASE64URL_PATTERN)
+    )]
+    Vec<u8>,
+);
+
+impl AgentWorkloadCertificateDer {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> ProtocolResult<Self> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > MAX_AGENT_WORKLOAD_CERTIFICATE_DER_BYTES {
+            return Err(ProtocolError::LimitExceeded {
+                limit_name: "Agent workload certificate DER",
+                limit: MAX_AGENT_WORKLOAD_CERTIFICATE_DER_BYTES,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl fmt::Debug for AgentWorkloadCertificateDer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentWorkloadCertificateDer")
+            .field("length", &self.0.len())
+            .finish()
+    }
+}
+
+impl Serialize for AgentWorkloadCertificateDer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&URL_SAFE_NO_PAD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentWorkloadCertificateDer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded.contains('=') {
+            return Err(de::Error::custom(
+                "Agent workload certificate DER must use unpadded base64url",
+            ));
+        }
+        let decoded = URL_SAFE_NO_PAD
+            .decode(encoded.as_bytes())
+            .map_err(de::Error::custom)?;
+        let value = Self::new(decoded).map_err(de::Error::custom)?;
+        if URL_SAFE_NO_PAD.encode(value.as_bytes()) != encoded {
+            return Err(de::Error::custom(
+                "Agent workload certificate DER is not canonical base64url",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+/// Versioned, Central-issued Agent mTLS credential delivered with approved enrollment status.
+///
+/// The identity URI and all generation fields are signed by the enclosing HTTPS/mTLS channel and
+/// are checked against the Agent's configured cluster and persisted Ed25519 public key before the
+/// certificate is installed. Certificate bytes are public material; the private key never leaves
+/// the Agent's durable identity store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentWorkloadCertificateBundle {
+    pub certificate_bundle_version: u16,
+    pub edge_cluster_id: EdgeClusterId,
+    pub agent_id: AgentId,
+    pub enrollment_id: AgentEnrollmentId,
+    #[schemars(length(min = 1, max = MAX_AGENT_WORKLOAD_IDENTITY_URI_BYTES))]
+    pub identity_uri: String,
+    #[schemars(
+        with = "String",
+        length(equal = 64),
+        regex(pattern = CONTENT_DIGEST_PATTERN)
+    )]
+    pub public_key_fingerprint: ContentDigest,
+    pub certificate_generation: CertificateGeneration,
+    pub session_generation: SessionGeneration,
+    pub mount_generation: MountGeneration,
+    pub owner_generation: OwnerGeneration,
+    pub not_before_unix_ms: UnixMillis,
+    pub not_after_unix_ms: UnixMillis,
+    pub renew_at_unix_ms: UnixMillis,
+    pub leaf_certificate_der: AgentWorkloadCertificateDer,
+    pub issuer_chain_der: Vec<AgentWorkloadCertificateDer>,
+    #[serde(default, flatten)]
+    pub extensions: Extensions,
+}
+
+impl AgentWorkloadCertificateBundle {
+    pub const VERSION: u16 = 1;
+
+    pub fn validate(&self) -> ProtocolResult<()> {
+        if self.certificate_bundle_version != Self::VERSION {
+            return Err(ProtocolError::UnsupportedProtocolVersion(
+                self.certificate_bundle_version,
+            ));
+        }
+        for (field, value) in [
+            ("certificate_generation", self.certificate_generation.get()),
+            ("session_generation", self.session_generation.get()),
+            ("mount_generation", self.mount_generation.get()),
+            ("owner_generation", self.owner_generation.get()),
+        ] {
+            validate_positive(field, value)?;
+        }
+        if self.not_before_unix_ms.get() == 0
+            || self.not_after_unix_ms.get() <= self.not_before_unix_ms.get()
+            || self.renew_at_unix_ms.get() < self.not_before_unix_ms.get()
+            || self.renew_at_unix_ms.get() >= self.not_after_unix_ms.get()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "not_after_unix_ms",
+                reason: "certificate validity and renewal windows are invalid".to_owned(),
+            });
+        }
+        if self.identity_uri.len() > MAX_AGENT_WORKLOAD_IDENTITY_URI_BYTES
+            || self.identity_uri.is_empty()
+            || self
+                .identity_uri
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+            || !self.identity_uri.starts_with("spiffe://")
+            || self.identity_uri.contains(['?', '#', '%'])
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "identity_uri",
+                reason: "identity_uri must be a canonical SPIFFE URI".to_owned(),
+            });
+        }
+        let suffix = format!(
+            "/workloads/edge-clusters/{}/agents/{}",
+            self.edge_cluster_id, self.agent_id
+        );
+        let authority = self
+            .identity_uri
+            .strip_prefix("spiffe://")
+            .and_then(|value| value.split_once('/'))
+            .map(|(domain, _)| domain)
+            .unwrap_or_default();
+        if authority.is_empty() || !self.identity_uri.ends_with(&suffix) {
+            return Err(ProtocolError::InvalidField {
+                field: "identity_uri",
+                reason: "identity_uri is not bound to the EdgeCluster and Agent".to_owned(),
+            });
+        }
+        if self.issuer_chain_der.is_empty()
+            || self.issuer_chain_der.len() > MAX_AGENT_WORKLOAD_CERTIFICATE_CHAIN_LENGTH
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "issuer_chain_der",
+                reason: "issuer chain must contain between one and eight certificates".to_owned(),
+            });
+        }
+        validate_extension_keys(
+            &self.extensions,
+            &[
+                "certificate_bundle_version",
+                "edge_cluster_id",
+                "agent_id",
+                "enrollment_id",
+                "identity_uri",
+                "public_key_fingerprint",
+                "certificate_generation",
+                "session_generation",
+                "mount_generation",
+                "owner_generation",
+                "not_before_unix_ms",
+                "not_after_unix_ms",
+                "renew_at_unix_ms",
+                "leaf_certificate_der",
+                "issuer_chain_der",
+            ],
+        )
+    }
+}
+
 /// Poll result for one stable bootstrap request identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentBootstrapStatusResponse {
@@ -1047,6 +1258,8 @@ pub struct AgentBootstrapStatusResponse {
     pub agent_id: Option<AgentId>,
     pub resource_version: ResourceVersion,
     pub updated_at_unix_ms: UnixMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<AgentWorkloadCertificateBundle>,
     #[serde(default, flatten)]
     pub extensions: Extensions,
 }
@@ -1086,6 +1299,31 @@ impl AgentBootstrapStatusResponse {
                 });
             }
         }
+        match (&self.agent_id, &self.certificate) {
+            (Some(agent_id), Some(certificate))
+                if self.state == AgentBootstrapStatusState::Approved =>
+            {
+                certificate.validate()?;
+                if &certificate.agent_id != agent_id
+                    || certificate.enrollment_id != self.enrollment_id
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "certificate",
+                        reason:
+                            "workload certificate bundle belongs to another enrollment identity"
+                                .to_owned(),
+                    });
+                }
+            }
+            (None, Some(_)) | (Some(_), Some(_)) => {
+                return Err(ProtocolError::InvalidField {
+                    field: "certificate",
+                    reason: "only approved bootstrap status may include a workload certificate"
+                        .to_owned(),
+                });
+            }
+            (_, None) => {}
+        }
         validate_extension_keys(
             &self.extensions,
             &[
@@ -1097,6 +1335,7 @@ impl AgentBootstrapStatusResponse {
                 "agent_id",
                 "resource_version",
                 "updated_at_unix_ms",
+                "certificate",
             ],
         )
     }
@@ -1700,6 +1939,7 @@ mod tests {
             agent_id: Some(AgentId::new("agent-a").unwrap()),
             resource_version: ResourceVersion::new(1),
             updated_at_unix_ms: UnixMillis::new(100),
+            certificate: None,
             extensions: Extensions::new(),
         };
         response.validate().unwrap();
@@ -1710,5 +1950,39 @@ mod tests {
         response.validate().unwrap();
         response.agent_id = Some(AgentId::new("agent-a").unwrap());
         assert!(response.validate().is_err());
+    }
+
+    #[test]
+    fn workload_certificate_bundle_is_versioned_and_exactly_identity_bound() {
+        let mut bundle = AgentWorkloadCertificateBundle {
+            certificate_bundle_version: AgentWorkloadCertificateBundle::VERSION,
+            edge_cluster_id: EdgeClusterId::new("edge-a").unwrap(),
+            agent_id: AgentId::new("agent-a").unwrap(),
+            enrollment_id: AgentEnrollmentId::new("enrollment-a").unwrap(),
+            identity_uri:
+                "spiffe://mesh.example.test/workloads/edge-clusters/edge-a/agents/agent-a"
+                    .to_owned(),
+            public_key_fingerprint: ContentDigest::hash(b"agent-key"),
+            certificate_generation: CertificateGeneration::new(1),
+            session_generation: SessionGeneration::new(1),
+            mount_generation: MountGeneration::new(1),
+            owner_generation: OwnerGeneration::new(1),
+            not_before_unix_ms: UnixMillis::new(1_000),
+            not_after_unix_ms: UnixMillis::new(21_601_000),
+            renew_at_unix_ms: UnixMillis::new(10_801_000),
+            leaf_certificate_der: AgentWorkloadCertificateDer::new(vec![0x30, 0x01]).unwrap(),
+            issuer_chain_der: vec![AgentWorkloadCertificateDer::new(vec![0x30, 0x02]).unwrap()],
+            extensions: Extensions::new(),
+        };
+        bundle.validate().unwrap();
+
+        bundle.agent_id = AgentId::new("agent-b").unwrap();
+        assert!(bundle.validate().is_err());
+        bundle.agent_id = AgentId::new("agent-a").unwrap();
+        bundle.certificate_bundle_version = 2;
+        assert!(matches!(
+            bundle.validate(),
+            Err(ProtocolError::UnsupportedProtocolVersion(2))
+        ));
     }
 }

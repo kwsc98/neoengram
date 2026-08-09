@@ -400,7 +400,7 @@ async fn sqlite_v4_migration_never_derives_artifact_authority_from_playgrounds()
         .fetch_one(&mut connection)
         .await
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     let columns: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM pragma_table_info('playground_catalog_records') ORDER BY cid",
     )

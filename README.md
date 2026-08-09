@@ -7,12 +7,14 @@
 
 项目当前聚焦单机仓库与本地工作流，已经提供 SQLite 元数据、事务化 checkout 和故障恢复
 能力。`0.2.0` 同时完成了中心化架构所需的 crate/protocol/状态机；独立 server 通过 Fusen 暴露
-已实现的 system、Tenant、StorageVolume、Enrollment、Artifact、Playground 和 Managed Add Job
-action API，并通过独立 listener 提供 Agent enrollment、HTTP/2 全双工控制 channel 和元数据 action。
-`neoengram-agentd` 已能主动注册、建立长连接、扫描真实 Playground、将对象持久化到用户 Volume 的
-本地 CAS、上报 Metadata 与 Placement receipt，并接收中心调度和发布决定。Server 不接收对象 payload。
-该链路仍是单实例 SQLite 和 loopback HTTP 的开发实现；生产 mTLS、跨 Volume 直传、PostgreSQL、HA
-及完整 Snapshot 服务仍属于后续阶段。整体产品目标、当前能力清单和
+已实现的 system、Tenant、StorageVolume、Enrollment、Artifact、Playground、Snapshot 基础、Managed Add Job 和
+Gateway Registry action API，并保留仅用于迁移测试的独立 Agent listener。旧 Agent 直连纵切已验证主动注册、
+H2 channel、真实 Playground 扫描、Volume-local CAS、Metadata/Placement 上报与调度决定；当前
+`neoengram-agentd` 已改为 Gateway-only 配置，Gateway 已提供有界 H2/mTLS tunnel、Agent 转发、
+RouteLease 和最多一跳 peer forwarding，Replica activation 的显式管理 action、challenge/proof 和
+证书投递和 Central peer credential directory（30 秒 TTL、leaf fingerprint 校验、control 断链 fail-closed）已实现；loopback 双副本 listener/H2/peer 协议 harness 已通过，但完整业务 E2E、外部生产 issuer/KMS-HSM adapter、真实集群故障/就绪和切换验收仍未完成，因此新的端到端控制链
+尚不可作为生产能力。Server 不接收对象 payload。跨 Volume
+直传、PostgreSQL、HA 及完整 Snapshot 服务仍属于后续阶段。整体产品目标、当前能力清单和
 分布式实现路线统一维护在 [`docs/implementation-plan.md`](docs/implementation-plan.md)。完整
 状态模型、命令行为和命令差异见 [`docs/technical-reference.md`](docs/technical-reference.md)。
 
@@ -410,8 +412,9 @@ neoengram gc
 │   └── neoengram/                   # Clap、cwd 输入和唯一终端渲染入口
 ├── services/
 │   ├── neoengramd/                  # 无网络中心状态机、ports 与 SQLite datasource/mapper
-│   ├── neoengram-server/            # Fusen 用户 HTTP、Hyper Agent H2 action channel 与运行时组装
-│   └── neoengram-agentd/            # 可运行的 Agent enrollment/H2 channel daemon 与健康命令
+│   ├── neoengram-server/            # 用户 HTTP + Gateway Registry/session；outbound control connector
+│   ├── neoengram-agentd/            # Gateway-only endpoint/trust bundle；下行 command trust 校验
+│   └── synapse-gateway/             # 三 listener H2 tunnel + activation + mTLS + 一跳 peer forwarding
 ├── apps/
 │   └── neoengram-web/               # Vue 3 用户控制台；首版由 OpenAPI/MSW 驱动
 └── docs/                            # 代码与存储架构说明
@@ -423,11 +426,19 @@ neoengram gc
 Agent library 到 `neoengramd` 的依赖仅存在于 dev/test 组合测试。CLI 之外不渲染终端输出；完整约束见
 [`docs/code-architecture.md`](docs/code-architecture.md)。
 
+2026-08-09 已确认 Synapse Gateway 目标拓扑：Central 主动连接每个 EdgeCluster 的多副本
+GatewayPool，Agent 只注册并连接本集群 Gateway；Gateway 不挂载 StorageVolume，也不保存 metadata 或
+对象权威。G1 已落地 Registry、管理 API、Gateway/部署清单、有界 H2 tunnel、运行时 mTLS、下行命令签名
+和一跳 peer forwarding；双 Replica listener/H2/peer 协议 harness 及真实 InMemory/SQLite RouteLease
+接管契约已分别通过，但完整 Central/Registry/outbox/签名业务 E2E、外部生产 issuer/KMS-HSM、真实集群
+故障/就绪与切换验收尚未完成；旧 Agent 直连 Server 只代表迁移前基线。专项设计和切换边界见
+[`docs/synapse-gateway-architecture.md`](docs/synapse-gateway-architecture.md)。
+
 `neoengram-web` 是独立 npm 应用，不进入 Cargo workspace，也不导入 Rust crate、Agent Schema 或
 数据库类型。它只从公开 OpenAPI 生成客户端类型；当前界面覆盖租户、StorageVolume、Enrollment、
 Artifact、单 Volume Playground、Playground Commit 和 Managed Add Job，仍有部分 Snapshot、资源浏览、
 Commit 描述/Tag 和父版本文件 Diff operation 由 MSW 提供。真实 server 已提供对应的 system、资源和
-Job action API，独立 Agent listener 提供 enrollment、HTTP/2 全双工控制 channel 与 metadata action。
+Job action API；Agent action 只作为 Gateway 内部转发契约，旧独立 listener 仅限 loopback 迁移测试。
 
 中心化 Agent 的产品定位、用户角色、资源语义、页面规格、Pre-commit/Commit/Snapshot 主链路和
 OpenAPI 对齐清单见 [`docs/centralized-agent-product.md`](docs/centralized-agent-product.md)；技术权威
@@ -460,12 +471,15 @@ crates.io 解析或 CLI 可从 registry 安装。
 当前存储边界。
 
 当前可运行产品完成的是本地 format v8、多 Workspace 与固定 Commit 只读 FUSE；中心另提供 protocol、
-Agent/控制面状态机、SQLite 单节点权威、Fusen 用户 listener 和 Hyper Agent listener。
+Agent/控制面状态机、SQLite 单节点权威、Fusen 用户 listener、Gateway Registry 和 outbound connector；
+旧 Hyper Agent listener 只保留为 loopback 迁移测试边界。
 `neoengram-agentd` 已能持久化身份、探测挂载、签名 bootstrap、建立 HTTP/2 全双工 session、执行 Job，
 并将 Chunk 写入获批用户 Volume 的 tenant/artifact 隔离 CAS；Server 只接收 metadata 与 placement
 evidence，不接收 Chunk payload。业务接口使用外部 OIDC/JWKS 与默认拒绝 RBAC；SQLite 模式只支持
-单副本，生产 TLS 由 Ingress/反向代理终止。它仍不包含其余 OpenAPI、生产 mTLS、PostgreSQL、HA、
-跨 Volume Agent/Gateway 直传、merge/rebase、`push/fetch/pull/clone` 或 Volume GC 编排。分页、事务、
+单副本，用户 API 的生产 TLS 由 Ingress/反向代理终止。它仍不包含其余 OpenAPI、生产凭据 provisioner、
+已验收的 Synapse Gateway 生产切换、跨 Volume Gateway-to-Gateway 传输、只读 S3 Access Point、
+merge/rebase、
+`push/fetch/pull/clone` 或 Volume GC 编排。分页、事务、
 CAS、分层 Merkle Directory 和流式 Commit
 已经落地；CLI 通过结构化 Request/typed Result facade 调用 Standalone，并拥有全部成功文本与
 错误/结果渲染，Standalone 不再暴露通用 `CommandResult`。
@@ -478,8 +492,9 @@ CAS、分层 Merkle Directory 和流式 Commit
 所有命令都适用于千万路径。
 
 下一步是继续把 Standalone 过渡物化 view 收敛到 engine 分页 ports，对 SQLite 大规模工作负载做
-基准与调优，并实现 PostgreSQL、其余用户 API、生产 mTLS，以及基于受限 `TransferRoute`/
-`TransferTicket` 的跨 Volume Agent/Gateway 直传、恢复与 GC 编排。目标是
+基准与调优，并实现 PostgreSQL、其余用户 API、Gateway 外部生产 issuer/KMS-HSM adapter、真实集群双 Replica
+故障/就绪与切换验收。后续再基于受限 `TransferRoute`/`TransferTicket` 实现固定的源 Agent -> 源 Gateway -> 目标 Gateway ->
+目标 Agent 传输、恢复与 GC 编排。目标是
 100 TB payload、千万路径和上亿 Chunk 引用下，命令内存由页大小与有界并发决定，而不是随
 仓库总量增长。
 

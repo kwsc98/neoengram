@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>数据物流空间 · 多集群运行可观测</title>
+<title>数据物流空间 · 迁移前观测原型</title>
 <style>
   :root {
     --bg: #ffffff;
@@ -39,6 +39,8 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
     font-size: 13px;
     overflow: hidden;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
   }
   button, input, select { font: inherit; }
   button { letter-spacing: 0; }
@@ -50,7 +52,8 @@
   .console {
     display: grid;
     grid-template-columns: 232px minmax(0, 1fr);
-    height: 100vh;
+    height: auto;
+    min-height: 0;
     background: var(--bg);
   }
   .sidebar {
@@ -515,6 +518,12 @@
 </style>
 </head>
 <body>
+<div style="padding:10px 16px;border-bottom:1px solid hsl(36 90% 75%);background:var(--warn-soft);color:hsl(30 80% 28%);line-height:1.45;z-index:100">
+  <strong>迁移前观测原型：</strong>本页内部图仍保留 Agent 直连 Central 和 Gateway 挂载对象根的历史
+  指标模型。目标为 Central -> 每集群多副本 GatewayPool <- Agent；Gateway 无 Volume mount。G1 尚未完成
+  生产切换，页面中的跨集群传输是未实现 G2 的 mock，S3 是后续 G3；本页数据不能作为当前能力证据。
+  详见 <a href="synapse-gateway-architecture.md">Synapse Gateway 架构</a>。
+</div>
 <div class="console">
   <aside class="sidebar">
     <div class="brand">
@@ -663,7 +672,7 @@
                   </g>
                   <path d="M430 110C400 138 330 145 260 178" fill="none" stroke="hsl(211 72% 50%)" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow-control)"/>
                   <path d="M670 110C700 138 770 145 840 178" fill="none" stroke="hsl(211 72% 50%)" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow-control)"/>
-                  <text x="550" y="133" text-anchor="middle" fill="hsl(211 72% 50%)" font-size="10">Agent 主动建立 mTLS H2/H3 JSON 双向流</text>
+                  <text x="550" y="133" text-anchor="middle" fill="hsl(211 72% 50%)" font-size="10">Central 主动连接 Gateway；Agent 连接本集群 Gateway</text>
 
                   <g>
                     <rect x="18" y="148" width="512" height="426" rx="14" fill="hsla(210 40% 99% / .96)" stroke="hsl(214 32% 84%)" stroke-width="1.5"/>
@@ -675,8 +684,8 @@
                     <text x="69" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Agent A · RW Owner</text>
                     <text x="69" y="260" fill="hsl(215 16% 47%)" font-size="9">会话 gen 29 · 心跳 4 秒</text>
                     <rect x="290" y="222" width="190" height="50" rx="7" fill="#fff" stroke="hsl(262 45% 80%)"/>
-                    <text x="305" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Volume Gateway A</text>
-                    <text x="305" y="260" fill="hsl(215 16% 47%)" font-size="9">只读对象根 · 凭证 gen 18</text>
+                    <text x="305" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">GatewayPool A [N]</text>
+                    <text x="305" y="260" fill="hsl(215 16% 47%)" font-size="9">控制入口 · 无 Volume mount</text>
 
                     <rect x="38" y="320" width="472" height="100" rx="9" fill="hsl(165 70% 96%)" stroke="hsl(169 60% 66%)"/>
                     <text x="52" y="341" fill="hsl(173 91% 30%)" font-size="10" font-weight="700">NFS 区（物理卷）</text>
@@ -701,8 +710,8 @@
                     <text x="621" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Agent B · RW Owner</text>
                     <text x="621" y="260" fill="hsl(215 16% 47%)" font-size="9">会话 gen 42 · 心跳 6 秒</text>
                     <rect x="842" y="222" width="190" height="50" rx="7" fill="#fff" stroke="hsl(262 45% 80%)"/>
-                    <text x="857" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">Volume Gateway B</text>
-                    <text x="857" y="260" fill="hsl(215 16% 47%)" font-size="9">只读对象根 · 凭证 gen 12</text>
+                    <text x="857" y="244" fill="hsl(222 47% 11%)" font-size="11" font-weight="700">GatewayPool B [N]</text>
+                    <text x="857" y="260" fill="hsl(215 16% 47%)" font-size="9">控制入口 · 无 Volume mount</text>
 
                     <rect x="590" y="320" width="472" height="100" rx="9" fill="hsl(165 70% 96%)" stroke="hsl(169 60% 66%)"/>
                     <text x="604" y="341" fill="hsl(173 91% 30%)" font-size="10" font-weight="700">NFS 区（物理卷）</text>
@@ -808,7 +817,7 @@
         </section>
         <section class="panel">
           <div class="panel-head">
-            <h2>Agent 会话</h2><span class="sub">由 Agent 主动连接中心</span><span class="spacer"></span>
+            <h2>Agent 会话</h2><span class="sub">Agent 只主动连接本集群 GatewayPool</span><span class="spacer"></span>
             <div class="filters">
               <input class="filter-input" id="agent-search" placeholder="搜索 Agent / 节点 / 集群" aria-label="搜索 Agent">
               <select class="filter-select" id="agent-state"><option value="">全部状态</option><option value="ready">正常</option><option value="degraded">降级</option><option value="unknown">未知</option></select>
@@ -847,7 +856,7 @@
             <div class="panel-body no-pad">
               <div class="io-list">
                 <div class="io-row"><div class="io-label">Agent 受管根</div><div class="mono">Agent → 本机 NFS 客户端 → Volume 受管根</div><span class="state s-rw">读写</span></div>
-                <div class="io-row"><div class="io-label">Gateway 对象根</div><div class="mono">Gateway → NFS objects/</div><span class="state s-ro">只读</span></div>
+                <div class="io-row"><div class="io-label">Gateway Volume 边界</div><div class="mono">Gateway 无业务 Volume mount</div><span class="state s-unknown">隔离</span></div>
                 <div class="io-row"><div class="io-label">业务 Pod 视图</div><div class="mono">Pod → 节点 NFS/CSI → 精确视图根目录</div><span class="state s-rw">按绑定</span></div>
               </div>
               <div style="padding:14px 16px"><div class="notice">Pod 文件流量直接到本集群 NFS，不经过 Agent 或中心 API；PodMountBinding 只记录已有挂载关系。</div></div>
@@ -878,12 +887,12 @@
 
       <section class="view" id="view-transfers">
         <div class="page-head">
-          <div><h1>跨集群传输</h1><p>目标 Agent 通过获批源 Volume Gateway 直传固定 Commit 对象，Server 不代理 payload</p></div>
+          <div><h1>跨集群传输</h1><p>源 Agent → 源 Gateway → 目标 Gateway → 目标 Agent；Central 不代理 payload</p></div>
           <div class="actions"><button class="button" id="transfer-anomaly" type="button">仅看异常</button></div>
         </div>
         <div class="kpi-strip" id="transfer-kpis"></div>
         <section class="panel">
-          <div class="panel-head"><h2>活动传输</h2><span class="sub">源 Gateway → 目标 Agent → 目标 StorageVolume</span></div>
+          <div class="panel-head"><h2>活动传输</h2><span class="sub">源 Agent → 源 Gateway → 目标 Gateway → 目标 Agent</span></div>
           <div class="panel-body"><div class="transfer-list" id="transfer-list"></div></div>
         </section>
         <section class="panel">
@@ -972,7 +981,6 @@
 
   const mounts = [
     { consumer:"agent-a-01", type:"Volume 读写 Owner", volume:"vol-a1", root:"/tenants/t-a/managed", mode:"rw", generation:"42" },
-    { consumer:"gw-a-01", type:"Volume Gateway", volume:"vol-a1", root:"/.neoengram/objects/tenants/t-a", mode:"ro", generation:"18" },
     { consumer:"train-pod-7d9", type:"PodMountBinding", volume:"vol-a1", root:"/views/snapshots/snp-88", mode:"ro", generation:"k8s rv 9912" },
     { consumer:"label-pod-3a2", type:"PodMountBinding", volume:"vol-a1", root:"/views/playgrounds/pg-18", mode:"rw", generation:"k8s rv 9918" },
     { consumer:"agent-b-01", type:"Volume 读写 Owner", volume:"vol-b1", root:"/tenants/t-a/managed", mode:"rw", generation:"66" }
@@ -1107,7 +1115,7 @@
     document.getElementById("cluster-tabs").innerHTML = clusters.map(c => '<button class="cluster-chip ' + (c.id === selectedCluster ? "active" : "") + '" type="button" data-cluster="' + c.id + '">' + c.name + ' · ' + labels[c.state] + '</button>').join("");
     const c = clusters.find(x => x.id === selectedCluster);
     document.getElementById("cluster-zones").innerHTML =
-      '<div class="zone system"><div class="zone-title">系统组件区</div><div class="zone-value">' + c.agents[0] + ' 个 Agent 会话</div><div class="zone-row"><span>Agent 健康</span>' + state(c.agents[1],c.agents[0]) + '</div><div class="zone-row"><span>Volume Gateway</span><span class="mono">' + c.gatewayId + '</span></div><div class="zone-row"><span>控制协议</span><span>H2/H3 JSON 流</span></div><div class="zone-row"><span>运行任务</span><strong>' + c.jobs + '</strong></div><div class="zone-flow">Agent 与 Gateway 都在系统组件区；Agent 主动连接中心。</div></div>' +
+      '<div class="zone system"><div class="zone-title">系统组件区</div><div class="zone-value">' + c.agents[0] + ' 个 Agent 会话</div><div class="zone-row"><span>Agent 健康</span>' + state(c.agents[1],c.agents[0]) + '</div><div class="zone-row"><span>GatewayPool</span><span class="mono">' + c.gatewayId + '</span></div><div class="zone-row"><span>控制协议</span><span>H2 + mTLS</span></div><div class="zone-row"><span>运行任务</span><strong>' + c.jobs + '</strong></div><div class="zone-flow">Central 主动连接 Gateway；Agent 只主动连接本集群 Gateway。</div></div>' +
       '<div class="zone nfs"><div class="zone-title">NFS 区</div><div class="zone-value mono">' + c.volume + '</div><div class="zone-row"><span>挂载健康</span>' + state(c.nfs[1],c.nfs[0]) + '</div><div class="zone-row"><span>I/O p95</span><span class="mono">' + c.nfs[2] + '</span></div><div class="zone-row"><span>Owner 约束</span><span>代次隔离</span></div><div class="zone-row"><span>可见目录</span><span>受管根 / 视图根</span></div><div class="zone-flow">一个 Artifact 在同一集群固定到一个 NFS；一个 NFS 可承载同租户多个 Artifact。</div></div>' +
       '<div class="zone pod"><div class="zone-title">业务 Pod 区</div><div class="zone-value">' + c.pods + ' 个已登记挂载</div><div class="zone-row"><span>视图类型</span><span>Playground / Snapshot</span></div><div class="zone-row"><span>观测新鲜度</span>' + state(c.playground[1],c.playground[0]) + '</div><div class="zone-row"><span>文件 I/O</span><span>Pod 直达本地 NFS</span></div><div class="zone-row"><span>中心职责</span><span>登记绑定关系</span></div><div class="zone-flow">中心不负责创建 Pod、PV、PVC 或 NAS，只观测已有 PodMountBinding。</div></div>';
     const q = document.getElementById("agent-search").value.trim().toLowerCase();

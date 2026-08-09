@@ -51,6 +51,7 @@ impl SqliteAuthority {
         )
         .with_precommits(self.inner.clone())
         .with_agent_registry(self.agent_registry.repository())
+        .with_gateway_registry(self.agent_registry.gateway_repository())
         .with_control_catalog(self.agent_registry.catalog_repository())
     }
 

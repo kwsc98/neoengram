@@ -823,6 +823,209 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/gateway/pool/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建 GatewayPool
+         * @description 为一个 EdgeCluster 创建唯一逻辑 GatewayPool；要求全局 gateway.manage 权限。
+         */
+        post: operations["createGatewayPool"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/gateway/pool/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 GatewayPool
+         * @description 按稳定 ID 查询 GatewayPool，不返回 Replica credential 或路由租约。
+         */
+        post: operations["queryGatewayPool"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/gateway/pool/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 分页查询 GatewayPool
+         * @description 可按 EdgeCluster 和状态过滤；游标使用上一页最后一个 GatewayPool ID。
+         */
+        post: operations["queryGatewayPoolList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/gateway/pool/update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 更新 GatewayPool
+         * @description 使用 expected_resource_version 原子更新入口、副本目标或非 draining 状态。
+         */
+        post: operations["updateGatewayPool"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/gateway/pool/drain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 排空 GatewayPool
+         * @description 使用 expected_resource_version 将 Pool 单向切换为 draining。
+         */
+        post: operations["drainGatewayPool"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/gateway/replica/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建 GatewayReplica
+         * @description activation_token 只在首次成功响应中出现；Central 持久化层只保存摘要。
+         */
+        post: operations["createGatewayReplica"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/gateway/replica/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 激活 GatewayReplica
+         * @description 仅允许具有全局 `gateway.manage` 权限的 operator 调用。Central 从 Registry 读取
+         *     持久化的 bootstrap_endpoint，主动完成 challenge/proof、证书投递和 Pending -> Active
+         *     原子提交；请求体不得指定或覆盖 endpoint。activation_token 只用于本次动作，不会在
+         *     Central 日志或持久化 payload 中出现。
+         */
+        post: operations["activateGatewayReplica"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/gateway/replica/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 分页查询 GatewayReplica
+         * @description 返回 endpoint、版本、capability 和证书状态，不返回 token 摘要或证书指纹。
+         */
+        post: operations["queryGatewayReplicaList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/gateway/replica/drain": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 排空 GatewayReplica
+         * @description 使用 expected_resource_version 将 Active Replica 单向切换为 draining。
+         */
+        post: operations["drainGatewayReplica"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/gateway/replica/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 撤销 GatewayReplica
+         * @description 原子标记 Replica 与 credential revoked，并提升已有 certificate generation。
+         */
+        post: operations["revokeGatewayReplica"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/job/add/create": {
         parameters: {
             query?: never;
@@ -943,6 +1146,131 @@ export interface components {
             agent_protocol_versions: 1[];
             capabilities: string[];
         };
+        CreateGatewayPoolRequest: {
+            gateway_pool_id: components["schemas"]["GatewayPoolId"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            display_name: string;
+            agent_endpoint: components["schemas"]["GatewayEndpoint"];
+            s3_endpoint?: components["schemas"]["GatewayEndpoint"];
+            desired_replicas: components["schemas"]["GatewayReplicaCount"];
+            minimum_ready_replicas: components["schemas"]["GatewayReplicaCount"];
+        };
+        QueryGatewayPoolRequest: {
+            gateway_pool_id: components["schemas"]["GatewayPoolId"];
+        };
+        QueryGatewayPoolListRequest: {
+            edge_cluster_id?: components["schemas"]["EdgeClusterId"];
+            state?: components["schemas"]["GatewayPoolState"];
+            after?: components["schemas"]["GatewayPoolId"];
+            page_size?: number;
+        };
+        UpdateGatewayPoolRequest: {
+            gateway_pool_id: components["schemas"]["GatewayPoolId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+            display_name?: string;
+            agent_endpoint?: components["schemas"]["GatewayEndpoint"];
+            s3_endpoint?: components["schemas"]["GatewayEndpoint"];
+            clear_s3_endpoint?: boolean;
+            desired_replicas?: components["schemas"]["GatewayReplicaCount"];
+            minimum_ready_replicas?: components["schemas"]["GatewayReplicaCount"];
+            /** @enum {string} */
+            state?: "provisioning" | "ready" | "disabled";
+        };
+        DrainGatewayPoolRequest: {
+            gateway_pool_id: components["schemas"]["GatewayPoolId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+        };
+        GatewayPoolResponse: {
+            gateway_pool: components["schemas"]["GatewayPoolView"];
+            replayed: boolean;
+        };
+        GatewayPoolListResponse: {
+            items: components["schemas"]["GatewayPoolView"][];
+            next_after?: components["schemas"]["GatewayPoolId"];
+        };
+        GatewayPoolView: {
+            gateway_pool_id: components["schemas"]["GatewayPoolId"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            display_name: string;
+            agent_endpoint: components["schemas"]["GatewayEndpoint"];
+            s3_endpoint?: components["schemas"]["GatewayEndpoint"];
+            desired_replicas: components["schemas"]["GatewayReplicaCount"];
+            minimum_ready_replicas: components["schemas"]["GatewayReplicaCount"];
+            state: components["schemas"]["GatewayPoolState"];
+            config_generation: components["schemas"]["PositiveCanonicalU64"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        CreateGatewayReplicaRequest: {
+            gateway_replica_id: components["schemas"]["GatewayReplicaId"];
+            gateway_pool_id: components["schemas"]["GatewayPoolId"];
+            control_endpoint: components["schemas"]["GatewayEndpoint"];
+            peer_endpoint: components["schemas"]["GatewayEndpoint"];
+            bootstrap_endpoint: components["schemas"]["GatewayEndpoint"];
+            software_version: string;
+            supported_protocol_versions: number[];
+            capabilities?: string[];
+        };
+        QueryGatewayReplicaListRequest: {
+            gateway_pool_id: components["schemas"]["GatewayPoolId"];
+            state?: components["schemas"]["GatewayReplicaState"];
+            after?: components["schemas"]["GatewayReplicaId"];
+            page_size?: number;
+        };
+        MutateGatewayReplicaRequest: {
+            gateway_replica_id: components["schemas"]["GatewayReplicaId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+        };
+        ActivateGatewayReplicaRequest: {
+            gateway_replica_id: components["schemas"]["GatewayReplicaId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+            activation_token: string;
+        };
+        CreateGatewayReplicaResponse: {
+            gateway_replica: components["schemas"]["GatewayReplicaView"];
+            readonly activation_token?: string;
+            replayed: boolean;
+        };
+        GatewayReplicaResponse: {
+            gateway_replica: components["schemas"]["GatewayReplicaView"];
+            replayed: boolean;
+        };
+        GatewayReplicaListResponse: {
+            items: components["schemas"]["GatewayReplicaView"][];
+            next_after?: components["schemas"]["GatewayReplicaId"];
+        };
+        GatewayReplicaView: {
+            gateway_replica_id: components["schemas"]["GatewayReplicaId"];
+            gateway_pool_id: components["schemas"]["GatewayPoolId"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            control_endpoint: components["schemas"]["GatewayEndpoint"];
+            peer_endpoint: components["schemas"]["GatewayEndpoint"];
+            bootstrap_endpoint: components["schemas"]["GatewayEndpoint"];
+            software_version: string;
+            supported_protocol_versions: number[];
+            capabilities: string[];
+            last_heartbeat_at_unix_ms?: components["schemas"]["UnixMillis"];
+            state: components["schemas"]["GatewayReplicaState"];
+            credential_state: components["schemas"]["GatewayCredentialState"];
+            certificate_generation?: components["schemas"]["PositiveCanonicalU64"];
+            certificate_not_after_unix_ms?: components["schemas"]["UnixMillis"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        /** @enum {string} */
+        GatewayPoolState: "provisioning" | "ready" | "draining" | "disabled";
+        /** @enum {string} */
+        GatewayReplicaState: "pending" | "active" | "draining" | "revoked";
+        /** @enum {string} */
+        GatewayCredentialState: "pending_activation" | "pending_certificate_delivery" | "active" | "expired" | "revoked";
+        GatewayReplicaCount: number;
+        /**
+         * Format: uri
+         * @description canonical HTTPS origin；不得包含 userinfo、path、query、fragment 或尾随斜杠。
+         */
+        GatewayEndpoint: string;
         QueryTenantListRequest: {
             cursor?: components["schemas"]["PageCursor"];
             page_size?: components["schemas"]["PageSize"];
@@ -1976,6 +2304,8 @@ export interface components {
         StorageEnrollmentId: components["schemas"]["ResourceId"];
         StorageEnrollmentTokenId: components["schemas"]["ResourceId"];
         EdgeClusterId: components["schemas"]["ResourceId"];
+        GatewayPoolId: components["schemas"]["ResourceId"];
+        GatewayReplicaId: components["schemas"]["ResourceId"];
         ProjectId: components["schemas"]["ResourceId"];
         ArtifactId: components["schemas"]["ResourceId"];
         PlaygroundId: components["schemas"]["ResourceId"];
@@ -2001,7 +2331,8 @@ export interface components {
         KubernetesPvcClaimName: string;
         /** @enum {string} */
         StorageVolumeState: "ready" | "degraded" | "unavailable";
-        PermissionName: string;
+        /** @enum {string} */
+        PermissionName: "job.create" | "job.read" | "job.finalize" | "tenant.read" | "tenant.create" | "tenant.admin" | "storage.read" | "storage.create" | "storage.enrollment.create" | "storage.enrollment.read" | "storage.enrollment.review" | "artifact.read" | "artifact.create" | "playground.read" | "playground.create" | "snapshot.read" | "snapshot.create" | "gateway.read" | "gateway.manage";
         TagName: string;
         /** @description 服务端生成、与资源 scope、筛选条件和排序绑定的不透明分页 token。 */
         PageCursor: string;
@@ -2010,6 +2341,8 @@ export interface components {
         SearchQuery: string;
         ContentDigest: string;
         CanonicalU64: string;
+        /** @description 大于零且不超过 u64 最大值的 canonical decimal JSON string。 */
+        PositiveCanonicalU64: components["schemas"]["CanonicalU64"] & unknown;
         /** @description Unix 毫秒时间戳，编码为 canonical decimal JSON string。 */
         UnixMillis: components["schemas"]["CanonicalU64"];
         /**
@@ -5247,6 +5580,470 @@ export interface operations {
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createGatewayPool: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateGatewayPoolRequest"];
+            };
+        };
+        responses: {
+            /** @description GatewayPool 已创建或相同定义被重放 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayPoolResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryGatewayPool: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryGatewayPoolRequest"];
+            };
+        };
+        responses: {
+            /** @description GatewayPool 当前视图 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayPoolResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryGatewayPoolList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryGatewayPoolListRequest"];
+            };
+        };
+        responses: {
+            /** @description GatewayPool 页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayPoolListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    updateGatewayPool: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateGatewayPoolRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的 GatewayPool */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayPoolResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    drainGatewayPool: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DrainGatewayPoolRequest"];
+            };
+        };
+        responses: {
+            /** @description Draining GatewayPool */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayPoolResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createGatewayReplica: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateGatewayReplicaRequest"];
+            };
+        };
+        responses: {
+            /** @description Pending GatewayReplica；重放响应不再包含 activation_token */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateGatewayReplicaResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    activateGatewayReplica: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ActivateGatewayReplicaRequest"];
+            };
+        };
+        responses: {
+            /** @description 已完成证书投递并激活的 GatewayReplica */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayReplicaResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryGatewayReplicaList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryGatewayReplicaListRequest"];
+            };
+        };
+        responses: {
+            /** @description GatewayReplica 页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayReplicaListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    drainGatewayReplica: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MutateGatewayReplicaRequest"];
+            };
+        };
+        responses: {
+            /** @description Draining GatewayReplica */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayReplicaResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    revokeGatewayReplica: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MutateGatewayReplicaRequest"];
+            };
+        };
+        responses: {
+            /** @description Revoked GatewayReplica */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GatewayReplicaResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
         };
     };

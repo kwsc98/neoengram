@@ -28,6 +28,7 @@ spec:
         neoengram.io/volume-slug: volume-safe-slug
       annotations:
         neoengram.io/storage-volume-id: volume-example
+        neoengram.io/gateway-pool-id: gateway-pool-example
         neoengram.io/config-revision: "replace-when-config-or-secret-changes"
     spec:
       automountServiceAccountToken: false
@@ -122,6 +123,8 @@ spec:
         - name: config
           configMap:
             name: neoengram-agent-config-volume-safe-slug
+            # The Agent configuration, GatewayPool CA, and Central command public keys are
+            # projected read-only. The runtime rejects writable trust bundle targets.
             defaultMode: 0444
         - name: bootstrap
           secret:

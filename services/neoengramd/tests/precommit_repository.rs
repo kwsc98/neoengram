@@ -398,7 +398,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
             .await
             .unwrap()
             .as_slice(),
-        &[committed.consumed_precommit.clone()]
+        std::slice::from_ref(&committed.consumed_precommit)
     );
     assert!(repository
         .list_unpublished_commits(Some(&key), 10)

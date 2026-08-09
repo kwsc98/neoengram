@@ -8,6 +8,9 @@
 
 ### Added
 
+- 新增 Synapse Gateway G1 控制面骨架：GatewayPool/Replica Registry、AgentRouteLease、三类 H2
+  listener、mTLS/签名边界和最多一跳 Replica forwarding；Central peer credential directory（30 秒
+  TTL、leaf fingerprint allow-list、control 断链 fail-closed）已接入；完整业务 E2E、生产 PKI 与切换仍在进行中。
 - 新增基于 Fusen 0.9.0 的 `neoengram-server`，以 DTO/controller/service 分层暴露版本、健康和
   Managed Add Job 六个 HTTP 接口，并接入外部 OIDC/JWKS、默认拒绝 RBAC 与优雅停机。
 - 将中心 SQLite adapter 拆为 datasource 与 mapper：连接、锁、schema/迁移和完整性归 datasource，
@@ -44,6 +47,10 @@
 
 ### Changed
 
+- **2026-08-09 Synapse Gateway 架构决策**：冻结每个 EdgeCluster 一个多副本 GatewayPool，Central
+  和 Agent 均经 Gateway 建立控制链路；Gateway 不挂载 Volume、不成为 metadata 或对象权威，跨集群
+  传输和只读 S3 延后到后续里程碑。当前 Agent 直连 Central 与 Volume-bound Gateway 仅保留为迁移前
+  基线，不代表目标架构。
 - 仓库格式升级为 v7、SQLite schema 升级为 5、Index 格式升级为 4、Manifest 规范编码升级为
   `neoengram-manifest-v4` 并将分块策略纳入内容 ID；开发期不迁移 v6 仓库。
 - FUSE 对超过 Chunk cache 上限的 WholeFile 在分配前明确失败；对象损坏在 fsck、commit、

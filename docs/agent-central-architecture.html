@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NeoEngram 中心化 Agent 架构</title>
+  <title>NeoEngram 中心化 Agent 架构（迁移前参考）</title>
   <style>
     :root {
       color-scheme: light;
@@ -834,21 +834,28 @@
   <header class="topbar">
     <div class="title-block">
       <p class="eyebrow">NeoEngram / System Map</p>
-      <h1>中心化 Agent 架构</h1>
+      <h1>中心化 Agent 架构（迁移前参考）</h1>
     </div>
     <div class="topbar-actions">
-      <span class="status">设计草案</span>
-      <a class="doc-link" href="./agent-central-control.md">设计文档</a>
+      <span class="status">已被新拓扑取代</span>
+      <a class="doc-link" href="./synapse-gateway-architecture.md">Gateway 目标架构</a>
     </div>
   </header>
+
+  <aside style="margin:16px 28px 0;padding:12px 14px;border:1px solid #f0c36b;background:#fff9e8;color:#744210;line-height:1.55" aria-label="迁移说明">
+    <strong>2026-08-09 迁移说明：</strong>本页交互图保留早期 Agent 直连 Central、Volume-bound Gateway
+    探索，仅用于理解迁移前背景，不是目标拓扑。目标为 Central 主动连接每集群多副本 GatewayPool，
+    Agent 只连接本集群 Gateway；Gateway 不挂载 Volume。后续跨集群固定经源 Agent -> 源 Gateway ->
+    目标 Gateway -> 目标 Agent。
+  </aside>
 
   <main>
     <section class="summary-band" aria-label="架构摘要">
       <div class="summary-lead">
         <p>
           Artifact 是版本化抽象文件系统，Commit 构成版本树；Playground 是读写工作区，Snapshot 是固定
-          Commit 的只读快照。所有控制命令只进入 neoengramd，跨集群对象由获批 Agent/Gateway
-          数据端点直传，Chunk payload 不经过 Server。
+          Commit 的只读快照。Central 是控制权威并主动连接区域 GatewayPool；Agent 只连接本集群
+          Gateway。Gateway 不挂载 Volume，Chunk payload 不经过 Server。
         </p>
       </div>
       <dl class="summary-fact">
@@ -1102,12 +1109,12 @@
             <text class="node-subtitle" x="360" y="937" text-anchor="middle">Agent root RW · Pod exact dir</text>
           </g>
 
-          <g class="node storage-node" data-node="gateway-a" tabindex="0" role="button" aria-label="EdgeCluster A Volume Gateway">
+          <g class="node storage-node" data-node="gateway-a" tabindex="0" role="button" aria-label="EdgeCluster A GatewayPool">
             <rect x="230" y="700" width="260" height="100" rx="6"></rect>
-            <text class="node-title" x="360" y="726" text-anchor="middle">Volume Gateway A</text>
-            <text class="node-subtitle" x="360" y="748" text-anchor="middle">源对象受控出口</text>
-            <text class="node-subtitle" x="360" y="768" text-anchor="middle">Ticket-scoped object stream</text>
-            <text class="node-subtitle" x="360" y="788" text-anchor="middle">Volume A objects-only RO</text>
+            <text class="node-title" x="360" y="726" text-anchor="middle">GatewayPool A [N]</text>
+            <text class="node-subtitle" x="360" y="748" text-anchor="middle">Central / Agent 控制入口</text>
+            <text class="node-subtitle" x="360" y="768" text-anchor="middle">后续 Ticket-scoped stream</text>
+            <text class="node-subtitle" x="360" y="788" text-anchor="middle">no Volume mount</text>
           </g>
 
           <g class="node storage-node" data-node="storage-b" tabindex="0" role="button" aria-label="Cluster B 目标 StorageVolume">
@@ -1118,12 +1125,12 @@
             <text class="node-subtitle" x="1080" y="937" text-anchor="middle">Agent root RW · Pod exact dir</text>
           </g>
 
-          <g class="node storage-node" data-node="gateway-b" tabindex="0" role="button" aria-label="EdgeCluster B Volume Gateway">
+          <g class="node storage-node" data-node="gateway-b" tabindex="0" role="button" aria-label="EdgeCluster B GatewayPool">
             <rect x="950" y="700" width="260" height="100" rx="6"></rect>
-            <text class="node-title" x="1080" y="726" text-anchor="middle">Volume Gateway B</text>
-            <text class="node-subtitle" x="1080" y="748" text-anchor="middle">B 作为源集群时启用</text>
-            <text class="node-subtitle" x="1080" y="768" text-anchor="middle">Ticket-scoped object stream</text>
-            <text class="node-subtitle" x="1080" y="788" text-anchor="middle">Volume B objects-only RO</text>
+            <text class="node-title" x="1080" y="726" text-anchor="middle">GatewayPool B [N]</text>
+            <text class="node-subtitle" x="1080" y="748" text-anchor="middle">Central / Agent 控制入口</text>
+            <text class="node-subtitle" x="1080" y="768" text-anchor="middle">后续 Ticket-scoped stream</text>
+            <text class="node-subtitle" x="1080" y="788" text-anchor="middle">no Volume mount</text>
           </g>
         </svg>
       </div>
@@ -1207,7 +1214,7 @@
           </tr>
           <tr>
             <th>对象传输</th>
-            <td>集群间不直连 Agent/NFS。Gateway 只读挂载对象根；目标 Agent 拉取固定 Commit 对象，中心只签发任务和票据。</td>
+            <td>Gateway 不挂载 Volume；后续固定经源 Agent -> 源 Gateway -> 目标 Gateway -> 目标 Agent 传输，中心只签发任务和票据。</td>
           </tr>
           <tr>
             <th>本地数据库</th>
@@ -1260,13 +1267,13 @@
         "agent-a": {
           title: "EdgeCluster A / Agent A",
           tags: ["Source cluster", "Volume Owner", "mTLS", "Recovery"],
-          description: "作为 Volume A 当前 RW Owner 执行该卷全部 Artifact/Playground 的可变任务，主动建立到中心的 H2/H3 JSON 双向流。",
-          boundary: "Owner generation 失效后不能继续写；Agent A 不向目标 Agent 主动推送对象。"
+          description: "作为 Volume A 当前 RW Owner 执行该卷全部 Artifact/Playground 的可变任务，只主动连接本集群 GatewayPool。",
+          boundary: "Owner generation 失效后不能继续写；Agent A 不直连 Central 或目标 Agent。"
         },
         "agent-b": {
           title: "EdgeCluster B / Agent B",
           tags: ["Destination cluster", "Volume Owner", "S3 pull", "mTLS"],
-          description: "作为 Volume B 当前 RW Owner 领取 Checkout Assignment，经 TransferRoute 从 Gateway A 拉取缺失对象并物化目标 Playground。",
+          description: "作为 Volume B 当前 RW Owner 领取 Checkout Assignment，经 Gateway B 接收 Gateway A 转发的缺失对象并物化目标 Playground。",
           boundary: "Agent B 不能直连 Agent A 或 StorageVolume A；写入必须匹配 Volume B 的 owner generation。"
         },
         "localdb-a": {
@@ -1300,10 +1307,10 @@
           boundary: "Pod/NFS 路径不成为资源身份；一个 Artifact 在 A 最多一个 active placement，跨 Artifact hardlink 和 NFS 别名 Owner 被禁止。"
         },
         "gateway-a": {
-          title: "EdgeCluster A / Volume Gateway A",
-          tags: ["System component", "Source endpoint", "Ticket-scoped stream", "Objects-only RO"],
-          description: "位于系统组件区，只读访问 Volume A 的 Artifact object roots，并把 TransferTicket 允许的对象直传给目标 Agent B。",
-          boundary: "不挂载或暴露 Playground、SQLite、锁、journal、secret 或整个 NFS export，也不参与 RW ownership。"
+          title: "EdgeCluster A / GatewayPool A",
+          tags: ["N replicas", "Control entry", "Ticket-scoped stream", "No Volume mount"],
+          description: "区域 Central/Agent 控制入口；后续从源 Agent 接收 TransferTicket 允许的对象并转发给 Gateway B。",
+          boundary: "不挂载 Volume，不保存 metadata/object 权威，也不参与 RW ownership。"
         },
         "storage-b": {
           title: "EdgeCluster B / StorageVolume B",
@@ -1312,10 +1319,10 @@
           boundary: "Pod 不能直连 Volume A；改变 Artifact 所在 NFS 必须执行 freeze/copy/verify/CAS/drain 迁移。"
         },
         "gateway-b": {
-          title: "EdgeCluster B / Volume Gateway B",
-          tags: ["System component", "Cluster-local", "Ticket-scoped stream", "Objects-only RO"],
-          description: "位于系统组件区，只读访问 Volume B 的 Artifact object roots；当 B 作为源集群时提供受控对象出口。",
-          boundary: "Gateway 是集群内只读数据出口，不是 RW Agent，也不是所有集群共享的全局 Gateway。"
+          title: "EdgeCluster B / GatewayPool B",
+          tags: ["N replicas", "Control entry", "Ticket-scoped stream", "No Volume mount"],
+          description: "区域 Central/Agent 控制入口；后续接收 Gateway A 数据流并转给目标 Agent B。",
+          boundary: "Gateway 不访问 Volume，不是 RW Agent；每个集群拥有自己的逻辑 GatewayPool。"
         }
       };
 

@@ -9,7 +9,9 @@ declare module '*.vue' {
 
 interface ImportMetaEnv {
   readonly VITE_API_BASE_URL?: string;
-  readonly VITE_AGENT_ENDPOINT?: string;
+  readonly VITE_GATEWAY_ENDPOINT?: string;
+  readonly VITE_GATEWAY_WORKLOAD_TRUST_DOMAIN?: string;
+  readonly VITE_GATEWAY_EDGE_CLUSTER_ID?: string;
   readonly VITE_API_MODE?: 'mock' | 'real';
   readonly VITE_AUTH_MODE?: 'mock' | 'development' | 'oidc';
   readonly VITE_DEVELOPMENT_TOKEN?: string;

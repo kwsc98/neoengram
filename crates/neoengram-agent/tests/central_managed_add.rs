@@ -359,6 +359,7 @@ impl ReportSink for CentralReportSink {
             request_id: None,
             trace_id: None,
             sent_at_unix_ms: UnixMillis::new(NOW),
+            central_signature: None,
             message: report.into_control_message(),
             extensions: Extensions::new(),
         };

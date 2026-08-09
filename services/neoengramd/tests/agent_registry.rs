@@ -8,11 +8,11 @@ use neoengram_protocol::{
     AgentBootstrapStatusRequest, AgentBootstrapStatusState, AgentEnrollmentApprovalRequest,
     AgentEnrollmentDecision, AgentEnrollmentId, AgentEnrollmentState,
     AgentEnrollmentTokenCreateRequest, AgentEnrollmentTokenId, AgentId, AgentInstallationId,
-    AgentMountId, AgentMountIdentityDigest, AgentMountStatusReport, Ed25519PublicKeySpki,
-    Ed25519Signature, EdgeClusterId, Extensions, MountAccessMode, MountGeneration, OwnerGeneration,
-    PrincipalId, PrincipalKind, PrincipalRef, PvcIdentityDigest, RequestId, ResourceHealth,
-    ResourceVersion, SequenceNumber, SessionGeneration, StorageVolumeId, TenantId, UnixMillis,
-    VolumeMarkerId, PROTOCOL_VERSION_V1,
+    AgentMountId, AgentMountIdentityDigest, AgentMountStatusReport, AgentWorkloadCertificateBundle,
+    AgentWorkloadCertificateDer, Ed25519PublicKeySpki, Ed25519Signature, EdgeClusterId, Extensions,
+    MountAccessMode, MountGeneration, OwnerGeneration, PrincipalId, PrincipalKind, PrincipalRef,
+    PvcIdentityDigest, RequestId, ResourceHealth, ResourceVersion, SequenceNumber,
+    SessionGeneration, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId, PROTOCOL_VERSION_V1,
 };
 use neoengramd::{
     open_sqlite_agent_registry, open_sqlite_authority, AgentEnrollmentAuditEvent,
@@ -177,6 +177,113 @@ async fn registry_debug_redacts_bootstrap_token_verifier() {
     assert!(debug.contains("[REDACTED]"));
     assert!(!debug.contains(INITIAL_TOKEN));
     assert!(!debug.contains(&verifier));
+}
+
+#[tokio::test]
+async fn workload_certificate_install_advances_generation_once() {
+    let repository: Arc<dyn AgentRegistryRepository> = Arc::new(InMemoryAgentRegistry::new());
+    let clock = Arc::new(InMemoryClock::new(200));
+    let service = AgentRegistryService::new(repository.clone(), clock, 100);
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            initial_token_request(),
+            "Workload certificate test volume",
+        ))
+        .await
+        .unwrap();
+    let key_pair = test_key_pair(1);
+    let pending = service
+        .bootstrap_agent_with_proof(signed_bootstrap_request(
+            initial_bootstrap_request(),
+            &key_pair,
+        ))
+        .await
+        .unwrap();
+    let approved = service
+        .decide_enrollment(
+            approval_request(
+                initial_enrollment_id(),
+                pending.record.resource_version,
+                false,
+            ),
+            actor(),
+        )
+        .await
+        .unwrap()
+        .record;
+    let public_key = approved
+        .candidate
+        .as_ref()
+        .unwrap()
+        .credential_evidence
+        .as_ref()
+        .unwrap()
+        .public_key_spki
+        .fingerprint();
+    let first = workload_certificate_bundle(&approved, public_key, 1, 1_000, 600);
+    let installed = service
+        .install_workload_certificate(approved.resource_version, first.clone())
+        .await
+        .unwrap();
+    let second = workload_certificate_bundle(&installed, public_key, 2, 2_000, 1_200);
+    let renewed = service
+        .install_workload_certificate(installed.resource_version, second.clone())
+        .await
+        .unwrap();
+    assert_eq!(renewed.workload_certificate, Some(second.clone()));
+    assert_eq!(
+        renewed.resource_version.get(),
+        installed.resource_version.get() + 1
+    );
+    let stale = service
+        .install_workload_certificate(renewed.resource_version, first)
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), CentralErrorCode::AgentIdentityMismatch);
+
+    let opened = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot_id("certificate-replacement-old-boot"),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: renewed.resource_version,
+        })
+        .await
+        .unwrap();
+    assert_eq!(opened.session_generation, SessionGeneration::new(1));
+    service
+        .create_storage_enrollment_intent(rich_intent(
+            replacement_token_request(),
+            "Workload certificate test volume",
+        ))
+        .await
+        .unwrap();
+    let replacement_key = test_key_pair(2);
+    let replacement = service
+        .bootstrap_agent_with_proof(signed_bootstrap_request(
+            replacement_bootstrap_request(),
+            &replacement_key,
+        ))
+        .await
+        .unwrap();
+    let replaced = service
+        .decide_enrollment(
+            approval_request(
+                replacement_enrollment_id(),
+                replacement.record.resource_version,
+                true,
+            ),
+            actor(),
+        )
+        .await
+        .unwrap();
+    let revoked = replaced.revoked_record.unwrap();
+    assert_eq!(revoked.workload_certificate, Some(second));
+    assert_eq!(
+        revoked.instance.unwrap().session_generation,
+        Some(SessionGeneration::new(2))
+    );
 }
 
 #[tokio::test]
@@ -3495,6 +3602,43 @@ fn healthy_bootstrap_probe() -> AgentBootstrapProbe {
         fsync_supported: true,
         health: ResourceHealth::Ready,
         observed_at_unix_ms: UnixMillis::new(199),
+        extensions: Extensions::new(),
+    }
+}
+
+fn workload_certificate_bundle(
+    record: &AgentRegistryRecord,
+    public_key_fingerprint: ContentDigest,
+    generation: u64,
+    not_after: u64,
+    renew_at: u64,
+) -> AgentWorkloadCertificateBundle {
+    AgentWorkloadCertificateBundle {
+        certificate_bundle_version: AgentWorkloadCertificateBundle::VERSION,
+        edge_cluster_id: record.enrollment.edge_cluster_id.clone(),
+        agent_id: record.enrollment.reserved_agent_id.clone(),
+        enrollment_id: record.enrollment.enrollment_id.clone(),
+        identity_uri: format!(
+            "spiffe://mesh.example.test/workloads/edge-clusters/{}/agents/{}",
+            record.enrollment.edge_cluster_id, record.enrollment.reserved_agent_id
+        ),
+        public_key_fingerprint,
+        certificate_generation: neoengram_protocol::CertificateGeneration::new(generation),
+        session_generation: record
+            .instance
+            .as_ref()
+            .and_then(|instance| instance.session_generation)
+            .unwrap_or_else(|| SessionGeneration::new(1)),
+        mount_generation: record.mount.mount_generation,
+        owner_generation: record.owner.owner_generation,
+        not_before_unix_ms: UnixMillis::new(100),
+        not_after_unix_ms: UnixMillis::new(not_after),
+        renew_at_unix_ms: UnixMillis::new(renew_at),
+        leaf_certificate_der: AgentWorkloadCertificateDer::new(
+            format!("agent-leaf-{generation}").into_bytes(),
+        )
+        .unwrap(),
+        issuer_chain_der: vec![AgentWorkloadCertificateDer::new(b"agent-issuer".to_vec()).unwrap()],
         extensions: Extensions::new(),
     }
 }

@@ -5,9 +5,10 @@ info:
   version: 0.0.1
   summary: Agent-initiated action API for enrollment, sessions, Jobs, Index and Manifest pages, and metadata
   description: |
-    Contract for the independent Agent listener. Every operation is an action-style POST and all
-    resource identities are carried in the JSON body. This API is not exposed by the public Web
-    listener.
+    Contract for the internal Agent action boundary carried through the Synapse Gateway. Every
+    operation is an action-style POST and all resource identities are carried in the JSON body.
+    This API is not exposed by the public Web listener. The standalone listener is a loopback-only
+    migration/test adapter and is not the production topology.
 
     Authentication is carried inside each JSON request. OpenAPI 3.1 Security Scheme Objects cannot
     describe a body-carried bootstrap token or Ed25519 proof, so every operation intentionally uses
@@ -18,7 +19,7 @@ info:
     identifier: MIT OR Apache-2.0
 servers:
   - url: http://127.0.0.1:8081
-    description: Loopback development Agent listener
+    description: Loopback migration/test Agent listener (not a production endpoint)
 tags:
   - name: Enrollment
     description: One-time enrollment bootstrap and signed approval-status query operations
@@ -506,7 +507,7 @@ components:
             session_generation:
               $ref: '#/components/schemas/PositiveDecimalU64'
     AgentChannelUpstreamFrame:
-      description: One independently signed Agent-to-Server JSON record, limited to 1048576 encoded bytes before its mandatory LF delimiter.
+      description: One independently signed Agent-to-Central logical JSON record carried through Gateway, limited to 1048576 encoded bytes before its mandatory LF delimiter.
       oneOf:
         - $ref: '#/components/schemas/AgentChannelOpenFrame'
         - $ref: '#/components/schemas/AgentChannelHeartbeatFrame'
@@ -592,7 +593,7 @@ components:
                     payload:
                       $ref: '#/components/schemas/AgentSessionClosePayload'
     AgentChannelDownstreamFrame:
-      description: One Server-to-Agent JSON record, limited to 1048576 encoded bytes before its mandatory LF delimiter.
+      description: One Central-to-Agent logical JSON record carried through Gateway, limited to 1048576 encoded bytes before its mandatory LF delimiter.
       oneOf:
         - $ref: '#/components/schemas/AgentChannelOpenedFrame'
         - $ref: '#/components/schemas/AgentChannelAssignmentFrame'

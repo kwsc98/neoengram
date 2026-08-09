@@ -6,6 +6,7 @@ deployment="$root/deployment.yaml"
 config="$root/configmap.yaml"
 secret="$root/secret.example.yaml"
 state_pvc="$root/agent-state-pvc.yaml"
+network_policy="$root/networkpolicy.yaml"
 
 fail() {
   echo "Agent manifest check failed: $*" >&2
@@ -14,7 +15,7 @@ fail() {
 
 command -v rg >/dev/null 2>&1 || fail "ripgrep is required"
 
-for file in "$deployment" "$config" "$secret" "$state_pvc"; do
+for file in "$deployment" "$config" "$secret" "$state_pvc" "$network_policy"; do
   [[ -f "$file" ]] || fail "missing $file"
   rg -q '^apiVersion: ' "$file" || fail "$file has no apiVersion"
   rg -q '^kind: ' "$file" || fail "$file has no kind"
@@ -56,6 +57,10 @@ for expected in \
 done
 
 for expected in \
+  'gateway_endpoint: https://synapse-gateway.' \
+  'trust_bundle_file: /etc/neoengram/gateway-ca.pem' \
+  'gateway_workload_trust_domain: mesh.example.test' \
+  'central_command_trust_bundle_file: /etc/neoengram/central-command-trust.json' \
   'storage_volume_id: volume-example' \
   'volume_descriptor_digest: replace-with-64-lowercase-hex-descriptor-digest' \
   'region: cn-example-1' \
@@ -69,7 +74,27 @@ for expected in \
   rg -q "$expected" "$config" || fail "Agent config is missing scope field: $expected"
 done
 
+if rg -n 'central_endpoint|neoengram-server|neoengram-central' "$config" "$deployment"; then
+  fail "Agent manifests must not contain a Central endpoint or fallback"
+fi
+rg -q '^  gateway-ca\.pem: \|$' "$config" || fail "Gateway trust bundle must be projected"
+rg -q '^  central-command-trust\.json: \|$' "$config" || \
+  fail "Central command trust bundle must be projected"
+rg -q '"certificate_generation": "1"' "$config" || \
+  fail "Central command trust keys must be generation-bound"
+rg -q '"state": "active"' "$config" || \
+  fail "Central command trust keys must declare a lifecycle state"
+rg -q '^kind: NetworkPolicy$' "$network_policy" || fail "Agent egress NetworkPolicy is required"
+rg -q '^    - Egress$' "$network_policy" || fail "Agent NetworkPolicy must restrict egress"
+rg -q 'app.kubernetes.io/name: synapse-gateway' "$network_policy" || \
+  fail "Agent egress must be scoped to Synapse Gateway"
+if rg -n 'neoengram-(server|central)|central' "$network_policy"; then
+  fail "Agent egress policy must not allow Central"
+fi
+
 rg -q '^    - ReadWriteOnce$' "$state_pvc" || fail "Agent state PVC must be RWO"
 rg -q '^immutable: true$' "$secret" || fail "bootstrap Secret must be immutable"
+rg -q 'neoengram.io/gateway-pool-id: gateway-pool-example' "$secret" || \
+  fail "bootstrap Secret must identify its GatewayPool"
 
 echo "Agent manifest policy checks passed"

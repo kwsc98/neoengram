@@ -1,0 +1,102 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: synapse-gateway-gateway-pool-example
+  namespace: synapse-gateway-example
+  annotations:
+    neoengram.io/example-only: "external-provisioner-required"
+    # Render an explicit ipBlock for Central/remote clusters in the deployment
+    # overlay. This example deliberately does not guess public CIDRs.
+    neoengram.io/external-network-policy: "render-cluster-specific-ip-block"
+  labels:
+    app.kubernetes.io/name: synapse-gateway
+    app.kubernetes.io/component: edge-gateway
+    neoengram.io/edge-cluster: edge-example
+    neoengram.io/gateway-pool: gateway-pool-example
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: synapse-gateway
+      neoengram.io/gateway-pool: gateway-pool-example
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Agent enrollment/status and authenticated Agent traffic enter only through
+    # the Agent edge listener. The namespace label is an explicit trust boundary.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: neoengram-agent-example
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: neoengram-agent
+      ports:
+        - protocol: TCP
+          port: 8081
+    # Central reaches the Replica bootstrap listener and the mTLS control listener.
+    # Add an ipBlock in the cluster overlay when Central is outside this cluster.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              neoengram.io/control-plane: "true"
+      ports:
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 8082
+    # Gateway peers are restricted to explicitly labelled Gateway namespaces and
+    # cannot use the Agent or Central listeners.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              neoengram.io/gateway-plane: "true"
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: synapse-gateway
+      ports:
+        - protocol: TCP
+          port: 8083
+    # Keep same-namespace peer traffic working for this single-cluster example.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: synapse-gateway
+              neoengram.io/gateway-pool: gateway-pool-example
+      ports:
+        - protocol: TCP
+          port: 8083
+  egress:
+    # In-cluster peer forwarding. Cross-cluster peers require a rendered ipBlock
+    # (or CNI-specific policy) and are intentionally absent from this example.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              neoengram.io/gateway-plane: "true"
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: synapse-gateway
+      ports:
+        - protocol: TCP
+          port: 8083
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: synapse-gateway
+              neoengram.io/gateway-pool: gateway-pool-example
+      ports:
+        - protocol: TCP
+          port: 8083
+    # DNS only; no broad egress to Central or Volume/Storage networks.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

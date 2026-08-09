@@ -29,7 +29,12 @@ import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import { runtimeConfig } from '@/config';
-import { buildAgentConfig, canonicalAgentEndpoint } from '@/features/storage/agent-config';
+import {
+  buildAgentConfig,
+  canonicalGatewayEndpoint,
+  canonicalGatewayWorkloadTrustDomain,
+  validateGatewayClusterBinding,
+} from '@/features/storage/agent-config';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
 
@@ -66,7 +71,7 @@ const pendingTokenRequest = ref<CreateStorageEnrollmentTokenRequest>();
 const enrollmentForm = reactive({
   storageVolumeId: '',
   displayName: '',
-  edgeClusterId: '',
+  edgeClusterId: runtimeConfig.gatewayEdgeClusterId,
   region: '',
   accessMode: 'read_write_many' as StorageEnrollmentAccessMode,
   pvcNamespace: '',
@@ -146,7 +151,13 @@ const deploymentConfigResult = computed(() => {
   if (!token || !descriptor) return { yaml: '', error: '' };
   try {
     return {
-      yaml: buildAgentConfig(runtimeConfig.agentEndpoint, descriptor, token),
+      yaml: buildAgentConfig(
+        runtimeConfig.gatewayEndpoint,
+        runtimeConfig.gatewayWorkloadTrustDomain,
+        descriptor,
+        token,
+        runtimeConfig.gatewayEdgeClusterId,
+      ),
       error: '',
     };
   } catch (error) {
@@ -226,7 +237,7 @@ function openEnrollment(): void {
   Object.assign(enrollmentForm, {
     storageVolumeId: '',
     displayName: '',
-    edgeClusterId: '',
+    edgeClusterId: runtimeConfig.gatewayEdgeClusterId,
     region: '',
     accessMode: 'read_write_many',
     pvcNamespace: '',
@@ -265,13 +276,26 @@ function validateResourceFields(fields: {
 async function submitEnrollment(): Promise<void> {
   enrollmentError.value = '';
   try {
-    canonicalAgentEndpoint(runtimeConfig.agentEndpoint);
+    const endpoint = canonicalGatewayEndpoint(runtimeConfig.gatewayEndpoint);
+    if (new URL(endpoint).protocol === 'https:') {
+      canonicalGatewayWorkloadTrustDomain(runtimeConfig.gatewayWorkloadTrustDomain);
+    }
   } catch (error) {
-    enrollmentError.value = error instanceof Error ? error.message : 'Agent endpoint 配置无效';
+    enrollmentError.value = error instanceof Error ? error.message : 'Gateway endpoint 配置无效';
     return;
   }
   if (!validateResourceFields(enrollmentForm)) {
     enrollmentError.value = '请填写合法的 StorageVolume ID、名称、EdgeCluster ID 和 Region';
+    return;
+  }
+  try {
+    validateGatewayClusterBinding(
+      runtimeConfig.gatewayEndpoint,
+      runtimeConfig.gatewayEdgeClusterId,
+      enrollmentForm.edgeClusterId,
+    );
+  } catch (error) {
+    enrollmentError.value = error instanceof Error ? error.message : 'Gateway 集群绑定配置无效';
     return;
   }
   const kubernetesNamespace = /^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
@@ -831,7 +855,11 @@ function fingerprintSummary(value: string): string {
               <el-input v-model="enrollmentForm.displayName" placeholder="视觉数据 PVC" />
             </el-form-item>
             <el-form-item label="EdgeCluster ID" required>
-              <el-input v-model="enrollmentForm.edgeClusterId" placeholder="cluster-cn-east-1" />
+              <el-input
+                v-model="enrollmentForm.edgeClusterId"
+                placeholder="cluster-cn-east-1"
+                :disabled="Boolean(runtimeConfig.gatewayEdgeClusterId)"
+              />
             </el-form-item>
             <el-form-item label="Region" required>
               <el-input v-model="enrollmentForm.region" placeholder="cn-shanghai" />

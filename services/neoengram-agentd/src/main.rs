@@ -55,6 +55,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+fn initialize_logging(
+    config: &AgentConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let filter = EnvFilter::try_new(&config.logging.level)?;
+    match config.logging.format {
+        LoggingFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .try_init()?,
+        LoggingFormat::Pretty => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .try_init()?,
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,20 +97,4 @@ mod tests {
         };
         assert!(arguments.development_directory_probe);
     }
-}
-
-fn initialize_logging(
-    config: &AgentConfig,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let filter = EnvFilter::try_new(&config.logging.level)?;
-    match config.logging.format {
-        LoggingFormat::Json => tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .try_init()?,
-        LoggingFormat::Pretty => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .try_init()?,
-    }
-    Ok(())
 }

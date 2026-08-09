@@ -4,12 +4,20 @@
 > README 中出现的路线描述应与本文保持一致；如果出现冲突，以本文为准。
 > 中心化 Agent 的用户角色、公开资源语义、页面和交互口径见
 > [`centralized-agent-product.md`](centralized-agent-product.md)。
+> Gateway 的连接、安全、HA、数据传输和 S3 专项边界见
+> [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。
 
-最后更新：2026-08-06
+最后更新：2026-08-10
 当前阶段：`0.2.0` P0、中心 `AuthorityStore`/SQLite 默认后端，以及 Volume-bound Agent enrollment、
 本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；独立 `neoengram-server` 提供用户 API 和
-Agent action listener，`neoengram-agentd` 已通过 H2 双向 channel 完成 enrollment/session/Job，并将 Chunk
-直接写入用户 Volume CAS。PG/MySQL、生产 mTLS、跨 Volume 复制与真实 Kubernetes 验收待实现
+迁移前 Agent action listener，`neoengram-agentd` 已通过 Gateway H2 双向 channel 完成
+enrollment/session/Job，并将 Chunk 直接写入用户 Volume CAS。Synapse Gateway G1 已实现协议、
+Registry v7、管理 API、Central session、
+Registry-driven outbound tunnel、Replica activation、运行时 H2/mTLS、RouteLease、Central command
+signing/trust bundle 和最多一跳 peer forwarding；双 Replica listener/H2/peer harness 与真实
+InMemory/SQLite RouteLease 接管契约已分别通过，但完整 Central/Registry/outbox/签名业务 E2E、外部生产
+issuer/KMS-HSM adapter、真实集群 readiness/failover 和一次性切换尚未完成。PG/MySQL、跨 Volume 复制与
+真实 Kubernetes 验收同样待实现。
 
 ## 1. 产品目标
 
@@ -19,6 +27,8 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 - Agent/客户端负责工作区、切块、校验、Volume 对象 CAS 和本地恢复；
 - 中心控制面负责 tenant/project/artifact、Commit/Directory/Manifest、内部版本 CAS、并发提交、权限、
   会话和审计；
+- 每个 EdgeCluster 的多副本 GatewayPool 作为 Central/Agent 控制连接和后续数据/S3 的区域入口，但不
+  成为 metadata 或对象权威；
 - Managed 数据面将 Chunk payload 保存在用户 StorageVolume 的 tenant/artifact 隔离 CAS，Server 不保存或代理字节；
 - 读取面以固定的 Snapshot、Shard 分页和租约向训练任务提供一致数据；
 - 所有不可变对象通过内容 ID 校验，ref 更新通过条件 CAS 线性化；
@@ -43,6 +53,9 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | `Playground` | 基于某个 Commit 的可读写工作区，拥有独立 IndexVersion，能够发布新 Commit |
 | `Snapshot` | 具有独立 `snapshot_id`，固定 `artifact_id + commit_id` 和一个 Region/StorageVolume 的只读交付；同一 Commit 可有多个 Snapshot |
 | `MetadataBatch` | Agent 向中心分页上传的 IndexDelta/ObjectReceipt 临时批次，不是 Artifact |
+| `GatewayPool` | 一个 EdgeCluster 的逻辑 Gateway 入口；生产由多个 GatewayReplica 提供服务 |
+| `GatewayReplica` | GatewayPool 内可独立连接、心跳、drain 和撤销的进程实例 |
+| `AgentRouteLease` | Central 权威记录的 Agent 当前 owner Replica、连接和 route generation 短租约 |
 
 当前 format v8 和 CLI 中的 `repository`、`workspace` 是 Standalone 名称：在中心领域模型中分别
 映射为 `Artifact`、`Playground`。本地保留 `repository.json` 和 `workspace` 命令，不得因此在新
@@ -54,8 +67,8 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
   PostgreSQL 是多实例/HA/RLS 目标；Server ObjectCatalog 只保存 Volume placement evidence；
 - 客户端通过 header-versioned、模块/动作式 HTTP JSON API 访问中心服务，不直接访问数据库；当前
   Fusen 用户 listener 已注册 system、Tenant、StorageVolume、Enrollment、Artifact、Playground、
-  Pre-commit、Commit 和 Job 纵切，独立 Hyper listener 提供 enrollment、H2 双向 session channel、
-  MetadataBatch 与 Index page action；
+  Pre-commit、Commit 和 Job 纵切；Agent action 契约经 Gateway 转发，迁移前独立 Hyper listener 仅在
+  loopback 测试中提供 enrollment、H2 双向 session channel、MetadataBatch 与 Index page action；
 - Vue 3 Web 控制台作为独立 `apps/neoengram-web` npm 应用，只消费公开 OpenAPI；首版 MSW 可运行，
   已覆盖租户切换/创建、StorageVolume 登记与放置选择、Project 筛选、无固定放置 Artifact、单 Volume
   Playground、单区域 Snapshot、Pre-commit、带描述和 Tags 的 Playground Commit、父版本文件/元数据
@@ -68,6 +81,9 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 - 默认部署边界是企业内部多租户；首版认证抽象使用外部 OIDC/JWKS 签发的 Bearer JWT，缺失绑定、
   未知或 disabled principal 默认拒绝；SQLite server 只部署一个副本，生产 TLS 由 Ingress/反向代理终止；
 - 当前 Agent 只访问获批 Volume；后续跨 Volume 复制使用精确 Object ID 范围的短期票据，不持有长期跨卷凭证；
+- 迁移前 Agent 直接连接 Server；当前 Agent 配置已改为只连接本集群 GatewayPool，Gateway H2/mTLS、
+  RouteLease、一跳 peer forwarding 和端到端命令签名已接入，但生产切换验收前仍 fail-closed。Central
+  主动连接持久化登记的 GatewayReplica；Gateway 不挂载 Volume；
 - v1 只做租户内对象去重，避免跨租户对象存在性侧信道。
 
 ### 产品决策状态
@@ -76,13 +92,15 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 | --- | --- | --- |
 | Chunk payload 位置 | 用户 StorageVolume 的 `.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects`；Server 无 payload | Agent Volume CAS 已实现，跨 Volume 复制待实现 |
 | API 传输 | protocol 与 transport 分离；Fusen 用户 action API + Hyper Agent action API | H2 双向 session/Job、enrollment、metadata/index 与当前资源纵切已实现；其余公开资源 operation 待实现 |
+| Gateway 控制入口 | 每 EdgeCluster 一个多副本 GatewayPool；Central 主动连接 Gateway，Agent 只连接本集群 Gateway | G1 进行中：Registry/管理面、H2/mTLS tunnel、RouteLease、命令签名与一跳 forwarding 已落地；协议网络 harness 与 Registry 接管契约已分别通过，完整业务 E2E、外部生产凭据、真实集群 readiness/failover 与切换待完成 |
+| Gateway 存储边界 | 不挂载 Volume、不保存 metadata/object；Volume I/O 仍只由 Owner Agent 执行 | 代码与 manifest 约束已实现，真实集群验收待完成 |
 | 一致性模型 | metadata/ref 强一致 CAS；对象具有精确 Volume/placement generation 凭证后才能发布 | P0 状态机已实现 |
 | 中心权威存储 | `AuthorityStore` + 默认 SQLite；PG/MySQL 独立实现相同行为契约 | SQLite 单节点已完成，HA/RLS 待实现 |
 | 身份认证 | `Authenticator` 抽象；v1 外部 OIDC/JWKS + Bearer JWT | 已注册用户接口已接线并默认拒绝；Agent enrollment 使用 token + Ed25519 proof；生产轮换/E2E 持续加固 |
 | 授权范围 | tenant → project → artifact → ref；服务端 RBAC，默认拒绝 | Job 与 Storage enrollment 已接线，其余资源授权待实现 |
 | 对象访问 | 当前仅 Volume Owner Agent 本地访问；跨 Volume 后续签发短期、source placement/Object 范围票据 | 本 Volume 已实现，跨 Volume 待实现 |
 | 训练快照 | `artifact_id + commit_id` 的固定、单 Region/单 StorageVolume Snapshot；可选 sidecar 描述 | 产品原型已确认，生产待实现 |
-| Kubernetes Agent 放置 | 一个业务 PVC = 一个 StorageVolume = 一个常驻 AgentInstance；固定挂载 `/volume`，Agent 状态使用独立 PVC | enrollment、H2 session daemon 与模板已实现；生产证书/mTLS 和真实集群 E2E 待实现 |
+| Kubernetes Agent 放置 | 一个业务 PVC = 一个 StorageVolume = 一个常驻 AgentInstance；固定挂载 `/volume`，Agent 状态使用独立 PVC | enrollment、H2 session daemon、证书安装、mTLS 和模板已实现；生产凭据 provisioner 与真实集群 E2E 待完成 |
 | Agent 注册与接管 | Agent 主动出站注册并等待首次审批；0.0.1 仅支持 generation + 人工 takeover 的 cooperative fencing | 状态语义已冻结，强 fencing 待原型 |
 | 历史保留 | ref、pin/hold、active lease/session/有效 TransferTicket 作为 GC roots；隔离期后由 Agent 回收 Volume 对象 | 已确定设计，待实现 |
 | 规模与可靠性 | 千万文件、上亿 Chunk、PB 级 payload；99.9%、RPO 0、RTO 1 小时 | 后续基准验证 |
@@ -170,7 +188,8 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 - Volume-bound Agent Registry 使用独立 `agent-registry.sqlite3`/`agent-registry.lock`，与 R1
   authority 在同一单进程 `AuthorityStore` 中组合，不共享 SQLite 文件。审批决策的规范审计事件
   嵌入同一 Registry CAS aggregate 并与决策原子持久化；Authority audit 表仅是后续兼容投影，
-  两个 SQLite 文件之间没有跨库事务承诺。
+  两个 SQLite 文件之间没有跨库事务承诺。G1 已将该 Registry 从 schema v6 原子迁移到 v7，加入
+  GatewayPool/Replica、credential 和 AgentRouteLease；这不改变 `authority.sqlite3` 的 user_version 6。
 
 ### 3.3 质量基线
 
@@ -201,7 +220,7 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 | --- | --- | --- |
 | 客户端数据面 | 工作区、Index、FastCDC/WholeFile Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
 | 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | SQLite adapter 继续收敛到 engine 分页 ports |
-| 中心/Agent | protocol v1、Ed25519 会话、H2 双向 channel、Agent Ledger/outbound SQLite、mount probe、enrollment registry、双 listener server、异步 AuthorityStore 与中心 SQLite 单节点权威 | 生产 mTLS、PostgreSQL HA/RLS、完整授权/调度与 Kubernetes E2E |
+| 中心/Agent | 迁移前 H2 双向 channel、Agent Ledger/outbound SQLite、mount probe、enrollment/AuthorityStore；Gateway ID/协议、Registry v7、管理 API/session/activation、Registry-driven outbound connector、H2/mTLS、RouteLease、命令签名、一跳 forwarding 和 Gateway-only Agent 配置；双 Replica 协议 harness 与 Registry 接管契约分别通过 | 完整 Central/Registry/outbox/签名双 Replica E2E、外部生产 issuer/KMS-HSM、真实集群 readiness/failover、切换验收、PostgreSQL HA/RLS、完整授权/调度 |
 | Managed 数据面 | Agent 扫描并将 Chunk 写入 Volume CAS，ObjectReceipt 绑定 placement generation，Server 无 payload | 跨 Volume 短期 ticket、断点续传、对象生命周期和 GC 编排 |
 | 读取面 | checkout、权限快照和固定 Commit FUSE | Snapshot、Shard 分页、mount lease、训练读取票据 |
 | 安全治理 | 本地路径安全、OIDC/JWKS、已注册接口的默认拒绝 RBAC、租户隐藏和 enrollment proof | RLS、完整资源授权/审计、密钥轮换和生产威胁模型 |
@@ -214,8 +233,10 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 这些限制不能在分布式服务上线前被忽略：
 
 1. **联网控制面仍是开发纵切**：已有 Tenant/Storage/Artifact/Playground/Pre-commit/Commit/Job
-   action、Agent enrollment/H2 session/Job delivery、OIDC/JWKS 与 RBAC，但其余 OpenAPI、生产 mTLS、
-   PostgreSQL HA/RLS、跨 Volume 调度和多副本部署仍未实现；SQLite server 必须保持单副本。
+  action、Agent enrollment/H2 session/Job delivery、OIDC/JWKS 与 RBAC，以及 Gateway Registry/管理面、
+   H2/mTLS tunnel、RouteLease、命令签名和一跳 forwarding；但其余 OpenAPI、外部生产凭据 adapter、
+   PostgreSQL HA/RLS、跨 Volume 调度、真实集群 readiness/failover 和切换验收仍未实现。Agent 已无 Central endpoint
+   fallback，切换验收前不能视为可用生产控制面；SQLite server 必须保持单副本。
 2. **没有跨 Volume 对象同步**：本 Volume CAS 写入、复核和 placement evidence 已实现，但尚无
    source/destination route、短期 ticket、断点续传、fetch/clone/push/pull。
 3. **文件语义不完整**：当前模型未保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。
@@ -245,11 +266,30 @@ neoengram CLI -> standalone -> engine <- agent
 该简图不枚举 CLI 对 core/engine 的直接类型导入；Agent 对 `neoengramd` 的 `dev-dependency` 只用于
 内存端到端组合测试，不属于生产依赖方向。
 
-Managed 运行时的目标数据流是用户 API 经 `neoengram-server` 进入 `neoengramd`，中心经
-`AuthorityStore` 持久化 Job/Assignment，经 Agent 主动建立的 H2 双向 session 下发；Agent 访问
-Playground 和同一获批 Volume 中的对象 CAS，将结构化 metadata/placement evidence 返回中心做最终
-CAS。Chunk 字节不进入 Server listener。当前该单 Server/单 Agent 开发纵切已实现；生产 mTLS、
-PostgreSQL HA/RLS、跨 Volume 传输和完整用户 API 仍待实现。
+Managed 的迁移前数据流是用户 API 经 `neoengram-server` 进入 `neoengramd`，中心经 `AuthorityStore`
+持久化 Job/Assignment，再通过 Agent 主动直连 Server 的 H2 session 下发。该单 Server/单 Agent 开发
+纵切曾经闭环；当前 Agent 配置已切到 Gateway-only，Gateway 控制面代码链已接入，loopback 双 Replica 网络
+listener/H2/peer harness 与真实 Registry RouteLease 接管契约已分别通过，但完整业务 E2E、真实集群
+readiness/failover 和维护窗口切换尚未完成，因此仓库仍处于控制链切换中的 fail-closed 阶段。
+
+目标控制拓扑固定为：
+
+```text
+Central -> GatewayPool A [N replicas] <- Agent A -> Volume A
+        -> GatewayPool B [N replicas] <- Agent B -> Volume B
+
+跨集群：Agent A -> Gateway A -> Gateway B -> Agent B
+S3：Client -> 所属集群 Gateway -> owning Agent -> Volume CAS
+```
+
+Central 主动连接持久化登记的 GatewayReplica；Agent 只主动连接本集群 GatewayPool。Central 以
+`AgentRouteLease` 原子维护唯一 owner Replica 和 route generation，跨 Replica forwarding 最多一跳。
+Gateway 使用 H2+mTLS、保留 Central/Agent 端到端签名，不挂载 Volume，也不持久化 metadata 或 Chunk。
+Agent 访问 Playground 和获批 Volume CAS，将结构化 metadata/placement evidence 经 Gateway 返回中心
+做最终 CAS。Gateway Registry/管理面、运行时 H2/mTLS tunnel、RouteLease、Central command signing 和
+最多一跳 forwarding 已实现；双 Replica 协议网络 harness 与真实 Registry 接管契约已分别通过，但完整
+业务 E2E、外部生产 issuer/KMS-HSM adapter、真实集群 readiness/failover、切换、PostgreSQL HA/RLS、
+跨 Volume 传输和完整用户 API 仍待实现。
 
 边界规则：
 
@@ -259,6 +299,8 @@ PostgreSQL HA/RLS、跨 Volume 传输和完整用户 API 仍待实现。
 - 服务端必须在 Index/ref CAS 前验证 Commit → Directory → Manifest → Object 的完整引用图。
 - 控制面负责认证、授权、元数据强一致、租约和审计；本 Volume 数据面由 Assignment generation
   限定，未来跨 Volume 数据面只接受 Server 签发的受限票据。
+- GatewayPool 多副本只提升区域入口可用性；不构成 metadata、Volume 或对象副本。GatewayPool 整体
+  不可用时该集群控制/传输/S3 失败关闭，但本地 Volume 数据不受损。
 - 读取面先把 ref 解析为固定 Commit，再分页读取 Manifest/Shard；ref 后续移动不能改变已打开
   Snapshot 的内容。
 - 所有 metadata/report 上报与 Volume 对象发布必须幂等；重试不能产生不同对象或重复提交。
@@ -269,9 +311,12 @@ PostgreSQL HA/RLS、跨 Volume 传输和完整用户 API 仍待实现。
 
 节点侧 Agent 和中心 Job/Assignment/Finalize 状态机已有 library + 内存适配器；一 PVC 一 Agent 纵切还
 增加了持久 SQLite 身份/Ledger、mount probe 和中心 Agent Registry adapter。多租户生产部署、
-多 EdgeCluster、CPU/NFS 调度、Gateway 和跨卷 checkout 仍处设计阶段，详细草案见
-[`agent-central-control.md`](agent-central-control.md)。当前网络 Agent 已覆盖 enrollment/session/Job/metadata；该文档
-不代表已经存在中心 PostgreSQL、生产 lease/fencing、Gateway 或跨 Volume 数据通道。
+多 EdgeCluster、CPU/NFS 调度和跨卷 checkout 仍处设计或后续阶段。Gateway 不再是待定目标：G1
+控制面已经落地 Registry/管理面、三类 listener、H2/mTLS tunnel、RouteLease、命令签名和最多一跳
+forwarding，但完整业务 E2E、外部生产 issuer/KMS-HSM、真实集群 readiness/failover、维护窗口切换
+仍未完成。Gateway 的边界以 [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md) 为准，
+其他控制面细节见 [`agent-central-control.md`](agent-central-control.md)。这些文档不代表已经存在中心
+PostgreSQL、生产级 lease/fencing、跨 Volume 数据通道或 G2/G3 能力。
 
 远程 Agent 设计已冻结以下存储约束：一个 Tenant 每个 EdgeCluster 可有多个 StorageVolume，一个
 Volume 可承载该 Tenant 的多个 Artifact，一个 Artifact 每集群最多一个 active `ArtifactPlacement`；
@@ -325,6 +370,95 @@ unavailable，禁止自动接管。
 `neoengram-agentd` 纵切；PostgreSQL、Agent 生产 mTLS、跨 Volume 复制、NFS fencing、其余公开 API 与 HA
 仍不包含在当前实现中。
 
+### G0：Synapse Gateway 架构冻结
+
+状态：**已完成（仅文档，不代表运行能力）**
+
+- 冻结每 EdgeCluster 一个逻辑 GatewayPool、Pool 内 N 个 GatewayReplica 的拓扑；
+- 冻结 Central 主动连接 Gateway、Agent 只连接本集群 Gateway 的连接方向；
+- 冻结 Central metadata authority、Volume Owner Agent I/O authority 和 Gateway 无业务持久状态边界；
+- 冻结一次性切换、无旧 Agent-Central 双栈兼容，以及跨集群/S3 后置策略。
+
+验收：专项架构、控制面、存储、产品、部署和原型文档清楚区分当前直连实现与目标 Gateway 架构。
+
+### G1：Gateway 控制面
+
+状态：**进行中；控制面代码链、双 Replica 协议 harness 和 Registry 接管契约已落地，完整业务 E2E、生产凭据、真实集群故障验收和切换未完成**
+
+- 已完成 `GatewayPoolId`/`GatewayReplicaId`、Gateway 控制帧，以及 GatewayPool、GatewayReplica、
+  AgentRouteLease 的协议/持久化模型；
+- 已完成 `GatewayRegistryRepository` 的 InMemory/SQLite v7、管理 API、受 `gateway.manage` 保护的
+  显式 Replica activate action，以及一次性 activation token 的摘要存储、challenge/proof、防重放
+  和 Pending -> Active CAS；Central 通过 Registry 持久化的 bootstrap endpoint 主动投递证书。
+- `GatewayActivationDependencies` 为 issuer/transport 提供显式 runtime 注入边界；生产
+  KMS/HSM-backed `WorkloadCertificateIssuer` 适配和默认进程配置仍待完成，未配置时 activate
+  action fail-closed 返回 `503`。
+- `HttpGatewayBootstrapTransport` 只能由 `reqwest::ClientBuilder` 构造，内部强制关闭 HTTP
+  redirect；bootstrap proof/证书 payload 不得被 3xx 转发到 Registry 之外的 origin。
+- 已新增 `services/synapse-gateway`、Agent edge/Central control/Replica peer listener、限额/health 和
+  Kubernetes Deployment/Service/PDB/NetworkPolicy；Gateway Pod 无业务 Volume mount；
+- 已将 Agent 配置收敛为 GatewayPool endpoint + trust bundle 且无 Central fallback；Central 根据
+  Registry endpoint 建立 outbound 连接，Agent 请求转发、session 与 RouteLease 由 Central 原子判定；
+- 已实现最多一跳的 Replica forwarding：Central 只从 Registry 读取 owner/peer endpoint，source Gateway
+  主动连接 owner peer listener，owner 校验 mTLS identity、Agent/connection/session/route generation 后
+  原样投递 LF-terminated Agent frame；不可达返回 `route_unavailable`，不广播或抢占 owner；
+- 已实现 Central peer credential directory：control 建链后发送当前 Pool 的 Active Replica
+  certificate generation/fingerprint 快照，heartbeat 刷新且同一 session 内严格递增；Gateway peer listener
+  对 TLS leaf DER 做 fingerprint allow-list 校验，目录缺失/过期、旧 fingerprint 或 Central control 断开均
+  fail-closed。该目录 TTL 最长 30 秒，是撤销传播边界，不替代 Registry CAS fencing；
+- 已实现六小时证书请求/半程续签时间、URI SAN/EKU/scope 校验、activation 防重放、Agent 首次安装及
+  Central 端严格递增 generation 的续签 bundle；Gateway 过期 credential 由周期 reconciler 以 CAS
+  revoke 并提升 generation，RouteLease acquire/renew 会复核 owner credential/notAfter，Gateway H2
+  入站连接也绑定对端客户端叶子证书 notAfter deadline；Agent daemon 会在半程主动取证、原子安装并
+  正常关闭旧 channel 后以新 mTLS 身份重连；Agent/Central 也会在 Gateway server leaf 到期时主动关闭
+  既有 H2 并重新握手。外部离线 Root + KMS/HSM-backed Intermediate issuer/provisioner、Gateway 新证书
+  交付/切换以及真实撤销/轮换演练仍待完成；
+- 在 Gateway 证书交付/切换协议完成前，GatewayPool 的 Agent/S3 endpoint 保持不可变；endpoint 主机
+  已固化到 Replica 证书 SAN，管理 API 会拒绝直接变更，避免现有连接在 TLS hostname 校验上失效。
+- 同一约束已下沉到 GatewayRegistry：Replica 的 control/peer/bootstrap endpoint 在证书
+  prepare 开始后不可由 InMemory 或 SQLite repository 直接替换；必须通过未来的证书
+  generation 轮换/交付协议整体切换。
+- 已完成 Central 下行独立 Ed25519 keyring/`key_id` 与 Agent trust bundle 验签；Assignment/Decision 在
+  Agent 执行前严格校验 payload、TTL、generation、key state 和签名，Gateway 不修改签名 payload；
+- 已提供每集群多 Replica、PDB、readiness、实际 preStop drain 和 NetworkPolicy 清单；loopback 双 Replica
+  listener/H2/peer harness 与真实 Registry RouteLease 接管契约已分别通过；待完成完整业务 E2E、真实集群
+  readiness/failover、证书自动切换和维护窗口切换，随后关闭 Central 旧 Agent listener。
+
+验收目标：在同一个完整双 Replica 业务 E2E 中，Agent 经任意入口只产生一个活动 RouteLease，Central
+命令最多一跳到达 owner，owner 退出后必须等旧租约失效或撤销再以新 generation 恢复，并覆盖 durable
+outbox、签名、report 和 finalize。当前仅协议网络 harness 与真实仓储租约契约分别通过。错误 SAN、
+证书/activation token 重放、generation 不匹配和端到端篡改失败关闭。真实集群 readiness/failover、
+Gateway 无 Volume mount、Central/Gateway 不产生 Chunk 持久副本以及 Agent 无法访问旧 Central Agent
+endpoint 的切换验收仍待完成。
+
+### G2：跨集群对象传输
+
+状态：**后续**
+
+- 增加 Central 权威 `TransferRoute`、`TransferTicket` 和 `TransferSession`；Ticket 精确绑定 tenant、
+  artifact、commit/object、源/目标 cluster、Agent、Gateway、method、size、generation 和 TTL；
+- 固定字节链路为源 Agent -> 源 Gateway -> 目标 Gateway -> 目标 Agent，Gateway 只流式转发、限速和
+  观测，不缓存为业务副本；
+- 目标 Agent 复核 size/BLAKE3、执行 durability barrier 并原子发布到目标 Volume 后，Central 才登记
+  placement；支持已验证边界的断点续传和幂等 session。
+
+验收：跨租户、错误 route/scope、过期 Ticket 和损坏对象全部硬失败；Central/Gateway durable storage
+与备份均无 payload；任一中断点不会发布半成品 placement。
+
+### G3：固定版本只读 S3
+
+状态：**后续**
+
+- 增加 Central 权威 `S3BucketBinding` 和 `S3AccessPoint`；Bucket 映射 tenant/project/artifact、primary
+  cluster、策略和固定 Commit/Snapshot，不直接等于 Volume、CAS、Artifact 或 Snapshot；
+- Gateway 后续首版计划实现 AWS SigV4、预签名读取、`ListObjectsV2`、`HEAD`、`GET` 和 Range；不实现
+  PUT、DELETE、Multipart 或 Versioning；当前 G3 尚未实现；
+- S3 Key 使用现有 `LogicalPath` 限制，LIST 查询 Central metadata，GET/Range 由 owning Agent 按
+  Manifest 读取 Volume CAS，内部 Chunk namespace 永不公开。
+
+验收：覆盖 SigV4、分页 LIST、Range、路径冲突和固定 Commit 一致性；S3 是访问协议而不是中心
+durability backend，Gateway 无对象持久副本。
+
 ### P1：中心元数据与安全 MVP
 
 状态：**计划**
@@ -359,7 +493,7 @@ ID 和完整引用图校验。
 - Server 授权固定 Commit/Directory/Manifest graph，并签发精确限制 source/destination placement、
   Object ID、方向、session 和 TTL 的 `TransferRoute`/`TransferTicket`；对象存在性、缺块结果和 CAS
   当前值不能泄漏给无权 tenant/project/artifact/ref。
-- 源与目标 Agent/Gateway 数据端点直接协商缺失 Object 并传输 Chunk，目标 Agent 先写临时对象，
+- 跨集群数据路径复用 G2，固定为源 Agent -> 源 Gateway -> 目标 Gateway -> 目标 Agent；目标 Agent 先写临时对象，
   校验 hash、size 和 checksum，完成 fsync/durability barrier 后原子发布到目标 Volume CAS。
   Chunk payload 不进入 Server listener，Server 只接收 metadata、`ObjectReceipt` 并保存
   `ObjectPlacementEvidence`。
@@ -381,10 +515,10 @@ finalize 或续签新票据；任一中断点恢复后不会出现 ref 指向缺
 交付：
 
 - `fetch` 从 Server 获取经授权的 refs 和固定 Commit/Directory/Manifest graph；`clone` 初始化本地
-  SQLite 仓库，并通过获批 Agent/Gateway 数据端点恢复目标 Commit 的 Chunk。
+  SQLite 仓库，并通过 G2 Gateway-to-Gateway 数据链路恢复目标 Commit 的 Chunk。
 - 提供固定 Snapshot 的 Manifest/Shard 分页、确定性文件级 ShardSet、lease 和续租 API。
 - 同 Volume 读取直接使用已验证的本地 CAS；跨 Volume fetch 使用 Server 授权的短期
-  `TransferRoute`/`TransferTicket`，Chunk 由源 Agent/Gateway 直接发送到目标端点，不经过 Server。
+  `TransferRoute`/`TransferTicket`，Chunk 固定经源 Agent/Gateway 和目标 Gateway/Agent 发送，不经过 Server。
   v1 拒绝普通 Chunk 的 Range GET；Pack/range 只有在 P5 定义可验证 receipt 后才能通过 capability
   开启，ticket 不允许 list/delete/任意 prefix 或访问未列出的 Object ID。
 - 目标端先写临时对象，durability barrier 成功后才发布本地 metadata/ref；支持并发上限、重试、
@@ -455,8 +589,8 @@ finalize 或续签新票据；任一中断点恢复后不会出现 ref 指向缺
 10. lease、pin/hold、ref、活跃 push/fetch session 和有效 `TransferTicket` 都是 GC roots；租约或票据
     有效期间不得删除 Snapshot 可达的 metadata 或相关 Volume placement。
 11. 缺失、损坏、大小不符或 hash 不符的 Chunk 必须硬失败，禁止静默跳过、替换或返回部分成功。
-12. Chunk payload 只能在获批 Volume 或获批 Agent/Gateway 数据端点之间流动，不能进入 Server listener、
-    Server 数据库、日志、临时目录或备份。
+12. Chunk payload 只能由获批 Agent 从 Volume 读取并沿源 Gateway -> 目标 Gateway 流向目标 Agent/Volume，
+    不能进入 Server listener、Server/Gateway 业务持久存储、日志、临时备份或 authority database。
 
 ## 8. 安全与身份架构
 
@@ -528,7 +662,7 @@ ref，并按表中规则向下生效：
   定义可验证 receipt 后通过 capability 开启。目标 Agent 必须在原子发布前完成完整 Chunk hash/size
   校验。有效 `TransferTicket` 在过期前是短期 GC root，且 TTL 不得超过统一 deletion grace；已签发
   ticket 在失权后最多存活到过期，该窗口必须进入威胁模型和审计字段。
-- Agent/Gateway 数据端点之间使用 TLS，生产阶段使用双向身份验证；Volume 和数据库使用各自存储侧
+- Central/Gateway、Agent/Gateway 和 Gateway/Gateway 每一跳使用 mTLS；Volume 和数据库使用各自存储侧
   加密及租户密钥引用。数据库、Agent/Gateway 和 KMS 凭证优先使用 workload identity，无法使用时
   放入 Secret Manager，并支持双凭证重叠轮换。Server 只签发/校验 route 权限，不代理数据连接。
 - IdP 通过重叠 JWKS key 无中断轮换；NeoEngram 不保存 IdP 私钥，也不把 JWT、TransferTicket、
@@ -620,7 +754,7 @@ source locator、sidecar 私密字段和数据内容不得进入审计或普通�
 | RPO / RTO | 目标：已确认 metadata 和具备 durable placement evidence 的 Volume object 的 RPO 0；RTO ≤ 1 小时 |
 | 元数据延迟 | 同区域常规负载下 ref/Snapshot/CAS p95 ≤ 250 ms |
 | 分页延迟 | 1000 条 Manifest/Shard 页面 p95 ≤ 300 ms |
-| 数据吞吐 | Agent/Gateway 直传达到相同端点间基线的至少 80%，Server payload ingress/egress 为 0 |
+| 数据吞吐 | Agent -> Gateway -> Gateway -> Agent 达到相同端点间基线的至少 80%，Server payload ingress/egress 和 Gateway 持久 payload 为 0 |
 | 审计保留 | 在线 180 天；P4 支持外部长期归档 |
 
 RPO 0 只适用于完成同步持久化/复制并通过 durability barrier 的 metadata，以及具有当前
@@ -636,9 +770,12 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | PostgreSQL schema/RLS | tenant/project/artifact/ref 如何分页、索引并保证跨租户约束？ | migration + 查询/隔离基准 |
 | JWT/JWKS | issuer、audience、算法拒绝、未知 kid 和无中断轮换如何验证？ | verifier contract + failpoint 测试 |
 | RBAC/审计 | role × scope × action、404 隐藏和审计保留如何控制写放大？ | 授权矩阵 + audit schema |
+| Gateway Registry/Lease | Pool/Replica 生命周期、唯一 Agent owner、30 秒租约/10 秒续租和 fencing 如何跨重启保持？ | repository 契约 + 双 Replica 故障测试 |
+| Workload PKI | 离线 Root、KMS/HSM Intermediate、URI SAN、6 小时叶子证书和撤销 generation 如何落地？ | issuer adapter + 轮换/撤销演练 |
 | TransferRoute/Ticket | source/destination placement generation、Object 范围、TTL、checksum、撤销窗口和端点身份如何落地？ | route/ticket adapter 原型 |
 | Snapshot/Shard | sidecar、Ready 状态、固定 Commit、path-hash 分片和 cursor 如何跨客户端复现？ | Snapshot/Shard contract + golden vectors |
-| Volume CAS/直传 | 临时写、hash/size 校验、fsync、原子发布、断点续传、生命周期和失败清理如何保证？ | Agent/Gateway 数据端点原型 |
+| Volume CAS/直传 | 源 Agent -> 源 Gateway -> 目标 Gateway -> 目标 Agent 的临时写、hash/size 校验、fsync、原子发布、断点续传和失败清理如何保证？ | Gateway 数据面原型 |
+| S3 Access Point | SigV4、BucketBinding、固定 Commit/Snapshot、LogicalPath key、LIST metadata 与 Range 如何保持一致？ | 只读 S3 契约 + golden/E2E |
 | Push session | 如何恢复部分直传、重新鉴权、复核 placement evidence 并避免 ref 竞态？ | 状态机 + failpoint 测试 |
 | 协议版本 | 客户端/服务端如何协商能力和升级？ | protocol compatibility matrix |
 | GC/生命周期 | Server 如何按 placement 编排并由 Volume Owner Agent 执行回收，同时处理并发 transfer、lease、pin/hold 和 detached 历史？ | generation/cutoff 方案 |
@@ -667,7 +804,13 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 - 架构检查：protocol 不含 engine/fs/SQLite/HTTP，Agent library 不依赖 standalone，`neoengramd` 不依赖
   engine/fs 并保持 library-only；`neoengram-server -> neoengramd -> protocol/core` 与
   `neoengram-agentd -> neoengram-agent/protocol`，controller/service 不访问 SQLx，controller 不绕过
-  service，CLI 之外没有终端输出。
+  service，CLI 之外没有终端输出。新增 Gateway 后还必须验证其只依赖 protocol/core 与网络/安全组件，
+  不依赖 authority datasource、engine/fs/standalone 或 Volume adapter。
+- Gateway 协议与 HA：Schema/golden、帧大小、deadline、重复帧、错误映射、H2 背压、双 Replica 唯一
+  Agent owner、最多一跳 forwarding、租约过期与新 generation fencing。
+- Gateway 安全：错误 URI SAN、跨集群证书、过期/撤销证书、peer credential directory 缺失/过期/旧
+  fingerprint、activation token 重放、generation 不匹配、
+  Central 下行和 Agent 上行 payload 篡改必须失败关闭。
 - 认证测试：错误签名、错误 issuer/audience、过期、未来 `nbf`、未知 `kid`、JWKS 轮换、服务身份
   和日志脱敏。
 - 授权测试：User/Service principal 的 role × scope × action 矩阵、默认拒绝、ref 级绑定、ACL 撤销
@@ -682,8 +825,11 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
   分片无遗漏/重复、lease/pin 在重启后保持、有效 ticket/lease 下 GC 不删对象。
 - 资源耗尽：恶意大 Manifest、直传/断点续传、分页 cursor、并发 lease、带宽和 quota 绕过必须触发
   限流或硬失败，且不会留下不可回收 session。
-- 服务集成：PostgreSQL migration、真实 PVC/StorageVolume CAS、Agent/Gateway 直传、push/fetch/clone、
+- 服务集成：PostgreSQL migration、真实 PVC/StorageVolume CAS、Gateway-to-Gateway 直传、push/fetch/clone、
   quota 和全链路审计；Server 文件系统、数据库和备份中不得出现 Chunk payload。
+- Gateway 切换：Agent enrollment、heartbeat、Assignment、MetadataBatch、report、decision 和 finalize
+  全链路经 Gateway；Agent 无法访问旧 Central Agent endpoint，Gateway 无 Volume mount，Central/Gateway
+  文件系统、数据库和备份中不得出现 Chunk payload。
 - 故障注入：网络中断、进程终止、重复请求、对象损坏、数据库故障、密钥轮换、并发 CAS 和 GC。
 - Agent 存储布局：每 Artifact/EdgeCluster 单 active placement、同租户多 Artifact/Volume、根路径非重叠、
   NFS 别名拒绝、单 Volume RW Owner、全卷 failover、跨 Artifact hardlink 拒绝和显式 placement 迁移。
@@ -735,3 +881,5 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-30 | 冻结派生 Artifact 与多区域 Snapshot 产品身份 | Artifact 只能为空或从同 Tenant 明确 Commit 派生；Snapshot 使用独立 ID，同一 Commit 可有多个单 Region/Volume Snapshot；Playground/Snapshot 主状态统一为 Creating/Ready/Abnormal |
 | 2026-07-31 | 冻结 0.0.1 Kubernetes Agent 部署和接管边界 | 一个业务 PVC/StorageVolume 对应一个常驻 AgentInstance；固定 `/volume`、独立状态 PVC、主动注册和首次审批；无 Operator/Kubernetes API，故障接管仅承诺 generation + 人工流程的 cooperative fencing |
 | 2026-08-06 | 以用户 StorageVolume 内的 Volume-local CAS 取代 2026-07-26 的中心 S3 durability authority | Chunk payload 由 Volume Owner Agent 持久化；Server 只保存 Manifest、Index 和 `ObjectPlacementEvidence`；跨 Volume 由获批 Agent/Gateway 数据端点直传，payload 不经过 Server |
+| 2026-08-09 | 确认每个 EdgeCluster 一个多副本 Synapse GatewayPool，Central 和 Agent 均经 Gateway 建立控制链路 | Gateway 成为固定区域入口和后续跨集群/S3 边界；Central 仍是 metadata authority，Volume Owner Agent 仍是唯一 Volume I/O 执行者；当前 Agent 直连 Server 和可选 Volume-bound Gateway 仅作为历史基线 |
+| 2026-08-10 | 校正 G2/G3、Web 配置与 GatewayPool readiness 的未完成边界 | G2/G3 目标流程明确标注当前未实现；静态 Web 构建必须绑定一个 GatewayPool EdgeCluster，Pool `Ready` 仍需外部 observed readiness/failover 证据；架构检查守护 Web binding，不改变 Central 授权或后端协议 |

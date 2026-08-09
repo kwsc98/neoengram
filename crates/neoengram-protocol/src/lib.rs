@@ -9,6 +9,7 @@ mod control;
 mod digest;
 mod enrollment;
 mod error;
+mod gateway;
 mod ids;
 mod metadata;
 mod scalars;
@@ -20,11 +21,14 @@ pub use control::*;
 pub use digest::{domain_separated_jcs_bytes, jcs_blake3, jcs_bytes};
 pub use enrollment::*;
 pub use error::{ProtocolError, ProtocolResult};
+pub use gateway::*;
 pub use ids::*;
 pub use metadata::*;
 pub use neoengram_core::ContentDigest;
 pub use scalars::*;
-pub use schema::{agent_api_schema, control_schema, enrollment_schema, metadata_schema};
+pub use schema::{
+    agent_api_schema, control_schema, enrollment_schema, gateway_schema, metadata_schema,
+};
 pub use validation::decode_bounded_unique_json;
 
 /// The only protocol version emitted by this crate.
