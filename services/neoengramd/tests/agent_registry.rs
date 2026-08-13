@@ -962,6 +962,29 @@ async fn approval_fails_closed_on_unsafe_probe_but_allows_degraded_health() {
             .unwrap(),
         DerivedVolumeState::Unavailable
     );
+    assert_eq!(
+        service
+            .current_volume_state(&tenant_id(), &storage_volume_id())
+            .await
+            .unwrap(),
+        DerivedVolumeState::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn current_volume_state_treats_a_missing_owner_as_unavailable() {
+    let service = AgentRegistryService::new(
+        Arc::new(InMemoryAgentRegistry::new()),
+        Arc::new(InMemoryClock::new(200)),
+        100,
+    );
+    assert_eq!(
+        service
+            .current_volume_state(&tenant_id(), &storage_volume_id())
+            .await
+            .unwrap(),
+        DerivedVolumeState::Unavailable
+    );
 }
 
 #[tokio::test]

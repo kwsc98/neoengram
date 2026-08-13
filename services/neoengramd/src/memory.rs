@@ -281,6 +281,22 @@ impl PreCommitRepository for InMemoryPreCommitRepository {
             .collect())
     }
 
+    async fn find_restart_result(
+        &self,
+        tenant_id: &TenantId,
+        restart_request_id: &neoengram_protocol::RequestId,
+    ) -> CentralResult<Option<PreCommitRecord>> {
+        Ok(
+            match lock(&self.state)?
+                .mutations
+                .get(&(tenant_id.clone(), restart_request_id.clone()))
+            {
+                Some(InMemoryPreCommitMutation::Restart { result, .. }) => Some(result.clone()),
+                _ => None,
+            },
+        )
+    }
+
     async fn restart(
         &self,
         request: PreCommitRestartRequest,
@@ -476,6 +492,37 @@ impl PreCommitRepository for InMemoryPreCommitRepository {
                 commit_id,
             ))
             .cloned())
+    }
+
+    async fn list_published_commits(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &neoengram_protocol::ProjectId,
+        artifact_id: &ArtifactId,
+    ) -> CentralResult<Vec<crate::CommitRecord>> {
+        let state = lock(&self.state)?;
+        Ok(state
+            .commits
+            .iter()
+            .filter(|((commit_tenant, commit_project, commit_artifact, _), _)| {
+                commit_tenant == tenant_id
+                    && commit_project == project_id
+                    && commit_artifact == artifact_id
+            })
+            .filter(|(_, commit)| {
+                state
+                    .precommits
+                    .get(&PreCommitKey::new(
+                        commit.tenant_id.clone(),
+                        commit.source_precommit_id.clone(),
+                    ))
+                    .is_some_and(|precommit| {
+                        precommit.committed_commit_id == Some(commit.commit_id)
+                            && precommit.head_published_at_unix_ms.is_some()
+                    })
+            })
+            .map(|(_, commit)| commit.clone())
+            .collect())
     }
 
     async fn acknowledge_head_publication(

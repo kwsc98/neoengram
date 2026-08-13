@@ -74,6 +74,7 @@ export type QueryPlaygroundResponse = components['schemas']['QueryPlaygroundResp
 export type CreatePlaygroundRequest = components['schemas']['CreatePlaygroundRequest'];
 export type CreatePlaygroundResponse = components['schemas']['CreatePlaygroundResponse'];
 export type PlaygroundState = components['schemas']['PlaygroundState'];
+export type PlaygroundStorageAvailability = components['schemas']['PlaygroundStorageAvailability'];
 export type PlaygroundView = components['schemas']['PlaygroundView'];
 export type StartPreCommitRequest = components['schemas']['StartPreCommitRequest'];
 export type StartPreCommitResponse = components['schemas']['StartPreCommitResponse'];

@@ -111,7 +111,7 @@ async fn historical_artifact_commit_mounts_as_a_ready_snapshot_without_server_ch
     );
     let data_plane = Arc::new(AgentDataPlaneService::new(authority.clone()));
     let handler = RegistryAgentApiHandler::with_transport(
-        registry,
+        registry.clone(),
         control,
         data_plane,
         Arc::new(AtomicBool::new(true)),
@@ -356,7 +356,8 @@ async fn historical_artifact_commit_mounts_as_a_ready_snapshot_without_server_ch
     );
     let snapshots = CatalogService::new(catalog.clone(), store.publisher(), policy, clock.clone())
         .with_precommits(store.precommits().unwrap())
-        .with_coordinator(coordinator);
+        .with_coordinator(coordinator)
+        .with_agent_registry(registry);
     let identity = AuthenticatedIdentity::new(
         "snapshot-user",
         PrincipalKind::User,

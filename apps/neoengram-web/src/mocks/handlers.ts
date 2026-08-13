@@ -1980,6 +1980,7 @@ export const handlers = [
       ...(baseCommitId ? { base_commit_id: baseCommitId, head_commit_id: baseCommitId } : {}),
       index_version: indexVersion,
       state: 'creating' as const,
+      storage_availability: 'ready' as const,
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
@@ -2002,7 +2003,7 @@ export const handlers = [
         item.playground_id === body.playground_id,
     );
     if (!playground) return notFound(request, 'Playground');
-    if (playground.state !== 'ready') {
+    if (playground.state !== 'ready' || playground.storage_availability !== 'ready') {
       return mutationConflict(
         request,
         'PLAYGROUND_NOT_READY',

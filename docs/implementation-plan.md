@@ -41,8 +41,9 @@ NeoEngram 的目标是一个面向模型权重和大规模训练数据的分布�
 WholeFile hardlink 只读视图；
 FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端下载或可写 overlay。
 
-第一阶段继续保持线性历史。Playground 创建可以原子创建并独占分支，但暂不提供独立
-`branch`/`switch`、merge、rebase 和远端协作分支管理；这些功能不能阻塞中心元数据和对象同步主链路。
+第一阶段支持单 parent、可分叉的 Commit 历史树：多个 Playground 可以从同一 Commit
+分别发布兄弟 Commit。暂不提供独立 `branch`/`switch`、merge、rebase 和远端协作分支管理；
+这些功能不能阻塞中心元数据和对象同步主链路。
 
 ### 1.1 规范术语
 
@@ -242,7 +243,8 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 3. **文件语义不完整**：当前模型未保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。
 4. **规模热点仍存在**：Standalone 的部分 SQLite/worktree compatibility view 和 GC 仍可能物化完整索引或引用集；
    loose object 目录仍是平铺扫描，完整文件缓存没有 quota/lease；远端分页、租约和 GC 尚未实现。
-5. **历史能力有限**：只有单父线性历史，没有命名分支、merge、rebase、tag 和 reflog。
+5. **历史能力有限**：单 parent Commit 可由不同 Playground 形成树，但没有命名分支、merge、
+   rebase、tag 和 reflog。
 6. **只读快照不是安全边界**：`0444/0555` 可被拥有权限的用户或 root 修改；hardlink 视图还与
    Loose 对象共享 inode 和权限，写入会污染所有引用该对象的快照。损坏必须从可信副本恢复。
 7. **没有训练读取语义**：当前不存在固定 Snapshot、ShardSet、schema/source 摘要或

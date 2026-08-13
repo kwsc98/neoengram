@@ -688,62 +688,203 @@ code {
 .resource-detail-shell .el-tabs__header {
   margin-bottom: 22px;
 }
-.commit-summary {
+.commit-tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.commit-tab-label small {
+  min-width: 20px;
+  height: 20px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 6px;
+  border-radius: 10px;
+  color: #52605a;
+  background: #e7ece9;
+  font-size: 11px;
+  line-height: 20px;
+}
+.commit-overview-summary {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 20px;
-  padding: 12px 14px;
-  background: #f2f5f3;
+  gap: 10px 20px;
 }
-.commit-summary > span {
-  font-weight: 650;
-}
-.commit-summary > small {
-  margin-right: auto;
+.commit-overview-summary > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
   color: var(--muted);
   font-size: 12px;
 }
+.commit-overview-summary strong {
+  color: var(--ink);
+  font-size: 18px;
+}
+.commit-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 20px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  background: var(--surface-soft);
+}
+.commit-summary__metrics,
+.commit-summary__state {
+  display: flex;
+  align-items: center;
+}
+.commit-summary__metrics > span {
+  min-width: 116px;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.commit-summary__metrics > span + span {
+  margin-left: 18px;
+  padding-left: 18px;
+  border-left: 1px solid var(--line);
+}
+.commit-summary__metrics strong {
+  color: var(--ink);
+  font-size: 22px;
+  line-height: 1;
+}
+.commit-summary__metrics small,
+.commit-summary__state small {
+  color: var(--muted);
+  font-size: 12px;
+}
+.commit-summary__state {
+  min-width: 0;
+  justify-content: flex-end;
+  gap: 12px;
+}
+.commit-summary__state > span {
+  min-width: 0;
+  display: grid;
+  justify-items: end;
+  gap: 3px;
+}
+.commit-summary__state code {
+  max-width: min(360px, 32vw);
+  overflow: hidden;
+  color: #45524c;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .commit-tree {
+  --commit-tree-indent: 36px;
+  --commit-tree-rail-x: 12px;
+
   margin: 0;
-  padding: 0 0 0 10px;
+  padding: 0;
   list-style: none;
+}
+.commit-branch {
+  position: relative;
+  min-width: 0;
+  list-style: none;
+}
+.commit-branch + .commit-branch {
+  margin-top: 12px;
 }
 .commit-node {
   position: relative;
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
+  grid-template-columns: 24px minmax(0, 1fr);
   gap: 10px;
-  padding-bottom: 18px;
+  padding-bottom: 12px;
 }
-.commit-node::before {
+.commit-node__rail {
+  position: relative;
+  min-height: 100%;
+}
+.commit-branch--has-children > .commit-node .commit-node__rail::after {
   content: '';
   position: absolute;
-  left: 6px;
-  top: 13px;
-  bottom: -3px;
+  z-index: 0;
+  left: 11px;
+  top: 25px;
+  bottom: -12px;
   width: 2px;
   background: #c9d4cf;
 }
-.commit-node:last-child::before {
+.commit-tree__children {
+  position: relative;
+  margin: 0 0 0 var(--commit-tree-rail-x);
+  padding: 4px 0 0 var(--commit-tree-indent);
+  border-left: 2px solid #c9d4cf;
+  list-style: none;
+}
+.commit-tree__children > .commit-branch::before {
+  content: '';
+  position: absolute;
+  z-index: 0;
+  left: calc(-1 * var(--commit-tree-indent));
+  top: 25px;
+  width: calc(var(--commit-tree-indent) + var(--commit-tree-rail-x));
+  height: 2px;
+  background: #c9d4cf;
+}
+.commit-tree__children > .commit-branch:last-child::after {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  left: calc(-1 * var(--commit-tree-indent) - 3px);
+  top: 26px;
+  bottom: 0;
+  width: 6px;
+  background: var(--surface);
+}
+.commit-tree__children--linear {
+  margin-left: 0;
+  padding-top: 0;
+  padding-left: 0;
+  border-left: 0;
+}
+.commit-tree__children--linear > .commit-branch::before {
+  left: 11px;
+  top: -4px;
+  width: 2px;
+  height: 29px;
+}
+.commit-tree__children--linear > .commit-branch:last-child::after {
   display: none;
 }
 .commit-node__dot {
-  position: relative;
-  z-index: 1;
+  position: absolute;
+  z-index: 3;
+  top: 18px;
+  left: 5px;
   width: 14px;
   height: 14px;
-  margin-top: 5px;
   border: 3px solid #fff;
   border-radius: 50%;
   background: var(--green);
   box-shadow: 0 0 0 1px #74a18f;
 }
+.commit-node--tip:not(.commit-node--head) .commit-node__dot {
+  background: #fff;
+  box-shadow: 0 0 0 2px var(--amber);
+}
 .commit-node__body {
+  position: relative;
+  z-index: 2;
   min-width: 0;
-  padding: 0 0 16px;
-  border-bottom: 1px solid var(--line);
+  padding: 12px 14px 13px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+.commit-node--head .commit-node__body {
+  border-color: #8dbbaa;
+  background: #f7fbf9;
+  box-shadow: inset 3px 0 0 var(--green);
 }
 .commit-node__heading,
 .commit-node__meta {
@@ -754,6 +895,17 @@ code {
 }
 .commit-node__heading {
   justify-content: space-between;
+}
+.commit-node__title,
+.commit-node__labels {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+.commit-node__title > strong {
+  line-height: 1.45;
 }
 .commit-node__heading time {
   color: var(--muted);
@@ -775,6 +927,9 @@ code {
   margin-top: 8px;
   color: var(--muted);
   font-size: 11px;
+}
+.commit-node__meta > span {
+  min-width: 0;
 }
 .commit-node__meta code {
   max-width: 100%;
@@ -1187,6 +1342,29 @@ code {
   .relation-list__aside {
     width: 100%;
     justify-content: space-between;
+  }
+  .commit-summary {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .commit-summary__metrics {
+    justify-content: space-between;
+  }
+  .commit-summary__metrics > span {
+    min-width: 0;
+    flex: 1 1 0;
+  }
+  .commit-summary__state {
+    justify-content: space-between;
+  }
+  .commit-summary__state > span {
+    justify-items: start;
+  }
+  .commit-summary__state code {
+    max-width: min(360px, 62vw);
+  }
+  .commit-tree {
+    --commit-tree-indent: 22px;
   }
   .commit-node__heading {
     align-items: flex-start;

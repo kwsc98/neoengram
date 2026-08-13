@@ -1104,9 +1104,11 @@ paths:
       operationId: queryArtifactCommitGraph
       summary: 查询 Artifact Commit 图
       description: |
-        从当前 Head 沿单 parent 权威链分页返回 Commit 节点和公开 Tags。Cursor 绑定 Artifact
-        resource version、Head 与完整 scope；Head 变化后旧 Cursor 返回 409。公开节点不包含 root
-        directory、Manifest、Chunk 或存储信息。
+        分页返回该 Artifact 的全部已发布单 parent Commit 节点和公开 Tags；客户端依据
+        `parent_commit_id` 重建可分叉的版本树。`head_commit_id` 是默认基线的便捷指针，不限制
+        图中可见的分支。Cursor 绑定 Artifact resource version、Head 与完整 scope；任一 Commit
+        发布并推进版本后，旧 Cursor 返回 409。公开节点不包含 root directory、Manifest、Chunk
+        或存储信息。
       security:
         - BearerAuth: []
       parameters:
@@ -1300,6 +1302,7 @@ paths:
                       revision: "31"
                       digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                     state: ready
+                    storage_availability: ready
                     created_at_unix_ms: "1785167000000"
                     updated_at_unix_ms: "1785167600000"
         "401":
@@ -1367,6 +1370,7 @@ paths:
                     revision: "31"
                     digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                   state: ready
+                  storage_availability: ready
                   created_at_unix_ms: "1785167000000"
                   updated_at_unix_ms: "1785167600000"
         "401":
@@ -1391,10 +1395,11 @@ paths:
       summary: 创建 Playground
       description: |
         在已存在的权威 Artifact 下创建受管可写 Playground。显式 `base_commit_id` 可以选择当前
-        Head 或该 Artifact 的任一历史 Commit；省略时服务端冻结创建瞬间的当前 Head。所选 Commit
-        的权威 Index 会先初始化为 Playground Index，再由目标 StorageVolume 的 Agent 异步物化；
-        完成前 Playground 保持 `state=creating`。所选 StorageVolume 必须属于同一 Tenant 且
-        `state=ready`；`degraded` 或 `unavailable` 均拒绝新放置并返回 409。
+        Head 或该 Artifact 已发布历史中的任一 Commit；未被任何 Head 可达、也未确认的 Commit 返回
+        404，省略时服务端冻结创建瞬间的当前 Head。所选 Commit 的权威 Index 会先初始化为
+        Playground Index，再由目标 StorageVolume 的 Agent 异步物化；完成前 Playground 保持
+        `state=creating`。所选 StorageVolume 必须属于同一 Tenant 且 `state=ready`；`degraded` 或
+        `unavailable` 均拒绝新放置并返回 409。
       security:
         - BearerAuth: []
       parameters:
@@ -1522,6 +1527,7 @@ paths:
                     revision: "31"
                     digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                   state: ready
+                  storage_availability: ready
                   active_precommit_id: precommit-july-labels-01
                   created_at_unix_ms: "1785167000000"
                   updated_at_unix_ms: "1785167600000"
@@ -2244,11 +2250,12 @@ paths:
       operationId: createSnapshot
       summary: 创建 Snapshot
       description: |
-        为指定 Artifact Commit 和 StorageVolume 创建单区域只读 Snapshot。所选 StorageVolume 必须
-        属于同一 Tenant 且 `state=ready`；`degraded` 或 `unavailable` 均拒绝新放置并返回 409。服务端
-        生成 `snapshot_id`；相同 `snapshot_request_id` 和 payload 返回 `replayed: true`，不同 request
-        identity 命中同一 Commit/Volume 的未删除 Snapshot 时返回 `placement_reused: true`。用途、
-        保留策略和 Dataset Profile 均不是创建参数；Profile 是创建后查询的派生只读元数据。200 返回时
+        为指定 Artifact Commit 和 StorageVolume 创建单区域只读 Snapshot。Commit 必须是该 Artifact
+        已发布历史中的 Commit，未被任何 Head 可达、也未确认的 Commit 返回 404。所选 StorageVolume
+        必须属于同一 Tenant 且 `state=ready`；`degraded` 或 `unavailable` 均拒绝新放置并返回 409。
+        服务端生成 `snapshot_id`；相同 `snapshot_request_id` 和 payload 返回 `replayed: true`，不同
+        request identity 命中同一 Commit/Volume 的未删除 Snapshot 时返回 `placement_reused: true`。
+        用途、保留策略和 Dataset Profile 均不是创建参数；Profile 是创建后查询的派生只读元数据。200 返回时
         Snapshot 记录已持久化且可查询，后续交付由其状态和阶段表达。
       security:
         - BearerAuth: []
@@ -5254,12 +5261,20 @@ components:
       type: string
       enum: [creating, ready, abnormal]
 
+    PlaygroundStorageAvailability:
+      type: string
+      description: |
+        Playground 所在 StorageVolume 的实时可达性。`unknown` 表示服务端当前无法确认存储状态；
+        只有 `ready` 可以执行扫描、Pre-commit 检测等依赖 Agent 的实时操作。中心已持久化的
+        Index、文件清单、变化和 Profile 不受该字段限制。
+      enum: [ready, degraded, unavailable, unknown]
+
     PlaygroundView:
       type: object
       description: |
         Playground 的 `tenant_id + project_id + artifact_id` 是不可变来源 scope，Region 始终由所选
-        StorageVolume 派生。主状态只表达工作区可用性；scanning、hashing、uploading 和 validating
-        仅属于独立 Pre-commit 流程。
+        StorageVolume 派生。`state` 只表达持久生命周期，`storage_availability` 表达所在存储的
+        实时可达性；scanning、hashing、uploading 和 validating 仅属于独立 Pre-commit 流程。
       additionalProperties: false
       required:
         - tenant_id
@@ -5271,6 +5286,7 @@ components:
         - display_name
         - index_version
         - state
+        - storage_availability
         - created_at_unix_ms
         - updated_at_unix_ms
       properties:
@@ -5296,6 +5312,8 @@ components:
           $ref: "#/components/schemas/IndexVersion"
         state:
           $ref: "#/components/schemas/PlaygroundState"
+        storage_availability:
+          $ref: "#/components/schemas/PlaygroundStorageAvailability"
         active_precommit_id:
           $ref: "#/components/schemas/PreCommitId"
         issue:

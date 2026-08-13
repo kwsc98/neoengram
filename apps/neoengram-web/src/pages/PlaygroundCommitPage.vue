@@ -40,6 +40,10 @@ import PageHeading from '@/components/PageHeading.vue';
 import { supportsResourceBrowser } from '@/features/capabilities';
 import {
   canCommitPreCommit,
+  isPlaygroundOperational,
+  playgroundOperationUnavailableReason,
+  playgroundPollInterval,
+  playgroundStorageAvailability,
   preCommitPhaseLabels,
   preCommitPollInterval,
   preCommitStateLabels,
@@ -79,8 +83,7 @@ const playgroundQuery = useQuery({
   queryKey: playgroundKey,
   queryFn: () =>
     queryPlayground(tenantId.value, projectId.value, artifactId.value, playgroundId.value),
-  refetchInterval: (query) =>
-    query.state.data?.data.playground.active_precommit_id ? 1000 : false,
+  refetchInterval: (query) => playgroundPollInterval(query.state.data?.data.playground),
 });
 const versionQuery = useQuery({
   queryKey: ['system', 'version'],
@@ -91,6 +94,10 @@ const resourceBrowserEnabled = computed(() =>
   supportsResourceBrowser(versionQuery.data.value?.data.capabilities),
 );
 const playground = computed(() => playgroundQuery.data.value?.data.playground);
+const playgroundOperational = computed(() => isPlaygroundOperational(playground.value));
+const playgroundUnavailableReason = computed(() =>
+  playgroundOperationUnavailableReason(playground.value),
+);
 const activePreCommitId = computed(() => playground.value?.active_precommit_id ?? '');
 const routedPreCommitId = computed(() => String(route.query.precommit_id ?? ''));
 const retainedPreCommitId = ref(routedPreCommitId.value);
@@ -194,6 +201,11 @@ const cancelMutation = useMutation({ mutationFn: cancelPlaygroundPreCommit });
 const restartMutation = useMutation({ mutationFn: restartPlaygroundPreCommit });
 const redetectMutation = useMutation({
   mutationFn: async (operation: RedetectOperation) => {
+    if (!playgroundOperational.value) {
+      throw new Error(
+        `${playgroundUnavailableReason.value ?? 'Playground 当前不可操作'}，无法重新检测`,
+      );
+    }
     await cancelPlaygroundPreCommit(operation.cancel);
     if (!operation.start) {
       const latest = await queryPlayground(
@@ -202,6 +214,11 @@ const redetectMutation = useMutation({
         operation.startScope.artifact_id,
         operation.startScope.playground_id,
       );
+      if (!isPlaygroundOperational(latest.data.playground)) {
+        throw new Error(
+          `${playgroundOperationUnavailableReason(latest.data.playground) ?? 'Playground 当前不可操作'}，无法重新检测`,
+        );
+      }
       operation.start = {
         ...operation.startScope,
         expected_index_version: latest.data.playground.index_version,
@@ -221,10 +238,14 @@ const diffSummary = computed(
   () => precommit.value?.diff_summary ?? frozenChangesQuery.data.value?.data.summary,
 );
 const canRedetect = computed(
-  () => precommit.value?.state === 'running' || precommit.value?.state === 'ready',
+  () =>
+    playgroundOperational.value &&
+    (precommit.value?.state === 'running' || precommit.value?.state === 'ready'),
 );
 const canRetry = computed(
-  () => precommit.value?.state === 'abnormal' || precommit.value?.state === 'cancelled',
+  () =>
+    playgroundOperational.value &&
+    (precommit.value?.state === 'abnormal' || precommit.value?.state === 'cancelled'),
 );
 
 function resetChangeCursor(): void {
@@ -367,6 +388,7 @@ async function pinPreCommitInUrl(precommitId: string): Promise<void> {
 
 async function redetectPreCommit(): Promise<void> {
   if (redetectMutation.isPending.value) return;
+  if (!playgroundOperational.value) return;
   const currentPreCommit = precommit.value;
   if (!pendingRedetectOperation.value) {
     if (!currentPreCommit || !canRedetect.value) return;
@@ -422,6 +444,7 @@ async function redetectPreCommit(): Promise<void> {
 
 async function retryPreCommit(): Promise<void> {
   if (restartMutation.isPending.value) return;
+  if (!playgroundOperational.value) return;
   const current = playground.value;
   const currentPreCommit = precommit.value;
   if (!current || !currentPreCommit || !canRetry.value) return;
@@ -656,6 +679,20 @@ async function createSnapshot(): Promise<void> {
           </div>
         </dl>
       </section>
+
+      <el-alert
+        v-if="!playgroundOperational"
+        :title="playgroundUnavailableReason"
+        description="当前 Playground 不能执行重新检测或失败重试；中心保存的候选变化仍可审查和提交。"
+        :type="
+          playground.state === 'abnormal' ||
+          playgroundStorageAvailability(playground) === 'unavailable'
+            ? 'error'
+            : 'warning'
+        "
+        :closable="false"
+        show-icon
+      />
 
       <section v-if="!currentPreCommitId && !commitCreated" class="empty-precommit">
         <WarningFilled />

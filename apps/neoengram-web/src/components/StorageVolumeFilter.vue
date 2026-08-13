@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/vue-query';
 import { computed } from 'vue';
 
 import { queryStorageVolumeList } from '@/api/operations';
+import type { StorageVolumeView } from '@/api/types';
 
 const props = defineProps<{
   tenantId: string;
@@ -21,7 +22,15 @@ const storageVolumesQuery = useQuery({
       ...(props.region ? { region: props.region } : {}),
     }),
   enabled: computed(() => Boolean(props.tenantId)),
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
 });
+
+function placementUnavailableReason(storageVolume: StorageVolumeView): string | undefined {
+  if (storageVolume.state === 'degraded') return '存储降级，暂不可用于新放置';
+  if (storageVolume.state === 'unavailable') return '存储不可达，暂不可用于新放置';
+  return undefined;
+}
 </script>
 
 <template>
@@ -45,6 +54,16 @@ const storageVolumesQuery = useQuery({
       <span class="storage-option__meta">
         {{ storageVolume.region }} · {{ storageVolume.backend_type.toUpperCase() }}
       </span>
+      <small v-if="placementUnavailableReason(storageVolume)" class="storage-option__reason">
+        {{ placementUnavailableReason(storageVolume) }}
+      </small>
     </el-option>
   </el-select>
 </template>
+
+<style scoped>
+.storage-option__reason {
+  margin-left: 12px;
+  color: var(--muted);
+}
+</style>

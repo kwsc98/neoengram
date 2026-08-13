@@ -636,6 +636,75 @@ async fn exercise_artifact_contract(repository: &dyn ControlCatalogRepository) {
     let replayed = repository.advance_playground_commit(advance).await.unwrap();
     assert!(replayed.replayed);
     assert_eq!(replayed.artifact.resource_version, 2);
+
+    let mut branch = valid.clone();
+    branch.playground_id = PlaygroundId::new("playground-branch").unwrap();
+    branch.relative_root = "playgrounds/project-a/artifact-a/playground-branch".to_owned();
+    branch.head_commit_id = None;
+    branch.base_commit_id = None;
+    repository.insert_playground(branch.clone()).await.unwrap();
+    let branch_commit_id = ContentDigest::from_bytes([0xee; 32]);
+    let branched = repository
+        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+            tenant_id: branch.tenant_id.clone(),
+            project_id: branch.project_id.clone(),
+            artifact_id: branch.artifact_id.clone(),
+            playground_id: branch.playground_id.clone(),
+            expected_head_commit_id: None,
+            commit_id: branch_commit_id,
+            updated_at_unix_ms: UnixMillis::new(350),
+        })
+        .await
+        .unwrap();
+    assert_eq!(branched.artifact.head_commit_id, Some(branch_commit_id));
+    assert_eq!(branched.artifact.resource_version, 3);
+    assert_eq!(branched.playground.head_commit_id, Some(branch_commit_id));
+    let branch_replay = repository
+        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+            tenant_id: branch.tenant_id.clone(),
+            project_id: branch.project_id.clone(),
+            artifact_id: branch.artifact_id.clone(),
+            playground_id: branch.playground_id.clone(),
+            expected_head_commit_id: None,
+            commit_id: branch_commit_id,
+            updated_at_unix_ms: UnixMillis::new(351),
+        })
+        .await
+        .unwrap();
+    assert!(branch_replay.replayed);
+    assert_eq!(branch_replay.artifact.resource_version, 3);
+
+    let third_commit_id = ContentDigest::from_bytes([0xef; 32]);
+    repository
+        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+            tenant_id: valid.tenant_id.clone(),
+            project_id: valid.project_id.clone(),
+            artifact_id: valid.artifact_id.clone(),
+            playground_id: valid.playground_id.clone(),
+            expected_head_commit_id: Some(commit_id),
+            commit_id: third_commit_id,
+            updated_at_unix_ms: UnixMillis::new(375),
+        })
+        .await
+        .unwrap();
+    let replay_after_other_branch_advanced = repository
+        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+            tenant_id: branch.tenant_id.clone(),
+            project_id: branch.project_id.clone(),
+            artifact_id: branch.artifact_id.clone(),
+            playground_id: branch.playground_id,
+            expected_head_commit_id: None,
+            commit_id: branch_commit_id,
+            updated_at_unix_ms: UnixMillis::new(376),
+        })
+        .await
+        .unwrap();
+    assert!(replay_after_other_branch_advanced.replayed);
+    assert_eq!(
+        replay_after_other_branch_advanced.artifact.head_commit_id,
+        Some(third_commit_id),
+        "recovery of an older branch publication must not roll Artifact Head back"
+    );
     let stale = AdvancePlaygroundCommitRequest {
         tenant_id: valid.tenant_id.clone(),
         project_id: valid.project_id.clone(),

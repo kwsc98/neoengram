@@ -543,15 +543,17 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
     '.resource-table:visible, .mobile-resource-list:visible',
   );
   await expect(visiblePlaygroundList.getByText('创建中', { exact: true })).toBeVisible();
-  await expect(visiblePlaygroundList.getByText('可用', { exact: true }).first()).toBeVisible();
+  await expect(visiblePlaygroundList.getByText('已物化', { exact: true }).first()).toBeVisible();
   await expect(visiblePlaygroundList.getByText('异常', { exact: true })).toBeVisible();
   await expect(visiblePlaygroundList.getByText(/活动 Pre-commit/).first()).toBeVisible();
   await expect(visiblePlaygroundList.getByText('计算内容摘要')).toHaveCount(0);
   await expect(visiblePlaygroundList.getByText('一致性校验')).toHaveCount(0);
 
   await page.getByRole('button', { name: /夜间回归检查/ }).click();
-  await expect(page.getByText('存在活动 Pre-commit', { exact: true })).toBeVisible();
+  // nightly-review 所在归档卷已降级：冻结候选仍可审查，Agent 依赖的操作被暂停。
+  await expect(page.getByText('Pre-commit 检测已暂停', { exact: true })).toBeVisible();
   await expect(page.getByText('precommit-nightly-0729', { exact: true })).toBeVisible();
+  await expect(page.getByText('存储降级', { exact: true }).first()).toBeVisible();
   await page.screenshot({
     path: testInfo.outputPath('active-precommit-controls.png'),
     animations: 'disabled',
@@ -564,36 +566,23 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   await expect(page.getByText('precommit-nightly-0729', { exact: true })).toBeVisible();
   await expect(page.locator('.preflight-status__body strong')).toContainText('可提交 · 处理完成');
   await expect(page.getByText('0 项阻断')).toBeVisible();
+  await expect(page.getByText('StorageVolume 当前处于降级状态', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '重新检测' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '失败重试' })).toHaveCount(0);
 
-  await page.getByRole('button', { name: '重新检测' }).click();
-  const restartDialog = page.locator('.el-message-box').filter({ hasText: '重新检测' });
-  await restartDialog.getByRole('button', { name: '重新检测', exact: true }).click();
-  await expect(page.getByText('precommit-nightly-0729')).toHaveCount(0);
-  await expect(page.locator('.preflight-status__body small')).toContainText('precommit-');
-  await expect(page.locator('.preflight-status__body strong')).toContainText('可提交 · 处理完成');
-  const redetectedPreCommitId =
-    (await page.locator('.preflight-status__body small').textContent())?.split(' · ')[0] ?? '';
-  expect(redetectedPreCommitId).toMatch(/^precommit-/);
-  await page.getByRole('button', { name: '填写 Commit 信息' }).click();
-  const restartedCommitDialog = page.getByRole('dialog', { name: '创建 Commit' });
-  await expect(restartedCommitDialog.locator('.tag-editor__values .el-tag')).toHaveCount(0);
-  await restartedCommitDialog.getByRole('button', { name: '取消' }).click();
-
+  // 取消是中心操作，不受存储可达性限制。
   await page.getByRole('button', { name: '取消 Pre-commit' }).click();
   const cancelDialog = page.locator('.el-message-box').filter({ hasText: '取消 Pre-commit' });
   await cancelDialog.getByRole('button', { name: '确认取消', exact: true }).click();
   await expect(page).toHaveURL(
-    new RegExp(`/playgrounds/nightly-review/commit\\?precommit_id=${redetectedPreCommitId}$`),
+    /\/playgrounds\/nightly-review\/commit\?precommit_id=precommit-nightly-0729$/,
   );
   await expect(page.locator('.preflight-status__body strong')).toContainText('已取消 · 处理完成');
   await expect(page.locator('.preflight-status__body small')).toContainText(
-    `${redetectedPreCommitId} · attempt 1`,
+    'precommit-nightly-0729 · attempt 1',
   );
-  await page.getByRole('button', { name: '失败重试' }).click();
-  await expect(page.locator('.preflight-status__body small')).toContainText(
-    `${redetectedPreCommitId} · attempt 2`,
-  );
-  await expect(page.locator('.preflight-status__body strong')).toContainText('可提交 · 处理完成');
+  // 存储仍降级，取消后重试入口保持隐藏。
+  await expect(page.getByRole('button', { name: '失败重试' })).toHaveCount(0);
 
   await page.goto(
     '/tenants/tenant-a/projects/project-language/artifacts/dialog-corpus/playgrounds/safety-review/commit',
@@ -777,6 +766,14 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   await page.getByRole('button', { name: '重新检测' }).click();
   const redetectDialog = page.locator('.el-message-box').filter({ hasText: '重新检测' });
   await redetectDialog.getByRole('button', { name: '重新检测', exact: true }).click();
+  await expect(page.locator('.preflight-status__body strong')).toContainText('可提交 · 处理完成');
+  // 存储可达的 Playground 保留完整的取消与重试闭环。
+  await page.getByRole('button', { name: '取消 Pre-commit' }).click();
+  const cancelDialog = page.locator('.el-message-box').filter({ hasText: '取消 Pre-commit' });
+  await cancelDialog.getByRole('button', { name: '确认取消', exact: true }).click();
+  await expect(page.locator('.preflight-status__body strong')).toContainText('已取消 · 处理完成');
+  await page.getByRole('button', { name: '失败重试' }).click();
+  await expect(page.locator('.preflight-status__body small')).toContainText('attempt 2');
   await expect(page.locator('.preflight-status__body strong')).toContainText('可提交 · 处理完成');
   await page.getByRole('button', { name: '填写 Commit 信息' }).click();
   await expect(commitDialog.getByLabel('Commit 标题')).toHaveValue('发布自动驾驶夜间场景 v4');

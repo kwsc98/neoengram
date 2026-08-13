@@ -22,6 +22,7 @@ function playground(overrides: Partial<PlaygroundView> = {}): PlaygroundView {
     display_name: 'Playground A',
     index_version: { revision: '7', digest: 'a'.repeat(64) },
     state: 'ready',
+    storage_availability: 'ready',
     created_at_unix_ms: '1',
     updated_at_unix_ms: '1',
     ...overrides,
@@ -52,6 +53,47 @@ describe('PlaygroundSelect', () => {
     await flushPromises();
 
     expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([option]);
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('disables a Playground whose lifecycle is ready but storage is unavailable', async () => {
+    api.queryPlaygroundList.mockResolvedValue({
+      data: { items: [playground({ storage_availability: 'unavailable' })] },
+      requestId: 'request-playgrounds',
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = mount(PlaygroundSelect, {
+      props: { tenantId: 'tenant-a', modelValue: undefined },
+      global: { plugins: [ElementPlus, [VueQueryPlugin, { queryClient }]] },
+    });
+    await flushPromises();
+
+    expect(wrapper.findComponent(ElOption).props('disabled')).toBe(true);
+    expect(wrapper.findComponent(ElOption).text()).toContain('StorageVolume 当前不可达');
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('explains an abnormal lifecycle before reporting a ready StorageVolume', async () => {
+    api.queryPlaygroundList.mockResolvedValue({
+      data: {
+        items: [playground({ state: 'abnormal', storage_availability: 'ready' })],
+      },
+      requestId: 'request-playgrounds',
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = mount(PlaygroundSelect, {
+      props: { tenantId: 'tenant-a', modelValue: undefined },
+      global: { plugins: [ElementPlus, [VueQueryPlugin, { queryClient }]] },
+    });
+    await flushPromises();
+
+    expect(wrapper.findComponent(ElOption).props('disabled')).toBe(true);
+    expect(wrapper.findComponent(ElOption).text()).toContain('Playground 生命周期异常');
+    expect(wrapper.findComponent(ElOption).text()).not.toContain('存储可达');
 
     wrapper.unmount();
     queryClient.clear();

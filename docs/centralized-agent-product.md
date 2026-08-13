@@ -348,15 +348,16 @@ StorageVolume 或 Default Ref。
 独立版本历史；跨 Artifact 来源只作为血缘，不能成为普通 parent。Artifact 详情包含：
 
 - **概览**：描述、当前 Commit、Tags、文件/逻辑大小汇总、元数据摘要；
-- **版本**：单 parent Commit 历史、父 Commit、标题、描述、Tags、创建者、时间和 Diff 入口；
+- **版本**：可分叉的单 parent Commit 树、父 Commit、标题、描述、Tags、创建者、时间和 Diff 入口；
 - **工作区**：该 Artifact 下的 Playground 和创建入口；
 - **快照**：该 Artifact 下的 Snapshot，以及从明确 Commit 创建 Snapshot 的入口。
 
-“当前 Commit”是产品层的便捷指针，不向用户暴露 Ref 名称。第一版不提供分支选择和 Ref 管理。
+“当前 Commit”是产品层的默认基线便捷指针，不向用户暴露 Ref 名称，也不限制其他 Playground
+从历史 Commit 形成兄弟分支。第一版不提供命名分支选择、merge 或 Ref 管理。
 
 ### 6.4 工作区
 
-Playground 列表显示 Artifact、Region、StorageVolume、主可用性、当前操作和更新时间。创建入口位于
+Playground 列表显示 Artifact、Region、StorageVolume、持久生命周期、实时存储可达性、当前操作和更新时间。创建入口位于
 Artifact 详情，用户必须选择：
 
 - Playground ID 和名称；
@@ -509,21 +510,28 @@ Snapshot 创建失败后资源进入 Abnormal，可以对同一 Snapshot 幂等�
 
 ## 8. 状态模型
 
-### 8.1 Playground 主状态与当前操作
+### 8.1 Playground 生命周期、存储可达性与当前操作
 
-Playground 使用两个正交字段，避免把资源可用性和临时任务混在一个枚举里。
+Playground 使用三个正交维度，避免把资源生命周期、实时存储可达性和临时任务混在一个枚举里。
 
-| 维度     | 状态         | 含义                                                | 允许行为                          |
-| -------- | ------------ | --------------------------------------------------- | --------------------------------- |
-| 主可用性 | `Creating`   | 中心已接受资源，正在初始化目标 Volume 上的工作目录  | 查看状态、等待                     |
-| 主可用性 | `Ready`      | 工作区和中心 Index 满足公开操作条件                 | 浏览、发起 Pre-commit             |
-| 主可用性 | `Abnormal`   | 至少一个基础条件不可用或观测过期                    | 查看元数据和活动；禁止新 mutation |
-| 当前操作 | `Idle`       | `active_precommit_id` 为空                          | 可发起 Pre-commit                 |
-| 当前操作 | `Pre-commit` | 存在活动检查会话，可能正在运行或等待 Commit         | 详情页查询会话后决定动作          |
+| 维度       | 状态          | 含义                                                | 允许行为                                 |
+| ---------- | ------------- | --------------------------------------------------- | ---------------------------------------- |
+| 持久生命周期 | `Creating`    | 中心已接受资源，正在初始化目标 Volume 上的工作目录  | 查看状态、等待                           |
+| 持久生命周期 | `Ready`       | 工作区目录已经成功物化，中心 Index 可查询           | 结合实时存储可达性决定依赖 Agent 的操作  |
+| 持久生命周期 | `Abnormal`    | 工作区创建或物化本身失败                            | 查看元数据和错误；禁止新 mutation        |
+| 存储可达性   | `Ready`       | 当前 Owner Agent、心跳、mount 和健康检查均有效      | 允许扫描、Pre-commit 和新放置            |
+| 存储可达性   | `Degraded`    | 存储仍有观测但不满足完整操作条件                    | 保留中心只读查询；暂停依赖 Agent 的操作  |
+| 存储可达性   | `Unavailable` | Agent、心跳、Owner 或 mount 当前不可用               | 保留中心只读查询；暂停依赖 Agent 的操作  |
+| 存储可达性   | `Unknown`     | 当前服务组合无法确认实时存储状态                    | 失败关闭依赖 Agent 的操作                 |
+| 当前操作     | `Idle`        | `active_precommit_id` 为空                          | 可在生命周期和存储均 Ready 时发起检查    |
+| 当前操作     | `Pre-commit`  | 存在活动检查会话，可能正在运行或等待 Commit         | 详情页查询会话后决定动作                  |
 
 创建任务成功后 Playground 从 `Creating` 进入 `Ready`；创建或基础设施校验失败进入 `Abnormal`。
 Playground 创建取消、重试和通用 Mutation 属于 P1，P0 不伪造相应动作。`Scanning` 不是 Playground
-主状态，只有显式 Pre-commit 才具有 scanning phase。
+生命周期状态，只有显式 Pre-commit 才具有 scanning phase。Agent 心跳超时或重启不会把已经物化的
+Playground 从 `Ready` 改成 `Abnormal`；此时只把存储可达性派生为 `Unavailable`，恢复心跳后可自动回到
+`Ready`。已经冻结且满足提交条件的候选保存在中心，可以继续审查和 Commit；重新扫描、重试和新放置仍需
+实时存储可达。
 
 ### 8.2 Pre-commit 状态
 

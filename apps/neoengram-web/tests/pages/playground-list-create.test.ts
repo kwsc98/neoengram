@@ -37,7 +37,7 @@ const artifact: ArtifactView = {
   updated_at_unix_ms: '1',
 };
 
-async function mountPage() {
+async function mountPage(playgroundItems: Array<Record<string, unknown>> = []) {
   api.queryApiVersion.mockResolvedValue({
     data: {
       service: 'neoengram-server',
@@ -50,7 +50,7 @@ async function mountPage() {
     requestId: 'request-version',
   });
   api.queryPlaygroundList.mockResolvedValue({
-    data: { items: [] },
+    data: { items: playgroundItems },
     requestId: 'request-playgrounds',
   });
   api.queryArtifactList.mockResolvedValue({
@@ -99,6 +99,7 @@ async function mountPage() {
         head_commit_id: historicalCommitId,
         index_version: { revision: '1', digest: historicalCommitId },
         state: 'creating',
+        storage_availability: 'ready',
         created_at_unix_ms: '1',
         updated_at_unix_ms: '1',
       },
@@ -184,6 +185,32 @@ describe('Playground list creation', () => {
       storage_volume_id: 'volume-a',
       base_commit_id: historicalCommitId,
     });
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('renders lifecycle and live storage availability as separate statuses', async () => {
+    const { queryClient, wrapper } = await mountPage([
+      {
+        tenant_id: 'tenant-a',
+        project_id: 'project-a',
+        artifact_id: 'artifact-a',
+        playground_id: 'offline-review',
+        storage_volume_id: 'volume-a',
+        region: 'cn-shanghai',
+        display_name: 'Offline review',
+        index_version: { revision: '1', digest: historicalCommitId },
+        state: 'ready',
+        storage_availability: 'unavailable',
+        created_at_unix_ms: '1',
+        updated_at_unix_ms: '2',
+      },
+    ]);
+
+    expect(wrapper.text()).toContain('已物化');
+    expect(wrapper.text()).toContain('存储不可达');
+    expect(wrapper.text()).not.toContain('可用');
 
     wrapper.unmount();
     queryClient.clear();

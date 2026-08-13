@@ -8,6 +8,13 @@
 
 ### Added
 
+- 新增可分叉的单 parent Commit 历史树：Commit 图端点按 `parent_commit_id` 返回全部已发布节点，
+  Playground 可从历史 Commit 形成兄弟分支；Playground/Snapshot 放置只接受已发布 Commit，
+  未被任何 Head 可达且未确认的 Commit 返回 404。
+- 新增 Playground 三态模型：持久生命周期（creating/ready/abnormal）与实时存储可达性
+  （ready/degraded/unavailable/unknown）正交；存储降级或不可达时冻结候选仍可审查和提交，
+  依赖 Agent 的重新检测、失败重试与新放置暂停。Web 控制台新增 Artifact Commit 树视图与
+  存储可达性筛选。
 - 新增 Synapse Gateway G1 控制面骨架：GatewayPool/Replica Registry、AgentRouteLease、三类 H2
   listener、mTLS/签名边界和最多一跳 Replica forwarding；Central peer credential directory（30 秒
   TTL、leaf fingerprint allow-list、control 断链 fail-closed）已接入；完整业务 E2E、生产 PKI 与切换仍在进行中。

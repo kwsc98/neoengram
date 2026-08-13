@@ -327,8 +327,9 @@ pub trait ControlCatalogRepository: Send + Sync {
         updated_at_unix_ms: UnixMillis,
     ) -> CentralResult<PlaygroundRecord>;
 
-    /// Atomically advances both authority-derived Head pointers for one committed Playground.
-    /// An exact replay which already observes `commit_id` on both resources succeeds unchanged.
+    /// Atomically advances the fenced Playground Head and the Artifact convenience Head for one
+    /// committed Playground. An exact replay already observed by the Playground succeeds without
+    /// moving an Artifact Head that another branch may have advanced meanwhile.
     async fn advance_playground_commit(
         &self,
         request: crate::AdvancePlaygroundCommitRequest,
@@ -398,8 +399,9 @@ pub trait JobRepository: Send + Sync {
 
 /// Durable Pre-commit aggregate and immutable Commit repository.
 ///
-/// `commit` consumes a candidate and inserts its Commit in one authority transaction. Updating
-/// Artifact and Playground Head pointers remains a separate control-catalog recovery boundary.
+/// `commit` consumes a candidate and inserts its Commit in one authority transaction. Publishing
+/// the source Playground Head and Artifact convenience Head remains a separate control-catalog
+/// recovery boundary.
 #[async_trait]
 pub trait PreCommitRepository: Send + Sync {
     async fn start(
@@ -430,6 +432,12 @@ pub trait PreCommitRepository: Send + Sync {
         after: Option<&PreCommitKey>,
         limit: usize,
     ) -> CentralResult<Vec<PreCommitRecord>>;
+    /// Returns the durable result for a prior restart idempotency key, when one exists.
+    async fn find_restart_result(
+        &self,
+        tenant_id: &TenantId,
+        restart_request_id: &neoengram_protocol::RequestId,
+    ) -> CentralResult<Option<PreCommitRecord>>;
     async fn restart(
         &self,
         request: PreCommitRestartRequest,
@@ -455,6 +463,15 @@ pub trait PreCommitRepository: Send + Sync {
         artifact_id: &ArtifactId,
         commit_id: neoengram_core::CommitId,
     ) -> CentralResult<Option<crate::CommitRecord>>;
+    /// Lists every published immutable Commit owned by one Artifact. A Commit is visible only
+    /// after its source Pre-commit has acknowledged Head publication; callers define presentation
+    /// order and pagination and must not limit the result to the current Artifact Head chain.
+    async fn list_published_commits(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &neoengram_protocol::ProjectId,
+        artifact_id: &ArtifactId,
+    ) -> CentralResult<Vec<crate::CommitRecord>>;
     async fn acknowledge_head_publication(
         &self,
         key: &PreCommitKey,

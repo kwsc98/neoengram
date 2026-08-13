@@ -232,6 +232,23 @@ impl PreCommitRepository for SqliteAuthorityStore {
         Ok(records)
     }
 
+    async fn find_restart_result(
+        &self,
+        tenant_id: &TenantId,
+        restart_request_id: &neoengram_protocol::RequestId,
+    ) -> CentralResult<Option<PreCommitRecord>> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let Some((kind, _request_payload, result_payload)) =
+            load_mutation(&mut transaction, tenant_id, restart_request_id.as_str()).await?
+        else {
+            return Ok(None);
+        };
+        if kind != "restart" {
+            return Ok(None);
+        }
+        decode(&result_payload).map(Some)
+    }
+
     async fn restart(
         &self,
         request: PreCommitRestartRequest,
@@ -492,6 +509,55 @@ impl PreCommitRepository for SqliteAuthorityStore {
                 Ok(record)
             })
             .transpose()
+    }
+
+    async fn list_published_commits(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+        artifact_id: &ArtifactId,
+    ) -> CentralResult<Vec<CommitRecord>> {
+        let rows = sqlx::query(
+            "SELECT commits.payload AS commit_payload, precommits.payload AS precommit_payload \
+             FROM commit_records AS commits JOIN precommit_records AS precommits \
+             ON precommits.tenant_id = commits.tenant_id \
+             AND precommits.precommit_id = commits.precommit_id \
+             WHERE commits.tenant_id = ? AND commits.project_id = ? \
+             AND commits.artifact_id = ?",
+        )
+        .bind(tenant_id.as_str())
+        .bind(project_id.as_str())
+        .bind(artifact_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let mut published = Vec::with_capacity(rows.len());
+        for row in rows {
+            let commit_payload: Vec<u8> = row.try_get("commit_payload").map_err(storage_error)?;
+            let precommit_payload: Vec<u8> =
+                row.try_get("precommit_payload").map_err(storage_error)?;
+            let commit: CommitRecord = decode(&commit_payload)?;
+            let precommit: PreCommitRecord = decode(&precommit_payload)?;
+            validate_commit(&commit)?;
+            validate_record(&precommit)?;
+            if commit.tenant_id != *tenant_id
+                || commit.project_id != *project_id
+                || commit.artifact_id != *artifact_id
+                || precommit.tenant_id != *tenant_id
+                || precommit.project_id != *project_id
+                || precommit.artifact_id != *artifact_id
+                || commit.source_precommit_id != precommit.precommit_id
+                || precommit.committed_commit_id != Some(commit.commit_id)
+            {
+                return Err(storage_corruption(
+                    "Commit publication scope differs from its durable records",
+                ));
+            }
+            if precommit.head_published_at_unix_ms.is_some() {
+                published.push(commit);
+            }
+        }
+        Ok(published)
     }
 
     async fn acknowledge_head_publication(

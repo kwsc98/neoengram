@@ -508,21 +508,20 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 "Commit Playground does not exist",
             )
         })?;
-        if artifact.head_commit_id == Some(request.commit_id)
-            && playground.head_commit_id == Some(request.commit_id)
-        {
+        // A Playground can publish from a historical Commit while another Playground has moved
+        // the Artifact's convenience Head. Once this Playground already observes the new Commit,
+        // treat the request as a replay without moving the Artifact pointer backwards.
+        if playground.head_commit_id == Some(request.commit_id) {
             return Ok(AdvancePlaygroundCommitOutcome {
                 artifact,
                 playground,
                 replayed: true,
             });
         }
-        if artifact.head_commit_id != request.expected_head_commit_id
-            || playground.head_commit_id != request.expected_head_commit_id
-        {
+        if playground.head_commit_id != request.expected_head_commit_id {
             return Err(catalog_parent_error(
                 CentralErrorCode::ArtifactHeadMismatch,
-                "Artifact or Playground Head changed after Pre-commit",
+                "Playground Head changed after Pre-commit",
             ));
         }
         if playground.state != crate::PlaygroundState::Ready {

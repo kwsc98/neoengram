@@ -1,7 +1,7 @@
 use std::{fmt, str::FromStr, sync::Arc};
 
 use fusen_rs::{Error, ErrorCategory};
-use neoengram_core::{ContentDigest, FileRecord, IndexVersion, LogicalPath};
+use neoengram_core::{CommitId, ContentDigest, FileRecord, IndexVersion, LogicalPath};
 use neoengram_engine::{
     build_commit_graph, BuildCommitGraphRequest, EngineError, EngineResult, IndexSnapshotReader,
     NoopProgressSink, Page, PageCursor, PageRequest,
@@ -121,7 +121,8 @@ impl WorkspaceCommitService {
         // closes the race between the authority transaction and the control-catalog transaction;
         // a process crash remains recoverable by replaying the stable commit_request_id.
         let _publication = self.publication_lock.lock().await;
-        let artifact = self
+        // Keep the Artifact scope check, but do not use its mutable Head as a parent fence.
+        let _artifact = self
             .catalog
             .get_artifact(&tenant_id, &project_id, &artifact_id)
             .await
@@ -234,11 +235,13 @@ impl WorkspaceCommitService {
                 .map_err(map_central_error)?
         } else {
             let frozen_head = precommit.frozen_head_commit_id.map(Into::into);
-            if artifact.head_commit_id != frozen_head || playground.head_commit_id != frozen_head {
+            if playground.head_commit_id != frozen_head {
                 return Err(commit_conflict(
+                    // Preserve the published wire code while narrowing the fence to the
+                    // branch-local Playground Head.
                     "artifact_head_mismatch",
                     "ARTIFACT_HEAD_MISMATCH",
-                    "Artifact or Playground Head changed after Pre-commit",
+                    "Playground Head changed after Pre-commit",
                 ));
             }
             let index_key = IndexKey {
@@ -317,19 +320,13 @@ impl WorkspaceCommitService {
                 replayed: true,
             });
         }
-        let heads = self
-            .catalog
-            .advance_playground_commit(AdvancePlaygroundCommitRequest {
-                tenant_id,
-                project_id,
-                artifact_id,
-                playground_id,
-                expected_head_commit_id: authority_outcome.commit.parent_commit_id.map(Into::into),
-                commit_id: authority_outcome.commit.commit_id.into(),
-                updated_at_unix_ms: authority_outcome.commit.created_at_unix_ms,
-            })
-            .await
-            .map_err(map_central_error)?;
+        let (published_playground, head_replayed) = publish_committed_playground_head(
+            self.catalog.as_ref(),
+            self.precommits.as_ref(),
+            &authority_outcome.commit,
+        )
+        .await
+        .map_err(map_central_error)?;
         let consumed_precommit = self
             .precommits
             .acknowledge_head_publication(
@@ -341,10 +338,122 @@ impl WorkspaceCommitService {
             .map_err(map_central_error)?;
         Ok(WorkspaceCommitResult {
             commit: authority_outcome.commit,
-            playground: heads.playground,
+            playground: published_playground,
             consumed_precommit,
-            replayed: authority_outcome.replayed || heads.replayed,
+            replayed: authority_outcome.replayed || head_replayed,
         })
+    }
+}
+
+pub(super) async fn publish_committed_playground_head(
+    catalog: &dyn ControlCatalogRepository,
+    precommits: &dyn PreCommitRepository,
+    commit: &CommitRecord,
+) -> CentralResult<(PlaygroundRecord, bool)> {
+    let current = load_commit_playground(catalog, commit).await?;
+    if playground_contains_commit(precommits, commit, &current).await? {
+        return Ok((current, true));
+    }
+
+    match catalog
+        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+            tenant_id: commit.tenant_id.clone(),
+            project_id: commit.project_id.clone(),
+            artifact_id: commit.artifact_id.clone(),
+            playground_id: commit.source_playground_id.clone(),
+            expected_head_commit_id: commit.parent_commit_id.map(Into::into),
+            commit_id: commit.commit_id.into(),
+            updated_at_unix_ms: commit.created_at_unix_ms,
+        })
+        .await
+    {
+        Ok(outcome) => Ok((outcome.playground, outcome.replayed)),
+        Err(error) if error.code() == CentralErrorCode::ArtifactHeadMismatch => {
+            // Another publisher may have advanced this same Playground between the observation
+            // and CAS. A descendant proves this Commit was already published; never move Head
+            // backwards merely to complete its recovery acknowledgement.
+            let current = load_commit_playground(catalog, commit).await?;
+            if playground_contains_commit(precommits, commit, &current).await? {
+                Ok((current, true))
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn load_commit_playground(
+    catalog: &dyn ControlCatalogRepository,
+    commit: &CommitRecord,
+) -> CentralResult<PlaygroundRecord> {
+    catalog
+        .get_playground(
+            &commit.tenant_id,
+            &commit.project_id,
+            &commit.artifact_id,
+            &commit.source_playground_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ArtifactNotFound,
+                "committed Pre-commit source Playground no longer exists",
+            )
+        })
+}
+
+async fn playground_contains_commit(
+    precommits: &dyn PreCommitRepository,
+    commit: &CommitRecord,
+    playground: &PlaygroundRecord,
+) -> CentralResult<bool> {
+    let Some(head) = playground.head_commit_id else {
+        return Ok(false);
+    };
+    is_commit_ancestor(
+        precommits,
+        &commit.tenant_id,
+        &commit.project_id,
+        &commit.artifact_id,
+        commit.commit_id,
+        CommitId::from_digest(head),
+    )
+    .await
+}
+
+async fn is_commit_ancestor(
+    precommits: &dyn PreCommitRepository,
+    tenant_id: &TenantId,
+    project_id: &ProjectId,
+    artifact_id: &ArtifactId,
+    ancestor: CommitId,
+    mut descendant: CommitId,
+) -> CentralResult<bool> {
+    let mut visited = std::collections::BTreeSet::new();
+    loop {
+        if descendant == ancestor {
+            return Ok(true);
+        }
+        if !visited.insert(descendant) {
+            return Err(CentralError::new(
+                CentralErrorCode::Internal,
+                "Commit parent chain contains a cycle",
+            ));
+        }
+        let commit = precommits
+            .get_commit(tenant_id, project_id, artifact_id, descendant)
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::Internal,
+                    "published Playground Head lost its immutable Commit row",
+                )
+            })?;
+        let Some(parent) = commit.parent_commit_id else {
+            return Ok(false);
+        };
+        descendant = parent;
     }
 }
 
@@ -523,4 +632,378 @@ fn commit_graph_error(error: EngineError) -> Error {
         format!("the authoritative Index could not form a canonical Commit: {error}"),
         false,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use async_trait::async_trait;
+    use neoengram_core::DirectoryId;
+    use neoengram_protocol::{EdgeClusterId, Extensions, RequestId, StorageVolumeId, UnixMillis};
+    use neoengramd::{
+        ArtifactInitialization, ArtifactRecord, CatalogPvcReference, InMemoryControlCatalog,
+        PreCommitCancelRequest, PreCommitCommitOutcome, PreCommitCommitRequest, PreCommitId,
+        PreCommitMutationOutcome, PreCommitRecord, PreCommitRestartRequest, PreCommitStartRequest,
+        PublishedIndex, StorageAccessMode, StorageBackendType, StorageVolumeRecord,
+        StorageVolumeState, TenantRecord,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_accepts_descendant_playground_head_without_rolling_it_back() {
+        let target = CommitId::from_bytes([1; 32]);
+        let descendant = CommitId::from_bytes([2; 32]);
+        let commits = CommitLookupRepository::new([
+            commit_record(target, None),
+            commit_record(descendant, Some(target)),
+        ]);
+        let catalog = catalog_with_head(descendant).await;
+
+        let (playground, replayed) =
+            publish_committed_playground_head(&catalog, &commits, &commit_record(target, None))
+                .await
+                .unwrap();
+
+        assert!(replayed);
+        assert_eq!(playground.head_commit_id, Some(descendant.into()));
+        assert_catalog_heads(&catalog, descendant).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_an_unrelated_playground_head() {
+        let target = CommitId::from_bytes([1; 32]);
+        let unrelated = CommitId::from_bytes([3; 32]);
+        let commits = CommitLookupRepository::new([
+            commit_record(target, None),
+            commit_record(unrelated, None),
+        ]);
+        let catalog = catalog_with_head(unrelated).await;
+
+        let error =
+            publish_committed_playground_head(&catalog, &commits, &commit_record(target, None))
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.code(), CentralErrorCode::ArtifactHeadMismatch);
+        assert_catalog_heads(&catalog, unrelated).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_reports_a_missing_parent_as_an_internal_consistency_error() {
+        let target = CommitId::from_bytes([1; 32]);
+        let descendant = CommitId::from_bytes([4; 32]);
+        let missing_parent = CommitId::from_bytes([5; 32]);
+        let commits = CommitLookupRepository::new([
+            commit_record(target, None),
+            commit_record(descendant, Some(missing_parent)),
+        ]);
+        let catalog = catalog_with_head(descendant).await;
+
+        let error =
+            publish_committed_playground_head(&catalog, &commits, &commit_record(target, None))
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.code(), CentralErrorCode::Internal);
+        assert_eq!(
+            error.message(),
+            "published Playground Head lost its immutable Commit row"
+        );
+        assert_catalog_heads(&catalog, descendant).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_reports_a_parent_cycle_as_an_internal_consistency_error() {
+        let target = CommitId::from_bytes([1; 32]);
+        let cycle_left = CommitId::from_bytes([6; 32]);
+        let cycle_right = CommitId::from_bytes([7; 32]);
+        let commits = CommitLookupRepository::new([
+            commit_record(target, None),
+            commit_record(cycle_left, Some(cycle_right)),
+            commit_record(cycle_right, Some(cycle_left)),
+        ]);
+        let catalog = catalog_with_head(cycle_left).await;
+
+        let error =
+            publish_committed_playground_head(&catalog, &commits, &commit_record(target, None))
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.code(), CentralErrorCode::Internal);
+        assert_eq!(error.message(), "Commit parent chain contains a cycle");
+        assert_catalog_heads(&catalog, cycle_left).await;
+    }
+
+    async fn catalog_with_head(head: CommitId) -> InMemoryControlCatalog {
+        let catalog = InMemoryControlCatalog::default();
+        let tenant_id = tenant_id();
+        let project_id = project_id();
+        let artifact_id = artifact_id();
+        catalog
+            .insert_tenant(TenantRecord {
+                tenant_id: tenant_id.clone(),
+                display_name: "Tenant".to_owned(),
+                description: None,
+                resource_version: 1,
+                created_at_unix_ms: UnixMillis::new(1),
+                updated_at_unix_ms: UnixMillis::new(1),
+            })
+            .await
+            .unwrap();
+        catalog
+            .insert_artifact(ArtifactRecord {
+                tenant_id: tenant_id.clone(),
+                project_id: project_id.clone(),
+                artifact_id: artifact_id.clone(),
+                display_name: "Artifact".to_owned(),
+                description: None,
+                initialization: ArtifactInitialization::Empty,
+                head_commit_id: Some(head.into()),
+                resource_version: 1,
+                created_at_unix_ms: UnixMillis::new(2),
+                updated_at_unix_ms: UnixMillis::new(2),
+            })
+            .await
+            .unwrap();
+        catalog
+            .insert_storage_volume(StorageVolumeRecord {
+                tenant_id: tenant_id.clone(),
+                storage_volume_id: storage_volume_id(),
+                display_name: "Volume".to_owned(),
+                edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
+                region: "local".to_owned(),
+                backend_type: StorageBackendType::Pvc,
+                access_mode: StorageAccessMode::ReadWriteMany,
+                pvc_reference: Some(CatalogPvcReference {
+                    namespace: "default".to_owned(),
+                    claim_name: "workspace".to_owned(),
+                }),
+                nfs_reference: None,
+                state: StorageVolumeState::Ready,
+                resource_version: 1,
+                created_at_unix_ms: UnixMillis::new(3),
+                updated_at_unix_ms: UnixMillis::new(3),
+            })
+            .await
+            .unwrap();
+        catalog
+            .insert_playground(PlaygroundRecord {
+                tenant_id,
+                project_id,
+                artifact_id,
+                playground_id: playground_id(),
+                storage_volume_id: storage_volume_id(),
+                region: "local".to_owned(),
+                display_name: "Playground".to_owned(),
+                base_commit_id: Some(head.into()),
+                head_commit_id: Some(head.into()),
+                state: PlaygroundState::Ready,
+                relative_root: "playgrounds/project-a/artifact-a/playground-a".to_owned(),
+                created_at_unix_ms: UnixMillis::new(4),
+                updated_at_unix_ms: UnixMillis::new(4),
+            })
+            .await
+            .unwrap();
+        catalog
+    }
+
+    async fn assert_catalog_heads(catalog: &InMemoryControlCatalog, expected: CommitId) {
+        let artifact = catalog
+            .get_artifact(&tenant_id(), &project_id(), &artifact_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let playground = catalog
+            .get_playground(
+                &tenant_id(),
+                &project_id(),
+                &artifact_id(),
+                &playground_id(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(artifact.head_commit_id, Some(expected.into()));
+        assert_eq!(playground.head_commit_id, Some(expected.into()));
+    }
+
+    fn commit_record(commit_id: CommitId, parent_commit_id: Option<CommitId>) -> CommitRecord {
+        CommitRecord {
+            tenant_id: tenant_id(),
+            project_id: project_id(),
+            artifact_id: artifact_id(),
+            source_playground_id: playground_id(),
+            source_storage_volume_id: Some(storage_volume_id()),
+            source_precommit_id: PreCommitId::new(format!("precommit-{commit_id}")).unwrap(),
+            commit_request_id: RequestId::new(format!("request-{commit_id}")).unwrap(),
+            commit_id,
+            root_directory_id: DirectoryId::from_bytes([8; 32]),
+            parent_commit_id,
+            index_version: WireIndexVersion {
+                revision: IndexRevision::new(1),
+                digest: ContentDigest::from_bytes([9; 32]),
+                extensions: Extensions::new(),
+            },
+            records: Vec::new(),
+            message: "Commit".to_owned(),
+            description: None,
+            tag_names: Vec::new(),
+            created_at_unix_ms: UnixMillis::new(10),
+        }
+    }
+
+    fn tenant_id() -> TenantId {
+        TenantId::new("tenant-a").unwrap()
+    }
+
+    fn project_id() -> ProjectId {
+        ProjectId::new("project-a").unwrap()
+    }
+
+    fn artifact_id() -> ArtifactId {
+        ArtifactId::new("artifact-a").unwrap()
+    }
+
+    fn playground_id() -> PlaygroundId {
+        PlaygroundId::new("playground-a").unwrap()
+    }
+
+    fn storage_volume_id() -> StorageVolumeId {
+        StorageVolumeId::new("volume-a").unwrap()
+    }
+
+    struct CommitLookupRepository {
+        commits: BTreeMap<CommitId, CommitRecord>,
+    }
+
+    impl CommitLookupRepository {
+        fn new(commits: impl IntoIterator<Item = CommitRecord>) -> Self {
+            Self {
+                commits: commits
+                    .into_iter()
+                    .map(|commit| (commit.commit_id, commit))
+                    .collect(),
+            }
+        }
+
+        fn unused<T>() -> CentralResult<T> {
+            panic!("unexpected PreCommitRepository operation in recovery test")
+        }
+    }
+
+    #[async_trait]
+    impl PreCommitRepository for CommitLookupRepository {
+        async fn start(
+            &self,
+            _request: PreCommitStartRequest,
+        ) -> CentralResult<PreCommitMutationOutcome> {
+            Self::unused()
+        }
+
+        async fn get(&self, _key: &PreCommitKey) -> CentralResult<Option<PreCommitRecord>> {
+            Self::unused()
+        }
+
+        async fn get_active(
+            &self,
+            _tenant_id: &TenantId,
+            _project_id: &ProjectId,
+            _artifact_id: &ArtifactId,
+            _playground_id: &PlaygroundId,
+        ) -> CentralResult<Option<PreCommitRecord>> {
+            Self::unused()
+        }
+
+        async fn list_running(
+            &self,
+            _after: Option<&PreCommitKey>,
+            _limit: usize,
+        ) -> CentralResult<Vec<PreCommitRecord>> {
+            Self::unused()
+        }
+
+        async fn list_unpublished_commits(
+            &self,
+            _after: Option<&PreCommitKey>,
+            _limit: usize,
+        ) -> CentralResult<Vec<PreCommitRecord>> {
+            Self::unused()
+        }
+
+        async fn find_restart_result(
+            &self,
+            _tenant_id: &TenantId,
+            _restart_request_id: &RequestId,
+        ) -> CentralResult<Option<PreCommitRecord>> {
+            Self::unused()
+        }
+
+        async fn restart(
+            &self,
+            _request: PreCommitRestartRequest,
+        ) -> CentralResult<PreCommitMutationOutcome> {
+            Self::unused()
+        }
+
+        async fn cancel(
+            &self,
+            _request: PreCommitCancelRequest,
+        ) -> CentralResult<PreCommitMutationOutcome> {
+            Self::unused()
+        }
+
+        async fn sync_job(
+            &self,
+            _job: neoengramd::JobRecord,
+            _published_index: Option<PublishedIndex>,
+            _observed_at_unix_ms: UnixMillis,
+        ) -> CentralResult<Option<PreCommitRecord>> {
+            Self::unused()
+        }
+
+        async fn commit(
+            &self,
+            _request: PreCommitCommitRequest,
+        ) -> CentralResult<PreCommitCommitOutcome> {
+            Self::unused()
+        }
+
+        async fn get_commit(
+            &self,
+            tenant_id: &TenantId,
+            project_id: &ProjectId,
+            artifact_id: &ArtifactId,
+            commit_id: CommitId,
+        ) -> CentralResult<Option<CommitRecord>> {
+            Ok(self
+                .commits
+                .get(&commit_id)
+                .filter(|commit| {
+                    &commit.tenant_id == tenant_id
+                        && &commit.project_id == project_id
+                        && &commit.artifact_id == artifact_id
+                })
+                .cloned())
+        }
+
+        async fn list_published_commits(
+            &self,
+            _tenant_id: &TenantId,
+            _project_id: &ProjectId,
+            _artifact_id: &ArtifactId,
+        ) -> CentralResult<Vec<CommitRecord>> {
+            Self::unused()
+        }
+
+        async fn acknowledge_head_publication(
+            &self,
+            _key: &PreCommitKey,
+            _commit_id: CommitId,
+            _published_at_unix_ms: UnixMillis,
+        ) -> CentralResult<PreCommitRecord> {
+            Self::unused()
+        }
+    }
 }

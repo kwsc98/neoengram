@@ -15,7 +15,7 @@ mod workload_pki;
 mod workspace_commit;
 
 pub use agent_certificate::{AgentWorkloadCertificateError, AgentWorkloadCertificateService};
-pub use catalog::CatalogService;
+pub use catalog::{CatalogService, StorageAvailabilityProvider};
 pub use command_signing::{
     CentralCommandKeyId, CentralCommandKeyState, CentralCommandKeyring,
     CentralCommandSecurityError, CentralCommandSignature, CentralCommandSignatureRequest,

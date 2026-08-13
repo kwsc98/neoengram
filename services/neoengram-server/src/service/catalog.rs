@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use fusen_rs::{Error, ErrorCategory};
 use neoengram_core::{CommitId, ContentDigest, FileRecord, LogicalPath};
@@ -12,7 +13,7 @@ use neoengram_protocol::{
     RequestId, SnapshotId, StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
 };
 use neoengramd::{
-    diff_index_snapshots, summarize_index_changes, ArtifactHeadExpectation,
+    diff_index_snapshots, summarize_index_changes, AgentRegistryService, ArtifactHeadExpectation,
     ArtifactInitialization as CatalogArtifactInitialization, ArtifactListCursor,
     ArtifactListRequest, ArtifactRecord, CatalogInsertOutcome, CatalogNfsReference,
     CatalogPvcReference, Clock, CommitRecord, ControlCatalogRepository, IndexKey, IndexPublisher,
@@ -73,6 +74,31 @@ const RESERVED_PRECOMMIT_FIELDS: &[&str] = &[
 ];
 const RESERVED_SNAPSHOT_FIELDS: &[&str] = &["actor", "principal", "request_digest"];
 
+/// Resolves live, Agent-derived availability for one Tenant-scoped StorageVolume.
+///
+/// Production composition uses [`AgentRegistryService`]. Keeping this boundary explicit makes a
+/// missing Registry distinguishable from an unreachable Volume instead of silently treating both
+/// as ready.
+#[async_trait]
+pub trait StorageAvailabilityProvider: Send + Sync {
+    async fn current_volume_state(
+        &self,
+        tenant_id: &TenantId,
+        storage_volume_id: &StorageVolumeId,
+    ) -> neoengramd::CentralResult<neoengramd::DerivedVolumeState>;
+}
+
+#[async_trait]
+impl StorageAvailabilityProvider for AgentRegistryService {
+    async fn current_volume_state(
+        &self,
+        tenant_id: &TenantId,
+        storage_volume_id: &StorageVolumeId,
+    ) -> neoengramd::CentralResult<neoengramd::DerivedVolumeState> {
+        AgentRegistryService::current_volume_state(self, tenant_id, storage_volume_id).await
+    }
+}
+
 /// Public Tenant, StorageVolume, and minimal Playground application service.
 pub struct CatalogService {
     repository: Arc<dyn ControlCatalogRepository>,
@@ -82,6 +108,7 @@ pub struct CatalogService {
     coordinator: Option<Arc<super::JobCoordinator>>,
     precommits: Option<Arc<dyn PreCommitRepository>>,
     workspace_commits: Option<Arc<super::WorkspaceCommitService>>,
+    storage_availability: Option<Arc<dyn StorageAvailabilityProvider>>,
 }
 
 impl CatalogService {
@@ -100,6 +127,7 @@ impl CatalogService {
             coordinator: None,
             precommits: None,
             workspace_commits: None,
+            storage_availability: None,
         }
     }
 
@@ -121,6 +149,21 @@ impl CatalogService {
         workspace_commits: Arc<super::WorkspaceCommitService>,
     ) -> Self {
         self.workspace_commits = Some(workspace_commits);
+        self
+    }
+
+    #[must_use]
+    pub fn with_agent_registry(mut self, agent_registry: Arc<AgentRegistryService>) -> Self {
+        self.storage_availability = Some(agent_registry);
+        self
+    }
+
+    #[must_use]
+    pub fn with_storage_availability_provider(
+        mut self,
+        storage_availability: Arc<dyn StorageAvailabilityProvider>,
+    ) -> Self {
+        self.storage_availability = Some(storage_availability);
         self
     }
 
@@ -280,10 +323,8 @@ impl CatalogService {
             .as_ref()
             .map(|cursor| encode_volume_cursor(&scope, cursor))
             .transpose()?;
-        Ok(QueryStorageVolumeListResponse {
-            items: page.records.iter().map(storage_volume_view).collect(),
-            next_cursor,
-        })
+        let items = page.records.iter().map(storage_volume_view).collect();
+        Ok(QueryStorageVolumeListResponse { items, next_cursor })
     }
 
     pub async fn query_storage_volume(
@@ -497,50 +538,64 @@ impl CatalogService {
             .map(|cursor| decode_commit_cursor(cursor, &scope))
             .transpose()?;
         let precommits = self.precommit_repository()?;
-        let mut current = artifact.head_commit_id.map(CommitId::from_digest);
-        let mut seeking_after = after.is_some();
-        let mut visited = BTreeSet::new();
-        let mut records = Vec::with_capacity(usize::from(page_size));
-        let mut next = None;
-        while let Some(commit_id) = current {
-            if !visited.insert(commit_id) {
-                return Err(internal_catalog_error());
+        // The Artifact Head is only one tip. A historical Playground can publish a sibling while
+        // another Playground advances that pointer, so walking parent links from the Head would
+        // hide valid commits. Read the complete immutable scope and order the current Head first,
+        // followed by newest commits; the UI can reconstruct the parent tree from each node.
+        let mut all_commits = self
+            .load_published_commit_graph(&artifact, precommits.as_ref())
+            .await?;
+        all_commits.sort_by(|left, right| {
+            (Some(right.commit_id) == artifact.head_commit_id.map(CommitId::from_digest))
+                .cmp(&(Some(left.commit_id) == artifact.head_commit_id.map(CommitId::from_digest)))
+                .then_with(|| right.created_at_unix_ms.cmp(&left.created_at_unix_ms))
+                .then_with(|| left.commit_id.cmp(&right.commit_id))
+        });
+        let start = if let Some(cursor) = &after {
+            let Some(index) = all_commits.iter().position(|commit| {
+                commit.commit_id == cursor.commit_id
+                    && commit.created_at_unix_ms == cursor.created_at_unix_ms
+            }) else {
+                return Err(cursor_conflict());
+            };
+            index.saturating_add(1)
+        } else {
+            0
+        };
+        let page = all_commits
+            .into_iter()
+            .skip(start)
+            .take(usize::from(page_size) + 1)
+            .collect::<Vec<_>>();
+        let has_more = page.len() > usize::from(page_size);
+        let mut records = page;
+        records.truncate(usize::from(page_size));
+        let next = has_more.then(|| {
+            let last = records.last().expect("non-empty Commit graph page");
+            CommitGraphCursor {
+                created_at_unix_ms: last.created_at_unix_ms,
+                commit_id: last.commit_id,
             }
-            let commit = precommits
-                .get_commit(&tenant_id, &project_id, &artifact_id, commit_id)
-                .await
-                .map_err(map_central_error)?
-                .ok_or_else(internal_catalog_error)?;
-            current = commit.parent_commit_id;
-            if seeking_after {
-                let cursor = after.as_ref().expect("cursor exists while seeking");
-                if commit.commit_id == cursor.commit_id {
-                    if commit.created_at_unix_ms != cursor.created_at_unix_ms {
-                        return Err(cursor_conflict());
-                    }
-                    seeking_after = false;
-                }
-                continue;
-            }
-            records.push(commit);
-            if records.len() == usize::from(page_size) {
-                if current.is_some() {
-                    let last = records.last().expect("non-empty Commit graph page");
-                    next = Some(CommitGraphCursor {
-                        created_at_unix_ms: last.created_at_unix_ms,
-                        commit_id: last.commit_id,
-                    });
-                }
-                break;
-            }
-        }
-        if seeking_after {
-            return Err(cursor_conflict());
-        }
+        });
         let next_cursor = next
             .as_ref()
             .map(|cursor| encode_commit_cursor(&scope, cursor))
             .transpose()?;
+        let observed_artifact = self
+            .repository
+            .get_artifact(&tenant_id, &project_id, &artifact_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("artifact"))?;
+        if observed_artifact.resource_version != artifact.resource_version
+            || observed_artifact.head_commit_id != artifact.head_commit_id
+        {
+            return Err(if after.is_some() {
+                cursor_conflict()
+            } else {
+                commit_graph_changed()
+            });
+        }
         Ok(QueryArtifactCommitGraphResponse {
             graph: CommitGraphView {
                 graph_version: artifact.resource_version.to_string(),
@@ -551,6 +606,100 @@ impl CatalogService {
                 next_cursor,
             },
         })
+    }
+
+    async fn load_published_commit_graph(
+        &self,
+        artifact: &ArtifactRecord,
+        precommits: &dyn PreCommitRepository,
+    ) -> Result<Vec<CommitRecord>, Error> {
+        // Acknowledgements preserve old tips after their Playground moves. Current Head pointers
+        // close the cross-store window where catalog publication committed but acknowledgement did
+        // not. Walking every seed to its root also restores an unacknowledged published parent.
+        let acknowledged = precommits
+            .list_published_commits(
+                &artifact.tenant_id,
+                &artifact.project_id,
+                &artifact.artifact_id,
+            )
+            .await
+            .map_err(map_central_error)?;
+        let mut commits = BTreeMap::new();
+        let mut seeds = Vec::with_capacity(acknowledged.len().saturating_add(1));
+        for commit in acknowledged {
+            seeds.push(commit.commit_id);
+            commits.insert(commit.commit_id, commit);
+        }
+        if let Some(head) = artifact.head_commit_id {
+            seeds.push(CommitId::from_digest(head));
+        }
+
+        let mut after = None;
+        loop {
+            let page = self
+                .repository
+                .list_playgrounds(&PlaygroundListRequest {
+                    tenant_id: artifact.tenant_id.clone(),
+                    project_id: Some(artifact.project_id.clone()),
+                    artifact_id: Some(artifact.artifact_id.clone()),
+                    region: None,
+                    state: None,
+                    query: None,
+                    after,
+                    limit: MAX_PAGE_SIZE,
+                })
+                .await
+                .map_err(map_central_error)?;
+            seeds.extend(
+                page.records
+                    .iter()
+                    .filter_map(|playground| playground.head_commit_id)
+                    .map(CommitId::from_digest),
+            );
+            let Some(next) = page.next else {
+                break;
+            };
+            after = Some(next);
+        }
+
+        let mut resolved = BTreeSet::new();
+        for seed in seeds {
+            if resolved.contains(&seed) {
+                continue;
+            }
+            let mut current = Some(seed);
+            let mut path = Vec::new();
+            let mut path_ids = BTreeSet::new();
+            while let Some(commit_id) = current {
+                if resolved.contains(&commit_id) {
+                    break;
+                }
+                if !path_ids.insert(commit_id) {
+                    return Err(internal_catalog_error());
+                }
+                let parent = if let Some(commit) = commits.get(&commit_id) {
+                    commit.parent_commit_id
+                } else {
+                    let commit = precommits
+                        .get_commit(
+                            &artifact.tenant_id,
+                            &artifact.project_id,
+                            &artifact.artifact_id,
+                            commit_id,
+                        )
+                        .await
+                        .map_err(map_central_error)?
+                        .ok_or_else(internal_catalog_error)?;
+                    let parent = commit.parent_commit_id;
+                    commits.insert(commit.commit_id, commit);
+                    parent
+                };
+                path.push(commit_id);
+                current = parent;
+            }
+            resolved.extend(path);
+        }
+        Ok(commits.into_values().collect())
     }
 
     pub async fn create_artifact(
@@ -735,6 +884,7 @@ impl CatalogService {
                     .as_ref()
                     .is_none_or(|requested| existing.base_commit_id.as_ref() == Some(requested))
             {
+                self.require_storage_availability_configured()?;
                 self.ensure_workspace_materialization(&existing).await;
                 return Ok(CreatePlaygroundResponse {
                     playground: self.playground_view(&existing).await?,
@@ -753,30 +903,45 @@ impl CatalogService {
             .await
             .map_err(map_central_error)?
             .ok_or_else(|| resource_not_found("artifact"))?;
-        // An explicit base may select any immutable Commit owned by this exact Artifact scope.
-        // Omitting it still means "freeze the current authoritative Head", not an empty baseline.
+        // An explicit base may select any published immutable Commit owned by this exact Artifact
+        // scope. Omitting it still means "freeze the current authoritative Head", not an empty
+        // baseline.
         let (base_commit_id, artifact_head) = match requested_base_commit_id {
             Some(commit_id) => {
-                let exists = self
-                    .precommit_repository()?
-                    .get_commit(
-                        &tenant_id,
-                        &project_id,
-                        &artifact_id,
-                        CommitId::from_digest(commit_id),
-                    )
-                    .await
-                    .map_err(map_central_error)?
-                    .is_some();
-                if !exists {
-                    return Err(resource_not_found("commit"));
-                }
+                let commit = self
+                    .load_published_commit(&artifact, CommitId::from_digest(commit_id))
+                    .await?;
+                let source_storage_volume_id =
+                    self.commit_source_storage_volume_id(&commit).await?;
+                require_commit_on_volume(
+                    &source_storage_volume_id,
+                    &storage_volume_id,
+                    "playground_volume_has_no_commit_data",
+                    "PLAYGROUND_VOLUME_HAS_NO_COMMIT_DATA",
+                    "the selected StorageVolume does not hold this Commit's immutable objects",
+                )?;
                 (Some(commit_id), ArtifactHeadExpectation::Any)
             }
-            None => (
-                artifact.head_commit_id,
-                ArtifactHeadExpectation::Exact(artifact.head_commit_id),
-            ),
+            None => {
+                if let Some(commit_id) = artifact.head_commit_id {
+                    let commit = self
+                        .load_published_commit(&artifact, CommitId::from_digest(commit_id))
+                        .await?;
+                    let source_storage_volume_id =
+                        self.commit_source_storage_volume_id(&commit).await?;
+                    require_commit_on_volume(
+                        &source_storage_volume_id,
+                        &storage_volume_id,
+                        "playground_volume_has_no_commit_data",
+                        "PLAYGROUND_VOLUME_HAS_NO_COMMIT_DATA",
+                        "the selected StorageVolume does not hold the Artifact Head Commit's immutable objects",
+                    )?;
+                }
+                (
+                    artifact.head_commit_id,
+                    ArtifactHeadExpectation::Exact(artifact.head_commit_id),
+                )
+            }
         };
         let volume = self
             .repository
@@ -791,6 +956,8 @@ impl CatalogService {
                 "the selected StorageVolume is not ready for placement",
             ));
         }
+        self.require_live_storage_ready(&tenant_id, &storage_volume_id, "Playground placement")
+            .await?;
         let now = self.clock.now();
         let outcome = self
             .repository
@@ -954,6 +1121,7 @@ impl CatalogService {
                     "Snapshot request ID is already bound to another create payload",
                 ));
             }
+            self.require_storage_availability_configured()?;
             self.ensure_snapshot_mount(&existing).await;
             return Ok(CreateSnapshotResponse {
                 snapshot: self.snapshot_view(&existing).await?,
@@ -961,7 +1129,7 @@ impl CatalogService {
                 placement_reused: false,
             });
         }
-        let _artifact = self
+        let artifact = self
             .repository
             .get_artifact(&tenant_id, &project_id, &artifact_id)
             .await
@@ -969,41 +1137,16 @@ impl CatalogService {
             .ok_or_else(|| resource_not_found("artifact"))?;
         let artifact_head = ArtifactHeadExpectation::Any;
         let commit = self
-            .precommit_repository()?
-            .get_commit(
-                &tenant_id,
-                &project_id,
-                &artifact_id,
-                CommitId::from_digest(commit_id),
-            )
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("commit"))?;
-        let source_storage_volume_id =
-            if let Some(source_storage_volume_id) = commit.source_storage_volume_id.as_ref() {
-                source_storage_volume_id.clone()
-            } else {
-                // Compatibility for immutable Commit payloads written before placement provenance was
-                // persisted. New Commits never depend on the source Playground for Snapshot placement.
-                self.repository
-                    .get_playground(
-                        &tenant_id,
-                        &project_id,
-                        &artifact_id,
-                        &commit.source_playground_id,
-                    )
-                    .await
-                    .map_err(map_central_error)?
-                    .ok_or_else(|| resource_not_found("commit"))?
-                    .storage_volume_id
-            };
-        if source_storage_volume_id != storage_volume_id {
-            return Err(catalog_conflict(
-                "snapshot_volume_has_no_commit_data",
-                "SNAPSHOT_VOLUME_HAS_NO_COMMIT_DATA",
-                "the selected StorageVolume does not hold this Commit's immutable objects",
-            ));
-        }
+            .load_published_commit(&artifact, CommitId::from_digest(commit_id))
+            .await?;
+        let source_storage_volume_id = self.commit_source_storage_volume_id(&commit).await?;
+        require_commit_on_volume(
+            &source_storage_volume_id,
+            &storage_volume_id,
+            "snapshot_volume_has_no_commit_data",
+            "SNAPSHOT_VOLUME_HAS_NO_COMMIT_DATA",
+            "the selected StorageVolume does not hold this Commit's immutable objects",
+        )?;
         let volume = self
             .repository
             .get_storage_volume(&tenant_id, &storage_volume_id)
@@ -1017,6 +1160,8 @@ impl CatalogService {
                 "the selected StorageVolume is not ready for Snapshot placement",
             ));
         }
+        self.require_live_storage_ready(&tenant_id, &storage_volume_id, "Snapshot placement")
+            .await?;
         let relative_root = neoengram_protocol::SnapshotMountAssignment::canonical_relative_root(
             &project_id,
             &artifact_id,
@@ -1118,6 +1263,7 @@ impl CatalogService {
         let project_id = parse_project_id(request.project_id)?;
         let artifact_id = parse_artifact_id(request.artifact_id)?;
         let playground_id = parse_playground_id(request.playground_id)?;
+        self.require_storage_availability_configured()?;
         let precommit_request_id = RequestId::new(request.precommit_request_id)
             .map_err(|error| invalid_request(format!("precommit_request_id: {error}")))?;
         let source_index_version = parse_index_version(request.expected_index_version)?;
@@ -1163,10 +1309,15 @@ impl CatalogService {
         let playground = self
             .load_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
             .await?;
+        self.require_live_storage_ready(
+            &playground.tenant_id,
+            &playground.storage_volume_id,
+            "Pre-commit start",
+        )
+        .await?;
         self.validate_precommit_source(&playground, &source_index_version)
             .await?;
-        let artifact = self
-            .repository
+        self.repository
             .get_artifact(&tenant_id, &project_id, &artifact_id)
             .await
             .map_err(map_central_error)?
@@ -1181,7 +1332,9 @@ impl CatalogService {
                 precommit_id,
                 precommit_request_id,
                 source_index_version,
-                frozen_head_commit_id: artifact.head_commit_id.map(Into::into),
+                // A Playground is an independent line of development. Freeze its own Head as
+                // the Commit parent; the Artifact Head is only the convenient current pointer.
+                frozen_head_commit_id: playground.head_commit_id.map(Into::into),
                 job_id,
                 created_at_unix_ms: now,
             })
@@ -1241,11 +1394,33 @@ impl CatalogService {
             .await?;
         let precommit_id = PreCommitId::new(request.precommit_id)
             .map_err(|error| invalid_request(format!("precommit_id: {error}")))?;
+        self.require_storage_availability_configured()?;
         let restart_request_id = RequestId::new(request.restart_request_id)
             .map_err(|error| invalid_request(format!("restart_request_id: {error}")))?;
         let source_index_version = parse_index_version(request.expected_index_version)?;
         let key = PreCommitKey::new(tenant_id.clone(), precommit_id.clone());
         let (precommits, coordinator) = self.precommit_execution()?;
+        if let Some(replayed) = precommits
+            .find_restart_result(&tenant_id, &restart_request_id)
+            .await
+            .map_err(map_central_error)?
+        {
+            if replayed.precommit_id != precommit_id
+                || !same_index_version(&replayed.source_index_version, &source_index_version)
+            {
+                return Err(precommit_conflict(
+                    "restart_request_id is already bound to another request",
+                ));
+            }
+            let playground = self
+                .load_precommit_playground(identity, &replayed, Permission::PlaygroundRead)
+                .await?;
+            return Ok(RestartPreCommitResponse {
+                precommit: precommit_view(&replayed),
+                playground: self.playground_view(&playground).await?,
+                replayed: true,
+            });
+        }
         let stored = precommits
             .get(&key)
             .await
@@ -1254,7 +1429,12 @@ impl CatalogService {
         let playground = self
             .load_precommit_playground(identity, &stored, Permission::PlaygroundCreate)
             .await?;
-
+        self.require_live_storage_ready(
+            &playground.tenant_id,
+            &playground.storage_volume_id,
+            "Pre-commit restart",
+        )
+        .await?;
         if matches!(
             stored.state,
             PreCommitState::Abnormal | PreCommitState::Cancelled
@@ -1262,8 +1442,7 @@ impl CatalogService {
             self.validate_precommit_source(&playground, &source_index_version)
                 .await?;
         }
-        let artifact = self
-            .repository
+        self.repository
             .get_artifact(&stored.tenant_id, &stored.project_id, &stored.artifact_id)
             .await
             .map_err(map_central_error)?
@@ -1272,16 +1451,16 @@ impl CatalogService {
             .attempt
             .checked_add(1)
             .ok_or_else(|| precommit_conflict("Pre-commit attempt is exhausted"))?;
-        let job_id = deterministic_precommit_job_id(&tenant_id, &precommit_id, next_attempt)?;
+        let restart = DomainPreCommitRestartRequest {
+            key,
+            restart_request_id,
+            source_index_version,
+            frozen_head_commit_id: playground.head_commit_id.map(Into::into),
+            job_id: deterministic_precommit_job_id(&tenant_id, &precommit_id, next_attempt)?,
+            restarted_at_unix_ms: self.clock.now(),
+        };
         let outcome = precommits
-            .restart(DomainPreCommitRestartRequest {
-                key,
-                restart_request_id,
-                source_index_version,
-                frozen_head_commit_id: artifact.head_commit_id.map(Into::into),
-                job_id,
-                restarted_at_unix_ms: self.clock.now(),
-            })
+            .restart(restart)
             .await
             .map_err(precommit_mutation_error)?;
         if outcome.precommit.state == PreCommitState::Running {
@@ -1673,6 +1852,43 @@ impl CatalogService {
         })
     }
 
+    async fn load_published_commit(
+        &self,
+        artifact: &ArtifactRecord,
+        commit_id: CommitId,
+    ) -> Result<CommitRecord, Error> {
+        let precommits = self.precommit_repository()?;
+        let published = self
+            .load_published_commit_graph(artifact, precommits.as_ref())
+            .await?;
+        published
+            .into_iter()
+            .find(|commit| commit.commit_id == commit_id)
+            .ok_or_else(|| resource_not_found("commit"))
+    }
+
+    async fn commit_source_storage_volume_id(
+        &self,
+        commit: &CommitRecord,
+    ) -> Result<StorageVolumeId, Error> {
+        if let Some(storage_volume_id) = &commit.source_storage_volume_id {
+            return Ok(storage_volume_id.clone());
+        }
+        // Compatibility for immutable Commit payloads written before placement provenance was
+        // persisted. New Commits never depend on the source Playground for placement checks.
+        self.repository
+            .get_playground(
+                &commit.tenant_id,
+                &commit.project_id,
+                &commit.artifact_id,
+                &commit.source_playground_id,
+            )
+            .await
+            .map_err(map_central_error)?
+            .map(|playground| playground.storage_volume_id)
+            .ok_or_else(|| resource_not_found("commit"))
+    }
+
     async fn load_commit_records(
         &self,
         tenant_id: &TenantId,
@@ -1801,6 +2017,51 @@ impl CatalogService {
         Ok(())
     }
 
+    async fn require_live_storage_ready(
+        &self,
+        tenant_id: &TenantId,
+        storage_volume_id: &StorageVolumeId,
+        operation: &str,
+    ) -> Result<(), Error> {
+        let provider = self.require_storage_availability_configured()?;
+        let state = provider
+            .current_volume_state(tenant_id, storage_volume_id)
+            .await
+            .map_err(map_central_error)?;
+        if state == neoengramd::DerivedVolumeState::Ready {
+            tracing::debug!(%operation, %tenant_id, %storage_volume_id, "live StorageVolume gate passed");
+            return Ok(());
+        }
+        let message = match state {
+            neoengramd::DerivedVolumeState::Degraded => {
+                "the StorageVolume is degraded and cannot execute this operation"
+            }
+            neoengramd::DerivedVolumeState::Unavailable => {
+                "the StorageVolume is currently unreachable"
+            }
+            neoengramd::DerivedVolumeState::Ready => unreachable!(),
+        };
+        Err(catalog_conflict(
+            "storage_volume_unavailable",
+            "STORAGE_VOLUME_UNAVAILABLE",
+            message,
+        ))
+    }
+
+    fn require_storage_availability_configured(
+        &self,
+    ) -> Result<&Arc<dyn StorageAvailabilityProvider>, Error> {
+        self.storage_availability.as_ref().ok_or_else(|| {
+            application_error(
+                ErrorCategory::Unavailable,
+                "storage_availability_unavailable",
+                "STORAGE_AVAILABILITY_UNAVAILABLE",
+                "live StorageVolume availability is not configured",
+                true,
+            )
+        })
+    }
+
     fn tenant_view(&self, identity: &AuthenticatedIdentity, record: &TenantRecord) -> TenantView {
         TenantView {
             tenant_id: record.tenant_id.to_string(),
@@ -1838,7 +2099,24 @@ impl CatalogService {
                 .map_err(map_central_error)?,
             None => None,
         };
-        Ok(playground_view(record, &index_version, active.as_ref()))
+        let storage_availability = match &self.storage_availability {
+            Some(provider) => match provider
+                .current_volume_state(&record.tenant_id, &record.storage_volume_id)
+                .await
+                .map_err(map_central_error)?
+            {
+                neoengramd::DerivedVolumeState::Ready => "ready",
+                neoengramd::DerivedVolumeState::Degraded => "degraded",
+                neoengramd::DerivedVolumeState::Unavailable => "unavailable",
+            },
+            None => "unknown",
+        };
+        Ok(playground_view(
+            record,
+            &index_version,
+            active.as_ref(),
+            storage_availability,
+        ))
     }
 
     async fn snapshot_view(&self, record: &SnapshotRecord) -> Result<SnapshotView, Error> {
@@ -1966,6 +2244,7 @@ fn playground_view(
     record: &PlaygroundRecord,
     index_version: &WireIndexVersion,
     active_precommit: Option<&PreCommitRecord>,
+    storage_availability: &str,
 ) -> PlaygroundView {
     PlaygroundView {
         tenant_id: record.tenant_id.to_string(),
@@ -1982,6 +2261,7 @@ fn playground_view(
             digest: index_version.digest.to_string(),
         },
         state: playground_state_name(record.state).to_owned(),
+        storage_availability: storage_availability.to_owned(),
         active_precommit_id: active_precommit.map(|record| record.precommit_id.to_string()),
         issue: None,
         created_at_unix_ms: record.created_at_unix_ms.to_string(),
@@ -2888,8 +3168,32 @@ fn cursor_conflict() -> Error {
     )
 }
 
+fn commit_graph_changed() -> Error {
+    application_error(
+        ErrorCategory::Conflict,
+        "commit_graph_changed",
+        "COMMIT_GRAPH_CHANGED",
+        "the Commit graph changed while it was being read; retry the query",
+        true,
+    )
+}
+
 fn catalog_conflict(code: &'static str, neo_code: &'static str, message: &'static str) -> Error {
     application_error(ErrorCategory::Conflict, code, neo_code, message, false)
+}
+
+fn require_commit_on_volume(
+    source_storage_volume_id: &StorageVolumeId,
+    target_storage_volume_id: &StorageVolumeId,
+    code: &'static str,
+    neo_code: &'static str,
+    message: &'static str,
+) -> Result<(), Error> {
+    if source_storage_volume_id == target_storage_volume_id {
+        Ok(())
+    } else {
+        Err(catalog_conflict(code, neo_code, message))
+    }
 }
 
 fn catalog_mutation_error(error: neoengramd::CentralError, reused_code: &'static str) -> Error {
