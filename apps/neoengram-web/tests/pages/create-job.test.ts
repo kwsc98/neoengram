@@ -46,6 +46,7 @@ function playground(overrides: Partial<PlaygroundView> = {}): PlaygroundView {
     display_name: 'Test playground',
     index_version: { revision: '7', digest: 'a'.repeat(64) },
     state: 'ready',
+    storage_availability: 'ready',
     created_at_unix_ms: '1785167000000',
     updated_at_unix_ms: '1785167600000',
     ...overrides,
@@ -250,6 +251,44 @@ describe('Create Job mutation identity', () => {
       playground_id: 'playground-selected',
       expected_index_version: { revision: '5', digest: 'c'.repeat(64) },
     });
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('does not create a scan Job while the Playground storage is unavailable', async () => {
+    const { wrapper, queryClient } = await mountPage({
+      queryPlaygroundImplementation: () =>
+        Promise.resolve({
+          data: { playground: playground({ storage_availability: 'unavailable' }) },
+          requestId: 'request-unavailable-playground',
+        }),
+    });
+
+    await submit(wrapper);
+
+    expect(api.createAddJob).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain('存储不可达');
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('reports an abnormal lifecycle before the ready storage state', async () => {
+    const { wrapper, queryClient } = await mountPage({
+      queryPlaygroundImplementation: () =>
+        Promise.resolve({
+          data: {
+            playground: playground({ state: 'abnormal', storage_availability: 'ready' }),
+          },
+          requestId: 'request-abnormal-playground',
+        }),
+    });
+
+    await submit(wrapper);
+
+    expect(api.createAddJob).not.toHaveBeenCalled();
+    expect(wrapper.html()).toContain('Playground 生命周期异常');
 
     wrapper.unmount();
     queryClient.clear();

@@ -1,12 +1,13 @@
 import { VueQueryPlugin, QueryClient } from '@tanstack/vue-query';
 import { flushPromises, shallowMount } from '@vue/test-utils';
 import { ElMessageBox } from 'element-plus';
-import { createPinia } from 'pinia';
+import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PlaygroundCommitPage from '@/pages/PlaygroundCommitPage.vue';
+import { useTenantsStore } from '@/stores/tenants';
 
 const api = vi.hoisted(() => ({
   cancelPlaygroundPreCommit: vi.fn(),
@@ -27,6 +28,7 @@ const sourceIndexVersion = { revision: '2', digest: 'sha256:index' };
 function playground(
   activePreCommitId?: string,
   indexVersion: { revision: string; digest: string } = sourceIndexVersion,
+  storageAvailability: 'ready' | 'degraded' | 'unavailable' | 'unknown' = 'ready',
 ) {
   return {
     tenant_id: 'tenant-a',
@@ -39,6 +41,7 @@ function playground(
     head_commit_id: headCommitId,
     index_version: indexVersion,
     state: 'ready' as const,
+    storage_availability: storageAvailability,
     ...(activePreCommitId ? { active_precommit_id: activePreCommitId } : {}),
     created_at_unix_ms: '1',
     updated_at_unix_ms: '2',
@@ -49,6 +52,7 @@ async function mountPage(
   activePreCommitId?: string,
   routedPreCommitId?: string,
   precommitOverrides: Record<string, unknown> = {},
+  storageAvailability: 'ready' | 'degraded' | 'unavailable' | 'unknown' = 'ready',
 ) {
   api.queryApiVersion.mockResolvedValue({
     data: {
@@ -59,7 +63,9 @@ async function mountPage(
     requestId: 'request-version',
   });
   api.queryPlayground.mockResolvedValue({
-    data: { playground: playground(activePreCommitId) },
+    data: {
+      playground: playground(activePreCommitId, sourceIndexVersion, storageAvailability),
+    },
     requestId: 'request-playground',
   });
   api.queryPlaygroundPreCommit.mockResolvedValue({
@@ -120,9 +126,21 @@ async function mountPage(
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
   });
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  useTenantsStore().items = [
+    {
+      tenant_id: 'tenant-a',
+      display_name: 'Tenant A',
+      permissions: ['playground.read', 'playground.create'],
+      resource_version: '1',
+      created_at_unix_ms: '1',
+      updated_at_unix_ms: '2',
+    },
+  ];
   const wrapper = shallowMount(PlaygroundCommitPage, {
     global: {
-      plugins: [createPinia(), [VueQueryPlugin, { queryClient }], router],
+      plugins: [pinia, [VueQueryPlugin, { queryClient }], router],
       stubs: {
         PageHeading: {
           template: '<section><slot /><slot name="actions" /></section>',
@@ -311,6 +329,46 @@ describe('Playground Commit page recovery', () => {
       .findAllComponents(ApiProblemAlert)
       .find((alert) => (alert.props('error') as Error | undefined)?.message.includes('不属于'));
     expect(scopeAlert).toBeDefined();
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('keeps a frozen candidate reviewable and committable while storage is unavailable', async () => {
+    const { wrapper, queryClient } = await mountPage(
+      'precommit-a',
+      undefined,
+      {
+        state: 'ready',
+        phase: 'idle',
+        candidate_index_version: { revision: '3', digest: 'sha256:candidate-3' },
+      },
+      'unavailable',
+    );
+
+    const storageAlert = wrapper
+      .findAll('el-alert, el-alert-stub')
+      .find((alert) => alert.attributes('title') === 'StorageVolume 当前不可达');
+    expect(storageAlert).toBeDefined();
+    expect(storageAlert?.attributes('description')).toContain('中心保存的候选变化仍可审查和提交');
+    expect(wrapper.text()).toContain('填写 Commit 信息');
+    expect(wrapper.text()).not.toContain('重新检测');
+    expect(api.queryPlaygroundChangeList).toHaveBeenCalledTimes(1);
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('gates an Agent-backed retry while storage is unavailable', async () => {
+    const { wrapper, queryClient } = await mountPage(
+      undefined,
+      'precommit-a',
+      { state: 'cancelled', phase: 'idle' },
+      'unavailable',
+    );
+
+    expect(wrapper.text()).not.toContain('失败重试');
+    expect(api.restartPlaygroundPreCommit).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();

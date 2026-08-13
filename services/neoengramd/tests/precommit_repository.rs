@@ -388,6 +388,11 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
     );
     assert_eq!(committed.commit.commit_id, commit_id);
     assert!(repository
+        .list_published_commits(&tenant_id, &project_id, &artifact_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(repository
         .get_active(&tenant_id, &project_id, &artifact_id, &playground_id)
         .await
         .unwrap()
@@ -424,6 +429,13 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
     assert_eq!(
         acknowledged.head_published_at_unix_ms,
         Some(UnixMillis::new(350))
+    );
+    assert_eq!(
+        repository
+            .list_published_commits(&tenant_id, &project_id, &artifact_id)
+            .await
+            .unwrap(),
+        vec![committed.commit.clone()]
     );
     let acknowledgement_replay = repository
         .acknowledge_head_publication(&key, commit_id, UnixMillis::new(999))
@@ -657,6 +669,13 @@ async fn exercise_restart_and_cancel(
     let restarted = repository.restart(restart.clone()).await.unwrap();
     assert_eq!(restarted.precommit.attempt, 2);
     assert_eq!(restarted.precommit.state, PreCommitState::Running);
+    assert_eq!(
+        repository
+            .find_restart_result(&tenant_id, &restart.restart_request_id)
+            .await
+            .unwrap(),
+        Some(restarted.precommit.clone())
+    );
     assert!(repository.restart(restart).await.unwrap().replayed);
     assert_eq!(repository.list_running(None, 10).await.unwrap().len(), 1);
 

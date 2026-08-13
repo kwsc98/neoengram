@@ -825,9 +825,9 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                     "Commit Playground does not exist",
                 )
             })?;
-        if artifact.head_commit_id == Some(request.commit_id)
-            && playground.head_commit_id == Some(request.commit_id)
-        {
+        // The Playground Head is the branch-local CAS fence. Artifact Head is only a mutable
+        // convenience pointer and may have advanced through another Playground branch.
+        if playground.head_commit_id == Some(request.commit_id) {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(AdvancePlaygroundCommitOutcome {
                 artifact,
@@ -835,12 +835,10 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 replayed: true,
             });
         }
-        if artifact.head_commit_id != request.expected_head_commit_id
-            || playground.head_commit_id != request.expected_head_commit_id
-        {
+        if playground.head_commit_id != request.expected_head_commit_id {
             return Err(catalog_parent_error(
                 CentralErrorCode::ArtifactHeadMismatch,
-                "Artifact or Playground Head changed after Pre-commit",
+                "Playground Head changed after Pre-commit",
             ));
         }
         if playground.state != PlaygroundState::Ready {
@@ -862,8 +860,7 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         let artifact_update = sqlx::query(
             "UPDATE artifact_catalog_records \
              SET head_commit_digest = ?, resource_version = ?, updated_at_unix_ms = ? \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? \
-               AND ((head_commit_digest IS NULL AND ? IS NULL) OR head_commit_digest = ?)",
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ?",
         )
         .bind(&commit_digest)
         .bind(next_resource_version.to_string())
@@ -871,8 +868,6 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         .bind(request.tenant_id.as_str())
         .bind(request.project_id.as_str())
         .bind(request.artifact_id.as_str())
-        .bind(expected_digest.clone())
-        .bind(expected_digest.clone())
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;

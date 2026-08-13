@@ -32,8 +32,13 @@ import {
   supportsResourceBrowser,
 } from '@/features/capabilities';
 import {
-  playgroundAvailabilityLabel,
-  playgroundAvailabilityTagType,
+  isPlaygroundOperational,
+  playgroundLifecycleLabel,
+  playgroundLifecycleTagType,
+  playgroundPollInterval,
+  playgroundStorageAvailability,
+  playgroundStorageAvailabilityLabel,
+  playgroundStorageAvailabilityTagType,
 } from '@/features/precommit/status';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
@@ -89,13 +94,12 @@ const playgroundQuery = useQuery({
   queryKey: playgroundKey,
   queryFn: () =>
     queryPlayground(tenantId.value, projectId.value, artifactId.value, playgroundId.value),
-  refetchInterval: (query) =>
-    query.state.data?.data.playground.state === 'creating' ||
-    Boolean(query.state.data?.data.playground.active_precommit_id)
-      ? 1_000
-      : false,
+  refetchInterval: (query) => playgroundPollInterval(query.state.data?.data.playground),
 });
 const playground = computed(() => playgroundQuery.data.value?.data.playground);
+const storageAvailability = computed(() => playgroundStorageAvailability(playground.value));
+const playgroundOperational = computed(() => isPlaygroundOperational(playground.value));
+const playgroundMaterialized = computed(() => playground.value?.state === 'ready');
 const playgroundIndexVersionKey = computed(() => {
   const indexVersion = playground.value?.index_version;
   return indexVersion ? `${indexVersion.revision}:${indexVersion.digest}` : '';
@@ -128,7 +132,7 @@ const changeQuery = useQuery({
       ...(changePathPrefix.value ? { path_prefix: changePathPrefix.value } : {}),
       ...(changeCursor.value ? { cursor: changeCursor.value } : {}),
     }),
-  enabled: computed(() => playgroundBrowserEnabled.value && playground.value?.state === 'ready'),
+  enabled: computed(() => playgroundBrowserEnabled.value && playgroundMaterialized.value),
 });
 
 const fileQuery = useQuery({
@@ -157,7 +161,7 @@ const fileQuery = useQuery({
       ...(fileFormat.value ? { format: fileFormat.value } : {}),
       ...(fileCursor.value ? { cursor: fileCursor.value } : {}),
     }),
-  enabled: computed(() => playgroundBrowserEnabled.value && playground.value?.state === 'ready'),
+  enabled: computed(() => playgroundBrowserEnabled.value && playgroundMaterialized.value),
 });
 
 const profileQuery = useQuery({
@@ -179,7 +183,7 @@ const profileQuery = useQuery({
       artifact_id: artifactId.value,
       playground_id: playgroundId.value,
     }),
-  enabled: computed(() => playgroundBrowserEnabled.value && playground.value?.state === 'ready'),
+  enabled: computed(() => playgroundBrowserEnabled.value && playgroundMaterialized.value),
 });
 const profile = computed(() => profileQuery.data.value?.data.profile);
 
@@ -207,7 +211,7 @@ const metadataQuery = useQuery({
   enabled: computed(
     () =>
       playgroundBrowserEnabled.value &&
-      playground.value?.state === 'ready' &&
+      playgroundMaterialized.value &&
       metadataDrawerOpen.value &&
       Boolean(selectedFilePath.value),
   ),
@@ -222,8 +226,8 @@ const canStartPreCommit = computed(
   () =>
     playgroundPreCommitEnabled.value &&
     hasCommitPermission.value &&
-    playground.value?.state === 'ready' &&
-    !playground.value.active_precommit_id,
+    playgroundOperational.value &&
+    !playground.value?.active_precommit_id,
 );
 
 const changeSummary = computed(() => changeQuery.data.value?.data.summary);
@@ -312,7 +316,7 @@ function changeImpact(row: PlaygroundChangeEntry): string {
 }
 
 function showFileMetadata(path: string): void {
-  if (!playgroundBrowserEnabled.value || playground.value?.state !== 'ready') return;
+  if (!playgroundBrowserEnabled.value || !playgroundMaterialized.value) return;
   selectedFilePath.value = path;
   metadataDrawerOpen.value = true;
 }
@@ -434,16 +438,34 @@ async function openHeadCommit(): Promise<void> {
       <el-alert
         v-else-if="playground.state === 'creating'"
         title="工作区正在创建"
-        description="Server 正在等待 Agent 物化工作区目录。完成后会自动变为可用。"
+        description="Server 正在等待 Agent 物化工作区目录。完成后生命周期会变为已物化，并单独展示实时存储可达性。"
         type="warning"
         :closable="false"
         show-icon
       />
       <el-alert
         v-else-if="playground.state === 'abnormal'"
-        title="工作区不可用"
+        title="工作区物化异常"
         description="当前只能查看权威状态和错误，修复物化问题后再重试。"
         type="error"
+        :closable="false"
+        show-icon
+      />
+      <el-alert
+        v-else-if="storageAvailability !== 'ready'"
+        :title="playgroundStorageAvailabilityLabel(storageAvailability)"
+        :description="
+          storageAvailability === 'unknown'
+            ? '服务端尚未确认 StorageVolume 的实时状态。可以查看中心索引，依赖 Agent 的实时操作已暂停。'
+            : 'Playground 已物化，但当前 StorageVolume 无法正常访问。可以查看中心索引，依赖 Agent 的实时操作已暂停。'
+        "
+        :type="
+          storageAvailability === 'unavailable'
+            ? 'error'
+            : storageAvailability === 'degraded'
+              ? 'warning'
+              : 'info'
+        "
         :closable="false"
         show-icon
       />
@@ -490,10 +512,21 @@ async function openHeadCommit(): Promise<void> {
             <dd>{{ playground.region }}</dd>
           </div>
           <div>
-            <dt>状态</dt>
+            <dt>生命周期</dt>
             <dd>
-              <el-tag :type="playgroundAvailabilityTagType(playground.state)" effect="plain">
-                {{ playgroundAvailabilityLabel(playground.state) }}
+              <el-tag :type="playgroundLifecycleTagType(playground.state)" effect="plain">
+                {{ playgroundLifecycleLabel(playground.state) }}
+              </el-tag>
+            </dd>
+          </div>
+          <div>
+            <dt>存储可达性</dt>
+            <dd>
+              <el-tag
+                :type="playgroundStorageAvailabilityTagType(storageAvailability)"
+                effect="plain"
+              >
+                {{ playgroundStorageAvailabilityLabel(storageAvailability) }}
               </el-tag>
             </dd>
           </div>
@@ -528,9 +561,15 @@ async function openHeadCommit(): Promise<void> {
 
       <section v-if="playgroundBrowserEnabled" class="resource-summary playground-summary">
         <div>
-          <span>可用性</span>
-          <el-tag :type="playgroundAvailabilityTagType(playground.state)" effect="plain">
-            {{ playgroundAvailabilityLabel(playground.state) }}
+          <span>生命周期</span>
+          <el-tag :type="playgroundLifecycleTagType(playground.state)" effect="plain">
+            {{ playgroundLifecycleLabel(playground.state) }}
+          </el-tag>
+        </div>
+        <div>
+          <span>存储可达性</span>
+          <el-tag :type="playgroundStorageAvailabilityTagType(storageAvailability)" effect="plain">
+            {{ playgroundStorageAvailabilityLabel(storageAvailability) }}
           </el-tag>
         </div>
         <div>
@@ -556,17 +595,23 @@ async function openHeadCommit(): Promise<void> {
         class="precommit-band"
         :class="{ 'is-active': playground.active_precommit_id }"
       >
-        <CircleCheck v-if="playground.state === 'ready'" />
+        <CircleCheck v-if="playgroundOperational" />
         <WarningFilled v-else />
         <div>
-          <strong v-if="playground.active_precommit_id">存在活动 Pre-commit</strong>
-          <strong v-else-if="playground.state === 'ready'">Playground 可以发起 Pre-commit</strong>
+          <strong v-if="playground.active_precommit_id && playgroundOperational">
+            存在活动 Pre-commit
+          </strong>
+          <strong v-else-if="playground.active_precommit_id">Pre-commit 检测已暂停</strong>
+          <strong v-else-if="playgroundOperational">Playground 可以发起 Pre-commit</strong>
           <strong v-else>Playground 当前不可提交</strong>
           <p v-if="playground.active_precommit_id">
             <code>{{ playground.active_precommit_id }}</code
-            >，进入提交页面查看权威状态。
+            >，进入提交页面查看中心保存的权威状态。
           </p>
-          <p v-else>Pre-commit 会冻结当前 IndexVersion，并返回可审查的变化和检查结果。</p>
+          <p v-else-if="playgroundOperational">
+            Pre-commit 会冻结当前 IndexVersion，并返回可审查的变化和检查结果。
+          </p>
+          <p v-else>需要生命周期为已物化且存储可达，才能执行依赖 Agent 的操作。</p>
         </div>
         <el-button v-if="playground.active_precommit_id" type="primary" @click="openCommitPage">
           查看状态
@@ -574,7 +619,7 @@ async function openHeadCommit(): Promise<void> {
       </section>
 
       <section
-        v-if="playgroundBrowserEnabled && playground.state === 'ready'"
+        v-if="playgroundBrowserEnabled && playgroundMaterialized"
         class="content-section playground-console"
       >
         <div class="section-heading section-heading--inline">

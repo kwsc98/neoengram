@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use fusen_rs::ErrorCategory;
 use neoengram_core::ContentDigest;
 use neoengram_protocol::{
     ArtifactId, EdgeClusterId, PlaygroundId, PrincipalKind, ProjectId, StorageVolumeId, TenantId,
@@ -9,19 +11,37 @@ use neoengram_server::{
     dto::{
         ArtifactInitialization as ArtifactInitializationBody, CreateArtifactRequest,
         CreatePlaygroundRequest, JsonExtensions, QueryArtifactCommitGraphRequest,
-        QueryArtifactListRequest, QueryArtifactRequest,
+        QueryArtifactListRequest, QueryArtifactRequest, QueryPlaygroundRequest,
     },
-    AuthenticatedIdentity, CatalogService, Permission, StaticRbacPolicy, SystemService,
+    AuthenticatedIdentity, CatalogService, Permission, StaticRbacPolicy,
+    StorageAvailabilityProvider, SystemService,
 };
 use neoengramd::{
-    ArtifactInitialization, ArtifactRecord, CatalogPvcReference, ControlCatalogRepository,
-    InMemoryComponents, PlaygroundRecord, PlaygroundState, StorageAccessMode, StorageBackendType,
-    StorageVolumeRecord, StorageVolumeState, TenantRecord,
+    ArtifactInitialization, ArtifactRecord, CatalogPvcReference, CentralResult,
+    ControlCatalogRepository, DerivedVolumeState, InMemoryComponents, PlaygroundRecord,
+    PlaygroundState, StorageAccessMode, StorageBackendType, StorageVolumeRecord,
+    StorageVolumeState, TenantRecord,
 };
+
+mod support;
+use support::ReadyStorageAvailability;
+
+struct FixedStorageAvailability(DerivedVolumeState);
+
+#[async_trait]
+impl StorageAvailabilityProvider for FixedStorageAvailability {
+    async fn current_volume_state(
+        &self,
+        _tenant_id: &TenantId,
+        _storage_volume_id: &StorageVolumeId,
+    ) -> CentralResult<DerivedVolumeState> {
+        Ok(self.0)
+    }
+}
 
 #[test]
 fn api_version_advertises_the_minimal_artifact_catalog() {
-    let version = SystemService.query_api_version();
+    let version = SystemService::new(false).query_api_version();
     assert!(version
         .capabilities
         .iter()
@@ -34,6 +54,30 @@ fn api_version_advertises_the_minimal_artifact_catalog() {
         .capabilities
         .iter()
         .any(|capability| capability == "resource_browser"));
+    for capability in [
+        "playground_materialize",
+        "playground_precommit",
+        "snapshot_materialize",
+    ] {
+        assert!(!version
+            .capabilities
+            .iter()
+            .any(|advertised| advertised == capability));
+    }
+
+    let storage_enabled = SystemService::new(true).query_api_version();
+    assert!(storage_enabled
+        .capabilities
+        .iter()
+        .any(|capability| capability == "playground_materialize"));
+    assert!(storage_enabled
+        .capabilities
+        .iter()
+        .any(|capability| capability == "playground_precommit"));
+    assert!(storage_enabled
+        .capabilities
+        .iter()
+        .any(|capability| capability == "snapshot_materialize"));
 }
 
 #[tokio::test]
@@ -331,11 +375,8 @@ async fn playground_requires_an_artifact_and_freezes_the_authoritative_head() {
             create_playground_request("playground-inherited", None),
         )
         .await
-        .unwrap();
-    assert!(!inherited.replayed);
-    assert_eq!(inherited.playground.state, "creating");
-    assert_eq!(inherited.playground.base_commit_id, Some(head.to_string()));
-    assert_eq!(inherited.playground.head_commit_id, Some(head.to_string()));
+        .unwrap_err();
+    assert_eq!(inherited.code().as_str(), "catalog_internal");
 
     let missing_commit = service
         .create_playground(
@@ -344,7 +385,259 @@ async fn playground_requires_an_artifact_and_freezes_the_authoritative_head() {
         )
         .await
         .unwrap_err();
-    assert_eq!(missing_commit.code().as_str(), "resource_not_found");
+    assert_eq!(missing_commit.code().as_str(), "catalog_internal");
+}
+
+#[tokio::test]
+async fn playground_create_fails_closed_without_live_storage_availability() {
+    let components = InMemoryComponents::new(1_000);
+    let tenant_id = TenantId::new("tenant-a").unwrap();
+    insert_tenant(&components, tenant_id.clone()).await;
+    components
+        .control_catalog
+        .insert_storage_volume(StorageVolumeRecord {
+            tenant_id: tenant_id.clone(),
+            storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
+            display_name: "Volume A".to_owned(),
+            edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
+            region: "cn-shanghai".to_owned(),
+            backend_type: StorageBackendType::Pvc,
+            access_mode: StorageAccessMode::ReadWriteMany,
+            pvc_reference: Some(CatalogPvcReference {
+                namespace: "neoengram".to_owned(),
+                claim_name: "data-a".to_owned(),
+            }),
+            nfs_reference: None,
+            state: StorageVolumeState::Ready,
+            resource_version: 1,
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+    components
+        .control_catalog
+        .insert_artifact(ArtifactRecord {
+            tenant_id: tenant_id.clone(),
+            project_id: ProjectId::new("project-a").unwrap(),
+            artifact_id: ArtifactId::new("artifact-a").unwrap(),
+            display_name: "Artifact A".to_owned(),
+            description: None,
+            initialization: ArtifactInitialization::Empty,
+            head_commit_id: None,
+            resource_version: 1,
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+    let policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-a",
+            [tenant_id.to_string()],
+            [Permission::PlaygroundCreate],
+        )
+        .unwrap(),
+    );
+    let service = CatalogService::new(
+        components.control_catalog.clone(),
+        components.publisher.clone(),
+        policy,
+        components.clock.clone(),
+    )
+    .with_precommits(components.precommits.clone());
+
+    let error = service
+        .create_playground(
+            &identity(),
+            create_playground_request("playground-no-registry", None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Unavailable);
+    assert_eq!(error.code().as_str(), "storage_availability_unavailable");
+}
+
+#[tokio::test]
+async fn playground_lifecycle_and_live_storage_availability_are_independent() {
+    let components = InMemoryComponents::new(1_000);
+    let tenant_id = TenantId::new("tenant-a").unwrap();
+    let project_id = ProjectId::new("project-a").unwrap();
+    let artifact_id = ArtifactId::new("artifact-a").unwrap();
+    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let storage_volume_id = StorageVolumeId::new("volume-a").unwrap();
+    insert_tenant(&components, tenant_id.clone()).await;
+    components
+        .control_catalog
+        .insert_storage_volume(StorageVolumeRecord {
+            tenant_id: tenant_id.clone(),
+            storage_volume_id: storage_volume_id.clone(),
+            display_name: "Volume A".to_owned(),
+            edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
+            region: "cn-shanghai".to_owned(),
+            backend_type: StorageBackendType::Pvc,
+            access_mode: StorageAccessMode::ReadWriteMany,
+            pvc_reference: Some(CatalogPvcReference {
+                namespace: "neoengram".to_owned(),
+                claim_name: "data-a".to_owned(),
+            }),
+            nfs_reference: None,
+            state: StorageVolumeState::Ready,
+            resource_version: 1,
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+    components
+        .control_catalog
+        .insert_artifact(ArtifactRecord {
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            artifact_id: artifact_id.clone(),
+            display_name: "Artifact A".to_owned(),
+            description: None,
+            initialization: ArtifactInitialization::Empty,
+            head_commit_id: None,
+            resource_version: 1,
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+    components
+        .control_catalog
+        .insert_playground(PlaygroundRecord {
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            artifact_id: artifact_id.clone(),
+            playground_id: playground_id.clone(),
+            storage_volume_id,
+            region: "cn-shanghai".to_owned(),
+            display_name: "Playground A".to_owned(),
+            base_commit_id: None,
+            head_commit_id: None,
+            state: PlaygroundState::Ready,
+            relative_root: "playgrounds/project-a/artifact-a/playground-a".to_owned(),
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+    let policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-a",
+            [tenant_id.to_string()],
+            [Permission::PlaygroundRead],
+        )
+        .unwrap(),
+    );
+    let request = QueryPlaygroundRequest {
+        tenant_id: tenant_id.to_string(),
+        project_id: project_id.to_string(),
+        artifact_id: artifact_id.to_string(),
+        playground_id: playground_id.to_string(),
+    };
+
+    let unavailable = CatalogService::new(
+        components.control_catalog.clone(),
+        components.publisher.clone(),
+        policy.clone(),
+        components.clock.clone(),
+    )
+    .with_storage_availability_provider(Arc::new(FixedStorageAvailability(
+        DerivedVolumeState::Unavailable,
+    )))
+    .query_playground(&identity(), request.clone())
+    .await
+    .unwrap();
+    assert_eq!(unavailable.playground.state, "ready");
+    assert_eq!(unavailable.playground.storage_availability, "unavailable");
+
+    let unknown = CatalogService::new(
+        components.control_catalog.clone(),
+        components.publisher.clone(),
+        policy,
+        components.clock.clone(),
+    )
+    .query_playground(&identity(), request)
+    .await
+    .unwrap();
+    assert_eq!(unknown.playground.state, "ready");
+    assert_eq!(unknown.playground.storage_availability, "unknown");
+}
+
+#[tokio::test]
+async fn playground_create_rejects_an_unreachable_live_storage_volume() {
+    let components = InMemoryComponents::new(1_000);
+    let tenant_id = TenantId::new("tenant-a").unwrap();
+    insert_tenant(&components, tenant_id.clone()).await;
+    components
+        .control_catalog
+        .insert_storage_volume(StorageVolumeRecord {
+            tenant_id: tenant_id.clone(),
+            storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
+            display_name: "Volume A".to_owned(),
+            edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
+            region: "cn-shanghai".to_owned(),
+            backend_type: StorageBackendType::Pvc,
+            access_mode: StorageAccessMode::ReadWriteMany,
+            pvc_reference: Some(CatalogPvcReference {
+                namespace: "neoengram".to_owned(),
+                claim_name: "data-a".to_owned(),
+            }),
+            nfs_reference: None,
+            state: StorageVolumeState::Ready,
+            resource_version: 1,
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+    components
+        .control_catalog
+        .insert_artifact(ArtifactRecord {
+            tenant_id: tenant_id.clone(),
+            project_id: ProjectId::new("project-a").unwrap(),
+            artifact_id: ArtifactId::new("artifact-a").unwrap(),
+            display_name: "Artifact A".to_owned(),
+            description: None,
+            initialization: ArtifactInitialization::Empty,
+            head_commit_id: None,
+            resource_version: 1,
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+    let policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-a",
+            [tenant_id.to_string()],
+            [Permission::PlaygroundCreate],
+        )
+        .unwrap(),
+    );
+    let service = CatalogService::new(
+        components.control_catalog.clone(),
+        components.publisher.clone(),
+        policy,
+        components.clock.clone(),
+    )
+    .with_precommits(components.precommits.clone())
+    .with_storage_availability_provider(Arc::new(FixedStorageAvailability(
+        DerivedVolumeState::Unavailable,
+    )));
+
+    let error = service
+        .create_playground(
+            &identity(),
+            create_playground_request("playground-unreachable", None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Conflict);
+    assert_eq!(error.code().as_str(), "storage_volume_unavailable");
 }
 
 fn catalog_service(
@@ -360,6 +653,7 @@ fn catalog_service(
         components.clock.clone(),
     )
     .with_precommits(components.precommits.clone())
+    .with_storage_availability_provider(Arc::new(ReadyStorageAvailability))
 }
 
 async fn insert_tenant(components: &InMemoryComponents, tenant_id: TenantId) {

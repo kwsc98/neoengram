@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use fusen_rs::ErrorCategory;
-use neoengram_core::{ContentDigest, FileRecord, LogicalPath, ManifestId};
+use neoengram_core::{Commit, ContentDigest, DirectoryId, FileRecord, LogicalPath, ManifestId};
 use neoengram_protocol::{
     ArtifactId, AssignmentGeneration, AssignmentId, DecisionGeneration, EdgeClusterId, Extensions,
     JobDecision, JobId, JobState, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef,
@@ -9,19 +9,23 @@ use neoengram_protocol::{
 };
 use neoengram_server::{
     dto::{
-        CommitPlaygroundRequest, CreatePlaygroundRequest, IndexVersionBody, JsonExtensions,
-        QueryArtifactCommitGraphRequest, QueryPlaygroundChangeListRequest,
+        CommitPlaygroundRequest, CreatePlaygroundRequest, CreateSnapshotRequest, IndexVersionBody,
+        JsonExtensions, QueryArtifactCommitGraphRequest, QueryPlaygroundChangeListRequest,
     },
     identity::{AuthenticatedIdentity, Permission, StaticRbacPolicy},
     service::{CatalogService, JobCoordinator, WorkspaceCommitService},
 };
 use neoengramd::{
     AddJobSpec, AdvancePlaygroundCommitRequest, ArtifactInitialization, ArtifactRecord,
-    CatalogPvcReference, Clock, ControlCatalogRepository, ControlPlane, InMemoryComponents,
-    IndexKey, IndexPublisher, JobInsertOutcome, JobOperation, JobRecord, JobRepository,
-    PreCommitId, PreCommitRepository, PreCommitStartRequest, StorageAccessMode, StorageBackendType,
-    StorageVolumeRecord, StorageVolumeState, TenantRecord,
+    CatalogPvcReference, Clock, CommitRecord, ControlCatalogRepository, ControlPlane,
+    InMemoryComponents, IndexKey, IndexPublisher, JobInsertOutcome, JobOperation, JobRecord,
+    JobRepository, PreCommitCommitRequest, PreCommitId, PreCommitRepository, PreCommitStartRequest,
+    PublishedIndex, StorageAccessMode, StorageBackendType, StorageVolumeRecord, StorageVolumeState,
+    TenantRecord,
 };
+
+mod support;
+use support::ReadyStorageAvailability;
 
 #[tokio::test]
 async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
@@ -94,6 +98,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
                 Permission::ArtifactRead,
                 Permission::PlaygroundCreate,
                 Permission::PlaygroundRead,
+                Permission::SnapshotCreate,
             ],
         )
         .unwrap(),
@@ -204,7 +209,8 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         components.clock.clone(),
     )
     .with_precommits(components.precommits.clone())
-    .with_coordinator(coordinator);
+    .with_coordinator(coordinator)
+    .with_storage_availability_provider(Arc::new(ReadyStorageAvailability));
     let derived_request = CreatePlaygroundRequest {
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
@@ -477,6 +483,187 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             .replayed
     );
 
+    components
+        .control_catalog
+        .insert_storage_volume(StorageVolumeRecord {
+            tenant_id: tenant_id.clone(),
+            storage_volume_id: StorageVolumeId::new("volume-b").unwrap(),
+            display_name: "Other Volume".to_owned(),
+            edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
+            region: "local".to_owned(),
+            backend_type: StorageBackendType::Pvc,
+            access_mode: StorageAccessMode::ReadWriteMany,
+            pvc_reference: Some(CatalogPvcReference {
+                namespace: "default".to_owned(),
+                claim_name: "other-workspace".to_owned(),
+            }),
+            nfs_reference: None,
+            state: StorageVolumeState::Ready,
+            resource_version: 1,
+            created_at_unix_ms: components.clock.now(),
+            updated_at_unix_ms: components.clock.now(),
+        })
+        .await
+        .unwrap();
+    let cross_volume_playground = catalog
+        .create_playground(
+            &identity,
+            CreatePlaygroundRequest {
+                tenant_id: tenant_id.to_string(),
+                project_id: project_id.to_string(),
+                artifact_id: artifact_id.to_string(),
+                playground_id: "playground-cross-volume".to_owned(),
+                storage_volume_id: "volume-b".to_owned(),
+                display_name: "Cross-volume Playground".to_owned(),
+                base_commit_id: Some(committed.commit.commit_id.to_string()),
+                extensions: JsonExtensions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        cross_volume_playground.code().as_str(),
+        "playground_volume_has_no_commit_data"
+    );
+    let cross_volume_snapshot = catalog
+        .create_snapshot(
+            &identity,
+            CreateSnapshotRequest {
+                tenant_id: tenant_id.to_string(),
+                project_id: project_id.to_string(),
+                artifact_id: artifact_id.to_string(),
+                commit_id: committed.commit.commit_id.to_string(),
+                storage_volume_id: "volume-b".to_owned(),
+                snapshot_request_id: "snapshot-request-cross-volume".to_owned(),
+                extensions: JsonExtensions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        cross_volume_snapshot.code().as_str(),
+        "snapshot_volume_has_no_commit_data"
+    );
+
+    let historical_playground_id = PlaygroundId::new("playground-historical").unwrap();
+    components
+        .control_catalog
+        .transition_playground_state(
+            &tenant_id,
+            &project_id,
+            &artifact_id,
+            &historical_playground_id,
+            neoengramd::PlaygroundState::Creating,
+            neoengramd::PlaygroundState::Ready,
+            components.clock.now(),
+        )
+        .await
+        .unwrap();
+    components.clock.advance(1).unwrap();
+    let branch_source = components
+        .publisher
+        .current_version(&IndexKey {
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            artifact_id: artifact_id.clone(),
+            playground_id: historical_playground_id.clone(),
+        })
+        .await
+        .unwrap();
+    let branch_precommit_id = PreCommitId::new("precommit-branch").unwrap();
+    let branch_job_id = JobId::new("precommit-job-branch").unwrap();
+    components
+        .precommits
+        .start(PreCommitStartRequest {
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            artifact_id: artifact_id.clone(),
+            playground_id: historical_playground_id.clone(),
+            precommit_id: branch_precommit_id.clone(),
+            precommit_request_id: RequestId::new("precommit-request-branch").unwrap(),
+            source_index_version: branch_source.clone(),
+            frozen_head_commit_id: Some(committed.commit.commit_id),
+            job_id: branch_job_id.clone(),
+            created_at_unix_ms: components.clock.now(),
+        })
+        .await
+        .unwrap();
+    components
+        .jobs
+        .insert_or_load(succeeded_job(
+            tenant_id.clone(),
+            project_id.clone(),
+            artifact_id.clone(),
+            historical_playground_id.clone(),
+            branch_job_id,
+            branch_source.clone(),
+        ))
+        .await
+        .unwrap();
+    let branch_commit = service
+        .commit_playground(
+            &identity,
+            CommitPlaygroundRequest {
+                tenant_id: tenant_id.to_string(),
+                project_id: project_id.to_string(),
+                artifact_id: artifact_id.to_string(),
+                playground_id: historical_playground_id.to_string(),
+                commit_request_id: "commit-request-branch".to_owned(),
+                precommit_id: branch_precommit_id.to_string(),
+                expected_candidate_index_version: IndexVersionBody {
+                    revision: branch_source.revision.to_string(),
+                    digest: branch_source.digest.to_string(),
+                },
+                message: "Publish sibling from historical Commit".to_owned(),
+                description: None,
+                tag_names: vec!["reviewed/branch".to_owned()],
+                extensions: JsonExtensions::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        branch_commit.commit.parent_commit_id,
+        Some(committed.commit.commit_id)
+    );
+    assert_eq!(
+        components
+            .control_catalog
+            .get_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_commit_id,
+        Some(second_committed.commit.commit_id.into()),
+        "publishing a sibling must not move another Playground"
+    );
+    let branched_graph = catalog
+        .query_artifact_commit_graph(
+            &identity,
+            QueryArtifactCommitGraphRequest {
+                tenant_id: tenant_id.to_string(),
+                project_id: project_id.to_string(),
+                artifact_id: artifact_id.to_string(),
+                cursor: None,
+                page_size: Some(10),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        branched_graph.graph.head_commit_id,
+        Some(branch_commit.commit.commit_id.to_string())
+    );
+    assert_eq!(branched_graph.graph.nodes.len(), 3);
+    assert!(branched_graph.graph.nodes.iter().any(|node| {
+        node.commit_id == branch_commit.commit.commit_id.to_string()
+            && node.parent_commit_id == Some(committed.commit.commit_id.to_string())
+    }));
+    assert!(branched_graph.graph.nodes.iter().any(|node| {
+        node.commit_id == second_committed.commit.commit_id.to_string()
+            && node.parent_commit_id == Some(committed.commit.commit_id.to_string())
+    }));
+
     let mut unknown_commit = derived_request.clone();
     unknown_commit.playground_id = "playground-unknown-commit".to_owned();
     unknown_commit.base_commit_id = Some("bb".repeat(32));
@@ -551,6 +738,212 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     assert_eq!(
         replayed_derived.playground.base_commit_id,
         Some(commit_digest.to_string())
+    );
+}
+
+#[tokio::test]
+async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
+    let components = InMemoryComponents::new(5_000);
+    let tenant_id = TenantId::new("tenant-a").unwrap();
+    let project_id = ProjectId::new("project-a").unwrap();
+    let artifact_id = ArtifactId::new("artifact-a").unwrap();
+    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    seed_catalog(
+        &components,
+        &tenant_id,
+        &project_id,
+        &artifact_id,
+        &playground_id,
+    )
+    .await;
+
+    let source = components
+        .publisher
+        .current_version(&IndexKey {
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            artifact_id: artifact_id.clone(),
+            playground_id: playground_id.clone(),
+        })
+        .await
+        .unwrap();
+    let precommit_id = PreCommitId::new("precommit-publication-window").unwrap();
+    let precommit_key = neoengramd::PreCommitKey::new(tenant_id.clone(), precommit_id.clone());
+    let job_id = JobId::new("precommit-job-publication-window").unwrap();
+    components
+        .precommits
+        .start(PreCommitStartRequest {
+            tenant_id: tenant_id.clone(),
+            project_id: project_id.clone(),
+            artifact_id: artifact_id.clone(),
+            playground_id: playground_id.clone(),
+            precommit_id: precommit_id.clone(),
+            precommit_request_id: RequestId::new("precommit-request-publication-window").unwrap(),
+            source_index_version: source.clone(),
+            frozen_head_commit_id: None,
+            job_id: job_id.clone(),
+            created_at_unix_ms: UnixMillis::new(4_000),
+        })
+        .await
+        .unwrap();
+    components
+        .precommits
+        .sync_job(
+            succeeded_job(
+                tenant_id.clone(),
+                project_id.clone(),
+                artifact_id.clone(),
+                playground_id.clone(),
+                job_id,
+                source.clone(),
+            ),
+            Some(PublishedIndex {
+                version: source.clone(),
+                records: Vec::new(),
+            }),
+            UnixMillis::new(4_100),
+        )
+        .await
+        .unwrap();
+
+    let root_directory_id = DirectoryId::from_bytes([7; 32]);
+    let created_at_unix_ms = UnixMillis::new(4_200);
+    let message = "Commit awaiting Head publication";
+    let commit_id = Commit::new(root_directory_id, None, message, created_at_unix_ms.get())
+        .unwrap()
+        .canonical_id()
+        .unwrap();
+    let committed = components
+        .precommits
+        .commit(PreCommitCommitRequest {
+            key: precommit_key.clone(),
+            expected_candidate_index_version: source.clone(),
+            commit: CommitRecord {
+                tenant_id: tenant_id.clone(),
+                project_id: project_id.clone(),
+                artifact_id: artifact_id.clone(),
+                source_playground_id: playground_id.clone(),
+                source_storage_volume_id: Some(StorageVolumeId::new("volume-a").unwrap()),
+                source_precommit_id: precommit_id,
+                commit_request_id: RequestId::new("commit-request-publication-window").unwrap(),
+                commit_id,
+                root_directory_id,
+                parent_commit_id: None,
+                index_version: source,
+                records: Vec::new(),
+                message: message.to_owned(),
+                description: None,
+                tag_names: Vec::new(),
+                created_at_unix_ms,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(committed
+        .consumed_precommit
+        .head_published_at_unix_ms
+        .is_none());
+
+    let policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-a",
+            [tenant_id.to_string()],
+            [
+                Permission::ArtifactRead,
+                Permission::PlaygroundCreate,
+                Permission::SnapshotCreate,
+            ],
+        )
+        .unwrap(),
+    );
+    let catalog = CatalogService::new(
+        components.control_catalog.clone(),
+        components.publisher.clone(),
+        policy,
+        components.clock.clone(),
+    )
+    .with_precommits(components.precommits.clone())
+    .with_storage_availability_provider(Arc::new(ReadyStorageAvailability));
+    let identity =
+        AuthenticatedIdentity::new("user-a", PrincipalKind::User, "test", "subject-a").unwrap();
+    let request = QueryArtifactCommitGraphRequest {
+        tenant_id: tenant_id.to_string(),
+        project_id: project_id.to_string(),
+        artifact_id: artifact_id.to_string(),
+        cursor: None,
+        page_size: Some(10),
+    };
+
+    let authority_only = catalog
+        .query_artifact_commit_graph(&identity, request.clone())
+        .await
+        .unwrap();
+    assert!(authority_only.graph.nodes.is_empty());
+
+    let unpublished_playground = catalog
+        .create_playground(
+            &identity,
+            CreatePlaygroundRequest {
+                tenant_id: tenant_id.to_string(),
+                project_id: project_id.to_string(),
+                artifact_id: artifact_id.to_string(),
+                playground_id: "playground-unpublished-base".to_owned(),
+                storage_volume_id: "volume-a".to_owned(),
+                display_name: "Unpublished base".to_owned(),
+                base_commit_id: Some(commit_id.to_string()),
+                extensions: JsonExtensions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unpublished_playground.code().as_str(), "resource_not_found");
+    let unpublished_snapshot = catalog
+        .create_snapshot(
+            &identity,
+            CreateSnapshotRequest {
+                tenant_id: tenant_id.to_string(),
+                project_id: project_id.to_string(),
+                artifact_id: artifact_id.to_string(),
+                commit_id: commit_id.to_string(),
+                storage_volume_id: "volume-a".to_owned(),
+                snapshot_request_id: "snapshot-request-unpublished-base".to_owned(),
+                extensions: JsonExtensions::default(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unpublished_snapshot.code().as_str(), "resource_not_found");
+
+    components
+        .control_catalog
+        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+            tenant_id,
+            project_id,
+            artifact_id,
+            playground_id,
+            expected_head_commit_id: None,
+            commit_id: commit_id.into(),
+            updated_at_unix_ms: UnixMillis::new(4_300),
+        })
+        .await
+        .unwrap();
+    assert!(components
+        .precommits
+        .get(&precommit_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .head_published_at_unix_ms
+        .is_none());
+
+    let head_published_before_ack = catalog
+        .query_artifact_commit_graph(&identity, request)
+        .await
+        .unwrap();
+    assert_eq!(head_published_before_ack.graph.nodes.len(), 1);
+    assert_eq!(
+        head_published_before_ack.graph.nodes[0].commit_id,
+        commit_id.to_string()
     );
 }
 

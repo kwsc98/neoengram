@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use fusen_rs::ErrorCategory;
 use neoengram_protocol::{
     ArtifactId, EdgeClusterId, JobId, PlaygroundId, PrincipalKind, ProjectId, RequestId,
     StorageVolumeId, TenantId, UnixMillis,
@@ -19,6 +20,9 @@ use neoengramd::{
     PreCommitStartRequest as DomainPreCommitStartRequest, StorageAccessMode, StorageBackendType,
     StorageVolumeRecord, StorageVolumeState, TenantRecord,
 };
+
+mod support;
+use support::ReadyStorageAvailability;
 
 #[tokio::test]
 async fn precommit_actions_create_real_jobs_and_enforce_active_scope() {
@@ -198,6 +202,119 @@ async fn coordinator_recovers_precommit_committed_before_its_job() {
     assert!(recovered.spec.all);
 }
 
+#[tokio::test]
+async fn precommit_freezes_the_playground_head_not_the_artifact_head() {
+    let fixture = fixture().await;
+    let playground_head = neoengram_core::ContentDigest::from_bytes([0x11; 32]);
+    let artifact_head = neoengram_core::ContentDigest::from_bytes([0x22; 32]);
+    fixture
+        .components
+        .control_catalog
+        .advance_playground_commit(neoengramd::AdvancePlaygroundCommitRequest {
+            tenant_id: fixture.tenant_id.clone(),
+            project_id: fixture.project_id.clone(),
+            artifact_id: fixture.artifact_id.clone(),
+            playground_id: fixture.playground_id.clone(),
+            expected_head_commit_id: None,
+            commit_id: playground_head,
+            updated_at_unix_ms: UnixMillis::new(1_001),
+        })
+        .await
+        .unwrap();
+    let sibling_id = PlaygroundId::new("playground-sibling").unwrap();
+    fixture
+        .components
+        .control_catalog
+        .insert_playground(PlaygroundRecord {
+            tenant_id: fixture.tenant_id.clone(),
+            project_id: fixture.project_id.clone(),
+            artifact_id: fixture.artifact_id.clone(),
+            playground_id: sibling_id.clone(),
+            storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
+            region: "cn-shanghai".to_owned(),
+            display_name: "Sibling".to_owned(),
+            base_commit_id: Some(playground_head),
+            head_commit_id: Some(playground_head),
+            state: PlaygroundState::Ready,
+            relative_root: "playgrounds/project-a/artifact-a/playground-sibling".to_owned(),
+            created_at_unix_ms: UnixMillis::new(1_001),
+            updated_at_unix_ms: UnixMillis::new(1_001),
+        })
+        .await
+        .unwrap();
+    fixture
+        .components
+        .control_catalog
+        .advance_playground_commit(neoengramd::AdvancePlaygroundCommitRequest {
+            tenant_id: fixture.tenant_id.clone(),
+            project_id: fixture.project_id.clone(),
+            artifact_id: fixture.artifact_id.clone(),
+            playground_id: sibling_id,
+            expected_head_commit_id: Some(playground_head),
+            commit_id: artifact_head,
+            updated_at_unix_ms: UnixMillis::new(1_002),
+        })
+        .await
+        .unwrap();
+
+    let started = fixture
+        .catalog
+        .start_playground_precommit(
+            &fixture.identity,
+            fixture.start_request("precommit-request-branch").await,
+        )
+        .await
+        .unwrap();
+    let stored = fixture
+        .components
+        .precommits
+        .get(&neoengramd::PreCommitKey::new(
+            fixture.tenant_id.clone(),
+            PreCommitId::new(started.precommit.precommit_id).unwrap(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.frozen_head_commit_id,
+        Some(neoengram_core::CommitId::from_digest(playground_head))
+    );
+}
+
+#[tokio::test]
+async fn precommit_start_fails_closed_without_live_storage_availability() {
+    let fixture = fixture().await;
+    let catalog = CatalogService::new(
+        fixture.components.control_catalog.clone(),
+        fixture.components.publisher.clone(),
+        Arc::new(
+            StaticRbacPolicy::one_principal(
+                "user-a",
+                [fixture.tenant_id.to_string()],
+                [
+                    Permission::PlaygroundRead,
+                    Permission::PlaygroundCreate,
+                    Permission::CreateAddJob,
+                ],
+            )
+            .unwrap(),
+        ),
+        fixture.components.clock.clone(),
+    )
+    .with_precommits(fixture.components.precommits.clone())
+    .with_coordinator(fixture.coordinator.clone());
+
+    let error = catalog
+        .start_playground_precommit(
+            &fixture.identity,
+            fixture.start_request("precommit-request-no-registry").await,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Unavailable);
+    assert_eq!(error.code().as_str(), "storage_availability_unavailable");
+}
+
 struct Fixture {
     components: InMemoryComponents,
     catalog: CatalogService,
@@ -370,7 +487,8 @@ async fn fixture() -> Fixture {
         components.clock.clone(),
     )
     .with_precommits(components.precommits.clone())
-    .with_coordinator(coordinator.clone());
+    .with_coordinator(coordinator.clone())
+    .with_storage_availability_provider(Arc::new(ReadyStorageAvailability));
     Fixture {
         components,
         catalog,

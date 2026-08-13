@@ -114,16 +114,15 @@ impl JobService {
             .preauthorize_create_add_job(identity.principal(), &spec)
             .await
             .map_err(map_central_error)?;
-        if self
+        let existing = self
             .jobs
             .get(&neoengramd::JobKey::new(
                 spec.tenant_id.clone(),
                 spec.job_id.clone(),
             ))
             .await
-            .map_err(map_central_error)?
-            .is_none()
-        {
+            .map_err(map_central_error)?;
+        if existing.is_none() {
             if let Some(precommits) = &self.precommits {
                 if precommits
                     .get_active(
@@ -146,14 +145,20 @@ impl JobService {
                 }
             }
         }
-        validate_job_spec(
-            self.jobs.as_ref(),
-            self.catalog.as_ref(),
-            self.indexes.as_ref(),
-            &spec,
-        )
-        .await
-        .map_err(map_central_error)?;
+        match &self.coordinator {
+            Some(coordinator) => coordinator
+                .validate_spec(&spec)
+                .await
+                .map_err(map_central_error)?,
+            None => validate_job_spec(
+                self.jobs.as_ref(),
+                self.catalog.as_ref(),
+                self.indexes.as_ref(),
+                &spec,
+            )
+            .await
+            .map_err(map_central_error)?,
+        }
         let result = self
             .control
             .create_add_job(neoengramd::CreateAddJobRequest {

@@ -11,6 +11,12 @@ import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import PlaygroundSelect from '@/components/PlaygroundSelect.vue';
 import { createJobFormSchema, parsePathLines } from '@/features/jobs/create-form';
+import {
+  isPlaygroundOperational,
+  playgroundOperationUnavailableReason,
+  playgroundStorageAvailability,
+  playgroundStorageAvailabilityLabel,
+} from '@/features/precommit/status';
 import { useRecentJobsStore } from '@/stores/recent-jobs';
 
 const route = useRoute();
@@ -100,6 +106,10 @@ const playgroundIndexVersionKey = computed(() => {
   const indexVersion = playground.value?.index_version;
   return indexVersion ? `${indexVersion.revision}:${indexVersion.digest}` : '';
 });
+const playgroundOperational = computed(() => isPlaygroundOperational(playground.value));
+const playgroundUnavailableReason = computed(() =>
+  playground.value ? playgroundOperationUnavailableReason(playground.value) : undefined,
+);
 let observedIndexVersionKey: string | undefined;
 
 function clearErrors(): void {
@@ -196,6 +206,10 @@ async function submit(): Promise<void> {
       : '请选择可查询的 Playground';
     return;
   }
+  if (!isPlaygroundOperational(currentPlayground)) {
+    errors.playground = `Playground 当前不可扫描：${playgroundOperationUnavailableReason(currentPlayground) ?? '状态未知'}`;
+    return;
+  }
   const paths = parsePathLines(form.pathsText);
   const parsed = createJobFormSchema.safeParse({
     tenantId: tenantId.value,
@@ -276,7 +290,11 @@ async function submit(): Promise<void> {
             <p>系统将读取该 Playground 的当前文件状态并生成新的 IndexVersion</p>
           </div>
         </div>
-        <el-form-item label="Playground" :error="errors.playground" required>
+        <el-form-item
+          label="Playground"
+          :error="errors.playground || playgroundUnavailableReason"
+          required
+        >
           <PlaygroundSelect v-model="selectedPlayground" :tenant-id="tenantId" />
         </el-form-item>
         <dl v-if="playground" class="scope-summary">
@@ -296,6 +314,12 @@ async function submit(): Promise<void> {
             <dt>Playground</dt>
             <dd>
               <code>{{ playground.playground_id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>存储可达性</dt>
+            <dd>
+              {{ playgroundStorageAvailabilityLabel(playgroundStorageAvailability(playground)) }}
             </dd>
           </div>
         </dl>
@@ -356,7 +380,7 @@ async function submit(): Promise<void> {
           native-type="submit"
           :icon="CirclePlus"
           :loading="mutation.isPending.value"
-          :disabled="!playground || playgroundQuery.isFetching.value"
+          :disabled="!playground || !playgroundOperational || playgroundQuery.isFetching.value"
         >
           开始扫描
         </el-button>

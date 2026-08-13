@@ -1691,6 +1691,25 @@ impl AgentRegistryService {
         Ok(record.derived_volume_state(self.clock.now(), self.heartbeat_timeout_ms))
     }
 
+    /// Returns the current runtime availability for a Tenant-scoped StorageVolume.
+    ///
+    /// A Volume without a current owner is unavailable. Callers that do not have a Registry
+    /// composition can represent that separate condition as unknown at their API boundary.
+    pub async fn current_volume_state(
+        &self,
+        tenant_id: &TenantId,
+        storage_volume_id: &StorageVolumeId,
+    ) -> CentralResult<DerivedVolumeState> {
+        let Some(record) = self
+            .repository
+            .get_current_by_volume(tenant_id, storage_volume_id)
+            .await?
+        else {
+            return Ok(DerivedVolumeState::Unavailable);
+        };
+        Ok(record.derived_volume_state(self.clock.now(), self.heartbeat_timeout_ms))
+    }
+
     async fn load(&self, enrollment_id: &AgentEnrollmentId) -> CentralResult<AgentRegistryRecord> {
         self.repository.get(enrollment_id).await?.ok_or_else(|| {
             error(

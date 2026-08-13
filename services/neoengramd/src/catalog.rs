@@ -319,12 +319,14 @@ pub struct AdvancePlaygroundCommitRequest {
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
     pub playground_id: PlaygroundId,
+    /// Branch-local Playground Head frozen by the Pre-commit. Artifact Head is a convenience
+    /// pointer and is deliberately not part of this compare-and-swap fence.
     pub expected_head_commit_id: Option<ContentDigest>,
     pub commit_id: ContentDigest,
     pub updated_at_unix_ms: UnixMillis,
 }
 
-/// Artifact and Playground heads observed after a successful publication CAS.
+/// Artifact and Playground heads observed after a successful branch-local publication CAS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvancePlaygroundCommitOutcome {
     pub artifact: ArtifactRecord,

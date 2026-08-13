@@ -8,15 +8,15 @@ use neoengram_protocol::{
     UnixMillis, WorkspaceMaterializeAssignment, WorkspaceMaterializeOperation,
 };
 use neoengramd::{
-    AddJobSpec, AdvancePlaygroundCommitRequest, AgentRegistryRepository, AssignJobRequest,
-    AssignSnapshotMountRequest, AssignWorkspaceMaterializationRequest, AssignmentTarget,
-    CentralError, CentralErrorCode, CentralResult, Clock, ControlCatalogRepository, ControlPlane,
-    CreateSnapshotMountRequest, CreateWorkspaceMaterializationRequest, ExpireAddJobRequest,
-    IndexKey, IndexPublisher, InitializeIndexSnapshotRequest, JobKey, JobOperation, JobRecord,
-    JobRepository, PlaygroundListRequest, PlaygroundRecord, PlaygroundState, PreCommitKey,
-    PreCommitRecord, PreCommitRepository, PreCommitState, ResumePublicationRequest,
-    SnapshotListRequest, SnapshotMountSpec, SnapshotMountTarget, SnapshotPhase, SnapshotRecord,
-    SnapshotState, TenantListRequest, WorkspaceMaterializeSpec, WorkspaceMaterializeTarget,
+    AddJobSpec, AgentRegistryRepository, AssignJobRequest, AssignSnapshotMountRequest,
+    AssignWorkspaceMaterializationRequest, AssignmentTarget, CentralError, CentralErrorCode,
+    CentralResult, Clock, ControlCatalogRepository, ControlPlane, CreateSnapshotMountRequest,
+    CreateWorkspaceMaterializationRequest, ExpireAddJobRequest, IndexKey, IndexPublisher,
+    InitializeIndexSnapshotRequest, JobKey, JobOperation, JobRecord, JobRepository,
+    PlaygroundListRequest, PlaygroundRecord, PlaygroundState, PreCommitKey, PreCommitRecord,
+    PreCommitRepository, PreCommitState, ResumePublicationRequest, SnapshotListRequest,
+    SnapshotMountSpec, SnapshotMountTarget, SnapshotPhase, SnapshotRecord, SnapshotState,
+    TenantListRequest, WorkspaceMaterializeSpec, WorkspaceMaterializeTarget,
 };
 
 const DEFAULT_RECOVERY_BATCH_SIZE: usize = 1_024;
@@ -83,13 +83,57 @@ impl JobCoordinator {
 
     /// Rejects fabricated Playground scope and stale client Index defaults before Job creation.
     pub async fn validate_spec(&self, spec: &neoengramd::AddJobSpec) -> CentralResult<()> {
+        if self
+            .jobs
+            .get(&JobKey::new(spec.tenant_id.clone(), spec.job_id.clone()))
+            .await?
+            .is_some()
+        {
+            // Preserve idempotency when the runtime owner later disappears. The control plane
+            // still compares the immutable persisted payload before returning the replay.
+            return Ok(());
+        }
         validate_job_spec(
             self.jobs.as_ref(),
             self.catalog.as_ref(),
             self.indexes.as_ref(),
             spec,
         )
-        .await
+        .await?;
+        self.validate_live_storage(spec).await
+    }
+
+    /// Rejects a new Agent-backed operation before it creates a durable queued Job.
+    pub async fn validate_live_storage(&self, spec: &neoengramd::AddJobSpec) -> CentralResult<()> {
+        let playground = self
+            .catalog
+            .get_playground(
+                &spec.tenant_id,
+                &spec.project_id,
+                &spec.artifact_id,
+                &spec.playground_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::JobNotFound,
+                    "the requested Playground is not visible or does not exist",
+                )
+                .with_retryable(false)
+            })?;
+        let Some(owner) = self
+            .registry
+            .get_current_by_volume(&spec.tenant_id, &playground.storage_volume_id)
+            .await?
+        else {
+            return Err(storage_volume_unavailable());
+        };
+        if owner.derived_volume_state(self.clock.now(), self.heartbeat_timeout_ms)
+            != neoengramd::DerivedVolumeState::Ready
+        {
+            return Err(storage_volume_unavailable());
+        }
+        Ok(())
     }
 
     /// Performs one immediate scheduling attempt. Lack of a Ready owner leaves the Job queued.
@@ -814,17 +858,12 @@ impl JobCoordinator {
                     "committed Pre-commit lost its immutable Commit row",
                 )
             })?;
-        self.catalog
-            .advance_playground_commit(AdvancePlaygroundCommitRequest {
-                tenant_id: commit.tenant_id.clone(),
-                project_id: commit.project_id.clone(),
-                artifact_id: commit.artifact_id.clone(),
-                playground_id: commit.source_playground_id.clone(),
-                expected_head_commit_id: commit.parent_commit_id.map(Into::into),
-                commit_id: commit.commit_id.into(),
-                updated_at_unix_ms: commit.created_at_unix_ms,
-            })
-            .await?;
+        super::workspace_commit::publish_committed_playground_head(
+            self.catalog.as_ref(),
+            precommits,
+            &commit,
+        )
+        .await?;
         precommits
             .acknowledge_head_publication(&precommit.key(), commit.commit_id, self.clock.now())
             .await?;
@@ -1462,6 +1501,14 @@ fn same_index_version(
     right: &neoengram_protocol::WireIndexVersion,
 ) -> bool {
     left.revision == right.revision && left.digest == right.digest
+}
+
+fn storage_volume_unavailable() -> CentralError {
+    CentralError::new(
+        CentralErrorCode::StorageVolumeNotReady,
+        "the Playground StorageVolume has no reachable Ready Agent owner",
+    )
+    .with_retryable(true)
 }
 
 fn deterministic_assignment_id(job: &JobRecord) -> CentralResult<AssignmentId> {

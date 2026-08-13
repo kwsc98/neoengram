@@ -10,8 +10,7 @@ use neoengram_server::{
         CreateAddJobRequest, CreatePlaygroundRequest, IndexVersionBody, JsonExtensions,
         QueryPlaygroundListRequest, QueryPlaygroundRequest,
     },
-    AuthenticatedIdentity, CatalogService, JobCoordinator, JobService, Permission,
-    StaticRbacPolicy,
+    AuthenticatedIdentity, CatalogService, JobService, Permission, StaticRbacPolicy,
 };
 use neoengramd::{
     ArtifactInitialization, ArtifactRecord, CatalogPvcReference, ControlCatalogRepository,
@@ -19,6 +18,9 @@ use neoengramd::{
     IndexPublisher, JobKey, JobRepository, StorageAccessMode, StorageBackendType,
     StorageVolumeRecord, StorageVolumeState, TenantRecord,
 };
+
+mod support;
+use support::ReadyStorageAvailability;
 
 #[tokio::test]
 async fn job_authorization_precedes_missing_scope_validation() {
@@ -207,25 +209,15 @@ async fn playground_responses_use_the_current_published_index_version() {
         components.publisher.clone(),
         policy.clone(),
         components.clock.clone(),
-    );
+    )
+    .with_storage_availability_provider(Arc::new(ReadyStorageAvailability));
     let authority_store = components.authority_store();
     let control = Arc::new(ControlPlane::new(
         policy,
         authority_store.clone(),
         components.clock.clone(),
     ));
-    let coordinator = Arc::new(
-        JobCoordinator::from_authority(
-            control.clone(),
-            &authority_store,
-            components.clock.clone(),
-            30_000,
-        )
-        .unwrap(),
-    );
-    let jobs = JobService::from_authority(control, &authority_store)
-        .unwrap()
-        .with_coordinator(coordinator);
+    let jobs = JobService::from_authority(control, &authority_store).unwrap();
     let identity =
         AuthenticatedIdentity::new("user-a", PrincipalKind::User, "test", "subject-a").unwrap();
     let create_request = CreatePlaygroundRequest {

@@ -328,6 +328,7 @@ pub struct PlaygroundView {
     pub head_commit_id: Option<String>,
     pub index_version: IndexVersionBody,
     pub state: String,
+    pub storage_availability: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_precommit_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

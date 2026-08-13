@@ -499,6 +499,10 @@ impl AppState {
             Some(coordinator) => catalog.with_coordinator(coordinator.clone()),
             None => catalog,
         };
+        let catalog = match enrollment_registry.as_ref() {
+            Some(registry) => catalog.with_agent_registry(registry.clone()),
+            None => catalog,
+        };
         let workspace_commits =
             WorkspaceCommitService::from_authority(&authority_store, policy.clone(), clock.clone())
                 .map(Arc::new)
@@ -617,7 +621,9 @@ impl AppState {
             .head_interceptor(AuthenticationInterceptor::new(self.authenticator.clone()))
             .problem_encoder(NeoEngramProblemEncoder)
             .interface(SystemApiServer::new(SystemController::new(
-                Arc::new(SystemService),
+                Arc::new(SystemService::new(
+                    self.enrollment_registry.is_some() && self.coordinator.is_some(),
+                )),
                 Arc::new(HealthService::new(readiness)),
             )))
             .interface(JobApiServer::new(JobController::new(self.jobs.clone())));

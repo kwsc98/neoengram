@@ -18,8 +18,12 @@ import {
   supportsPlaygroundMaterialize,
 } from '@/features/capabilities';
 import {
-  playgroundAvailabilityLabel,
-  playgroundAvailabilityTagType,
+  playgroundLifecycleLabel,
+  playgroundLifecycleTagType,
+  playgroundListPollInterval,
+  playgroundStorageAvailability,
+  playgroundStorageAvailabilityLabel,
+  playgroundStorageAvailabilityTagType,
 } from '@/features/precommit/status';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
@@ -80,8 +84,7 @@ const playgroundQuery = useQuery({
       ...(search.value ? { query: search.value } : {}),
       ...(cursor.value ? { cursor: cursor.value } : {}),
     }),
-  refetchInterval: (query) =>
-    query.state.data?.data.items.some((item) => item.state === 'creating') ? 1_000 : false,
+  refetchInterval: (query) => playgroundListPollInterval(query.state.data?.data.items ?? []),
 });
 
 watch(projectId, (value, previous) => {
@@ -285,16 +288,23 @@ async function openPlayground(
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="可用性 / 当前操作" min-width="190">
+          <el-table-column label="生命周期 / 存储" min-width="210">
             <template #default="scope">
               <div class="state-stack">
-                <el-tag :type="playgroundAvailabilityTagType(scope.row.state)" effect="plain">
-                  {{ playgroundAvailabilityLabel(scope.row.state) }}
+                <el-tag :type="playgroundLifecycleTagType(scope.row.state)" effect="plain">
+                  {{ playgroundLifecycleLabel(scope.row.state) }}
+                </el-tag>
+                <el-tag
+                  :type="
+                    playgroundStorageAvailabilityTagType(playgroundStorageAvailability(scope.row))
+                  "
+                  effect="plain"
+                >
+                  {{ playgroundStorageAvailabilityLabel(playgroundStorageAvailability(scope.row)) }}
                 </el-tag>
                 <el-tag v-if="scope.row.active_precommit_id" type="warning" effect="plain">
                   存在活动 Pre-commit
                 </el-tag>
-                <span v-else>空闲</span>
               </div>
             </template>
           </el-table-column>
@@ -339,10 +349,19 @@ async function openPlayground(
             <span
               ><small>{{ playground.region }}</small
               ><el-tag
-                :type="playgroundAvailabilityTagType(playground.state)"
+                :type="playgroundLifecycleTagType(playground.state)"
                 size="small"
                 effect="plain"
-                >{{ playgroundAvailabilityLabel(playground.state) }}</el-tag
+                >{{ playgroundLifecycleLabel(playground.state) }}</el-tag
+              ><el-tag
+                :type="
+                  playgroundStorageAvailabilityTagType(playgroundStorageAvailability(playground))
+                "
+                size="small"
+                effect="plain"
+                >{{
+                  playgroundStorageAvailabilityLabel(playgroundStorageAvailability(playground))
+                }}</el-tag
               ><el-tag
                 v-if="playground.active_precommit_id"
                 type="warning"
@@ -411,11 +430,7 @@ async function openPlayground(
 .state-stack {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
-}
-
-.state-stack > span {
-  color: var(--muted);
-  font-size: 10px;
 }
 </style>

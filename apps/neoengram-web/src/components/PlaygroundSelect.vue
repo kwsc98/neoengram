@@ -4,6 +4,7 @@ import { computed, ref, watch } from 'vue';
 
 import { queryPlaygroundList } from '@/api/operations';
 import type { PlaygroundView } from '@/api/types';
+import { playgroundOperationUnavailableReason } from '@/features/precommit/status';
 
 const props = withDefaults(
   defineProps<{
@@ -50,6 +51,10 @@ function select(value: string): void {
   emit('update:modelValue', playground);
 }
 
+function optionUnavailableReason(playground: PlaygroundView): string | undefined {
+  return playgroundOperationUnavailableReason(playground);
+}
+
 watch(
   () => props.tenantId,
   () => emit('update:modelValue', undefined),
@@ -74,11 +79,15 @@ watch(
       :key="playgroundKey(playground)"
       :label="`${playground.display_name} · ${playground.project_id}/${playground.artifact_id}/${playground.playground_id}`"
       :value="playgroundKey(playground)"
+      :disabled="Boolean(optionUnavailableReason(playground))"
     >
       <span class="playground-option__name">{{ playground.display_name }}</span>
       <code>
         {{ playground.project_id }}/{{ playground.artifact_id }}/{{ playground.playground_id }}
       </code>
+      <small v-if="optionUnavailableReason(playground)" class="playground-option__state">
+        {{ optionUnavailableReason(playground) }}
+      </small>
     </el-option>
   </el-select>
 </template>
@@ -86,5 +95,10 @@ watch(
 <style scoped>
 .playground-option__name {
   margin-right: 12px;
+}
+
+.playground-option__state {
+  margin-left: 12px;
+  color: var(--muted);
 }
 </style>

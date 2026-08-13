@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowRight, DocumentCopy, Files, Plus, RefreshRight } from '@element-plus/icons-vue';
+import { ArrowRight, DocumentCopy, Plus, RefreshRight } from '@element-plus/icons-vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { ElMessage } from 'element-plus';
 import { computed, reactive, ref, watch } from 'vue';
@@ -17,6 +17,7 @@ import {
 import type { CommitNode } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
+import ArtifactCommitTree from '@/components/ArtifactCommitTree.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
 import {
@@ -25,8 +26,11 @@ import {
   supportsSnapshotMaterialize,
 } from '@/features/capabilities';
 import {
-  playgroundAvailabilityLabel,
-  playgroundAvailabilityTagType,
+  playgroundLifecycleLabel,
+  playgroundLifecycleTagType,
+  playgroundStorageAvailability,
+  playgroundStorageAvailabilityLabel,
+  playgroundStorageAvailabilityTagType,
 } from '@/features/precommit/status';
 import {
   snapshotPhaseLabel,
@@ -35,6 +39,7 @@ import {
 } from '@/features/snapshots/status';
 import { useTenantsStore } from '@/stores/tenants';
 import { commitTagNames } from '@/utils/commit';
+import { buildCommitTree } from '@/utils/commit-tree';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
 const route = useRoute();
@@ -68,6 +73,7 @@ const activeTab = ref('overview');
 const commitNodes = ref<CommitNode[]>([]);
 const nextCommitCursor = ref<string>();
 const loadingMoreCommits = ref(false);
+const loadMoreCommitsError = ref<unknown>();
 const selectedCommitId = ref('');
 const commitDetailOpen = ref(false);
 const createPlaygroundOpen = ref(false);
@@ -91,6 +97,10 @@ const artifactQuery = useQuery({
   queryFn: () => queryArtifact(tenantId.value, projectId.value, artifactId.value),
 });
 const artifact = computed(() => artifactQuery.data.value?.data.artifact);
+const artifactScopeKey = computed(() =>
+  [tenantId.value, projectId.value, artifactId.value].join('\u0000'),
+);
+let commitDataEpoch = 0;
 const canCreatePlayground = computed(
   () =>
     Boolean(artifact.value) &&
@@ -110,9 +120,10 @@ const commitQuery = useQuery({
 const currentCommit = computed(() => {
   const graph = commitQuery.data.value?.data.graph;
   if (!graph) return undefined;
-  return graph.nodes.find((node) => node.commit_id === graph.head_commit_id) ?? graph.nodes[0];
+  return commitNodes.value.find((node) => node.commit_id === graph.head_commit_id);
 });
 const currentCommitTags = computed(() => commitTagNames(currentCommit.value?.tag_names ?? []));
+const commitTree = computed(() => buildCommitTree(commitNodes.value));
 const commitDiffQuery = useQuery({
   queryKey: computed(() => [
     'artifact-commit-diff',
@@ -150,6 +161,10 @@ const playgroundQuery = useQuery({
       page_size: 100,
     }),
   enabled: computed(() => activeTab.value === 'overview' || activeTab.value === 'playgrounds'),
+  refetchInterval: (query) =>
+    query.state.data?.data.items.some((playground) => playground.state === 'creating')
+      ? 1_000
+      : 5_000,
 });
 const snapshotQuery = useQuery({
   queryKey: computed(() => [
@@ -179,13 +194,23 @@ const artifactSnapshots = computed(() => snapshotQuery.data.value?.data.items ??
 const availableRegions = computed(() => [
   ...new Set(artifactSnapshots.value.map((snapshot) => snapshot.region)),
 ]);
+const detailRefreshing = computed(
+  () =>
+    artifactQuery.isFetching.value ||
+    commitQuery.isFetching.value ||
+    playgroundQuery.isFetching.value ||
+    snapshotQuery.isFetching.value,
+);
 
 watch(
   () => commitQuery.data.value,
   (result) => {
     if (!result) return;
+    commitDataEpoch += 1;
     commitNodes.value = [...result.data.graph.nodes];
     nextCommitCursor.value = result.data.graph.next_cursor;
+    loadingMoreCommits.value = false;
+    loadMoreCommitsError.value = undefined;
   },
   { immediate: true },
 );
@@ -208,10 +233,12 @@ watch(
   { immediate: true },
 );
 
-watch([tenantId, projectId, artifactId], () => {
+watch(artifactScopeKey, () => {
+  commitDataEpoch += 1;
   commitNodes.value = [];
   nextCommitCursor.value = undefined;
   loadingMoreCommits.value = false;
+  loadMoreCommitsError.value = undefined;
   selectedCommitId.value = artifactCommitGraphEnabled.value
     ? String(route.query.commit_id ?? '')
     : '';
@@ -252,20 +279,38 @@ function diffTagType(changeType: string): 'success' | 'warning' | 'danger' | 'in
 }
 
 async function loadMoreCommits(): Promise<void> {
-  if (!nextCommitCursor.value || loadingMoreCommits.value) return;
+  const requestCursor = nextCommitCursor.value;
+  if (!requestCursor || loadingMoreCommits.value) return;
+  const requestScopeKey = artifactScopeKey.value;
+  const requestEpoch = commitDataEpoch;
+  const isCurrentRequest = () =>
+    artifactScopeKey.value === requestScopeKey && commitDataEpoch === requestEpoch;
   loadingMoreCommits.value = true;
+  loadMoreCommitsError.value = undefined;
   try {
     const result = await queryArtifactCommitGraph(
       tenantId.value,
       projectId.value,
       artifactId.value,
-      nextCommitCursor.value,
+      requestCursor,
     );
-    commitNodes.value.push(...result.data.graph.nodes);
+    if (!isCurrentRequest() || nextCommitCursor.value !== requestCursor) return;
+    const commitsById = new Map(commitNodes.value.map((commit) => [commit.commit_id, commit]));
+    for (const commit of result.data.graph.nodes) commitsById.set(commit.commit_id, commit);
+    commitNodes.value = [...commitsById.values()];
     nextCommitCursor.value = result.data.graph.next_cursor;
+  } catch (error) {
+    if (isCurrentRequest()) loadMoreCommitsError.value = error;
   } finally {
-    loadingMoreCommits.value = false;
+    if (isCurrentRequest()) loadingMoreCommits.value = false;
   }
+}
+
+async function refreshArtifactDetail(): Promise<void> {
+  const requests: Promise<unknown>[] = [artifactQuery.refetch(), playgroundQuery.refetch()];
+  if (artifactCommitGraphEnabled.value) requests.push(commitQuery.refetch());
+  if (snapshotMaterializeEnabled.value) requests.push(snapshotQuery.refetch());
+  await Promise.allSettled(requests);
 }
 
 async function openPlayground(playgroundId: string): Promise<void> {
@@ -364,11 +409,7 @@ async function showCreateSnapshot(): Promise<void> {
         >
           创建 Snapshot
         </el-button>
-        <el-button
-          :icon="RefreshRight"
-          :loading="artifactQuery.isFetching.value"
-          @click="artifactQuery.refetch"
-        >
+        <el-button :icon="RefreshRight" :loading="detailRefreshing" @click="refreshArtifactDetail">
           刷新
         </el-button>
       </template>
@@ -430,12 +471,46 @@ async function showCreateSnapshot(): Promise<void> {
               <dd v-if="artifact.head_commit_id" class="commit-identity">
                 <code>{{ artifact.head_commit_id }}</code>
                 <span v-if="currentCommit">{{ currentCommit.message }}</span>
+                <el-tag
+                  v-if="artifactCommitGraphEnabled"
+                  size="small"
+                  type="success"
+                  effect="plain"
+                >
+                  默认基线
+                </el-tag>
               </dd>
               <dd v-else>尚无 Commit</dd>
             </div>
             <div v-if="artifactCommitGraphEnabled" class="definition-grid__wide">
+              <dt>提交图谱</dt>
+              <dd v-if="commitQuery.isPending.value" class="commit-overview-summary">
+                正在加载提交图谱
+              </dd>
+              <dd v-else-if="commitQuery.error.value" class="commit-overview-summary">
+                <span>提交图谱加载失败</span>
+                <el-button text type="primary" @click="commitQuery.refetch">重试</el-button>
+              </dd>
+              <dd v-else-if="commitQuery.data.value" class="commit-overview-summary">
+                <span>
+                  <strong>{{ commitTree.loadedCount }}</strong>
+                  已加载 Commit
+                </span>
+                <span>
+                  <strong>{{ commitTree.tipCount }}</strong>
+                  {{ nextCommitCursor ? '已加载分支末端' : '分支末端' }}
+                </span>
+                <el-tag v-if="nextCommitCursor" size="small" type="warning" effect="plain">
+                  部分图谱
+                </el-tag>
+                <el-tag v-else size="small" type="success" effect="plain">完整图谱</el-tag>
+              </dd>
+            </div>
+            <div v-if="artifactCommitGraphEnabled" class="definition-grid__wide">
               <dt>Tags</dt>
-              <dd class="tag-list">
+              <dd v-if="commitQuery.isPending.value">正在加载</dd>
+              <dd v-else-if="commitQuery.error.value">提交图谱加载失败</dd>
+              <dd v-else class="tag-list">
                 <el-tag v-for="tagName in currentCommitTags" :key="tagName" effect="plain">
                   {{ tagName }}
                 </el-tag>
@@ -474,7 +549,13 @@ async function showCreateSnapshot(): Promise<void> {
           </dl>
         </el-tab-pane>
 
-        <el-tab-pane v-if="artifactCommitGraphEnabled" label="版本" name="commits">
+        <el-tab-pane v-if="artifactCommitGraphEnabled" name="commits">
+          <template #label>
+            <span class="commit-tab-label">
+              版本
+              <small v-if="commitQuery.data.value">{{ commitTree.loadedCount }}</small>
+            </span>
+          </template>
           <ApiProblemAlert
             v-if="commitQuery.error.value"
             :error="commitQuery.error.value"
@@ -483,48 +564,34 @@ async function showCreateSnapshot(): Promise<void> {
           />
           <el-skeleton v-if="commitQuery.isPending.value" :rows="6" animated />
           <template v-else-if="commitQuery.data.value">
+            <ApiProblemAlert v-if="loadMoreCommitsError" :error="loadMoreCommitsError" />
             <div class="commit-summary">
-              <span>{{ commitNodes.length }} 个 Commit</span>
-              <small>Tags 用于标记可识别的固定版本</small>
+              <div class="commit-summary__metrics">
+                <span>
+                  <strong>{{ commitTree.loadedCount }}</strong>
+                  <small>已加载 Commit</small>
+                </span>
+                <span>
+                  <strong>{{ commitTree.tipCount }}</strong>
+                  <small>{{ nextCommitCursor ? '已加载分支末端' : '分支末端' }}</small>
+                </span>
+              </div>
+              <div class="commit-summary__state">
+                <span v-if="artifact.head_commit_id">
+                  <small>默认 HEAD</small>
+                  <code>{{ artifact.head_commit_id }}</code>
+                </span>
+                <el-tag v-if="nextCommitCursor" type="warning" effect="plain">部分图谱</el-tag>
+                <el-tag v-else type="success" effect="plain">完整图谱</el-tag>
+              </div>
             </div>
-            <ol class="commit-tree" aria-label="Commit 图">
-              <li v-for="node in commitNodes" :key="node.commit_id" class="commit-node">
-                <span class="commit-node__dot" />
-                <div class="commit-node__body">
-                  <div class="commit-node__heading">
-                    <strong>{{ node.message }}</strong>
-                    <span class="commit-node__actions">
-                      <time>{{ formatTime(node.created_at_unix_ms) }}</time>
-                      <el-button
-                        text
-                        type="primary"
-                        :icon="Files"
-                        @click="showCommitDetail(node.commit_id)"
-                      >
-                        详情与 Diff
-                      </el-button>
-                    </span>
-                  </div>
-                  <p v-if="node.description" class="commit-node__description">
-                    {{ node.description }}
-                  </p>
-                  <div class="commit-node__meta">
-                    <code>{{ node.commit_id }}</code>
-                    <span v-if="node.parent_commit_id">
-                      parent <code>{{ node.parent_commit_id }}</code>
-                    </span>
-                    <el-tag
-                      v-for="tagName in commitTagNames(node.tag_names)"
-                      :key="tagName"
-                      size="small"
-                      effect="plain"
-                    >
-                      {{ tagName }}
-                    </el-tag>
-                  </div>
-                </div>
-              </li>
-            </ol>
+            <el-empty v-if="commitTree.loadedCount === 0" description="此 Artifact 暂无 Commit" />
+            <ArtifactCommitTree
+              v-else
+              :roots="commitTree.roots"
+              :head-commit-id="artifact.head_commit_id"
+              @select="showCommitDetail"
+            />
             <el-button
               v-if="nextCommitCursor"
               :loading="loadingMoreCommits"
@@ -560,9 +627,17 @@ async function showCreateSnapshot(): Promise<void> {
               </span>
               <span class="relation-list__aside">
                 <small>{{ playground.region }}</small>
-                <el-tag :type="playgroundAvailabilityTagType(playground.state)" effect="plain">{{
-                  playgroundAvailabilityLabel(playground.state)
+                <el-tag :type="playgroundLifecycleTagType(playground.state)" effect="plain">{{
+                  playgroundLifecycleLabel(playground.state)
                 }}</el-tag
+                ><el-tag
+                  :type="
+                    playgroundStorageAvailabilityTagType(playgroundStorageAvailability(playground))
+                  "
+                  effect="plain"
+                  >{{
+                    playgroundStorageAvailabilityLabel(playgroundStorageAvailability(playground))
+                  }}</el-tag
                 ><el-tag v-if="playground.active_precommit_id" type="warning" effect="plain">
                   活动 Pre-commit
                 </el-tag>

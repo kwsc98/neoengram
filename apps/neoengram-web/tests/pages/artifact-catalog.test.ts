@@ -5,7 +5,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { ArtifactView } from '@/api/types';
+import type { ArtifactView, CommitGraphView } from '@/api/types';
 import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
@@ -28,6 +28,14 @@ vi.mock('@/api/operations', () => api);
 const headCommitId = 'a'.repeat(64);
 const historicalCommitId = 'b'.repeat(64);
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 const artifact = {
   tenant_id: 'tenant-a',
   project_id: 'project-a',
@@ -44,6 +52,7 @@ async function mountPage(
   location = '/tenants/tenant-a/projects/project-a/artifacts/artifact-a',
   artifactView: ArtifactView = artifact,
   capabilities = ['artifact_catalog'],
+  commitGraph?: CommitGraphView,
 ) {
   api.queryApiVersion.mockResolvedValue({
     data: {
@@ -66,7 +75,7 @@ async function mountPage(
   });
   api.queryArtifactCommitGraph.mockResolvedValue({
     data: {
-      graph: {
+      graph: commitGraph ?? {
         graph_version: '1',
         head_commit_id: artifactView.head_commit_id,
         nodes: artifactView.head_commit_id
@@ -321,6 +330,181 @@ describe('Artifact catalog detail', () => {
     expect(api.queryArtifactCommitDiff).not.toHaveBeenCalled();
     expect(wrapper.findComponent({ name: 'ElDrawer' }).exists()).toBe(false);
     expect(wrapper.findComponent({ name: 'ElTabs' }).props('modelValue')).toBe('overview');
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('renders commits sharing a parent as sibling branch tips with an explicit count', async () => {
+    const siblingCommitId = 'c'.repeat(64);
+    const rootCommitId = 'd'.repeat(64);
+    const graph: CommitGraphView = {
+      graph_version: '4',
+      head_commit_id: headCommitId,
+      nodes: [
+        {
+          commit_id: headCommitId,
+          parent_commit_id: historicalCommitId,
+          message: 'Commit 2',
+          tag_names: ['default-line'],
+          created_at_unix_ms: '4',
+        },
+        {
+          commit_id: siblingCommitId,
+          parent_commit_id: historicalCommitId,
+          message: 'Commit 2.2',
+          tag_names: ['experiment'],
+          created_at_unix_ms: '3',
+        },
+        {
+          commit_id: historicalCommitId,
+          parent_commit_id: rootCommitId,
+          message: 'Commit 1',
+          tag_names: [],
+          created_at_unix_ms: '2',
+        },
+        {
+          commit_id: rootCommitId,
+          message: 'Root commit',
+          tag_names: [],
+          created_at_unix_ms: '1',
+        },
+      ],
+    };
+    const { queryClient, wrapper } = await mountPage(
+      '/tenants/tenant-a/projects/project-a/artifacts/artifact-a?tab=commits',
+      artifact,
+      ['artifact_catalog', 'artifact_commit_graph'],
+      graph,
+    );
+
+    const tree = wrapper.find('[aria-label="Commit 分支树"]');
+    expect(tree.exists()).toBe(true);
+    expect(tree.findAll('.commit-node')).toHaveLength(4);
+    expect(wrapper.find('.commit-summary__metrics').text()).toContain('4已加载 Commit');
+    expect(wrapper.find('.commit-summary__metrics').text()).toContain('2分支末端');
+
+    const headNode = tree.find(`[data-commit-id="${headCommitId}"]`);
+    const siblingNode = tree.find(`[data-commit-id="${siblingCommitId}"]`);
+    expect(headNode.attributes('data-parent-commit-id')).toBe(historicalCommitId);
+    expect(siblingNode.attributes('data-parent-commit-id')).toBe(historicalCommitId);
+    expect(headNode.attributes('data-depth')).toBe('2');
+    expect(siblingNode.attributes('data-depth')).toBe('2');
+    expect(headNode.classes()).toContain('commit-node--head');
+    expect(headNode.text()).toContain('默认 HEAD');
+    expect(siblingNode.text()).not.toContain('默认 HEAD');
+    expect(tree.findAll('.commit-node--tip')).toHaveLength(2);
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('refreshes the Artifact and every enabled relation from one action', async () => {
+    const { queryClient, wrapper } = await mountPage(
+      '/tenants/tenant-a/projects/project-a/artifacts/artifact-a',
+      artifact,
+      [
+        'artifact_catalog',
+        'artifact_commit_graph',
+        'playground_materialize',
+        'snapshot_materialize',
+      ],
+    );
+
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '刷新')!
+      .trigger('click');
+    await flushPromises();
+
+    expect(api.queryArtifact).toHaveBeenCalledTimes(2);
+    expect(api.queryArtifactCommitGraph).toHaveBeenCalledTimes(2);
+    expect(api.queryPlaygroundList).toHaveBeenCalledTimes(2);
+    expect(api.querySnapshotList).toHaveBeenCalledTimes(2);
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('ignores a stale Commit page after navigating to another Artifact', async () => {
+    const stalePage = deferred<{
+      data: { graph: CommitGraphView };
+      requestId: string;
+    }>();
+    const firstGraph: CommitGraphView = {
+      graph_version: '2',
+      head_commit_id: headCommitId,
+      nodes: [
+        {
+          commit_id: headCommitId,
+          message: 'Artifact A head',
+          tag_names: [],
+          created_at_unix_ms: '2',
+        },
+      ],
+      next_cursor: 'artifact-a-page-2',
+    };
+    const { queryClient, router, wrapper } = await mountPage(
+      '/tenants/tenant-a/projects/project-a/artifacts/artifact-a?tab=commits',
+      artifact,
+      ['artifact_catalog', 'artifact_commit_graph'],
+      firstGraph,
+    );
+    const artifactBCommitId = 'e'.repeat(64);
+    const staleCommitId = 'f'.repeat(64);
+    api.queryArtifactCommitGraph.mockImplementation(
+      (_tenantId: string, _projectId: string, requestedArtifactId: string, cursor?: string) => {
+        if (cursor === 'artifact-a-page-2') return stalePage.promise;
+        if (requestedArtifactId === 'artifact-b') {
+          return Promise.resolve({
+            data: {
+              graph: {
+                graph_version: '1',
+                head_commit_id: artifactBCommitId,
+                nodes: [
+                  {
+                    commit_id: artifactBCommitId,
+                    message: 'Artifact B head',
+                    tag_names: [],
+                    created_at_unix_ms: '3',
+                  },
+                ],
+              },
+            },
+            requestId: 'request-artifact-b-commits',
+          });
+        }
+        throw new Error('unexpected Commit graph request');
+      },
+    );
+
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '加载更多历史')!
+      .trigger('click');
+    await router.push('/tenants/tenant-a/projects/project-a/artifacts/artifact-b?tab=commits');
+    await flushPromises();
+    stalePage.resolve({
+      data: {
+        graph: {
+          graph_version: '2',
+          head_commit_id: headCommitId,
+          nodes: [
+            {
+              commit_id: staleCommitId,
+              message: 'Stale Artifact A history',
+              tag_names: [],
+              created_at_unix_ms: '1',
+            },
+          ],
+        },
+      },
+      requestId: 'request-stale-page',
+    });
+    await flushPromises();
+
+    expect(wrapper.find(`[data-commit-id="${artifactBCommitId}"]`).exists()).toBe(true);
+    expect(wrapper.find(`[data-commit-id="${staleCommitId}"]`).exists()).toBe(false);
 
     wrapper.unmount();
     queryClient.clear();

@@ -22,12 +22,24 @@ vi.mock('@/api/operations', () => api);
 
 const indexDigest = 'a'.repeat(64);
 
-async function mountPage(state: 'ready' | 'creating' | 'abnormal' = 'ready') {
+interface MountPageOptions {
+  state?: 'ready' | 'creating' | 'abnormal';
+  storageAvailability?: 'ready' | 'degraded' | 'unavailable' | 'unknown';
+  includeStorageAvailability?: boolean;
+  capabilities?: string[];
+}
+
+async function mountPage({
+  state = 'ready',
+  storageAvailability = 'ready',
+  includeStorageAvailability = true,
+  capabilities = ['artifact_catalog'],
+}: MountPageOptions = {}) {
   api.queryApiVersion.mockResolvedValue({
     data: {
       api_versions: [1],
       agent_protocol_versions: [1],
-      capabilities: ['artifact_catalog'],
+      capabilities,
     },
     requestId: 'request-version',
   });
@@ -43,6 +55,7 @@ async function mountPage(state: 'ready' | 'creating' | 'abnormal' = 'ready') {
         display_name: 'Catalog Playground',
         index_version: { revision: '7', digest: indexDigest },
         state,
+        ...(includeStorageAvailability ? { storage_availability: storageAvailability } : {}),
         created_at_unix_ms: '1785167000000',
         updated_at_unix_ms: '1785167600000',
       },
@@ -108,7 +121,10 @@ async function mountPage(state: 'ready' | 'creating' | 'abnormal' = 'ready') {
   return { queryClient, router, wrapper };
 }
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.clearAllMocks();
+});
 
 describe('artifact_catalog-only Playground detail', () => {
   it('shows authoritative metadata without exposing a direct Add/scan Job entry', async () => {
@@ -142,7 +158,7 @@ describe('artifact_catalog-only Playground detail', () => {
   });
 
   it('does not offer a scan Job for a non-ready Playground', async () => {
-    const { queryClient, wrapper } = await mountPage('abnormal');
+    const { queryClient, wrapper } = await mountPage({ state: 'abnormal' });
 
     expect(wrapper.findAll('button').some((button) => button.text() === '创建扫描 Job')).toBe(
       false,
@@ -152,20 +168,119 @@ describe('artifact_catalog-only Playground detail', () => {
     expect(api.queryPlaygroundDatasetProfile).not.toHaveBeenCalled();
     expect(api.queryPlaygroundFileMetadata).not.toHaveBeenCalled();
     expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
-    expect(wrapper.text()).toContain('工作区不可用');
+    expect(wrapper.text()).toContain('工作区物化异常');
 
     wrapper.unmount();
     queryClient.clear();
   });
 
   it('renders the materializing state as a read-only wait screen', async () => {
-    const { queryClient, wrapper } = await mountPage('creating');
+    const { queryClient, wrapper } = await mountPage({ state: 'creating' });
 
     expect(wrapper.text()).toContain('工作区正在创建');
     expect(wrapper.text()).toContain('创建中');
     expect(wrapper.text()).not.toContain('发起 Pre-commit');
     expect(api.queryPlaygroundChangeList).not.toHaveBeenCalled();
     expect(api.queryPlaygroundFileList).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('shows an unavailable StorageVolume, keeps central metadata readable, and gates mutations', async () => {
+    const { queryClient, wrapper } = await mountPage({
+      storageAvailability: 'unavailable',
+      capabilities: ['artifact_catalog', 'playground_browser', 'playground_precommit'],
+    });
+
+    expect(wrapper.text()).toContain('已物化');
+    expect(wrapper.text()).toContain('存储不可达');
+    expect(wrapper.text()).toContain('可以查看中心索引');
+    expect(wrapper.text()).toContain('工作区数据');
+    expect(wrapper.findAll('button').some((button) => button.text() === '发起 Pre-commit')).toBe(
+      false,
+    );
+    expect(api.queryPlaygroundChangeList).toHaveBeenCalled();
+    expect(api.queryPlaygroundFileList).toHaveBeenCalled();
+    expect(api.queryPlaygroundDatasetProfile).toHaveBeenCalled();
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('fails closed for a legacy response that omits storage availability', async () => {
+    const { queryClient, wrapper } = await mountPage({
+      includeStorageAvailability: false,
+      capabilities: ['artifact_catalog', 'playground_browser', 'playground_precommit'],
+    });
+
+    expect(wrapper.text()).toContain('存储状态未知');
+    expect(wrapper.findAll('button').some((button) => button.text() === '发起 Pre-commit')).toBe(
+      false,
+    );
+    expect(api.queryPlaygroundChangeList).toHaveBeenCalled();
+    expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('automatically follows Agent storage loss and recovery after the Playground is ready', async () => {
+    vi.useFakeTimers();
+    const { queryClient, wrapper } = await mountPage({
+      capabilities: ['artifact_catalog', 'playground_browser', 'playground_precommit'],
+    });
+
+    api.queryPlayground.mockResolvedValueOnce({
+      data: {
+        playground: {
+          tenant_id: 'tenant-a',
+          project_id: 'project-a',
+          artifact_id: 'artifact-a',
+          playground_id: 'playground-a',
+          storage_volume_id: 'volume-a',
+          region: 'cn-shanghai',
+          display_name: 'Catalog Playground',
+          index_version: { revision: '7', digest: indexDigest },
+          state: 'ready',
+          storage_availability: 'unavailable',
+          created_at_unix_ms: '1785167000000',
+          updated_at_unix_ms: '1785167600000',
+        },
+      },
+      requestId: 'request-playground-offline',
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+
+    expect(api.queryPlayground).toHaveBeenCalledTimes(2);
+    expect(wrapper.text()).toContain('存储不可达');
+
+    api.queryPlayground.mockResolvedValueOnce({
+      data: {
+        playground: {
+          tenant_id: 'tenant-a',
+          project_id: 'project-a',
+          artifact_id: 'artifact-a',
+          playground_id: 'playground-a',
+          storage_volume_id: 'volume-a',
+          region: 'cn-shanghai',
+          display_name: 'Catalog Playground',
+          index_version: { revision: '7', digest: indexDigest },
+          state: 'ready',
+          storage_availability: 'ready',
+          created_at_unix_ms: '1785167000000',
+          updated_at_unix_ms: '1785167600000',
+        },
+      },
+      requestId: 'request-playground-recovered',
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+
+    expect(api.queryPlayground).toHaveBeenCalledTimes(3);
+    expect(wrapper.text()).toContain('存储可达');
+    expect(wrapper.text()).not.toContain('依赖 Agent 的实时操作已暂停');
 
     wrapper.unmount();
     queryClient.clear();

@@ -322,8 +322,9 @@ pub struct PreCommitRecord {
     pub diff_summary: Option<CommitDiffSummary>,
     pub issue: Option<PreCommitNotice>,
     pub committed_commit_id: Option<CommitId>,
-    /// Recovery acknowledgement written only after both control-catalog Head pointers observe the
-    /// committed Commit.
+    /// Recovery acknowledgement written after the source Playground Head and the Artifact's
+    /// convenience Head have published this Commit. Only the Playground Head is the branch-local
+    /// concurrency fence.
     pub head_published_at_unix_ms: Option<UnixMillis>,
     pub frozen_head_commit_id: Option<CommitId>,
     pub job_id: JobId,
