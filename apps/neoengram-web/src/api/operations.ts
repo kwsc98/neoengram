@@ -14,6 +14,8 @@ import type {
   CreateArtifactResponse,
   CreatePlaygroundRequest,
   CreatePlaygroundResponse,
+  CreateProjectRequest,
+  CreateProjectResponse,
   CreateSnapshotRequest,
   CreateSnapshotResponse,
   CreateStorageVolumeRequest,
@@ -68,8 +70,46 @@ import type {
   RejectStorageEnrollmentResponse,
   RetrySnapshotDeliveryRequest,
   RetrySnapshotDeliveryResponse,
+  CreateSnapshotDeliveryRequest,
+  CreateSnapshotDeliveryResponse,
+  QuerySnapshotDeliveryRequest,
+  QuerySnapshotDeliveryResponse,
+  QuerySnapshotDeliveryListRequest,
+  QuerySnapshotDeliveryListResponse,
+  DeleteSnapshotDeliveryRequest,
+  DeleteSnapshotDeliveryResponse,
   StartPreCommitRequest,
   StartPreCommitResponse,
+  CreateS3AccessPointRequest,
+  CreateS3AccessPointResponse,
+  QueryS3AccessPointListRequest,
+  QueryS3AccessPointListResponse,
+  QueryS3AccessPointResponse,
+  QueryS3AccessPointRequest,
+  UpdateS3AccessPointRequest,
+  UpdateS3AccessPointResponse,
+  CreateS3CredentialRequest,
+  CreateS3CredentialResponse,
+  QueryS3CredentialListRequest,
+  QueryS3CredentialListResponse,
+  RevokeS3CredentialRequest,
+  QueryS3ObjectListRequest,
+  QueryS3ObjectListResponse,
+  CreateS3DownloadUrlRequest,
+  CreateS3DownloadUrlResponse,
+  CreateDeletionRequest,
+  CreateRetentionHoldRequest,
+  CreateRetentionHoldResponse,
+  DeletionMutationResponse,
+  QueryDeletionImpactRequest,
+  QueryDeletionImpactResponse,
+  QueryDeletionListRequest,
+  QueryDeletionListResponse,
+  QueryDeletionRequest,
+  QueryDeletionResponse,
+  ReleaseRetentionHoldRequest,
+  ReleaseRetentionHoldResponse,
+  UpdateDeletionRequest,
 } from './types';
 
 export interface ApiResult<T> {
@@ -219,6 +259,14 @@ export async function queryProjectList(
 ): Promise<ApiResult<QueryProjectListResponse>> {
   return unwrap(
     await apiClient.POST('/api/project/list/query', { body: request, params: versionHeader }),
+  );
+}
+
+export async function createProject(
+  request: CreateProjectRequest,
+): Promise<ApiResult<CreateProjectResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/project/create', { body: request, params: versionHeader }),
   );
 }
 
@@ -466,6 +514,50 @@ export async function retrySnapshotDelivery(
   );
 }
 
+export async function createSnapshotDelivery(
+  request: CreateSnapshotDeliveryRequest,
+): Promise<ApiResult<CreateSnapshotDeliveryResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/snapshot/delivery/create', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function querySnapshotDelivery(
+  request: QuerySnapshotDeliveryRequest,
+): Promise<ApiResult<QuerySnapshotDeliveryResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/snapshot/delivery/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function querySnapshotDeliveryList(
+  request: QuerySnapshotDeliveryListRequest,
+): Promise<ApiResult<QuerySnapshotDeliveryListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/snapshot/delivery/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function deleteSnapshotDelivery(
+  request: DeleteSnapshotDeliveryRequest,
+): Promise<ApiResult<DeleteSnapshotDeliveryResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/snapshot/delivery/delete', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
 export async function querySnapshotFileList(
   request: QuerySnapshotFileListRequest,
 ): Promise<ApiResult<QuerySnapshotFileListResponse>> {
@@ -493,6 +585,186 @@ export async function querySnapshotDatasetProfile(
 ): Promise<ApiResult<QuerySnapshotDatasetProfileResponse>> {
   return unwrap(
     await apiClient.POST('/api/snapshot/dataset/profile/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryS3AccessPointList(
+  request: QueryS3AccessPointListRequest,
+): Promise<ApiResult<QueryS3AccessPointListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/access-point/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryS3AccessPoint(
+  request: QueryS3AccessPointRequest,
+): Promise<ApiResult<QueryS3AccessPointResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/access-point/query', { body: request, params: versionHeader }),
+  );
+}
+
+export async function createS3AccessPoint(
+  request: CreateS3AccessPointRequest,
+): Promise<ApiResult<CreateS3AccessPointResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/access-point/create', { body: request, params: versionHeader }),
+  );
+}
+
+export async function enableS3AccessPoint(
+  request: UpdateS3AccessPointRequest,
+): Promise<ApiResult<UpdateS3AccessPointResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/access-point/enable', { body: request, params: versionHeader }),
+  );
+}
+
+export async function disableS3AccessPoint(
+  request: UpdateS3AccessPointRequest,
+): Promise<ApiResult<UpdateS3AccessPointResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/access-point/disable', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function createS3Credential(
+  request: CreateS3CredentialRequest,
+): Promise<ApiResult<CreateS3CredentialResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/credential/create', { body: request, params: versionHeader }),
+  );
+}
+
+export async function queryS3CredentialList(
+  request: QueryS3CredentialListRequest,
+): Promise<ApiResult<QueryS3CredentialListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/credential/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function revokeS3Credential(
+  request: RevokeS3CredentialRequest,
+): Promise<ApiResult<QueryS3CredentialListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/credential/revoke', { body: request, params: versionHeader }),
+  );
+}
+
+export async function queryS3ObjectList(
+  request: QueryS3ObjectListRequest,
+): Promise<ApiResult<QueryS3ObjectListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/object/list/query', { body: request, params: versionHeader }),
+  );
+}
+
+export async function createS3DownloadUrl(
+  request: CreateS3DownloadUrlRequest,
+): Promise<ApiResult<CreateS3DownloadUrlResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/object/download-url/create', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryDeletionImpact(
+  request: QueryDeletionImpactRequest,
+): Promise<ApiResult<QueryDeletionImpactResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/resource/deletion/impact/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function createDeletion(
+  request: CreateDeletionRequest,
+): Promise<ApiResult<DeletionMutationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/resource/deletion/create', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryDeletion(
+  request: QueryDeletionRequest,
+): Promise<ApiResult<QueryDeletionResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/resource/deletion/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryDeletionList(
+  request: QueryDeletionListRequest,
+): Promise<ApiResult<QueryDeletionListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/resource/deletion/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function restoreDeletion(
+  request: UpdateDeletionRequest,
+): Promise<ApiResult<DeletionMutationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/resource/deletion/restore', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function retryDeletion(
+  request: UpdateDeletionRequest,
+): Promise<ApiResult<DeletionMutationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/resource/deletion/retry', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function createRetentionHold(
+  request: CreateRetentionHoldRequest,
+): Promise<ApiResult<CreateRetentionHoldResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/resource/retention-hold/create', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function releaseRetentionHold(
+  request: ReleaseRetentionHoldRequest,
+): Promise<ApiResult<ReleaseRetentionHoldResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/resource/retention-hold/release', {
       body: request,
       params: versionHeader,
     }),

@@ -8,6 +8,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { createPlayground, queryApiVersion, queryPlaygroundList } from '@/api/operations';
 import type { ArtifactView } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
+import ResourceDeletionDialog from '@/components/ResourceDeletionDialog.vue';
 import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
 import ArtifactSelect from '@/components/ArtifactSelect.vue';
 import PageCursor from '@/components/PageCursor.vue';
@@ -16,7 +17,9 @@ import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
 import {
   supportsArtifactCommitGraph,
   supportsPlaygroundMaterialize,
+  supportsResourceLifecycle,
 } from '@/features/capabilities';
+import { lifecycleResourceVersion } from '@/features/lifecycle';
 import {
   playgroundLifecycleLabel,
   playgroundLifecycleTagType,
@@ -64,6 +67,12 @@ const canCreatePlayground = computed(
   () =>
     (tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false) &&
     materializeEnabled.value,
+);
+const lifecycleEnabled = computed(
+  () =>
+    supportsResourceLifecycle(versionQuery.data.value?.data.capabilities) &&
+    (tenants.byId(tenantId.value)?.permissions.includes('resource.lifecycle.manage' as never) ??
+      false),
 );
 
 const playgroundQuery = useQuery({
@@ -311,30 +320,59 @@ async function openPlayground(
           <el-table-column label="更新时间" min-width="160">
             <template #default="scope">{{ formatTime(scope.row.updated_at_unix_ms) }}</template>
           </el-table-column>
-          <el-table-column width="54" align="right">
+          <el-table-column :width="lifecycleEnabled ? 96 : 54" align="right">
             <template #default="scope">
-              <el-button
-                text
-                :icon="ArrowRight"
-                title="查看 Playground"
-                @click="
-                  openPlayground(
-                    scope.row.project_id,
-                    scope.row.artifact_id,
-                    scope.row.playground_id,
-                  )
-                "
-              />
+              <div class="row-actions">
+                <ResourceDeletionDialog
+                  v-if="lifecycleEnabled"
+                  :tenant-id="tenantId"
+                  :resource="{
+                    type: 'playground',
+                    project_id: scope.row.project_id,
+                    artifact_id: scope.row.artifact_id,
+                    playground_id: scope.row.playground_id,
+                  }"
+                  :resource-version="lifecycleResourceVersion(scope.row)"
+                  :display-name="scope.row.display_name"
+                />
+                <el-button
+                  text
+                  :icon="ArrowRight"
+                  title="查看 Playground"
+                  @click="
+                    openPlayground(
+                      scope.row.project_id,
+                      scope.row.artifact_id,
+                      scope.row.playground_id,
+                    )
+                  "
+                />
+              </div>
             </template>
           </el-table-column>
         </el-table>
         <div class="mobile-resource-list">
-          <button
+          <div
             v-for="playground in playgroundQuery.data.value?.data.items"
             :key="`${playground.project_id}/${playground.artifact_id}/${playground.playground_id}`"
             class="mobile-resource-item"
-            type="button"
+            role="button"
+            tabindex="0"
             @click="
+              openPlayground(
+                playground.project_id,
+                playground.artifact_id,
+                playground.playground_id,
+              )
+            "
+            @keydown.enter="
+              openPlayground(
+                playground.project_id,
+                playground.artifact_id,
+                playground.playground_id,
+              )
+            "
+            @keydown.space.prevent="
               openPlayground(
                 playground.project_id,
                 playground.artifact_id,
@@ -368,9 +406,20 @@ async function openPlayground(
                 size="small"
                 effect="plain"
                 >活动 Pre-commit</el-tag
+              ><ResourceDeletionDialog
+                v-if="lifecycleEnabled"
+                :tenant-id="tenantId"
+                :resource="{
+                  type: 'playground',
+                  project_id: playground.project_id,
+                  artifact_id: playground.artifact_id,
+                  playground_id: playground.playground_id,
+                }"
+                :resource-version="lifecycleResourceVersion(playground)"
+                :display-name="playground.display_name" />
               ><ArrowRight
             /></span>
-          </button>
+          </div>
         </div>
         <PageCursor
           :has-previous="cursorHistory.length > 0"

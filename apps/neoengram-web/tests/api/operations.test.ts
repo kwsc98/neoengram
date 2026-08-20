@@ -15,7 +15,6 @@ function request(overrides: Partial<CreateAddJobRequest> = {}): CreateAddJobRequ
     deadline_unix_ms: String(Date.now() + 60_000),
     paths: ['dataset/images'],
     all: false,
-    future_mode: 'strict',
     ...overrides,
   };
 }
@@ -32,10 +31,10 @@ describe('public Job operations', () => {
     expect(replay.data.job.job_id).toBe('job-test-1');
   });
 
-  it('includes unknown extension fields in the mock idempotency comparison', async () => {
+  it('rejects a different valid payload when a Job ID is reused', async () => {
     await createAddJob(request());
 
-    await expect(createAddJob(request({ future_mode: 'relaxed' }))).rejects.toMatchObject({
+    await expect(createAddJob(request({ paths: ['dataset/other'] }))).rejects.toMatchObject({
       status: 409,
       code: 'JOB_ID_REUSED',
       retryable: false,

@@ -1,14 +1,18 @@
 <script setup lang="ts">
 import {
   Box,
+  Close,
   Collection,
   Coin,
   DataAnalysis,
+  Delete,
   DocumentCopy,
   Fold,
   Key,
   Plus,
   Search,
+  FolderOpened,
+  Folder,
   SwitchButton,
 } from '@element-plus/icons-vue';
 import { useQuery, useQueryClient } from '@tanstack/vue-query';
@@ -19,7 +23,12 @@ import { useRoute, useRouter } from 'vue-router';
 
 import { queryApiVersion } from '@/api/operations';
 import { runtimeConfig } from '@/config';
-import { supportsArtifactCatalog, supportsSnapshotMaterialize } from '@/features/capabilities';
+import {
+  supportsArtifactCatalog,
+  supportsS3ReadonlyAccessPoint,
+  supportsResourceLifecycle,
+  supportsSnapshotMaterialize,
+} from '@/features/capabilities';
 import { useAuthStore } from '@/stores/auth';
 import { useTenantsStore } from '@/stores/tenants';
 
@@ -35,6 +44,7 @@ const createError = ref('');
 const form = reactive({ tenantId: '', displayName: '', description: '' });
 const currentTenantId = computed(() => String(route.params.tenantId ?? ''));
 const currentTenant = computed(() => tenants.byId(currentTenantId.value));
+const identityInitial = computed(() => auth.displayName.trim().charAt(0).toUpperCase() || 'U');
 const versionQuery = useQuery({
   queryKey: ['system', 'version'],
   queryFn: queryApiVersion,
@@ -46,6 +56,23 @@ const artifactCatalogEnabled = computed(() =>
 const snapshotMaterializeEnabled = computed(() =>
   supportsSnapshotMaterialize(versionQuery.data.value?.data.capabilities),
 );
+const s3ReadonlyEnabled = computed(() =>
+  Boolean(
+    supportsS3ReadonlyAccessPoint(versionQuery.data.value?.data.capabilities) &&
+    currentTenant.value?.permissions.includes('s3.access.read'),
+  ),
+);
+const resourceLifecycleEnabled = computed(() =>
+  Boolean(
+    supportsResourceLifecycle(versionQuery.data.value?.data.capabilities) &&
+    currentTenant.value?.permissions.includes('resource.lifecycle.read' as never),
+  ),
+);
+const controlPlaneState = computed(() => {
+  if (versionQuery.isPending.value) return { label: '连接检查中', online: false };
+  if (versionQuery.isError.value) return { label: '控制面不可用', online: false };
+  return { label: '控制面在线', online: true };
+});
 
 const navGroups = computed(() => {
   if (!currentTenantId.value) return [];
@@ -55,6 +82,7 @@ const navGroups = computed(() => {
       label: '数据工作流',
       items: [
         { name: 'tenant-overview', label: '概览', icon: DataAnalysis, params: { tenantId } },
+        { name: 'project-list', label: 'Projects', icon: Folder, params: { tenantId } },
         ...(artifactCatalogEnabled.value
           ? [{ name: 'artifact-list', label: '数据资产', icon: Box, params: { tenantId } }]
           : []),
@@ -69,7 +97,20 @@ const navGroups = computed(() => {
               },
             ]
           : []),
+        ...(s3ReadonlyEnabled.value
+          ? [
+              {
+                name: 'object-storage-list',
+                label: '对象存储',
+                icon: FolderOpened,
+                params: { tenantId },
+              },
+            ]
+          : []),
         { name: 'job-query', label: '活动', icon: Search, params: { tenantId } },
+        ...(resourceLifecycleEnabled.value
+          ? [{ name: 'recycle-bin', label: '回收站', icon: Delete, params: { tenantId } }]
+          : []),
       ],
     },
     {
@@ -89,9 +130,12 @@ const navGroups = computed(() => {
 const activeMenu = computed(() => {
   const name = String(route.name ?? '');
   if (name.startsWith('storage-volume-')) return 'storage-volume-list';
+  if (name.startsWith('project-')) return 'project-list';
   if (name.startsWith('artifact-')) return 'artifact-list';
   if (name.startsWith('playground-')) return 'playground-list';
   if (name.startsWith('snapshot-')) return 'snapshot-list';
+  if (name.startsWith('object-storage-')) return 'object-storage-list';
+  if (name === 'recycle-bin') return 'recycle-bin';
   if (name === 'job-detail') return 'job-query';
   return name;
 });
@@ -112,9 +156,12 @@ async function navigate(name: string, params: Record<string, string>): Promise<v
 function targetForTenantSwitch(): string {
   const name = String(route.name ?? '');
   if (name.startsWith('storage-volume-')) return 'storage-volume-list';
+  if (name.startsWith('project-')) return 'project-list';
   if (name.startsWith('artifact-')) return 'artifact-list';
   if (name.startsWith('playground-')) return 'playground-list';
   if (name.startsWith('snapshot-')) return 'snapshot-list';
+  if (name.startsWith('object-storage-')) return 'object-storage-list';
+  if (name === 'recycle-bin') return 'recycle-bin';
   if (name === 'job-create') return 'job-query';
   if (name === 'job-query' || name === 'job-detail') return 'job-query';
   return 'tenant-overview';
@@ -180,6 +227,7 @@ async function submitTenant(): Promise<void> {
 <template>
   <el-config-provider :locale="zhCn">
     <div class="app-shell">
+      <a class="skip-link" href="#main-content">跳到主内容</a>
       <header class="topbar">
         <button
           class="icon-button mobile-menu"
@@ -189,11 +237,16 @@ async function submitTenant(): Promise<void> {
         >
           <el-icon><Fold /></el-icon>
         </button>
-        <button class="brand" type="button" @click="router.push('/')">
-          <span class="brand__mark">N</span>
-          <span>
+        <button
+          class="brand"
+          type="button"
+          aria-label="返回 NeoEngram 首页"
+          @click="router.push('/')"
+        >
+          <span class="brand__mark" aria-hidden="true"><span>N</span></span>
+          <span class="brand__wordmark">
             <strong>NeoEngram</strong>
-            <small>Control Console</small>
+            <small>Workspace Console</small>
           </span>
         </button>
         <div class="topbar__right">
@@ -239,12 +292,17 @@ async function submitTenant(): Promise<void> {
               @click="openCreate"
             />
           </div>
-          <span class="identity">{{ auth.displayName }}</span>
+          <div v-if="auth.authenticated" class="identity" :title="auth.displayName">
+            <span class="identity__avatar" aria-hidden="true">{{ identityInitial }}</span>
+            <span class="identity__name">{{ auth.displayName }}</span>
+          </div>
           <el-button
             v-if="auth.authenticated"
+            class="sign-out-button"
             text
             :icon="SwitchButton"
             title="退出登录"
+            aria-label="退出登录"
             @click="auth.logout()"
           />
           <el-button v-else type="primary" :icon="Key" @click="auth.login()">登录</el-button>
@@ -253,7 +311,15 @@ async function submitTenant(): Promise<void> {
 
       <aside class="sidebar">
         <div v-if="currentTenant" class="sidebar-tenant">
-          <span>{{ currentTenant.display_name }}</span>
+          <small>当前租户</small>
+          <span class="sidebar-tenant__name">
+            {{ currentTenant.display_name }}
+            <i
+              class="status-dot"
+              :class="{ 'status-dot--ok': controlPlaneState.online }"
+              :title="controlPlaneState.label"
+            />
+          </span>
           <code>{{ currentTenant.tenant_id }}</code>
         </div>
         <nav aria-label="主导航">
@@ -265,6 +331,7 @@ async function submitTenant(): Promise<void> {
               type="button"
               class="nav-item"
               :class="{ 'nav-item--active': activeMenu === item.name }"
+              :aria-current="activeMenu === item.name ? 'page' : undefined"
               @click="navigate(item.name, item.params)"
             >
               <el-icon><component :is="item.icon" /></el-icon>
@@ -272,9 +339,9 @@ async function submitTenant(): Promise<void> {
             </button>
           </div>
         </nav>
-        <div class="sidebar__footer">
-          <span class="status-dot status-dot--ok" />
-          <span>控制面在线</span>
+        <div class="sidebar__footer" role="status" aria-live="polite">
+          <span class="status-dot" :class="{ 'status-dot--ok': controlPlaneState.online }" />
+          <span>{{ controlPlaneState.label }}</span>
         </div>
       </aside>
 
@@ -285,9 +352,24 @@ async function submitTenant(): Promise<void> {
         :with-header="false"
         class="mobile-drawer"
       >
-        <div class="drawer-brand">NeoEngram</div>
+        <div class="drawer-header">
+          <div class="drawer-brand">
+            <span class="brand__mark" aria-hidden="true"><span>N</span></span>
+            <span>NeoEngram</span>
+          </div>
+          <button
+            class="icon-button drawer-close"
+            type="button"
+            title="关闭导航"
+            aria-label="关闭导航"
+            @click="drawerOpen = false"
+          >
+            <el-icon><Close /></el-icon>
+          </button>
+        </div>
         <div v-if="currentTenant" class="sidebar-tenant sidebar-tenant--drawer">
-          <span>{{ currentTenant.display_name }}</span>
+          <small>当前租户</small>
+          <span class="sidebar-tenant__name">{{ currentTenant.display_name }}</span>
           <code>{{ currentTenant.tenant_id }}</code>
         </div>
         <nav aria-label="移动端主导航">
@@ -299,6 +381,7 @@ async function submitTenant(): Promise<void> {
               type="button"
               class="nav-item"
               :class="{ 'nav-item--active': activeMenu === item.name }"
+              :aria-current="activeMenu === item.name ? 'page' : undefined"
               @click="navigate(item.name, item.params)"
             >
               <el-icon><component :is="item.icon" /></el-icon>
@@ -308,7 +391,7 @@ async function submitTenant(): Promise<void> {
         </nav>
       </el-drawer>
 
-      <main class="main-content">
+      <main id="main-content" class="main-content" tabindex="-1">
         <router-view />
       </main>
 

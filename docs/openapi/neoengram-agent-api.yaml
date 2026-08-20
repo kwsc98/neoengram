@@ -7,8 +7,8 @@ info:
   description: |
     Contract for the internal Agent action boundary carried through the Synapse Gateway. Every
     operation is an action-style POST and all resource identities are carried in the JSON body.
-    This API is not exposed by the public Web listener. The standalone listener is a loopback-only
-    migration/test adapter and is not the production topology.
+    This API is not exposed by the public Web listener. It is carried only by the mTLS Gateway
+    control tunnel and is not a standalone public endpoint.
 
     Authentication is carried inside each JSON request. OpenAPI 3.1 Security Scheme Objects cannot
     describe a body-carried bootstrap token or Ed25519 proof, so every operation intentionally uses
@@ -18,13 +18,13 @@ info:
     name: MIT OR Apache-2.0
     identifier: MIT OR Apache-2.0
 servers:
-  - url: http://127.0.0.1:8081
-    description: Loopback migration/test Agent listener (not a production endpoint)
+  - url: https://gateway.internal.example
+    description: Internal mTLS Gateway control endpoint
 tags:
   - name: Enrollment
     description: One-time enrollment bootstrap and signed approval-status query operations
   - name: Session
-    description: Signed HTTP/2 control channel, session lifecycle, and compatibility recovery operations
+    description: Signed HTTP/2 control channel, session lifecycle, and recovery operations
   - name: Job
     description: Signed Job report, metadata, and authoritative Index and Manifest operations; object bytes stay on the Volume
 x-neoengram-body-security-schemes:
@@ -93,8 +93,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/AgentBootstrapStatusResponse'
         default:
           $ref: '#/components/responses/Problem'
   /agent/session/open:
@@ -182,30 +181,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AgentHeartbeatReportResponse'
-        default:
-          $ref: '#/components/responses/Problem'
-  /agent/session/message/list/query:
-    post:
-      operationId: queryAgentSessionMessages
-      tags: [Session]
-      summary: Recover deliverable session messages through the compatibility action
-      description: >-
-        Compatibility and manual-recovery action only; the primary Agent runtime receives
-        assignments and decisions through the HTTP/2 full-duplex channel. When explicitly invoked,
-        this action short-polls up to 32 messages for the fenced session and an empty result asks the
-        caller to retry after 1000 milliseconds.
-      security: []
-      x-neoengram-body-security: ApprovedAgentEd25519
-      x-neoengram-compatibility-only: true
-      requestBody:
-        $ref: '#/components/requestBodies/MessageListQuery'
-      responses:
-        '200':
-          description: Assignments and decisions currently deliverable to this session.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AgentMessageListQueryResponse'
         default:
           $ref: '#/components/responses/Problem'
   /agent/job/report/create:
@@ -333,9 +308,11 @@ components:
             allOf:
               - $ref: '#/components/schemas/SignedAgentRequest'
               - type: object
+                additionalProperties: false
                 properties:
                   payload:
                     $ref: '#/components/schemas/AgentSessionOpenPayload'
+            unevaluatedProperties: false
     HeartbeatReport:
       required: true
       content:
@@ -344,20 +321,11 @@ components:
             allOf:
               - $ref: '#/components/schemas/EstablishedSessionRequest'
               - type: object
+                additionalProperties: false
                 properties:
                   payload:
                     $ref: '#/components/schemas/AgentHeartbeatReportPayload'
-    MessageListQuery:
-      required: true
-      content:
-        application/json:
-          schema:
-            allOf:
-              - $ref: '#/components/schemas/EstablishedSessionRequest'
-              - type: object
-                properties:
-                  payload:
-                    $ref: '#/components/schemas/AgentMessageListQueryPayload'
+            unevaluatedProperties: false
     JobReportCreate:
       required: true
       content:
@@ -366,9 +334,11 @@ components:
             allOf:
               - $ref: '#/components/schemas/EstablishedSessionRequest'
               - type: object
+                additionalProperties: false
                 properties:
                   payload:
                     $ref: '#/components/schemas/AgentJobReportCreatePayload'
+            unevaluatedProperties: false
     MetadataBatchStage:
       required: true
       content:
@@ -377,9 +347,11 @@ components:
             allOf:
               - $ref: '#/components/schemas/EstablishedSessionRequest'
               - type: object
+                additionalProperties: false
                 properties:
                   payload:
                     $ref: '#/components/schemas/AgentMetadataBatchStagePayload'
+            unevaluatedProperties: false
     MetadataPageStage:
       required: true
       content:
@@ -388,9 +360,11 @@ components:
             allOf:
               - $ref: '#/components/schemas/EstablishedSessionRequest'
               - type: object
+                additionalProperties: false
                 properties:
                   payload:
                     $ref: '#/components/schemas/AgentMetadataPageStagePayload'
+            unevaluatedProperties: false
     IndexPageQuery:
       required: true
       content:
@@ -399,9 +373,11 @@ components:
             allOf:
               - $ref: '#/components/schemas/EstablishedSessionRequest'
               - type: object
+                additionalProperties: false
                 properties:
                   payload:
                     $ref: '#/components/schemas/AgentIndexPageQueryPayload'
+            unevaluatedProperties: false
     ManifestPageQuery:
       required: true
       content:
@@ -410,9 +386,11 @@ components:
             allOf:
               - $ref: '#/components/schemas/EstablishedSessionRequest'
               - type: object
+                additionalProperties: false
                 properties:
                   payload:
                     $ref: '#/components/schemas/AgentManifestPageQueryPayload'
+            unevaluatedProperties: false
     SessionClose:
       required: true
       content:
@@ -421,9 +399,11 @@ components:
             allOf:
               - $ref: '#/components/schemas/EstablishedSessionRequest'
               - type: object
+                additionalProperties: false
                 properties:
                   payload:
                     $ref: '#/components/schemas/AgentSessionClosePayload'
+            unevaluatedProperties: false
   responses:
     ActionAccepted:
       description: Action was applied or replayed.
@@ -450,14 +430,15 @@ components:
       maxLength: 128
       pattern: '^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$'
     DecimalU64:
-      $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/DecimalU64'
+      $ref: '../../crates/neoengram-domain/schemas/current/control-envelope.schema.json#/$defs/DecimalU64'
     PositiveDecimalU64:
-      $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/SessionGeneration'
+      $ref: '../../crates/neoengram-domain/schemas/current/control-envelope.schema.json#/$defs/SessionGeneration'
     Digest:
       type: string
       pattern: '^[0-9a-f]{64}$'
     AgentRequestProof:
       type: object
+      additionalProperties: false
       required: [unsigned_body_digest, algorithm, public_key_spki, signature]
       properties:
         unsigned_body_digest:
@@ -465,13 +446,14 @@ components:
         algorithm:
           const: ed25519
         public_key_spki:
-          $ref: '../../crates/neoengram-protocol/schemas/v1/agent-enrollment.schema.json#/$defs/Ed25519PublicKeySpki'
+          $ref: '../../crates/neoengram-domain/schemas/current/agent-enrollment.schema.json#/$defs/Ed25519PublicKeySpki'
         signature:
-          $ref: '../../crates/neoengram-protocol/schemas/v1/agent-enrollment.schema.json#/$defs/Ed25519Signature'
+          $ref: '../../crates/neoengram-domain/schemas/current/agent-enrollment.schema.json#/$defs/Ed25519Signature'
     SignedAgentRequest:
       type: object
+      additionalProperties: false
       required:
-        - protocol_version
+        - wire_version
         - request_id
         - agent_id
         - installation_id
@@ -480,7 +462,7 @@ components:
         - payload
         - proof
       properties:
-        protocol_version:
+        wire_version:
           const: 1
         request_id:
           $ref: '#/components/schemas/Id'
@@ -490,22 +472,39 @@ components:
           $ref: '#/components/schemas/Id'
         boot_id:
           $ref: '#/components/schemas/Id'
+        session_id:
+          $ref: '#/components/schemas/Id'
+        session_generation:
+          $ref: '#/components/schemas/PositiveDecimalU64'
         signed_at_unix_ms:
           $ref: '#/components/schemas/DecimalU64'
         payload:
-          type: object
+          $ref: '#/components/schemas/AgentRequestPayload'
         proof:
           $ref: '#/components/schemas/AgentRequestProof'
     EstablishedSessionRequest:
       allOf:
         - $ref: '#/components/schemas/SignedAgentRequest'
         - type: object
+          additionalProperties: false
           required: [session_id, session_generation]
           properties:
             session_id:
               $ref: '#/components/schemas/Id'
             session_generation:
               $ref: '#/components/schemas/PositiveDecimalU64'
+      unevaluatedProperties: false
+    AgentRequestPayload:
+      oneOf:
+        - $ref: '#/components/schemas/AgentSessionOpenPayload'
+        - $ref: '#/components/schemas/AgentHeartbeatReportPayload'
+        - $ref: '#/components/schemas/AgentJobReportCreatePayload'
+        - $ref: '#/components/schemas/AgentMetadataBatchStagePayload'
+        - $ref: '#/components/schemas/AgentMetadataPageStagePayload'
+        - $ref: '#/components/schemas/AgentIndexPageQueryPayload'
+        - $ref: '#/components/schemas/AgentManifestPageQueryPayload'
+        - $ref: '#/components/schemas/AgentSessionClosePayload'
+        - $ref: '#/components/schemas/AgentChannelUpstreamPayloadBase'
     AgentChannelUpstreamFrame:
       description: One independently signed Agent-to-Central logical JSON record carried through Gateway, limited to 1048576 encoded bytes before its mandatory LF delimiter.
       oneOf:
@@ -515,6 +514,7 @@ components:
         - $ref: '#/components/schemas/AgentChannelCloseFrame'
     AgentChannelUpstreamPayloadBase:
       type: object
+      additionalProperties: false
       required: [sequence, message_id, type, payload]
       properties:
         sequence:
@@ -526,11 +526,16 @@ components:
         type:
           type: string
         payload:
-          type: object
+          oneOf:
+            - $ref: '#/components/schemas/AgentSessionOpenPayload'
+            - $ref: '#/components/schemas/AgentHeartbeatReportPayload'
+            - $ref: '#/components/schemas/AgentJobReportCreatePayload'
+            - $ref: '#/components/schemas/AgentSessionClosePayload'
     AgentChannelOpenFrame:
       allOf:
         - $ref: '#/components/schemas/SignedAgentRequest'
         - type: object
+          additionalProperties: false
           required: [payload]
           properties:
             session_id: false
@@ -539,6 +544,7 @@ components:
               allOf:
                 - $ref: '#/components/schemas/AgentChannelUpstreamPayloadBase'
                 - type: object
+                  additionalProperties: false
                   properties:
                     correlation_id: false
                     sequence:
@@ -547,51 +553,61 @@ components:
                       const: channel.open
                     payload:
                       $ref: '#/components/schemas/AgentSessionOpenPayload'
+      unevaluatedProperties: false
     AgentChannelHeartbeatFrame:
       allOf:
         - $ref: '#/components/schemas/EstablishedSessionRequest'
         - type: object
+          additionalProperties: false
           required: [payload]
           properties:
             payload:
               allOf:
                 - $ref: '#/components/schemas/AgentChannelUpstreamPayloadBase'
                 - type: object
+                  additionalProperties: false
                   properties:
                     type:
                       const: session.heartbeat
                     payload:
                       $ref: '#/components/schemas/AgentHeartbeatReportPayload'
+      unevaluatedProperties: false
     AgentChannelReportFrame:
       allOf:
         - $ref: '#/components/schemas/EstablishedSessionRequest'
         - type: object
+          additionalProperties: false
           required: [payload]
           properties:
             payload:
               allOf:
                 - $ref: '#/components/schemas/AgentChannelUpstreamPayloadBase'
                 - type: object
+                  additionalProperties: false
                   properties:
                     type:
                       const: job.report
                     payload:
                       $ref: '#/components/schemas/AgentJobReportCreatePayload'
+      unevaluatedProperties: false
     AgentChannelCloseFrame:
       allOf:
         - $ref: '#/components/schemas/EstablishedSessionRequest'
         - type: object
+          additionalProperties: false
           required: [payload]
           properties:
             payload:
               allOf:
                 - $ref: '#/components/schemas/AgentChannelUpstreamPayloadBase'
                 - type: object
+                  additionalProperties: false
                   properties:
                     type:
                       const: channel.close
                     payload:
                       $ref: '#/components/schemas/AgentSessionClosePayload'
+      unevaluatedProperties: false
     AgentChannelDownstreamFrame:
       description: One Central-to-Agent logical JSON record carried through Gateway, limited to 1048576 encoded bytes before its mandatory LF delimiter.
       oneOf:
@@ -610,8 +626,9 @@ components:
           protocol.error: '#/components/schemas/AgentChannelErrorFrame'
     AgentChannelDownstreamBase:
       type: object
+      additionalProperties: false
       required:
-        - protocol_version
+        - wire_version
         - sequence
         - message_id
         - session_generation
@@ -619,7 +636,7 @@ components:
         - type
         - payload
       properties:
-        protocol_version:
+        wire_version:
           const: 1
         sequence:
           $ref: '#/components/schemas/PositiveDecimalU64'
@@ -634,11 +651,17 @@ components:
         type:
           type: string
         payload:
-          type: object
+          oneOf:
+            - $ref: '#/components/schemas/AgentSessionOpenResponse'
+            - $ref: '#/components/schemas/AgentChannelJobAssignment'
+            - $ref: '#/components/schemas/AgentChannelJobDecision'
+            - $ref: '#/components/schemas/AgentChannelAck'
+            - $ref: '#/components/schemas/AgentChannelControlError'
     AgentChannelOpenedFrame:
       allOf:
         - $ref: '#/components/schemas/AgentChannelDownstreamBase'
         - type: object
+          additionalProperties: false
           required: [correlation_id]
           properties:
             sequence:
@@ -647,47 +670,57 @@ components:
               const: channel.opened
             payload:
               $ref: '#/components/schemas/AgentSessionOpenResponse'
+      unevaluatedProperties: false
     AgentChannelAssignmentFrame:
       allOf:
         - $ref: '#/components/schemas/AgentChannelDownstreamBase'
         - type: object
+          additionalProperties: false
           properties:
             correlation_id: false
             type:
               const: job.assignment
             payload:
               $ref: '#/components/schemas/AgentChannelJobAssignment'
+      unevaluatedProperties: false
     AgentChannelDecisionFrame:
       allOf:
         - $ref: '#/components/schemas/AgentChannelDownstreamBase'
         - type: object
+          additionalProperties: false
           properties:
             correlation_id: false
             type:
               const: job.decision
             payload:
               $ref: '#/components/schemas/AgentChannelJobDecision'
+      unevaluatedProperties: false
     AgentChannelAckFrame:
       allOf:
         - $ref: '#/components/schemas/AgentChannelDownstreamBase'
         - type: object
+          additionalProperties: false
           required: [correlation_id]
           properties:
             type:
               const: channel.ack
             payload:
               $ref: '#/components/schemas/AgentChannelAck'
+      unevaluatedProperties: false
     AgentChannelErrorFrame:
       allOf:
         - $ref: '#/components/schemas/AgentChannelDownstreamBase'
         - type: object
+          additionalProperties: false
           properties:
             type:
               const: protocol.error
             payload:
               $ref: '#/components/schemas/AgentChannelControlError'
+      unevaluatedProperties: false
     AgentChannelAck:
       type: object
+      additionalProperties: false
       required: [acknowledged_sequence, resource_version, replayed]
       properties:
         acknowledged_sequence:
@@ -697,11 +730,29 @@ components:
         replayed:
           type: boolean
     AgentChannelJobAssignment:
-      $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/JobAssignment'
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/control-envelope.schema.json#/$defs/JobAssignment'
+        - type: object
+          additionalProperties: false
+          properties:
+            assignment: {}
+      unevaluatedProperties: false
     AgentChannelJobDecision:
-      $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/JobDecision'
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/control-envelope.schema.json#/$defs/JobDecision'
+        - type: object
+          additionalProperties: false
+          properties:
+            assignment_generation: {}
+            assignment_id: {}
+            decision: {}
+            decision_generation: {}
+            final_state: {}
+            job_id: {}
+      unevaluatedProperties: false
     AgentChannelControlError:
       type: object
+      additionalProperties: false
       required: [code, message, retryable]
       properties:
         code:
@@ -719,6 +770,7 @@ components:
           $ref: '#/components/schemas/DecimalU64'
     AgentSessionOpenPayload:
       type: object
+      additionalProperties: false
       required: [mount_identity_digest, expected_resource_version]
       properties:
         mount_identity_digest:
@@ -727,9 +779,10 @@ components:
           $ref: '#/components/schemas/DecimalU64'
     AgentSessionOpenResponse:
       type: object
-      required: [protocol_version, request_id, agent_id, session_id, session_generation, agent_mount_id, mount_generation, owner_generation, resource_version, opened_at_unix_ms, replayed]
+      additionalProperties: false
+      required: [wire_version, request_id, agent_id, session_id, session_generation, agent_mount_id, mount_generation, owner_generation, resource_version, opened_at_unix_ms, replayed]
       properties:
-        protocol_version: { const: 1 }
+        wire_version: { const: 1 }
         request_id: { $ref: '#/components/schemas/Id' }
         agent_id: { $ref: '#/components/schemas/Id' }
         session_id: { $ref: '#/components/schemas/Id' }
@@ -742,89 +795,114 @@ components:
         replayed: { type: boolean }
     AgentHeartbeatReportPayload:
       type: object
+      additionalProperties: false
       required: [heartbeat, mount_report]
       properties:
         heartbeat:
-          $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json#/$defs/AgentHeartbeat'
+          $ref: '#/components/schemas/AgentHeartbeat'
         mount_report:
-          $ref: '../../crates/neoengram-protocol/schemas/v1/agent-enrollment.schema.json#/$defs/AgentMountStatusReport'
+          $ref: '#/components/schemas/AgentMountStatusReport'
     AgentHeartbeatReportResponse:
       type: object
-      required: [protocol_version, request_id, resource_version, received_at_unix_ms, replayed]
+      additionalProperties: false
+      required: [wire_version, request_id, resource_version, received_at_unix_ms, replayed]
       properties:
-        protocol_version: { const: 1 }
+        wire_version: { const: 1 }
         request_id: { $ref: '#/components/schemas/Id' }
         resource_version: { $ref: '#/components/schemas/DecimalU64' }
         received_at_unix_ms: { $ref: '#/components/schemas/DecimalU64' }
         replayed: { type: boolean }
-    AgentMessageListQueryPayload:
-      type: object
-      required: [max_messages]
-      properties:
-        max_messages: { type: integer, minimum: 1, maximum: 32 }
-    AgentMessageListQueryResponse:
-      type: object
-      required: [protocol_version, request_id, messages, retry_after_ms]
-      properties:
-        protocol_version: { const: 1 }
-        request_id: { $ref: '#/components/schemas/Id' }
-        messages:
-          type: array
-          maxItems: 32
-          items: { type: object, additionalProperties: true }
-        retry_after_ms: { $ref: '#/components/schemas/DecimalU64' }
     AgentJobReportCreatePayload:
       type: object
+      additionalProperties: false
       required: [tenant_id, report]
       properties:
         tenant_id: { $ref: '#/components/schemas/Id' }
         report:
-          $ref: '../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json'
+          allOf:
+            - $ref: '../../crates/neoengram-domain/schemas/current/action-envelope.schema.json'
+            - type: object
+              description: >-
+                Job reports are sent only on an established Agent session, so the shared Envelope
+                must carry the same positive session generation as the authenticated outer request.
+              required: [session_generation]
     AgentMetadataBatchStagePayload:
       type: object
+      additionalProperties: false
       required: [tenant_id, job_id, descriptor]
       properties:
         tenant_id: { $ref: '#/components/schemas/Id' }
         job_id: { $ref: '#/components/schemas/Id' }
-        descriptor: { type: object, additionalProperties: true }
+        descriptor:
+          $ref: '#/components/schemas/AgentMetadataBatchDescriptor'
     AgentMetadataPageStagePayload:
       type: object
+      additionalProperties: false
       required: [tenant_id, job_id, page]
       properties:
         tenant_id: { $ref: '#/components/schemas/Id' }
         job_id: { $ref: '#/components/schemas/Id' }
-        page: { type: object, additionalProperties: true }
+        page:
+          $ref: '#/components/schemas/AgentMetadataBatchPage'
     AgentIndexPageQueryPayload:
       type: object
+      additionalProperties: false
       required: [tenant_id, job_id, artifact_id, index_version, page_number, max_records]
       oneOf:
         - required: [playground_id]
+          properties:
+            playground_id: { $ref: '#/components/schemas/Id' }
         - required: [snapshot_id]
+          properties:
+            snapshot_id: { $ref: '#/components/schemas/Id' }
       properties:
         tenant_id: { $ref: '#/components/schemas/Id' }
         job_id: { $ref: '#/components/schemas/Id' }
         artifact_id: { $ref: '#/components/schemas/Id' }
         playground_id: { $ref: '#/components/schemas/Id' }
         snapshot_id: { $ref: '#/components/schemas/Id' }
-        index_version: { type: object, additionalProperties: true }
+        index_version:
+          $ref: '#/components/schemas/AgentWireIndexVersion'
         page_number: { type: integer, minimum: 0 }
         max_records: { type: integer, minimum: 1, maximum: 4096 }
     AgentIndexPageQueryResponse:
       type: object
-      required: [protocol_version, request_id, index_version, page_number, page_count, records]
+      additionalProperties: false
+      required: [wire_version, request_id, index_version, page_number, page_count, records]
       properties:
-        protocol_version: { const: 1 }
+        wire_version: { const: 1 }
         request_id: { $ref: '#/components/schemas/Id' }
-        index_version: { type: object, additionalProperties: true }
+        index_version:
+          $ref: '#/components/schemas/AgentWireIndexVersion'
         page_number: { type: integer, minimum: 0 }
         page_count: { type: integer, minimum: 0 }
-        records: { type: array, maxItems: 4096, items: { type: object } }
+        records:
+          type: array
+          maxItems: 4096
+          items:
+            $ref: '#/components/schemas/AgentIndexRecord'
+    AgentIndexRecord:
+      type: object
+      additionalProperties: false
+      required: [path, manifest_id, total_size, chunk_count]
+      properties:
+        path:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        manifest_id:
+          $ref: '#/components/schemas/Digest'
+        total_size:
+          $ref: '#/components/schemas/DecimalU64'
+        chunk_count:
+          $ref: '#/components/schemas/DecimalU64'
     WireChunkingStrategy:
-      $ref: '../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json#/$defs/WireChunkingStrategy'
+      $ref: '../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json#/$defs/WireChunkingStrategy'
     WireChunkRef:
-      $ref: '../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json#/$defs/WireChunkRef'
+      $ref: '#/components/schemas/AgentWireChunkRef'
     AgentManifestPageQueryPayload:
       type: object
+      additionalProperties: false
       required: [tenant_id, job_id, artifact_id, manifest_id, page_number, max_chunks]
       properties:
         tenant_id: { $ref: '#/components/schemas/Id' }
@@ -835,9 +913,10 @@ components:
         max_chunks: { type: integer, minimum: 1, maximum: 4096 }
     AgentManifestPageQueryResponse:
       type: object
-      required: [protocol_version, request_id, manifest_id, total_size, chunking, page_number, page_count, chunks]
+      additionalProperties: false
+      required: [wire_version, request_id, manifest_id, total_size, chunking, page_number, page_count, chunks]
       properties:
-        protocol_version: { const: 1 }
+        wire_version: { const: 1 }
         request_id: { $ref: '#/components/schemas/Id' }
         manifest_id: { $ref: '#/components/schemas/Digest' }
         total_size: { $ref: '#/components/schemas/DecimalU64' }
@@ -847,48 +926,220 @@ components:
         chunks: { type: array, maxItems: 4096, items: { $ref: '#/components/schemas/WireChunkRef' } }
     AgentSessionClosePayload:
       type: object
+      additionalProperties: false
       required: [expected_resource_version]
       properties:
         expected_resource_version: { $ref: '#/components/schemas/DecimalU64' }
     AgentSessionCloseResponse:
       type: object
-      required: [protocol_version, request_id, resource_version, closed_at_unix_ms]
+      additionalProperties: false
+      required: [wire_version, request_id, resource_version, closed_at_unix_ms]
       properties:
-        protocol_version: { const: 1 }
+        wire_version: { const: 1 }
         request_id: { $ref: '#/components/schemas/Id' }
         resource_version: { $ref: '#/components/schemas/DecimalU64' }
         closed_at_unix_ms: { $ref: '#/components/schemas/DecimalU64' }
     AgentActionAcceptedResponse:
       type: object
-      required: [protocol_version, request_id, resource_version, replayed]
+      additionalProperties: false
+      required: [wire_version, request_id, resource_version, replayed]
       properties:
-        protocol_version: { const: 1 }
+        wire_version: { const: 1 }
         request_id: { $ref: '#/components/schemas/Id' }
         resource_version: { $ref: '#/components/schemas/DecimalU64' }
         replayed: { type: boolean }
     AgentMetadataStageResponse:
       type: object
-      required: [protocol_version, request_id, batch_id, complete, replayed]
+      additionalProperties: false
+      required: [wire_version, request_id, batch_id, complete, replayed]
       properties:
-        protocol_version: { const: 1 }
+        wire_version: { const: 1 }
         request_id: { $ref: '#/components/schemas/Id' }
         batch_id: { $ref: '#/components/schemas/Id' }
         complete: { type: boolean }
         replayed: { type: boolean }
+    AgentHeartbeat:
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/control-envelope.schema.json#/$defs/AgentHeartbeat'
+        - type: object
+          additionalProperties: false
+          properties:
+            acknowledged_resource_version: {}
+            agent_id: {}
+            mount_observations: {}
+            observed_at_unix_ms: {}
+            running_jobs: {}
+            sequence: {}
+      unevaluatedProperties: false
+    AgentMountStatusReport:
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/agent-enrollment.schema.json#/$defs/AgentMountStatusReport'
+        - type: object
+          additionalProperties: false
+          properties:
+            access_mode: {}
+            agent_id: {}
+            agent_mount_id: {}
+            boot_id: {}
+            health: {}
+            installation_id: {}
+            mount_generation: {}
+            mount_identity_digest: {}
+            observed_at_unix_ms: {}
+            observed_volume_marker: {}
+            owner_generation: {}
+            sequence: {}
+            session_generation: {}
+            storage_volume_id: {}
+      unevaluatedProperties: false
+    AgentWireChunkRef:
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json#/$defs/WireChunkRef'
+        - type: object
+          additionalProperties: false
+          properties:
+            object_id: {}
+            offset: {}
+            size: {}
+      unevaluatedProperties: false
+    AgentMetadataBatchDescriptor:
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/control-envelope.schema.json#/$defs/MetadataBatchDescriptor'
+        - type: object
+          additionalProperties: false
+          properties:
+            batch_digest: {}
+            batch_id: {}
+            encoded_bytes: {}
+            kind: {}
+            page_count: {}
+            pages: {}
+            record_count: {}
+            schema_version: {}
+            scope: {}
+      unevaluatedProperties: false
+    AgentMetadataBatchPage:
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json#/$defs/MetadataBatchPage'
+        - type: object
+          additionalProperties: false
+          properties:
+            batch_id: {}
+            batch_digest: {}
+            kind: {}
+            page_count: {}
+            page_digest: {}
+            page_number: {}
+            records: {}
+            record_count: {}
+            schema_version: {}
+            scope: {}
+      unevaluatedProperties: false
+    AgentWireIndexVersion:
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json#/$defs/WireIndexVersion'
+        - type: object
+          additionalProperties: false
+          properties:
+            digest: {}
+            revision: {}
+      unevaluatedProperties: false
     AgentBootstrapRequest:
-      type: object
-      description: AgentBootstrapRequest from neoengram-protocol enrollment v1.
-      additionalProperties: true
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/agent-enrollment.schema.json#/$defs/AgentBootstrapRequest'
+        - type: object
+          additionalProperties: false
+          properties:
+            agent_version: {}
+            bootstrap_request_id: {}
+            bootstrap_token: {}
+            capabilities: {}
+            edge_cluster_id: {}
+            installation_id: {}
+            probe:
+              $ref: '#/components/schemas/AgentBootstrapProbe'
+            proof:
+              $ref: '#/components/schemas/AgentBootstrapProof'
+            public_key_fingerprint: {}
+            storage_volume_id: {}
+            tenant_id: {}
+            volume_descriptor_digest: {}
+            wire_version: {}
+      unevaluatedProperties: false
     AgentBootstrapStatusRequest:
-      type: object
-      description: AgentBootstrapStatusRequest from neoengram-protocol enrollment v1.
-      additionalProperties: true
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/agent-enrollment.schema.json#/$defs/AgentBootstrapStatusRequest'
+        - type: object
+          additionalProperties: false
+          properties:
+            bootstrap_request_id: {}
+            installation_id: {}
+            proof: {}
+            signed_at_unix_ms: {}
+            tenant_id: {}
+            wire_version: {}
+      unevaluatedProperties: false
+    AgentBootstrapStatusResponse:
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/agent-enrollment.schema.json#/$defs/AgentBootstrapStatusResponse'
+        - type: object
+          additionalProperties: false
+          properties:
+            agent_id: {}
+            bootstrap_request_id: {}
+            certificate: {}
+            enrollment_id: {}
+            installation_id: {}
+            resource_version: {}
+            state: {}
+            updated_at_unix_ms: {}
+            wire_version: {}
+      unevaluatedProperties: false
     AgentBootstrapAccepted:
-      type: object
-      description: AgentBootstrapAccepted from neoengram-protocol enrollment v1.
-      additionalProperties: true
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/agent-enrollment.schema.json#/$defs/AgentBootstrapAccepted'
+        - type: object
+          additionalProperties: false
+          properties:
+            agent_id: {}
+            agent_mount_id: {}
+            bootstrap_request_id: {}
+            enrollment_id: {}
+            mount_generation: {}
+            replayed: {}
+            resource_version: {}
+            review_expires_at_unix_ms: {}
+            state: {}
+      unevaluatedProperties: false
+    AgentBootstrapProbe:
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/agent-enrollment.schema.json#/$defs/AgentBootstrapProbe'
+        - type: object
+          additionalProperties: false
+          properties:
+            access_mode: {}
+            fsync_supported: {}
+            health: {}
+            marker_matches: {}
+            mount_boundary_detected: {}
+            mount_identity_digest: {}
+            observed_at_unix_ms: {}
+            observed_volume_marker: {}
+            rename_supported: {}
+      unevaluatedProperties: false
+    AgentBootstrapProof:
+      allOf:
+        - $ref: '../../crates/neoengram-domain/schemas/current/agent-enrollment.schema.json#/$defs/AgentBootstrapProof'
+        - type: object
+          additionalProperties: false
+          properties:
+            algorithm: {}
+            public_key_spki: {}
+            signature: {}
+      unevaluatedProperties: false
     Problem:
       type: object
+      additionalProperties: false
       required: [type, title, status, detail, instance, code, request_id, retryable]
       properties:
         type: { type: string }

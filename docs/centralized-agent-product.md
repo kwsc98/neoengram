@@ -3,11 +3,11 @@
 > 状态：基于 2026-08-03 OpenAPI v1 收敛 P0 产品口径，并于 2026-08-09 纳入 Synapse Gateway
 > 目标拓扑；公开契约是 P0 Web 的权威边界。
 >
-> 适用对象：产品、设计、前端、OpenAPI、`neoengramd`、Agent 和测试团队。
+> 适用对象：产品、设计、前端、OpenAPI、`neoengram-central`、Agent 和测试团队。
 >
-> 能力声明：本文描述目标产品和已经验证的交互语义。当前真正可运行的是本地 Standalone、SQLite
-> authority 和已注册的用户 HTTP/OIDC/RBAC 纵切；Agent 直连 Server 的 enrollment/session/Job
-> transport 是已验证的迁移前基线。G1 已加入 Gateway Registry/管理面、H2/mTLS 控制面、命令签名和一跳
+> 能力声明：本文描述目标产品和已经验证的交互语义。当前真正可运行的是本地 CLI、SQLite
+> authority、Gateway Registry/管理面和已注册的用户 HTTP/OIDC/RBAC 纵切；Agent 的
+> enrollment/session/Job transport 固定经 Gateway action 路由。G1 已加入 H2/mTLS 控制面、命令签名和一跳
 > forwarding；双 Replica 协议网络 harness 与 Registry RouteLease 接管契约已分别通过，但完整业务 E2E、
 > 外部生产凭据适配、真实集群故障/就绪与切换验收、完整 NFS 认证、跨 Volume 对象复制和分布式调度尚未实现。
 
@@ -170,8 +170,8 @@ flowchart TB
 StorageVolume 上 tenant/artifact 隔离的 CAS；业务 Pod 直接访问本区域 StorageVolume 上的 Playground
 或 Snapshot。Gateway Registry、管理面、Replica activation、H2/mTLS、命令签名和一跳 forwarding 已进入
 G1；双 Replica listener/H2/peer harness 和真实 Registry RouteLease 接管契约已分别通过，但完整业务
-E2E、外部生产 issuer/KMS-HSM、真实集群故障/就绪与切换尚未完成，控制面仍按失败关闭策略运行；Agent
-直连 Server 只作为迁移前基线。后续跨
+E2E、外部生产 issuer/KMS-HSM、真实集群故障/就绪与切换尚未完成，控制面仍按失败关闭策略运行；旧
+Agent 直连 Server 已删除。后续跨
 区域复制固定经源 Agent -> 源 Gateway -> 目标 Gateway -> 目标 Agent，不得经过中心 API 代理 payload。
 
 ## 3. 用户与角色

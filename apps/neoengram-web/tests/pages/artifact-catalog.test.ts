@@ -44,6 +44,7 @@ const artifact = {
   initialization: { mode: 'empty' as const },
   head_commit_id: headCommitId,
   resource_version: '3',
+  lifecycle: { state: 'active' as const, generation: '1' },
   created_at_unix_ms: '1',
   updated_at_unix_ms: '2',
 };
@@ -56,11 +57,11 @@ async function mountPage(
 ) {
   api.queryApiVersion.mockResolvedValue({
     data: {
-      service: 'neoengram-server',
+      service: 'neoengram-central',
       version: '0.2.0',
       git_commit: 'test',
-      api_versions: [1],
-      agent_protocol_versions: [1],
+      api_version: 1,
+      agent_wire_version: 1,
       capabilities,
     },
     requestId: 'request-version',
@@ -85,12 +86,14 @@ async function mountPage(
                 parent_commit_id: historicalCommitId,
                 message: 'Current head',
                 tag_names: [],
+                data_layout: 'fast_cdc',
                 created_at_unix_ms: '2',
               },
               {
                 commit_id: historicalCommitId,
                 message: 'Historical baseline',
                 tag_names: [],
+                data_layout: 'fast_cdc',
                 created_at_unix_ms: '1',
               },
             ]
@@ -214,11 +217,11 @@ describe('Artifact catalog detail', () => {
     queryClient.clear();
   });
 
-  it('keeps non-empty Playground derivation available to the full resource browser', async () => {
+  it('keeps non-empty Playground derivation available with explicit capabilities', async () => {
     const { queryClient, wrapper } = await mountPage(
       '/tenants/tenant-a/projects/project-a/artifacts/artifact-a',
       artifact,
-      ['resource_browser'],
+      ['artifact_catalog', 'artifact_commit_graph', 'playground_materialize'],
     );
 
     expect(wrapper.findAll('button').some((button) => button.text() === '创建 Playground')).toBe(
@@ -347,6 +350,7 @@ describe('Artifact catalog detail', () => {
           parent_commit_id: historicalCommitId,
           message: 'Commit 2',
           tag_names: ['default-line'],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: '4',
         },
         {
@@ -354,6 +358,7 @@ describe('Artifact catalog detail', () => {
           parent_commit_id: historicalCommitId,
           message: 'Commit 2.2',
           tag_names: ['experiment'],
+          data_layout: 'whole_file',
           created_at_unix_ms: '3',
         },
         {
@@ -361,12 +366,14 @@ describe('Artifact catalog detail', () => {
           parent_commit_id: rootCommitId,
           message: 'Commit 1',
           tag_names: [],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: '2',
         },
         {
           commit_id: rootCommitId,
           message: 'Root commit',
           tag_names: [],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: '1',
         },
       ],
@@ -439,6 +446,7 @@ describe('Artifact catalog detail', () => {
           commit_id: headCommitId,
           message: 'Artifact A head',
           tag_names: [],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: '2',
         },
       ],
@@ -466,6 +474,7 @@ describe('Artifact catalog detail', () => {
                     commit_id: artifactBCommitId,
                     message: 'Artifact B head',
                     tag_names: [],
+                    data_layout: 'whole_file',
                     created_at_unix_ms: '3',
                   },
                 ],
@@ -494,6 +503,7 @@ describe('Artifact catalog detail', () => {
               commit_id: staleCommitId,
               message: 'Stale Artifact A history',
               tag_names: [],
+              data_layout: 'fast_cdc',
               created_at_unix_ms: '1',
             },
           ],

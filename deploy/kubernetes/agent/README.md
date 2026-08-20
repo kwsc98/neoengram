@@ -21,13 +21,13 @@ PVC; the Agent stores each Chunk at
 `/volume/.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects/<object_id>`. The center stores Manifests,
 Index state, and placement evidence, but never receives or persists Chunk payloads.
 
-The repository contains the runnable `neoengram-agent` binary in the `neoengram-agentd` package. The Agent
+The repository contains the runnable `neoengram-agent` binary in the `neoengram-agent` package. The Agent
 initiates the control connection to its configured GatewayPool with the independent OpenAPI action
 `POST /agent/session/channel/open`, then keeps an HTTP/2 full-duplex NDJSON stream open so Central can
 logically invoke the Agent through the Gateway by pushing Assignment and Decision frames downstream.
 Heartbeat and Job reports flow upstream on the same channel. Bootstrap, MetadataBatch pages, and Index pages remain separate
 action-style POST operations under `/agent/*`; there is no center-facing missing-object or object-upload
-operation. The legacy message-list poll is compatibility and manual-recovery only. Approved Ed25519 keys
+operation. Approved Ed25519 keys
 authenticate every upstream frame or unary request, and the bootstrap token never becomes a session
 credential. The configured `trust_bundle_file` is the exclusive server-auth trust root for both unary and
 streaming Gateway requests; system roots are not used by the production construction path. Agent workload

@@ -21,7 +21,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as ConnectionBuilder,
 };
-use neoengram_protocol::{ContentDigest, UnixMillis};
+use neoengram_domain::protocol::{ContentDigest, UnixMillis};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -38,7 +38,11 @@ use x509_parser::{
 };
 
 mod bootstrap;
+mod central_http;
 mod peer;
+mod public_listener;
+mod s3_backend;
+mod s3_read_channel;
 mod transport_config;
 mod tunnel;
 
@@ -56,7 +60,16 @@ use tunnel::{
 const DEFAULT_AGENT_LISTEN: &str = "0.0.0.0:8081";
 const DEFAULT_CONTROL_LISTEN: &str = "0.0.0.0:8082";
 const DEFAULT_PEER_LISTEN: &str = "0.0.0.0:8083";
-const MAX_CONFIGURED_REQUEST_BYTES: usize = neoengram_protocol::MAX_GATEWAY_OPAQUE_PAYLOAD_BYTES;
+const DEFAULT_CONSOLE_HOST: &str = "localhost";
+// Local development uses path-style S3 against the Gateway's loopback public listener. Production
+// deployments override this with their DNS name (or a literal IP) through SYNAPSE_GATEWAY_S3_HOST.
+const DEFAULT_S3_HOST: &str = "127.0.0.1";
+const DEFAULT_WEB_ROOT: &str = "apps/neoengram-web/dist";
+const DEFAULT_CENTRAL_UPSTREAM: &str = "http://127.0.0.1:8080";
+const DEFAULT_PUBLIC_MAX_STREAMS: usize = 128;
+const MAX_PUBLIC_STREAMS: usize = 16_384;
+const MAX_CONFIGURED_REQUEST_BYTES: usize =
+    neoengram_domain::protocol::MAX_GATEWAY_OPAQUE_PAYLOAD_BYTES;
 const MAX_CONFIGURED_DEADLINE_MILLIS: u64 = 300_000;
 const MAX_PRE_STOP_DRAIN_SECONDS: u64 = 300;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -93,6 +106,50 @@ struct GatewayConfig {
         default_value = DEFAULT_PEER_LISTEN
     )]
     peer_listen: SocketAddr,
+    /// Optional browser/S3 listener. Existing workload-only deployments remain unchanged until
+    /// this address is configured explicitly.
+    #[arg(long, env = "SYNAPSE_GATEWAY_PUBLIC_LISTEN")]
+    public_listen: Option<SocketAddr>,
+    /// Public TLS certificate for browser/S3 clients.  Workload mTLS files above are separate.
+    #[arg(long, env = "SYNAPSE_GATEWAY_PUBLIC_TLS_CERTIFICATE_FILE")]
+    public_tls_certificate_file: Option<std::path::PathBuf>,
+    /// Public TLS private key matching `public_tls_certificate_file`.
+    #[arg(
+        long,
+        env = "SYNAPSE_GATEWAY_PUBLIC_TLS_PRIVATE_KEY_FILE",
+        hide_env_values = true
+    )]
+    public_tls_private_key_file: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        env = "SYNAPSE_GATEWAY_CONSOLE_HOST",
+        default_value = DEFAULT_CONSOLE_HOST
+    )]
+    console_host: String,
+    #[arg(
+        long,
+        env = "SYNAPSE_GATEWAY_S3_HOST",
+        default_value = DEFAULT_S3_HOST
+    )]
+    s3_host: String,
+    #[arg(
+        long,
+        env = "SYNAPSE_GATEWAY_WEB_ROOT",
+        default_value = DEFAULT_WEB_ROOT
+    )]
+    web_root: std::path::PathBuf,
+    #[arg(
+        long,
+        env = "SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM",
+        default_value = DEFAULT_CENTRAL_UPSTREAM
+    )]
+    central_upstream: url::Url,
+    #[arg(
+        long,
+        env = "SYNAPSE_GATEWAY_S3_MAX_STREAMS",
+        default_value_t = DEFAULT_PUBLIC_MAX_STREAMS
+    )]
+    s3_max_streams: usize,
     #[arg(
         long,
         env = "SYNAPSE_GATEWAY_MAX_CONNECTIONS_PER_LISTENER",
@@ -143,17 +200,95 @@ struct GatewayConfig {
 
 impl GatewayConfig {
     fn validate(&self) -> Result<(), String> {
-        neoengram_protocol::EdgeClusterId::new(&self.edge_cluster_id)
+        neoengram_domain::protocol::EdgeClusterId::new(&self.edge_cluster_id)
             .map_err(|error| format!("SYNAPSE_GATEWAY_EDGE_CLUSTER_ID is invalid: {error}"))?;
-        neoengram_protocol::GatewayPoolId::new(&self.gateway_pool_id)
+        neoengram_domain::protocol::GatewayPoolId::new(&self.gateway_pool_id)
             .map_err(|error| format!("SYNAPSE_GATEWAY_POOL_ID is invalid: {error}"))?;
-        neoengram_protocol::GatewayReplicaId::new(&self.gateway_replica_id)
+        neoengram_domain::protocol::GatewayReplicaId::new(&self.gateway_replica_id)
             .map_err(|error| format!("SYNAPSE_GATEWAY_REPLICA_ID is invalid: {error}"))?;
         if self.agent_listen == self.control_listen
             || self.agent_listen == self.peer_listen
             || self.control_listen == self.peer_listen
+            || self.public_listen.is_some_and(|public| {
+                [self.agent_listen, self.control_listen, self.peer_listen].contains(&public)
+            })
         {
-            return Err("agent, control, and peer listeners must use distinct addresses".into());
+            return Err("Gateway listeners must use distinct addresses".into());
+        }
+        let console_host = public_listener::normalize_configured_host(&self.console_host)
+            .ok_or_else(|| "console_host must be a valid hostname without a port".to_owned())?;
+        let s3_host = public_listener::normalize_configured_host(&self.s3_host)
+            .ok_or_else(|| "s3_host must be a valid hostname without a port".to_owned())?;
+        if console_host == s3_host {
+            return Err("console_host and s3_host must be distinct non-empty hostnames".into());
+        }
+        if self.s3_max_streams == 0 || self.s3_max_streams > MAX_PUBLIC_STREAMS {
+            return Err(format!(
+                "s3_max_streams must be in 1..={MAX_PUBLIC_STREAMS}"
+            ));
+        }
+        match (
+            &self.public_tls_certificate_file,
+            &self.public_tls_private_key_file,
+        ) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => {
+                return Err(
+                    "public TLS certificate and private key files must be configured together"
+                        .into(),
+                )
+            }
+        }
+        if self.public_listen.is_none()
+            && (self.public_tls_certificate_file.is_some()
+                || self.public_tls_private_key_file.is_some())
+        {
+            return Err("public listener must be configured when public TLS is configured".into());
+        }
+        if self
+            .public_listen
+            .is_some_and(|address| !address.ip().is_loopback())
+            && self.public_tls_certificate_file.is_none()
+        {
+            return Err(
+                "exposed public listener requires public TLS certificate and private key".into(),
+            );
+        }
+        let workload_loopback = [self.agent_listen, self.control_listen, self.peer_listen]
+            .iter()
+            .all(|address| address.ip().is_loopback());
+        if let Some(public_listen) = self.public_listen {
+            if !matches!(self.central_upstream.scheme(), "http" | "https")
+                || self.central_upstream.host_str().is_none()
+                || !self.central_upstream.username().is_empty()
+                || self.central_upstream.password().is_some()
+                || (self.central_upstream.path() != "/" && !self.central_upstream.path().is_empty())
+                || self.central_upstream.query().is_some()
+                || self.central_upstream.fragment().is_some()
+            {
+                return Err(
+                    "central_upstream must be an origin-form http(s) URL without credentials or a path"
+                        .into(),
+                );
+            }
+            if self.central_upstream.scheme() == "http"
+                && (!workload_loopback || !public_listen.ip().is_loopback())
+            {
+                return Err(
+                    "plain HTTP Central upstream is permitted only for loopback-only development"
+                        .into(),
+                );
+            }
+            if self.central_upstream.scheme() == "https"
+                && (self.transport.tls_certificate_file.is_none()
+                    || self.transport.tls_private_key_file.is_none()
+                    || self.transport.tls_client_ca_file.is_none())
+            {
+                return Err(
+                    "HTTPS Central upstream requires the Gateway workload certificate, key, and client CA"
+                        .into(),
+                );
+            }
         }
         if self.max_connections_per_listener == 0 {
             return Err("max_connections_per_listener must be positive".into());
@@ -192,7 +327,11 @@ impl GatewayConfig {
         let bootstrap_is_configured = self.bootstrap.private_key_file.is_some()
             || self.bootstrap.activation_token_file.is_some()
             || self.bootstrap.certificate_chain_file.is_some();
+        // Local development may complete the one-time bootstrap over loopback HTTP. Exposed
+        // deployments still require a server-authenticated TLS bootstrap channel.
+        let loopback_bootstrap = bootstrap_is_configured && workload_loopback;
         if bootstrap_is_configured
+            && !loopback_bootstrap
             && (self.transport.tls_certificate_file.is_none()
                 || self.transport.tls_private_key_file.is_none())
         {
@@ -245,9 +384,10 @@ impl ListenerRole {
 #[derive(Clone)]
 struct ListenerState {
     role: ListenerRole,
-    edge_cluster_id: neoengram_protocol::EdgeClusterId,
-    gateway_pool_id: neoengram_protocol::GatewayPoolId,
+    edge_cluster_id: neoengram_domain::protocol::EdgeClusterId,
+    gateway_pool_id: neoengram_domain::protocol::GatewayPoolId,
     tunnel: Arc<GatewayTunnel>,
+    s3_read_channels: Arc<s3_read_channel::S3ReadChannelRegistry>,
     request_admission: Arc<Semaphore>,
     max_request_bytes: usize,
     request_deadline: Duration,
@@ -259,7 +399,7 @@ struct ListenerState {
 
 #[derive(Clone, Default)]
 struct GatewayLifecycle {
-    draining: Arc<AtomicBool>,
+    pub(crate) draining: Arc<AtomicBool>,
 }
 
 impl GatewayLifecycle {
@@ -277,18 +417,18 @@ enum PeerAuth {
     /// No client certificate was presented on the optional Agent listener.
     Anonymous,
     /// A verified workload certificate identified an Agent in this EdgeCluster.
-    Agent(neoengram_protocol::AgentId),
+    Agent(neoengram_domain::protocol::AgentId),
     /// Loopback plaintext development transport. TLS identity checks do not apply here.
     Development,
     /// A verified Central workload certificate on the control listener.
     Central,
     /// A verified same-pool Gateway Replica identity from the peer mTLS URI SAN.
     #[allow(dead_code)]
-    GatewayReplica(neoengram_protocol::GatewayReplicaId),
+    GatewayReplica(neoengram_domain::protocol::GatewayReplicaId),
     /// The same identity plus the exact DER leaf observed during the TLS handshake. The
     /// fingerprint is checked against Central's short-lived peer directory before delivery.
     GatewayReplicaWithCertificate {
-        replica_id: neoengram_protocol::GatewayReplicaId,
+        replica_id: neoengram_domain::protocol::GatewayReplicaId,
         certificate_fingerprint: ContentDigest,
     },
 }
@@ -298,7 +438,7 @@ impl PeerAuth {
         !matches!(self, Self::Anonymous)
     }
 
-    fn agent_id(&self) -> Option<neoengram_protocol::AgentId> {
+    fn agent_id(&self) -> Option<neoengram_domain::protocol::AgentId> {
         match self {
             Self::Agent(agent_id) => Some(agent_id.clone()),
             Self::Anonymous
@@ -337,15 +477,28 @@ fn initialize_logging(filter: &str) -> Result<(), Box<dyn Error + Send + Sync>> 
 
 async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
     let identity = GatewayIdentity {
-        edge_cluster_id: neoengram_protocol::EdgeClusterId::new(&config.edge_cluster_id)?,
-        gateway_pool_id: neoengram_protocol::GatewayPoolId::new(&config.gateway_pool_id)?,
-        gateway_replica_id: neoengram_protocol::GatewayReplicaId::new(&config.gateway_replica_id)?,
+        edge_cluster_id: neoengram_domain::protocol::EdgeClusterId::new(&config.edge_cluster_id)?,
+        gateway_pool_id: neoengram_domain::protocol::GatewayPoolId::new(&config.gateway_pool_id)?,
+        gateway_replica_id: neoengram_domain::protocol::GatewayReplicaId::new(
+            &config.gateway_replica_id,
+        )?,
         software_version: env!("CARGO_PKG_VERSION").to_owned(),
     };
     if config.bootstrap.private_key_file.is_some() {
-        config
-            .transport
-            .validate_local_bootstrap_server_identity()?;
+        // The explicit loopback development profile may bootstrap over plaintext. Production
+        // bootstrap still validates the short-lived server-authenticated TLS certificate.
+        let loopback_only = [
+            config.agent_listen,
+            config.control_listen,
+            config.peer_listen,
+        ]
+        .iter()
+        .all(|address| address.ip().is_loopback());
+        if !loopback_only {
+            config
+                .transport
+                .validate_local_bootstrap_server_identity()?;
+        }
     } else {
         config.transport.validate_local_server_identity(
             identity.edge_cluster_id.as_str(),
@@ -362,6 +515,19 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
             config.peer_listen,
         ])?
         .map(|config| config.map(TlsAcceptor::from));
+    let public_tls = match (
+        config.public_tls_certificate_file.as_deref(),
+        config.public_tls_private_key_file.as_deref(),
+    ) {
+        (Some(certificate), Some(private_key)) => Some(TlsAcceptor::from(
+            transport_config::GatewayTransportConfig::load_public_server_config(
+                certificate,
+                private_key,
+            )?,
+        )),
+        (None, None) => None,
+        _ => unreachable!("public TLS pair was validated before startup"),
+    };
     let bootstrap = config.bootstrap.load(
         identity.clone(),
         config.workload_trust_domain.as_deref(),
@@ -378,14 +544,28 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
     .all(|address| address.ip().is_loopback());
     let peer_forwarder = Arc::new(H2PeerForwarder::new(
         identity.clone(),
-        peer_client_tls,
+        peer_client_tls.clone(),
         config.workload_trust_domain.clone().map(Arc::<str>::from),
         allow_loopback_http,
     ));
-    let tunnel = Arc::new(GatewayTunnel::with_peer_forwarder(identity, peer_forwarder));
+    let tunnel = Arc::new(GatewayTunnel::with_peer_forwarder(
+        identity,
+        peer_forwarder.clone(),
+    ));
+    let s3_read_channels = Arc::new(s3_read_channel::S3ReadChannelRegistry::with_peer_reader(
+        tunnel.clone(),
+        peer_forwarder,
+    ));
     let agent = TcpListener::bind(config.agent_listen).await?;
     let control = TcpListener::bind(config.control_listen).await?;
     let peer = TcpListener::bind(config.peer_listen).await?;
+    let public = match config.public_listen {
+        Some(address) => Some((
+            TcpListener::bind(address).await?,
+            address.ip().is_loopback(),
+        )),
+        None => None,
+    };
     let lifecycle = GatewayLifecycle::default();
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let mut listeners = JoinSet::new();
@@ -396,6 +576,7 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         ListenerRole::Agent,
         &config,
         tunnel.clone(),
+        s3_read_channels.clone(),
         bootstrap.clone(),
         agent_tls,
         lifecycle.clone(),
@@ -407,6 +588,7 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         ListenerRole::Control,
         &config,
         tunnel.clone(),
+        s3_read_channels.clone(),
         bootstrap.clone(),
         control_tls,
         lifecycle.clone(),
@@ -418,11 +600,50 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         ListenerRole::Peer,
         &config,
         tunnel.clone(),
+        s3_read_channels.clone(),
         bootstrap,
         peer_server_tls,
         lifecycle.clone(),
-        shutdown_receiver,
+        shutdown_receiver.clone(),
     );
+    if let Some((public, allow_loopback_hosts)) = public {
+        let central_client = central_http::CentralHttpClient::new(peer_client_tls.clone())
+            .map_err(std::io::Error::other)?;
+        let s3_backend = Arc::new(
+            s3_backend::CentralS3Backend::new_with_client(
+                config.gateway_pool_id.clone(),
+                &config.central_upstream,
+                central_client.clone(),
+            )
+            .map_err(std::io::Error::other)?
+            .with_object_reader(s3_read_channels),
+        );
+        public_listener::spawn_listener(
+            &mut listeners,
+            public,
+            public_tls,
+            public_listener::PublicListenerState::new(
+                public_listener::PublicListenerConfig::new(
+                    config.console_host.clone(),
+                    config.s3_host.clone(),
+                    config.web_root.clone(),
+                    Some(config.central_upstream.clone()),
+                    config.s3_max_streams,
+                    allow_loopback_hosts,
+                ),
+                public_listener::PublicListenerLimits::new(
+                    config.max_connections_per_listener,
+                    config.max_in_flight_requests_per_listener,
+                    config.max_request_bytes,
+                    Duration::from_millis(config.request_deadline_millis),
+                ),
+                lifecycle.draining.clone(),
+            )
+            .with_s3_backend(s3_backend)
+            .with_central_client(central_client),
+            shutdown_receiver,
+        );
+    }
 
     let drain_duration = config
         .pre_stop_drain_duration()
@@ -457,6 +678,7 @@ fn spawn_listener(
     role: ListenerRole,
     config: &GatewayConfig,
     tunnel: Arc<GatewayTunnel>,
+    s3_read_channels: Arc<s3_read_channel::S3ReadChannelRegistry>,
     bootstrap: Option<Arc<GatewayBootstrap>>,
     tls_acceptor: Option<TlsAcceptor>,
     lifecycle: GatewayLifecycle,
@@ -464,11 +686,12 @@ fn spawn_listener(
 ) {
     let state = ListenerState {
         role,
-        edge_cluster_id: neoengram_protocol::EdgeClusterId::new(&config.edge_cluster_id)
+        edge_cluster_id: neoengram_domain::protocol::EdgeClusterId::new(&config.edge_cluster_id)
             .expect("GatewayConfig was validated before listener construction"),
-        gateway_pool_id: neoengram_protocol::GatewayPoolId::new(&config.gateway_pool_id)
+        gateway_pool_id: neoengram_domain::protocol::GatewayPoolId::new(&config.gateway_pool_id)
             .expect("GatewayConfig was validated before listener construction"),
         tunnel,
+        s3_read_channels,
         request_admission: Arc::new(Semaphore::new(config.max_in_flight_requests_per_listener)),
         max_request_bytes: config.max_request_bytes,
         request_deadline: Duration::from_millis(config.request_deadline_millis),
@@ -597,8 +820,18 @@ async fn serve_http_connection<I>(
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let service =
-        service_fn(move |request| handle_request(request, state.clone(), peer_auth.clone()));
+    let service = service_fn(move |request| {
+        let request_id = request.headers().get("x-request-id").cloned();
+        let state = state.clone();
+        let peer_auth = peer_auth.clone();
+        async move {
+            let mut response = handle_request(request, state, peer_auth).await?;
+            if let Some(request_id) = request_id {
+                response.headers_mut().insert("x-request-id", request_id);
+            }
+            Ok::<_, Infallible>(response)
+        }
+    });
     let mut builder = ConnectionBuilder::new(TokioExecutor::new());
     builder
         .http2()
@@ -783,9 +1016,55 @@ where
             ));
         }
     };
+    if matches!(state.role, ListenerRole::Agent)
+        && request.uri().path() == neoengram_domain::protocol::S3_READ_CHANNEL_PATH
+    {
+        let mut response = state
+            .s3_read_channels
+            .open_channel(request, peer_auth.agent_id())
+            .await;
+        if let Either::Right(body) = response.body_mut() {
+            body.retain_request_permit(permit);
+        } else {
+            drop(permit);
+        }
+        return Ok(response);
+    }
+    if matches!(state.role, ListenerRole::Peer)
+        && request.uri().path() == neoengram_domain::protocol::S3_READ_PEER_PATH
+    {
+        let (source_replica_id, certificate_fingerprint) = match &peer_auth {
+            PeerAuth::GatewayReplica(replica_id) => (Some(replica_id.clone()), None),
+            PeerAuth::GatewayReplicaWithCertificate {
+                replica_id,
+                certificate_fingerprint,
+            } => (Some(replica_id.clone()), Some(*certificate_fingerprint)),
+            PeerAuth::Development => (
+                request
+                    .headers()
+                    .get("x-synapse-source-replica")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| {
+                        neoengram_domain::protocol::GatewayReplicaId::new(value).ok()
+                    }),
+                None,
+            ),
+            _ => (None, None),
+        };
+        let mut response = state
+            .s3_read_channels
+            .open_peer_stream(request, source_replica_id, certificate_fingerprint)
+            .await;
+        if let Either::Right(body) = response.body_mut() {
+            body.retain_request_permit(permit);
+        } else {
+            drop(permit);
+        }
+        return Ok(response);
+    }
     let result = match state.role {
         ListenerRole::Control
-            if request.uri().path() == neoengram_protocol::GATEWAY_CONTROL_CHANNEL_PATH =>
+            if request.uri().path() == neoengram_domain::protocol::GATEWAY_CONTROL_CHANNEL_PATH =>
         {
             state.tunnel.open_control(request).await
         }
@@ -805,7 +1084,7 @@ where
                 .await
         }
         ListenerRole::Peer
-            if request.uri().path() == neoengram_protocol::GATEWAY_PEER_FORWARD_PATH =>
+            if request.uri().path() == neoengram_domain::protocol::GATEWAY_PEER_FORWARD_PATH =>
         {
             let response = handle_peer_forward(request, &state, &peer_auth).await;
             drop(permit);
@@ -883,7 +1162,7 @@ where
         }
         Ok(Ok(body)) => body,
     };
-    let frame = match neoengram_protocol::GatewayControlFrame::decode_json(&body) {
+    let frame = match neoengram_domain::protocol::GatewayControlFrame::decode_json(&body) {
         Ok(frame) => frame,
         Err(_) => {
             return problem_response(
@@ -931,30 +1210,32 @@ where
     .await
     {
         Ok(result) => result,
-        Err(_) => Err(neoengram_protocol::GatewayControlError {
-            code: neoengram_protocol::GatewayErrorCode::DeadlineExceeded,
+        Err(_) => Err(neoengram_domain::protocol::GatewayControlError {
+            code: neoengram_domain::protocol::GatewayErrorCode::DeadlineExceeded,
             detail: "owner Agent stream delivery exceeded the bounded deadline".to_owned(),
             retryable: false,
         }),
     };
     let message = match result {
-        Ok(accepted) => neoengram_protocol::GatewayControlMessage::PeerForwardAccepted(accepted),
-        Err(error) => neoengram_protocol::GatewayControlMessage::Error(error),
+        Ok(accepted) => {
+            neoengram_domain::protocol::GatewayControlMessage::PeerForwardAccepted(accepted)
+        }
+        Err(error) => neoengram_domain::protocol::GatewayControlMessage::Error(error),
     };
     let now = now_unix_ms();
-    let response_frame = neoengram_protocol::GatewayControlFrame {
-        protocol_version: neoengram_protocol::ProtocolVersion::V1,
+    let response_frame = neoengram_domain::protocol::GatewayControlFrame {
+        wire_version: neoengram_domain::protocol::CURRENT_WIRE_VERSION,
         gateway_pool_id: state.gateway_pool_id.clone(),
         gateway_replica_id: state.tunnel.identity().gateway_replica_id.clone(),
         connection_id,
-        sequence: neoengram_protocol::SequenceNumber::new(1),
+        sequence: neoengram_domain::protocol::SequenceNumber::new(1),
         request_id,
         trace_id: None,
         sent_at_unix_ms: now,
         deadline_unix_ms: UnixMillis::new(now.get().saturating_add(10_000)),
         hop_count: 1,
         message,
-        extensions: neoengram_protocol::Extensions::new(),
+        extensions: neoengram_domain::protocol::Extensions::new(),
     };
     match response_frame.encode_ndjson() {
         Ok(bytes) => json_response(
@@ -1145,9 +1426,9 @@ fn parse_workload_uri(
 
 fn parse_agent_workload_uri(
     value: &str,
-    expected_cluster: &neoengram_protocol::EdgeClusterId,
+    expected_cluster: &neoengram_domain::protocol::EdgeClusterId,
     expected_trust_domain: Option<&str>,
-) -> Result<neoengram_protocol::AgentId, String> {
+) -> Result<neoengram_domain::protocol::AgentId, String> {
     let segments = parse_workload_uri(value, expected_trust_domain)?;
     if segments.len() != 5
         || segments[0] != "workloads"
@@ -1157,7 +1438,7 @@ fn parse_agent_workload_uri(
     {
         return Err("Agent certificate URI SAN is outside this EdgeCluster".to_owned());
     }
-    neoengram_protocol::AgentId::new(&segments[4])
+    neoengram_domain::protocol::AgentId::new(&segments[4])
         .map_err(|_| "Agent certificate URI SAN contains an invalid AgentId".to_owned())
 }
 
@@ -1174,10 +1455,10 @@ fn parse_central_workload_uri(
 
 fn parse_gateway_replica_uri(
     value: &str,
-    expected_cluster: &neoengram_protocol::EdgeClusterId,
-    expected_pool: &neoengram_protocol::GatewayPoolId,
+    expected_cluster: &neoengram_domain::protocol::EdgeClusterId,
+    expected_pool: &neoengram_domain::protocol::GatewayPoolId,
     expected_trust_domain: Option<&str>,
-) -> Result<neoengram_protocol::GatewayReplicaId, String> {
+) -> Result<neoengram_domain::protocol::GatewayReplicaId, String> {
     let segments = parse_workload_uri(value, expected_trust_domain)?;
     if segments.len() != 7
         || segments[0] != "workloads"
@@ -1189,25 +1470,25 @@ fn parse_gateway_replica_uri(
     {
         return Err("Gateway peer certificate URI SAN is outside this GatewayPool".to_owned());
     }
-    neoengram_protocol::GatewayReplicaId::new(&segments[6])
+    neoengram_domain::protocol::GatewayReplicaId::new(&segments[6])
         .map_err(|_| "Gateway peer certificate URI SAN contains an invalid ReplicaId".to_owned())
 }
 
 fn anonymous_agent_path_allowed(path: &str) -> bool {
     matches!(
         path,
-        neoengram_protocol::AGENT_ENROLLMENT_BOOTSTRAP_PATH
-            | neoengram_protocol::AGENT_ENROLLMENT_STATUS_QUERY_PATH
-            | neoengram_protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH
-            | neoengram_protocol::GATEWAY_REPLICA_BOOTSTRAP_CERTIFICATE_PATH
+        neoengram_domain::protocol::AGENT_ENROLLMENT_BOOTSTRAP_PATH
+            | neoengram_domain::protocol::AGENT_ENROLLMENT_STATUS_QUERY_PATH
+            | neoengram_domain::protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH
+            | neoengram_domain::protocol::GATEWAY_REPLICA_BOOTSTRAP_CERTIFICATE_PATH
     )
 }
 
 fn is_gateway_bootstrap_path(path: &str) -> bool {
     matches!(
         path,
-        neoengram_protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH
-            | neoengram_protocol::GATEWAY_REPLICA_BOOTSTRAP_CERTIFICATE_PATH
+        neoengram_domain::protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH
+            | neoengram_domain::protocol::GATEWAY_REPLICA_BOOTSTRAP_CERTIFICATE_PATH
     )
 }
 
@@ -1281,7 +1562,7 @@ where
         }
         Ok(Ok(body)) => body,
     };
-    let result = if path == neoengram_protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH {
+    let result = if path == neoengram_domain::protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH {
         bootstrap.prove(&body).await.map(|proof| {
             json_response(
                 StatusCode::OK,
@@ -1500,19 +1781,22 @@ mod tests {
 
     fn test_tunnel() -> Arc<GatewayTunnel> {
         Arc::new(GatewayTunnel::new(GatewayIdentity {
-            edge_cluster_id: neoengram_protocol::EdgeClusterId::new("cluster-a").unwrap(),
-            gateway_pool_id: neoengram_protocol::GatewayPoolId::new("pool-a").unwrap(),
-            gateway_replica_id: neoengram_protocol::GatewayReplicaId::new("replica-a").unwrap(),
+            edge_cluster_id: neoengram_domain::protocol::EdgeClusterId::new("cluster-a").unwrap(),
+            gateway_pool_id: neoengram_domain::protocol::GatewayPoolId::new("pool-a").unwrap(),
+            gateway_replica_id: neoengram_domain::protocol::GatewayReplicaId::new("replica-a")
+                .unwrap(),
             software_version: "test".to_owned(),
         }))
     }
 
     fn state(role: ListenerRole, max_request_bytes: usize) -> ListenerState {
+        let tunnel = test_tunnel();
         ListenerState {
             role,
-            edge_cluster_id: neoengram_protocol::EdgeClusterId::new("cluster-a").unwrap(),
-            gateway_pool_id: neoengram_protocol::GatewayPoolId::new("pool-a").unwrap(),
-            tunnel: test_tunnel(),
+            edge_cluster_id: neoengram_domain::protocol::EdgeClusterId::new("cluster-a").unwrap(),
+            gateway_pool_id: neoengram_domain::protocol::GatewayPoolId::new("pool-a").unwrap(),
+            tunnel: tunnel.clone(),
+            s3_read_channels: Arc::new(s3_read_channel::S3ReadChannelRegistry::new(tunnel)),
             request_admission: Arc::new(Semaphore::new(1)),
             max_request_bytes,
             request_deadline: Duration::from_secs(1),
@@ -1538,11 +1822,35 @@ mod tests {
         config.agent_listen = "127.0.0.1:8081".parse().unwrap();
         config.control_listen = "127.0.0.1:8082".parse().unwrap();
         config.peer_listen = "127.0.0.1:8083".parse().unwrap();
+        assert!(config.public_listen.is_none());
         config.validate().unwrap();
+        config.public_listen = Some(config.agent_listen);
+        assert!(config.validate().is_err());
+        config.public_listen = None;
         config.peer_listen = config.agent_listen;
         assert!(config.validate().is_err());
         config.peer_listen = DEFAULT_PEER_LISTEN.parse().unwrap();
         config.max_request_bytes = MAX_CONFIGURED_REQUEST_BYTES + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn public_hostnames_are_compared_after_dns_normalization() {
+        let mut config = GatewayConfig::try_parse_from([
+            "synapse-gateway",
+            "--edge-cluster-id",
+            "cluster-a",
+            "--gateway-pool-id",
+            "pool-a",
+            "--gateway-replica-id",
+            "replica-a",
+        ])
+        .unwrap();
+        config.agent_listen = "127.0.0.1:8081".parse().unwrap();
+        config.control_listen = "127.0.0.1:8082".parse().unwrap();
+        config.peer_listen = "127.0.0.1:8083".parse().unwrap();
+        config.console_host = "Console.Example.Test".to_owned();
+        config.s3_host = "console.example.test.".to_owned();
         assert!(config.validate().is_err());
     }
 
@@ -1612,9 +1920,76 @@ mod tests {
     }
 
     #[test]
+    fn exposed_gateway_rejects_plain_central_upstream() {
+        let mut config = GatewayConfig::try_parse_from([
+            "synapse-gateway",
+            "--edge-cluster-id",
+            "cluster-a",
+            "--gateway-pool-id",
+            "pool-a",
+            "--gateway-replica-id",
+            "replica-a",
+        ])
+        .unwrap();
+        config.agent_listen = "0.0.0.0:8081".parse().unwrap();
+        config.control_listen = "0.0.0.0:8082".parse().unwrap();
+        config.peer_listen = "0.0.0.0:8083".parse().unwrap();
+        config.public_listen = Some("0.0.0.0:8080".parse().unwrap());
+        config.public_tls_certificate_file = Some("/public.crt".into());
+        config.public_tls_private_key_file = Some("/public.key".into());
+        config.transport.tls_certificate_file = Some("/listener.crt".into());
+        config.transport.tls_private_key_file = Some("/listener.key".into());
+        config.transport.tls_client_ca_file = Some("/workload-ca.crt".into());
+        config.workload_trust_domain = Some("mesh.example.test".to_owned());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn https_central_upstream_requires_workload_client_material() {
+        let mut config = GatewayConfig::try_parse_from([
+            "synapse-gateway",
+            "--edge-cluster-id",
+            "cluster-a",
+            "--gateway-pool-id",
+            "pool-a",
+            "--gateway-replica-id",
+            "replica-a",
+        ])
+        .unwrap();
+        config.public_listen = Some("127.0.0.1:8080".parse().unwrap());
+        config.central_upstream = "https://central.example.test:8080".parse().unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn workload_only_gateway_does_not_validate_unused_central_upstream() {
+        let mut config = GatewayConfig::try_parse_from([
+            "synapse-gateway",
+            "--edge-cluster-id",
+            "cluster-a",
+            "--gateway-pool-id",
+            "pool-a",
+            "--gateway-replica-id",
+            "replica-a",
+        ])
+        .unwrap();
+        config.agent_listen = "0.0.0.0:8081".parse().unwrap();
+        config.control_listen = "0.0.0.0:8082".parse().unwrap();
+        config.peer_listen = "0.0.0.0:8083".parse().unwrap();
+        config.transport.tls_certificate_file = Some("/listener.crt".into());
+        config.transport.tls_private_key_file = Some("/listener.key".into());
+        config.transport.tls_client_ca_file = Some("/workload-ca.crt".into());
+        config.workload_trust_domain = Some("mesh.example.test".to_owned());
+
+        assert!(config.public_listen.is_none());
+        assert_eq!(config.central_upstream.scheme(), "http");
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn workload_uri_identity_is_bound_to_trust_domain_cluster_and_role() {
-        let cluster = neoengram_protocol::EdgeClusterId::new("cluster-a").unwrap();
-        let pool = neoengram_protocol::GatewayPoolId::new("pool-a").unwrap();
+        let cluster = neoengram_domain::protocol::EdgeClusterId::new("cluster-a").unwrap();
+        let pool = neoengram_domain::protocol::GatewayPoolId::new("pool-a").unwrap();
         parse_central_workload_uri(
             "spiffe://mesh.example.test/workloads/central",
             Some("mesh.example.test"),
@@ -1836,7 +2211,7 @@ mod tests {
         let response = handle_request(
             Request::builder()
                 .method(Method::POST)
-                .uri(neoengram_protocol::GATEWAY_REPLICA_BOOTSTRAP_CERTIFICATE_PATH)
+                .uri(neoengram_domain::protocol::GATEWAY_REPLICA_BOOTSTRAP_CERTIFICATE_PATH)
                 .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
                 .body(Full::new(Bytes::from_static(b"{}")))
                 .unwrap(),
@@ -1853,7 +2228,7 @@ mod tests {
         let development = handle_request(
             Request::builder()
                 .method(Method::POST)
-                .uri(neoengram_protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH)
+                .uri(neoengram_domain::protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH)
                 .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
                 .body(Full::new(Bytes::from_static(b"{}")))
                 .unwrap(),
@@ -1888,7 +2263,7 @@ mod tests {
         let protocol = handle_request(
             Request::builder()
                 .method(Method::POST)
-                .uri(neoengram_protocol::AGENT_SESSION_OPEN_PATH)
+                .uri(neoengram_domain::protocol::AGENT_SESSION_OPEN_PATH)
                 .body(Full::new(Bytes::new()))
                 .unwrap(),
             draining.clone(),
@@ -1925,7 +2300,7 @@ mod tests {
                 .unwrap(),
             state(ListenerRole::Peer, 4),
             PeerAuth::GatewayReplica(
-                neoengram_protocol::GatewayReplicaId::new("replica-b").unwrap(),
+                neoengram_domain::protocol::GatewayReplicaId::new("replica-b").unwrap(),
             ),
         )
         .await
@@ -1940,7 +2315,7 @@ mod tests {
                 .unwrap(),
             state(ListenerRole::Peer, 4),
             PeerAuth::GatewayReplica(
-                neoengram_protocol::GatewayReplicaId::new("replica-b").unwrap(),
+                neoengram_domain::protocol::GatewayReplicaId::new("replica-b").unwrap(),
             ),
         )
         .await
@@ -1957,7 +2332,7 @@ mod tests {
             Request::builder()
                 .method(Method::POST)
                 .version(http::Version::HTTP_2)
-                .uri(neoengram_protocol::GATEWAY_CONTROL_CHANNEL_PATH)
+                .uri(neoengram_domain::protocol::GATEWAY_CONTROL_CHANNEL_PATH)
                 .header(CONTENT_TYPE, NDJSON_CONTENT_TYPE)
                 .body(Full::new(Bytes::new()))
                 .unwrap(),
@@ -1976,15 +2351,15 @@ mod tests {
     async fn control_listener_rejects_anonymous_agent_and_replica_auth() {
         for peer_auth in [
             PeerAuth::Anonymous,
-            PeerAuth::Agent(neoengram_protocol::AgentId::new("agent-a").unwrap()),
+            PeerAuth::Agent(neoengram_domain::protocol::AgentId::new("agent-a").unwrap()),
             PeerAuth::GatewayReplica(
-                neoengram_protocol::GatewayReplicaId::new("replica-a").unwrap(),
+                neoengram_domain::protocol::GatewayReplicaId::new("replica-a").unwrap(),
             ),
         ] {
             let response = handle_request(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(neoengram_protocol::GATEWAY_CONTROL_CHANNEL_PATH)
+                    .uri(neoengram_domain::protocol::GATEWAY_CONTROL_CHANNEL_PATH)
                     .body(Full::new(Bytes::new()))
                     .unwrap(),
                 state(ListenerRole::Control, 1024),
@@ -2006,7 +2381,7 @@ mod tests {
         let protected = handle_request(
             Request::builder()
                 .method(Method::POST)
-                .uri(neoengram_protocol::AGENT_SESSION_HEARTBEAT_REPORT_PATH)
+                .uri(neoengram_domain::protocol::AGENT_SESSION_HEARTBEAT_REPORT_PATH)
                 .body(Full::new(Bytes::from_static(b"{}")))
                 .unwrap(),
             state(ListenerRole::Agent, 16),
@@ -2022,10 +2397,10 @@ mod tests {
         );
 
         for path in [
-            neoengram_protocol::AGENT_ENROLLMENT_BOOTSTRAP_PATH,
-            neoengram_protocol::AGENT_ENROLLMENT_STATUS_QUERY_PATH,
-            neoengram_protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH,
-            neoengram_protocol::GATEWAY_REPLICA_BOOTSTRAP_CERTIFICATE_PATH,
+            neoengram_domain::protocol::AGENT_ENROLLMENT_BOOTSTRAP_PATH,
+            neoengram_domain::protocol::AGENT_ENROLLMENT_STATUS_QUERY_PATH,
+            neoengram_domain::protocol::GATEWAY_REPLICA_BOOTSTRAP_CHALLENGE_PATH,
+            neoengram_domain::protocol::GATEWAY_REPLICA_BOOTSTRAP_CERTIFICATE_PATH,
         ] {
             let enrollment = handle_request(
                 Request::builder()

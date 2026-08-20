@@ -28,7 +28,6 @@ import { supportsArtifactCommitGraph } from '@/features/capabilities';
 import {
   snapshotIntegrityLabel,
   snapshotIntegrityTagType,
-  snapshotPhaseLabel,
   snapshotPollInterval,
   snapshotStateLabel,
   snapshotStateTagType,
@@ -400,7 +399,7 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
           </span>
           <div>
             <small>{{ snapshotStateLabel(deliverySnapshot.state) }}</small>
-            <h2>{{ snapshotPhaseLabel(deliverySnapshot.phase) }}</h2>
+            <h2>{{ snapshotStateLabel(deliverySnapshot.state) }}</h2>
             <p>目标 Volume 正在提供该 Commit 的只读 FUSE 视图。</p>
           </div>
         </div>

@@ -47,6 +47,8 @@ function playground(overrides: Partial<PlaygroundView> = {}): PlaygroundView {
     index_version: { revision: '7', digest: 'a'.repeat(64) },
     state: 'ready',
     storage_availability: 'ready',
+    resource_version: '1',
+    lifecycle: { state: 'active', generation: '1' },
     created_at_unix_ms: '1785167000000',
     updated_at_unix_ms: '1785167600000',
     ...overrides,
@@ -166,8 +168,8 @@ describe('Create Job mutation identity', () => {
     const submitted = requests();
     expect(submitted).toHaveLength(2);
     expect(submitted[1]).toEqual(submitted[0]);
-    expect(submitted[0]?.job_id).toBe('job-00000000-0000-4000-8000-000000000002');
-    expect(randomUUID).toHaveBeenCalledTimes(3);
+    expect(submitted[0]?.job_id).toBe('job-00000000-0000-4000-8000-000000000001');
+    expect(randomUUID).toHaveBeenCalledTimes(2);
     expect(router.currentRoute.value.name).toBe('job-detail');
 
     wrapper.unmount();
@@ -192,9 +194,42 @@ describe('Create Job mutation identity', () => {
 
     const submitted = requests();
     expect(submitted).toHaveLength(2);
-    expect(submitted[0]?.job_id).toBe('job-00000000-0000-4000-8000-000000000012');
-    expect(submitted[1]?.job_id).toBe('job-00000000-0000-4000-8000-000000000013');
+    expect(submitted[0]?.job_id).toBe('job-00000000-0000-4000-8000-000000000011');
+    expect(submitted[1]?.job_id).toBe('job-00000000-0000-4000-8000-000000000012');
     expect(submitted[1]?.deadline_unix_ms).not.toBe(submitted[0]?.deadline_unix_ms);
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('preserves Job ID input while the route-selected Playground loads', async () => {
+    let resolveSource: ((value: unknown) => void) | undefined;
+    let queryCount = 0;
+    const response = {
+      data: { playground: playground() },
+      requestId: 'request-delayed-playground',
+    };
+    const { wrapper, queryClient } = await mountPage({
+      queryPlaygroundImplementation: () => {
+        queryCount += 1;
+        if (queryCount === 1) {
+          return new Promise((resolve) => {
+            resolveSource = resolve;
+          });
+        }
+        return Promise.resolve(response);
+      },
+    });
+
+    const jobId = wrapper.find('input');
+    await jobId.setValue('invalid job id');
+    resolveSource?.(response);
+    await flushPromises();
+    await flushPromises();
+
+    expect(jobId.element.value).toBe('invalid job id');
+    await submit(wrapper);
+    expect(api.createAddJob).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();

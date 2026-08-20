@@ -37,7 +37,7 @@ import type {
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
-import { supportsResourceBrowser } from '@/features/capabilities';
+import { supportsArtifactCommitGraph, supportsSnapshotMaterialize } from '@/features/capabilities';
 import {
   canCommitPreCommit,
   isPlaygroundOperational,
@@ -62,6 +62,7 @@ interface RedetectOperation {
     artifact_id: string;
     playground_id: string;
     precommit_request_id: string;
+    data_layout: StartPreCommitRequest['data_layout'];
   };
   start?: StartPreCommitRequest;
 }
@@ -90,8 +91,11 @@ const versionQuery = useQuery({
   queryFn: queryApiVersion,
   staleTime: Number.POSITIVE_INFINITY,
 });
-const resourceBrowserEnabled = computed(() =>
-  supportsResourceBrowser(versionQuery.data.value?.data.capabilities),
+const artifactCommitGraphEnabled = computed(() =>
+  supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
+);
+const snapshotMaterializeEnabled = computed(() =>
+  supportsSnapshotMaterialize(versionQuery.data.value?.data.capabilities),
 );
 const playground = computed(() => playgroundQuery.data.value?.data.playground);
 const playgroundOperational = computed(() => isPlaygroundOperational(playground.value));
@@ -222,6 +226,7 @@ const redetectMutation = useMutation({
       operation.start = {
         ...operation.startScope,
         expected_index_version: latest.data.playground.index_version,
+        data_layout: operation.startScope.data_layout,
       };
     }
     return startPlaygroundPreCommit(operation.start);
@@ -418,6 +423,7 @@ async function redetectPreCommit(): Promise<void> {
         artifact_id: artifactId.value,
         playground_id: playgroundId.value,
         precommit_request_id: `precommit-request-${globalThis.crypto.randomUUID()}`,
+        data_layout: currentPreCommit.data_layout,
       },
     };
   }
@@ -448,14 +454,14 @@ async function retryPreCommit(): Promise<void> {
   const current = playground.value;
   const currentPreCommit = precommit.value;
   if (!current || !currentPreCommit || !canRetry.value) return;
-  pendingRestartRequest.value ??= {
+  const restartRequest = (pendingRestartRequest.value ??= {
     tenant_id: tenantId.value,
     precommit_id: currentPreCommit.precommit_id,
     restart_request_id: `restart-request-${globalThis.crypto.randomUUID()}`,
     expected_index_version: current.index_version,
-  };
+  });
   try {
-    await restartMutation.mutateAsync(pendingRestartRequest.value);
+    await restartMutation.mutateAsync(restartRequest);
   } catch {
     return;
   }
@@ -520,6 +526,7 @@ async function createCommit(): Promise<void> {
     commit_request_id: `commit-request-${globalThis.crypto.randomUUID()}`,
     precommit_id: currentPreCommit.precommit_id,
     expected_candidate_index_version: currentPreCommit.candidate_index_version,
+    data_layout: currentPreCommit.data_layout,
     message: commitMessage.value.trim(),
     ...(commitDescription.value.trim() ? { description: commitDescription.value.trim() } : {}),
     ...(tagNames.value.length ? { tag_names: tagNames.value } : {}),
@@ -568,7 +575,7 @@ async function backToPlayground(): Promise<void> {
 }
 
 async function openVersionHistory(): Promise<void> {
-  if (!resourceBrowserEnabled.value || !createdCommit.value) return;
+  if (!artifactCommitGraphEnabled.value || !createdCommit.value) return;
   await router.push({
     name: 'artifact-detail',
     params: { tenantId: tenantId.value, projectId: projectId.value, artifactId: artifactId.value },
@@ -577,7 +584,7 @@ async function openVersionHistory(): Promise<void> {
 }
 
 async function createSnapshot(): Promise<void> {
-  if (!resourceBrowserEnabled.value || !createdCommit.value) return;
+  if (!snapshotMaterializeEnabled.value || !createdCommit.value) return;
   await router.push({
     name: 'snapshot-create',
     params: { tenantId: tenantId.value, projectId: projectId.value, artifactId: artifactId.value },
@@ -713,7 +720,10 @@ async function createSnapshot(): Promise<void> {
             <RefreshRight v-else class="is-spinning" />
           </span>
           <div class="preflight-status__body">
-            <small>{{ precommit.precommit_id }} · attempt {{ precommit.attempt }}</small>
+            <small>
+              {{ precommit.precommit_id }} · attempt {{ precommit.attempt }} ·
+              {{ precommit.data_layout === 'whole_file' ? 'WholeFile' : 'FastCDC' }}
+            </small>
             <strong
               >{{ preCommitStateLabels[precommit.state] }} ·
               {{ preCommitPhaseLabels[precommit.phase] }}</strong
@@ -975,7 +985,7 @@ async function createSnapshot(): Promise<void> {
             <dd>revision {{ createdIndexRevision }}</dd>
           </div>
         </dl>
-        <div v-if="resourceBrowserEnabled" class="result-next">
+        <div v-if="snapshotMaterializeEnabled" class="result-next">
           <div>
             <strong>创建只读 Snapshot</strong>
             <p>选择目标 StorageVolume，将该 Commit 交付到指定 Region。</p>
@@ -986,7 +996,7 @@ async function createSnapshot(): Promise<void> {
         </div>
         <div class="result-actions">
           <el-button @click="backToPlayground">返回 Playground</el-button>
-          <el-button v-if="resourceBrowserEnabled" @click="openVersionHistory"
+          <el-button v-if="artifactCommitGraphEnabled" @click="openVersionHistory"
             >查看版本历史</el-button
           >
         </div>

@@ -1,9 +1,9 @@
 # 中心化多租户控制面与 Agent 架构
 
 > 当前实现状态：P0 protocol、Agent/中心状态机和 SQLite 单节点中心权威后端已实现；独立
-> `neoengram-server` 已提供 Fusen 用户 API、Gateway Registry 管理 API、Gateway session 处理边界与旧
-> Hyper Agent action listener；Agent OpenAPI 3.1、Ed25519 逐帧签名 session、HTTP/2 全双工 NDJSON
-> channel、Job report/metadata/Index transport 已进入开发联调实现。`neoengram-agentd` 已改为只配置
+> `neoengram-central` 已提供 Fusen 用户 API、Gateway Registry 管理 API 和 Gateway session 处理边界；
+> Agent OpenAPI 3.1、Ed25519 逐帧签名 session、HTTP/2 全双工 NDJSON
+> channel、Job report/metadata/Index transport 已进入开发联调实现。`neoengram-agent` 已改为只配置
 > Gateway endpoint/trust bundle；Gateway 控制面、运行时 mTLS、Central 下行签名/trust bundle 和最多一跳
 > peer forwarding 和 Central peer credential directory（30 秒 TTL、leaf fingerprint allow-list、control 断链
 > fail-closed）已接入；双 Replica listener/H2/peer 协议 harness 和真实 Registry RouteLease 接管契约
@@ -13,15 +13,15 @@
 > 最后更新：2026-08-10。
 >
 > 目标架构决策：Central 主动连接每个 EdgeCluster 的多副本 Synapse GatewayPool，Agent 只连接本集群
-> Gateway；Agent 直连 `neoengram-server` 是迁移前基线，当前 Agent 已改为 Gateway-only 配置。Gateway
+> Gateway；Agent 控制链固定经 Gateway，当前 Agent 已改为 Gateway-only 配置。Gateway
 > 专项权威边界见
 > [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。本文其余任何旧 Gateway 探索与该
 > 文档冲突时均视为 obsolete。
 >
-> 本文统一描述 `neoengramd`、`neoengram-agent`、多租户/多 EdgeCluster 边界、CPU 计算节点、NFS
-> 存储、Volume-bound Agent 和 Volume-local CAS。当前 `0.2.0`/format v8 只实现 transport- and
+> 本文统一描述 `neoengram-central`、`neoengram-agent`、多租户/多 EdgeCluster 边界、CPU 计算节点、NFS
+> 存储、Volume-bound Agent 和 Volume-local CAS。当前 `0.2.0`/仓库格式 9 只实现 transport- and
 > storage-independent library、协议、内存适配器、中心 SQLite authority、已注册的用户 API，以及
-> Agent enrollment/session/Job transport 开发 adapter。Synapse Gateway 的协议、Registry v7、管理面和
+> Agent enrollment/session/Job transport 开发 adapter。Synapse Gateway 的协议、Gateway Registry、管理面和
 > fail-closed 服务/部署骨架和 Replica activation challenge/proof/证书投递已部分实现；生产
 > 外部生产 issuer/KMS-HSM adapter、真实集群 readiness/failover 和切换仍是后续工作。PostgreSQL、跨 Volume 数据通道、NFS fencing、
 > HA 与生产部署也不是当前开发运行能力。
@@ -35,22 +35,22 @@ P0 的 production/runtime 源码依赖主方向已经固定：
 ```text
 neoengram CLI -> standalone -> engine <- agent
                      |          ^       ^
-                     +-> fs ----+    protocol <- neoengramd
+                     +-> fs ----+    protocol <- neoengram-central
                          ^             ^
                          +---- core ---+
 ```
 
 该简图不枚举 CLI 对 core/engine 的直接类型导入。`neoengram-agent` 的生产依赖只有
-core/engine/protocol，不依赖 standalone；它对 `neoengramd` 的 `dev-dependency` 仅用于内存端到端
-组合测试，不属于上图。`neoengramd` 只依赖 core/protocol，不依赖 engine/fs。两者均为
-library-only；网络进程分别位于 `neoengram-server` 和 `neoengram-agentd`。协议和状态机不假设某一种
+domain/runtime，不依赖 standalone；它对 `neoengram-central` 的 `dev-dependency` 仅用于内存端到端
+组合测试，不属于上图。`neoengram-central` 只依赖 core/protocol，不依赖 runtime。两者均为
+library-only；网络进程分别位于 `neoengram-central` 和 `neoengram-agent`。协议和状态机不假设某一种
 HTTP 框架、数据库 driver、文件系统挂载方式或跨 Volume 传输实现。
 
 ## 1. 结论摘要
 
 目标系统采用以下模型：
 
-- `neoengramd` 是多租户控制面，负责身份、授权、资源目录、调度、租约、最终 CAS 和审计；
+- `neoengram-central` 是多租户控制面，负责身份、授权、资源目录、调度、租约、最终 CAS 和审计；
 - `Artifact` 是一个版本化的抽象文件系统，也是租户内权限、版本历史和对象归属的领域根；
 - `Commit` 是 Artifact 的不可变版本节点：Commit 之间形成版本历史树，每个 Commit 内部再通过
   Directory/Manifest 表示一棵文件系统树；
@@ -73,8 +73,9 @@ HTTP 框架、数据库 driver、文件系统挂载方式或跨 Volume 传输实
   NFS 上保存 SQLite 数据库快照；
 - Agent 基于中心 `IndexVersion` 产生结构化 IndexDelta/ObjectReceipt，中心通过 staging + CAS
   只发布一个候选；
-- Agent 本地 SQLite 按职责拆分为 Agent system DB、Tenant Ledger、可选 Playground cache 和每 Job
-  candidate；这些数据库位于独立的 Agent 状态 PVC，不得放在业务 StorageVolume 且不具备业务权威；
+- Agent 本地只使用统一 `agent-state.sqlite3` 保存 system identity、Ledger、session/recovery、
+  outbound 和执行证据；可选 Playground cache、Job candidate 与 filesystem journal 仍是独立的可重建
+  文件目录，全部位于 Agent 状态 PVC，不得放在业务 StorageVolume 且不具备业务权威；
 - NFS 文件锁只是进程内/文件系统的第二层保护。跨 Agent 写入必须使用中心租约、单调 fencing
   token，并在强隔离模式下由存储侧撤销过期写权限；
 - 调度和存储侧 fencing 以 `StorageVolume` 为所有权单元：每个 owner generation 最多一个活动 RW
@@ -87,8 +88,8 @@ HTTP 框架、数据库 driver、文件系统挂载方式或跨 Volume 传输实
   数据与 S3 入口；Gateway 不是 metadata 权威，不挂载 Volume，也不保存对象持久副本；
 - Kubernetes 用户 Pod 可以把单个 Snapshot/Playground 的精确目录挂到容器路径；中心只用
   `PodMountBinding` 描述和校验已有挂载关系，实际 I/O 经节点 NFS/CSI 客户端直达 NFS，不经过 Agent；
-- 当前 `neoengram-server` 是用户、CLI、UI、自动化系统和 Agent 的网络 composition root；目标切换后
-  它不再接受 Agent 直连，而是作为 Central 主动连接 Gateway。`neoengramd` 保持领域用例边界。分配
+- 当前 `neoengram-central` 是用户、CLI、UI、自动化系统和 Agent 的网络 composition root；目标切换后
+  它不再接受 Agent 直连，而是作为 Central 主动连接 Gateway。`neoengram-central` 保持领域用例边界。分配
   Job 时中心先把
   tenant-scoped Assignment ID `reserve` 到不可投递的 outbox 记录，CAS 持久化 Job/Assignment 后才
   `publish` 为可投递消息；开发链路通过独立 Agent OpenAPI 的 HTTP/2 全双工 action channel 投递，
@@ -112,8 +113,8 @@ Agent 的签名 Placement receipt 证明“对象已在该 Volume Durable”。
 
 | 主题 | 状态 | 当前结论 |
 | --- | --- | --- |
-| 控制入口 | 已确认 | 用户、CLI、UI 和自动化系统只调用 `neoengramd`，不能直接向 Agent 下发业务命令 |
-| Agent 控制循环 | Gateway 控制面已接入 | ControlEnvelope、heartbeat/assignment/report/failed/decision/finalized 已定义；独立 OpenAPI action、HTTP/2 全双工 NDJSON channel、generation fencing、运行时 mTLS 和中央下行签名校验已实现；完整双 Replica 业务 E2E、生产凭据轮换与真实集群切换待验收 |
+| 控制入口 | 已确认 | 用户、CLI、UI 和自动化系统只调用 `neoengram-central`，不能直接向 Agent 下发业务命令 |
+| Agent 控制循环 | Gateway 控制面已接入 | Strict Envelope、heartbeat/assignment/report/failed/decision/finalized 已定义；独立 OpenAPI action、HTTP/2 全双工 NDJSON channel、generation fencing、运行时 mTLS 和中央下行签名校验已实现；完整双 Replica 业务 E2E、生产凭据轮换与真实集群切换待验收 |
 | 领域根 | 已确认 | Artifact 是版本化抽象文件系统；创建时为空或从同 Tenant 另一个 Artifact 的明确 Commit 派生，不能表示 Job 输出或临时传输文件 |
 | 可变/只读视图 | 已确认 | Playground 是单区域读写工作区；Snapshot 有独立 ID、固定一个 Commit 和一个单区域 RO placement；同一 Commit 可有多个 Snapshot |
 | 集群边界 | 已确认 | EdgeCluster 是网络/调度/故障域；跨集群不共享 NFS，后续固定经源 Agent/Gateway -> 目标 Gateway/Agent 传输 Commit 对象 |
@@ -136,10 +137,10 @@ Agent 的签名 Placement receipt 证明“对象已在该 Volume Durable”。
 | Gateway 归属 | G1 控制面已实现 | 每 EdgeCluster 一个多副本 GatewayPool；Registry/管理 API、三 listener、H2 tunnel、mTLS、RouteLease 和最多一跳 peer forwarding 已接入；不挂载 Volume，不得成为 metadata 或对象权威 |
 | 用户 Pod 挂载 | 已确认 | 只描述和校验现有 Pod 到精确 Snapshot/Playground 目录的挂载；Pod/NAS/PV/PVC 创建不在范围内，实际 I/O 直达本集群 NFS |
 | NFS 强 fencing | 待原型 | 优先评估 NFSv4 身份/ACL、RW 挂载切换或存储代理强制 token |
-| Agent Ledger | SQLite adapter 已实现 | ledger-first、`list_active`、按 Job 保序 outbound queue、Agent/Tenant 数据库身份绑定与重开恢复已覆盖；daemon 的完整生命周期装配仍需验收 |
+| Agent 状态 | SQLite adapter 已实现 | 单一 `agent-state.sqlite3`/`agent-state.lock` 覆盖 ledger、session/recovery、outbound 与执行证据；旧拆分库直接拒绝，daemon 的完整生命周期装配仍需验收 |
 | 大型不可变元数据 | 待基准 | v1 优先 PostgreSQL；超出目标规模后可外置 Blob，但中心服务仍保持逻辑权威 |
 | Agent 传输 | 迁移中、生产切换前失败关闭 | Agent 配置只接受 GatewayPool endpoint；Gateway H2 action/channel、下行 command 签名校验、mTLS 和 RouteLease fencing 已接入；协议网络 harness 与 Registry 接管契约已分别验证，完整业务 E2E、真实集群故障演练与维护窗口切换待完成 |
-| Gateway 控制 | G1 控制面已实现 | 控制帧、Registry v7、RouteLease repository/session、Central outbound connector、原子 session open、Agent/peer forwarding、peer credential directory 和错误/背压边界已接入；listener/H2/peer harness 未覆盖真实 Registry、outbox、签名和 report/finalize，完整 E2E、真实集群验收与生产凭据适配待完成 |
+| Gateway 控制 | G1 控制面已实现 | 控制帧、Gateway Registry、RouteLease repository/session、Central outbound connector、原子 session open、Agent/peer forwarding、peer credential directory 和错误/背压边界已接入；listener/H2/peer harness 未覆盖真实 Registry、outbox、签名和 report/finalize，完整 E2E、真实集群验收与生产凭据适配待完成 |
 
 这里的“中心管控”指 Central 拥有命令、Desired State、调度、租约和最终状态的决定权。目标拓扑中
 Central 主动连接 GatewayReplica，但不会直连计算节点；Agent 只主动连接本集群 GatewayPool，并通过
@@ -342,7 +343,7 @@ flowchart TB
 
     subgraph CENTER["中心控制面：多租户、唯一元数据权威"]
         direction LR
-        API["neoengramd API<br/>认证 / Tenant RBAC / Quota / Audit"]
+        API["neoengram-central API<br/>认证 / Tenant RBAC / Quota / Audit"]
         REGISTRY["Resource Registry<br/>ArtifactPlacement / Volume Owner<br/>Volume ↔ Agent：0.0.1 一对一"]
         JOBS["Scheduler / Job Store<br/>PlaygroundLease / Fencing<br/>Desired State / Assignment / Finalize"]
         META["Central MetadataStore<br/>Artifact / Commit history / Snapshot<br/>Playground Index / IndexVersion / Ref<br/>Directory / Manifest / ObjectLocation"]
@@ -434,11 +435,11 @@ flowchart TB
   SQLite，未来接 PostgreSQL；只有中心能完成 `IndexVersion`/Ref CAS，但中心不持有 Chunk；
 - 黄色节点是 Gateway 与 Agent。目标链路由 Central 主动连接 Gateway、Agent 主动连接本集群
   Gateway；H2+mTLS 保护每一跳，Central 下行与 Agent 上行 payload 保持端到端 Ed25519 签名。当前
-  Agent 直连 Server 的 HTTP/2 action channel 是迁移前实现；
-- 灰色 Agent 状态 PVC 保存 system identity、health、Job Ledger 和 durable outbound queue；缓存和
+  旧 Agent 直连 Server 的 HTTP/2 action channel 已删除，不再作为运行或回退路径；
+- 灰色 Agent 状态 PVC 的统一状态库保存 system identity、health、Job Ledger 和 durable outbound queue；缓存和
   临时候选仍是非权威可恢复状态。状态盘丢失后可从中心重建非权威缓存，但 Agent 必须重新注册审批；
 - 青色 StorageVolume 区域保存 Playground、journal 和 tenant/artifact 隔离的不可变对象 CAS。Agent 在
-  获批 mount 内写入、复核并同步对象，payload 不经过 `neoengramd` 或 Central/Gateway 控制 listener；
+  获批 mount 内写入、复核并同步对象，payload 不经过 `neoengram-central` 或 Central/Gateway 控制 listener；
 - 每个用户 Pod 只把本集群 NFS 上一个 Playground/Snapshot 的精确目录挂到 `/workspace`；文件 I/O
   经过节点 NFS/CSI 客户端直达 NFS，不经过 Agent，也不表示中心负责创建 Pod、NAS、PV 或 PVC；
 - 每个 EdgeCluster 从上到下分为系统组件区、NFS 区和业务 Pod 区；Agent 与本地 Ledger 位于系统区，
@@ -471,7 +472,7 @@ PrepareAdd
           │ tenant-scoped API
           ▼
 ┌────────────────────────────────────────────┐
-│ neoengramd                                 │
+│ neoengram-central                                 │
 │ Auth / Tenant RBAC / RLS / Quota / Audit │
 │ Resource Registry / Scheduler / Job Store │
 │ Lease & Fencing / IndexVersion & Ref CAS  │
@@ -499,7 +500,7 @@ PrepareAdd
 
 | 平面 | 内容 | 权威/路径 |
 | --- | --- | --- |
-| 控制面 | Tenant、RBAC、Job、调度、Desired State | 中心权威；迁移前为 Agent 直连 Server，当前 Gateway-only 控制面代码链已接入但生产切换未验收，目标 Central -> Gateway <- Agent |
+| 控制面 | Tenant、RBAC、Job、调度、Desired State | 中心权威；控制消息固定经 Gateway 转发，生产切换验收完成前仍 fail-closed，目标 Central -> Gateway <- Agent |
 | 集群拓扑面 | EdgeCluster、GatewayPool/Replica、AgentRouteLease、placement、TransferRoute | 中心 registry；不从 IP/hostname 隐式推断集群 |
 | 发布元数据面 | Playground Index、Commit catalog、Ref、lease/fence | 中心 CAS；P0 内存 publisher，未来 PostgreSQL |
 | 执行元数据面 | Agent Ledger/cache、IndexDelta/Receipt/Job MetadataBatch | 独立 Agent 状态 PVC 或临时 MetadataBatch |
@@ -518,18 +519,18 @@ PrepareAdd
 | Job 意图与最终结果 | 中心 | Agent Ledger 是执行恢复副本 |
 | 当前 Playground Index/IndexVersion | 中心 | P0 内存 publisher；未来 PostgreSQL 行/分页结构，均通过 expected-version CAS |
 | 已发布 Commit/Ref | 中心 | Ref 只通过 expected-value CAS 更新 |
-| Agent system/Tenant Ledger | Agent 本地恢复副本 | 不替代中心 Job/Assignment/Lease 权威 |
+| Agent state/Ledger | Agent 本地恢复副本 | 不替代中心 Job/Assignment/Lease 权威 |
 | Agent Playground cache | 无全局权威 | 只缓存某 IndexVersion，可删除并从中心重建 |
 | Agent Job candidate | 无全局权威 | 中心尚未接收的临时 Delta/Receipt/MetadataBatch |
 | Playground 当前字节 | StorageVolume | 修改必须受 PlaygroundLease 和 journal 保护 |
 | Managed Object 字节 | 用户 StorageVolume | Agent 落盘并复核 BLAKE3；Server ObjectCatalog 只权威保存 Volume/placement generation 凭证 |
 | Playground 状态观测 | Agent 观测、中心缓存 | 必须携带 observed_at/mount_generation/completeness |
 
-## 5. 中心系统 `neoengramd`
+## 5. 中心系统 `neoengram-central`
 
 ### 5.1 模块职责
 
-P0 的 `services/neoengramd` 是 transport/storage-independent library，已实现：
+P0 的 `services/neoengram-central` 是 transport/storage-independent library，已实现：
 
 - `CreateAddJob`、`AssignJob`、`ReceiveReport`、`StageMetadataBatch`、外部 `FinalizeAdd` 与内部
   `ResumePublication`；
@@ -543,11 +544,11 @@ P0 的 `services/neoengramd` 是 transport/storage-independent library，已实�
   `Prepared -> Publishing` 持久化前的当前 deadline/assignment lease gate；同一次 Job CAS 冻结完整
   canonical publication candidate，Publishing 恢复不再读取可 TTL 清理的 staging。
 
-生产阶段仍建议保持模块化单体。当前 HTTP adapter 已独立位于 `neoengram-server` 的
+生产阶段仍建议保持模块化单体。当前 HTTP adapter 已独立位于 `neoengram-central` 的
 `dto/controller/service/identity/runtime`；以下其余领域 adapters/模块仍是目标结构：
 
 ```text
-services/neoengramd/
+services/neoengram-central/
 ├── ports/           # 传输无关的中心用例边界
 ├── agent_control/   # 经 Gateway 的 H2 channel、heartbeat、状态/MetadataBatch 上报
 ├── identity/        # OIDC/JWKS、Principal、Service identity
@@ -744,10 +745,11 @@ persist registration_request_id + key pair on agent-state PVC
   -> Agent/StorageVolume ready
 ```
 
-当前 `neoengram-agentd` 已实现审批状态轮询、approved identity 持久化，以及 H2 channel client/driver；
+当前 `neoengram-agent` 已实现审批状态轮询、approved identity 持久化，以及 H2 channel client/driver；
 server 已实现 channel 内的 session open、heartbeat、Assignment/Decision 投递、report 与 Volume 状态推进。
-旧 session/poll action 只用于兼容和人工恢复，不进入 daemon 主运行链路。断线重连与持续 Ready 生命周期
-仍需端到端验收，因此 readiness 必须继续 fail closed，而不能仅凭 approved 状态成功。
+Assignments and decisions use the full-duplex session channel exclusively; unary session actions do not
+provide a polling fallback. 断线重连与持续 Ready 生命周期仍需端到端验收，因此 readiness 必须继续
+fail closed，而不能仅凭 approved 状态成功。
 
 目标业务 PVC 必须已经由基础设施管理员准备，但 StorageVolume 记录不要求预先存在。TenantAdmin 在
 存储页生成限定到完整 StorageVolume descriptor 的 bootstrap credential；Agent bootstrap 只创建待审批
@@ -780,54 +782,52 @@ key 撤销、审批撤回和 generation 不匹配立即停止新 Job 与租约�
 
 ### 6.3 Agent 本地状态
 
-enrollment daemon 在独立 agent-state PVC 上创建 system identity 与 health 状态：
+enrollment daemon 在独立 agent-state PVC 上创建统一 Agent 状态库与 health 状态：
 
 ```text
 /var/lib/neoengram-agent/
-├── system.sqlite3
-├── system.lock
+├── agent-state.sqlite3
+├── agent-state.lock
 ├── bootstrap-status-clock.json
 └── runtime-health.json
 ```
 
-- `system.sqlite3` 保存 installation/request identity、签名私钥和已审批 Agent identity；
-- `system.lock` 保证同一 system identity 数据目录只被一个 daemon 进程打开；
+- `agent-state.sqlite3` 在一个 SQLite schema 中保存 system identity、Ledger、session/recovery
+  状态、outbound report 和本地执行证据；所有适配器共享同一连接与锁域；
+- `agent-state.lock` 保证同一状态目录只被一个 Agent 进程打开；第二个进程必须 fail closed；
 - `bootstrap-status-clock.json` 保存签名 status 请求的单调时间水位；
 - `runtime-health.json` 是 startup/liveness/readiness 命令读取的 daemon health record；readiness 只有在
   session generation、mount recovery 和 heartbeat 全部有效后才能成功。
 
-Job/session 组件使用以下按 Tenant 隔离的 Ledger/outbound/cache/candidate 布局：
+Job/session 组件使用统一状态库；对象 cache、candidate 和 filesystem journal 仍是可重建的文件系统
+目录，不属于权威状态库：
 
 ```text
 /var/lib/neoengram-agent/tenants/<tenant-id>/
-├── ledger.sqlite3
-├── outbound.sqlite3
-├── object-cache.sqlite3                         # 可选、可重建
-├── playgrounds/<playground-id>/cache.sqlite3  # 可选、可重建
-└── jobs/<job-id>/candidate.sqlite3             # 可选、临时
+├── object-cache/                                # 可选、可重建
+├── playgrounds/<playground-id>/cache/           # 可选、可重建
+└── jobs/<job-id>/candidate/                     # 可选、临时
 ```
 
-- 每个 Tenant 使用独立 `ledger.sqlite3` 保存本节点已接受 Job、幂等摘要、阶段和恢复线索，避免
-  SQLite 缺少 RLS 导致的跨租户误读，并缩小损坏范围；
-- `outbound.sqlite3` 按入队顺序持久化 Job report；中心成功 ack 后才删除，重启后继续重放；
-- Playground `cache.sqlite3` 只缓存某个中心 IndexVersion、文件 fingerprint 和分页数据，可随时删除
+- Agent state 中的 Ledger 按 Tenant key 过滤，保存本节点已接受 Job、幂等摘要、阶段和恢复线索；
+- 同一库中的 outbound 表按入队顺序持久化 Job report；中心成功 ack 后才删除，重启后继续重放；
+- Playground `cache/` 只缓存某个中心 IndexVersion、文件 fingerprint 和分页数据，可随时删除
   并从中心重建；它不是该 Playground 的完整 MetadataStore；
-- 大 Job 可使用独立 `candidate.sqlite3` 对 IndexDelta/Manifest 进行分页、排序和断点恢复。中心拉取并
+- 大 Job 可使用独立 `candidate/` 对 IndexDelta/Manifest 进行分页、排序和断点恢复。中心拉取并
   发布后按 TTL 删除，不能把它当作已发布 Index；
-- 不采用“一个 Agent 内所有租户共用一个业务 SQLite”，也不采用“每个 Playground 一套完整 Artifact
-  SQLite”。前者隔离不足，后者会复制 Artifact 历史并放大同步和恢复成本；
-- 未来每个 Tenant Ledger/cache/candidate 数据库都保存并在打开时验证
-  `database_identity(schema_version, agent_id, tenant_id[, playground_id/job_id])`；
+- Agent state 只保存本地执行状态，不拥有 Artifact、Commit、Index 或 Placement 权威；
+- 状态库打开时验证唯一 `schema_identity(agent_id, schema_version)`，未知旧 schema、旧拆分文件或
+  旧目录直接拒绝，不做迁移、双读或字段推断；
 - Bearer Token、跨 Volume endpoint secret、完整 TransferTicket 和 KMS key 不进入 Ledger；
 - Agent 状态 PVC 丢失时，新 Agent 从中心权威 store 重建 Index/cache；无法凭空证明旧 Job 对业务卷
   的中间副作用，仍必须结合 Playground journal 进入 RecoverJob；
-- 可重建 cache/candidate 可以删除；`system.sqlite3` 或未来 Ledger 丢失必须按重新注册/恢复
-  流程处理。任何本地数据库都不能成为 Ref、lease、IndexVersion 或已发布 Commit 的唯一记录。
+- 可重建 cache/candidate 可以删除；`agent-state.sqlite3` 丢失必须按重新注册/恢复流程处理。任何
+  本地数据库都不能成为 Ref、lease、IndexVersion 或已发布 Commit 的唯一记录。
 
 ### 6.4 Agent 内部结构
 
 ```text
-crates/neoengram-agent/src/
+services/neoengram-agent/src/agent_core/
 ├── agent.rs          # assignment/execute/decision 状态转换
 ├── state.rs          # Ledger record、receipt、report 与状态
 ├── ports.rs          # Ledger/validator/executor/transfer/report/clock
@@ -1198,28 +1198,28 @@ Worker 不能各自更新 Index。外部进程在扫描期间修改 NFS Playgrou
 
 ### 10.1 Standalone 与 Managed 是两种运行模式
 
-当前 format v8 的本地 CLI 使用 Standalone SQLite stores；托管 Agent 模式使用中心 `AuthorityStore`，
+当前仓库格式 9 的本地 CLI 使用 Standalone SQLite stores；托管 Agent 模式使用中心 `AuthorityStore`，
 默认后端为单进程 SQLite，多实例生产目标为 PostgreSQL。二者复用 core 规范模型和 engine 业务规则，但不共享
 数据库文件：
 
 ```text
-Standalone CLI -> neoengram-standalone -> format v8 SQLite stores
-Managed Agent  -> protocol -> neoengramd AuthorityStore -> SQLite (default) / PostgreSQL (future)
+CLI -> neoengram-runtime -> 仓库格式 9 SQLite stores
+Managed Agent  -> protocol -> neoengram-central AuthorityStore -> SQLite (default) / PostgreSQL (future)
 ```
 
-- Standalone 适合单机/单管理域，SQLite、WAL、锁和 `.neoengram` 目录使用 format v8；不迁移 v7；
-- Managed 中心是唯一 metadata authority；SQLite 仅支持单个 `neoengramd` 进程，PostgreSQL 目标支持多实例、HA 与 RLS；
+- Standalone 适合单机/单管理域，SQLite、WAL、锁和 `.neoengram` 目录使用仓库格式 9；不迁移 v7；
+- Managed 中心是唯一 metadata authority；SQLite 仅支持单个 `neoengram-central` 进程，PostgreSQL 目标支持多实例、HA 与 RLS；
 - Agent 不在 NFS 打开 Artifact SQLite，不上传或下载 SQLite 数据库快照，也不把本地数据库同步给
   其他 Agent；
 - 不能把 Managed 简化为把 `.neoengram/metadata` symlink 到本地盘。Engine 必须接收结构化
   Request/Result、执行 ports 和逻辑 Playground 身份；
 - 从 Standalone 纳管到 Managed、或反向导出，是显式 import/export 流程，不是两个 MetadataStore
   的双向复制。
-- Managed SQLite 使用独立 `authority.sqlite3`/`authority.lock`，绝不复用 format v8 数据库；当前
-  authority 支持 v1 到 v6 的线性原子迁移，其他未知 schema 不探测、回退或双读。
-- Agent Registry 使用另一组 `agent-registry.sqlite3`/`agent-registry.lock`，由同一单进程
-  `AuthorityStore` 组合。审批决策和规范审计事件共享一个 Registry CAS aggregate；跨库 audit
-  projection 不是跨 SQLite 文件事务。
+- Managed SQLite 使用单一 `authority.sqlite3`/`authority.lock`，绝不复用仓库格式 9 数据库；当前
+  authority schema identity 为 `application_id = 0x4e454155`、`user_version = 12`，未知 schema
+  不探测、回退或双读。
+- Agent Registry、Gateway Registry、S3、Snapshot 和生命周期表都安装在同一 authority 数据库内，
+  所有相关 mutation 使用同一个 SQLite 事务和锁；不再创建独立 Registry 数据库。
 - Control catalog v4 到 v5 不会从旧 Playground 反向合成 Artifact。只要 v4 中存在 Playground，
   迁移就原子回滚；运维方必须先导出并移除旧 Playground，升级后显式创建 Artifact，再重建
   Playground。只有无 Playground 的 v4 catalog 可以直接升级，派生资源永远不能成为推断权威根的依据。
@@ -1265,29 +1265,28 @@ Commit 发布也在中心事务内完成 immutable catalog insert 和 Ref CAS。
 
 ```text
 /var/lib/neoengram-agent/
-├── system.sqlite3
+├── agent-state.sqlite3
+├── agent-state.lock
 └── tenants/<tenant-id>/
-    ├── ledger.sqlite3
-    ├── outbound.sqlite3
-    ├── object-cache.sqlite3                     # 可选
-    ├── playgrounds/<playground-id>/cache.sqlite3  # 可选
-    └── jobs/<job-id>/candidate.sqlite3          # 可选
+    ├── object-cache/                            # 可选、可重建
+    ├── playgrounds/<playground-id>/cache/       # 可选、可重建
+    └── jobs/<job-id>/candidate/                 # 可选、临时
 ```
 
-| 数据库 | 生命周期 | 内容 | 是否权威 |
+| 存储 | 生命周期 | 内容 | 是否权威 |
 | --- | --- | --- | --- |
-| `system.sqlite3` | AgentInstance | Agent identity、配置版本、Mount inventory、worker 状态 | 否 |
-| Tenant `ledger.sqlite3` | TenantAssignment | 本节点 Job、request digest、阶段、恢复线索、MetadataBatch 索引 | 否 |
-| Tenant `outbound.sqlite3` | AgentInstance + Tenant | 按 Job 保序、等待中心 ack 的 durable reports | 否 |
-| Playground `cache.sqlite3` | 可删除 | 某 IndexVersion 的分页缓存、fingerprint、扫描加速数据 | 否 |
-| Job `candidate.sqlite3` | 短期/TTL | 大型 Delta/Manifest 的排序、分页、digest 和断点恢复 | 否 |
+| `agent-state.sqlite3` | AgentInstance | Agent identity、Ledger、session/recovery、outbound report 和执行证据 | 否 |
+| `agent-state.lock` | AgentInstance | 单 Agent 进程独占状态盘的文件锁 | 否 |
+| Playground `cache/` | 可删除 | 某 IndexVersion 的分页缓存、fingerprint、扫描加速数据 | 否 |
+| Job `candidate/` | 短期/TTL | 大型 Delta/Manifest 的排序、分页、digest 和断点恢复 | 否 |
 
-采用每租户 Ledger，是因为 SQLite 没有 RLS；物理分库能降低代码漏过滤造成的越权概率，也缩小单库
-损坏范围。Playground cache 和 Job candidate 根据规模按需创建，避免每个 Playground 都复制完整
-Artifact 历史。严格隔离部署再配合每租户 Worker、Unix user、目录权限和独立 NFS 凭证。
+Ledger、session、outbound 和 lifecycle 表共享一个受锁保护的 SQLite 事务域；SQL 操作必须显式绑定
+Agent/Tenant scope。Playground cache 和 Job candidate 根据规模按需创建，避免每个 Playground 都复制
+完整 Artifact 历史。严格隔离部署再配合每租户 Worker、Unix user、目录权限和独立 NFS 凭证。
 
-所有本地数据库打开时必须验证 `database_identity`，至少包含 schema version、Agent ID 和 Tenant ID；
-Playground/Job 库再包含对应资源 ID。把数据库文件移动到另一个租户目录不能改变其身份。
+状态库打开时必须验证唯一 schema identity、Agent ID 和 schema version；把数据库文件移动到另一个
+租户目录不能改变其身份。旧的 `system.sqlite3`、`ledger.sqlite3`、`outbound.sqlite3`、
+`lifecycle.sqlite3` 或对应 lock/目录布局一律拒绝，必须重新初始化。
 
 ### 10.4 Agent 上报与中心发布
 
@@ -1356,11 +1355,11 @@ blob 放入受控 metadata blob store，PostgreSQL 保存 tenant-scoped ID、Has
 
 ### 10.7 WAL、恢复与 Agent 接管
 
-本地 format v8 和未来 Agent SQLite adapter 可以使用 WAL；Agent WAL/SHM 必须留在独立状态 PVC。
+本地仓库格式 9 和未来 Agent SQLite adapter 可以使用 WAL；Agent WAL/SHM 必须留在独立状态 PVC。
 Agent 绝不能在业务 PVC 上打开 SQLite。把 `journal_mode` 改成 DELETE 也不会把 SQLite
 变成生产级分布式数据库，因为 NFS 锁、缓存和故障恢复语义仍取决于具体实现。
 
-- Pod/节点重建并复用原状态 PVC：本地 SQLite 通过 WAL 恢复，Tenant Ledger 驱动 Job 进入 recovering；
+- Pod/节点重建并复用原状态 PVC：统一 Agent SQLite 通过 WAL 恢复，Ledger 驱动 Job 进入 recovering；
 - Agent 状态 PVC 永久丢失：替代 Agent 重新注册并等待审批，从中心按页重建 Index cache，不从业务卷
   恢复身份或元数据库文件；
 - MetadataBatch 尚未完整上传就丢失：Job 保持未发布，Agent 从 Ledger/candidate 续传，或显式重建候选；
@@ -1379,10 +1378,10 @@ Agent 绝不能在业务 PVC 上打开 SQLite。把 `journal_mode` 改成 DELETE
 用户/CLI/UI 的首版公开契约见 [`openapi/neoengram-api.yaml`](openapi/neoengram-api.yaml)。它使用
 OpenAPI 3.1、普通 JSON 和模块/子域/动作路径；path 不含版本，认证业务方法通过
 `NeoEngram-API-Version: 1` header 协商版本，错误使用 RFC 9457 Problem Details。独立
-`neoengram-server` 默认实现版本查询、live/ready、Tenant/StorageVolume/Artifact/Playground/
+`neoengram-central` 默认实现版本查询、live/ready、Tenant/StorageVolume/Artifact/Playground/
 Snapshot 基础 action、Job create/query/finalize 和 Gateway Registry 管理路径；启用 enrollment 后还
 实现五条 Storage enrollment 管理路径。以下清单同时列出已注册和目标契约，精确状态见清单后的说明；
-`neoengramd` 自身始终保持 library-only：
+`neoengram-central` 自身始终保持 library-only：
 
 ```text
 # 用户/CLI/UI 公开 OpenAPI；业务 ID 全部位于 JSON body
@@ -1435,7 +1434,6 @@ POST /agent/enrollment/status/query
 POST /agent/session/open
 POST /agent/session/channel/open
 POST /agent/session/heartbeat/report
-POST /agent/session/message/list/query
 POST /agent/job/report/create
 POST /agent/job/metadata/batch/stage
 POST /agent/job/metadata/page/stage
@@ -1485,7 +1483,7 @@ Content-Type: application/x-ndjson
 Accept: application/x-ndjson
 
 {
-  "protocol_version": 1,
+  "wire_version": 1,
   "request_id": "req-open-01",
   "agent_id": "agent-123",
   "installation_id": "installation-123",
@@ -1538,7 +1536,7 @@ Accept: application/x-ndjson
 ```json
 {
   "type": "job.assignment",
-  "protocol_version": 1,
+  "wire_version": 1,
   "message_id": "msg-...",
   "session_generation": "12",
   "resource_version": "41892",
@@ -1583,7 +1581,7 @@ lease/fence、operation 和安全相关选项，不能只对 operation body 做 
 ```json
 {
   "type": "job.status",
-  "protocol_version": 1,
+  "wire_version": 1,
   "message_id": "msg-...",
   "session_generation": "12",
   "sequence": "815",
@@ -2058,7 +2056,7 @@ final result / recovery / deletion reason
 ### 17.1 多 EdgeCluster
 
 ```text
-                         neoengramd
+                         neoengram-central
                   / Central 主动 H2+mTLS \
                    v                      v
        GatewayPool A [N]             GatewayPool B [N]
@@ -2134,17 +2132,14 @@ AgentInstance、StorageVolume、AgentMount 和 ArtifactPlacement 仍使用中心
 P0 已创建并通过 crate 边界隔离：
 
 ```text
-crates/neoengram-core/          # typed content IDs、logical paths、canonical digests
-crates/neoengram-engine/        # Request/Result、ports、PreparedAdd、mutation/progress/error
-crates/neoengram-protocol/      # v1 DTO、Schema、JCS digest、limits、stable errors
-crates/neoengram-agent/         # library-only Agent state machine、ports、memory/fake adapters
-services/neoengramd/            # library-only central state machine、ports、memory adapters
-services/neoengram-server/      # user API + Gateway Registry/session + outbound Gateway connector
-services/neoengram-agentd/      # Gateway-only endpoint/trust bundle + command signature verification
+crates/neoengram-domain/src/     # typed content IDs、logical paths、canonical digests、Envelope、Schema、SigV4
+crates/neoengram-runtime/        # Chunk、ObjectStore、Worktree、Mutation、Recovery 与读取内核
+services/neoengram-agent/       # Agent state machine + Gateway endpoint/trust/session transport
+services/neoengram-central/     # authority、identity、catalog、jobs、gateway、storage、snapshot、S3、lifecycle、API
 services/synapse-gateway/       # three-listener H2/mTLS router + activation + one-hop forwarding
 ```
 
-`neoengram-protocol` 只依赖 core 与 Serde/JSON Schema/JCS 支撑库，不依赖 engine、CLI、SQLite、
+`neoengram-domain::protocol` 只依赖 Serde/JSON Schema/JCS 支撑库，不依赖 runtime、CLI、SQLite、
 文件系统、存储 SDK 或具体 HTTP 框架。它定义：
 
 - Tenant/Project/Artifact/Playground/Cluster/Agent/Volume/Mount/Job/Assignment/Lease/Batch 强类型 ID；
@@ -2163,8 +2158,8 @@ services/synapse-gateway/       # three-listener H2/mTLS router + activation + o
   `extensions` round-trip 和未知消息稳定错误；metadata committed Schema 根是实际 wire DTO 的
   `anyOf` 联合，不是要求所有 DTO 同时出现的 catalog wrapper。
 
-目标 `synapse-gateway` 只允许依赖 protocol/core 与网络、TLS、签名、观测组件，不得依赖
-`neoengramd` authority datasource/mapper、engine、fs、standalone 或 Volume adapter。它不包含业务
+目标 `synapse-gateway` 只允许依赖 domain 与网络、TLS、签名、观测组件，不得依赖
+`neoengram-central` authority datasource/mapper、engine、fs、standalone 或 Volume adapter。它不包含业务
 数据库，不挂载 StorageVolume，也不成为 Chunk 或 metadata store。
 
 Engine 已拆出确定性的执行边界：
@@ -2178,7 +2173,7 @@ EngineError { code, retry_class, context, source }
 ```
 
 以上 Engine/fs 契约已经进入 Standalone 生产路径：`checkout`、工作区 `restore` 和工作区 `rm` 把
-format-v8 transactional Worktree 组合进 Engine executor，遵循 durable journal、receipt、权威发布、
+仓库格式 9 transactional Worktree 组合进 Engine executor，遵循 durable journal、receipt、权威发布、
 finalize 的顺序。checkout/rm 用 plan.expected `IndexVersion` 执行 SQLite CAS 后才 finalize；worktree
 restore 不发布 Index，`restore --staged` 独立更新 SQLite Index；`recover` 负责本地事务以及
 active/finalized Engine journals 的恢复和清理。
@@ -2187,7 +2182,7 @@ active/finalized Engine journals 的恢复和清理。
 由 CLI 生成；Standalone 通用 `CommandResult` 已删除。`add`、`commit`、`mount`、`checkout`、`rm`、
 `restore` 和 `recover` 已把 caller-owned `ProgressSink` 接到 CLI。
 
-Standalone publisher 和中心 `IndexPublisher` 分别拥有最终 CAS；engine/fs 不可暗中发布权威状态。
+Standalone publisher 和中心 `IndexPublisher` 分别拥有最终 CAS；runtime 不可暗中发布权威状态。
 业务层不能依赖“中心一定使用 HTTP”，也不能把 CLI 文本、NFS 本地路径或 SQLite connection 暴露
 为跨进程协议。所有命令通过结构化 Request/Result；终端渲染只存在于 `neoengram` CLI。
 
@@ -2203,7 +2198,7 @@ Standalone publisher 和中心 `IndexPublisher` 分别拥有最终 CAS；engine/
 - 定义一个 Artifact 每 EdgeCluster 一个 active placement、Volume/Artifact root 非重叠、同租户复合外键，
   以及 Volume Owner/owner generation 约束；
 - 定义 PostgreSQL RLS、复合外键、RBAC、Quota 和 system scope；
-- 已定义 transport-independent ControlEnvelope、JSON Schema、MetadataBatch 上传/staging、IndexVersion
+- 已定义 transport-independent strict Envelope、JSON Schema、MetadataBatch 上传/staging、IndexVersion
   CAS、finalize decision 和 lease/fence wire 类型；HTTP/2 action channel、运行时 mTLS 和端到端下行签名已接入，
   外部生产凭据适配与轮换验收待完成；
 - 明确 Cooperative/Enforced/Dedicated 三种隔离承诺；
@@ -2225,7 +2220,7 @@ Gateway secret 放入公共 DTO。
 - PlaygroundAttachment、固定 Commit show 和缓存 status observation；
 - 本地 Job Ledger、Agent heartbeat/watch、断线重连和幂等状态上报；
 - 跨租户 list/get/status/job/metadata-batch 默认拒绝；
-- 迁移前直连纵切不启用 Gateway；当前 Agent 已不保留 Central endpoint fallback；双 Replica 协议网络
+- 旧直连纵切已删除；当前 Agent 已不保留 Central endpoint fallback；双 Replica 协议网络
   harness 与真实 Registry RouteLease 接管契约已分别通过，但完整业务 E2E、真实集群故障/就绪和维护
   窗口切换完成前，新链路仍失败关闭。
 
@@ -2325,7 +2320,7 @@ Gateway 持久存储均没有 payload。
   产生第二个 Owner，Owner failover 会 fence 全卷旧写者；
 - 同一 Playground 不会在两个集群同时成为活动可写 placement；
 - 单 Agent 内多个 Worker 读取同一 IndexVersion/Commit 返回相同固定结果且只能合并为一个 candidate；
-- system DB 与每 Tenant Ledger 的文件/目录权限和 `database_identity` 隔离；
+- 单一 Agent state DB 使用严格 schema identity、tenant-scoped keys 和状态盘文件权限隔离；
 - Agent 不会在 NFS 创建/打开托管 SQLite、WAL 或 SHM；
 - PodMountBinding 的 cluster、Volume、Artifact、视图 ID、精确目录、容器路径和 access mode 一致；
   跨集群 Volume 或指向 Volume/objects/journal/sibling root 的关系被拒绝；
@@ -2351,7 +2346,7 @@ Gateway 持久存储均没有 payload。
 
 ### 20.5 Gateway 与跨集群传输
 
-- GatewayPool/Replica Registry、v6 -> v7 migration、AgentRouteLease CAS/恢复/过期和 generation fencing；
+- GatewayPool/Replica Registry、current schema identity、AgentRouteLease CAS/恢复/过期和 generation fencing；
 - 双 Replica 下 Agent 经任意入口建立唯一 owner，Central 命令最多一跳到达；owner 不可达时不广播；
 - activation token 重放、错误 URI SAN、跨集群证书、过期/撤销证书和端到端 payload 篡改失败关闭；
 - 同 Cluster/Volume 不复制、跨 Cluster/Volume 缺块拉取和断点续传；
@@ -2365,20 +2360,20 @@ Gateway 持久存储均没有 payload。
 
 ## 21. 当前实现与目标差距
 
-当前代码已经具有本地 format v8、SQLite WAL stores、内容寻址对象、Engine/fs ports 与
+当前代码已经具有本地仓库格式 9、SQLite WAL stores、内容寻址对象、Engine/fs ports 与
 mutation executor/adapters、接入 Engine lifecycle 的 checkout/rm/restore durable transactions、
-recover、WholeFile/FastCDC、copy/hardlink export 和只读 FUSE；同时已经具有 protocol v1、Agent Ledger
+recover、WholeFile/FastCDC、copy/hardlink export 和只读 FUSE；同时已经具有 current wire protocol、Agent Ledger
 状态机与 SQLite identity/Ledger adapter、单 Volume mount probe/assignment gate、中心
 Job/Assignment/Batch/Finalize 状态机、Agent enrollment Registry，以及 `AuthorityStore` 的
 InMemory/SQLite composition，以及基于 Fusen 0.9.0、外部 OIDC/JWKS 和默认拒绝 RBAC 的用户 HTTP
-server；迁移前启用 enrollment 时另有五条公开管理路由、loopback-only 独立 Agent listener 和可运行的 enrollment daemon。
+server；当前 enrollment 与 Agent 控制消息统一经 Gateway action 路由，Central 不暴露独立 Agent listener。
 SQLite 模式只允许单 server 副本，生产 TLS 由 Ingress/反向代理终止。
 相关契约见：
 
 - [`storage-architecture.md`](storage-architecture.md)
 - [`technical-reference.md`](technical-reference.md)
 - [`code-architecture.md`](code-architecture.md)
-- [`local/metadata/README.md`](../crates/neoengram-standalone/src/local/metadata/README.md)
+- [`local/metadata/README.md`](../crates/neoengram-runtime/src/local/metadata/README.md)
 
 仍未完成或尚未达到生产验收：
 

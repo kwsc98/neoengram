@@ -9,10 +9,10 @@
 
 最后更新：2026-08-10
 当前阶段：`0.2.0` P0、中心 `AuthorityStore`/SQLite 默认后端，以及 Volume-bound Agent enrollment、
-本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；独立 `neoengram-server` 提供用户 API 和
-迁移前 Agent action listener，`neoengram-agentd` 已通过 Gateway H2 双向 channel 完成
+本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；独立 `neoengram-central` 提供用户 API 和
+迁移前 Agent action listener，`neoengram-agent` 已通过 Gateway H2 双向 channel 完成
 enrollment/session/Job，并将 Chunk 直接写入用户 Volume CAS。Synapse Gateway G1 已实现协议、
-Registry v7、管理 API、Central session、
+Gateway Registry、管理 API、Central session、
 Registry-driven outbound tunnel、Replica activation、运行时 H2/mTLS、RouteLease、Central command
 signing/trust bundle 和最多一跳 peer forwarding；双 Replica listener/H2/peer harness 与真实
 InMemory/SQLite RouteLease 接管契约已分别通过，但完整 Central/Registry/outbox/签名业务 E2E、外部生产
@@ -58,8 +58,8 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | `GatewayReplica` | GatewayPool 内可独立连接、心跳、drain 和撤销的进程实例 |
 | `AgentRouteLease` | Central 权威记录的 Agent 当前 owner Replica、连接和 route generation 短租约 |
 
-当前 format v8 和 CLI 中的 `repository`、`workspace` 是 Standalone 名称：在中心领域模型中分别
-映射为 `Artifact`、`Playground`。本地保留 `repository.json` 和 `workspace` 命令，不得因此在新
+当前仓库格式 9 和 CLI 中的 `repository`、`workspace` 是 Standalone 名称：在中心领域模型中分别
+映射为 `Artifact`、`Playground`。本地保留 `metadata.sqlite3` 和 `workspace` 命令，不得因此在新
 API、数据库 schema 或协议中继续引入第二套概念名称。
 
 当前已确认的边界（远端生产适配器尚未实现）：
@@ -122,7 +122,7 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 
 | 能力 | 状态 | 当前语义 |
 | --- | --- | --- |
-| `init` | 已完成 | 创建 format v8 SQLite 仓库，并不可变绑定 fastcdc/whole-file/mixed 策略；旧格式明确拒绝 |
+| `init` | 已完成 | 创建仓库格式 9 SQLite 仓库，并不可变绑定 fastcdc/whole-file/mixed 策略；旧格式明确拒绝 |
 | `workspace create/list/remove` | 已完成 | 独立 HEAD/Index/base、分支独占、内外部 Playground 与安全删除 |
 | `add` / `add -A` | 已完成 | 固定仓库强制既定策略；mixed 可逐文件选择，支持 BLAKE3 去重和删除暂存 |
 | `rm` | 已完成 | 安全移除工作区或仅移除 index，支持持久事务和可验证回滚 |
@@ -142,55 +142,53 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 
 ### 3.2 P0 架构、存储与一致性
 
-- Workspace 已拆为 core、engine、fs、protocol、standalone、agent、CLI 和 `neoengramd`；版本统一为
-  `0.2.0`。CLI 只解析输入和渲染，Standalone 每个命令使用独立 Request、显式 cwd 和领域化 typed
+- Workspace 已拆为 domain、runtime、standalone、agent、CLI 和 `neoengram-central`；版本统一为
+  `0.2.0`。`apps/neoengram-cli` 只解析输入和渲染，Standalone 每个命令使用独立 Request、显式 cwd 和领域化 typed
   Result；只读、`add`/`commit`/`gc`、mutation 与 lifecycle 均已完成迁移。Standalone 通用
   `CommandResult` 已删除，成功文本只在 CLI 生成。
-- `neoengram-core` 提供强类型内容 ID、NFC 逻辑路径、Manifest/Directory/Commit/FileRecord、
-  有界 IndexDelta 和唯一规范 digest；公共 API 不再包含扁平 Tree、FileNode 或物化 Index。
-- `neoengram-engine` 提供执行 ports、闭合校验的 `PreparedAdd`、结构化错误/重试分类、进度事件、
+- `neoengram-domain::core` 提供强类型内容 ID、NFC 逻辑路径、Manifest/Directory/Commit/FileRecord、
+  有界 IndexDelta 和唯一规范 digest；公共 API 不包含扁平兼容 snapshot、WorkspaceFileRecord 或物化 Index。
+- `neoengram-runtime` 提供执行 ports、闭合校验的 `PreparedAdd`、结构化错误/重试分类、进度事件、
   故障注入和 mutation plan/journal/receipt 契约；Standalone `commit` 已组合 canonical graph builder
   与 SQLite publisher，Agent 在 durable `running` 后发出 progress report。Engine 不读取 cwd、环境、
   SQLite 或 CLI 文本，也不直接输出。
-- Engine 的 `execute_mutation`/`finalize_mutation` 与 `neoengram-fs` journal/lock adapters 已实现；
+- Engine 的 `execute_mutation`/`finalize_mutation` 与 `neoengram-runtime` journal/lock adapters 已实现；
   Standalone `checkout`、工作区 `restore` 和工作区 `rm` 已通过 transactional Worktree adapter 接入
   `MutationPlan -> durable journal -> WorktreeReceipt`。`add`、`commit`、`mount`、`checkout`、`rm`、
   `restore` 和 `recover` 已把 caller-owned `ProgressSink` 从 facade 透传到 CLI。
 - Standalone 的持久化职责拆为 immutable catalog、workspace index、ref 和 workspace registry；
-  内部仍有仅限 SQLite/worktree 的过渡物化 view，后续继续迁移到分页 engine ports。
+  Directory、Manifest 和 WorkspaceIndex 统一通过分页端口访问，不保留迁移期物化 view。
 - SQLite 是唯一元数据后端；JSON 后端和旧格式兼容已删除。
-- `repository.json` 持久化不可变分块策略；Artifact 在 Index、Directory、Commit 和 fsck 路径强制校验。
+- `metadata.sqlite3` 持久化不可变分块策略；Artifact 在 Index、Directory、Commit 和 fsck 路径强制校验。
 - `ObjectStore` 提供流式发布、校验读取、分页枚举、durability barrier、协调删除和可选硬链接能力。
 - 本地锁固定按 object -> Playground worktree -> state 获取；工作区读操作共享、mutation 独占，冲突立即失败。
 - `add` 基于最初的 `IndexVersion` 做最终 CAS；status/diff 在输出前复核实际依赖的 Index 与
   HEAD/main。
-- checkout/rm/restore 在工作区 mutation 前先持久化 Engine journal，再由 format-v8 本地事务执行实际
+- checkout/rm/restore 在工作区 mutation 前先持久化 Engine journal，再由仓库格式 9 本地事务执行实际
   文件变更并返回 receipt。checkout/rm 用 plan.expected `IndexVersion` 完成 SQLite 权威 CAS 后才
   finalize；worktree restore 不更新 Index，`restore --staged` 独立更新 SQLite Index。`recover` 同时
   恢复本地事务、清理 stale lock 并收尾 Engine journals，任何无法证明安全的状态仍保留 journal。
 - `add`、`gc` 和 `fsck` 使用独立对象锁，避免发布、校验和回收竞态。
 - `fsck` 的 Chunk 引用检查已使用有界外部排序，避免完整 Chunk Hash 集合常驻内存。
-- protocol v1 已包含资源/代次强类型、ControlEnvelope、Add Assignment、MetadataBatch、
+- current wire protocol 已包含资源/代次强类型、strict Envelope、Add Assignment、MetadataBatch、
   RFC 8785 JCS + BLAKE3 digest、统一限额 validator 和提交的 JSON Schema。v1 不公开中心
   missing/upload/S3 durability 协议；Manifest 使用 `chunk_start` fragment 跨页表达，中心重组后
   校验完整 canonical ID。
 - Agent 已有 ledger-first 幂等 Assignment 状态机；durable `TransferReceipt` 保存 exact descriptors/pages，
   Prepared 报告在 metadata staging 前由中心持久化，响应丢失时从 Prepared 幂等重放；失败报告统一为
-  protocol `JobFailed`。`neoengramd` 已有 Create/Assign/Report/Stage/Finalize 状态机、异步
+  protocol `JobFailed`。`neoengram-central` 已有 Create/Assign/Report/Stage/Finalize 状态机、异步
   `AuthorityStore`、InMemory 契约后端和默认 SQLite 持久 CAS。
   `JobPrepared.candidate_digest` 绑定 assignment identity、base IndexVersion、descriptors 和 extensions。
-  领域状态机保持 library-only；用户/中心网络组装位于 `neoengram-server`，Agent enrollment 进程位于
-  `neoengram-agentd`。SQLite authority 支持
+  领域状态机保持 library-only；用户/中心网络组装位于 `neoengram-central`，Agent enrollment 进程位于
+  `neoengram-agent`。SQLite authority 支持
   单进程、单 server 副本持久化，不支持 HA/RLS。
-- SQLite authority 独立使用 `authority.sqlite3`/`authority.lock`，不复用 Standalone format v8；当前
-  `user_version = 6`，支持 v1 到 v6 的线性原子迁移，v6 新增 Volume `object_placements`，不从旧中心
-  durability 行推导凭证。其他
-  `application_id`、schema 版本、未知表或 record format 均失败关闭，不做双读或回退。
-- Volume-bound Agent Registry 使用独立 `agent-registry.sqlite3`/`agent-registry.lock`，与 R1
-  authority 在同一单进程 `AuthorityStore` 中组合，不共享 SQLite 文件。审批决策的规范审计事件
-  嵌入同一 Registry CAS aggregate 并与决策原子持久化；Authority audit 表仅是后续兼容投影，
-  两个 SQLite 文件之间没有跨库事务承诺。G1 已将该 Registry 从 schema v6 原子迁移到 v7，加入
-  GatewayPool/Replica、credential 和 AgentRouteLease；这不改变 `authority.sqlite3` 的 user_version 6。
+- SQLite authority 独立使用 `authority.sqlite3`/`authority.lock`，不复用 Standalone 仓库格式 9；当前
+  clean-slate identity 为 `application_id = 0x4e454155`、`user_version = 12`。其他 application ID、
+  schema 版本、未知表或 record format 均失败关闭，不做迁移、双读或回退。
+- Volume-bound Agent Registry、GatewayPool/Replica、credential、AgentRouteLease、S3 和生命周期
+  表全部安装在同一 `authority.sqlite3`/`authority.lock`，并在一个 SQLite 事务内提交。当前
+  clean-slate schema identity 为 `application_id = 0x4e454155`、`user_version = 12`；旧数据库和
+  独立 Registry 文件直接拒绝，不做迁移、双读或字段推断。
 
 ### 3.3 质量基线
 
@@ -203,15 +201,15 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 ```bash
 cargo fmt --all -- --check
 bash .github/check-architecture.sh
-cargo run -p neoengram-protocol --example generate_schemas --offline
+cargo run -p neoengram-domain --example generate_schemas --offline
 cargo test --workspace --all-targets --offline
 cargo clippy --workspace --all-targets --offline -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --offline
-cargo package --locked --allow-dirty -p neoengram-core
+cargo package --locked --allow-dirty -p neoengram-domain
 cargo package --locked --allow-dirty --no-verify --exclude-lockfile -p neoengram
 ```
 
-Schema 命令确定性重建已提交的 `crates/neoengram-protocol/schemas/v1`。CI 在 Linux 运行 workspace
+Schema 命令确定性重建已提交的 `crates/neoengram-domain/schemas/current`。CI 在 Linux 运行 workspace
 `--all-features` 测试、Clippy、rustdoc 和 MSRV check；Linux、macOS、Windows 的通用矩阵运行默认
 feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 只检查 archive assembly。
 
@@ -221,7 +219,7 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 | --- | --- | --- |
 | 客户端数据面 | 工作区、Index、FastCDC/WholeFile Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
 | 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | SQLite adapter 继续收敛到 engine 分页 ports |
-| 中心/Agent | 迁移前 H2 双向 channel、Agent Ledger/outbound SQLite、mount probe、enrollment/AuthorityStore；Gateway ID/协议、Registry v7、管理 API/session/activation、Registry-driven outbound connector、H2/mTLS、RouteLease、命令签名、一跳 forwarding 和 Gateway-only Agent 配置；双 Replica 协议 harness 与 Registry 接管契约分别通过 | 完整 Central/Registry/outbox/签名双 Replica E2E、外部生产 issuer/KMS-HSM、真实集群 readiness/failover、切换验收、PostgreSQL HA/RLS、完整授权/调度 |
+| 中心/Agent | 迁移前 H2 双向 channel、统一 Agent state SQLite（Ledger/outbound）、mount probe、enrollment/AuthorityStore；Gateway ID/协议、Gateway Registry、管理 API/session/activation、Registry-driven outbound connector、H2/mTLS、RouteLease、命令签名、一跳 forwarding 和 Gateway-only Agent 配置；双 Replica 协议 harness 与 Registry 接管契约分别通过 | 完整 Central/Registry/outbox/签名双 Replica E2E、外部生产 issuer/KMS-HSM、真实集群 readiness/failover、切换验收、PostgreSQL HA/RLS、完整授权/调度 |
 | Managed 数据面 | Agent 扫描并将 Chunk 写入 Volume CAS，ObjectReceipt 绑定 placement generation，Server 无 payload | 跨 Volume 短期 ticket、断点续传、对象生命周期和 GC 编排 |
 | 读取面 | checkout、权限快照和固定 Commit FUSE | Snapshot、Shard 分页、mount lease、训练读取票据 |
 | 安全治理 | 本地路径安全、OIDC/JWKS、已注册接口的默认拒绝 RBAC、租户隐藏和 enrollment proof | RLS、完整资源授权/审计、密钥轮换和生产威胁模型 |
@@ -241,7 +239,7 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 2. **没有跨 Volume 对象同步**：本 Volume CAS 写入、复核和 placement evidence 已实现，但尚无
    source/destination route、短期 ticket、断点续传、fetch/clone/push/pull。
 3. **文件语义不完整**：当前模型未保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。
-4. **规模热点仍存在**：Standalone 的部分 SQLite/worktree compatibility view 和 GC 仍可能物化完整索引或引用集；
+4. **规模热点仍存在**：Standalone 的部分 SQLite/worktree workspace snapshot 和 GC 仍可能物化完整索引或引用集；
    loose object 目录仍是平铺扫描，完整文件缓存没有 quota/lease；远端分页、租约和 GC 尚未实现。
 5. **历史能力有限**：单 parent Commit 可由不同 Playground 形成树，但没有命名分支、merge、
    rebase、tag 和 reflog。
@@ -260,15 +258,15 @@ P0 已冻结 production/runtime 的主要源码依赖方向：
 ```text
 neoengram CLI -> standalone -> engine <- agent
                      |          ^       ^
-                     +-> fs ----+    protocol <- neoengramd
+                     +-> fs ----+    protocol <- neoengram-central
                          ^             ^
                          +---- core ---+
 ```
 
-该简图不枚举 CLI 对 core/engine 的直接类型导入；Agent 对 `neoengramd` 的 `dev-dependency` 只用于
+该简图不枚举 CLI 对 core/engine 的直接类型导入；Agent 对 `neoengram-central` 的 `dev-dependency` 只用于
 内存端到端组合测试，不属于生产依赖方向。
 
-Managed 的迁移前数据流是用户 API 经 `neoengram-server` 进入 `neoengramd`，中心经 `AuthorityStore`
+Managed 的迁移前数据流是用户 API 经 `neoengram-central` 进入 `neoengram-central`，中心经 `AuthorityStore`
 持久化 Job/Assignment，再通过 Agent 主动直连 Server 的 H2 session 下发。该单 Server/单 Agent 开发
 纵切曾经闭环；当前 Agent 配置已切到 Gateway-only，Gateway 控制面代码链已接入，loopback 双 Replica 网络
 listener/H2/peer harness 与真实 Registry RouteLease 接管契约已分别通过，但完整业务 E2E、真实集群
@@ -296,7 +294,7 @@ Agent 访问 Playground 和获批 Volume CAS，将结构化 metadata/placement e
 边界规则：
 
 - PostgreSQL 和 Managed Volume CAS 不作为 Standalone `MetadataStoreKind`/`ObjectStoreKind` 的简单枚举值。
-- 客户端只访问 `neoengram-server` 的版本化 API，不直连 `neoengramd`/PostgreSQL；只有获批
+- 客户端只访问 `neoengram-central` 的版本化 API，不直连 `neoengram-central`/PostgreSQL；只有获批
   Volume Owner Agent 能访问 Managed 对象根。
 - 服务端必须在 Index/ref CAS 前验证 Commit → Directory → Manifest → Object 的完整引用图。
 - 控制面负责认证、授权、元数据强一致、租约和审计；本 Volume 数据面由 Assignment generation
@@ -354,22 +352,22 @@ unavailable，禁止自动接管。
 
 交付：
 
-- Workspace 版本升级为 `0.2.0`、仓库升级为 format v8，并按 core/engine/fs/protocol/standalone/
-  agent/CLI/`neoengramd` 拆分；除 core 和 CLI 外均为 private package。
+- Workspace 版本升级为 `0.2.0`、仓库升级为仓库格式 9，并按 core/runtime/protocol/standalone/
+  agent/CLI/`neoengram-central` 拆分；除 core 和 CLI 外均为 private package。
 - core 冻结强类型 ID、逻辑路径、Manifest/Directory/Commit/FileRecord、分页 IndexDelta 和 canonical
   digest；保留既有有效内容域，只统一 IndexVersion 的后端无关算法。
 - engine 冻结 ports、每用例 Request/Result、`PreparedAdd`、错误分类、进度、故障注入和 mutation
   journal/receipt；Standalone 接管 SQLite、Repository、FUSE 与本地最终发布，CLI 成为唯一渲染层。
-- protocol v1 冻结资源/代次 ID、ControlEnvelope、完整 Add Assignment、MetadataBatch、
+- current wire protocol 冻结资源/代次 ID、strict Envelope、完整 Add Assignment、MetadataBatch、
   1 MiB/8 MiB/4096 限制、Schema、未知字段 round-trip 和 RFC 8785 JCS + BLAKE3 digest。
 - Agent 实现 ledger-first、同 digest 重放与不同 digest `JOB_ID_REUSED` 状态机；中心实现
   CreateAddJob、AssignJob、ReceiveReport、StageMetadataBatch、FinalizeAdd 及内存 ports/CAS。
 - 固定 Managed Add 闭环和存储权威：Agent 先将对象写入用户 Volume CAS 并执行 durability
   barrier，Server 再绑定 ObjectReceipt/placement generation、验证 MetadataBatch 并执行 IndexVersion CAS。
 
-验收：core/protocol golden 与 validator 测试、Agent/中心幂等和 CAS 组合测试、format v8 本地测试及
+验收：core/protocol golden 与 validator 测试、Agent/中心幂等和 CAS 组合测试、仓库格式 9 本地测试及
 架构依赖检查通过。P0 后续增加了独立 Fusen 用户 HTTP、Hyper Agent enrollment、OIDC/RBAC 与
-`neoengram-agentd` 纵切；PostgreSQL、Agent 生产 mTLS、跨 Volume 复制、NFS fencing、其余公开 API 与 HA
+`neoengram-agent` 纵切；PostgreSQL、Agent 生产 mTLS、跨 Volume 复制、NFS fencing、其余公开 API 与 HA
 仍不包含在当前实现中。
 
 ### G0：Synapse Gateway 架构冻结
@@ -389,7 +387,7 @@ unavailable，禁止自动接管。
 
 - 已完成 `GatewayPoolId`/`GatewayReplicaId`、Gateway 控制帧，以及 GatewayPool、GatewayReplica、
   AgentRouteLease 的协议/持久化模型；
-- 已完成 `GatewayRegistryRepository` 的 InMemory/SQLite v7、管理 API、受 `gateway.manage` 保护的
+- 已完成 `GatewayRegistryRepository` 的 InMemory/SQLite current schema、管理 API、受 `gateway.manage` 保护的
   显式 Replica activate action，以及一次性 activation token 的摘要存储、challenge/proof、防重放
   和 Pending -> Active CAS；Central 通过 Registry 持久化的 bootstrap endpoint 主动投递证书。
 - `GatewayActivationDependencies` 为 issuer/transport 提供显式 runtime 注入边界；生产
@@ -467,7 +465,7 @@ durability backend，Gateway 无对象持久副本。
 
 交付：
 
-- 为现有 `services/neoengramd` library 增加 transport、生产配置和独立 PostgreSQL adapter/migration；
+- 为现有 `services/neoengram-central` library 增加 transport、生产配置和独立 PostgreSQL adapter/migration；
   不共享 SQLite SQL、migration 或物理 schema。
 - 表覆盖 tenants、projects、artifacts、refs、commits、directories、manifests、object catalog、
   role bindings、sessions、snapshots、leases/holds 和 append-only audit。
@@ -737,7 +735,7 @@ source locator、sidecar 私密字段和数据内容不得进入审计或普通�
 
 ## 10. 协议级接口与首版设计目标
 
-协议阶段固定以下概念，具体 HTTP 路径和序列化字段在 `neoengram-protocol` 中定义：
+协议阶段固定以下概念，具体 HTTP 路径和序列化字段在 `neoengram-domain::protocol` 中定义：
 
 - `PrincipalContext`、`Authenticator`、`Authorizer`、`Action`、`ResourceScope`、`AuthorizationDecision`；
 - `PushSession`、`FetchSession`、`TransferRoute`、`TransferTicket`、`ObjectPlacementEvidence` 和
@@ -792,7 +790,7 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 - Core 契约：强类型 ID、Manifest/Directory/Commit/Index canonical golden、NFC/保留名/前缀冲突、
   IndexDelta 排序分页和非法引用。
 - Engine/Standalone：结构化 Request/Result、PreparedAdd candidate、错误分类/进度、mutation journal
-  顺序、format v8 SQLite、对象完整性、Index/HEAD CAS、固定锁序、恢复和路径安全。
+  顺序、仓库格式 9 SQLite、对象完整性、Index/HEAD CAS、固定锁序、恢复和路径安全。
 - FUSE 契约：inode/cookie、跨 Chunk range read、LRU/single-flight、只读错误码、固定 Commit、信号和 mount table 卸载验证。
 - 本地竞态：shared/shared 成功，shared/exclusive 拒绝；add 暂停期间工作区 mutation 被拒绝，
   index-only 更新使 add CAS 失败，status/diff 不输出跨版本报告。
@@ -803,11 +801,11 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 - 组件组合：create job -> assignment -> ledger -> prepared -> durable Volume placements -> complete Batch ->
   expected IndexVersion CAS -> decision/finalized；在各边界重复投递，并覆盖 Job digest reuse、缺页、
   缺失/陈旧/伪造 placement evidence 和 CAS conflict。
-- 架构检查：protocol 不含 engine/fs/SQLite/HTTP，Agent library 不依赖 standalone，`neoengramd` 不依赖
-  engine/fs 并保持 library-only；`neoengram-server -> neoengramd -> protocol/core` 与
-  `neoengram-agentd -> neoengram-agent/protocol`，controller/service 不访问 SQLx，controller 不绕过
-  service，CLI 之外没有终端输出。新增 Gateway 后还必须验证其只依赖 protocol/core 与网络/安全组件，
-  不依赖 authority datasource、engine/fs/standalone 或 Volume adapter。
+- 架构检查：domain 不含 runtime/SQLite/HTTP，Agent 不依赖 standalone，`neoengram-central` 统一承载
+  authority 与 HTTP bounded contexts；`neoengram-central -> domain/runtime` 与
+  `neoengram-agent -> domain/runtime`，controller/service 不绕过
+  service，CLI 之外没有终端输出。新增 Gateway 后还必须验证其只依赖 domain 与网络/安全组件，
+  不依赖 authority datasource、runtime/standalone 或 Volume adapter。
 - Gateway 协议与 HA：Schema/golden、帧大小、deadline、重复帧、错误映射、H2 背压、双 Replica 唯一
   Agent owner、最多一跳 forwarding、租约过期与新 generation fencing。
 - Gateway 安全：错误 URI SAN、跨集群证书、过期/撤销证书、peer credential directory 缺失/过期/旧
@@ -845,7 +843,7 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 - 规模基准：路径数、Chunk 数、Manifest/Shard 大小、峰值 RSS、吞吐、写放大、恢复时间和 SLO。
 - 发布门槛：fmt、Clippy `-D warnings`、rustdoc、全量测试、三平台 CI，以及两个 `.crate` 的 README、
   MIT/Apache-2.0 许可证和 metadata 检查；远端阶段另需 migration dry-run、灾备演练和安全审计。
-  `neoengram-core` 使用 locked package 归档检查；CLI 因依赖 workspace-private engine/standalone，当前
+  `neoengram-domain` 使用 locked package 归档检查；CLI 因依赖 workspace-private runtime/standalone，当前
   `--exclude-lockfile` 检查只证明归档可组装及内容正确，不证明 crates.io 解析或 registry 安装能力。
 
 ## 13. 文档维护规则
@@ -876,7 +874,7 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-24 | 冻结 Artifact、Commit、Playground、Snapshot 术语，并将 Agent 临时上传结果改称 MetadataBatch | Artifact 只表示版本化抽象文件系统，避免与 Job 输出重名；读写和只读视图具有明确边界 |
 | 2026-07-24 | 冻结 ArtifactPlacement、同租户多 Artifact/Volume 和单 Volume RW Owner 约束 | 避免同一 NFS 上多 Agent 写入与 hardlink/根目录重叠；更换 NFS 必须走可恢复迁移状态机 |
 | 2026-07-24 | 在跨集群总图中把每个集群分为系统组件、居中 NFS、业务 Pod 三区，并补充 PodMountBinding | 保留 Pod 精确视图挂载与基础设施边界；当时的 NFS object-root/Gateway 假设先被 2026-07-26 中心 S3 决策取代，该中心 S3 决策又被 2026-08-06 Volume-local CAS 决策取代 |
-| 2026-07-26 | 完成 `0.2.0` P0 crate/protocol/state-machine 改造并升级 format v8 | core 统一 typed IDs/canonical digest；CLI/Standalone/engine/fs 分层；Agent/中心提供无网络内存组合测试 |
+| 2026-07-26 | 完成 `0.2.0` P0 crate/protocol/state-machine 改造并升级仓库格式 9 | core 统一 typed IDs/canonical digest；CLI/Standalone/runtime 分层；Agent/中心提供无网络内存组合测试 |
 | 2026-07-26 | 将 Managed 对象 durability authority 固定为中心 S3，NFS 仅放 Playground/journal/cache（已被 2026-08-06 决策取代） | 当时要求 Finalize 经过 missing upload、中心 durability、MetadataBatch 完整性和 IndexVersion CAS；不再代表当前或未来架构 |
 | 2026-07-27 | 合并 R1.1/R1.2，完成 `AuthorityStore` 与默认 SQLite 中心权威后端 | 全部中心端口可跨重开恢复并运行同一后端契约；SQLite 限单进程且无 RLS/HA，PG/MySQL 后端保持独立 schema/migration |
 | 2026-07-30 | 基于 Web Mock 冻结中心化 Agent 产品定义 | Artifact 无固定放置；Commit 只从 Playground 发起；用户界面仅展示 Commit/Tags；Snapshot 固定单 Region/Volume；Pre-commit 与 Playground 主可用性正交 |

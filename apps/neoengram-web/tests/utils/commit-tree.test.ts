@@ -13,6 +13,7 @@ function commit(
     ...(parentCommitId ? { parent_commit_id: parentCommitId } : {}),
     message: commitId,
     tag_names: [],
+    data_layout: 'fast_cdc',
     created_at_unix_ms: createdAtUnixMs,
   };
 }

@@ -1,7 +1,7 @@
 # NeoEngram Public OpenAPI
 
 [`neoengram-api.yaml`](neoengram-api.yaml) 是面向用户、CLI 和 UI 的公开 API 设计契约。
-`neoengramd` 保持 library-only，独立的 `neoengram-server` 使用 Fusen 0.9.0 提供可监听 HTTP server。
+`neoengram-central` 是唯一 Central 进程，使用 Fusen 0.9.0 提供可监听 HTTP API。
 默认配置注册当前已实现的 system、Tenant、StorageVolume、Artifact、Playground、Snapshot 和 Job
 action API：
 
@@ -59,8 +59,7 @@ Volume，也不把 Gateway 变成 metadata 或 Chunk authority。跨集群 Trans
 启用 Agent enrollment 时，同一 Fusen 用户 listener 还注册 token create、enrollment list/query、approve
 和 reject 五个公开管理接口。另一份 OpenAPI 3.1 契约
 [`neoengram-agent-api.yaml`](neoengram-agent-api.yaml) 定义 Gateway 内部转发使用的 Agent action
-边界；它不是公开 Web API。生产目标中 Agent 只连接本集群 Gateway，Central 不暴露 Agent listener。
-`--agent-bind` 对应的独立 Hyper listener 仅限 loopback 迁移测试。Agent 契约同样采用模块/子域/动作
+边界；它不是公开 Web API。Agent 只连接本集群 Gateway，Central 不暴露 Agent listener。Agent 契约同样采用模块/子域/动作
 命名，全部使用 POST，所有资源 ID 均位于 JSON body：
 
 ```text
@@ -69,7 +68,6 @@ POST /agent/enrollment/status/query
 POST /agent/session/open
 POST /agent/session/channel/open
 POST /agent/session/heartbeat/report
-POST /agent/session/message/list/query
 POST /agent/job/report/create
 POST /agent/job/metadata/batch/stage
 POST /agent/job/metadata/page/stage
@@ -166,16 +164,16 @@ Agent API 不属于公开 Web OpenAPI。开发控制链路由 Agent 主动发起
 `POST /agent/session/channel/open`，使用 HTTP/2 全双工 `application/x-ndjson` 流。H2 DATA 边界没有
 协议语义；每个 JSON 帧以 LF 结束且正文最多 1 MiB。首个上行帧固定为 `channel.open`，首个下行帧
 固定为相关联的 `channel.opened`。每个上行帧都独立携带 Ed25519 proof，并绑定完整 identity、session
-fence、sequence、message ID、correlation、type 和 payload。原有短轮询 action 保留为兼容与人工恢复
-入口，不进入 daemon 主运行链路；MetadataBatch 分页、对象传输和重放规则由以下契约定义：
+fence、sequence、message ID、correlation、type 和 payload。MetadataBatch 分页、对象传输和重放规则
+由以下契约定义：
 
 - [`neoengram-agent-api.yaml`](neoengram-agent-api.yaml)
 - [`../agent-central-control.md`](../agent-central-control.md)
-- [`../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json`](../../crates/neoengram-protocol/schemas/v1/control-envelope.schema.json)
-- [`../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json`](../../crates/neoengram-protocol/schemas/v1/metadata-batch.schema.json)
+- [`../../crates/neoengram-domain/schemas/current/control-envelope.schema.json`](../../crates/neoengram-domain/schemas/current/control-envelope.schema.json)
+- [`../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json`](../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json)
 
 `AssignJob`、`ExpireAddJob` 和 `ResumePublication` 是中心调度/恢复内部方法，不得加入公开 OpenAPI。
-Storage Enrollment 公开 DTO 同样不得暴露 CSR、公私钥、证书、bootstrap/poll credential、PVC UID、
+Storage Enrollment 公开 DTO 同样不得暴露 CSR、公私钥、证书、bootstrap credential、PVC UID、
 CSI handle、fsid/device、mount path/options/fingerprint、AgentId、AgentMountId、ComputeNodeId、session
 或 credential generation、heartbeat/job/assignment，以及 tenant owner、lease 或 fencing 信息。
 
@@ -188,11 +186,15 @@ npm ci
 npm run lint
 npm run bundle
 npm run test:contract
+cargo run --locked --offline -p neoengram-domain --example export_action_registry
 ```
 
 `bundle` 只在仓库 `target/openapi/` 下生成 public/Agent JSON 检查产物，不提交生成文件；`test:contract`
-基于这些 bundle 校验公开路径、认证与版本头、状态映射、示例、u64 编码、ready-only 放置、独立
+会调用 `neoengram-domain` 的 action registry 导出器，以同一份 method/path/operationId 清单校验
+public OpenAPI 和 Agent OpenAPI。`x-neoengram-central-route: false` 明确表示当前仅由 Web mock 提供、
+尚未安装到 Central 的契约动作；除此以外的公开动作必须出现在编译后的 Central controller descriptor。
+检查同时基于 bundle 校验认证与版本头、状态映射、示例、u64 编码、ready-only 放置、独立
 Snapshot 身份、Pre-commit 会话/attempt 语义、内部 Head CAS、Storage Enrollment token/审批边界、
 Artifact 初始化模型和所有公开资源视图的脱敏边界；同时固定 Agent action 路径、body-only 输入、H2
-full-duplex 主控制 channel 和 compatibility-only message-list poll。
+full-duplex 主控制 channel。
 CI 会按以上顺序运行相同命令。

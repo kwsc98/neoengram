@@ -90,6 +90,9 @@ spec:
                   name: synapse-gateway-config-gateway-pool-example
                   key: SYNAPSE_GATEWAY_WORKLOAD_TRUST_DOMAIN
           ports:
+            - name: public
+              containerPort: 8080
+              protocol: TCP
             - name: agent
               containerPort: 8081
               protocol: TCP
@@ -135,6 +138,9 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
           volumeMounts:
+            - name: public-tls
+              mountPath: /var/run/secrets/synapse-gateway/public
+              readOnly: true
             - name: listener-tls
               mountPath: /var/run/secrets/synapse-gateway/listener
               readOnly: true
@@ -147,6 +153,10 @@ spec:
               mountPath: /var/run/secrets/synapse-gateway/workload
               readOnly: false
       volumes:
+        - name: public-tls
+          secret:
+            secretName: synapse-gateway-public-tls-gateway-pool-example
+            defaultMode: 0440
         - name: listener-tls
           secret:
             secretName: synapse-gateway-identity-gateway-pool-example-r0
@@ -248,6 +258,9 @@ spec:
                   name: synapse-gateway-config-gateway-pool-example
                   key: SYNAPSE_GATEWAY_WORKLOAD_TRUST_DOMAIN
           ports:
+            - name: public
+              containerPort: 8080
+              protocol: TCP
             - name: agent
               containerPort: 8081
               protocol: TCP
@@ -293,6 +306,9 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
           volumeMounts:
+            - name: public-tls
+              mountPath: /var/run/secrets/synapse-gateway/public
+              readOnly: true
             - name: listener-tls
               mountPath: /var/run/secrets/synapse-gateway/listener
               readOnly: true
@@ -303,6 +319,10 @@ spec:
               mountPath: /var/run/secrets/synapse-gateway/workload
               readOnly: false
       volumes:
+        - name: public-tls
+          secret:
+            secretName: synapse-gateway-public-tls-gateway-pool-example
+            defaultMode: 0440
         - name: listener-tls
           secret:
             secretName: synapse-gateway-identity-gateway-pool-example-r1

@@ -21,6 +21,7 @@ import {
   queryPlaygroundPreCommit,
   queryProjectList,
   querySnapshot,
+  querySnapshotDelivery,
   querySnapshotActivityList,
   querySnapshotDatasetProfile,
   querySnapshotFileList,
@@ -88,7 +89,6 @@ describe('tenant-scoped public resource operations', () => {
       tenant_id: 'tenant-test',
       display_name: '测试租户',
       description: 'Vitest tenant',
-      extension_mode: 'future',
     };
     expect((await createTenant(request)).data.replayed).toBe(false);
     expect((await createTenant(request)).data.replayed).toBe(true);
@@ -319,6 +319,7 @@ describe('tenant-scoped public resource operations', () => {
       playground_id: playground.playground_id,
       precommit_request_id: 'precommit-head-conflict',
       expected_index_version: playground.index_version,
+      data_layout: 'fast_cdc' as const,
     });
     const ready = await waitForPreCommitTerminal(
       playground.tenant_id,
@@ -344,6 +345,7 @@ describe('tenant-scoped public resource operations', () => {
         commit_request_id: 'commit-head-conflict',
         precommit_id: ready.precommit_id,
         expected_candidate_index_version: ready.candidate_index_version,
+        data_layout: 'fast_cdc',
         message: '此提交必须被 CAS 拒绝',
       }),
     ).rejects.toMatchObject({ status: 409, code: 'HEAD_COMMIT_CONFLICT' });
@@ -445,6 +447,7 @@ describe('tenant-scoped public resource operations', () => {
         playground_id: 'review',
         precommit_request_id: 'precommit-evaluation-not-ready',
         expected_index_version: createdPlayground.data.playground.index_version,
+        data_layout: 'fast_cdc',
       }),
     ).rejects.toMatchObject({
       status: 409,
@@ -481,6 +484,7 @@ describe('tenant-scoped public resource operations', () => {
       playground_id: 'labeling',
       precommit_request_id: 'precommit-request-test',
       expected_index_version: readyPlayground.index_version,
+      data_layout: 'fast_cdc',
     });
     expect(startedPreCommit.data.precommit.state).toBe('running');
     const readyPreCommit = await waitForPreCommitTerminal(
@@ -498,6 +502,7 @@ describe('tenant-scoped public resource operations', () => {
       commit_request_id: 'commit-request-test',
       precommit_id: readyPreCommit.precommit_id,
       expected_candidate_index_version: readyPreCommit.candidate_index_version,
+      data_layout: 'fast_cdc' as const,
       message: '建立跨区域评测基线',
       description: '记录评测集初始导入范围和质量检查结果。',
       tag_names: ['test-baseline', 'test-evaluation/v1'],
@@ -529,6 +534,7 @@ describe('tenant-scoped public resource operations', () => {
       playground_id: 'labeling',
       precommit_request_id: 'precommit-duplicate-tag',
       expected_index_version: readyPlayground.index_version,
+      data_layout: 'fast_cdc',
     });
     const duplicateReady = await waitForPreCommitTerminal(
       'tenant-a',
@@ -541,6 +547,7 @@ describe('tenant-scoped public resource operations', () => {
         commit_request_id: 'commit-request-duplicate-tag',
         precommit_id: duplicateReady.precommit_id,
         expected_candidate_index_version: duplicateReady.candidate_index_version,
+        data_layout: 'fast_cdc' as const,
         message: '重复使用 Tag',
         tag_names: ['test-baseline'],
       }),
@@ -557,7 +564,7 @@ describe('tenant-scoped public resource operations', () => {
     const firstSnapshot = await createSnapshot(snapshotRequest);
     expect(firstSnapshot.data.replayed).toBe(false);
     expect(firstSnapshot.data.placement_reused).toBe(false);
-    expect(firstSnapshot.data.snapshot.state).toBe('creating');
+    expect(firstSnapshot.data.snapshot.state).toBe('ready');
     expect((await createSnapshot(snapshotRequest)).data.replayed).toBe(true);
     const reusedPlacement = await createSnapshot({
       ...snapshotRequest,
@@ -566,21 +573,12 @@ describe('tenant-scoped public resource operations', () => {
     expect(reusedPlacement.data.replayed).toBe(false);
     expect(reusedPlacement.data.placement_reused).toBe(true);
     expect(reusedPlacement.data.snapshot.snapshot_id).toBe(firstSnapshot.data.snapshot.snapshot_id);
-    const creatingSnapshot = (
-      await querySnapshot(snapshotRequest.tenant_id, firstSnapshot.data.snapshot.snapshot_id)
-    ).data.snapshot;
-    expect(creatingSnapshot).toMatchObject({
-      region: 'cn-guangzhou',
-      state: 'creating',
-      phase: 'materializing',
-      integrity: { state: 'pending' },
-    });
     const readySnapshot = (
       await querySnapshot(snapshotRequest.tenant_id, firstSnapshot.data.snapshot.snapshot_id)
     ).data.snapshot;
     expect(readySnapshot).toMatchObject({
+      region: 'cn-guangzhou',
       state: 'ready',
-      phase: 'idle',
       integrity: { state: 'verified' },
     });
 
@@ -607,6 +605,7 @@ describe('tenant-scoped public resource operations', () => {
       playground_id: 'occlusion-audit',
       precommit_request_id: 'precommit-fail-validation',
       expected_index_version: abnormalPlayground.index_version,
+      data_layout: 'fast_cdc',
     });
     expect(failing.data.precommit.state).toBe('running');
     const abnormal = (
@@ -653,6 +652,7 @@ describe('tenant-scoped public resource operations', () => {
       playground_id: 'labeling',
       precommit_request_id: 'precommit-metadata-ready',
       expected_index_version: playground.index_version,
+      data_layout: 'fast_cdc',
     });
     const observedPhases = [started.data.precommit.phase];
     let ready = started.data.precommit;
@@ -713,39 +713,37 @@ describe('tenant-scoped public resource operations', () => {
     expect(profile.data.profile.state).toBe('ready');
   });
 
-  it('retries Snapshot delivery and gates file browsing on Ready state', async () => {
+  it('retries an independent Snapshot delivery and gates file browsing on Snapshot state', async () => {
     const retry = await retrySnapshotDelivery({
       tenant_id: 'tenant-a',
-      snapshot_id: 'snap-road-main2-sha-01',
-      retry_request_id: 'retry-snapshot-main2-01',
+      delivery_id: 'delivery-snapshot-main3-01',
+      request_id: 'retry-snapshot-main3-01',
     });
-    expect(retry.data.snapshot).toMatchObject({ state: 'creating', phase: 'materializing' });
+    expect(retry.data.delivery).toMatchObject({ state: 'requested' });
     expect(
       (
         await retrySnapshotDelivery({
           tenant_id: 'tenant-a',
-          snapshot_id: 'snap-road-main2-sha-01',
-          retry_request_id: 'retry-snapshot-main2-01',
+          delivery_id: 'delivery-snapshot-main3-01',
+          request_id: 'retry-snapshot-main3-01',
         })
       ).data.replayed,
     ).toBe(true);
 
-    const firstRetryQuery = await querySnapshot('tenant-a', 'snap-road-main2-sha-01');
-    expect(firstRetryQuery.data.snapshot).toMatchObject({
-      state: 'creating',
-      phase: 'materializing',
-      integrity: { state: 'pending' },
+    const firstRetryQuery = await querySnapshotDelivery({
+      tenant_id: 'tenant-a',
+      delivery_id: 'delivery-snapshot-main3-01',
     });
+    expect(firstRetryQuery.data.delivery).toMatchObject({ state: 'requested' });
     await expect(
       querySnapshotFileList({
         tenant_id: 'tenant-a',
         snapshot_id: 'snap-road-main2-sha-01',
       }),
     ).rejects.toMatchObject({ status: 409, code: 'SNAPSHOT_NOT_READY' });
-    const completedRetry = await querySnapshot('tenant-a', 'snap-road-main2-sha-01');
-    expect(completedRetry.data.snapshot).toMatchObject({
+    const unchangedSnapshot = await querySnapshot('tenant-a', 'snap-road-main3-sha-01');
+    expect(unchangedSnapshot.data.snapshot).toMatchObject({
       state: 'ready',
-      phase: 'idle',
       integrity: { state: 'verified' },
     });
 

@@ -22,14 +22,15 @@ import {
   queryPlaygroundFileMetadata,
   startPlaygroundPreCommit,
 } from '@/api/operations';
-import type { PlaygroundChangeEntry, StartPreCommitRequest } from '@/api/types';
+import type { DataLayout, PlaygroundChangeEntry, StartPreCommitRequest } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import {
+  supportsCommitLayoutSelection,
+  supportsArtifactCommitGraph,
   supportsPlaygroundBrowser,
   supportsPlaygroundPreCommit,
-  supportsResourceBrowser,
 } from '@/features/capabilities';
 import {
   isPlaygroundOperational,
@@ -72,6 +73,7 @@ const fileCursor = ref<string>();
 const fileCursorHistory = ref<string[]>([]);
 const metadataDrawerOpen = ref(false);
 const selectedFilePath = ref('');
+const selectedDataLayout = ref<DataLayout>('fast_cdc');
 const pendingStartRequest = ref<StartPreCommitRequest>();
 
 const versionQuery = useQuery({
@@ -85,10 +87,11 @@ const playgroundBrowserEnabled = computed(() =>
 const playgroundPreCommitEnabled = computed(() =>
   supportsPlaygroundPreCommit(versionQuery.data.value?.data.capabilities),
 );
-// Commit graph and Snapshot links remain behind the legacy aggregate capability
-// until those authority APIs are independently advertised.
-const resourceBrowserEnabled = computed(() =>
-  supportsResourceBrowser(versionQuery.data.value?.data.capabilities),
+const commitLayoutSelectionEnabled = computed(() =>
+  supportsCommitLayoutSelection(versionQuery.data.value?.data.capabilities),
+);
+const artifactCommitGraphEnabled = computed(() =>
+  supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
 );
 const playgroundQuery = useQuery({
   queryKey: playgroundKey,
@@ -348,6 +351,7 @@ async function startPreCommit(): Promise<void> {
     playground_id: playgroundId.value,
     precommit_request_id: `precommit-request-${globalThis.crypto.randomUUID()}`,
     expected_index_version: current.index_version,
+    data_layout: commitLayoutSelectionEnabled.value ? selectedDataLayout.value : 'fast_cdc',
   };
   try {
     await startMutation.mutateAsync(pendingStartRequest.value);
@@ -364,7 +368,7 @@ async function startPreCommit(): Promise<void> {
 }
 
 async function openHeadCommit(): Promise<void> {
-  if (!resourceBrowserEnabled.value || !playground.value?.head_commit_id) return;
+  if (!artifactCommitGraphEnabled.value || !playground.value?.head_commit_id) return;
   await router.push({
     name: 'artifact-detail',
     params: { tenantId: tenantId.value, projectId: projectId.value, artifactId: artifactId.value },
@@ -381,16 +385,7 @@ async function openHeadCommit(): Promise<void> {
     >
       <template #actions>
         <el-button
-          v-if="canStartPreCommit"
-          type="primary"
-          :icon="Check"
-          :loading="startMutation.isPending.value"
-          @click="startPreCommit"
-        >
-          发起 Pre-commit
-        </el-button>
-        <el-button
-          v-else-if="playgroundPreCommitEnabled && playground?.active_precommit_id"
+          v-if="playgroundPreCommitEnabled && playground?.active_precommit_id"
           type="primary"
           plain
           @click="openCommitPage"
@@ -613,8 +608,33 @@ async function openHeadCommit(): Promise<void> {
           </p>
           <p v-else>需要生命周期为已物化且存储可达，才能执行依赖 Agent 的操作。</p>
         </div>
+        <div
+          v-if="
+            !playground.active_precommit_id && playgroundOperational && commitLayoutSelectionEnabled
+          "
+          class="precommit-layout"
+        >
+          <span>数据布局</span>
+          <el-segmented
+            v-model="selectedDataLayout"
+            :options="[
+              { label: 'FastCDC', value: 'fast_cdc' },
+              { label: 'WholeFile', value: 'whole_file' },
+            ]"
+            :disabled="startMutation.isPending.value"
+          />
+        </div>
         <el-button v-if="playground.active_precommit_id" type="primary" @click="openCommitPage">
           查看状态
+        </el-button>
+        <el-button
+          v-else-if="canStartPreCommit"
+          type="primary"
+          :icon="Check"
+          :loading="startMutation.isPending.value"
+          @click="startPreCommit"
+        >
+          发起 Pre-commit
         </el-button>
       </section>
 
@@ -1007,7 +1027,7 @@ async function openHeadCommit(): Promise<void> {
 
 .precommit-band {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
+  grid-template-columns: 34px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 14px;
   margin: 14px 0 18px;
@@ -1031,6 +1051,17 @@ async function openHeadCommit(): Promise<void> {
 .precommit-band p {
   display: block;
   margin: 0;
+}
+
+.precommit-layout {
+  display: grid;
+  gap: 6px;
+  min-width: 250px;
+}
+
+.precommit-layout > span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .precommit-band p {
@@ -1207,6 +1238,10 @@ async function openHeadCommit(): Promise<void> {
 
   .precommit-band > svg {
     display: none;
+  }
+
+  .precommit-layout {
+    min-width: 0;
   }
 
   .playground-summary,

@@ -9,6 +9,7 @@ pdb="$manifest_dir/pdb.yaml"
 network_policy="$manifest_dir/networkpolicy.yaml"
 identity_secrets="$manifest_dir/secret.example.yaml"
 activation_secrets="$manifest_dir/activation-secret.example.yaml"
+public_tls_secret="$manifest_dir/public-tls-secret.example.yaml"
 kustomization="$manifest_dir/kustomization.yaml"
 readme="$manifest_dir/README.md"
 
@@ -37,6 +38,7 @@ for file in \
   "$network_policy" \
   "$identity_secrets" \
   "$activation_secrets" \
+  "$public_tls_secret" \
   "$kustomization"; do
   [[ -f "$file" ]] || fail "missing $file"
   rg -q '^apiVersion: ' "$file" || fail "$file has no apiVersion"
@@ -59,10 +61,12 @@ if command -v ruby >/dev/null 2>&1; then
     end
   ' \
     "$deployments" "$services" "$config" "$pdb" "$network_policy" \
-    "$identity_secrets" "$activation_secrets" "$kustomization" || fail "YAML parsing failed"
+    "$identity_secrets" "$activation_secrets" "$public_tls_secret" "$kustomization" || \
+      fail "YAML parsing failed"
 fi
 
-for resource in configmap.yaml secret.example.yaml activation-secret.example.yaml \
+for resource in configmap.yaml public-tls-secret.example.yaml secret.example.yaml \
+  activation-secret.example.yaml \
   deployment.yaml service.yaml pdb.yaml networkpolicy.yaml; do
   rg -q "^[[:space:]]+- ${resource}$" "$kustomization" || \
     fail "kustomization.yaml is missing ${resource}"
@@ -139,6 +143,18 @@ rg -q '^  SYNAPSE_GATEWAY_TLS_PRIVATE_KEY_FILE: /var/run/secrets/synapse-gateway
   "$config" || fail "Gateway listener private-key path is missing or inconsistent"
 rg -q '^  SYNAPSE_GATEWAY_TLS_CLIENT_CA_FILE: /var/run/secrets/synapse-gateway/listener/ca\.crt$' \
   "$config" || fail "Gateway workload CA path is missing or inconsistent"
+rg -q '^  SYNAPSE_GATEWAY_PUBLIC_LISTEN: 0\.0\.0\.0:8080$' "$config" || \
+  fail "Gateway public listener must be explicitly enabled on port 8080"
+rg -q '^  SYNAPSE_GATEWAY_PUBLIC_TLS_CERTIFICATE_FILE: /var/run/secrets/synapse-gateway/public/tls\.crt$' \
+  "$config" || fail "Gateway public certificate path is missing or inconsistent"
+rg -q '^  SYNAPSE_GATEWAY_PUBLIC_TLS_PRIVATE_KEY_FILE: /var/run/secrets/synapse-gateway/public/tls\.key$' \
+  "$config" || fail "Gateway public private-key path is missing or inconsistent"
+for setting in SYNAPSE_GATEWAY_CONSOLE_HOST SYNAPSE_GATEWAY_S3_HOST \
+  SYNAPSE_GATEWAY_WEB_ROOT SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM SYNAPSE_GATEWAY_S3_MAX_STREAMS; do
+  rg -q "^  ${setting}: " "$config" || fail "Gateway public setting ${setting} is missing"
+done
+rg -q '^  SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM: https://[^/]+:8080$' "$config" || \
+  fail "Gateway Central upstream must be a private origin-form HTTPS URL"
 
 expect_count 2 '^type: kubernetes\.io/tls$' "$identity_secrets"
 expect_count 2 '^  tls\.crt: \|$' "$identity_secrets"
@@ -148,6 +164,17 @@ expect_count 2 '^type: Opaque$' "$activation_secrets"
 expect_count 2 '^  activation-token: \|$' "$activation_secrets"
 expect_count 2 '^immutable: true$' "$identity_secrets"
 expect_count 2 '^immutable: true$' "$activation_secrets"
+expect_count 1 '^kind: Secret$' "$public_tls_secret"
+expect_count 1 '^  name: synapse-gateway-public-tls-gateway-pool-example$' "$public_tls_secret"
+expect_count 1 '^type: kubernetes\.io/tls$' "$public_tls_secret"
+expect_count 1 '^  tls\.crt: \|$' "$public_tls_secret"
+expect_count 1 '^  tls\.key: \|$' "$public_tls_secret"
+expect_count 1 '^immutable: true$' "$public_tls_secret"
+
+expect_count 2 '^            - name: public$' "$deployments"
+expect_count 2 '^              containerPort: 8080$' "$deployments"
+expect_count 2 '^              mountPath: /var/run/secrets/synapse-gateway/public$' "$deployments"
+expect_count 2 '^            secretName: synapse-gateway-public-tls-gateway-pool-example$' "$deployments"
 
 # Only a bounded, memory-backed certificate delivery directory is writable. Gateway must never
 # receive a business Volume, durable PVC, host path, storage adapter, or object payload mount.
@@ -158,7 +185,7 @@ if rg -n 'persistentVolumeClaim:|hostPath:|nfs:|csi:|claimName:|mountPath: /(vol
   "$deployments"; then
   fail "Gateway must not mount a business Volume, PVC, host path, NFS export, or CAS path"
 fi
-if rg -n 'neoengram-(engine|fs|standalone|agentd|server)|neoengramd|fusen|sql' "$config"; then
+if rg -n 'neoengram-(engine|fs|standalone|agentd|server)|neoengram-central|fusen|sql' "$config"; then
   fail "Gateway runtime configuration contains a forbidden architecture dependency"
 fi
 
@@ -169,6 +196,9 @@ expect_count 2 '^  publishNotReadyAddresses: true$' "$services"
 for port in agent control peer; do
   rg -q "^    - name: ${port}$" "$services" || fail "Gateway Services are missing ${port}"
 done
+expect_count 1 '^    - name: public$' "$services"
+expect_count 1 '^      port: 443$' "$services"
+expect_count 1 '^      targetPort: public$' "$services"
 rg -q '^  minAvailable: 1$' "$pdb" || fail "Gateway PDB must preserve one replica"
 rg -Uq '^  selector:\n    matchLabels:\n      app\.kubernetes\.io/name: synapse-gateway$' "$pdb" || \
   fail "Gateway PDB selector indentation is invalid"
@@ -180,18 +210,24 @@ rg -q 'neoengram\.io/control-plane: "true"' "$network_policy" || \
   fail "Central ingress must be namespace-scoped"
 rg -q 'neoengram\.io/gateway-plane: "true"' "$network_policy" || \
   fail "peer traffic must be namespace-scoped"
-for port in 8081 8082 8083; do
+rg -q 'neoengram\.io/public-ingress: "true"' "$network_policy" || \
+  fail "public ingress must be namespace-scoped"
+rg -q 'neoengram\.io/gateway-public-ingress: "true"' "$network_policy" || \
+  fail "public ingress must be pod-scoped"
+rg -q 'app\.kubernetes\.io/name: neoengram-central' "$network_policy" || \
+  fail "Central egress must be pod-scoped"
+for port in 8080 8081 8082 8083; do
   rg -q "port: ${port}$" "$network_policy" || \
     fail "NetworkPolicy is missing listener port ${port}"
 done
-if rg -n 'central_endpoint|neoengram-server|neoengram-central' "$config" "$deployments"; then
+if rg -n 'central_endpoint|neoengram-central|neoengram-central' "$config" "$deployments"; then
   fail "Gateway manifests must not configure a static Agent-to-Central fallback"
 fi
 
 # These files are intentionally unusable as a production activation bundle until a renderer and
 # external provisioner replace all placeholders and implement Secret rotation.
 for file in "$deployments" "$services" "$config" "$pdb" "$network_policy" \
-  "$identity_secrets" "$activation_secrets"; do
+  "$identity_secrets" "$activation_secrets" "$public_tls_secret"; do
   rg -q 'neoengram.io/example-only: "external-provisioner-required"' "$file" || \
     fail "$file must remain marked example-only"
 done

@@ -20,6 +20,7 @@ async function expectNoOperatorDetails(page: Page) {
 }
 
 async function navigateFromSidebar(page: Page, label: string) {
+  await expect(page.locator('.app-shell')).toBeVisible();
   const mobileMenu = page.getByRole('button', { name: '打开导航' });
   if (await mobileMenu.isVisible()) {
     await mobileMenu.click();
@@ -90,6 +91,67 @@ test('selects the preferred Tenant and creates a new Tenant', async ({ page }, t
   await expect(page.getByText('当前筛选下没有 Artifact')).toBeVisible();
 });
 
+test('browses an S3 bucket and downloads an object through a presigned URL', async ({
+  page,
+}, testInfo) => {
+  let downloadedPath = '';
+  const s3Endpoint = `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? '4174'}`;
+  await page.route(`${s3Endpoint}/road-scenes-snapshot/**`, async (route) => {
+    downloadedPath = new URL(route.request().url()).pathname;
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/markdown',
+      headers: { 'Content-Disposition': 'attachment; filename="README.md"' },
+      body: '# Road scenes\n',
+    });
+  });
+
+  await page.goto('/tenants/tenant-a/overview');
+  await navigateFromSidebar(page, '对象存储');
+  await expect(page).toHaveURL(/\/tenants\/tenant-a\/object-storage$/);
+  await expect(page.getByRole('heading', { name: '对象存储' })).toBeVisible();
+
+  const bucket = page
+    .locator('.resource-link:visible, .mobile-resource-item:visible')
+    .filter({ hasText: 'road-scenes-snapshot' })
+    .first();
+  await expect(bucket).toBeVisible();
+  await bucket.click();
+  await expect(page).toHaveURL(/\/object-storage\/ap-road-main3$/);
+  await expect(page.getByRole('heading', { name: 'road-scenes-snapshot' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'images', exact: true }).click();
+  await expect(page).toHaveURL(/prefix=images/);
+  await expect(page.getByRole('button', { name: 'day', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'night', exact: true })).toBeVisible();
+
+  await page.getByRole('textbox', { name: '对象前缀' }).fill('manifests/');
+  await page.getByRole('button', { name: '查询', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'index.json', exact: true })).toBeVisible();
+
+  await page
+    .locator('.object-breadcrumb')
+    .getByRole('button', { name: 'road-scenes-snapshot', exact: true })
+    .click();
+  await page.getByRole('button', { name: 'README.md', exact: true }).click();
+  const objectDetails = page.getByRole('dialog', { name: '对象详情' });
+  await expect(objectDetails.getByText('s3://road-scenes-snapshot/README.md')).toBeVisible();
+  await expect(objectDetails.getByText('"readme-road-main3"')).toBeVisible();
+
+  const downloadEvent = page.waitForEvent('download');
+  await objectDetails.getByRole('button', { name: '下载对象', exact: true }).click();
+  const download = await downloadEvent;
+  expect(download.suggestedFilename()).toBe('README.md');
+  expect(downloadedPath).toBe('/road-scenes-snapshot/README.md');
+
+  await expectHealthyLayout(page);
+  await page.screenshot({
+    path: testInfo.outputPath('object-storage-browser.png'),
+    animations: 'disabled',
+    fullPage: true,
+  });
+});
+
 test('creates a PVC token and independently approves a pending enrollment', async ({
   page,
 }, testInfo) => {
@@ -124,7 +186,7 @@ test('creates a PVC token and independently approves a pending enrollment', asyn
     .textContent();
   const agentConfig = enrollmentDialog.locator('.deployment-config');
   await expect(agentConfig).toContainText('schema_version: 1');
-  await expect(agentConfig).toContainText('protocol_version: 1');
+  await expect(agentConfig).toContainText('wire_version: 1');
   await expect(agentConfig).toContainText('region: cn-guangzhou');
   await expect(agentConfig).toContainText('storage:');
   await expect(agentConfig).toContainText('backend_type: pvc');
@@ -602,14 +664,23 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
     .locator('.desktop-table .el-table__row')
     .filter({ hasText: roadMain3CommitId });
   await expect(regionalSnapshots).toHaveCount(2);
-  await page.getByRole('button', { name: /snap-road-main3-sha-01/ }).click();
+  const targetSnapshot = page
+    .locator(
+      testInfo.project.name === 'desktop'
+        ? '.desktop-table .resource-link'
+        : '.mobile-resource-list .mobile-resource-item',
+    )
+    .filter({ hasText: 'snap-road-main3-sha-01' })
+    .first();
+  await targetSnapshot.click();
   await expect(page).toHaveURL(/\/snapshots\/snap-road-main3-sha-01$/);
   await expect(page.locator('.snapshot-state-band > .el-tag')).toHaveText('可用');
   await expect(page.getByText('Artifact Commit', { exact: true })).toBeVisible();
   await expect(page.getByText('dataset/v4', { exact: true })).toBeVisible();
   await expect(page.getByText(/refs\/heads/)).toHaveCount(0);
   await expect(page.getByText('12 GiB', { exact: true }).first()).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'FUSE 挂载' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '只读交付' })).toBeVisible();
+  await expect(page.getByRole('radio', { name: 'FUSE' })).toBeChecked();
   await expect(page.getByText('cn-shanghai', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('cn-guangzhou', { exact: true })).toHaveCount(0);
   await page.screenshot({
@@ -816,7 +887,7 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   });
   await page.getByRole('button', { name: '创建 Snapshot', exact: true }).click();
 
-  await expect(page.getByText('中心 authority 暂不可用')).toBeVisible();
+  await expect(page.getByText('服务暂时不可用')).toBeVisible();
   await expect(page.getByText('AUTHORITY_UNAVAILABLE', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '重试', exact: true }).click();
   await expect(page.locator('.delivery-heading small')).toHaveText('可用');
@@ -897,7 +968,7 @@ test('handles missing, validation, unavailable and invisible Tenant routes', asy
   await page.goto('/tenants/tenant-a/jobs/query');
   await page.getByLabel('Job ID').fill('job-missing');
   await page.getByRole('button', { name: '查询', exact: true }).click();
-  await expect(page.getByText('未找到可见的 Job')).toBeVisible();
+  await expect(page.getByText('未找到请求的资源')).toBeVisible();
 
   await page.goto(
     '/tenants/tenant-a/jobs/new?project_id=project-vision&artifact_id=road-scenes&playground_id=labeling',
@@ -913,7 +984,7 @@ test('handles missing, validation, unavailable and invisible Tenant routes', asy
   await page.goto(
     '/tenants/tenant-unavailable/jobs/new?project_id=project-vision&artifact_id=road-scenes&playground_id=labeling',
   );
-  await expect(page.getByText('中心 authority 暂不可用')).toBeVisible();
+  await expect(page.getByText('服务暂时不可用')).toBeVisible();
   await expect(page.getByRole('button', { name: '重试' })).toBeVisible();
 
   await page.goto('/tenants/tenant-secret/artifacts');

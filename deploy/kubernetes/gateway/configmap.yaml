@@ -19,6 +19,20 @@ data:
   SYNAPSE_GATEWAY_AGENT_LISTEN: 0.0.0.0:8081
   SYNAPSE_GATEWAY_CONTROL_LISTEN: 0.0.0.0:8082
   SYNAPSE_GATEWAY_PEER_LISTEN: 0.0.0.0:8083
+  # One TLS listener serves the console and read-only S3 API by Host. The public
+  # certificate/key are intentionally separate from the workload mTLS identity.
+  SYNAPSE_GATEWAY_PUBLIC_LISTEN: 0.0.0.0:8080
+  SYNAPSE_GATEWAY_PUBLIC_TLS_CERTIFICATE_FILE: /var/run/secrets/synapse-gateway/public/tls.crt
+  SYNAPSE_GATEWAY_PUBLIC_TLS_PRIVATE_KEY_FILE: /var/run/secrets/synapse-gateway/public/tls.key
+  SYNAPSE_GATEWAY_CONSOLE_HOST: console.example.test
+  SYNAPSE_GATEWAY_S3_HOST: s3.example.test
+  SYNAPSE_GATEWAY_WEB_ROOT: /opt/neoengram/web
+  # Render this to a private Central mTLS terminator or service-mesh origin. The
+  # Gateway workload certificate authenticates this HTTPS connection; the
+  # terminator forwards to Central's plain-HTTP Fusen listener, and NetworkPolicy
+  # additionally permits only labelled control-plane Pods on this port.
+  SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM: https://central-api.neoengram-control-example.svc.cluster.local:8080
+  SYNAPSE_GATEWAY_S3_MAX_STREAMS: "128"
   SYNAPSE_GATEWAY_TLS_CERTIFICATE_FILE: /var/run/secrets/synapse-gateway/listener/tls.crt
   SYNAPSE_GATEWAY_TLS_PRIVATE_KEY_FILE: /var/run/secrets/synapse-gateway/listener/tls.key
   SYNAPSE_GATEWAY_TLS_CLIENT_CA_FILE: /var/run/secrets/synapse-gateway/listener/ca.crt

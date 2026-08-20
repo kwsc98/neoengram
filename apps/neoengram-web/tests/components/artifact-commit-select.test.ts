@@ -17,12 +17,14 @@ const headCommit = {
   parent_commit_id: historicalCommitId,
   message: 'Current head',
   tag_names: [],
+  data_layout: 'fast_cdc' as const,
   created_at_unix_ms: '2',
 };
 const historicalCommit = {
   commit_id: historicalCommitId,
   message: 'Historical baseline',
   tag_names: ['v1'],
+  data_layout: 'fast_cdc' as const,
   created_at_unix_ms: '1',
 };
 
@@ -114,12 +116,14 @@ describe('ArtifactCommitSelect', () => {
       parent_commit_id: newHistoricalCommitId,
       message: 'New Artifact head',
       tag_names: [],
+      data_layout: 'whole_file' as const,
       created_at_unix_ms: '4',
     };
     const newHistoricalCommit = {
       commit_id: newHistoricalCommitId,
       message: 'New Artifact baseline',
       tag_names: [],
+      data_layout: 'fast_cdc' as const,
       created_at_unix_ms: '3',
     };
     api.queryArtifactCommitGraph.mockImplementation(

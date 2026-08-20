@@ -361,6 +361,48 @@ impl GatewayTransportConfig {
         Ok([Some(agent), Some(control), Some(peer)])
     }
 
+    /// Builds the server-only TLS policy used by the public console/S3 listener.  The public
+    /// listener intentionally has no workload client-CA verifier; workload mTLS remains confined
+    /// to the Agent, Central-control, and peer listeners above.
+    pub(crate) fn load_public_server_config(
+        certificate_path: &Path,
+        private_key_path: &Path,
+    ) -> Result<Arc<ServerConfig>, GatewayTransportConfigError> {
+        let certificate_pem = read_bounded_file(
+            certificate_path,
+            "public certificate",
+            MAX_CERTIFICATE_CHAIN_BYTES,
+        )?;
+        let private_key_pem = read_bounded_file(
+            private_key_path,
+            "public private key",
+            MAX_PRIVATE_KEY_BYTES,
+        )?;
+        let certificates = CertificateDer::pem_slice_iter(&certificate_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| GatewayTransportConfigError::InvalidFile {
+                kind: "public certificate",
+                message: error.to_string(),
+            })?;
+        if certificates.is_empty() {
+            return Err(GatewayTransportConfigError::EmptyCertificateChain);
+        }
+        let private_key = PrivateKeyDer::from_pem_slice(&private_key_pem)
+            .map_err(|_| GatewayTransportConfigError::MissingPrivateKey)?;
+        let mut server = build_server_config(
+            &certificates,
+            &private_key,
+            None,
+            ClientAuthentication::Optional,
+        )?;
+        // Browser clients negotiate either HTTP/2 or HTTP/1.1 on the public endpoint.  Workload
+        // listeners intentionally remain H2-only, so this ALPN policy is local to this method.
+        Arc::get_mut(&mut server)
+            .expect("new public TLS configuration must have one owner")
+            .alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(server)
+    }
+
     #[cfg(test)]
     pub(crate) fn load_server_config(
         &self,
@@ -540,6 +582,23 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
             .unwrap()
             .unwrap();
         assert_eq!(server.alpn_protocols, vec![b"h2".to_vec()]);
+    }
+
+    #[test]
+    fn public_identity_supports_browser_http_versions_without_client_auth() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("certificate.pem");
+        let private_key = directory.path().join("private-key.pem");
+        fs::write(&certificate, TEST_CERTIFICATE).unwrap();
+        fs::write(&private_key, TEST_PRIVATE_KEY).unwrap();
+
+        let server =
+            GatewayTransportConfig::load_public_server_config(&certificate, &private_key).unwrap();
+        assert_eq!(
+            server.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert!(!server.session_storage.can_cache());
     }
 
     #[test]

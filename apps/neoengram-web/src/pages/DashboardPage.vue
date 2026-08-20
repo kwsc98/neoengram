@@ -5,6 +5,7 @@ import {
   Collection,
   Connection,
   DocumentCopy,
+  Folder,
   RefreshRight,
   TakeawayBox,
 } from '@element-plus/icons-vue';
@@ -38,6 +39,7 @@ const readyQuery = useQuery({
 });
 const tenant = computed(() => tenantQuery.data.value?.data.tenant);
 const version = computed(() => versionQuery.data.value?.data);
+const canCreateProject = computed(() => tenant.value?.permissions.includes('project.create') ?? false);
 const firstError = computed(
   () =>
     tenantQuery.error.value ??
@@ -54,6 +56,12 @@ const refreshing = computed(
 );
 
 const resourceLinks = computed(() => [
+  {
+    name: 'project-list',
+    label: 'Projects',
+    detail: '创建和管理租户内的逻辑项目',
+    icon: Folder,
+  },
   ...(supportsArtifactCatalog(version.value?.capabilities)
     ? [
         {
@@ -100,6 +108,14 @@ async function refresh(): Promise<void> {
 async function openResource(name: string): Promise<void> {
   await router.push({ name, params: { tenantId: tenantId.value } });
 }
+
+async function openProjectCreate(): Promise<void> {
+  await router.push({
+    name: 'project-list',
+    params: { tenantId: tenantId.value },
+    query: { create: '1' },
+  });
+}
 </script>
 
 <template>
@@ -113,6 +129,14 @@ async function openResource(name: string): Promise<void> {
           <span class="status-dot" :class="readyQuery.data.value ? 'status-dot--ok' : ''" />
           {{ readyQuery.data.value ? '控制面正常' : '状态检查中' }}
         </span>
+        <el-button
+          v-if="canCreateProject"
+          type="primary"
+          :icon="Folder"
+          @click="openProjectCreate"
+        >
+          创建 Project
+        </el-button>
         <el-button :icon="RefreshRight" :loading="refreshing" @click="refresh">刷新</el-button>
       </template>
     </PageHeading>
@@ -124,20 +148,53 @@ async function openResource(name: string): Promise<void> {
       @retry="refresh"
     />
 
-    <section class="resource-navigation" aria-label="租户资源">
-      <button
-        v-for="item in resourceLinks"
-        :key="item.name"
-        type="button"
-        @click="openResource(item.name)"
-      >
-        <span class="resource-navigation__icon"><component :is="item.icon" /></span>
+    <section class="overview-status" aria-label="运行状态" aria-live="polite">
+      <div class="overview-status__item">
+        <span class="overview-status__icon"><Connection /></span>
         <span>
-          <strong>{{ item.label }}</strong>
-          <small>{{ item.detail }}</small>
+          <small>API 协议</small>
+          <strong>v{{ version?.api_version ?? '—' }}</strong>
         </span>
-        <ArrowRight />
-      </button>
+      </div>
+      <div class="overview-status__item">
+        <i class="status-dot" :class="liveQuery.data.value ? 'status-dot--ok' : ''" />
+        <span>
+          <small>存活探针</small>
+          <strong>{{ liveQuery.data.value ? '运行正常' : '检查中' }}</strong>
+        </span>
+      </div>
+      <div class="overview-status__item">
+        <i class="status-dot" :class="readyQuery.data.value ? 'status-dot--ok' : ''" />
+        <span>
+          <small>就绪探针</small>
+          <strong>{{ readyQuery.data.value ? '服务就绪' : '检查中' }}</strong>
+        </span>
+      </div>
+    </section>
+
+    <section class="workspace-section" aria-labelledby="resource-heading">
+      <header class="workspace-section__heading">
+        <div>
+          <h2 id="resource-heading">租户资源</h2>
+          <p>进入当前租户的数据、工作区与基础设施</p>
+        </div>
+        <code>{{ tenantId }}</code>
+      </header>
+      <div class="resource-navigation">
+        <button
+          v-for="item in resourceLinks"
+          :key="item.name"
+          type="button"
+          @click="openResource(item.name)"
+        >
+          <span class="resource-navigation__icon"><component :is="item.icon" /></span>
+          <span>
+            <strong>{{ item.label }}</strong>
+            <small>{{ item.detail }}</small>
+          </span>
+          <ArrowRight />
+        </button>
+      </div>
     </section>
 
     <section v-if="tenant" class="tenant-summary">
@@ -173,29 +230,12 @@ async function openResource(name: string): Promise<void> {
         </div>
       </dl>
     </section>
-
-    <footer class="system-strip">
-      <span><Connection /> API v{{ version?.api_versions.join(', ') ?? '—' }}</span>
-      <span
-        ><i
-          class="status-dot"
-          :class="liveQuery.data.value ? 'status-dot--ok' : ''"
-        />存活探针</span
-      >
-      <span
-        ><i
-          class="status-dot"
-          :class="readyQuery.data.value ? 'status-dot--ok' : ''"
-        />就绪探针</span
-      >
-      <code>{{ tenantId }}</code>
-    </footer>
   </div>
 </template>
 
 <style scoped>
 .tenant-home {
-  --home-border: #d8dfdc;
+  --home-border: var(--line);
 }
 
 .control-health {
@@ -204,52 +244,161 @@ async function openResource(name: string): Promise<void> {
   gap: 8px;
   color: var(--muted);
   font-size: 12px;
+  font-weight: 600;
+}
+
+.overview-status {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border: 1px solid var(--home-border);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+}
+
+.overview-status__item {
+  min-width: 0;
+  min-height: 86px;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  border-right: 1px solid var(--home-border);
+  padding: 18px 20px;
+}
+
+.overview-status__item:last-child {
+  border-right: 0;
+}
+
+.overview-status__icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.overview-status__icon svg {
+  width: 17px;
+}
+
+.overview-status__item > .status-dot {
+  width: 10px;
+  height: 10px;
+  margin: 0 12px;
+}
+
+.overview-status small,
+.overview-status strong {
+  display: block;
+}
+
+.overview-status small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.overview-status strong {
+  margin-top: 5px;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.workspace-section {
+  margin-top: 30px;
+}
+
+.workspace-section__heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 14px;
+}
+
+.workspace-section__heading h2,
+.tenant-summary h2 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.workspace-section__heading p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.workspace-section__heading code {
+  max-width: 40%;
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .resource-navigation {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  border: 1px solid var(--home-border);
-  background: #fff;
+  gap: 12px;
 }
 
 .resource-navigation button {
   min-width: 0;
-  min-height: 104px;
+  min-height: 108px;
   display: grid;
-  grid-template-columns: 40px minmax(0, 1fr) 18px;
+  grid-template-columns: 42px minmax(0, 1fr) 18px;
   align-items: center;
-  gap: 14px;
-  border: 0;
-  border-right: 1px solid var(--home-border);
-  border-bottom: 1px solid var(--home-border);
+  gap: 15px;
+  border: 1px solid var(--home-border);
+  border-radius: 8px;
   padding: 18px 20px;
-  background: transparent;
+  background: #fff;
+  box-shadow: var(--shadow-xs);
   cursor: pointer;
   text-align: left;
-}
-
-.resource-navigation button:nth-child(2n) {
-  border-right: 0;
-}
-
-.resource-navigation button:nth-last-child(-n + 2) {
-  border-bottom: 0;
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
 }
 
 .resource-navigation button:hover {
-  background: #f7faf8;
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-1px);
 }
 
 .resource-navigation__icon {
-  width: 40px;
-  height: 40px;
+  width: 42px;
+  height: 42px;
   display: grid;
   place-items: center;
-  border-radius: 6px;
+  border-radius: 8px;
   color: var(--green);
-  background: #e5f0eb;
+  background: var(--green-soft);
   font-size: 19px;
+}
+
+.resource-navigation button:nth-child(2) .resource-navigation__icon {
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.resource-navigation button:nth-child(3) .resource-navigation__icon {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.resource-navigation button:nth-child(4) .resource-navigation__icon {
+  color: var(--rose);
+  background: var(--rose-soft);
 }
 
 .resource-navigation strong,
@@ -262,35 +411,40 @@ async function openResource(name: string): Promise<void> {
 }
 
 .resource-navigation small {
+  max-width: 420px;
   margin-top: 6px;
   color: var(--muted);
   font-size: 12px;
+  line-height: 1.55;
 }
 
 .resource-navigation button > svg {
   width: 16px;
-  color: #89938f;
+  color: var(--muted-light);
+  transition: color 160ms ease;
+}
+
+.resource-navigation button:hover > svg {
+  color: var(--green);
 }
 
 .tenant-summary {
-  margin-top: 20px;
-  border: 1px solid var(--home-border);
-  background: #fff;
+  margin-top: 30px;
+  padding-top: 22px;
+  border-top: 1px solid var(--home-border);
 }
 
 .tenant-summary > header {
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--home-border);
-}
-
-.tenant-summary h2 {
-  margin: 0;
-  font-size: 15px;
+  margin-bottom: 12px;
 }
 
 .tenant-summary .definition-grid {
   margin: 0;
-  padding: 20px;
+  border: 1px solid var(--home-border);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
 }
 
 .permission-list {
@@ -299,59 +453,40 @@ async function openResource(name: string): Promise<void> {
   gap: 6px;
 }
 
-.system-strip {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  margin-top: 20px;
-  padding: 11px 14px;
-  color: var(--muted);
-  background: #e9eeeb;
-  font-size: 11px;
-}
-
-.system-strip span {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.system-strip svg {
-  width: 14px;
-}
-
-.system-strip code {
-  margin-left: auto;
-}
-
 @media (max-width: 650px) {
+  .overview-status {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .overview-status__item {
+    min-height: 76px;
+    border-bottom: 1px solid var(--home-border);
+  }
+
+  .overview-status__item:nth-child(2) {
+    border-right: 0;
+  }
+
+  .overview-status__item:last-child {
+    grid-column: 1 / -1;
+    border-bottom: 0;
+  }
+
   .resource-navigation {
     grid-template-columns: 1fr;
   }
 
-  .resource-navigation button,
-  .resource-navigation button:nth-child(2n),
-  .resource-navigation button:nth-last-child(-n + 2) {
-    border-right: 0;
-    border-bottom: 1px solid var(--home-border);
+  .resource-navigation button {
+    min-height: 96px;
+    padding: 16px;
   }
 
-  .resource-navigation button:last-child {
-    border-bottom: 0;
+  .workspace-section__heading code {
+    display: none;
   }
 
   .control-health {
     display: none;
-  }
-
-  .system-strip {
-    flex-wrap: wrap;
-    gap: 9px 14px;
-  }
-
-  .system-strip code {
-    width: 100%;
-    margin-left: 0;
   }
 }
 </style>

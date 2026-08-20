@@ -65,7 +65,7 @@ const elementComponents = [
 ] as const;
 
 async function enableMocks(): Promise<void> {
-  if (import.meta.env.PROD) return;
+  if (import.meta.env.PROD && import.meta.env.VITE_E2E_GATEWAY_MOCKS !== 'true') return;
   if (runtimeConfig.apiMode !== 'mock') return;
   const { worker } = await import('./mocks/browser');
   await worker.start({ onUnhandledRequest: 'bypass', quiet: true });

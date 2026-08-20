@@ -1,0 +1,12 @@
+pub(crate) mod agent_registry;
+mod audit;
+pub(crate) mod authority;
+mod catalog;
+mod gateway_registry;
+mod index;
+mod job;
+mod lifecycle;
+mod metadata;
+mod object;
+mod outbox;
+mod precommit;

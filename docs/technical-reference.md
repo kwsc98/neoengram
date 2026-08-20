@@ -1,7 +1,7 @@
 # NeoEngram 技术参考
 
 本文描述 NeoEngram 当前实现的状态模型、仓库策略、全部 CLI 命令、命令之间的区别、
-一致性保证和已知边界。它以当前 `0.2.0`/format v8 代码为准，面向需要操作仓库、集成命令行或排查
+一致性保证和已知边界。它以当前 `0.2.0`/仓库格式 9 代码为准，面向需要操作仓库、集成命令行或排查
 故障的使用者。
 
 源码模块职责见 [`code-architecture.md`](code-architecture.md)，磁盘布局、内容图和锁协议见
@@ -75,7 +75,7 @@ neoengram init [--chunking fastcdc|whole-file|mixed] [PATH]
 | `whole-file` | 所有文件固定 WholeFile | 同文件系统硬链接导出、整文件对象复用 | 任意字节变化都会产生完整新对象 |
 | `mixed` | 可按次/按文件选择 | 同一仓库确实需要两种行为 | Commit 不保证可硬链接导出，运维规则更复杂 |
 
-未指定时新仓库固定为 `fastcdc`。策略持久化在 `repository.json`，仓库创建后不可修改；对已有
+未指定时新仓库固定为 `fastcdc`。策略持久化在 `metadata.sqlite3`，仓库创建后不可修改；对已有
 仓库再次执行 `init` 只补全布局，显式指定不同策略会失败。
 
 FastCDC 参数固定为 256 KiB / 1 MiB / 4 MiB（min/avg/max）。WholeFile 对非空文件生成一个
@@ -97,7 +97,7 @@ mixed 仓库未显式指定时，已跟踪文件继承原策略，新文件默�
 
 | 命令 | 读取 | 修改 | 核心用途 |
 | --- | --- | --- | --- |
-| `init` | 仓库配置 | 仓库布局 | 创建 format v8 仓库 |
+| `init` | 仓库配置 | 仓库布局 | 创建仓库格式 9 仓库 |
 | `workspace create/list/remove` | Commit、注册表 | Workspace 注册和目录 | 管理共享对象库的可写工作区 |
 | `add` | 工作区 | ObjectStore、Index | 暂存新增或修改 |
 | `add -A` | 工作区 | ObjectStore、Index | 暂存新增、修改和删除 |
@@ -124,7 +124,7 @@ neoengram init [--chunking POLICY] [PATH]
 
 `PATH` 默认是当前目录，不存在时会创建。新仓库先在同一父目录的私有临时目录中完成初始化，
 再以 no-replace rename 发布 `.neoengram`。已有完整仓库可以幂等重新初始化，但旧格式、半成品
-仓库或策略冲突会明确失败。format v8 只使用 SQLite 元数据和 Loose 对象后端，不迁移 v7 或更旧格式。
+仓库或策略冲突会明确失败。仓库格式 9 只使用 SQLite 元数据和 Loose 对象后端，任何其他仓库格式都必须重新初始化。
 
 ### `workspace create`
 
@@ -456,14 +456,16 @@ export、FUSE cache miss、fsck 和 GC 删除前验证。损坏会 fail closed�
 
 | 层 | 版本 |
 | --- | --- |
-| Repository format | v8 |
+| Repository format | v9 |
 | Manifest | v4 |
-| Index | v8 |
-| SQLite schema | v5 |
+| Index canonical digest | v8 |
+| SQLite schema | v6 |
 
-`repository.json` 保存 format、repository ID、ObjectStore 类型和不可变分块策略。SQLite 保存
+`metadata.sqlite3` 的 `repository_state` 单例行保存 format、repository ID、ObjectStore 类型和不可变分块策略；SQLite 保存
 Workspace-scoped Index/HEAD、refs、Manifest、Directory 和 Commit；`.neoengram/objects` 保存
 Loose Chunk payload；工作区恢复 journal 和物化缓存不属于上述两个存储接口。
+
+这里的 Index v8 是当前内容寻址快照/增量 digest 规范版本，不是旧仓库格式的兼容入口。
 
 项目仍处开发期，格式升级可以拒绝旧仓库，不提供自动迁移。升级二进制前必须保留经过验证、
 不与仓库对象共享 inode 的独立备份；hardlink export 不能作为这种备份。

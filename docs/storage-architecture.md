@@ -1,13 +1,14 @@
-# format v8 存储架构
+# 当前仓库存储架构
 
-> 本文同时记录当前 format v8/Managed 存储实现和已确认的 Synapse Gateway 目标边界。
-> Gateway Registry、管理面、H2/mTLS 控制 tunnel 和一跳 Replica forwarding 已进入 G1，但跨集群对象传输与 S3 尚未实现，
-> Gateway 也没有任何 Volume/CAS I/O 能力；其专项设计见
+> 本文同时记录当前 Standalone/Managed 存储实现和已确认的 Synapse Gateway 目标边界。
+> Gateway Registry、管理面、H2/mTLS 控制 tunnel 和一跳 Replica forwarding 已进入 G1；固定 Ready Snapshot 的
+> 一期只读 S3 Access Point、Gateway Web/S3 listener 和 Agent 流式读取已经实现，公网 DNS/TLS、生产凭据
+> provisioner 与真实双 Replica 故障演练仍属于部署验收项。Gateway 也没有任何 Volume/CAS I/O 能力；其专项设计见
 > [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。
 
-NeoEngram `0.2.0` 的本地仓库格式是 v8。开发期升级允许破坏兼容性：实现明确拒绝 v7 和其他旧
-格式，不读取、不迁移，也不提供自动回退。format v8 将可移植内容模型和规范 digest 收敛到
-`neoengram-core`，把本地 SQLite/文件系统实现留在 `neoengram-standalone` 与 `neoengram-fs`。
+NeoEngram `0.2.0` 的本地仓库格式为 9。升级允许破坏兼容性：实现明确拒绝所有旧
+格式，不读取、不迁移，也不提供自动回退。仓库格式 9 将可移植内容模型和规范 digest 收敛到
+`neoengram-domain`，本地 SQLite/文件系统实现统一留在 `neoengram-runtime`。
 
 ## 内容图与规范身份
 
@@ -21,12 +22,12 @@ Workspace IndexVersion -> paged FileRecord
 ```
 
 `ObjectId`、`ManifestId`、`DirectoryId`、`CommitId` 和 `ContentDigest` 是不可互换的强类型。
-`Commit` 使用 `root_directory_id`，不再保存 `tree_hash`。core 公共模型不包含扁平 `Tree`、
-`FileNode` 或物化 `Index`；Standalone 中暂存的 compatibility view 仅服务于 SQLite/worktree 渐进
-迁移，不能作为持久格式或跨 crate API。
+`Commit` 使用 `root_directory_id`，不再保存 `tree_hash`。core 公共模型不包含扁平兼容 snapshot、
+`WorkspaceFileRecord` 或物化 `WorkspaceIndex`；Standalone 只在 SQLite/worktree 文件系统边界按页读取并直接消费
+文件记录，不将其作为持久格式或跨 crate API。
 
 对象 ID 继续使用既有有效内容域。Manifest、Directory 和 Commit 使用带 domain/version 的规范
-二进制编码；IndexVersion、Index snapshot 与 IndexDelta 使用 v8 新增的后端无关规范算法。路径
+二进制编码；IndexVersion、Index snapshot 与 IndexDelta 使用当前后端无关规范算法。路径
 统一表示为 NFC、`/` 分隔的 `LogicalPath`/`PathComponent`，并拒绝 Windows drive/UNC 前缀、保留
 设备名、非法组件、大小写冲突及文件/目录前缀冲突。规范编码和 golden vectors 的唯一实现都在
 core，SQLite、Agent 和中心不得各自重写 hash 算法。
@@ -34,7 +35,7 @@ core，SQLite、Agent 和中心不得各自重写 hash 算法。
 Chunk/Object ID 仍是原始 payload 的 BLAKE3。Manifest 将 `FastCdc`/`WholeFile` 策略纳入规范编码，
 因此相同字节使用不同策略时仍可得到不同 Manifest。Directory 只包含直接子项，递归统计不参与 ID。
 
-`repository.json` 持久化不可变的 `fastcdc`、`whole-file` 或 `mixed` 仓库策略。前两种要求全部
+`metadata.sqlite3` 持久化格式身份、repository ID、对象后端和不可变的 `fastcdc`、`whole-file` 或 `mixed` 仓库策略。前两种要求全部
 Index 和历史 Manifest 使用对应策略；`mixed` 才允许逐文件选择。Repository 在 Index 发布、
 Directory 构造/读取、Commit 发布和 fsck 遍历时重复检查该约束。
 
@@ -47,14 +48,14 @@ Standalone 的逻辑持久化边界拆分为：
 - `RefStore`：HEAD/ref 读取与 compare-exchange；
 - `WorkspaceRegistry`：Repository discovery、Workspace 身份与布局。
 
-format v8 的真实元数据适配器仍是 SQLite。现有实现内部可共享连接、事务和迁移代码，但上层用例
+仓库格式 9 的真实元数据适配器仍是 SQLite。现有实现内部共享连接和事务，但上层用例
 不能再把所有职责当成单个跨运行模式的 `MetadataStore`；未来 PostgreSQL 也不会作为本地 store
 枚举值塞入 Standalone。
 
 SQLite 使用 WAL、foreign key、`synchronous=FULL` 和即时写事务。Manifest 与 Directory 按 ordinal
 分页，Index 使用 keyset 分页与 expected-version transaction，HEAD/ref 使用 CAS。Directory writer
 的 staging 批次受条数和字节上限约束；Commit 分页读取 Index 并维护目录路径栈，结束一个目录时
-发布其 ID，再追加到父 writer，不创建公共扁平 Tree。Reader 不跨 FUSE 请求长期持有 transaction。
+发布其 ID，再追加到父 writer，不创建公共扁平兼容 snapshot。Reader 不跨 FUSE 请求长期持有 transaction。
 
 ## Managed AuthorityStore
 
@@ -63,7 +64,7 @@ Managed 中心的逻辑权威通过异步 `AuthorityStore` 组合 `JobRepository
 默认后端是单节点生产可用的 SQLite：显式目录内固定创建独立 `authority.sqlite3` 和生命周期独占
 `authority.lock`，连接池固定单连接，并启用 WAL、foreign keys、`synchronous=FULL` 和 busy timeout。
 
-该数据库不属于 Standalone format v8，也不得与 Standalone 共用文件。它只接受当前
+该数据库不属于 Standalone 仓库格式 9，也不得与 Standalone 共用文件。它只接受当前
 `application_id`/`user_version` 和当前 JSON record format；旧格式、错误 schema 和未知非空数据库
 直接拒绝，不提供 migration、双读、字段别名或回退。所有租户查询和复合键都包含 tenant ID，但
 SQLite 仍是应用层隔离，不伪装成数据库级 RLS、HA 或多进程后端。
@@ -106,7 +107,7 @@ PrepareAdd
 -> decision / finalized 幂等确认
 ```
 
-对象 payload 不经过 Central/Gateway 控制 listener 或 `neoengramd` API 进程。只有所有所需对象均有当前 Assignment
+对象 payload 不经过 Central/Gateway 控制 listener 或 `neoengram-central` API 进程。只有所有所需对象均有当前 Assignment
 精确 Volume/placement generation 的有效凭证、批次页完整且 digest/资源 scope/base version 全部通过，
 中心才可执行 CAS。`ObjectReceipt` 是已审批 Agent 对 Volume 中指定对象执行完整性与耐久化
 校验的证据，不包含物理路径或 payload。`JobPrepared.publication_digest` 绑定
@@ -143,11 +144,11 @@ Standalone 锁顺序固定为 `objects.lock -> Workspace worktree.lock -> write.
 与 HEAD/ref CAS 提供线性化点；Commit 先发布 Object/Manifest/Directory/Commit，最后 CAS 更新
 HEAD/ref。失败可留下不可达不可变元数据，但不能发布缺失依赖的引用。
 
-Engine 的统一 mutation 契约与 `neoengram-fs` adapters 遵循
+Engine 的统一 mutation 契约与 `neoengram-runtime` adapters 遵循
 `MutationPlan -> durable journal -> WorktreeReceipt`：journal 必须在第一次工作区 mutation 前原子
 发布并同步，文件系统适配器只返回 receipt，不隐式更新权威 Index、HEAD 或 ref。
 
-Standalone 的 `checkout`、工作区 `restore` 和工作区 `rm` 已把 format-v8 durable transaction 包装成
+Standalone 的 `checkout`、工作区 `restore` 和工作区 `rm` 已把仓库格式 9 的 durable transaction 包装成
 Engine `Worktree` adapter：Engine journal 先进入 durable `Applying`，本地事务随后执行工作区变更并
 返回 `WorktreeReceipt`。`rm --cached` 和 `restore --staged` 不修改工作区，因此只走权威元数据路径。
 
@@ -183,6 +184,6 @@ root inode 为 1；其他 inode 从 Commit ID、逻辑路径、kind 和 salt 派
 - macOS：`fuser` + macFUSE SDK/runtime，使用 `/sbin/umount`。
 - Windows：常规仓库命令可构建，挂载命令返回 unsupported/未启用。
 
-FUSE、Commit Directory 构造和 Manifest range read 已分页；Standalone 的部分 compatibility view 和
+FUSE、Commit Directory 构造和 Manifest range read 已分页；Standalone 的部分 workspace snapshot 和
 GC 可达集合仍可能随仓库规模增长。后续需继续迁移到 engine 分页 ports，并在 Linux/macOS 实挂
 环境记录启动时间、RSS、目录分页、冷热随机读和顺序吞吐。

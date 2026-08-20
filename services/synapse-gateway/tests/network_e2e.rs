@@ -19,7 +19,7 @@ use hyper::{
     client::conn::http2,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use neoengram_protocol::{
+use neoengram_domain::protocol::{
     AgentAuthenticatedRequest, AgentBootId, AgentBootstrapProof, AgentChannelDownstreamFrame,
     AgentChannelDownstreamMessage, AgentChannelNdjsonDecoder, AgentChannelUpstreamFrame,
     AgentChannelUpstreamMessage, AgentChannelUpstreamPayload, AgentId, AgentInstallationId,
@@ -30,9 +30,9 @@ use neoengram_protocol::{
     GatewayControlNdjsonDecoder, GatewayErrorCode, GatewayOpaqueBytes, GatewayPeerForwardAccepted,
     GatewayPeerForwardRequest, GatewayPoolId, GatewayReplicaId, GatewayRouteLeaseGranted,
     IndexRevision, JobDecision, JobId, JobState, MessageId, MountGeneration, OwnerGeneration,
-    ProtocolVersion, PublishDecision, RequestId, ResourceVersion, RouteGeneration, SequenceNumber,
+    PublishDecision, RequestId, ResourceVersion, RouteGeneration, SequenceNumber,
     SessionGeneration, SessionId, UnixMillis, WireIndexVersion, AGENT_SESSION_CHANNEL_OPEN_PATH,
-    GATEWAY_CONTROL_CHANNEL_PATH,
+    CURRENT_WIRE_VERSION, GATEWAY_CONTROL_CHANNEL_PATH,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use tokio::{
@@ -274,7 +274,7 @@ impl CentralLink {
     async fn send(&mut self, request_id: RequestId, message: GatewayControlMessage) {
         let now = now_unix_ms();
         let frame = GatewayControlFrame {
-            protocol_version: ProtocolVersion::V1,
+            wire_version: CURRENT_WIRE_VERSION,
             gateway_pool_id: GatewayPoolId::new(GATEWAY_POOL_ID).unwrap(),
             gateway_replica_id: self.replica_id.clone(),
             connection_id: self.connection_id.clone(),
@@ -450,7 +450,7 @@ async fn grant_agent_route(
     .await;
     let now = now_unix_ms();
     let opened = AgentChannelDownstreamFrame {
-        protocol_version: ProtocolVersion::V1,
+        wire_version: CURRENT_WIRE_VERSION,
         sequence: SequenceNumber::new(1),
         message_id: MessageId::new(format!("opened-{}", session_generation.get())).unwrap(),
         correlation_id: Some(observed.frame.request.payload.message_id.clone()),
@@ -458,7 +458,7 @@ async fn grant_agent_route(
         sent_at_unix_ms: now,
         central_signature: None,
         message: AgentChannelDownstreamMessage::Opened(AgentSessionOpenResponse {
-            protocol_version: ProtocolVersion::V1,
+            wire_version: CURRENT_WIRE_VERSION,
             request_id: observed.frame.request.request_id.clone(),
             agent_id: observed.frame.request.agent_id.clone(),
             session_id: SessionId::new(format!("session-{}", session_generation.get())).unwrap(),
@@ -475,10 +475,12 @@ async fn grant_agent_route(
     };
     link.send(
         request_id,
-        GatewayControlMessage::AgentStreamData(neoengram_protocol::GatewayAgentStreamData {
-            stream_id: observed.stream_id.clone(),
-            chunk: GatewayOpaqueBytes::new(opened.encode_ndjson().unwrap()).unwrap(),
-        }),
+        GatewayControlMessage::AgentStreamData(
+            neoengram_domain::protocol::GatewayAgentStreamData {
+                stream_id: observed.stream_id.clone(),
+                chunk: GatewayOpaqueBytes::new(opened.encode_ndjson().unwrap()).unwrap(),
+            },
+        ),
     )
     .await;
 }
@@ -537,7 +539,7 @@ fn agent_open_frame(request_id: &str, message_id: &str) -> AgentChannelUpstreamF
     let key_pair = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
     let mut frame = AgentChannelUpstreamFrame {
         request: AgentAuthenticatedRequest {
-            protocol_version: ProtocolVersion::V1,
+            wire_version: CURRENT_WIRE_VERSION,
             request_id: RequestId::new(request_id).unwrap(),
             agent_id: AgentId::new(AGENT_ID).unwrap(),
             installation_id: AgentInstallationId::new("installation-network-e2e").unwrap(),
@@ -584,7 +586,7 @@ fn agent_open_frame(request_id: &str, message_id: &str) -> AgentChannelUpstreamF
 
 fn decision_frame(session_generation: SessionGeneration, number: u64) -> Vec<u8> {
     AgentChannelDownstreamFrame {
-        protocol_version: ProtocolVersion::V1,
+        wire_version: CURRENT_WIRE_VERSION,
         sequence: SequenceNumber::new(2),
         message_id: MessageId::new(format!("decision-message-{number}")).unwrap(),
         correlation_id: None,

@@ -60,8 +60,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
-      - name: Package and verify neoengram-core
-        run: cargo package --locked -p neoengram-core
+      - name: Package and verify neoengram-domain
+        run: cargo package --locked -p neoengram-domain
       - name: Assemble neoengram CLI archive only
         run: |
           # The CLI composes publish=false workspace crates. This checks archive
@@ -93,13 +93,19 @@ jobs:
               fi
             done
 
-            cmp -s "crates/$crate/LICENSE-MIT" LICENSE-MIT
-            cmp -s "crates/$crate/LICENSE-APACHE" LICENSE-APACHE
+            local manifest_dir
+            if [[ "$crate" == "neoengram" ]]; then
+              manifest_dir="apps/neoengram-cli"
+            else
+              manifest_dir="crates/$crate"
+            fi
+            cmp -s "$manifest_dir/LICENSE-MIT" LICENSE-MIT
+            cmp -s "$manifest_dir/LICENSE-APACHE" LICENSE-APACHE
             tar -xOf "$archive" "$prefix/LICENSE-MIT" | cmp -s - LICENSE-MIT
             tar -xOf "$archive" "$prefix/LICENSE-APACHE" | cmp -s - LICENSE-APACHE
           }
 
-          check_package neoengram-core
+          check_package neoengram-domain
           check_package neoengram
 
   test:

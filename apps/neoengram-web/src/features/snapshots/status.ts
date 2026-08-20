@@ -2,7 +2,6 @@ import type {
   DatasetProfileState,
   SnapshotActivityType,
   SnapshotIntegrityState,
-  SnapshotPhase,
   SnapshotState,
 } from '@/api/types';
 
@@ -14,15 +13,6 @@ export function snapshotStateTagType(state: SnapshotState): 'warning' | 'success
   if (state === 'creating') return 'warning';
   if (state === 'abnormal') return 'danger';
   return 'success';
-}
-
-export function snapshotPhaseLabel(phase: SnapshotPhase): string {
-  return {
-    planning: '规划交付',
-    materializing: '物化数据',
-    verifying: '完整性校验',
-    idle: '处理完成',
-  }[phase];
 }
 
 export function snapshotPollInterval(state?: SnapshotState): 1000 | false {
@@ -44,10 +34,9 @@ export function snapshotIntegrityTagType(
 export function snapshotActivityTypeLabel(type: SnapshotActivityType): string {
   return {
     created: 'Snapshot 已创建',
-    phase_changed: '交付阶段更新',
+    status_changed: 'Snapshot 状态更新',
     ready: 'Snapshot 已可用',
     failed: '交付失败',
-    retry_started: '重新开始交付',
   }[type];
 }
 
@@ -56,7 +45,6 @@ export function snapshotActivityTagType(
 ): 'primary' | 'success' | 'danger' | 'warning' {
   if (type === 'ready') return 'success';
   if (type === 'failed') return 'danger';
-  if (type === 'retry_started') return 'warning';
   return 'primary';
 }
 

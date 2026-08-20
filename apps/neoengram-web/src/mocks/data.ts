@@ -2,14 +2,21 @@ import type {
   ArtifactView,
   CommitGraphView,
   PlaygroundView,
-  ProjectSummary,
+  ProjectView,
   SnapshotView,
+  S3AccessPointView,
+  S3CredentialView,
+  S3ObjectEntryView,
   StorageVolumeView,
   TenantView,
 } from '@/api/types';
+import { runtimeConfig } from '@/config';
+
+import { mockS3Entries } from './s3-files';
 
 const created = '1785167000000';
 const updated = '1785167600000';
+const activeLifecycle = { state: 'active', generation: '1' } as const;
 
 export const mockCommitIds = {
   roadMain3: 'a'.repeat(64),
@@ -41,9 +48,16 @@ export const tenants: TenantView[] = [
       'storage.enrollment.review',
       'artifact.read',
       'artifact.create',
+      'project.read',
+      'project.create',
       'playground.create',
       'snapshot.create',
       'job.create',
+      's3.access.read',
+      's3.access.manage',
+      'resource.lifecycle.read',
+      'resource.lifecycle.manage',
+      'retention.manage',
     ],
   },
   {
@@ -53,15 +67,17 @@ export const tenants: TenantView[] = [
     resource_version: '7',
     created_at_unix_ms: '1784167000000',
     updated_at_unix_ms: '1785067600000',
-    permissions: ['tenant.read', 'storage.read', 'artifact.read'],
+    permissions: ['tenant.read', 'storage.read', 'artifact.read', 's3.access.read'],
   },
 ];
 
-export const projects: ProjectSummary[] = [
+export const projects: ProjectView[] = [
   {
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     display_name: '视觉数据',
+    description: '道路场景和视觉评测数据',
+    resource_version: '2',
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -69,6 +85,8 @@ export const projects: ProjectSummary[] = [
     tenant_id: 'tenant-a',
     project_id: 'project-language',
     display_name: '语言模型数据',
+    description: '对话语料和文本评测数据',
+    resource_version: '1',
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -76,6 +94,7 @@ export const projects: ProjectSummary[] = [
     tenant_id: 'tenant-b',
     project_id: 'project-release',
     display_name: '版本交付',
+    resource_version: '3',
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -90,9 +109,14 @@ export const storageVolumes: StorageVolumeView[] = [
     region: 'cn-shanghai',
     backend_type: 'pvc',
     access_mode: 'read_write_many',
+    allowed_delivery_modes: ['fuse', 'copy'],
+    hardlink_policy: 'disabled',
+    max_whole_file_bytes: '18446744073709551615',
+    copy_reserve_bytes: '0',
     pvc_reference: { namespace: 'neoengram-data', claim_name: 'vision-data' },
     state: 'ready',
     resource_version: '4',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -104,8 +128,13 @@ export const storageVolumes: StorageVolumeView[] = [
     region: 'cn-shanghai',
     backend_type: 'nfs',
     access_mode: 'read_write_many',
+    allowed_delivery_modes: ['fuse', 'copy'],
+    hardlink_policy: 'disabled',
+    max_whole_file_bytes: '18446744073709551615',
+    copy_reserve_bytes: '0',
     state: 'degraded',
     resource_version: '8',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -117,9 +146,14 @@ export const storageVolumes: StorageVolumeView[] = [
     region: 'cn-beijing',
     backend_type: 'pvc',
     access_mode: 'read_write_once',
+    allowed_delivery_modes: ['fuse', 'copy'],
+    hardlink_policy: 'disabled',
+    max_whole_file_bytes: '18446744073709551615',
+    copy_reserve_bytes: '0',
     pvc_reference: { namespace: 'neoengram-data', claim_name: 'language-data' },
     state: 'ready',
     resource_version: '2',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -131,9 +165,14 @@ export const storageVolumes: StorageVolumeView[] = [
     region: 'cn-guangzhou',
     backend_type: 'pvc',
     access_mode: 'read_write_many',
+    allowed_delivery_modes: ['fuse', 'copy'],
+    hardlink_policy: 'disabled',
+    max_whole_file_bytes: '18446744073709551615',
+    copy_reserve_bytes: '0',
     pvc_reference: { namespace: 'neoengram-data', claim_name: 'training-delivery' },
     state: 'ready',
     resource_version: '3',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -145,9 +184,14 @@ export const storageVolumes: StorageVolumeView[] = [
     region: 'cn-shanghai',
     backend_type: 'pvc',
     access_mode: 'read_write_many',
+    allowed_delivery_modes: ['fuse', 'copy'],
+    hardlink_policy: 'disabled',
+    max_whole_file_bytes: '18446744073709551615',
+    copy_reserve_bytes: '0',
     pvc_reference: { namespace: 'neoengram-release', claim_name: 'release-archive' },
     state: 'ready',
     resource_version: '7',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -163,6 +207,7 @@ export const artifacts: ArtifactView[] = [
     initialization: { mode: 'empty' },
     head_commit_id: mockCommitIds.roadMain3,
     resource_version: '18',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -180,6 +225,7 @@ export const artifacts: ArtifactView[] = [
     },
     head_commit_id: mockCommitIds.report2,
     resource_version: '9',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -192,6 +238,7 @@ export const artifacts: ArtifactView[] = [
     initialization: { mode: 'empty' },
     head_commit_id: mockCommitIds.dialog2,
     resource_version: '12',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -204,6 +251,7 @@ export const artifacts: ArtifactView[] = [
     initialization: { mode: 'empty' },
     head_commit_id: mockCommitIds.release1,
     resource_version: '6',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -222,6 +270,7 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           message: '补充夜间道路场景',
           description: '增加夜间和低照度样本，并更新场景索引。',
           tag_names: ['dataset/v4', 'release-candidate'],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: '1785167600000',
         },
         {
@@ -230,6 +279,7 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           message: '实验性标注规则',
           description: '验证新的遮挡物和反光标注规则。',
           tag_names: ['occlusion-experiment'],
+          data_layout: 'whole_file',
           created_at_unix_ms: '1785167500000',
         },
         {
@@ -238,6 +288,7 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           message: '完成首轮质量复核',
           description: '完成白天场景的质量抽检和标签修订。',
           tag_names: ['v1.0'],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: '1785067400000',
         },
         {
@@ -245,6 +296,7 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           message: '导入初始道路场景',
           description: '建立道路场景数据集的初始版本。',
           tag_names: [],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: '1784967000000',
         },
       ],
@@ -261,12 +313,14 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           parent_commit_id: mockCommitIds.report1,
           message: '补充夜间场景评估',
           tag_names: ['quality-nightly'],
+          data_layout: 'whole_file',
           created_at_unix_ms: updated,
         },
         {
           commit_id: mockCommitIds.report1,
           message: '建立质量基线',
           tag_names: [],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: created,
         },
       ],
@@ -283,12 +337,14 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           parent_commit_id: mockCommitIds.dialog1,
           message: '增加安全标注',
           tag_names: ['safety-reviewed'],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: updated,
         },
         {
           commit_id: mockCommitIds.dialog1,
           message: '导入脱敏对话',
           tag_names: [],
+          data_layout: 'fast_cdc',
           created_at_unix_ms: created,
         },
       ],
@@ -304,6 +360,7 @@ export const commitGraphs = new Map<string, CommitGraphView>([
           commit_id: mockCommitIds.release1,
           message: '发布 2026.07',
           tag_names: ['release-2026.07'],
+          data_layout: 'whole_file',
           created_at_unix_ms: updated,
         },
       ],
@@ -317,6 +374,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
     playground_id: 'labeling',
+    resource_version: '6',
+    lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-vision',
     region: 'cn-shanghai',
     display_name: '标注工作区',
@@ -333,6 +392,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-vision',
     artifact_id: 'quality-reports',
     playground_id: 'nightly-review',
+    resource_version: '4',
+    lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-archive',
     region: 'cn-shanghai',
     display_name: '夜间回归检查',
@@ -350,6 +411,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-language',
     artifact_id: 'dialog-corpus',
     playground_id: 'safety-review',
+    resource_version: '7',
+    lifecycle: activeLifecycle,
     storage_volume_id: 'volume-beijing-language',
     region: 'cn-beijing',
     display_name: '安全标注复核',
@@ -366,6 +429,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
     playground_id: 'occlusion-audit',
+    resource_version: '3',
+    lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-vision',
     region: 'cn-shanghai',
     display_name: '遮挡场景质量复核',
@@ -382,6 +447,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
     playground_id: 'fog-augmentation',
+    resource_version: '2',
+    lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-vision',
     region: 'cn-shanghai',
     display_name: '雾天数据增强',
@@ -398,6 +465,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-vision',
     artifact_id: 'quality-reports',
     playground_id: 'july-regression',
+    resource_version: '5',
+    lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-vision',
     region: 'cn-shanghai',
     display_name: '七月回归报告复核',
@@ -414,6 +483,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-language',
     artifact_id: 'dialog-corpus',
     playground_id: 'pii-redaction',
+    resource_version: '8',
+    lifecycle: activeLifecycle,
     storage_volume_id: 'volume-beijing-language',
     region: 'cn-beijing',
     display_name: 'PII 脱敏复查',
@@ -430,6 +501,8 @@ export const playgrounds: PlaygroundView[] = [
     project_id: 'project-release',
     artifact_id: 'release-assets',
     playground_id: 'release-candidate',
+    resource_version: '3',
+    lifecycle: activeLifecycle,
     storage_volume_id: 'volume-release',
     region: 'cn-shanghai',
     display_name: '交付候选区',
@@ -446,16 +519,18 @@ export const playgrounds: PlaygroundView[] = [
 export const snapshots: SnapshotView[] = [
   {
     snapshot_id: 'snap-road-main3-sha-01',
+    resource_version: '4',
+    lifecycle: activeLifecycle,
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
     commit_id: mockCommitIds.roadMain3,
+    data_layout: 'fast_cdc',
     storage_volume_id: 'volume-shanghai-archive',
     region: 'cn-shanghai',
     message: '补充夜间道路场景',
     tag_names: ['dataset/v4', 'release-candidate'],
     state: 'ready',
-    phase: 'idle',
     integrity: {
       state: 'verified',
       files_verified: '864',
@@ -469,16 +544,18 @@ export const snapshots: SnapshotView[] = [
   },
   {
     snapshot_id: 'snap-road-main3-gz-01',
+    resource_version: '2',
+    lifecycle: activeLifecycle,
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
     commit_id: mockCommitIds.roadMain3,
+    data_layout: 'fast_cdc',
     storage_volume_id: 'volume-guangzhou-delivery',
     region: 'cn-guangzhou',
     message: '补充夜间道路场景',
     tag_names: ['dataset/v4', 'release-candidate'],
     state: 'creating',
-    phase: 'materializing',
     integrity: { state: 'pending', files_verified: '0', bytes_verified: '0' },
     created_at_unix_ms: '1785170900000',
     updated_at_unix_ms: '1785171000000',
@@ -487,16 +564,18 @@ export const snapshots: SnapshotView[] = [
   },
   {
     snapshot_id: 'snap-road-main2-sha-01',
+    resource_version: '5',
+    lifecycle: activeLifecycle,
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
     commit_id: mockCommitIds.roadMain2,
+    data_layout: 'fast_cdc',
     storage_volume_id: 'volume-shanghai-vision',
     region: 'cn-shanghai',
     message: '完成首轮质量复核',
     tag_names: ['v1.0'],
     state: 'abnormal',
-    phase: 'idle',
     issue: {
       code: 'SNAPSHOT_DELIVERY_FAILED',
       message: '目标存储交付校验失败，可在原区域重试。',
@@ -511,16 +590,18 @@ export const snapshots: SnapshotView[] = [
   },
   {
     snapshot_id: 'snap-dialog-2-bj-01',
+    resource_version: '6',
+    lifecycle: activeLifecycle,
     tenant_id: 'tenant-a',
     project_id: 'project-language',
     artifact_id: 'dialog-corpus',
     commit_id: mockCommitIds.dialog2,
+    data_layout: 'fast_cdc',
     storage_volume_id: 'volume-beijing-language',
     region: 'cn-beijing',
     message: '增加安全标注',
     tag_names: ['safety-reviewed'],
     state: 'ready',
-    phase: 'idle',
     integrity: {
       state: 'verified',
       files_verified: '120',
@@ -534,16 +615,18 @@ export const snapshots: SnapshotView[] = [
   },
   {
     snapshot_id: 'snap-release-1-sha-01',
+    resource_version: '4',
+    lifecycle: activeLifecycle,
     tenant_id: 'tenant-b',
     project_id: 'project-release',
     artifact_id: 'release-assets',
     commit_id: mockCommitIds.release1,
+    data_layout: 'whole_file',
     storage_volume_id: 'volume-release',
     region: 'cn-shanghai',
     message: '发布 2026.07',
     tag_names: ['release-2026.07'],
     state: 'ready',
-    phase: 'idle',
     integrity: {
       state: 'verified',
       files_verified: '42',
@@ -557,21 +640,65 @@ export const snapshots: SnapshotView[] = [
   },
 ];
 
+export const s3AccessPoints: S3AccessPointView[] = [
+  {
+    access_point_id: 'ap-road-main3',
+    tenant_id: 'tenant-a',
+    project_id: 'project-vision',
+    artifact_id: 'road-scenes',
+    snapshot_id: 'snap-road-main3-sha-01',
+    commit_id: mockCommitIds.roadMain3,
+    bucket_name: 'road-scenes-snapshot',
+    endpoint: runtimeConfig.s3Endpoint,
+    region: 'cn-shanghai',
+    state: 'active',
+    policy_generation: '1',
+    created_at_unix_ms: updated,
+    updated_at_unix_ms: updated,
+  },
+];
+
+export const s3Credentials: S3CredentialView[] = [
+  {
+    credential_id: 'cred-road-reader',
+    access_point_id: 'ap-road-main3',
+    access_key_id: 'NGS3ROADREADER01',
+    state: 'active',
+    expires_at_unix_ms: '1790000000000',
+    created_at_unix_ms: updated,
+  },
+];
+
+export const s3Objects = new Map<string, S3ObjectEntryView[]>([
+  ['ap-road-main3', mockS3Entries('ap-road-main3')],
+]);
+
 const initialTenants = structuredClone(tenants);
+const initialProjects = structuredClone(projects);
 const initialStorageVolumes = structuredClone(storageVolumes);
 const initialArtifacts = structuredClone(artifacts);
 const initialPlaygrounds = structuredClone(playgrounds);
 const initialSnapshots = structuredClone(snapshots);
+const initialS3AccessPoints = structuredClone(s3AccessPoints);
+const initialS3Credentials = structuredClone(s3Credentials);
+const initialS3Objects = [...s3Objects].map(
+  ([key, entries]) => [key, structuredClone(entries)] as const,
+);
 const initialCommitGraphs = [...commitGraphs].map(
   ([key, graph]) => [key, structuredClone(graph)] as const,
 );
 
 export function resetMockData(): void {
   tenants.splice(0, tenants.length, ...structuredClone(initialTenants));
+  projects.splice(0, projects.length, ...structuredClone(initialProjects));
   storageVolumes.splice(0, storageVolumes.length, ...structuredClone(initialStorageVolumes));
   artifacts.splice(0, artifacts.length, ...structuredClone(initialArtifacts));
   playgrounds.splice(0, playgrounds.length, ...structuredClone(initialPlaygrounds));
   snapshots.splice(0, snapshots.length, ...structuredClone(initialSnapshots));
+  s3AccessPoints.splice(0, s3AccessPoints.length, ...structuredClone(initialS3AccessPoints));
+  s3Credentials.splice(0, s3Credentials.length, ...structuredClone(initialS3Credentials));
+  s3Objects.clear();
+  for (const [key, entries] of initialS3Objects) s3Objects.set(key, structuredClone(entries));
   commitGraphs.clear();
   for (const [key, graph] of initialCommitGraphs) commitGraphs.set(key, structuredClone(graph));
 }

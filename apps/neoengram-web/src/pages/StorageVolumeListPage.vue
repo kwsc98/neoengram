@@ -7,6 +7,7 @@ import { useRoute } from 'vue-router';
 
 import {
   approveStorageEnrollment,
+  queryApiVersion,
   createStorageEnrollmentToken,
   createStorageVolume,
   queryStorageEnrollmentList,
@@ -26,9 +27,12 @@ import type {
   StorageEnrollmentView,
 } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
+import ResourceDeletionDialog from '@/components/ResourceDeletionDialog.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import { runtimeConfig } from '@/config';
+import { supportsResourceLifecycle } from '@/features/capabilities';
+import { lifecycleResourceVersion } from '@/features/lifecycle';
 import {
   buildAgentConfig,
   canonicalGatewayEndpoint,
@@ -51,6 +55,16 @@ const canCreateEnrollment = computed(() => permissions.value.includes('storage.e
 const canReadEnrollments = computed(() => permissions.value.includes('storage.enrollment.read'));
 const canReviewEnrollments = computed(() =>
   permissions.value.includes('storage.enrollment.review'),
+);
+const versionQuery = useQuery({
+  queryKey: ['system', 'version'],
+  queryFn: queryApiVersion,
+  staleTime: Number.POSITIVE_INFINITY,
+});
+const lifecycleEnabled = computed(
+  () =>
+    supportsResourceLifecycle(versionQuery.data.value?.data.capabilities) &&
+    permissions.value.includes('resource.lifecycle.manage' as never),
 );
 
 const activeView = ref<ViewName>('volumes');
@@ -545,9 +559,7 @@ function enrollmentStateType(state: StorageEnrollmentState): TagType {
 
 function probePassed(enrollment: StorageEnrollmentView): boolean {
   return (
-    enrollment.probe.descriptor_matches &&
-    enrollment.probe.protocol_compatible &&
-    enrollment.probe.observed_access_mode === 'read_write'
+    enrollment.probe.descriptor_matches && enrollment.probe.observed_access_mode === 'read_write'
   );
 }
 
@@ -627,6 +639,19 @@ function fingerprintSummary(value: string): string {
               <el-table-column label="更新时间" min-width="160">
                 <template #default="scope">{{ formatTime(scope.row.updated_at_unix_ms) }}</template>
               </el-table-column>
+              <el-table-column v-if="lifecycleEnabled" label="操作" width="70" align="right">
+                <template #default="scope">
+                  <ResourceDeletionDialog
+                    :tenant-id="tenantId"
+                    :resource="{
+                      type: 'storage_volume',
+                      storage_volume_id: scope.row.storage_volume_id,
+                    }"
+                    :resource-version="lifecycleResourceVersion(scope.row)"
+                    :display-name="scope.row.display_name"
+                  />
+                </template>
+              </el-table-column>
             </el-table>
             <div class="mobile-resource-list">
               <div
@@ -646,6 +671,16 @@ function fingerprintSummary(value: string): string {
                   <el-tag :type="volumeStateType(storageVolume.state)" size="small" effect="plain">
                     {{ storageVolume.state }}
                   </el-tag>
+                  <ResourceDeletionDialog
+                    v-if="lifecycleEnabled"
+                    :tenant-id="tenantId"
+                    :resource="{
+                      type: 'storage_volume',
+                      storage_volume_id: storageVolume.storage_volume_id,
+                    }"
+                    :resource-version="lifecycleResourceVersion(storageVolume)"
+                    :display-name="storageVolume.display_name"
+                  />
                 </span>
               </div>
             </div>
