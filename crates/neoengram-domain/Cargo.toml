@@ -1,0 +1,30 @@
+[package]
+name = "neoengram-domain"
+description = "NeoEngram domain models, canonical encodings, and wire contracts"
+publish = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["data-structures", "development-tools"]
+
+[dependencies]
+base64 = "0.22.1"
+blake3.workspace = true
+percent-encoding = "2.3"
+ring = "0.17.14"
+schemars = "1.2.1"
+serde.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+serde_json_canonicalizer = "0.3.2"
+time = { version = "0.3.55", features = ["formatting"] }
+unicode-casefold.workspace = true
+unicode-normalization.workspace = true
+url = "2.5"
+
+[lints]
+workspace = true

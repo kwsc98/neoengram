@@ -22,6 +22,18 @@ spec:
     - Ingress
     - Egress
   ingress:
+    # Public Web/S3 traffic must traverse a deliberately labelled ingress controller;
+    # this example does not admit node-wide or Internet-wide source CIDRs directly.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              neoengram.io/public-ingress: "true"
+          podSelector:
+            matchLabels:
+              neoengram.io/gateway-public-ingress: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
     # Agent enrollment/status and authenticated Agent traffic enter only through
     # the Agent edge listener. The namespace label is an explicit trust boundary.
     - from:
@@ -67,6 +79,18 @@ spec:
         - protocol: TCP
           port: 8083
   egress:
+    # Console API proxying and S3 authorization reach only the private Central
+    # Service Pods. Cross-cluster Central requires a narrowly rendered ipBlock.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              neoengram.io/control-plane: "true"
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: neoengram-central
+      ports:
+        - protocol: TCP
+          port: 8080
     # In-cluster peer forwarding. Cross-cluster peers require a rendered ipBlock
     # (or CNI-specific policy) and are intentionally absent from this example.
     - to:

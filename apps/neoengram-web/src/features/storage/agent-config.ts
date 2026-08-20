@@ -121,7 +121,7 @@ export function buildAgentConfig(
   return dump(
     {
       schema_version: 1,
-      protocol_version: 1,
+      wire_version: 1,
       gateway_endpoint: canonicalEndpoint,
       trust_bundle_file: '/etc/neoengram/gateway-ca.pem',
       ...gatewayIdentity,

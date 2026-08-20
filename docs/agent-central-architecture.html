@@ -910,7 +910,7 @@
         >
           <title id="diagram-title">NeoEngram 中心化 Agent 总体架构</title>
           <desc id="diagram-description">
-            图中展示中心 PostgreSQL、neoengramd、网络隔离的 EdgeCluster A 和 EdgeCluster B、各集群的
+            图中展示中心 PostgreSQL、neoengram-central、网络隔离的 EdgeCluster A 和 EdgeCluster B、各集群的
             系统组件区、居中的 NFS 区和业务 Pod 区，以及唯一跨集群 S3 数据通路和 Pod 到本集群 NFS
             子目录的直接挂载路径。
           </desc>
@@ -1016,9 +1016,9 @@
             <text class="node-subtitle" x="720" y="82" text-anchor="middle">所有请求先进入租户作用域 API</text>
           </g>
 
-          <g class="node control-node" data-node="api" tabindex="0" role="button" aria-label="neoengramd API">
+          <g class="node control-node" data-node="api" tabindex="0" role="button" aria-label="neoengram-central API">
             <rect x="70" y="210" width="240" height="110" rx="6"></rect>
-            <text class="node-title" x="190" y="242" text-anchor="middle">neoengramd API</text>
+            <text class="node-title" x="190" y="242" text-anchor="middle">neoengram-central API</text>
             <text class="node-subtitle" x="190" y="267" text-anchor="middle">认证 / Tenant RBAC / RLS</text>
             <text class="node-subtitle" x="190" y="289" text-anchor="middle">Quota / Audit</text>
           </g>
@@ -1190,7 +1190,7 @@
         <tbody>
           <tr>
             <th>命令入口</th>
-            <td>用户、CLI、UI 和自动化系统只调用 neoengramd。Agent 不接受绕过中心的业务命令或入站管理调用。</td>
+            <td>用户、CLI、UI 和自动化系统只调用 neoengram-central。Agent 不接受绕过中心的业务命令或入站管理调用。</td>
           </tr>
           <tr>
             <th>元数据权威</th>
@@ -1231,11 +1231,11 @@
         entry: {
           title: "用户 / UI / Scheduler",
           tags: ["Tenant scoped", "API only"],
-          description: "用户和上层调度器只访问 neoengramd，不直接连接 Agent、PostgreSQL 或 NFS 物理路径。",
+          description: "用户和上层调度器只访问 neoengram-central，不直接连接 Agent、PostgreSQL 或 NFS 物理路径。",
           boundary: "资源 ID 用于定位，不是授权凭据；每次请求只能处于一个已授权租户作用域。"
         },
         api: {
-          title: "neoengramd API",
+          title: "neoengram-central API",
           tags: ["认证", "RBAC", "Quota", "Audit"],
           description: "建立 Principal 与 Tenant 上下文，验证权限和配额，并把具有开始/结束语义的操作持久化为 Job。",
           boundary: "普通租户请求不能使用 BYPASSRLS，也不能把用户字符串转换为 SSH 或 shell 命令。"

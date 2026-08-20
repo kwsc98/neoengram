@@ -1,45 +1,56 @@
 export function supportsArtifactCatalog(capabilities: readonly string[] | undefined): boolean {
-  return (
-    capabilities?.includes('artifact_catalog') ||
-    capabilities?.includes('resource_browser') ||
-    false
-  );
-}
-
-/**
- * `resource_browser` was the original all-or-nothing capability. Keep it as
- * an alias while allowing the workspace surface to be rolled out in pieces.
- */
-export function supportsResourceBrowser(capabilities: readonly string[] | undefined): boolean {
-  return capabilities?.includes('resource_browser') ?? false;
+  return capabilities?.includes('artifact_catalog') ?? false;
 }
 
 export function supportsArtifactCommitGraph(capabilities: readonly string[] | undefined): boolean {
-  return Boolean(
-    capabilities?.includes('artifact_commit_graph') || capabilities?.includes('resource_browser'),
-  );
+  return capabilities?.includes('artifact_commit_graph') ?? false;
 }
 
 export function supportsPlaygroundMaterialize(
   capabilities: readonly string[] | undefined,
 ): boolean {
-  return Boolean(
-    capabilities?.includes('playground_materialize') || capabilities?.includes('resource_browser'),
-  );
+  return capabilities?.includes('playground_materialize') ?? false;
 }
 
 export function supportsPlaygroundBrowser(capabilities: readonly string[] | undefined): boolean {
-  return Boolean(
-    capabilities?.includes('playground_browser') || capabilities?.includes('resource_browser'),
-  );
+  return capabilities?.includes('playground_browser') ?? false;
 }
 
 export function supportsPlaygroundPreCommit(capabilities: readonly string[] | undefined): boolean {
-  return Boolean(
-    capabilities?.includes('playground_precommit') || capabilities?.includes('resource_browser'),
-  );
+  return capabilities?.includes('playground_precommit') ?? false;
 }
 
 export function supportsSnapshotMaterialize(capabilities: readonly string[] | undefined): boolean {
   return capabilities?.includes('snapshot_materialize') ?? false;
+}
+
+export function supportsCommitLayoutSelection(
+  capabilities: readonly string[] | undefined,
+): boolean {
+  return capabilities?.includes('commit_layout_selection_v2') ?? false;
+}
+
+export type SnapshotDeliveryCapabilityMode = 'fuse' | 'copy' | 'hardlink';
+
+export function supportsSnapshotDeliveryMode(
+  capabilities: readonly string[] | undefined,
+  mode: SnapshotDeliveryCapabilityMode,
+): boolean {
+  return capabilities?.includes(`snapshot_delivery_${mode}_v2`) ?? false;
+}
+
+export function supportsSnapshotDelivery(capabilities: readonly string[] | undefined): boolean {
+  return (['fuse', 'copy', 'hardlink'] as const).some((mode) =>
+    supportsSnapshotDeliveryMode(capabilities, mode),
+  );
+}
+
+export function supportsS3ReadonlyAccessPoint(
+  capabilities: readonly string[] | undefined,
+): boolean {
+  return capabilities?.includes('s3_readonly_access_point') ?? false;
+}
+
+export function supportsResourceLifecycle(capabilities: readonly string[] | undefined): boolean {
+  return capabilities?.includes('resource_lifecycle_v1') ?? false;
 }

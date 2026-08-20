@@ -14,9 +14,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 查询 API 和 Agent 协议版本
-         * @description 返回当前服务理解的公开 API 版本和 Agent wire protocol 版本。该方法用于
-         *     版本协商，因此不要求 `NeoEngram-API-Version` 或认证。
+         * 查询当前 API 和 Agent wire 版本
+         * @description 返回当前服务使用的公开 API 版本和 Agent wire protocol 版本。版本不匹配直接拒绝，
+         *     不提供版本数组协商，因此不要求 `NeoEngram-API-Version` 或认证。
          */
         post: operations["queryApiVersion"];
         delete?: never;
@@ -235,7 +235,7 @@ export interface paths {
          * 批准 Storage enrollment
          * @description 要求 `storage.enrollment.review` 权限。仅允许批准未过期的 `pending_approval` enrollment；服务端
          *     必须在一个事务中执行 resource version CAS，校验冻结的 Tenant/Volume/EdgeCluster/Region/
-         *     access mode/PVC descriptor、probe、协议兼容性和一 PVC 一活动 Agent 唯一约束。initial 审批
+         *     access mode/PVC descriptor、probe 和一 PVC 一活动 Agent 唯一约束。initial 审批
          *     创建缺失的 StorageVolume，或精确绑定 descriptor 完全一致且 `unavailable`、无活动 Owner 的
          *     既有 PVC Volume；replacement 则精确绑定同一 Tenant 下由旧 Owner 占用的既有 Volume。
          *     `registration_kind=replacement` 时必须显式传 `confirm_replacement=true`，否则返回 409。
@@ -249,6 +249,29 @@ export interface paths {
          *     `expected_resource_version`、非 pending_approval 状态或 PVC 已绑定另一活动 Agent 均返回 409。
          */
         post: operations["approveStorageEnrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/storage/enrollment/recovery/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 完成 replacement Storage recovery
+         * @description 要求 `storage.enrollment.review` 权限。仅用于 replacement Agent 已建立认证 session 并报告
+         *     Ready mount 后，显式完成 Volume recovery fence。服务端同时校验 enrollment resource version
+         *     和当前 owner generation；旧 Owner、旧 generation、非 recovery 状态或尚未 Ready 的 mount
+         *     均返回 409。该动作不会签发凭证，也不接受客户端路径或挂载信息。
+         */
+        post: operations["completeStorageRecovery"];
         delete?: never;
         options?: never;
         head?: never;
@@ -277,6 +300,27 @@ export interface paths {
          *     resource version 或非 pending_approval 状态返回 409。
          */
         post: operations["rejectStorageEnrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/project/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建 Project
+         * @description 要求 Tenant 内的 `project.create` 权限。相同 Tenant、Project ID 和 canonical 创建内容返回
+         *     既有 Project 并标记 `replayed=true`；相同 Project ID 对应不同内容时返回冲突。
+         */
+        post: operations["createProject"];
         delete?: never;
         options?: never;
         head?: never;
@@ -735,7 +779,7 @@ export interface paths {
          *     服务端生成 `snapshot_id`；相同 `snapshot_request_id` 和 payload 返回 `replayed: true`，不同
          *     request identity 命中同一 Commit/Volume 的未删除 Snapshot 时返回 `placement_reused: true`。
          *     用途、保留策略和 Dataset Profile 均不是创建参数；Profile 是创建后查询的派生只读元数据。200 返回时
-         *     Snapshot 记录已持久化且可查询，后续交付由其状态和阶段表达。
+         *     Snapshot 记录已持久化且可查询；具体物化进度由独立 SnapshotDelivery 表达。
          */
         post: operations["createSnapshot"];
         delete?: never;
@@ -755,11 +799,94 @@ export interface paths {
         put?: never;
         /**
          * 重试 Snapshot 交付
-         * @description 对 Abnormal Snapshot 的同一固定 Commit/Volume 交付重新发起 attempt，使状态回到 Creating。
-         *     相同 `retry_request_id` 和 payload 幂等返回；状态不允许重试时返回 409。200 返回时新的交付
-         *     attempt 已持久化，后续进度通过 Snapshot 状态、阶段和活动查询。
+         * @description 对 failed SnapshotDelivery 的同一固定 Snapshot/Commit/Volume 交付重新发起 attempt，
+         *     使 Delivery 状态回到 requested，Snapshot 状态保持不变。相同 `request_id` 和 payload
+         *     幂等返回；状态不允许重试时返回 409。200 返回时新的交付 attempt 已持久化，
+         *     后续进度通过 SnapshotDelivery 查询。
          */
         post: operations["retrySnapshotDelivery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/snapshot/delivery/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建 Snapshot 只读交付
+         * @description 为固定 Snapshot 创建 FUSE、Copy 或 Hardlink 只读交付，目标路径由服务端推导。
+         */
+        post: operations["createSnapshotDelivery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/snapshot/delivery/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Snapshot 只读交付
+         * @description 返回单个 SnapshotDelivery 的状态、交付模式和物化进度。
+         */
+        post: operations["querySnapshotDelivery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/snapshot/delivery/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Snapshot 只读交付列表
+         * @description 分页返回指定 Snapshot 的所有只读交付。
+         */
+        post: operations["querySnapshotDeliveryList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/snapshot/delivery/delete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 删除 Snapshot 只读交付
+         * @description 将指定 SnapshotDelivery 标记为 `deleting`，并异步卸载 FUSE 或清理 Copy/Hardlink 交付。
+         *     200 只表示删除流程已持久化；最终 `deleted` 状态通过查询接口获取，相同 `request_id` 和 payload
+         *     幂等返回同一结果。
+         */
+        post: operations["deleteSnapshotDelivery"];
         delete?: never;
         options?: never;
         head?: never;
@@ -797,8 +924,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 查询 Snapshot 交付活动
-         * @description 分页返回 Snapshot 创建、阶段变化、失败、重试和就绪的脱敏活动记录。
+         * 查询 Snapshot 活动
+         * @description 分页返回 Snapshot 创建、状态变化、失败和就绪的脱敏活动记录；Delivery 重试不改变 Snapshot 活动。
          */
         post: operations["querySnapshotActivityList"];
         delete?: never;
@@ -821,6 +948,386 @@ export interface paths {
          * @description 返回固定 Snapshot 的公开数据集画像、Schema、质量和 freshness 摘要。
          */
         post: operations["querySnapshotDatasetProfile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/access-point/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 为 Ready Snapshot 开启只读 S3 访问
+         * @description 要求 `s3.access.manage` 权限。为固定 Snapshot 创建唯一只读 Access Point，并在首次成功
+         *     响应中返回一组短期凭证。Snapshot 必须为 `ready`，对应 GatewayPool 必须可服务；同一
+         *     Snapshot 已有停用 Access Point 时必须显式调用 enable，不会通过本方法重新签发凭证。
+         *     `secret_access_key` 只在首次创建凭证时返回，幂等重放不会再次返回原 Secret。
+         */
+        post: operations["createS3AccessPoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/access-point/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 分页查询 S3 Access Point
+         * @description 要求 `s3.access.read` 权限；仅返回当前 Tenant 可见的 Access Point。
+         */
+        post: operations["queryS3AccessPointList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/access-point/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 S3 Access Point
+         * @description 要求 `s3.access.read` 权限；不存在或不可见统一返回 404。
+         */
+        post: operations["queryS3AccessPoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/access-point/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 启用 S3 Access Point
+         * @description 要求 `s3.access.manage` 权限。启用只恢复 Access Point 策略，不恢复停用时已撤销的凭证；
+         *     调用方需要随后创建新凭证。
+         */
+        post: operations["enableS3AccessPoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/access-point/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 停用 S3 Access Point
+         * @description 要求 `s3.access.manage` 权限。停用后对象访问立即不可用，所有 active 凭证被撤销，
+         *     policy generation 单调递增。
+         */
+        post: operations["disableS3AccessPoint"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/credential/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建 S3 短期凭证
+         * @description 要求 `s3.access.manage` 权限。仅 active Access Point 可创建凭证；disabled 状态返回
+         *     `S3_ACCESS_POINT_DISABLED`。每个 Access Point 最多同时存在两组 active 凭证，
+         *     `secret_access_key` 只在首次成功响应中返回。
+         */
+        post: operations["createS3Credential"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/credential/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Access Point 凭证
+         * @description 要求 `s3.access.manage` 权限；响应永不包含 Secret 或加密材料。
+         */
+        post: operations["queryS3CredentialList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/credential/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 撤销 S3 凭证
+         * @description 要求 `s3.access.manage` 权限；重复撤销保持 revoked，并返回当前凭证列表。
+         */
+        post: operations["revokeS3Credential"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/object/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 浏览只读 S3 对象
+         * @description 要求 `s3.access.read` 权限。对象列表来自 Access Point 固定 Commit 的不可变索引；
+         *     `prefix` 与 `delimiter` 使用 S3 ListObjectsV2 语义，公共目录前缀单独返回。
+         */
+        post: operations["queryS3ObjectList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/s3/object/download-url/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建只读对象下载 URL
+         * @description 要求 `s3.access.read` 权限。为固定 Commit 中存在的对象创建短期、只读 presigned URL；
+         *     URL 不授予列举、写入或删除权限，且不会绕过 disabled Access Point。
+         */
+        post: operations["createS3DownloadUrl"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/resource/deletion/impact/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询资源安全删除影响
+         * @description 要求 `resource.lifecycle.read` 权限。基于当前 Catalog 依赖图返回待删除资源、活动任务、
+         *     S3 凭证、唯一对象副本与预计清理规模，并签发五分钟有效的 `impact_digest`。该调用只做
+         *     dry-run，不改变资源状态；Artifact 或 StorageVolume 的子资源仅在显式 `cascade=true` 时纳入。
+         */
+        post: operations["queryResourceDeletionImpact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/resource/deletion/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 创建安全删除任务
+         * @description 要求 `resource.lifecycle.manage` 权限。服务端在 Catalog 事务中重新验证五分钟影响摘要、
+         *     资源版本与依赖集合，然后原子停止整批资源访问、停用关联 S3 Access Point 并创建删除 Saga。
+         *     相同 `request_id` 与请求摘要幂等重放原任务；进入 `purging` 后不再允许恢复。
+         */
+        post: operations["createResourceDeletion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/resource/deletion/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询删除任务详情
+         * @description 要求 `resource.lifecycle.read` 权限。返回删除 Saga 当前阶段、整批目标、错误和所有
+         *     Retention Hold；永久删除后的资源只可通过本任务视图和保留 tombstone 审计查询。
+         */
+        post: operations["queryResourceDeletion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/resource/deletion/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 分页查询回收站任务
+         * @description 要求 `resource.lifecycle.read` 权限。按 Tenant 和可选任务状态分页返回删除批次；
+         *     普通资源列表仍只返回 `active` 资源，本方法是管理员查看回收站和永久删除记录的入口。
+         */
+        post: operations["queryResourceDeletionList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/resource/deletion/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 整批恢复回收站资源
+         * @description 要求 `resource.lifecycle.manage` 权限。仅在任务进入 `purging` 前接受恢复，并以固定依赖批次
+         *     执行；所有目标保持 `restoring`，直到 Agent 物理恢复完成后由 Catalog 原子切回 `active`。
+         *     已撤销的 S3 凭证、Job 与 Pre-commit 不会随资源自动恢复。
+         */
+        post: operations["restoreResourceDeletion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/resource/deletion/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 重试阻塞或失败的删除任务
+         * @description 要求 `resource.lifecycle.manage` 权限。对 `blocked` 或 `failed` Saga 创建幂等重试，保留原删除
+         *     ID、依赖批次和生命周期 generation；该方法不能绕过 Retention Hold、唯一副本或 Agent fencing。
+         */
+        post: operations["retryResourceDeletion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/resource/retention-hold/create": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 为删除任务创建 Retention Hold
+         * @description 要求 `retention.manage` 权限。Hold 必须记录原因，可永久有效或设置到期时间；它不会恢复
+         *     资源访问，只阻止删除任务进入 `purging`。相同 `request_id` 和请求摘要幂等返回同一个 Hold。
+         */
+        post: operations["createResourceRetentionHold"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/resource/retention-hold/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 释放删除任务的 Retention Hold
+         * @description 要求 `retention.manage` 权限。使用删除任务资源版本执行 CAS 并幂等释放指定 Hold；最后一个
+         *     有效 Hold 释放后，已超过 `purge_after` 的任务立即重新具备进入物理清理阶段的资格。
+         */
+        post: operations["releaseResourceRetentionHold"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1108,7 +1615,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * 检查 neoengramd 进程是否存活
+         * 检查 neoengram-central 进程是否存活
          * @description 不访问 authority；仅表示进程可以处理 HTTP 请求。
          */
         get: operations["liveProbe"];
@@ -1128,7 +1635,7 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * 检查 neoengramd 是否可以接收业务请求
+         * 检查 neoengram-central 是否可以接收业务请求
          * @description 至少验证 authority 已打开并通过其后端完整性检查。
          */
         get: operations["readyProbe"];
@@ -1146,8 +1653,10 @@ export interface components {
     schemas: {
         EmptyRequest: Record<string, never>;
         ApiVersionResponse: {
-            api_versions: 1[];
-            agent_protocol_versions: 1[];
+            /** @enum {integer} */
+            api_version: 1;
+            /** @enum {integer} */
+            agent_wire_version: 1;
             capabilities: string[];
         };
         CreateGatewayPoolRequest: {
@@ -1213,7 +1722,8 @@ export interface components {
             peer_endpoint: components["schemas"]["GatewayEndpoint"];
             bootstrap_endpoint: components["schemas"]["GatewayEndpoint"];
             software_version: string;
-            supported_protocol_versions: number[];
+            /** @constant */
+            wire_version: 1;
             capabilities?: string[];
         };
         QueryGatewayReplicaListRequest: {
@@ -1252,7 +1762,8 @@ export interface components {
             peer_endpoint: components["schemas"]["GatewayEndpoint"];
             bootstrap_endpoint: components["schemas"]["GatewayEndpoint"];
             software_version: string;
-            supported_protocol_versions: number[];
+            /** @constant */
+            wire_version: 1;
             capabilities: string[];
             last_heartbeat_at_unix_ms?: components["schemas"]["UnixMillis"];
             state: components["schemas"]["GatewayReplicaState"];
@@ -1272,7 +1783,7 @@ export interface components {
         GatewayReplicaCount: number;
         /**
          * Format: uri
-         * @description canonical HTTPS origin；不得包含 userinfo、path、query、fragment 或尾随斜杠。
+         * @description canonical HTTPS origin；开发环境允许 literal loopback HTTP origin；不得包含 userinfo、path、query、fragment 或尾随斜杠。
          */
         GatewayEndpoint: string;
         QueryTenantListRequest: {
@@ -1295,8 +1806,6 @@ export interface components {
             tenant_id: components["schemas"]["TenantId"];
             display_name: components["schemas"]["DisplayName"];
             description?: components["schemas"]["Description"];
-        } & {
-            [key: string]: unknown;
         };
         CreateTenantResponse: {
             tenant: components["schemas"]["TenantView"];
@@ -1331,7 +1840,7 @@ export interface components {
         QueryStorageVolumeResponse: {
             storage_volume: components["schemas"]["StorageVolumeView"];
         };
-        CreateStorageVolumeRequest: ({
+        CreateStorageVolumeRequest: {
             tenant_id: components["schemas"]["TenantId"];
             storage_volume_id: components["schemas"]["StorageVolumeId"];
             display_name: components["schemas"]["DisplayName"];
@@ -1339,11 +1848,13 @@ export interface components {
             region: components["schemas"]["RegionName"];
             backend_type: components["schemas"]["StorageBackendType"];
             access_mode: components["schemas"]["StorageAccessMode"];
+            allowed_delivery_modes?: components["schemas"]["SnapshotDeliveryMode"][];
+            hardlink_policy?: components["schemas"]["HardlinkPolicy"];
+            max_whole_file_bytes?: components["schemas"]["DecimalU64"];
+            copy_reserve_bytes?: components["schemas"]["DecimalU64"];
             pvc_reference?: components["schemas"]["PvcReference"];
             nfs_reference?: components["schemas"]["NfsReference"];
-        } & {
-            [key: string]: unknown;
-        }) & ({
+        } & ({
             /** @constant */
             backend_type?: "pvc";
             nfs_reference?: never;
@@ -1369,9 +1880,14 @@ export interface components {
             region: components["schemas"]["RegionName"];
             backend_type: components["schemas"]["StorageBackendType"];
             access_mode: components["schemas"]["StorageAccessMode"];
+            allowed_delivery_modes: components["schemas"]["SnapshotDeliveryMode"][];
+            hardlink_policy: components["schemas"]["HardlinkPolicy"];
+            max_whole_file_bytes: components["schemas"]["DecimalU64"];
+            copy_reserve_bytes: components["schemas"]["DecimalU64"];
             pvc_reference?: components["schemas"]["PvcReference"];
             state: components["schemas"]["StorageVolumeState"];
             resource_version: components["schemas"]["CanonicalU64"];
+            lifecycle: components["schemas"]["ResourceLifecycleView"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
         };
@@ -1443,6 +1959,20 @@ export interface components {
             replayed: boolean;
         };
         /**
+         * @description 使用 expected_resource_version 和当前 owner_generation 完成 replacement recovery fence。
+         *     Tenant、Enrollment 与 Owner generation 必须全部匹配服务端当前状态。
+         */
+        CompleteStorageRecoveryRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            storage_enrollment_id: components["schemas"]["StorageEnrollmentId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+            owner_generation: components["schemas"]["CanonicalU64"];
+        };
+        CompleteStorageRecoveryResponse: {
+            enrollment: components["schemas"]["StorageEnrollmentView"];
+            storage_volume: components["schemas"]["StorageVolumeView"];
+        };
+        /**
          * @description 使用 expected_resource_version 对 pending_approval enrollment 执行 CAS；rejection_request_id
          *     与完整 payload 构成稳定幂等 identity，并与 approval_request_id 共享 Tenant 级 decision request
          *     identity 命名空间。
@@ -1492,7 +2022,6 @@ export interface components {
             /** @enum {string} */
             observed_access_mode: "read_only" | "read_write";
             descriptor_matches: boolean;
-            protocol_compatible: boolean;
             observed_at_unix_ms: components["schemas"]["UnixMillis"];
         };
         /**
@@ -1533,13 +2062,25 @@ export interface components {
             query?: components["schemas"]["SearchQuery"];
         };
         QueryProjectListResponse: {
-            items: components["schemas"]["ProjectSummary"][];
+            items: components["schemas"]["ProjectView"][];
             next_cursor?: components["schemas"]["PageCursor"];
         };
-        ProjectSummary: {
+        CreateProjectRequest: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
             display_name: components["schemas"]["DisplayName"];
+            description?: components["schemas"]["Description"];
+        };
+        CreateProjectResponse: {
+            project: components["schemas"]["ProjectView"];
+            replayed: boolean;
+        };
+        ProjectView: {
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            display_name: components["schemas"]["DisplayName"];
+            description?: components["schemas"]["Description"];
+            resource_version: components["schemas"]["CanonicalU64"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
         };
@@ -1569,8 +2110,6 @@ export interface components {
             display_name: components["schemas"]["DisplayName"];
             description?: components["schemas"]["Description"];
             initialization: components["schemas"]["ArtifactInitialization"];
-        } & {
-            [key: string]: unknown;
         };
         ArtifactInitialization: components["schemas"]["EmptyArtifactInitialization"] | components["schemas"]["DerivedArtifactInitialization"];
         EmptyArtifactInitialization: {
@@ -1612,6 +2151,7 @@ export interface components {
             initialization: components["schemas"]["ArtifactInitialization"];
             head_commit_id?: components["schemas"]["CommitId"];
             resource_version: components["schemas"]["CanonicalU64"];
+            lifecycle: components["schemas"]["ResourceLifecycleView"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
         };
@@ -1638,8 +2178,14 @@ export interface components {
             message: string;
             description?: components["schemas"]["Description"];
             tag_names: components["schemas"]["TagName"][];
+            data_layout: components["schemas"]["DataLayout"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
         };
+        /**
+         * @description Commit 内所有文件使用的统一数据布局。
+         * @enum {string}
+         */
+        DataLayout: "fast_cdc" | "whole_file";
         QueryArtifactCommitDiffRequest: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
@@ -1714,8 +2260,6 @@ export interface components {
              *     且服务端不会为其伪造 base Commit。
              */
             base_commit_id?: components["schemas"]["CommitId"];
-        } & {
-            [key: string]: unknown;
         };
         CreatePlaygroundResponse: {
             playground: components["schemas"]["PlaygroundView"];
@@ -1750,6 +2294,8 @@ export interface components {
             storage_availability: components["schemas"]["PlaygroundStorageAvailability"];
             active_precommit_id?: components["schemas"]["PreCommitId"];
             issue?: components["schemas"]["ResourceIssueSummary"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            lifecycle: components["schemas"]["ResourceLifecycleView"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
         };
@@ -1764,8 +2310,7 @@ export interface components {
             playground_id: components["schemas"]["PlaygroundId"];
             precommit_request_id: components["schemas"]["ResourceId"];
             expected_index_version: components["schemas"]["IndexVersion"];
-        } & {
-            [key: string]: unknown;
+            data_layout: components["schemas"]["DataLayout"];
         };
         StartPreCommitResponse: {
             precommit: components["schemas"]["PreCommitView"];
@@ -1788,8 +2333,6 @@ export interface components {
             precommit_id: components["schemas"]["PreCommitId"];
             restart_request_id: components["schemas"]["ResourceId"];
             expected_index_version: components["schemas"]["IndexVersion"];
-        } & {
-            [key: string]: unknown;
         };
         RestartPreCommitResponse: {
             precommit: components["schemas"]["PreCommitView"];
@@ -1800,8 +2343,6 @@ export interface components {
             tenant_id: components["schemas"]["TenantId"];
             precommit_id: components["schemas"]["PreCommitId"];
             cancel_request_id: components["schemas"]["ResourceId"];
-        } & {
-            [key: string]: unknown;
         };
         CancelPreCommitResponse: {
             precommit: components["schemas"]["PreCommitView"];
@@ -1839,6 +2380,7 @@ export interface components {
             warnings: components["schemas"]["PreCommitNotice"][];
             blockers: components["schemas"]["PreCommitNotice"][];
             source_index_version: components["schemas"]["IndexVersion"];
+            data_layout: components["schemas"]["DataLayout"];
             candidate_index_version?: components["schemas"]["IndexVersion"];
             diff_summary?: components["schemas"]["CommitDiffSummary"];
             issue?: components["schemas"]["ResourceIssueSummary"];
@@ -1876,11 +2418,10 @@ export interface components {
             commit_request_id: components["schemas"]["ResourceId"];
             precommit_id: components["schemas"]["PreCommitId"];
             expected_candidate_index_version: components["schemas"]["IndexVersion"];
+            data_layout: components["schemas"]["DataLayout"];
             message: string;
             description?: components["schemas"]["Description"];
             tag_names?: components["schemas"]["TagName"][];
-        } & {
-            [key: string]: unknown;
         };
         CommitPlaygroundResponse: {
             commit: components["schemas"]["CommitNode"];
@@ -2064,23 +2605,79 @@ export interface components {
             commit_id: components["schemas"]["CommitId"];
             storage_volume_id: components["schemas"]["StorageVolumeId"];
             snapshot_request_id: components["schemas"]["ResourceId"];
-        } & {
-            [key: string]: unknown;
         };
         CreateSnapshotResponse: {
             snapshot: components["schemas"]["SnapshotView"];
             replayed: boolean;
             placement_reused: boolean;
         };
-        RetrySnapshotDeliveryRequest: {
+        /** @enum {string} */
+        SnapshotDeliveryMode: "fuse" | "copy" | "hardlink";
+        /** @enum {string} */
+        HardlinkPolicy: "disabled" | "sealed_acl" | "trusted_local";
+        /** @enum {string} */
+        SnapshotDeliveryState: "requested" | "validating" | "materializing" | "ready" | "failed" | "deleting" | "deleted";
+        SnapshotDeliveryView: {
+            delivery_id: components["schemas"]["ResourceId"];
+            snapshot_id: components["schemas"]["SnapshotId"];
+            commit_id: components["schemas"]["CommitId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            mode: components["schemas"]["SnapshotDeliveryMode"];
+            target_relative_root: string;
+            state: components["schemas"]["SnapshotDeliveryState"];
+            source_index_digest: components["schemas"]["ContentDigest"];
+            delivery_generation: components["schemas"]["CanonicalU64"];
+            file_count: components["schemas"]["CanonicalU64"];
+            size_bytes: components["schemas"]["CanonicalU64"];
+            object_set_digest: components["schemas"]["ContentDigest"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            issue?: components["schemas"]["ResourceIssueSummary"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        CreateSnapshotDeliveryRequest: {
             tenant_id: components["schemas"]["TenantId"];
             snapshot_id: components["schemas"]["SnapshotId"];
-            retry_request_id: components["schemas"]["ResourceId"];
-        } & {
-            [key: string]: unknown;
+            mode: components["schemas"]["SnapshotDeliveryMode"];
+            request_id: components["schemas"]["ResourceId"];
+        };
+        CreateSnapshotDeliveryResponse: {
+            delivery: components["schemas"]["SnapshotDeliveryView"];
+            replayed: boolean;
+        };
+        QuerySnapshotDeliveryRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            delivery_id: components["schemas"]["ResourceId"];
+        };
+        QuerySnapshotDeliveryResponse: {
+            delivery: components["schemas"]["SnapshotDeliveryView"];
+        };
+        QuerySnapshotDeliveryListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            snapshot_id: components["schemas"]["SnapshotId"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
+        };
+        QuerySnapshotDeliveryListResponse: {
+            items: components["schemas"]["SnapshotDeliveryView"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        RetrySnapshotDeliveryRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            delivery_id: components["schemas"]["ResourceId"];
+            request_id: components["schemas"]["ResourceId"];
         };
         RetrySnapshotDeliveryResponse: {
-            snapshot: components["schemas"]["SnapshotView"];
+            delivery: components["schemas"]["SnapshotDeliveryView"];
+            replayed: boolean;
+        };
+        DeleteSnapshotDeliveryRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            delivery_id: components["schemas"]["ResourceId"];
+            request_id: components["schemas"]["ResourceId"];
+        };
+        DeleteSnapshotDeliveryResponse: {
+            delivery: components["schemas"]["SnapshotDeliveryView"];
             replayed: boolean;
         };
         QuerySnapshotFileListRequest: {
@@ -2108,9 +2705,8 @@ export interface components {
         SnapshotActivityView: {
             activity_id: components["schemas"]["ResourceId"];
             /** @enum {string} */
-            activity_type: "created" | "phase_changed" | "ready" | "failed" | "retry_started";
+            activity_type: "created" | "status_changed" | "ready" | "failed";
             summary: string;
-            phase?: components["schemas"]["SnapshotPhase"];
             issue?: components["schemas"]["ResourceIssueSummary"];
             created_at_unix_ms: components["schemas"]["UnixMillis"];
         };
@@ -2123,12 +2719,10 @@ export interface components {
         };
         /** @enum {string} */
         SnapshotState: "creating" | "ready" | "abnormal";
-        /** @enum {string} */
-        SnapshotPhase: "planning" | "materializing" | "verifying" | "idle";
         /**
-         * @description 独立身份、固定 Artifact Commit、单 StorageVolume 和单 Region 的只读交付资源。
-         *     `tenant_id + project_id + artifact_id + commit_id` 是不可变来源 scope；Snapshot 只是该 Commit
-         *     的交付视图，不拥有或改写 Artifact 数据权威。
+         * @description 独立身份，固定一个 Artifact、Commit、StorageVolume 和 Region 的不可变 Snapshot 资源。
+         *     `tenant_id + project_id + artifact_id + commit_id` 是不可变来源 scope；只读交付由独立的
+         *     SnapshotDelivery 资源表达，Snapshot 本身不保存挂载或物化模式，也不拥有或改写 Artifact 数据权威。
          */
         SnapshotView: {
             snapshot_id: components["schemas"]["SnapshotId"];
@@ -2136,14 +2730,16 @@ export interface components {
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
             commit_id: components["schemas"]["CommitId"];
+            data_layout: components["schemas"]["DataLayout"];
             storage_volume_id: components["schemas"]["StorageVolumeId"];
             region: components["schemas"]["RegionName"];
             message: string;
             tag_names: components["schemas"]["TagName"][];
             state: components["schemas"]["SnapshotState"];
-            phase: components["schemas"]["SnapshotPhase"];
             issue?: components["schemas"]["ResourceIssueSummary"];
             integrity: components["schemas"]["SnapshotIntegritySummary"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            lifecycle: components["schemas"]["ResourceLifecycleView"];
             logical_file_count: components["schemas"]["CanonicalU64"];
             logical_size_bytes: components["schemas"]["CanonicalU64"];
             dataset_profile?: components["schemas"]["DatasetProfileSummary"];
@@ -2158,8 +2754,323 @@ export interface components {
             verified_at_unix_ms?: components["schemas"]["UnixMillis"];
         };
         /**
+         * @description 与资源健康状态独立的访问和删除生命周期。
+         * @enum {string}
+         */
+        ResourceLifecycleState: "active" | "pending_delete" | "deleting" | "restoring" | "deleted";
+        /**
+         * @description 四类可删除存储资源共享的生命周期 fence。`generation` 在删除、恢复和最终清理时单调增加，
+         *     Agent assignment、S3 Ticket 和迟到报告必须携带并匹配该值。
+         */
+        ResourceLifecycleView: {
+            state: components["schemas"]["ResourceLifecycleState"];
+            generation: components["schemas"]["PositiveCanonicalU64"];
+            active_deletion_id?: components["schemas"]["DeletionId"];
+            delete_requested_at_unix_ms?: components["schemas"]["UnixMillis"];
+            purge_after_unix_ms?: components["schemas"]["UnixMillis"];
+            deleted_at_unix_ms?: components["schemas"]["UnixMillis"];
+        };
+        /** @description Tenant scope 由包含该引用的请求携带，不允许从资源 ID 推断或覆盖。 */
+        ResourceRef: components["schemas"]["StorageVolumeResourceRef"] | components["schemas"]["ArtifactResourceRef"] | components["schemas"]["PlaygroundResourceRef"] | components["schemas"]["SnapshotResourceRef"];
+        StorageVolumeResourceRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "storage_volume";
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+        };
+        ArtifactResourceRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "artifact";
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+        };
+        PlaygroundResourceRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "playground";
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            playground_id: components["schemas"]["PlaygroundId"];
+        };
+        SnapshotResourceRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "snapshot";
+            snapshot_id: components["schemas"]["SnapshotId"];
+        };
+        /** @enum {string} */
+        DeletionOperationState: "requested" | "quiescing" | "quarantining" | "recoverable" | "restoring" | "purging" | "finalizing" | "completed" | "blocked" | "failed";
+        /** @enum {string} */
+        DeletionCompletion: "restored" | "purged";
+        /** @enum {string} */
+        RetentionHoldState: "active" | "released";
+        DeletionTargetView: {
+            resource: components["schemas"]["ResourceRef"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            lifecycle_generation: components["schemas"]["PositiveCanonicalU64"];
+            requires_agent_cleanup: boolean;
+        };
+        DeletionBlockerView: {
+            code: components["schemas"]["ErrorCode"];
+            resource?: components["schemas"]["ResourceRef"];
+            message: string;
+        };
+        /** @description 五分钟内不可变且与资源版本、依赖集合和删除确认选项绑定的 dry-run 结果。 */
+        DeletionImpactView: {
+            tenant_id: components["schemas"]["TenantId"];
+            root: components["schemas"]["ResourceRef"];
+            cascade: boolean;
+            confirm_managed_data_erase: boolean;
+            targets: components["schemas"]["DeletionTargetView"][];
+            active_job_count: components["schemas"]["CanonicalU64"];
+            active_s3_credential_count: components["schemas"]["CanonicalU64"];
+            estimated_file_count: components["schemas"]["CanonicalU64"];
+            estimated_bytes: components["schemas"]["CanonicalU64"];
+            blockers: components["schemas"]["DeletionBlockerView"][];
+            issued_at_unix_ms: components["schemas"]["UnixMillis"];
+            expires_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        /** @description 固定依赖批次的持久化安全删除 Saga；进入 `purging` 后不可恢复。 */
+        DeletionOperationView: {
+            deletion_id: components["schemas"]["DeletionId"];
+            tenant_id: components["schemas"]["TenantId"];
+            root: components["schemas"]["ResourceRef"];
+            state: components["schemas"]["DeletionOperationState"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            targets: components["schemas"]["DeletionTargetView"][];
+            request_id: components["schemas"]["RequestId"];
+            request_digest: components["schemas"]["ContentDigest"];
+            impact_digest: components["schemas"]["ContentDigest"];
+            cascade: boolean;
+            confirm_managed_data_erase: boolean;
+            purge_after_unix_ms: components["schemas"]["UnixMillis"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+            completion?: components["schemas"]["DeletionCompletion"];
+            last_error?: string;
+            /**
+             * @description `blocked` 或 `failed` 操作的持久化恢复点。重试会返回此阶段；`restoring`
+             *     表示继续恢复，其余可恢复阶段表示继续删除。非错误状态不返回该字段。
+             */
+            resume_state?: components["schemas"]["DeletionOperationState"];
+            retry_count: components["schemas"]["CanonicalU64"];
+        };
+        /** @description 只阻止任务进入物理清理阶段，不恢复或扩大资源访问权限。 */
+        RetentionHoldView: {
+            retention_hold_id: components["schemas"]["RetentionHoldId"];
+            tenant_id: components["schemas"]["TenantId"];
+            deletion_id: components["schemas"]["DeletionId"];
+            reason: string;
+            state: components["schemas"]["RetentionHoldState"];
+            expires_at_unix_ms?: components["schemas"]["UnixMillis"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            released_at_unix_ms?: components["schemas"]["UnixMillis"];
+        };
+        QueryDeletionImpactRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            resource: components["schemas"]["ResourceRef"];
+            cascade: boolean;
+            confirm_managed_data_erase: boolean;
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+        };
+        QueryDeletionImpactResponse: {
+            impact: components["schemas"]["DeletionImpactView"];
+            impact_digest: components["schemas"]["ContentDigest"];
+        };
+        CreateDeletionRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            resource: components["schemas"]["ResourceRef"];
+            cascade: boolean;
+            confirm_managed_data_erase: boolean;
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+            impact_digest: components["schemas"]["ContentDigest"];
+            request_id: components["schemas"]["RequestId"];
+        };
+        QueryDeletionRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            deletion_id: components["schemas"]["DeletionId"];
+        };
+        QueryDeletionResponse: {
+            deletion: components["schemas"]["DeletionOperationView"];
+            retention_holds: components["schemas"]["RetentionHoldView"][];
+        };
+        QueryDeletionListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            states?: components["schemas"]["DeletionOperationState"][];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
+        };
+        QueryDeletionListResponse: {
+            items: components["schemas"]["DeletionOperationView"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        UpdateDeletionRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            deletion_id: components["schemas"]["DeletionId"];
+            request_id: components["schemas"]["RequestId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+        };
+        CreateRetentionHoldRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            deletion_id: components["schemas"]["DeletionId"];
+            request_id: components["schemas"]["RequestId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+            reason: string;
+            expires_at_unix_ms?: components["schemas"]["UnixMillis"];
+        };
+        ReleaseRetentionHoldRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            deletion_id: components["schemas"]["DeletionId"];
+            retention_hold_id: components["schemas"]["RetentionHoldId"];
+            request_id: components["schemas"]["RequestId"];
+            expected_resource_version: components["schemas"]["CanonicalU64"];
+        };
+        DeletionMutationResponse: {
+            deletion: components["schemas"]["DeletionOperationView"];
+            replayed: boolean;
+        };
+        CreateRetentionHoldResponse: {
+            deletion: components["schemas"]["DeletionOperationView"];
+            retention_hold: components["schemas"]["RetentionHoldView"];
+            replayed: boolean;
+        };
+        ReleaseRetentionHoldResponse: {
+            deletion: components["schemas"]["DeletionOperationView"];
+            retention_hold: components["schemas"]["RetentionHoldView"];
+            replayed: boolean;
+        };
+        /** @description 为同 Tenant 下的 Ready Snapshot 开启只读 S3 Access Point。 */
+        CreateS3AccessPointRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            snapshot_id: components["schemas"]["SnapshotId"];
+            bucket_name: components["schemas"]["S3BucketName"];
+            request_id: components["schemas"]["RequestId"];
+        };
+        QueryS3AccessPointListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
+        };
+        QueryS3AccessPointListResponse: {
+            items: components["schemas"]["S3AccessPointView"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        QueryS3AccessPointRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            access_point_id: components["schemas"]["S3AccessPointId"];
+        };
+        QueryS3AccessPointResponse: {
+            access_point: components["schemas"]["S3AccessPointView"];
+        };
+        UpdateS3AccessPointRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            access_point_id: components["schemas"]["S3AccessPointId"];
+            request_id: components["schemas"]["RequestId"];
+        };
+        UpdateS3AccessPointResponse: {
+            access_point: components["schemas"]["S3AccessPointView"];
+            replayed: boolean;
+        };
+        CreateS3AccessPointResponse: {
+            access_point: components["schemas"]["S3AccessPointView"];
+            access_key_id: string;
+            secret_access_key?: string;
+            credential_expires_at_unix_ms: components["schemas"]["UnixMillis"];
+            replayed: boolean;
+        };
+        CreateS3CredentialRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            access_point_id: components["schemas"]["S3AccessPointId"];
+            request_id: components["schemas"]["RequestId"];
+            expires_at_unix_ms?: components["schemas"]["UnixMillis"];
+        };
+        CreateS3CredentialResponse: {
+            credential: components["schemas"]["S3CredentialView"];
+            secret_access_key?: string;
+            replayed: boolean;
+        };
+        QueryS3CredentialListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            access_point_id: components["schemas"]["S3AccessPointId"];
+        };
+        QueryS3CredentialListResponse: {
+            items: components["schemas"]["S3CredentialView"][];
+        };
+        RevokeS3CredentialRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            access_point_id: components["schemas"]["S3AccessPointId"];
+            credential_id: components["schemas"]["S3CredentialId"];
+            request_id: components["schemas"]["RequestId"];
+        };
+        QueryS3ObjectListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            access_point_id: components["schemas"]["S3AccessPointId"];
+            prefix?: components["schemas"]["S3ObjectKeyPrefix"];
+            /** @enum {string} */
+            delimiter?: "" | "/";
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["S3PageSize"];
+        };
+        QueryS3ObjectListResponse: {
+            items: components["schemas"]["S3ObjectEntryView"][];
+            common_prefixes: components["schemas"]["S3ObjectKeyPrefix"][];
+            next_cursor?: components["schemas"]["PageCursor"];
+        };
+        CreateS3DownloadUrlRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            access_point_id: components["schemas"]["S3AccessPointId"];
+            key: components["schemas"]["S3ObjectKey"];
+            expires_seconds?: number;
+        };
+        CreateS3DownloadUrlResponse: {
+            /** Format: uri-reference */
+            url: string;
+            expires_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        S3AccessPointView: {
+            access_point_id: components["schemas"]["S3AccessPointId"];
+            tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            snapshot_id: components["schemas"]["SnapshotId"];
+            commit_id: components["schemas"]["CommitId"];
+            bucket_name: components["schemas"]["S3BucketName"];
+            /** Format: uri-reference */
+            endpoint: string;
+            region: components["schemas"]["RegionName"];
+            state: components["schemas"]["S3AccessPointState"];
+            policy_generation: components["schemas"]["PositiveCanonicalU64"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+        };
+        S3CredentialView: {
+            credential_id: components["schemas"]["S3CredentialId"];
+            access_point_id: components["schemas"]["S3AccessPointId"];
+            access_key_id: string;
+            state: components["schemas"]["S3CredentialState"];
+            expires_at_unix_ms: components["schemas"]["UnixMillis"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            last_used_at_unix_ms?: components["schemas"]["UnixMillis"];
+        };
+        S3ObjectEntryView: {
+            key: components["schemas"]["S3ObjectKey"];
+            entry_type: components["schemas"]["S3ObjectEntryType"];
+            size_bytes?: components["schemas"]["CanonicalU64"];
+            etag?: string;
+            last_modified_unix_ms?: components["schemas"]["UnixMillis"];
+        };
+        /**
          * @description 公开 Add operation。服务端将认证后的 PrincipalRef 注入 canonical operation 后计算
-         *     `request_digest` 并写入内部 AddJobSpec；请求中的未知非保留字段按协议兼容规则参与 digest。
+         *     `request_digest` 并写入内部 AddJobSpec；请求字段必须严格匹配本 schema。
          */
         CreateAddJobRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -2175,8 +3086,6 @@ export interface components {
              */
             paths: components["schemas"]["LogicalPath"][];
             all: boolean;
-        } & {
-            [key: string]: unknown;
         };
         CreateAddJobResponse: {
             job: components["schemas"]["JobView"];
@@ -2219,8 +3128,6 @@ export interface components {
             decision?: components["schemas"]["PublicJobDecision"];
             failure?: components["schemas"]["PublicJobFailure"];
             finalized_at_unix_ms?: components["schemas"]["UnixMillis"];
-        } & {
-            [key: string]: unknown;
         };
         PublicJobProgress: {
             state: components["schemas"]["JobState"];
@@ -2228,8 +3135,6 @@ export interface components {
             files_completed: components["schemas"]["CanonicalU64"];
             bytes_completed: components["schemas"]["CanonicalU64"];
             retry_after_ms?: components["schemas"]["CanonicalU64"];
-        } & {
-            [key: string]: unknown;
         };
         PublicJobDecision: components["schemas"]["PublishJobDecision"] | components["schemas"]["ConflictJobDecision"] | components["schemas"]["RejectJobDecision"];
         PublishJobDecision: {
@@ -2241,8 +3146,6 @@ export interface components {
             /** @constant */
             final_state: "succeeded";
             published_index_version: components["schemas"]["IndexVersion"];
-        } & {
-            [key: string]: unknown;
         };
         ConflictJobDecision: {
             /**
@@ -2253,8 +3156,6 @@ export interface components {
             /** @constant */
             final_state: "conflicted";
             current_index_version: components["schemas"]["IndexVersion"];
-        } & {
-            [key: string]: unknown;
         };
         RejectJobDecision: {
             /**
@@ -2265,8 +3166,6 @@ export interface components {
             /** @enum {string} */
             final_state: "rejected" | "failed" | "cancelled" | "timed_out" | "recovery_required";
             error: components["schemas"]["JobError"];
-        } & {
-            [key: string]: unknown;
         };
         PublicJobFailure: {
             /** @enum {string} */
@@ -2275,16 +3174,12 @@ export interface components {
             /** @enum {string} */
             stage: "execution" | "object_transfer" | "reporting" | "finalization";
             error: components["schemas"]["JobError"];
-        } & {
-            [key: string]: unknown;
         };
         JobError: {
             code: components["schemas"]["ErrorCode"];
             message: string;
             retryable: boolean;
             retry_after_ms?: components["schemas"]["CanonicalU64"];
-        } & {
-            [key: string]: unknown;
         };
         /** @description RFC 9457 Problem Details，并携带 NeoEngram 稳定错误字段。 */
         ProblemDetails: {
@@ -2300,8 +3195,6 @@ export interface components {
             retryable: boolean;
             retry_after_ms?: components["schemas"]["CanonicalU64"];
             violations?: components["schemas"]["FieldViolation"][];
-        } & {
-            [key: string]: unknown;
         };
         FieldViolation: {
             field: string;
@@ -2324,6 +3217,10 @@ export interface components {
         CommitId: components["schemas"]["ContentDigest"];
         PreCommitId: components["schemas"]["ResourceId"];
         SnapshotId: components["schemas"]["ResourceId"];
+        S3AccessPointId: components["schemas"]["ResourceId"];
+        S3CredentialId: components["schemas"]["ResourceId"];
+        DeletionId: components["schemas"]["ResourceId"];
+        RetentionHoldId: components["schemas"]["ResourceId"];
         JobId: components["schemas"]["ResourceId"];
         RequestId: components["schemas"]["ResourceId"];
         /** @description 15 分钟有效且只能成功消费一次的 opaque secret；不得写入日志、审计或其他公开 DTO。 */
@@ -2344,15 +3241,29 @@ export interface components {
         /** @enum {string} */
         StorageVolumeState: "ready" | "degraded" | "unavailable";
         /** @enum {string} */
-        PermissionName: "job.create" | "job.read" | "job.finalize" | "tenant.read" | "tenant.create" | "tenant.admin" | "storage.read" | "storage.create" | "storage.enrollment.create" | "storage.enrollment.read" | "storage.enrollment.review" | "artifact.read" | "artifact.create" | "playground.read" | "playground.create" | "snapshot.read" | "snapshot.create" | "gateway.read" | "gateway.manage";
+        S3AccessPointState: "active" | "disabled";
+        /** @enum {string} */
+        S3CredentialState: "active" | "revoked" | "expired";
+        /** @enum {string} */
+        S3ObjectEntryType: "object" | "prefix";
+        /** @description S3 DNS-compatible bucket name; names are globally unique across the control plane. */
+        S3BucketName: string;
+        S3ObjectKey: components["schemas"]["LogicalPath"];
+        S3ObjectKeyPrefix: string;
+        /** @enum {string} */
+        PermissionName: "job.create" | "job.read" | "job.finalize" | "tenant.read" | "tenant.create" | "tenant.admin" | "storage.read" | "storage.create" | "storage.enrollment.create" | "storage.enrollment.read" | "storage.enrollment.review" | "artifact.read" | "artifact.create" | "project.read" | "project.create" | "playground.read" | "playground.create" | "snapshot.read" | "snapshot.create" | "s3.access.read" | "s3.access.manage" | "resource.lifecycle.read" | "resource.lifecycle.manage" | "retention.manage" | "gateway.read" | "gateway.manage";
         TagName: string;
         /** @description 服务端生成、与资源 scope、筛选条件和排序绑定的不透明分页 token。 */
         PageCursor: string;
         /** @default 50 */
         PageSize: number;
+        /** @default 100 */
+        S3PageSize: number;
         SearchQuery: string;
         ContentDigest: string;
         CanonicalU64: string;
+        /** @description 无符号整数，编码为 canonical decimal JSON string。 */
+        DecimalU64: components["schemas"]["CanonicalU64"];
         /** @description 大于零且不超过 u64 最大值的 canonical decimal JSON string。 */
         PositiveCanonicalU64: components["schemas"]["CanonicalU64"] & unknown;
         /** @description Unix 毫秒时间戳，编码为 canonical decimal JSON string。 */
@@ -2365,8 +3276,6 @@ export interface components {
         IndexVersion: {
             revision: components["schemas"]["CanonicalU64"];
             digest: components["schemas"]["ContentDigest"];
-        } & {
-            [key: string]: unknown;
         };
         /** @enum {string} */
         JobState: "queued" | "assigned" | "accepted" | "running" | "prepared" | "publishing" | "cancel_requested" | "succeeded" | "conflicted" | "rejected" | "failed" | "cancelled" | "timed_out" | "recovery_required" | "unknown";
@@ -2499,18 +3408,6 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                /**
-                 * @example {
-                 *       "type": "urn:neoengram:problem:resource-conflict",
-                 *       "title": "Resource mutation conflict",
-                 *       "status": 409,
-                 *       "detail": "The resource identity or expected version conflicts with current state",
-                 *       "instance": "/api/playground/commit/create",
-                 *       "code": "RESOURCE_CONFLICT",
-                 *       "request_id": "req-20260727-001",
-                 *       "retryable": false
-                 *     }
-                 */
                 "application/problem+json": components["schemas"]["ProblemDetails"];
             };
         };
@@ -2768,17 +3665,19 @@ export interface operations {
                 content: {
                     /**
                      * @example {
-                     *       "api_versions": [
-                     *         1
-                     *       ],
-                     *       "agent_protocol_versions": [
-                     *         1
-                     *       ],
+                     *       "api_version": 1,
+                     *       "agent_wire_version": 1,
                      *       "capabilities": [
                      *         "artifact_catalog",
                      *         "artifact_commit_graph",
                      *         "managed_add",
-                     *         "sqlite_authority"
+                     *         "sqlite_authority",
+                     *         "commit_layout_selection_v2",
+                     *         "snapshot_delivery_fuse_v2",
+                     *         "snapshot_delivery_copy_v2",
+                     *         "snapshot_delivery_hardlink_v2",
+                     *         "s3_readonly_access_point",
+                     *         "resource_lifecycle_v1"
                      *       ]
                      *     }
                      */
@@ -3291,7 +4190,6 @@ export interface operations {
                      *           "probe": {
                      *             "observed_access_mode": "read_write",
                      *             "descriptor_matches": true,
-                     *             "protocol_compatible": true,
                      *             "observed_at_unix_ms": "1785168060000"
                      *           },
                      *           "resource_version": "1",
@@ -3440,7 +4338,6 @@ export interface operations {
                      *         "probe": {
                      *           "observed_access_mode": "read_write",
                      *           "descriptor_matches": true,
-                     *           "protocol_compatible": true,
                      *           "observed_at_unix_ms": "1785168060000"
                      *         },
                      *         "resource_version": "2",
@@ -3457,12 +4354,23 @@ export interface operations {
                      *         "region": "cn-east-1",
                      *         "backend_type": "pvc",
                      *         "access_mode": "read_write_many",
+                     *         "allowed_delivery_modes": [
+                     *           "fuse",
+                     *           "copy"
+                     *         ],
+                     *         "hardlink_policy": "disabled",
+                     *         "max_whole_file_bytes": "107374182400",
+                     *         "copy_reserve_bytes": "10737418240",
                      *         "pvc_reference": {
                      *           "namespace": "neoengram-data",
                      *           "claim_name": "vision-data"
                      *         },
                      *         "state": "unavailable",
                      *         "resource_version": "1",
+                     *         "lifecycle": {
+                     *           "state": "active",
+                     *           "generation": "1"
+                     *         },
                      *         "created_at_unix_ms": "1785168120000",
                      *         "updated_at_unix_ms": "1785168120000"
                      *       },
@@ -3470,6 +4378,65 @@ export interface operations {
                      *     }
                      */
                     "application/json": components["schemas"]["ApproveStorageEnrollmentResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["StorageEnrollmentNotFoundProblem"];
+            409: components["responses"]["StorageEnrollmentConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            429: components["responses"]["OverloadedProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+            504: components["responses"]["RequestTimeoutProblem"];
+        };
+    };
+    completeStorageRecovery: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "storage_enrollment_id": "storage-enrollment-vision-replacement-01",
+                 *       "expected_resource_version": "4",
+                 *       "owner_generation": "2"
+                 *     }
+                 */
+                "application/json": components["schemas"]["CompleteStorageRecoveryRequest"];
+            };
+        };
+        responses: {
+            /** @description recovery fence 已由当前 Ready Owner 完成 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CompleteStorageRecoveryResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];
@@ -3551,7 +4518,6 @@ export interface operations {
                      *         "probe": {
                      *           "observed_access_mode": "read_write",
                      *           "descriptor_matches": false,
-                     *           "protocol_compatible": true,
                      *           "observed_at_unix_ms": "1785168060000"
                      *         },
                      *         "resource_version": "2",
@@ -3576,6 +4542,63 @@ export interface operations {
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
             504: components["responses"]["RequestTimeoutProblem"];
+        };
+    };
+    createProject: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                /**
+                 * @example {
+                 *       "tenant_id": "tenant-a",
+                 *       "project_id": "project-lab",
+                 *       "display_name": "算法实验室",
+                 *       "description": "实验数据和结果"
+                 *     }
+                 */
+                "application/json": components["schemas"]["CreateProjectRequest"];
+            };
+        };
+        responses: {
+            /** @description Project 已创建或相同创建请求被重放 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateProjectResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
         };
     };
     queryProjectList: {
@@ -3627,6 +4650,7 @@ export interface operations {
                      *           "tenant_id": "tenant-a",
                      *           "project_id": "project-vision",
                      *           "display_name": "视觉数据",
+                     *           "resource_version": "2",
                      *           "created_at_unix_ms": "1785167000000",
                      *           "updated_at_unix_ms": "1785167600000"
                      *         }
@@ -3702,6 +4726,10 @@ export interface operations {
                      *           },
                      *           "head_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *           "resource_version": "18",
+                     *           "lifecycle": {
+                     *             "state": "active",
+                     *             "generation": "1"
+                     *           },
                      *           "created_at_unix_ms": "1785167000000",
                      *           "updated_at_unix_ms": "1785167600000"
                      *         }
@@ -3776,6 +4804,10 @@ export interface operations {
                      *         },
                      *         "head_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *         "resource_version": "18",
+                     *         "lifecycle": {
+                     *           "state": "active",
+                     *           "generation": "1"
+                     *         },
                      *         "created_at_unix_ms": "1785167000000",
                      *         "updated_at_unix_ms": "1785167600000"
                      *       }
@@ -3911,6 +4943,7 @@ export interface operations {
                      *               "dataset/v4",
                      *               "release-candidate"
                      *             ],
+                     *             "data_layout": "fast_cdc",
                      *             "created_at_unix_ms": "1785167600000"
                      *           },
                      *           {
@@ -3920,6 +4953,7 @@ export interface operations {
                      *             "tag_names": [
                      *               "v1.0"
                      *             ],
+                     *             "data_layout": "whole_file",
                      *             "created_at_unix_ms": "1785067400000"
                      *           }
                      *         ]
@@ -3994,6 +5028,7 @@ export interface operations {
                      *           "tag_names": [
                      *             "v1.0"
                      *           ],
+                     *           "data_layout": "whole_file",
                      *           "created_at_unix_ms": "1785067400000"
                      *         },
                      *         "target_commit": {
@@ -4005,6 +5040,7 @@ export interface operations {
                      *             "dataset/v4",
                      *             "release-candidate"
                      *           ],
+                     *           "data_layout": "fast_cdc",
                      *           "created_at_unix_ms": "1785167600000"
                      *         },
                      *         "summary": {
@@ -4108,6 +5144,11 @@ export interface operations {
                      *           },
                      *           "state": "ready",
                      *           "storage_availability": "ready",
+                     *           "resource_version": "1",
+                     *           "lifecycle": {
+                     *             "state": "active",
+                     *             "generation": "1"
+                     *           },
                      *           "created_at_unix_ms": "1785167000000",
                      *           "updated_at_unix_ms": "1785167600000"
                      *         }
@@ -4189,6 +5230,11 @@ export interface operations {
                      *         },
                      *         "state": "ready",
                      *         "storage_availability": "ready",
+                     *         "resource_version": "1",
+                     *         "lifecycle": {
+                     *           "state": "active",
+                     *           "generation": "1"
+                     *         },
                      *         "created_at_unix_ms": "1785167000000",
                      *         "updated_at_unix_ms": "1785167600000"
                      *       }
@@ -4301,7 +5347,8 @@ export interface operations {
                  *       "expected_index_version": {
                  *         "revision": "31",
                  *         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                 *       }
+                 *       },
+                 *       "data_layout": "fast_cdc"
                  *     }
                  */
                 "application/json": components["schemas"]["StartPreCommitRequest"];
@@ -4324,6 +5371,7 @@ export interface operations {
                      *         "playground_id": "labeling",
                      *         "precommit_id": "precommit-july-labels-01",
                      *         "precommit_request_id": "precommit-request-july-labels",
+                     *         "data_layout": "fast_cdc",
                      *         "attempt": 1,
                      *         "state": "running",
                      *         "phase": "queued",
@@ -4359,6 +5407,11 @@ export interface operations {
                      *         "state": "ready",
                      *         "storage_availability": "ready",
                      *         "active_precommit_id": "precommit-july-labels-01",
+                     *         "resource_version": "1",
+                     *         "lifecycle": {
+                     *           "state": "active",
+                     *           "generation": "1"
+                     *         },
                      *         "created_at_unix_ms": "1785167000000",
                      *         "updated_at_unix_ms": "1785167600000"
                      *       },
@@ -4429,6 +5482,7 @@ export interface operations {
                      *         "playground_id": "labeling",
                      *         "precommit_id": "precommit-july-labels-01",
                      *         "precommit_request_id": "precommit-request-july-labels",
+                     *         "data_layout": "fast_cdc",
                      *         "attempt": 1,
                      *         "state": "ready",
                      *         "phase": "idle",
@@ -4990,6 +6044,7 @@ export interface operations {
                  *         "revision": "31",
                  *         "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                  *       },
+                 *       "data_layout": "fast_cdc",
                  *       "message": "完成七月标注复核",
                  *       "description": "完成夜间场景的人工复核并冻结训练候选。",
                  *       "tag_names": [
@@ -5077,6 +6132,7 @@ export interface operations {
                      *           "project_id": "project-vision",
                      *           "artifact_id": "road-scenes",
                      *           "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *           "data_layout": "fast_cdc",
                      *           "storage_volume_id": "volume-shanghai-archive",
                      *           "region": "cn-shanghai",
                      *           "message": "补充夜间道路场景",
@@ -5085,12 +6141,16 @@ export interface operations {
                      *             "release-candidate"
                      *           ],
                      *           "state": "ready",
-                     *           "phase": "idle",
                      *           "integrity": {
                      *             "state": "verified",
                      *             "files_verified": "864",
                      *             "bytes_verified": "12884901888",
                      *             "verified_at_unix_ms": "1785167700000"
+                     *           },
+                     *           "resource_version": "1",
+                     *           "lifecycle": {
+                     *             "state": "active",
+                     *             "generation": "1"
                      *           },
                      *           "created_at_unix_ms": "1785167600000",
                      *           "updated_at_unix_ms": "1785167700000",
@@ -5163,6 +6223,7 @@ export interface operations {
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
                      *         "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "data_layout": "fast_cdc",
                      *         "storage_volume_id": "volume-shanghai-archive",
                      *         "region": "cn-shanghai",
                      *         "message": "补充夜间道路场景",
@@ -5171,12 +6232,16 @@ export interface operations {
                      *           "release-candidate"
                      *         ],
                      *         "state": "ready",
-                     *         "phase": "idle",
                      *         "integrity": {
                      *           "state": "verified",
                      *           "files_verified": "864",
                      *           "bytes_verified": "12884901888",
                      *           "verified_at_unix_ms": "1785167700000"
+                     *         },
+                     *         "resource_version": "1",
+                     *         "lifecycle": {
+                     *           "state": "active",
+                     *           "generation": "1"
                      *         },
                      *         "created_at_unix_ms": "1785167600000",
                      *         "updated_at_unix_ms": "1785167700000",
@@ -5251,6 +6316,7 @@ export interface operations {
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
                      *         "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "data_layout": "fast_cdc",
                      *         "storage_volume_id": "volume-shanghai-archive",
                      *         "region": "cn-shanghai",
                      *         "message": "补充夜间道路场景",
@@ -5259,11 +6325,15 @@ export interface operations {
                      *           "release-candidate"
                      *         ],
                      *         "state": "creating",
-                     *         "phase": "planning",
                      *         "integrity": {
                      *           "state": "pending",
                      *           "files_verified": "0",
                      *           "bytes_verified": "0"
+                     *         },
+                     *         "resource_version": "1",
+                     *         "lifecycle": {
+                     *           "state": "active",
+                     *           "generation": "1"
                      *         },
                      *         "logical_file_count": "864",
                      *         "logical_size_bytes": "12884901888",
@@ -5315,15 +6385,15 @@ export interface operations {
                 /**
                  * @example {
                  *       "tenant_id": "tenant-a",
-                 *       "snapshot_id": "snap-road-main2-sha-01",
-                 *       "retry_request_id": "retry-road-main2-sha-02"
+                 *       "delivery_id": "delivery-road-main2-fuse-01",
+                 *       "request_id": "retry-road-main2-fuse-02"
                  *     }
                  */
                 "application/json": components["schemas"]["RetrySnapshotDeliveryRequest"];
             };
         };
         responses: {
-            /** @description 已重新发起或幂等返回的 Snapshot */
+            /** @description 已重新发起或幂等返回的 SnapshotDelivery */
             200: {
                 headers: {
                     "X-Request-ID": components["headers"]["RequestId"];
@@ -5332,27 +6402,20 @@ export interface operations {
                 content: {
                     /**
                      * @example {
-                     *       "snapshot": {
+                     *       "delivery": {
+                     *         "delivery_id": "delivery-road-main2-fuse-01",
                      *         "snapshot_id": "snap-road-main2-sha-01",
-                     *         "tenant_id": "tenant-a",
-                     *         "project_id": "project-vision",
-                     *         "artifact_id": "road-scenes",
                      *         "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                      *         "storage_volume_id": "volume-shanghai-vision",
-                     *         "region": "cn-shanghai",
-                     *         "message": "完成首轮质量复核",
-                     *         "tag_names": [
-                     *           "v1.0"
-                     *         ],
-                     *         "state": "creating",
-                     *         "phase": "planning",
-                     *         "integrity": {
-                     *           "state": "pending",
-                     *           "files_verified": "0",
-                     *           "bytes_verified": "0"
-                     *         },
-                     *         "logical_file_count": "820",
-                     *         "logical_size_bytes": "11884901888",
+                     *         "mode": "fuse",
+                     *         "target_relative_root": "deliveries/delivery-road-main2-fuse-01",
+                     *         "state": "requested",
+                     *         "source_index_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "delivery_generation": "2",
+                     *         "file_count": "820",
+                     *         "size_bytes": "11884901888",
+                     *         "object_set_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                     *         "resource_version": "2",
                      *         "created_at_unix_ms": "1785067400000",
                      *         "updated_at_unix_ms": "1785167800000"
                      *       },
@@ -5370,6 +6433,172 @@ export interface operations {
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createSnapshotDelivery: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateSnapshotDeliveryRequest"];
+            };
+        };
+        responses: {
+            /** @description 已创建或幂等返回的交付 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateSnapshotDeliveryResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    querySnapshotDelivery: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QuerySnapshotDeliveryRequest"];
+            };
+        };
+        responses: {
+            /** @description 交付详情 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QuerySnapshotDeliveryResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+        };
+    };
+    querySnapshotDeliveryList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QuerySnapshotDeliveryListRequest"];
+            };
+        };
+        responses: {
+            /** @description 交付列表 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QuerySnapshotDeliveryListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["CursorConflictProblem"];
+        };
+    };
+    deleteSnapshotDelivery: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteSnapshotDeliveryRequest"];
+            };
+        };
+        responses: {
+            /** @description 已进入异步删除流程或幂等返回的交付 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeleteSnapshotDeliveryResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
         };
     };
     querySnapshotFileList: {
@@ -5494,14 +6723,12 @@ export interface operations {
                      *           "activity_id": "activity-snap-road-main3-ready",
                      *           "activity_type": "ready",
                      *           "summary": "Snapshot 已完成完整性校验并可读取",
-                     *           "phase": "idle",
                      *           "created_at_unix_ms": "1785167700000"
                      *         },
                      *         {
                      *           "activity_id": "activity-snap-road-main3-created",
                      *           "activity_type": "created",
                      *           "summary": "Snapshot 记录已创建",
-                     *           "phase": "planning",
                      *           "created_at_unix_ms": "1785167600000"
                      *         }
                      *       ]
@@ -5592,6 +6819,872 @@ export interface operations {
             401: components["responses"]["AuthenticationProblem"];
             403: components["responses"]["AuthorizationProblem"];
             404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createS3AccessPoint: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateS3AccessPointRequest"];
+            };
+        };
+        responses: {
+            /** @description Access Point 与首次凭证 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateS3AccessPointResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryS3AccessPointList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryS3AccessPointListRequest"];
+            };
+        };
+        responses: {
+            /** @description Access Point 页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryS3AccessPointListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryS3AccessPoint: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryS3AccessPointRequest"];
+            };
+        };
+        responses: {
+            /** @description Access Point 当前视图 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryS3AccessPointResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    enableS3AccessPoint: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateS3AccessPointRequest"];
+            };
+        };
+        responses: {
+            /** @description 已启用 Access Point */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateS3AccessPointResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    disableS3AccessPoint: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateS3AccessPointRequest"];
+            };
+        };
+        responses: {
+            /** @description 已停用 Access Point */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpdateS3AccessPointResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createS3Credential: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateS3CredentialRequest"];
+            };
+        };
+        responses: {
+            /** @description 新凭证或幂等重放结果 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateS3CredentialResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryS3CredentialList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryS3CredentialListRequest"];
+            };
+        };
+        responses: {
+            /** @description Access Point 凭证列表 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryS3CredentialListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    revokeS3Credential: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevokeS3CredentialRequest"];
+            };
+        };
+        responses: {
+            /** @description 撤销后的凭证列表 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryS3CredentialListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryS3ObjectList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryS3ObjectListRequest"];
+            };
+        };
+        responses: {
+            /** @description 对象与公共前缀页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryS3ObjectListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createS3DownloadUrl: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateS3DownloadUrlRequest"];
+            };
+        };
+        responses: {
+            /** @description 短期下载 URL */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateS3DownloadUrlResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryResourceDeletionImpact: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryDeletionImpactRequest"];
+            };
+        };
+        responses: {
+            /** @description 与当前资源版本和依赖图绑定的删除影响摘要 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryDeletionImpactResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createResourceDeletion: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateDeletionRequest"];
+            };
+        };
+        responses: {
+            /** @description 已线性化的删除任务 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeletionMutationResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryResourceDeletion: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryDeletionRequest"];
+            };
+        };
+        responses: {
+            /** @description 删除任务与 Retention Hold */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryDeletionResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryResourceDeletionList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryDeletionListRequest"];
+            };
+        };
+        responses: {
+            /** @description 删除任务页 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryDeletionListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    restoreResourceDeletion: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateDeletionRequest"];
+            };
+        };
+        responses: {
+            /** @description 已进入恢复流程的删除任务 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeletionMutationResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    retryResourceDeletion: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateDeletionRequest"];
+            };
+        };
+        responses: {
+            /** @description 已重新进入可推进状态的删除任务 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeletionMutationResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    createResourceRetentionHold: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRetentionHoldRequest"];
+            };
+        };
+        responses: {
+            /** @description 删除任务与新建 Hold */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateRetentionHoldResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            413: components["responses"]["PayloadTooLargeProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    releaseResourceRetentionHold: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReleaseRetentionHoldRequest"];
+            };
+        };
+        responses: {
+            /** @description 删除任务与已释放 Hold */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReleaseRetentionHoldResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];

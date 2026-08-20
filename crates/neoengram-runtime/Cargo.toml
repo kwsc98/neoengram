@@ -1,0 +1,48 @@
+[package]
+name = "neoengram-runtime"
+description = "Stable execution and local runtime boundary for NeoEngram"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["development-tools", "filesystem"]
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+fastcdc.workspace = true
+fs2.workspace = true
+futures.workspace = true
+libc.workspace = true
+memmap2.workspace = true
+neoengram-domain.workspace = true
+reflink-copy.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+unicode-normalization.workspace = true
+walkdir.workspace = true
+
+[features]
+default = []
+fuse-mount = ["dep:fuser"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { workspace = true, optional = true, features = ["abi-7-31"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { workspace = true, optional = true, features = ["libfuse", "abi-7-19"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

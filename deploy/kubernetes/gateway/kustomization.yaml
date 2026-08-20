@@ -5,6 +5,7 @@ kind: Kustomization
 # resources are intentionally example-only and contain no usable activation material.
 resources:
   - configmap.yaml
+  - public-tls-secret.example.yaml
   - secret.example.yaml
   - activation-secret.example.yaml
   - deployment.yaml

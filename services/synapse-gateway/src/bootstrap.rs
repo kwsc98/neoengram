@@ -8,11 +8,11 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Args;
-use neoengram_protocol::{
+use neoengram_domain::protocol::{
     decode_bounded_unique_json, AgentBootstrapProof, ContentDigest, Ed25519PublicKeySpki,
     Ed25519Signature, GatewayBootstrapCertificateDelivery, GatewayBootstrapChallenge,
     GatewayBootstrapChallengeRequest, GatewayBootstrapProofResponse, UnixMillis,
-    MAX_AGENT_ENROLLMENT_MESSAGE_BYTES, PROTOCOL_VERSION_V1,
+    CURRENT_WIRE_VERSION, MAX_AGENT_ENROLLMENT_MESSAGE_BYTES,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use rustls::{
@@ -181,7 +181,7 @@ pub(crate) struct GatewayBootstrap {
 struct BootstrapState {
     pending: Option<GatewayBootstrapChallenge>,
     certificate_installed: bool,
-    installed_request_id: Option<neoengram_protocol::RequestId>,
+    installed_request_id: Option<neoengram_domain::protocol::RequestId>,
     installed_certificate_digest: Option<ContentDigest>,
 }
 
@@ -232,7 +232,7 @@ impl GatewayBootstrap {
             .map_err(|_| BootstrapError::Key)?;
         state.pending = Some(request.challenge);
         Ok(GatewayBootstrapProofResponse {
-            protocol_version: PROTOCOL_VERSION_V1,
+            wire_version: CURRENT_WIRE_VERSION,
             proof: AgentBootstrapProof::new(self.public_key_spki.clone(), signature),
         })
     }
@@ -623,7 +623,7 @@ fn atomic_write_restricted(path: &Path, bytes: &[u8]) -> Result<(), BootstrapErr
 
 #[cfg(test)]
 mod tests {
-    use neoengram_protocol::{
+    use neoengram_domain::protocol::{
         CertificateGeneration, EdgeClusterId, GatewayOpaqueBytes, GatewayPoolId, GatewayReplicaId,
     };
 
@@ -689,7 +689,7 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
     fn challenge() -> GatewayBootstrapChallenge {
         let now = unix_millis().unwrap().get();
         GatewayBootstrapChallenge {
-            request_id: neoengram_protocol::RequestId::new("request-a").unwrap(),
+            request_id: neoengram_domain::protocol::RequestId::new("request-a").unwrap(),
             edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
             gateway_pool_id: GatewayPoolId::new("pool-a").unwrap(),
             gateway_replica_id: GatewayReplicaId::new("replica-a").unwrap(),
@@ -819,7 +819,7 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
         let (directory, bootstrap, certificate_path) = fixture();
         let challenge = challenge();
         let request = GatewayBootstrapChallengeRequest {
-            protocol_version: PROTOCOL_VERSION_V1,
+            wire_version: CURRENT_WIRE_VERSION,
             challenge: challenge.clone(),
         };
         let proof = bootstrap
@@ -832,7 +832,7 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
             .unwrap();
 
         let delivery = GatewayBootstrapCertificateDelivery {
-            protocol_version: PROTOCOL_VERSION_V1,
+            wire_version: CURRENT_WIRE_VERSION,
             request_id: challenge.request_id,
             certificate_generation: CertificateGeneration::new(1),
             leaf_certificate_der: GatewayOpaqueBytes::new(matching_leaf_certificate()).unwrap(),
@@ -904,7 +904,7 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
         let (_directory, bootstrap, _certificate_path) = fixture();
         let challenge = challenge();
         let request = GatewayBootstrapChallengeRequest {
-            protocol_version: PROTOCOL_VERSION_V1,
+            wire_version: CURRENT_WIRE_VERSION,
             challenge: challenge.clone(),
         };
         bootstrap
@@ -912,14 +912,14 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
             .await
             .unwrap();
         let delivery = |request_id, generation, leaf| GatewayBootstrapCertificateDelivery {
-            protocol_version: PROTOCOL_VERSION_V1,
+            wire_version: CURRENT_WIRE_VERSION,
             request_id,
             certificate_generation: CertificateGeneration::new(generation),
             leaf_certificate_der: GatewayOpaqueBytes::new(leaf).unwrap(),
             issuer_chain_der: vec![GatewayOpaqueBytes::new(matching_leaf_certificate()).unwrap()],
         };
         let wrong_request = delivery(
-            neoengram_protocol::RequestId::new("request-b").unwrap(),
+            neoengram_domain::protocol::RequestId::new("request-b").unwrap(),
             1,
             matching_leaf_certificate(),
         );
@@ -1016,7 +1016,7 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
         bootstrap
             .prove(
                 &serde_json::to_vec(&GatewayBootstrapChallengeRequest {
-                    protocol_version: PROTOCOL_VERSION_V1,
+                    wire_version: CURRENT_WIRE_VERSION,
                     challenge: challenge.clone(),
                 })
                 .unwrap(),
@@ -1024,7 +1024,7 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
             .await
             .unwrap();
         let delivery = GatewayBootstrapCertificateDelivery {
-            protocol_version: PROTOCOL_VERSION_V1,
+            wire_version: CURRENT_WIRE_VERSION,
             request_id: challenge.request_id,
             certificate_generation: CertificateGeneration::new(1),
             leaf_certificate_der: GatewayOpaqueBytes::new(leaf).unwrap(),

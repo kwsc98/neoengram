@@ -8,9 +8,9 @@
 项目当前聚焦单机仓库与本地工作流，已经提供 SQLite 元数据、事务化 checkout 和故障恢复
 能力。`0.2.0` 同时完成了中心化架构所需的 crate/protocol/状态机；独立 server 通过 Fusen 暴露
 已实现的 system、Tenant、StorageVolume、Enrollment、Artifact、Playground、Snapshot 基础、Managed Add Job 和
-Gateway Registry action API，并保留仅用于迁移测试的独立 Agent listener。旧 Agent 直连纵切已验证主动注册、
+Gateway Registry action API。Agent 仅通过 Gateway 建立控制连接，Central 不暴露独立 Agent listener；主动注册、
 H2 channel、真实 Playground 扫描、Volume-local CAS、Metadata/Placement 上报与调度决定；当前
-`neoengram-agentd` 已改为 Gateway-only 配置，Gateway 已提供有界 H2/mTLS tunnel、Agent 转发、
+`neoengram-agent` 已改为 Gateway-only 配置，Gateway 已提供有界 H2/mTLS tunnel、Agent 转发、
 RouteLease 和最多一跳 peer forwarding，Replica activation 的显式管理 action、challenge/proof 和
 证书投递和 Central peer credential directory（30 秒 TTL、leaf fingerprint 校验、control 断链 fail-closed）已实现；loopback 双副本 listener/H2/peer 协议 harness 已通过，但完整业务 E2E、外部生产 issuer/KMS-HSM adapter、真实集群故障/就绪和切换验收仍未完成，因此新的端到端控制链
 尚不可作为生产能力。Server 不接收对象 payload。跨 Volume
@@ -37,7 +37,7 @@ RouteLease 和最多一跳 peer forwarding，Replica activation 的显式管理 
 ```bash
 git clone https://github.com/kwsc98/synapse.git
 cd synapse
-cargo install --locked --path crates/neoengram --features fuse-mount
+cargo install --locked --path apps/neoengram-cli --features fuse-mount
 cd ..
 ```
 
@@ -78,7 +78,7 @@ neoengram gc --dry-run
 neoengram fsck
 ```
 
-format v8 固定使用 SQLite；`init --metadata-store` 已删除。新仓库默认绑定 fastcdc，也可以
+仓库格式 9 固定使用 SQLite；`init --metadata-store` 已删除。新仓库默认绑定 fastcdc，也可以
 在初始化时选择 whole-file 或 mixed。仓库策略不可通过重新初始化修改，旧格式不迁移，打开时会
 明确要求重新初始化。
 
@@ -113,10 +113,9 @@ repository-root/                     # 默认 main Workspace
 │   ├── staging/                     # add 的稳定输入快照
 │   ├── transactions/                # main Workspace 恢复事务
 │   └── metadata/
-│       ├── repository.json          # format v8、repository_id、对象后端、分块策略
+│       ├── metadata.sqlite3          # 格式身份、repository_id、对象后端、分块策略，以及对象/refs/Workspace 元数据
 │       ├── objects.lock
-│       ├── write.lock
-│       └── metadata.sqlite3         # 共享对象、refs、Workspace-scoped HEAD/Index
+│       └── write.lock
 ├── workspaces/<name>/               # 其他受管可写 Workspace
 │   └── .neoengram/{locks,transactions}/
 ├── mounts/<name>/                   # 固定 Commit FUSE 挂载点
@@ -145,21 +144,19 @@ gc/fsck 先协调对象再锁状态。
 compare-exchange。Chunk payload 由独立 `ObjectStore` 管理，提供流式发布、校验读取、分页枚举和
 durability barrier。Repository 和命令层都不依赖对象物理路径。
 
-当前 Standalone 实现使用 SQLite 和 `LooseObjectStore`。开发期仓库格式直接演进，不提供
-旧格式自动回退；`repository.json` 为：
+当前 Standalone 实现使用 SQLite 和 `LooseObjectStore`。旧数据库直接拒绝，不提供
+迁移或回退；配置和元数据统一保存在 `metadata.sqlite3`。其中 `repository_state` 表只有一行，关键字段为：
 
-```json
-{
-  "format_version": 8,
-  "repository_id": "<64-char lowercase id>",
-  "object_store": "loose",
-  "chunking": "fastcdc"
-}
-```
+| 字段 | 当前值或含义 |
+| --- | --- |
+| `format_version` | `9` |
+| `repository_id` | 64 字符小写十六进制仓库 ID |
+| `object_store` | `loose` |
+| `chunking` | `fastcdc`、`whole-file` 或 `mixed` |
 
 完整文件缓存和工作区 mutation journal 不放进上述两个存储接口：缓存按 Manifest ID 共享，
 journal 位于各 Workspace 自身文件系统中。逐项接口语义见
-[`local/metadata/README.md`](crates/neoengram-standalone/src/local/metadata/README.md)，整体规模预算和迁移顺序
+[`local/metadata/README.md`](crates/neoengram-runtime/src/local/metadata/README.md)，整体规模预算和迁移顺序
 见 [`docs/storage-architecture.md`](docs/storage-architecture.md)，源码职责与未来扩展落点见
 [`docs/code-architecture.md`](docs/code-architecture.md)；实现路线和研究记录见
 [`docs/implementation-plan.md`](docs/implementation-plan.md)。
@@ -403,27 +400,23 @@ neoengram gc
 ```text
 .
 ├── crates/
-│   ├── neoengram-core/              # 强类型领域模型、规范 digest 与路径校验
-│   ├── neoengram-engine/            # 结构化用例与执行 ports
-│   ├── neoengram-fs/                # worktree/object/journal/lock 适配器
-│   ├── neoengram-protocol/          # v1 DTO、Schema、JCS digest 与限额
-│   ├── neoengram-standalone/        # SQLite、Repository、FUSE 与本地编排
-│   ├── neoengram-agent/             # 无网络 Agent 状态机与测试适配器
-│   └── neoengram/                   # Clap、cwd 输入和唯一终端渲染入口
+│   ├── neoengram-domain/             # 唯一领域与 current wire contract facade
+│   └── neoengram-runtime/           # 执行内核、本地 SQLite、Repository、FUSE 与读取适配器
 ├── services/
-│   ├── neoengramd/                  # 无网络中心状态机、ports 与 SQLite datasource/mapper
-│   ├── neoengram-server/            # 用户 HTTP + Gateway Registry/session；outbound control connector
-│   ├── neoengram-agentd/            # Gateway-only endpoint/trust bundle；下行 command trust 校验
+│   ├── neoengram-central/           # Central authority + HTTP composition
+│   ├── neoengram-agent/             # Agent state machine + Gateway transport adapter
 │   └── synapse-gateway/             # 三 listener H2 tunnel + activation + mTLS + 一跳 peer forwarding
 ├── apps/
+│   ├── neoengram-cli/               # Clap、cwd 输入和唯一终端渲染入口
 │   └── neoengram-web/               # Vue 3 用户控制台；首版由 OpenAPI/MSW 驱动
 └── docs/                            # 代码与存储架构说明
 ```
 
-生产依赖主要保持单向：`CLI -> standalone -> engine <- agent`，Standalone 同时依赖 fs；protocol
-只依赖 core，服务端方向固定为 `neoengram-server -> neoengramd -> protocol/core`，Agent 进程方向为
-`neoengram-agentd -> neoengram-agent/protocol`。该简图不枚举 CLI 对 core/engine 的直接类型导入；
-Agent library 到 `neoengramd` 的依赖仅存在于 dev/test 组合测试。CLI 之外不渲染终端输出；完整约束见
+生产依赖主要保持单向：`CLI -> runtime <- agent`；CLI 与 Agent 共用同一套执行和读取内核，
+domain 是唯一协议/领域边界，Central 方向固定为 `neoengram-central -> domain/runtime`，Agent 进程方向为
+`neoengram-agent -> domain/runtime`。旧拆分包已删除，不再是生产路径的业务依赖边界；该简图不枚举
+CLI 对 domain/runtime 的直接类型导入；
+Agent 的本地组合测试只通过 Central 的公开测试适配器验证控制面，不引入 Central 运行时依赖。CLI 之外不渲染终端输出；完整约束见
 [`docs/code-architecture.md`](docs/code-architecture.md)。
 
 2026-08-09 已确认 Synapse Gateway 目标拓扑：Central 主动连接每个 EdgeCluster 的多副本
@@ -431,14 +424,14 @@ GatewayPool，Agent 只注册并连接本集群 Gateway；Gateway 不挂载 Stor
 对象权威。G1 已落地 Registry、管理 API、Gateway/部署清单、有界 H2 tunnel、运行时 mTLS、下行命令签名
 和一跳 peer forwarding；双 Replica listener/H2/peer 协议 harness 及真实 InMemory/SQLite RouteLease
 接管契约已分别通过，但完整 Central/Registry/outbox/签名业务 E2E、外部生产 issuer/KMS-HSM、真实集群
-故障/就绪与切换验收尚未完成；旧 Agent 直连 Server 只代表迁移前基线。专项设计和切换边界见
+故障/就绪与切换验收尚未完成；旧 Agent 直连 Server 已删除，不再作为运行或回退路径。专项设计和切换边界见
 [`docs/synapse-gateway-architecture.md`](docs/synapse-gateway-architecture.md)。
 
 `neoengram-web` 是独立 npm 应用，不进入 Cargo workspace，也不导入 Rust crate、Agent Schema 或
 数据库类型。它只从公开 OpenAPI 生成客户端类型；当前界面覆盖租户、StorageVolume、Enrollment、
 Artifact、单 Volume Playground、Playground Commit 和 Managed Add Job，仍有部分 Snapshot、资源浏览、
 Commit 描述/Tag 和父版本文件 Diff operation 由 MSW 提供。真实 server 已提供对应的 system、资源和
-Job action API；Agent action 只作为 Gateway 内部转发契约，旧独立 listener 仅限 loopback 迁移测试。
+Job action API；Agent action 只作为 Gateway 内部转发契约。
 
 中心化 Agent 的产品定位、用户角色、资源语义、页面规格、Pre-commit/Commit/Snapshot 主链路和
 OpenAPI 对齐清单见 [`docs/centralized-agent-product.md`](docs/centralized-agent-product.md)；技术权威
@@ -449,15 +442,15 @@ OpenAPI 对齐清单见 [`docs/centralized-agent-product.md`](docs/centralized-a
 ```bash
 cargo fmt --all -- --check
 bash .github/check-architecture.sh
-cargo run -p neoengram-protocol --example generate_schemas --offline
+cargo run -p neoengram-domain --example generate_schemas --offline
 cargo test --workspace --all-targets --offline
 cargo clippy --workspace --all-targets --offline -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --offline
-cargo package --locked --allow-dirty -p neoengram-core
+cargo package --locked --allow-dirty -p neoengram-domain
 cargo package --locked --allow-dirty --no-verify --exclude-lockfile -p neoengram
 ```
 
-Schema 命令确定性重建已提交的 `crates/neoengram-protocol/schemas/v1`。这组本地命令使用默认
+Schema 命令确定性重建已提交的 `crates/neoengram-domain/schemas/current`。这组本地命令使用默认
 feature，因而不要求 macOS 已安装 macFUSE SDK/runtime。CI 在 Linux 运行 `--all-features` 测试、
 Clippy、rustdoc 和 MSRV check，并在 Linux、macOS 和 Windows 运行默认 feature 的 workspace 测试。
 最后两个命令分别验证可发布的 core crate 和 CLI `.crate` 归档；CLI 使用 workspace-private 的
@@ -470,15 +463,19 @@ crates.io 解析或 CLI 可从 registry 安装。
 [`docs/implementation-plan.md`](docs/implementation-plan.md)。本文只保留面向用户的使用说明和
 当前存储边界。
 
-当前可运行产品完成的是本地 format v8、多 Workspace 与固定 Commit 只读 FUSE；中心另提供 protocol、
+当前可运行产品完成的是本地仓库格式 9、多 Workspace 与固定 Commit 只读 FUSE；中心另提供 protocol、
 Agent/控制面状态机、SQLite 单节点权威、Fusen 用户 listener、Gateway Registry 和 outbound connector；
-旧 Hyper Agent listener 只保留为 loopback 迁移测试边界。
-`neoengram-agentd` 已能持久化身份、探测挂载、签名 bootstrap、建立 HTTP/2 全双工 session、执行 Job，
+Agent 控制面只经 Gateway 转发。
+`neoengram-agent` 已能持久化身份、探测挂载、签名 bootstrap、建立 HTTP/2 全双工 session、执行 Job，
 并将 Chunk 写入获批用户 Volume 的 tenant/artifact 隔离 CAS；Server 只接收 metadata 与 placement
 evidence，不接收 Chunk payload。业务接口使用外部 OIDC/JWKS 与默认拒绝 RBAC；SQLite 模式只支持
-单副本，用户 API 的生产 TLS 由 Ingress/反向代理终止。它仍不包含其余 OpenAPI、生产凭据 provisioner、
-已验收的 Synapse Gateway 生产切换、跨 Volume Gateway-to-Gateway 传输、只读 S3 Access Point、
-merge/rebase、
+单副本，用户 API 的生产 TLS 由 Ingress/反向代理终止。Ready Snapshot 的只读 S3 Access Point、
+凭证轮换、对象浏览、Agent 二进制读取和 Gateway Web/S3 公网 listener 已接入；生产环境仍需完成
+公网 DNS/TLS、Central mTLS 前置终止、生产密钥 provisioner 和真实双 Replica 故障验收。生产 Central
+开发环境可通过 `SYNAPSE_S3_ENVELOPE_KEY_FILE` 注入恰好 32 字节且权限不宽于 `0600` 的本地 KEK；
+生产环境拒绝该文件适配器，必须通过 `RuntimeDependencies::with_s3_secret_envelope` 注入 KMS/HSM provider。
+每条凭证使用独立 DEK，持久化 wrapped DEK 与 wrapping key ID，并支持保留旧 unwrap key 完成轮换。仓库仍不包含
+其余 OpenAPI、已验收的 Synapse Gateway 生产切换、跨 Volume Gateway-to-Gateway 传输、merge/rebase、
 `push/fetch/pull/clone` 或 Volume GC 编排。分页、事务、
 CAS、分层 Merkle Directory 和流式 Commit
 已经落地；CLI 通过结构化 Request/typed Result facade 调用 Standalone，并拥有全部成功文本与
@@ -488,11 +485,10 @@ CAS、分层 Merkle Directory 和流式 Commit
 `IndexVersion` CAS 后才 finalize，`recover` 会恢复本地事务并清理 Engine journals。`add`、`commit`、
 `mount`、`checkout`、`rm`、`restore` 和 `recover` 的 Engine `ProgressEvent` 已通过 caller-owned
 `ProgressSink` 透传到 CLI。
-部分非 FUSE compatibility view 和 mutation journal 仍会物化完整 Index，因此当前实现还不能宣称
+部分非 FUSE workspace snapshot 和 mutation journal 仍会物化完整 WorkspaceIndex，因此当前实现还不能宣称
 所有命令都适用于千万路径。
 
-下一步是继续把 Standalone 过渡物化 view 收敛到 engine 分页 ports，对 SQLite 大规模工作负载做
-基准与调优，并实现 PostgreSQL、其余用户 API、Gateway 外部生产 issuer/KMS-HSM adapter、真实集群双 Replica
+下一步是对 SQLite 大规模工作负载做基准与调优，并实现 PostgreSQL、其余用户 API、Gateway 外部生产 issuer/KMS-HSM adapter、真实集群双 Replica
 故障/就绪与切换验收。后续再基于受限 `TransferRoute`/`TransferTicket` 实现固定的源 Agent -> 源 Gateway -> 目标 Gateway ->
 目标 Agent 传输、恢复与 GC 编排。目标是
 100 TB payload、千万路径和上亿 Chunk 引用下，命令内存由页大小与有界并发决定，而不是随

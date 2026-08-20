@@ -19,7 +19,7 @@ use http::{
 };
 use http_body_util::{BodyExt, Either, Full};
 use hyper::body::{Body, Frame, SizeHint};
-use neoengram_protocol::{
+use neoengram_domain::protocol::{
     decode_bounded_unique_json, AgentChannelDownstreamFrame, AgentChannelDownstreamMessage,
     AgentChannelNdjsonDecoder, AgentChannelUpstreamFrame, AgentChannelUpstreamMessage,
     ContentDigest, GatewayAgentAction, GatewayAgentRequest, GatewayAgentResponse,
@@ -28,13 +28,13 @@ use neoengram_protocol::{
     GatewayControlNdjsonDecoder, GatewayDrain, GatewayErrorCode, GatewayOpaqueBytes,
     GatewayPeerDirectory, GatewayPeerForwardAccepted, GatewayPeerForwardRequest, GatewayPoolId,
     GatewayReplicaHeartbeat, GatewayReplicaHello, GatewayReplicaId, GatewayRouteLeaseGranted,
-    GatewayRouteLeaseRequest, ProtocolVersion, RequestId, RouteGeneration, SequenceNumber,
+    GatewayRouteLeaseRequest, GatewayS3ReadRevocation, RequestId, RouteGeneration, SequenceNumber,
     SessionGeneration, TraceId, UnixMillis, AGENT_ROUTE_LEASE_RENEW_INTERVAL_MS,
-    AGENT_ROUTE_LEASE_TTL_MS, MAX_CONTROL_MESSAGE_BYTES, MAX_GATEWAY_STREAM_CHUNK_BYTES,
-    MAX_METADATA_PAGE_BYTES,
+    AGENT_ROUTE_LEASE_TTL_MS, CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES,
+    MAX_GATEWAY_STREAM_CHUNK_BYTES, MAX_METADATA_PAGE_BYTES,
 };
 use tokio::{
-    sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit},
+    sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit},
     task::JoinSet,
     time::{interval, timeout, MissedTickBehavior},
 };
@@ -59,10 +59,11 @@ const MAX_LATE_CONTROL_RESPONSES: usize = 1024;
 // finite bound for a long-lived Gateway. Closed entries are eligible for eviction; request-ID
 // binding checks below keep a stale worker harmless if it arrives after an eviction.
 const MAX_STREAM_ADMISSION_GATES: usize = 4096;
+const S3_READ_REVOCATION_BUFFER: usize = 256;
 
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayIdentity {
-    pub edge_cluster_id: neoengram_protocol::EdgeClusterId,
+    pub edge_cluster_id: neoengram_domain::protocol::EdgeClusterId,
     pub gateway_pool_id: GatewayPoolId,
     pub gateway_replica_id: GatewayReplicaId,
     pub software_version: String,
@@ -74,7 +75,7 @@ pub(crate) struct StreamingBody {
 }
 
 impl StreamingBody {
-    fn new(frames: mpsc::Receiver<Bytes>) -> Self {
+    pub(crate) fn new(frames: mpsc::Receiver<Bytes>) -> Self {
         Self {
             frames,
             _request_permit: None,
@@ -157,6 +158,9 @@ struct TunnelState {
     /// Central's current allow-list for peer TLS credentials. This is scoped to the active control
     /// connection and is cleared atomically when that connection is fenced or disconnected.
     peer_directory: Mutex<Option<GatewayPeerDirectory>>,
+    /// Monotonic S3 authorization fences are fanned out to the dedicated binary read registry.
+    /// A broadcast channel keeps the control transport independent from that data-plane module.
+    s3_read_revocations: broadcast::Sender<GatewayS3ReadRevocation>,
 }
 
 struct CentralLink {
@@ -177,7 +181,7 @@ enum StreamEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveRoute {
-    agent_id: neoengram_protocol::AgentId,
+    agent_id: neoengram_domain::protocol::AgentId,
     session_generation: SessionGeneration,
     route_generation: RouteGeneration,
     lease_expires_at_unix_ms: UnixMillis,
@@ -190,7 +194,7 @@ struct PeerForwardReplayBinding {
     source_replica_id: GatewayReplicaId,
     target_replica_id: GatewayReplicaId,
     target_peer_endpoint: String,
-    agent_id: neoengram_protocol::AgentId,
+    agent_id: neoengram_domain::protocol::AgentId,
     agent_connection_id: GatewayConnectionId,
     session_generation: SessionGeneration,
     route_generation: RouteGeneration,
@@ -275,7 +279,7 @@ pub(crate) enum TunnelError {
     #[error("Gateway request is invalid: {0}")]
     Invalid(&'static str),
     #[error("Gateway protocol rejected the request: {0}")]
-    Protocol(#[from] neoengram_protocol::ProtocolError),
+    Protocol(#[from] neoengram_domain::protocol::ProtocolError),
     #[error("Gateway request exceeded its deadline")]
     Deadline,
     #[error("Gateway route was fenced")]
@@ -326,6 +330,7 @@ impl GatewayTunnel {
         identity: GatewayIdentity,
         peer_forwarder: Arc<dyn PeerForwarder>,
     ) -> Self {
+        let (s3_read_revocations, _) = broadcast::channel(S3_READ_REVOCATION_BUFFER);
         Self {
             identity,
             state: Arc::new(TunnelState {
@@ -344,9 +349,21 @@ impl GatewayTunnel {
                 routes: Mutex::new(BTreeMap::new()),
                 peer_forward_seen: Mutex::new(BTreeMap::new()),
                 peer_directory: Mutex::new(None),
+                s3_read_revocations,
             }),
             peer_forwarder,
         }
+    }
+
+    pub(crate) fn subscribe_s3_read_revocations(
+        &self,
+    ) -> broadcast::Receiver<GatewayS3ReadRevocation> {
+        self.state.s3_read_revocations.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_test_s3_read_revocation(&self, revocation: GatewayS3ReadRevocation) {
+        let _ = self.state.s3_read_revocations.send(revocation);
     }
 
     pub(crate) async fn is_ready(&self) -> bool {
@@ -390,7 +407,7 @@ impl GatewayTunnel {
     /// Checks the TLS leaf fingerprint against the latest non-expired Central directory. The
     /// caller has already authenticated the URI SAN; this second binding is what makes Registry
     /// certificate revocation and rotation effective for an otherwise long-lived mTLS peer.
-    async fn authorize_peer_source(
+    pub(crate) async fn authorize_peer_source(
         &self,
         source_replica_id: &GatewayReplicaId,
         certificate_fingerprint: &ContentDigest,
@@ -536,6 +553,140 @@ impl GatewayTunnel {
         &self.identity
     }
 
+    /// Captures the exact Central-authoritative route fence for a new Agent S3 channel.
+    pub(crate) async fn current_agent_route_fence(
+        &self,
+        agent_id: &neoengram_domain::protocol::AgentId,
+        session_generation: SessionGeneration,
+    ) -> Option<(GatewayConnectionId, RouteGeneration)> {
+        if self.is_draining() {
+            return None;
+        }
+        let now = now_unix_ms();
+        self.state
+            .routes
+            .lock()
+            .await
+            .iter()
+            .find_map(|(connection_id, route)| {
+                (&route.agent_id == agent_id
+                    && route.session_generation == session_generation
+                    && route.lease_expires_at_unix_ms.get() > now.get())
+                .then(|| (connection_id.clone(), route.route_generation))
+            })
+    }
+
+    /// Revalidates the full route fence captured when an Agent S3 channel was established.
+    pub(crate) async fn agent_route_fence_is_current(
+        &self,
+        agent_id: &neoengram_domain::protocol::AgentId,
+        session_generation: SessionGeneration,
+        connection_id: &GatewayConnectionId,
+        route_generation: RouteGeneration,
+    ) -> bool {
+        if self.is_draining() {
+            return false;
+        }
+        let now = now_unix_ms();
+        self.state
+            .routes
+            .lock()
+            .await
+            .get(connection_id)
+            .is_some_and(|route| {
+                &route.agent_id == agent_id
+                    && route.session_generation == session_generation
+                    && route.route_generation == route_generation
+                    && route.lease_expires_at_unix_ms.get() > now.get()
+            })
+    }
+
+    /// Matches every Central-authoritative route field embedded in an S3 read ticket. Unlike the
+    /// Agent channel liveness check above, peer reads must bind the exact connection and route
+    /// generation so a ticket issued before takeover cannot reach a newer session.
+    pub(crate) async fn s3_read_route_is_current(
+        &self,
+        ticket: &neoengram_domain::protocol::S3ReadTicket,
+    ) -> bool {
+        if self.is_draining()
+            || ticket.owner_replica_id != self.identity.gateway_replica_id
+            || ticket.gateway_pool_id != self.identity.gateway_pool_id.as_str()
+        {
+            return false;
+        }
+        let now = now_unix_ms();
+        self.state
+            .routes
+            .lock()
+            .await
+            .get(&ticket.agent_connection_id)
+            .is_some_and(|route| {
+                route.agent_id == ticket.agent_id
+                    && route.session_generation == ticket.session_generation
+                    && route.route_generation == ticket.route_generation
+                    && route.lease_expires_at_unix_ms.get() > now.get()
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_test_agent_route(
+        &self,
+        agent_id: neoengram_domain::protocol::AgentId,
+        session_generation: SessionGeneration,
+    ) -> GatewayConnectionId {
+        let connection_id = GatewayConnectionId::new(format!(
+            "s3-test-route-{}-{}",
+            agent_id.as_str(),
+            session_generation.get()
+        ))
+        .expect("test route ID must be valid");
+        self.state.routes.lock().await.insert(
+            connection_id.clone(),
+            ActiveRoute {
+                agent_id,
+                session_generation,
+                route_generation: RouteGeneration::new(1),
+                lease_expires_at_unix_ms: UnixMillis::new(
+                    now_unix_ms().get().saturating_add(60_000),
+                ),
+            },
+        );
+        connection_id
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn remove_test_agent_route(&self, connection_id: &GatewayConnectionId) {
+        self.state.routes.lock().await.remove(connection_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn replace_test_agent_route(
+        &self,
+        agent_id: neoengram_domain::protocol::AgentId,
+        session_generation: SessionGeneration,
+    ) -> GatewayConnectionId {
+        let connection_id = GatewayConnectionId::new(format!(
+            "s3-test-replacement-{}-{}",
+            agent_id.as_str(),
+            session_generation.get()
+        ))
+        .expect("test replacement route ID must be valid");
+        let mut routes = self.state.routes.lock().await;
+        routes.retain(|_, route| route.agent_id != agent_id);
+        routes.insert(
+            connection_id.clone(),
+            ActiveRoute {
+                agent_id,
+                session_generation,
+                route_generation: RouteGeneration::new(2),
+                lease_expires_at_unix_ms: UnixMillis::new(
+                    now_unix_ms().get().saturating_add(60_000),
+                ),
+            },
+        );
+        connection_id
+    }
+
     pub(crate) async fn open_control<B>(
         self: &Arc<Self>,
         request: Request<B>,
@@ -584,8 +735,8 @@ impl GatewayTunnel {
                 GatewayControlMessage::ReplicaHello(GatewayReplicaHello {
                     edge_cluster_id: self.identity.edge_cluster_id.clone(),
                     software_version: self.identity.software_version.clone(),
-                    supported_protocol_versions: [ProtocolVersion::V1].into_iter().collect(),
-                    capabilities: neoengram_protocol::gateway_capabilities_v1(),
+                    wire_version: CURRENT_WIRE_VERSION,
+                    capabilities: neoengram_domain::protocol::gateway_capabilities_v1(),
                 }),
             )
             .await
@@ -652,7 +803,7 @@ impl GatewayTunnel {
     pub(crate) async fn forward_agent<B>(
         self: &Arc<Self>,
         request: Request<B>,
-        peer_agent_id: Option<neoengram_protocol::AgentId>,
+        peer_agent_id: Option<neoengram_domain::protocol::AgentId>,
         max_request_bytes: usize,
         request_deadline: Duration,
     ) -> Result<Response<GatewayBody>, TunnelError>
@@ -687,7 +838,7 @@ impl GatewayTunnel {
         &self,
         request: Request<B>,
         action: GatewayAgentAction,
-        peer_agent_id: Option<neoengram_protocol::AgentId>,
+        peer_agent_id: Option<neoengram_domain::protocol::AgentId>,
         configured_max_bytes: usize,
         request_deadline: Duration,
     ) -> Result<Response<GatewayBody>, TunnelError>
@@ -787,7 +938,7 @@ impl GatewayTunnel {
     async fn forward_agent_stream<B>(
         self: &Arc<Self>,
         request: Request<B>,
-        peer_agent_id: Option<neoengram_protocol::AgentId>,
+        peer_agent_id: Option<neoengram_domain::protocol::AgentId>,
         request_deadline: Duration,
     ) -> Result<Response<GatewayBody>, TunnelError>
     where
@@ -1203,7 +1354,7 @@ impl GatewayTunnel {
         &self,
         request_id: RequestId,
         stream_id: GatewayConnectionId,
-        agent_id: neoengram_protocol::AgentId,
+        agent_id: neoengram_domain::protocol::AgentId,
         route_receiver: oneshot::Receiver<Result<GatewayRouteLeaseGranted, GatewayControlError>>,
         mut events: mpsc::Receiver<StreamEvent>,
         output: mpsc::Sender<Bytes>,
@@ -1569,6 +1720,12 @@ impl GatewayTunnel {
                 }
                 Ok(())
             }
+            GatewayControlMessage::S3ReadRevocation(revocation) => {
+                // No receiver means this Replica has no S3 read registry and therefore no active
+                // object streams to revoke. Lag handling is fail-closed in the registry itself.
+                let _ = self.state.s3_read_revocations.send(revocation);
+                Ok(())
+            }
             GatewayControlMessage::PeerDirectory(directory) => {
                 self.install_peer_directory(directory).await
             }
@@ -1635,7 +1792,7 @@ impl GatewayTunnel {
         }
         let peer_connection_id = fresh_connection_id("peer")?;
         let peer_frame = GatewayControlFrame {
-            protocol_version: ProtocolVersion::V1,
+            wire_version: CURRENT_WIRE_VERSION,
             gateway_pool_id: self.identity.gateway_pool_id.clone(),
             gateway_replica_id: self.identity.gateway_replica_id.clone(),
             connection_id: peer_connection_id,
@@ -1646,7 +1803,7 @@ impl GatewayTunnel {
             deadline_unix_ms,
             hop_count: 1,
             message: GatewayControlMessage::PeerForward(request.clone()),
-            extensions: neoengram_protocol::Extensions::new(),
+            extensions: neoengram_domain::protocol::Extensions::new(),
         };
         let result = timeout(
             Duration::from_millis(remaining),
@@ -1695,7 +1852,7 @@ impl GatewayTunnel {
         let now = now_unix_ms();
         match frame.validate_at(now) {
             Ok(()) => {}
-            Err(neoengram_protocol::ProtocolError::InvalidField {
+            Err(neoengram_domain::protocol::ProtocolError::InvalidField {
                 field: "deadline_unix_ms",
                 ..
             }) => {
@@ -1743,9 +1900,10 @@ impl GatewayTunnel {
             downstream.message,
             AgentChannelDownstreamMessage::Assignment(_)
                 | AgentChannelDownstreamMessage::Decision(_)
+                | AgentChannelDownstreamMessage::LifecycleAssignment(_)
         ) {
             return Err(protocol_invalid(
-                "peer forwarding accepts only Central Assignment or Decision frames",
+                "peer forwarding accepts only Central Job or lifecycle command frames",
             ));
         }
         let request_id = frame.request_id.clone();
@@ -2161,7 +2319,7 @@ impl GatewayTunnel {
                 .checked_add(1)
                 .ok_or(TunnelError::Invalid("Gateway sequence exhausted"))?;
             let frame = GatewayControlFrame {
-                protocol_version: ProtocolVersion::V1,
+                wire_version: CURRENT_WIRE_VERSION,
                 gateway_pool_id: self.identity.gateway_pool_id.clone(),
                 gateway_replica_id: self.identity.gateway_replica_id.clone(),
                 connection_id: link.connection_id.clone(),
@@ -2174,7 +2332,7 @@ impl GatewayTunnel {
                 ),
                 hop_count: 0,
                 message,
-                extensions: neoengram_protocol::Extensions::new(),
+                extensions: neoengram_domain::protocol::Extensions::new(),
             };
             let encoded = Bytes::from(frame.encode_ndjson()?);
             let connection_id = link.connection_id.clone();
@@ -2600,7 +2758,7 @@ where
     Ok(bytes)
 }
 
-fn request_agent_id(body: &[u8]) -> Result<neoengram_protocol::AgentId, TunnelError> {
+fn request_agent_id(body: &[u8]) -> Result<neoengram_domain::protocol::AgentId, TunnelError> {
     let value: serde_json::Value = decode_bounded_unique_json(body, body.len())?;
     let agent_id = value
         .get("agent_id")
@@ -2608,7 +2766,7 @@ fn request_agent_id(body: &[u8]) -> Result<neoengram_protocol::AgentId, TunnelEr
         .ok_or(TunnelError::Invalid(
             "authenticated Agent request has no AgentId",
         ))?;
-    neoengram_protocol::AgentId::new(agent_id).map_err(TunnelError::Protocol)
+    neoengram_domain::protocol::AgentId::new(agent_id).map_err(TunnelError::Protocol)
 }
 
 fn agent_action_limit(action: GatewayAgentAction) -> usize {
@@ -2701,10 +2859,14 @@ mod tests {
 
     use super::*;
     use http_body_util::Full;
-    use neoengram_protocol::{
-        AssignmentGeneration, AssignmentId, ContentDigest, DecisionGeneration, EdgeClusterId,
-        Extensions, GatewayRouteFence, IndexRevision, JobDecision, JobId, JobState, MessageId,
-        PublishDecision, WireIndexVersion,
+    use neoengram_domain::protocol::{
+        AgentId, AgentMountId, AgentResourceLifecycleAssignment, AgentResourceLifecycleScope,
+        ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId, ContentDigest,
+        DecisionGeneration, DeletionId, EdgeClusterId, Extensions, GatewayRouteFence,
+        IndexRevision, JobDecision, JobId, JobState, LifecycleAssignmentId, LifecycleGeneration,
+        MessageId, MountGeneration, OwnerGeneration, PlacementGeneration, ProjectId,
+        PublishDecision, ResourceLifecycleAction, ResourceLifecycleAssignment, ResourceRef,
+        StorageVolumeId, TenantId, VolumeMarkerId, WireIndexVersion,
     };
 
     struct InProcessPeerForwarder {
@@ -2762,7 +2924,7 @@ mod tests {
 
     fn decision_frame_bytes(session_generation: SessionGeneration) -> Bytes {
         let frame = AgentChannelDownstreamFrame {
-            protocol_version: ProtocolVersion::V1,
+            wire_version: CURRENT_WIRE_VERSION,
             sequence: SequenceNumber::new(7),
             message_id: MessageId::new("central-decision-message-1").unwrap(),
             correlation_id: None,
@@ -2790,6 +2952,54 @@ mod tests {
         Bytes::from(frame.encode_ndjson().unwrap())
     }
 
+    fn lifecycle_frame_bytes(session_generation: SessionGeneration) -> Bytes {
+        let now = now_unix_ms();
+        let frame = AgentChannelDownstreamFrame {
+            wire_version: CURRENT_WIRE_VERSION,
+            sequence: SequenceNumber::new(8),
+            message_id: MessageId::new("central-lifecycle-message-1").unwrap(),
+            correlation_id: None,
+            session_generation,
+            sent_at_unix_ms: now,
+            central_signature: None,
+            message: AgentChannelDownstreamMessage::LifecycleAssignment(Box::new(
+                AgentResourceLifecycleAssignment {
+                    assignment: ResourceLifecycleAssignment {
+                        assignment_id: LifecycleAssignmentId::new("lifecycle-assignment-1")
+                            .unwrap(),
+                        tenant_id: TenantId::new("tenant-a").unwrap(),
+                        deletion_id: DeletionId::new("deletion-a").unwrap(),
+                        resource: ResourceRef::Artifact {
+                            project_id: ProjectId::new("project-a").unwrap(),
+                            artifact_id: ArtifactId::new("artifact-a").unwrap(),
+                        },
+                        action: ResourceLifecycleAction::Quarantine,
+                        lifecycle_generation: LifecycleGeneration::new(3),
+                        request_digest: ContentDigest::from_bytes([0x61; 32]),
+                        deadline_unix_ms: UnixMillis::new(now.get().saturating_add(60_000)),
+                    },
+                    resource_scope: AgentResourceLifecycleScope::Artifact {
+                        project_id: ProjectId::new("project-a").unwrap(),
+                        artifact_id: ArtifactId::new("artifact-a").unwrap(),
+                        storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
+                        artifact_placement_id: ArtifactPlacementId::new("placement-a").unwrap(),
+                        placement_generation: PlacementGeneration::new(2),
+                    },
+                    agent_id: AgentId::new("agent-a").unwrap(),
+                    edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
+                    agent_mount_id: AgentMountId::new("mount-a").unwrap(),
+                    volume_marker_id: VolumeMarkerId::new("volume-a").unwrap(),
+                    session_generation,
+                    mount_generation: MountGeneration::new(4),
+                    owner_generation: OwnerGeneration::new(5),
+                    extensions: Extensions::new(),
+                },
+            )),
+            extensions: Extensions::new(),
+        };
+        Bytes::from(frame.encode_ndjson().unwrap())
+    }
+
     fn peer_request(
         source: &str,
         target: &str,
@@ -2802,7 +3012,7 @@ mod tests {
             source_replica_id: GatewayReplicaId::new(source).unwrap(),
             target_replica_id: GatewayReplicaId::new(target).unwrap(),
             target_peer_endpoint: format!("https://{target}.gateway.example"),
-            agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+            agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
             agent_connection_id: connection_id,
             session_generation,
             route_generation,
@@ -2818,7 +3028,7 @@ mod tests {
     ) -> GatewayControlFrame {
         let now = now_unix_ms();
         GatewayControlFrame {
-            protocol_version: ProtocolVersion::V1,
+            wire_version: CURRENT_WIRE_VERSION,
             gateway_pool_id: GatewayPoolId::new("pool-a").unwrap(),
             gateway_replica_id: GatewayReplicaId::new(replica).unwrap(),
             connection_id,
@@ -2867,12 +3077,14 @@ mod tests {
         let now = now_unix_ms();
         tunnel
             .install_peer_directory(GatewayPeerDirectory {
-                directory_generation: neoengram_protocol::Generation::new(2),
+                directory_generation: neoengram_domain::protocol::Generation::new(2),
                 issued_at_unix_ms: now,
                 expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(5_000)),
-                replicas: vec![neoengram_protocol::GatewayPeerDirectoryEntry {
+                replicas: vec![neoengram_domain::protocol::GatewayPeerDirectoryEntry {
                     gateway_replica_id: source.clone(),
-                    certificate_generation: neoengram_protocol::CertificateGeneration::new(2),
+                    certificate_generation: neoengram_domain::protocol::CertificateGeneration::new(
+                        2,
+                    ),
                     certificate_fingerprint: fingerprint,
                 }],
             })
@@ -2888,7 +3100,7 @@ mod tests {
             .is_err());
 
         let stale = GatewayPeerDirectory {
-            directory_generation: neoengram_protocol::Generation::new(1),
+            directory_generation: neoengram_domain::protocol::Generation::new(1),
             issued_at_unix_ms: now,
             expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(5_000)),
             replicas: Vec::new(),
@@ -2898,7 +3110,7 @@ mod tests {
             Err(TunnelError::Invalid(_))
         ));
         let duplicate_generation = GatewayPeerDirectory {
-            directory_generation: neoengram_protocol::Generation::new(2),
+            directory_generation: neoengram_domain::protocol::Generation::new(2),
             issued_at_unix_ms: now,
             expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(5_000)),
             replicas: Vec::new(),
@@ -3142,8 +3354,8 @@ mod tests {
                 GatewayControlMessage::ReplicaHello(GatewayReplicaHello {
                     edge_cluster_id: tunnel.identity.edge_cluster_id.clone(),
                     software_version: tunnel.identity.software_version.clone(),
-                    supported_protocol_versions: [ProtocolVersion::V1].into_iter().collect(),
-                    capabilities: neoengram_protocol::gateway_capabilities_v1(),
+                    wire_version: CURRENT_WIRE_VERSION,
+                    capabilities: neoengram_domain::protocol::gateway_capabilities_v1(),
                 }),
             )
             .await
@@ -3189,7 +3401,7 @@ mod tests {
         assert!(!tunnel.is_ready().await);
 
         let route = move |route_generation| GatewayRouteLeaseRequest {
-            agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+            agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
             owner_replica_id: GatewayReplicaId::new("replica-a").unwrap(),
             agent_connection_id: GatewayConnectionId::new("agent-a-connection").unwrap(),
             session_generation: SessionGeneration::new(1),
@@ -3258,7 +3470,7 @@ mod tests {
                     RequestId::new("drain-race-renew").unwrap(),
                     None,
                     GatewayControlMessage::RouteRenew(GatewayRouteLeaseRequest {
-                        agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+                        agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
                         owner_replica_id: GatewayReplicaId::new("replica-a").unwrap(),
                         agent_connection_id: GatewayConnectionId::new("agent-a-connection")
                             .unwrap(),
@@ -3343,7 +3555,7 @@ mod tests {
         tunnel.state.routes.lock().await.insert(
             stream_id.clone(),
             ActiveRoute {
-                agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+                agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
                 session_generation: SessionGeneration::new(1),
                 route_generation: RouteGeneration::new(1),
                 lease_expires_at_unix_ms: lease_expiry(),
@@ -3606,7 +3818,7 @@ mod tests {
         tunnel.state.routes.lock().await.insert(
             new_stream.clone(),
             ActiveRoute {
-                agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+                agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
                 session_generation: SessionGeneration::new(1),
                 route_generation: RouteGeneration::new(1),
                 lease_expires_at_unix_ms: lease_expiry(),
@@ -3665,7 +3877,7 @@ mod tests {
             .await
             .insert(stream_id.clone(), watch::channel(false).0);
         let current_route = ActiveRoute {
-            agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+            agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
             session_generation: SessionGeneration::new(2),
             route_generation: RouteGeneration::new(4),
             lease_expires_at_unix_ms: lease_expiry(),
@@ -3723,7 +3935,7 @@ mod tests {
         let stream_id = GatewayConnectionId::new("route-reuse-stream").unwrap();
         let now = now_unix_ms();
         let original = ActiveRoute {
-            agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+            agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
             session_generation: SessionGeneration::new(2),
             route_generation: RouteGeneration::new(4),
             lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(1_000)),
@@ -3735,7 +3947,7 @@ mod tests {
         );
 
         let replacement = ActiveRoute {
-            agent_id: neoengram_protocol::AgentId::new("agent-b").unwrap(),
+            agent_id: neoengram_domain::protocol::AgentId::new("agent-b").unwrap(),
             session_generation: SessionGeneration::new(3),
             route_generation: RouteGeneration::new(5),
             lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(2_000)),
@@ -3799,7 +4011,7 @@ mod tests {
         tunnel.state.routes.lock().await.insert(
             route_stream.clone(),
             ActiveRoute {
-                agent_id: neoengram_protocol::AgentId::new("gate-eviction-agent").unwrap(),
+                agent_id: neoengram_domain::protocol::AgentId::new("gate-eviction-agent").unwrap(),
                 session_generation: SessionGeneration::new(1),
                 route_generation: RouteGeneration::new(1),
                 lease_expires_at_unix_ms: lease_expiry(),
@@ -3878,13 +4090,13 @@ mod tests {
             .insert(request_id.clone(), stream_id.clone());
         let now = now_unix_ms();
         let stale_route = ActiveRoute {
-            agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+            agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
             session_generation: SessionGeneration::new(2),
             route_generation: RouteGeneration::new(4),
             lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(1_000)),
         };
         let current_route = ActiveRoute {
-            agent_id: neoengram_protocol::AgentId::new("agent-b").unwrap(),
+            agent_id: neoengram_domain::protocol::AgentId::new("agent-b").unwrap(),
             session_generation: SessionGeneration::new(3),
             route_generation: RouteGeneration::new(5),
             lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(2_000)),
@@ -3942,7 +4154,7 @@ mod tests {
             .forward_agent_unary(
                 request,
                 GatewayAgentAction::SessionOpen,
-                Some(neoengram_protocol::AgentId::new("agent-a").unwrap()),
+                Some(neoengram_domain::protocol::AgentId::new("agent-a").unwrap()),
                 1024,
                 Duration::from_secs(1),
             )
@@ -4026,7 +4238,7 @@ mod tests {
         });
         let now = now_unix_ms();
         let route = GatewayRouteLeaseRequest {
-            agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+            agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
             owner_replica_id: GatewayReplicaId::new("replica-a").unwrap(),
             agent_connection_id: GatewayConnectionId::new("agent-late-route").unwrap(),
             session_generation: SessionGeneration::new(3),
@@ -4079,7 +4291,7 @@ mod tests {
         let stream_id = GatewayConnectionId::new("full-agent-stream").unwrap();
         let now = now_unix_ms();
         let route = ActiveRoute {
-            agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+            agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
             session_generation: SessionGeneration::new(3),
             route_generation: RouteGeneration::new(7),
             lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(30_000)),
@@ -4529,7 +4741,7 @@ mod tests {
             tunnel.state.routes.lock().await.insert(
                 stream_id.clone(),
                 ActiveRoute {
-                    agent_id: neoengram_protocol::AgentId::new(agent_name).unwrap(),
+                    agent_id: neoengram_domain::protocol::AgentId::new(agent_name).unwrap(),
                     session_generation: SessionGeneration::new(3),
                     route_generation: RouteGeneration::new(generation),
                     lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(30_000)),
@@ -4544,7 +4756,7 @@ mod tests {
                 GatewayConnectionId::new("central-route-fence").unwrap(),
                 0,
                 GatewayControlMessage::RouteFence(GatewayRouteFence {
-                    agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+                    agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
                     route_generation: fenced_generation,
                     reason: "takeover".to_owned(),
                 }),
@@ -4616,7 +4828,7 @@ mod tests {
         owner.state.routes.lock().await.insert(
             stream_id.clone(),
             ActiveRoute {
-                agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+                agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
                 session_generation,
                 route_generation,
                 lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(30_000)),
@@ -4705,6 +4917,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_forwarding_delivers_a_fenced_lifecycle_assignment() {
+        let owner = GatewayTunnel::new(identity("replica-b"));
+        let stream_id = GatewayConnectionId::new("agent-lifecycle-owner-connection").unwrap();
+        let session_generation = SessionGeneration::new(3);
+        let route_generation = RouteGeneration::new(5);
+        let now = now_unix_ms();
+        owner.state.routes.lock().await.insert(
+            stream_id.clone(),
+            ActiveRoute {
+                agent_id: AgentId::new("agent-a").unwrap(),
+                session_generation,
+                route_generation,
+                lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(30_000)),
+            },
+        );
+        let (sender, mut receiver) = mpsc::channel(1);
+        owner
+            .state
+            .streams
+            .lock()
+            .await
+            .insert(stream_id.clone(), sender);
+
+        let downstream = lifecycle_frame_bytes(session_generation);
+        let request = peer_request(
+            "replica-a",
+            "replica-b",
+            stream_id,
+            session_generation,
+            route_generation,
+            downstream.clone(),
+        );
+        let frame = control_frame(
+            "replica-a",
+            GatewayConnectionId::new("peer-lifecycle-connection").unwrap(),
+            1,
+            GatewayControlMessage::PeerForward(request),
+        );
+
+        owner
+            .accept_peer_forward(frame, &GatewayReplicaId::new("replica-a").unwrap())
+            .await
+            .unwrap();
+        let Some(StreamEvent::Data(delivered)) = receiver.recv().await else {
+            panic!("expected a forwarded lifecycle assignment")
+        };
+        assert_eq!(delivered, downstream);
+        let decoded = AgentChannelDownstreamFrame::decode_json(
+            &delivered[..delivered.len().saturating_sub(1)],
+        )
+        .unwrap();
+        assert!(matches!(
+            decoded.message,
+            AgentChannelDownstreamMessage::LifecycleAssignment(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn peer_delivery_cannot_enter_a_stream_after_close_wins_the_fence() {
         let owner = tunnel();
         let stream_id = GatewayConnectionId::new("peer-fence-race-stream").unwrap();
@@ -4714,7 +4984,7 @@ mod tests {
         owner.state.routes.lock().await.insert(
             stream_id.clone(),
             ActiveRoute {
-                agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+                agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
                 session_generation,
                 route_generation,
                 lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(30_000)),
@@ -4786,7 +5056,7 @@ mod tests {
         owner.state.routes.lock().await.insert(
             stream_id.clone(),
             ActiveRoute {
-                agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+                agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
                 session_generation,
                 route_generation,
                 lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(30_000)),
@@ -4871,7 +5141,7 @@ mod tests {
         owner.state.routes.lock().await.insert(
             stream_id.clone(),
             ActiveRoute {
-                agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+                agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
                 session_generation,
                 route_generation,
                 lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(30_000)),
@@ -5011,7 +5281,7 @@ mod tests {
         owner.state.routes.lock().await.insert(
             stream_id.clone(),
             ActiveRoute {
-                agent_id: neoengram_protocol::AgentId::new("agent-a").unwrap(),
+                agent_id: neoengram_domain::protocol::AgentId::new("agent-a").unwrap(),
                 session_generation,
                 route_generation,
                 lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(30_000)),

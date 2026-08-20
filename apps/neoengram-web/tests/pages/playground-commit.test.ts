@@ -56,9 +56,14 @@ async function mountPage(
 ) {
   api.queryApiVersion.mockResolvedValue({
     data: {
-      api_versions: [1],
-      agent_protocol_versions: [1],
-      capabilities: ['resource_browser'],
+      api_version: 1,
+      agent_wire_version: 1,
+      capabilities: [
+        'artifact_commit_graph',
+        'snapshot_materialize',
+        'playground_browser',
+        'playground_precommit',
+      ],
     },
     requestId: 'request-version',
   });
@@ -85,6 +90,7 @@ async function mountPage(
         warnings: [],
         blockers: [],
         source_index_version: sourceIndexVersion,
+        data_layout: 'fast_cdc',
         created_at_unix_ms: '1',
         updated_at_unix_ms: '2',
         ...precommitOverrides,
@@ -221,6 +227,7 @@ describe('Playground Commit page recovery', () => {
           warnings: [],
           blockers: [],
           source_index_version: sourceIndexVersion,
+          data_layout: 'fast_cdc',
           candidate_index_version: secondCandidate,
           created_at_unix_ms: '1',
           updated_at_unix_ms: '3',
@@ -261,7 +268,11 @@ describe('Playground Commit page recovery', () => {
     vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue(undefined as never);
     api.cancelPlaygroundPreCommit.mockResolvedValue({
       data: {
-        precommit: { precommit_id: 'precommit-a', state: 'cancelled' },
+        precommit: {
+          precommit_id: 'precommit-a',
+          state: 'cancelled',
+          data_layout: 'fast_cdc',
+        },
         playground: playground(undefined, nextIndexVersion),
         replayed: false,
       },
@@ -273,7 +284,7 @@ describe('Playground Commit page recovery', () => {
     });
     api.startPlaygroundPreCommit.mockResolvedValue({
       data: {
-        precommit: { precommit_id: 'precommit-b', state: 'running' },
+        precommit: { precommit_id: 'precommit-b', state: 'running', data_layout: 'fast_cdc' },
         playground: playground('precommit-b', nextIndexVersion),
         replayed: false,
       },

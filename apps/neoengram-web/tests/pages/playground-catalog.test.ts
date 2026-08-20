@@ -37,8 +37,8 @@ async function mountPage({
 }: MountPageOptions = {}) {
   api.queryApiVersion.mockResolvedValue({
     data: {
-      api_versions: [1],
-      agent_protocol_versions: [1],
+      api_version: 1,
+      agent_wire_version: 1,
       capabilities,
     },
     requestId: 'request-version',

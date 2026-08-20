@@ -23,6 +23,8 @@ function playground(overrides: Partial<PlaygroundView> = {}): PlaygroundView {
     index_version: { revision: '7', digest: 'a'.repeat(64) },
     state: 'ready',
     storage_availability: 'ready',
+    resource_version: '1',
+    lifecycle: { state: 'active', generation: '1' },
     created_at_unix_ms: '1',
     updated_at_unix_ms: '1',
     ...overrides,

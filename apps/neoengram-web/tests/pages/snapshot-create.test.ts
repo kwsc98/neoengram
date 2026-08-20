@@ -65,12 +65,12 @@ const snapshot = {
   project_id: 'project-a',
   artifact_id: 'artifact-a',
   commit_id: historicalCommitId,
+  data_layout: 'fast_cdc' as const,
   storage_volume_id: 'volume-ready',
   region: 'cn-shanghai',
   message: 'Historical baseline',
   tag_names: [],
   state: 'ready' as const,
-  phase: 'idle' as const,
   integrity: { state: 'verified' as const, files_verified: '3', bytes_verified: '30' },
   logical_file_count: '3',
   logical_size_bytes: '30',
@@ -81,8 +81,8 @@ const snapshot = {
 function mockBaseQueries(): void {
   api.queryApiVersion.mockResolvedValue({
     data: {
-      api_versions: [1],
-      agent_protocol_versions: [1],
+      api_version: 1,
+      agent_wire_version: 1,
       capabilities: ['artifact_catalog', 'artifact_commit_graph', 'snapshot_materialize'],
     },
     requestId: 'request-version',

@@ -32,11 +32,7 @@ import {
   playgroundStorageAvailabilityLabel,
   playgroundStorageAvailabilityTagType,
 } from '@/features/precommit/status';
-import {
-  snapshotPhaseLabel,
-  snapshotStateLabel,
-  snapshotStateTagType,
-} from '@/features/snapshots/status';
+import { snapshotStateLabel, snapshotStateTagType } from '@/features/snapshots/status';
 import { useTenantsStore } from '@/stores/tenants';
 import { commitTagNames } from '@/utils/commit';
 import { buildCommitTree } from '@/utils/commit-tree';
@@ -677,8 +673,7 @@ async function showCreateSnapshot(): Promise<void> {
                   {{ formatBytes(snapshot.logical_size_bytes) }}
                 </small>
                 <el-tag :type="snapshotStateTagType(snapshot.state)" effect="plain">
-                  {{ snapshotStateLabel(snapshot.state) }} ·
-                  {{ snapshotPhaseLabel(snapshot.phase) }}
+                  {{ snapshotStateLabel(snapshot.state) }}
                 </el-tag>
                 <ArrowRight />
               </span>

@@ -11,10 +11,10 @@
 
 ## 当前基线
 
-- `0.2.0`、format v8 和 P0 crate/protocol/state-machine 改造已完成。
+- `0.2.0`、仓库格式 9 和 P0 crate/protocol/state-machine 改造已完成。
 - Standalone 本地工作流可运行；FUSE 实挂矩阵和大规模基准尚未完成。
-- `neoengramd` 保持无网络 library；`neoengram-server` 提供 Fusen 用户 listener、Gateway Registry
-  action 和迁移前 Hyper Agent listener。旧 Agent 直连 H2 全双工 action channel 已完成开发验证；
+- `neoengram-central` 提供 Fusen 用户 listener、Gateway Registry
+  action。Agent 直连 H2 全双工 action channel 只存在于 Gateway 转发链路；
   当前 Agent 配置已 Gateway-only；Gateway H2/mTLS tunnel、RouteLease 和一跳 peer forwarding 已接入，
   Central peer credential directory（heartbeat 刷新、30 秒 TTL、leaf fingerprint allow-list、control 断链
   fail-closed）已接入，
@@ -28,9 +28,9 @@
 - Managed 模式的 Chunk 字节以业务 StorageVolume 内的 immutable CAS 为耐久落点；Server 只保存
   Manifest/Index 和带 Volume、Artifact placement、generation 的 evidence，不接收或持久化 payload。
 - 0.0.1 Kubernetes 部署剖面已冻结为一个业务 PVC/StorageVolume 对应一个常驻 AgentInstance；Agent
-  SQLite 身份/Ledger/outbox adapter、mount probe、可运行的 `neoengram-agentd`、enrollment、H2
+  SQLite 身份/Ledger/outbox adapter、mount probe、可运行的 `neoengram-agent`、enrollment、H2
   session/Job transport 与 Volume-local CAS 纵切已实现；生产证书签发和真实集群闭环仍待实现。
-- G1 已部分落地：Gateway 协议与强类型 ID、GatewayRegistry/AgentRouteLease 的 InMemory/SQLite v7、
+- G1 已部分落地：Gateway 协议与强类型 ID、GatewayRegistry/AgentRouteLease 的 InMemory/SQLite current schema、
   管理 API、三 listener H2/mTLS tunnel、Agent/Gateway 部署与 NetworkPolicy 已加入。Agent 配置不再
   接受 Central fallback；Central outbound connector、Replica activation challenge/proof/证书投递、
   Central command signing/trust bundle 和一跳 peer forwarding 已实现。命令仅在完整帧尚未进入 owner
@@ -50,7 +50,7 @@
 
 | 迭代 | 状态 | 可交付结果 | 对应战略阶段 |
 | --- | --- | --- | --- |
-| R0 | 已完成 | format v8、协议 v1、Engine/Agent/中心内存状态机 | P0 / A0 |
+| R0 | 已完成 | 仓库格式 9、当前 wire 协议、Engine/Agent/中心内存状态机 | P0 / A0 |
 | R1 | 已完成 | AuthorityStore + SQLite 默认后端，覆盖全部中心权威状态 | P1 / A2 |
 | R2 | 进行中 | 一 PVC 一常驻 Agent：enrollment/审批契约、持久身份/Ledger/outbox、mount probe、可运行 daemon、双 listener、H2 session/Job、部署模板和人工 cooperative takeover；生产证书与集群验收待完成 | A1 / A2 |
 | R3 | 后续 | 把 OIDC/JWKS、RBAC/RLS 扩展到其余只读 Artifact/Commit/Tags/Snapshot API | P1 |
@@ -58,7 +58,7 @@
 | R5 | 已完成 | Volume-local Chunk CAS、ObjectPlacement evidence 和端到端 Managed Add；Server 零 payload | P2 / A4 |
 | R6 | 后续 | 中心 Commit/Ref CAS、固定 Snapshot 和 DatasetProfile | P1 / P2 |
 | G0 | 已完成 | 冻结 Synapse Gateway 专项架构、权威边界、切换策略和阶段验收 | Gateway docs |
-| G1 | 进行中 | Registry v7、管理面、H2+mTLS 实际隧道、RouteLease、命令签名、入队前最多一次 peer fallback/入队后仅 outbox 重投边界已完成；loopback listener/H2/peer harness 已通过，完整 Central/Registry/outbox/签名双 Replica E2E、外部生产凭据、真实集群 readiness/failover 与一次性切换待完成 | Gateway control |
+| G1 | 进行中 | Gateway Registry、管理面、H2+mTLS 实际隧道、RouteLease、命令签名、入队前最多一次 peer fallback/入队后仅 outbox 重投边界已完成；loopback listener/H2/peer harness 已通过，完整 Central/Registry/outbox/签名双 Replica E2E、外部生产凭据、真实集群 readiness/failover 与一次性切换待完成 | Gateway control |
 | G2 | 后续 | TransferRoute/Ticket/Session；源 Agent -> 源 Gateway -> 目标 Gateway -> 目标 Agent，Server 零 payload | Gateway data |
 | G3 | 后续 | 固定 Commit/Snapshot 的只读 S3：SigV4、LIST/HEAD/GET/Range | Gateway S3 |
 | R7 | 后续 | 客户端 push、fetch、clone 和授权训练读取；跨 Volume payload 复用 G2 数据链路 | P2 / P3 |
@@ -76,13 +76,12 @@
 | 存储边界 | SQLite 固定单连接、WAL、foreign keys、`synchronous=FULL`；应用层租户隔离，不声称数据库级 RLS、HA 或多进程能力 |
 | 非目标 | daemon、HTTP、OIDC、跨 Volume payload route、PG/MySQL adapter、跨后端迁移、SQLite 复制和用户界面 |
 
-SQLite authority 使用独立 `authority.sqlite3`/`authority.lock`，不复用 Standalone format v8。
-当前格式使用 `application_id = 0x4e454f41`、`user_version = 6`；启动时支持 v1 到 v6 的线性原子
-迁移，v6 新增 Volume `object_placements`，且不会从 legacy `durable_objects` row 推导 placement；其他
-版本、未知表或变更 schema 均失败关闭。
-R2 Agent Registry 另外使用 `agent-registry.sqlite3`/`agent-registry.lock`，由单个中心进程组合进
-`AuthorityStore`。审批决策和其规范审计事件在同一 Registry CAS aggregate 中原子持久化；
-`authority.sqlite3` 中的 enrollment audit 表只是兼容投影，不声称两个 SQLite 文件具有跨库事务。
+SQLite authority 使用独立 `authority.sqlite3`/`authority.lock`，不复用 Standalone 仓库格式 9。
+当前 clean-slate 格式使用 `application_id = 0x4e454155`、`user_version = 12`；旧版本、未知表或
+变更 schema 均失败关闭，不执行迁移或双读。
+R2 Agent Registry、Gateway Registry、S3 和生命周期数据全部使用 `authority.sqlite3`/`authority.lock`，
+由单个中心进程以同一个 SQLite 事务组合。当前 clean-slate schema identity 为
+`application_id = 0x4e454155`、`user_version = 12`；不再创建独立 Registry 数据库。
 PostgreSQL/MySQL 后续实现同一行为契约，但各自拥有独立 SQL、migration、物理 schema、锁和 CAS 设计。
 
 ## 决策门

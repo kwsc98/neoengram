@@ -22,8 +22,9 @@ getrandom = "0.4"
 http = "1.4"
 http-body-util = "0.1"
 hyper = { version = "1.11", features = ["client", "http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
-neoengram-protocol = { path = "../../crates/neoengram-protocol" }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2"] }
+neoengram-domain.workspace = true
 ring = "0.17.14"
 rustls = "0.23"
 rustls-pki-types = "1.15"
@@ -31,6 +32,7 @@ rustix = { workspace = true, features = ["process"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26"
+percent-encoding = "2.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2.0"

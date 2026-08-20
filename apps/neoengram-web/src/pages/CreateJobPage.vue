@@ -68,6 +68,10 @@ const selectedScope = computed(() => {
     playground_id: selected.playground_id,
   };
 });
+const selectedScopeKey = computed(() => {
+  const scope = selectedScope.value;
+  return scope ? `${scope.project_id}\0${scope.artifact_id}\0${scope.playground_id}` : '';
+});
 const playgroundQuery = useQuery({
   queryKey: computed(() => [
     'playground',
@@ -124,9 +128,6 @@ function resetJobId(): void {
 watch(
   () => [
     tenantId.value,
-    selectedScope.value?.project_id ?? '',
-    selectedScope.value?.artifact_id ?? '',
-    selectedScope.value?.playground_id ?? '',
     form.deadline instanceof Date ? form.deadline.getTime() : '',
     form.all,
     form.pathsText,
@@ -136,6 +137,19 @@ watch(
     clearErrors();
   },
 );
+
+let observedSelectedScopeKey: string | undefined;
+watch(selectedScopeKey, (value) => {
+  if (!value) return;
+  if (observedSelectedScopeKey === undefined) {
+    observedSelectedScopeKey = value;
+    return;
+  }
+  if (value === observedSelectedScopeKey) return;
+  observedSelectedScopeKey = value;
+  resetJobId();
+  clearErrors();
+});
 
 watch(
   () => sourcePlaygroundQuery.data.value?.data.playground,

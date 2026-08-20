@@ -1,4 +1,29 @@
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
+const actionRegistry = JSON.parse(
+  execFileSync(
+    "cargo",
+    [
+      "run",
+      "--quiet",
+      "--locked",
+      "--offline",
+      "-p",
+      "neoengram-domain",
+      "--example",
+      "export_action_registry",
+    ],
+    {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "inherit"],
+    },
+  ),
+);
 
 const bundleUrl = new URL(
   "../../../target/openapi/neoengram-api.json",
@@ -47,6 +72,34 @@ function resolveAgentRef(value) {
     .reduce((current, part) => current?.[part], agentDocument);
 }
 
+function resolveAgentSchema(value) {
+  const schema = resolveAgentRef(value);
+  if (!schema?.allOf) return schema;
+  return schema.allOf.reduce(
+    (merged, part) => {
+      const resolved = resolveAgentSchema(part) ?? {};
+      const properties = { ...(merged.properties ?? {}) };
+      for (const [name, property] of Object.entries(resolved.properties ?? {})) {
+        if (
+          !properties[name] ||
+          (property && typeof property === "object" && Object.keys(property).length > 0)
+        ) {
+          properties[name] = property;
+        }
+      }
+      return {
+        ...merged,
+        ...resolved,
+        properties,
+        required: [
+          ...new Set([...(merged.required ?? []), ...(resolved.required ?? [])]),
+        ],
+      };
+    },
+    {},
+  );
+}
+
 function sorted(values) {
   return [...values].sort();
 }
@@ -68,6 +121,24 @@ function assertDescriptionIncludes(value, fragments, message) {
   }
 }
 
+function findPermissiveObjects(value, path = [], found = []) {
+  if (!value || typeof value !== "object") return found;
+  if (value.additionalProperties === true) found.push(path.join("."));
+  for (const [key, child] of Object.entries(value)) {
+    findPermissiveObjects(child, [...path, key], found);
+  }
+  return found;
+}
+
+assert(
+  findPermissiveObjects(document).length === 0,
+  "public OpenAPI contains an object that accepts unknown fields",
+);
+assert(
+  findPermissiveObjects(agentDocument).length === 0,
+  "Agent OpenAPI contains an object that accepts unknown fields",
+);
+
 assertDescriptionIncludes(
   document.info,
   ["HTTP/2", "application/x-ndjson", "heartbeat", "MetadataBatch"],
@@ -79,75 +150,35 @@ assert(
   "Public API overview still describes the obsolete Agent transport state",
 );
 
-const expectedOperations = {
-  "/api/system/version/query": ["post", "queryApiVersion"],
-  "/api/tenant/list/query": ["post", "queryTenantList"],
-  "/api/tenant/query": ["post", "queryTenant"],
-  "/api/tenant/create": ["post", "createTenant"],
-  "/api/storage/volume/list/query": ["post", "queryStorageVolumeList"],
-  "/api/storage/volume/query": ["post", "queryStorageVolume"],
-  "/api/storage/volume/create": ["post", "createStorageVolume"],
-  "/api/storage/enrollment/token/create": [
-    "post",
-    "createStorageEnrollmentToken",
-  ],
-  "/api/storage/enrollment/list/query": ["post", "queryStorageEnrollmentList"],
-  "/api/storage/enrollment/query": ["post", "queryStorageEnrollment"],
-  "/api/storage/enrollment/approve": ["post", "approveStorageEnrollment"],
-  "/api/storage/enrollment/reject": ["post", "rejectStorageEnrollment"],
-  "/api/project/list/query": ["post", "queryProjectList"],
-  "/api/artifact/list/query": ["post", "queryArtifactList"],
-  "/api/artifact/query": ["post", "queryArtifact"],
-  "/api/artifact/create": ["post", "createArtifact"],
-  "/api/artifact/commit/graph/query": ["post", "queryArtifactCommitGraph"],
-  "/api/artifact/commit/diff/query": ["post", "queryArtifactCommitDiff"],
-  "/api/playground/list/query": ["post", "queryPlaygroundList"],
-  "/api/playground/query": ["post", "queryPlayground"],
-  "/api/playground/create": ["post", "createPlayground"],
-  "/api/playground/precommit/start": ["post", "startPlaygroundPreCommit"],
-  "/api/playground/precommit/query": ["post", "queryPlaygroundPreCommit"],
-  "/api/playground/precommit/restart": ["post", "restartPlaygroundPreCommit"],
-  "/api/playground/precommit/cancel": ["post", "cancelPlaygroundPreCommit"],
-  "/api/playground/file/list/query": ["post", "queryPlaygroundFileList"],
-  "/api/playground/change/list/query": ["post", "queryPlaygroundChangeList"],
-  "/api/playground/file/metadata/query": [
-    "post",
-    "queryPlaygroundFileMetadata",
-  ],
-  "/api/playground/dataset/profile/query": [
-    "post",
-    "queryPlaygroundDatasetProfile",
-  ],
-  "/api/playground/commit/create": ["post", "commitPlayground"],
-  "/api/snapshot/list/query": ["post", "querySnapshotList"],
-  "/api/snapshot/query": ["post", "querySnapshot"],
-  "/api/snapshot/create": ["post", "createSnapshot"],
-  "/api/snapshot/delivery/retry": ["post", "retrySnapshotDelivery"],
-  "/api/snapshot/file/list/query": ["post", "querySnapshotFileList"],
-  "/api/snapshot/activity/list/query": ["post", "querySnapshotActivityList"],
-  "/api/snapshot/dataset/profile/query": [
-    "post",
-    "querySnapshotDatasetProfile",
-  ],
-  "/api/gateway/pool/create": ["post", "createGatewayPool"],
-  "/api/gateway/pool/query": ["post", "queryGatewayPool"],
-  "/api/gateway/pool/list/query": ["post", "queryGatewayPoolList"],
-  "/api/gateway/pool/update": ["post", "updateGatewayPool"],
-  "/api/gateway/pool/drain": ["post", "drainGatewayPool"],
-  "/api/gateway/replica/create": ["post", "createGatewayReplica"],
-  "/api/gateway/replica/activate": ["post", "activateGatewayReplica"],
-  "/api/gateway/replica/list/query": [
-    "post",
-    "queryGatewayReplicaList",
-  ],
-  "/api/gateway/replica/drain": ["post", "drainGatewayReplica"],
-  "/api/gateway/replica/revoke": ["post", "revokeGatewayReplica"],
-  "/api/job/add/create": ["post", "createAddJob"],
-  "/api/job/query": ["post", "queryJob"],
-  "/api/job/add/finalize": ["post", "finalizeAddJob"],
-  "/health/live": ["get", "liveProbe"],
-  "/health/ready": ["get", "readyProbe"],
-};
+assert(actionRegistry.schema_version === 1, "action registry version changed");
+const expectedOperations = Object.fromEntries(
+  actionRegistry.public_openapi.map((route) => [
+    route.path,
+    [route.method.toLowerCase(), route.operation_id],
+  ]),
+);
+assert(
+  Object.keys(expectedOperations).length ===
+    actionRegistry.public_openapi.length,
+  "public action registry contains duplicate paths",
+);
+assertSameMembers(
+  actionRegistry.central_routes
+    .filter((route) => route.visibility === "public")
+    .map((route) => `${route.method} ${route.path}`),
+  actionRegistry.public_openapi
+    .filter((route) => route.routed_by_central)
+    .map((route) => `${route.method} ${route.path}`),
+  "Central public route export differs from the OpenAPI registry",
+);
+for (const route of actionRegistry.central_routes.filter(
+  (candidate) => candidate.visibility === "internal",
+)) {
+  assert(
+    document.paths[route.path] === undefined,
+    `internal Central route leaked into public OpenAPI: ${route.path}`,
+  );
+}
 
 assert(document.openapi === "3.1.0", "OpenAPI version must be 3.1.0");
 assertSameMembers(
@@ -165,6 +196,14 @@ for (const [path, [method, operationId]] of Object.entries(
   assert(
     operation.operationId === operationId,
     `${method.toUpperCase()} ${path} has wrong operationId`,
+  );
+  const registryRoute = actionRegistry.public_openapi.find(
+    (route) => route.path === path,
+  );
+  assert(
+    (operation["x-neoengram-central-route"] !== false) ===
+      registryRoute.routed_by_central,
+    `${method.toUpperCase()} ${path} has wrong Central route availability`,
   );
   operationIds.push(operation.operationId);
 
@@ -207,6 +246,10 @@ for (const [path, [method, operationId]] of Object.entries(
     }
   }
 }
+assert(
+  new Set(operationIds).size === operationIds.length,
+  "public OpenAPI operationId values are not unique",
+);
 
 assert(
   !operationIds.some((id) =>
@@ -374,6 +417,7 @@ for (const operationId of [
   "queryStorageEnrollmentList",
   "queryStorageEnrollment",
   "approveStorageEnrollment",
+  "completeStorageRecovery",
   "rejectStorageEnrollment",
   "liveProbe",
   "readyProbe",
@@ -394,8 +438,8 @@ for (const operationId of [
 
 const createRequest = document.components.schemas.CreateAddJobRequest;
 assert(
-  createRequest.additionalProperties === true,
-  "Add request must retain compatible extension fields",
+  createRequest.additionalProperties === false,
+  "Add request must reject unknown fields",
 );
 assertSameMembers(
   createRequest.required,
@@ -420,10 +464,14 @@ assert(
 );
 assert(
   createRequest.properties.paths.maxItems === 4096,
-  "Add path limit must match neoengram-protocol",
+  "Add path limit must match neoengram-domain",
 );
 
 const jobView = document.components.schemas.JobView;
+assert(
+  jobView.additionalProperties === false,
+  "JobView must reject unknown fields",
+);
 assertSameMembers(
   Object.keys(jobView.properties),
   [
@@ -444,54 +492,20 @@ assertSameMembers(
   "public JobView fields changed",
 );
 
-const forbiddenJobFields = [
-  "accepted",
-  "agent_id",
-  "agent_mount_id",
-  "artifact_placement_id",
-  "assignment",
-  "assignment_generation",
-  "assignment_id",
-  "assignment_target",
-  "decision_generation",
-  "edge_cluster_id",
-  "fencing",
-  "fencing_token",
-  "finalized_ack",
-  "generation",
-  "index_delta",
-  "lease",
-  "manifest",
-  "manifests",
-  "mount_generation",
-  "mutations",
-  "owner_generation",
-  "placement_generation",
-  "prepared",
-  "publication_candidate",
-  "resume_publication",
-  "storage_volume_id",
-];
-assertSameMembers(
-  jobView.propertyNames?.not?.enum ?? [],
-  forbiddenJobFields,
-  "JobView internal-field denylist changed",
-);
-
 const canonicalU64 = document.components.schemas.CanonicalU64;
 assert(
   canonicalU64.type === "string" && canonicalU64.pattern,
   "u64 values must be canonical decimal strings",
 );
 assert(
-  document.components.schemas.ApiVersionResponse.properties.api_versions.items
-    .type === "integer",
-  "small API versions must be JSON numbers",
+  document.components.schemas.ApiVersionResponse.properties.api_version.type ===
+    "integer",
+  "the current API version must be a JSON number",
 );
 assert(
-  document.components.schemas.ApiVersionResponse.properties
-    .agent_protocol_versions.items.type === "integer",
-  "small protocol versions must be JSON numbers",
+  document.components.schemas.ApiVersionResponse.properties.agent_wire_version
+    .type === "integer",
+  "current agent wire version must be a JSON number",
 );
 
 const canonicalFields = [
@@ -573,6 +587,10 @@ const resourceContracts = {
     "ApproveStorageEnrollmentRequest",
     "ApproveStorageEnrollmentResponse",
   ],
+  completeStorageRecovery: [
+    "CompleteStorageRecoveryRequest",
+    "CompleteStorageRecoveryResponse",
+  ],
   rejectStorageEnrollment: [
     "RejectStorageEnrollmentRequest",
     "RejectStorageEnrollmentResponse",
@@ -625,9 +643,25 @@ const resourceContracts = {
   querySnapshotList: ["QuerySnapshotListRequest", "QuerySnapshotListResponse"],
   querySnapshot: ["QuerySnapshotRequest", "QuerySnapshotResponse"],
   createSnapshot: ["CreateSnapshotRequest", "CreateSnapshotResponse"],
+  createSnapshotDelivery: [
+    "CreateSnapshotDeliveryRequest",
+    "CreateSnapshotDeliveryResponse",
+  ],
+  querySnapshotDelivery: [
+    "QuerySnapshotDeliveryRequest",
+    "QuerySnapshotDeliveryResponse",
+  ],
+  querySnapshotDeliveryList: [
+    "QuerySnapshotDeliveryListRequest",
+    "QuerySnapshotDeliveryListResponse",
+  ],
   retrySnapshotDelivery: [
     "RetrySnapshotDeliveryRequest",
     "RetrySnapshotDeliveryResponse",
+  ],
+  deleteSnapshotDelivery: [
+    "DeleteSnapshotDeliveryRequest",
+    "DeleteSnapshotDeliveryResponse",
   ],
   querySnapshotFileList: [
     "QuerySnapshotFileListRequest",
@@ -640,6 +674,66 @@ const resourceContracts = {
   querySnapshotDatasetProfile: [
     "QuerySnapshotDatasetProfileRequest",
     "QuerySnapshotDatasetProfileResponse",
+  ],
+  createS3AccessPoint: [
+    "CreateS3AccessPointRequest",
+    "CreateS3AccessPointResponse",
+  ],
+  queryS3AccessPointList: [
+    "QueryS3AccessPointListRequest",
+    "QueryS3AccessPointListResponse",
+  ],
+  queryS3AccessPoint: [
+    "QueryS3AccessPointRequest",
+    "QueryS3AccessPointResponse",
+  ],
+  enableS3AccessPoint: [
+    "UpdateS3AccessPointRequest",
+    "UpdateS3AccessPointResponse",
+  ],
+  disableS3AccessPoint: [
+    "UpdateS3AccessPointRequest",
+    "UpdateS3AccessPointResponse",
+  ],
+  createS3Credential: [
+    "CreateS3CredentialRequest",
+    "CreateS3CredentialResponse",
+  ],
+  queryS3CredentialList: [
+    "QueryS3CredentialListRequest",
+    "QueryS3CredentialListResponse",
+  ],
+  revokeS3Credential: [
+    "RevokeS3CredentialRequest",
+    "QueryS3CredentialListResponse",
+  ],
+  queryS3ObjectList: ["QueryS3ObjectListRequest", "QueryS3ObjectListResponse"],
+  createS3DownloadUrl: [
+    "CreateS3DownloadUrlRequest",
+    "CreateS3DownloadUrlResponse",
+  ],
+  queryResourceDeletionImpact: [
+    "QueryDeletionImpactRequest",
+    "QueryDeletionImpactResponse",
+  ],
+  createResourceDeletion: ["CreateDeletionRequest", "DeletionMutationResponse"],
+  queryResourceDeletion: ["QueryDeletionRequest", "QueryDeletionResponse"],
+  queryResourceDeletionList: [
+    "QueryDeletionListRequest",
+    "QueryDeletionListResponse",
+  ],
+  restoreResourceDeletion: [
+    "UpdateDeletionRequest",
+    "DeletionMutationResponse",
+  ],
+  retryResourceDeletion: ["UpdateDeletionRequest", "DeletionMutationResponse"],
+  createResourceRetentionHold: [
+    "CreateRetentionHoldRequest",
+    "CreateRetentionHoldResponse",
+  ],
+  releaseResourceRetentionHold: [
+    "ReleaseRetentionHoldRequest",
+    "ReleaseRetentionHoldResponse",
   ],
   createGatewayPool: ["CreateGatewayPoolRequest", "GatewayPoolResponse"],
   queryGatewayPool: ["QueryGatewayPoolRequest", "GatewayPoolResponse"],
@@ -712,18 +806,198 @@ assertSameMembers(
     "storage.enrollment.review",
     "artifact.read",
     "artifact.create",
+    "project.read",
+    "project.create",
     "playground.read",
     "playground.create",
     "snapshot.read",
     "snapshot.create",
+    "s3.access.read",
+    "s3.access.manage",
+    "resource.lifecycle.read",
+    "resource.lifecycle.manage",
+    "retention.manage",
     "gateway.read",
     "gateway.manage",
   ],
   "public permission vocabulary changed",
 );
+
+const advertisedCapabilities = resolveRef(
+  document.paths["/api/system/version/query"].post.responses["200"],
+).content["application/json"].example.capabilities;
+assert(
+  [
+    "commit_layout_selection_v2",
+    "snapshot_delivery_fuse_v2",
+    "snapshot_delivery_copy_v2",
+    "snapshot_delivery_hardlink_v2",
+    "resource_lifecycle_v1",
+  ].every((capability) => advertisedCapabilities.includes(capability)),
+  "version query example must advertise the new Commit and SnapshotDelivery capabilities",
+);
+
+assertSameMembers(
+  document.components.schemas.ResourceLifecycleState.enum,
+  ["active", "pending_delete", "deleting", "restoring", "deleted"],
+  "resource lifecycle states changed",
+);
+assertSameMembers(
+  document.components.schemas.DeletionOperationState.enum,
+  [
+    "requested",
+    "quiescing",
+    "quarantining",
+    "recoverable",
+    "restoring",
+    "purging",
+    "finalizing",
+    "completed",
+    "blocked",
+    "failed",
+  ],
+  "deletion Saga states changed",
+);
+assertSameMembers(
+  document.components.schemas.DeletionCompletion.enum,
+  ["restored", "purged"],
+  "deletion completion states changed",
+);
+assertSameMembers(
+  document.components.schemas.RetentionHoldState.enum,
+  ["active", "released"],
+  "Retention Hold states changed",
+);
+
+const resourceRef = document.components.schemas.ResourceRef;
+assert(
+  resourceRef.discriminator?.propertyName === "type" &&
+    resourceRef.oneOf?.length === 4,
+  "ResourceRef must remain a four-way tagged union",
+);
+for (const [schemaName, type, required] of [
+  ["StorageVolumeResourceRef", "storage_volume", ["type", "storage_volume_id"]],
+  ["ArtifactResourceRef", "artifact", ["type", "project_id", "artifact_id"]],
+  [
+    "PlaygroundResourceRef",
+    "playground",
+    ["type", "project_id", "artifact_id", "playground_id"],
+  ],
+  ["SnapshotResourceRef", "snapshot", ["type", "snapshot_id"]],
+]) {
+  const schema = document.components.schemas[schemaName];
+  assert(
+    schema.additionalProperties === false &&
+      schema.properties.type.const === type,
+    `${schemaName} lost its closed tagged-union boundary`,
+  );
+  assertSameMembers(schema.required, required, `${schemaName} scope changed`);
+}
+
+for (const schemaName of [
+  "StorageVolumeView",
+  "ArtifactView",
+  "PlaygroundView",
+  "SnapshotView",
+]) {
+  const schema = document.components.schemas[schemaName];
+  assert(
+    schema.required.includes("resource_version") &&
+      schema.required.includes("lifecycle") &&
+      schema.properties.resource_version.$ref ===
+        "#/components/schemas/CanonicalU64" &&
+      schema.properties.lifecycle.$ref ===
+        "#/components/schemas/ResourceLifecycleView",
+    `${schemaName} must expose the lifecycle CAS fence`,
+  );
+}
+
+const lifecycleView = document.components.schemas.ResourceLifecycleView;
+assertSameMembers(
+  lifecycleView.required,
+  ["state", "generation"],
+  "ResourceLifecycleView required fence changed",
+);
+assert(
+  lifecycleView.additionalProperties === false &&
+    lifecycleView.properties.generation.$ref ===
+      "#/components/schemas/PositiveCanonicalU64",
+  "ResourceLifecycleView must remain closed with a positive generation",
+);
+
+assertSameMembers(
+  document.components.schemas.CreateDeletionRequest.required,
+  [
+    "tenant_id",
+    "resource",
+    "cascade",
+    "confirm_managed_data_erase",
+    "expected_resource_version",
+    "impact_digest",
+    "request_id",
+  ],
+  "delete mutation confirmation boundary changed",
+);
+assertSameMembers(
+  document.components.schemas.UpdateDeletionRequest.required,
+  ["tenant_id", "deletion_id", "request_id", "expected_resource_version"],
+  "delete update CAS boundary changed",
+);
+assertSameMembers(
+  document.components.schemas.CreateRetentionHoldRequest.required,
+  [
+    "tenant_id",
+    "deletion_id",
+    "request_id",
+    "expected_resource_version",
+    "reason",
+  ],
+  "Retention Hold create boundary changed",
+);
+assertSameMembers(
+  document.components.schemas.ReleaseRetentionHoldRequest.required,
+  [
+    "tenant_id",
+    "deletion_id",
+    "retention_hold_id",
+    "request_id",
+    "expected_resource_version",
+  ],
+  "Retention Hold release boundary changed",
+);
+
+for (const operationId of [
+  "queryResourceDeletionImpact",
+  "createResourceDeletion",
+  "queryResourceDeletion",
+  "queryResourceDeletionList",
+  "restoreResourceDeletion",
+  "retryResourceDeletion",
+  "createResourceRetentionHold",
+  "releaseResourceRetentionHold",
+]) {
+  const [path, [method]] = Object.entries(expectedOperations).find(
+    ([, [, candidate]]) => candidate === operationId,
+  );
+  const operation = document.paths[path][method];
+  assert(
+    operation.tags.includes("ResourceLifecycle"),
+    `${operationId} must use the ResourceLifecycle tag`,
+  );
+  assert(
+    operation.responses["409"] || operationId.includes("queryResourceDeletion"),
+    `${operationId} must expose lifecycle CAS conflicts`,
+  );
+}
 assertDescriptionIncludes(
   document.components.schemas.GatewayEndpoint,
-  ["canonical HTTPS origin", "path", "query", "fragment"],
+  [
+    "canonical HTTPS origin",
+    "loopback HTTP origin",
+    "path",
+    "query",
+    "fragment",
+  ],
   "Gateway endpoint must document its canonical origin boundary",
 );
 assert(
@@ -991,11 +1265,77 @@ assertSameMembers(
   ["creating", "ready", "abnormal"],
   "Snapshot states changed",
 );
-assertSameMembers(
-  document.components.schemas.SnapshotPhase.enum,
-  ["planning", "materializing", "verifying", "idle"],
-  "Snapshot phases changed",
+assert(
+  document.components.schemas.SnapshotPhase === undefined,
+  "SnapshotPhase must not remain in the new delivery protocol",
 );
+assert(
+  document.components.schemas.SnapshotView.properties.phase === undefined,
+  "SnapshotView must not expose delivery phase",
+);
+assert(
+  document.components.schemas.SnapshotActivityView.properties.phase ===
+    undefined,
+  "Snapshot activity must not expose delivery phase",
+);
+assertSameMembers(
+  document.components.schemas.SnapshotActivityView.properties.activity_type
+    .enum,
+  ["created", "status_changed", "ready", "failed"],
+  "Snapshot activity must not contain SnapshotDelivery retry events",
+);
+assertDescriptionIncludes(
+  document.components.schemas.SnapshotView,
+  ["SnapshotDelivery", "不保存挂载或物化模式"],
+  "Snapshot view must delegate materialization to SnapshotDelivery",
+);
+
+const deliveryQueryOperation =
+  document.paths["/api/snapshot/delivery/query"].post;
+assert(
+  deliveryQueryOperation.description.includes("交付模式") &&
+    !deliveryQueryOperation.description.includes("布局"),
+  "SnapshotDelivery query must describe delivery mode rather than Commit layout",
+);
+const deliveryListResponses =
+  document.paths["/api/snapshot/delivery/list/query"].post.responses;
+assert(
+  deliveryListResponses["404"]?.$ref ===
+    "#/components/responses/ResourceNotFoundProblem" &&
+    deliveryListResponses["409"]?.$ref ===
+      "#/components/responses/CursorConflictProblem",
+  "SnapshotDelivery list must expose missing Snapshot and cursor conflicts",
+);
+const snapshotDeliveryView = document.components.schemas.SnapshotDeliveryView;
+for (const field of ["source_index_digest", "object_set_digest"]) {
+  assert(
+    snapshotDeliveryView.properties[field].$ref ===
+      "#/components/schemas/ContentDigest",
+    `SnapshotDeliveryView.${field} must use ContentDigest`,
+  );
+}
+assertDescriptionIncludes(
+  document.paths["/api/snapshot/delivery/delete"].post,
+  ["deleting", "200 只表示删除流程已持久化", "deleted"],
+  "SnapshotDelivery delete must describe asynchronous completion",
+);
+const deliveryConflictCodes = Object.values(
+  document.components.responses.MutationConflictProblem.content[
+    "application/problem+json"
+  ].examples,
+).map((example) => example.value.code);
+for (const code of [
+  "HARDLINK_REQUIRES_WHOLE_FILE",
+  "HARDLINK_CROSS_FILESYSTEM",
+  "HARDLINK_UNSAFE_VOLUME",
+  "HARDLINK_OBJECT_NOT_SEALED",
+  "DELIVERY_TARGET_CONFLICT",
+]) {
+  assert(
+    deliveryConflictCodes.includes(code),
+    `SnapshotDelivery conflict examples omit ${code}`,
+  );
+}
 
 const publicResourceViews = [
   document.components.schemas.StorageVolumeView,
@@ -1218,9 +1558,14 @@ assertSameMembers(
     "region",
     "backend_type",
     "access_mode",
+    "allowed_delivery_modes",
+    "hardlink_policy",
+    "max_whole_file_bytes",
+    "copy_reserve_bytes",
     "pvc_reference",
     "state",
     "resource_version",
+    "lifecycle",
     "created_at_unix_ms",
     "updated_at_unix_ms",
   ],
@@ -1236,8 +1581,13 @@ assertSameMembers(
     "region",
     "backend_type",
     "access_mode",
+    "allowed_delivery_modes",
+    "hardlink_policy",
+    "max_whole_file_bytes",
+    "copy_reserve_bytes",
     "state",
     "resource_version",
+    "lifecycle",
     "created_at_unix_ms",
     "updated_at_unix_ms",
   ],
@@ -1297,6 +1647,23 @@ const storageEnrollmentOperations = {
   },
   approveStorageEnrollment: {
     path: "/api/storage/enrollment/approve",
+    permission: "storage.enrollment.review",
+    statuses: [
+      "200",
+      "401",
+      "403",
+      "404",
+      "409",
+      "413",
+      "422",
+      "429",
+      "500",
+      "503",
+      "504",
+    ],
+  },
+  completeStorageRecovery: {
+    path: "/api/storage/enrollment/recovery/complete",
     permission: "storage.enrollment.review",
     statuses: [
       "200",
@@ -1563,7 +1930,6 @@ const enrollmentProbe =
 const enrollmentProbeFields = [
   "observed_access_mode",
   "descriptor_matches",
-  "protocol_compatible",
   "observed_at_unix_ms",
 ];
 assertSameMembers(
@@ -1811,6 +2177,43 @@ assert(
   "Storage enrollment approval example must return approved enrollment and unavailable Volume",
 );
 
+const completeRecoveryRequest =
+  document.components.schemas.CompleteStorageRecoveryRequest;
+assertSameMembers(
+  completeRecoveryRequest.required,
+  [
+    "tenant_id",
+    "storage_enrollment_id",
+    "expected_resource_version",
+    "owner_generation",
+  ],
+  "Storage recovery completion fence fields changed",
+);
+assertSameMembers(
+  Object.keys(completeRecoveryRequest.properties),
+  completeRecoveryRequest.required,
+  "Storage recovery completion accepts uncontracted fields",
+);
+assert(
+  resolveRef(completeRecoveryRequest.properties.expected_resource_version) ===
+    canonicalU64 &&
+    resolveRef(completeRecoveryRequest.properties.owner_generation) ===
+      canonicalU64,
+  "Storage recovery completion versions must use CanonicalU64",
+);
+assertDescriptionIncludes(
+  document.paths["/api/storage/enrollment/recovery/complete"].post,
+  ["Ready mount", "owner generation", "旧 generation", "409"],
+  "Storage recovery completion does not document its Ready-owner fence",
+);
+const completeRecoveryResponse =
+  document.components.schemas.CompleteStorageRecoveryResponse;
+assertSameMembers(
+  completeRecoveryResponse.required,
+  ["enrollment", "storage_volume"],
+  "Storage recovery completion response fields changed",
+);
+
 const rejectEnrollmentRequest =
   document.components.schemas.RejectStorageEnrollmentRequest;
 assertSameMembers(
@@ -1855,8 +2258,8 @@ assert(
 
 const createTenantRequest = document.components.schemas.CreateTenantRequest;
 assert(
-  createTenantRequest.additionalProperties === true,
-  "Tenant create request must retain compatible extension fields",
+  createTenantRequest.additionalProperties === false,
+  "Tenant create request must reject unknown fields",
 );
 assert(
   !createTenantRequest.properties.actor &&
@@ -1864,20 +2267,19 @@ assert(
   "Tenant create request must not declare actor or principal",
 );
 
-const expectedAgentOperations = {
-  "/agent/enrollment/bootstrap": "bootstrapAgentEnrollment",
-  "/agent/enrollment/status/query": "queryAgentEnrollmentStatus",
-  "/agent/session/open": "openAgentSession",
-  "/agent/session/channel/open": "openAgentSessionChannel",
-  "/agent/session/heartbeat/report": "reportAgentSessionHeartbeat",
-  "/agent/session/message/list/query": "queryAgentSessionMessages",
-  "/agent/job/report/create": "createAgentJobReport",
-  "/agent/job/metadata/batch/stage": "stageAgentJobMetadataBatch",
-  "/agent/job/metadata/page/stage": "stageAgentJobMetadataPage",
-  "/agent/job/index/page/query": "queryAgentJobIndexPage",
-  "/agent/job/manifest/page/query": "queryAgentJobManifestPage",
-  "/agent/session/close": "closeAgentSession",
-};
+const expectedAgentOperations = Object.fromEntries(
+  actionRegistry.agent_actions.map((route) => [route.path, route.operation_id]),
+);
+assert(
+  Object.keys(expectedAgentOperations).length ===
+    actionRegistry.agent_actions.length,
+  "Agent action registry contains duplicate paths",
+);
+assert(
+  new Set(Object.values(expectedAgentOperations)).size ===
+    actionRegistry.agent_actions.length,
+  "Agent action registry contains duplicate operationId values",
+);
 assert(
   agentDocument.openapi === "3.1.0",
   "Agent OpenAPI version must be 3.1.0",
@@ -1894,19 +2296,20 @@ for (const [path, operationId] of Object.entries(expectedAgentOperations)) {
     `Agent action path uses a path parameter: ${path}`,
   );
   const pathItem = agentDocument.paths[path];
+  const methods = Object.keys(pathItem).filter((key) =>
+    [
+      "get",
+      "put",
+      "post",
+      "delete",
+      "patch",
+      "options",
+      "head",
+      "trace",
+    ].includes(key),
+  );
   assertSameMembers(
-    Object.keys(pathItem).filter((key) =>
-      [
-        "get",
-        "put",
-        "post",
-        "delete",
-        "patch",
-        "options",
-        "head",
-        "trace",
-      ].includes(key),
-    ),
+    methods,
     ["post"],
     `Agent action must be POST-only: ${path}`,
   );
@@ -1922,6 +2325,18 @@ for (const [path, operationId] of Object.entries(expectedAgentOperations)) {
   assert(
     typeof operation["x-neoengram-body-security"] === "string",
     `Agent action omits its body security scheme: ${path}`,
+  );
+  const registryRoute = actionRegistry.agent_actions.find(
+    (route) => route.path === path,
+  );
+  assert(
+    registryRoute.method.toLowerCase() === methods[0],
+    `Agent registry method changed: ${path}`,
+  );
+  assert(
+    (path === "/agent/session/channel/open") ===
+      (registryRoute.transport === "http2-ndjson"),
+    `Agent action has wrong registry transport: ${path}`,
   );
   assert(
     operation.parameters === undefined && pathItem.parameters === undefined,
@@ -1952,23 +2367,6 @@ assert(
     "application/x-ndjson"
   ] && channelOperation.responses["200"].content["application/x-ndjson"],
   "Agent control channel must stream NDJSON in both directions",
-);
-
-const compatibilityPoll =
-  agentDocument.paths["/agent/session/message/list/query"].post;
-assert(
-  compatibilityPoll["x-neoengram-compatibility-only"] === true,
-  "Agent message-list poll must remain compatibility-only",
-);
-assertDescriptionIncludes(
-  compatibilityPoll,
-  [
-    "Compatibility",
-    "manual-recovery",
-    "primary Agent runtime",
-    "HTTP/2 full-duplex",
-  ],
-  "Agent message-list poll could be mistaken for the primary control transport",
 );
 
 const agentDecimalU64 = resolveAgentRef(
@@ -2023,7 +2421,7 @@ for (const [schema, encodedLength, name] of [
 
 const heartbeatPayload =
   agentDocument.components.schemas.AgentHeartbeatReportPayload;
-const heartbeat = resolveAgentRef(heartbeatPayload.properties.heartbeat);
+const heartbeat = resolveAgentSchema(heartbeatPayload.properties.heartbeat);
 assert(
   heartbeat.type === "object" &&
     heartbeat.required.includes("agent_id") &&
@@ -2032,7 +2430,7 @@ assert(
     heartbeat.properties.sequence,
   "Agent heartbeat must resolve to the concrete Rust DTO",
 );
-const mountReport = resolveAgentRef(heartbeatPayload.properties.mount_report);
+const mountReport = resolveAgentSchema(heartbeatPayload.properties.mount_report);
 for (const field of ["installation_id", "boot_id", "session_generation"]) {
   assert(
     mountReport.required.includes(field) && mountReport.properties[field],
@@ -2042,28 +2440,31 @@ for (const field of ["installation_id", "boot_id", "session_generation"]) {
 
 const jobReportPayload =
   agentDocument.components.schemas.AgentJobReportCreatePayload;
-const controlEnvelope = resolveAgentRef(jobReportPayload.properties.report);
+const controlEnvelope = resolveAgentSchema(jobReportPayload.properties.report);
 assert(
-  controlEnvelope.title === "ControlEnvelope" &&
+  controlEnvelope.title === "Envelope" &&
     controlEnvelope.type === "object" &&
-    Array.isArray(controlEnvelope.oneOf) &&
-    controlEnvelope.oneOf.length > 0,
-  "Agent job report must resolve to the concrete ControlEnvelope union",
+    controlEnvelope.properties?.action &&
+    controlEnvelope.properties?.body,
+  "Agent job report must resolve to the strict action Envelope",
 );
 for (const field of [
-  "protocol_version",
-  "message_id",
+  "wire_version",
+  "action",
+  "request_id",
+  "trace_id",
   "session_generation",
-  "sent_at_unix_ms",
+  "deadline",
+  "body",
 ]) {
   assert(
     controlEnvelope.required.includes(field) &&
       controlEnvelope.properties[field],
-    `ControlEnvelope report omits concrete Rust field ${field}`,
+    `Envelope report omits concrete Rust field ${field}`,
   );
 }
 
-const channelAssignment = resolveAgentRef(
+const channelAssignment = resolveAgentSchema(
   agentDocument.components.schemas.AgentChannelJobAssignment,
 );
 assertSameMembers(
@@ -2088,7 +2489,7 @@ for (const branch of assignmentOperation.oneOf) {
   );
 }
 
-const channelDecision = resolveAgentRef(
+const channelDecision = resolveAgentSchema(
   agentDocument.components.schemas.AgentChannelJobDecision,
 );
 assert(

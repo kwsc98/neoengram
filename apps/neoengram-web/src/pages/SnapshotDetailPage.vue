@@ -1,29 +1,66 @@
 <script setup lang="ts">
-import { Back, CircleCheck, Lock, RefreshRight, WarningFilled } from '@element-plus/icons-vue';
-import { useQuery } from '@tanstack/vue-query';
-import { computed } from 'vue';
+import {
+  Back,
+  CircleCheck,
+  Delete,
+  FolderOpened,
+  Lock,
+  Plus,
+  RefreshRight,
+  WarningFilled,
+} from '@element-plus/icons-vue';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
+import { ElMessage, ElMessageBox } from 'element-plus';
+import { computed, ref, watchEffect } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { querySnapshot } from '@/api/operations';
+import {
+  createSnapshotDelivery,
+  deleteSnapshotDelivery,
+  queryApiVersion,
+  querySnapshot,
+  querySnapshotDeliveryList,
+  queryStorageVolume,
+  retrySnapshotDelivery,
+} from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import {
+  supportsS3ReadonlyAccessPoint,
+  supportsSnapshotDelivery,
+  supportsSnapshotDeliveryMode,
+} from '@/features/capabilities';
+import {
   snapshotIntegrityLabel,
   snapshotIntegrityTagType,
-  snapshotPhaseLabel,
   snapshotPollInterval,
   snapshotStateLabel,
   snapshotStateTagType,
 } from '@/features/snapshots/status';
+import { useTenantsStore } from '@/stores/tenants';
 import { commitTagNames } from '@/utils/commit';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
 const route = useRoute();
 const router = useRouter();
+const queryClient = useQueryClient();
+const tenants = useTenantsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
 const projectId = computed(() => String(route.params.projectId ?? ''));
 const artifactId = computed(() => String(route.params.artifactId ?? ''));
 const snapshotId = computed(() => String(route.params.snapshotId ?? ''));
+
+const versionQuery = useQuery({
+  queryKey: ['system', 'version'],
+  queryFn: queryApiVersion,
+  staleTime: Number.POSITIVE_INFINITY,
+});
+const s3ReadonlyEnabled = computed(() =>
+  Boolean(
+    supportsS3ReadonlyAccessPoint(versionQuery.data.value?.data.capabilities) &&
+    tenants.byId(tenantId.value)?.permissions.includes('s3.access.read'),
+  ),
+);
 
 const snapshotQuery = useQuery({
   queryKey: computed(() => ['snapshot', tenantId.value, snapshotId.value]),
@@ -39,12 +76,216 @@ const snapshotQuery = useQuery({
 });
 const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
 const tags = computed(() => commitTagNames(snapshot.value?.tag_names ?? []));
+const selectedDeliveryMode = ref<'fuse' | 'copy' | 'hardlink'>('fuse');
+const deliveryCapabilityEnabled = computed(() =>
+  supportsSnapshotDelivery(versionQuery.data.value?.data.capabilities),
+);
+const volumeQuery = useQuery({
+  queryKey: computed(() => ['storage-volume', tenantId.value, snapshot.value?.storage_volume_id]),
+  queryFn: () => queryStorageVolume(tenantId.value, snapshot.value!.storage_volume_id),
+  enabled: computed(() =>
+    Boolean(snapshot.value?.storage_volume_id && deliveryCapabilityEnabled.value),
+  ),
+  staleTime: 30_000,
+});
+const storageVolume = computed(() => volumeQuery.data.value?.data.storage_volume);
+const deliveryModeAvailability = computed(() => {
+  const capabilities = versionQuery.data.value?.data.capabilities;
+  const volume = storageVolume.value;
+  const layout = snapshot.value?.data_layout;
+  return {
+    fuse:
+      supportsSnapshotDeliveryMode(capabilities, 'fuse') &&
+      Boolean(volume?.allowed_delivery_modes.includes('fuse')),
+    copy:
+      supportsSnapshotDeliveryMode(capabilities, 'copy') &&
+      Boolean(volume?.allowed_delivery_modes.includes('copy')),
+    hardlink:
+      supportsSnapshotDeliveryMode(capabilities, 'hardlink') &&
+      Boolean(volume?.allowed_delivery_modes.includes('hardlink')) &&
+      layout === 'whole_file' &&
+      volume?.hardlink_policy !== 'disabled',
+  };
+});
+const deliveryQuery = useQuery({
+  queryKey: computed(() => ['snapshot-deliveries', tenantId.value, snapshotId.value]),
+  queryFn: () =>
+    querySnapshotDeliveryList({
+      tenant_id: tenantId.value,
+      snapshot_id: snapshotId.value,
+      page_size: 100,
+    }),
+  enabled: computed(() =>
+    Boolean(snapshot.value?.state === 'ready' && deliveryCapabilityEnabled.value),
+  ),
+});
+const deliveryMutation = useMutation({
+  mutationFn: createSnapshotDelivery,
+  onSuccess: async () => {
+    await queryClient.invalidateQueries({
+      queryKey: ['snapshot-deliveries', tenantId.value, snapshotId.value],
+    });
+    ElMessage.success('只读交付已创建');
+  },
+});
+const deleteDeliveryMutation = useMutation({
+  mutationFn: deleteSnapshotDelivery,
+  onSuccess: async () => {
+    await queryClient.invalidateQueries({
+      queryKey: ['snapshot-deliveries', tenantId.value, snapshotId.value],
+    });
+    ElMessage.success('只读交付已删除');
+  },
+});
+const retryDeliveryMutation = useMutation({
+  mutationFn: retrySnapshotDelivery,
+  onSuccess: async () => {
+    await queryClient.invalidateQueries({
+      queryKey: ['snapshot-deliveries', tenantId.value, snapshotId.value],
+    });
+    ElMessage.success('只读交付已重新提交');
+  },
+});
+const deliveries = computed(() => deliveryQuery.data.value?.data.items ?? []);
+
+const copyRequiredBytes = computed(() => {
+  try {
+    const size = BigInt(snapshot.value?.logical_size_bytes ?? '0');
+    const reserve = BigInt(storageVolume.value?.copy_reserve_bytes ?? '0');
+    return (size + reserve).toString();
+  } catch {
+    return undefined;
+  }
+});
+
+const deliveryModeOptions = computed(() => [
+  {
+    label: 'FUSE',
+    value: 'fuse',
+    disabled: !deliveryModeAvailability.value.fuse,
+  },
+  {
+    label: '全部复制',
+    value: 'copy',
+    disabled: !deliveryModeAvailability.value.copy,
+  },
+  {
+    label: '硬链接',
+    value: 'hardlink',
+    disabled: !deliveryModeAvailability.value.hardlink,
+  },
+]);
+
+watchEffect(() => {
+  if (!storageVolume.value || deliveryModeAvailability.value[selectedDeliveryMode.value]) return;
+  const firstAvailable = (['fuse', 'copy', 'hardlink'] as const).find(
+    (mode) => deliveryModeAvailability.value[mode],
+  );
+  if (firstAvailable) selectedDeliveryMode.value = firstAvailable;
+});
+
+function deliveryModeReason(mode: 'fuse' | 'copy' | 'hardlink'): string | undefined {
+  const capabilities = versionQuery.data.value?.data.capabilities;
+  if (!supportsSnapshotDeliveryMode(capabilities, mode)) {
+    return 'Central 未声明该交付能力';
+  }
+  const volume = storageVolume.value;
+  if (!volume) return '正在读取 StorageVolume 策略';
+  if (!volume.allowed_delivery_modes.includes(mode)) return 'StorageVolume 策略未允许该模式';
+  if (mode === 'hardlink' && snapshot.value?.data_layout !== 'whole_file') {
+    return '硬链接要求 WholeFile Commit，系统不会自动转换布局';
+  }
+  if (mode === 'hardlink' && volume.hardlink_policy === 'disabled') {
+    return 'StorageVolume 未配置 sealed ACL 或 trusted-local 策略';
+  }
+  return undefined;
+}
+
+function deliveryModeLabel(mode: 'fuse' | 'copy' | 'hardlink'): string {
+  return { fuse: 'FUSE', copy: '全部复制', hardlink: '硬链接' }[mode];
+}
+
+function operationRequestId(prefix: string): string {
+  const random = globalThis.crypto?.randomUUID?.();
+  return `${prefix}-${random ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+}
+
+function deliveryStateLabel(state: string): string {
+  return (
+    {
+      requested: '等待调度',
+      validating: '校验中',
+      materializing: '物化中',
+      ready: '就绪',
+      failed: '失败',
+      deleting: '删除中',
+      deleted: '已删除',
+    }[state] ?? state
+  );
+}
+
+async function createDelivery(): Promise<void> {
+  if (
+    snapshot.value?.state !== 'ready' ||
+    deliveryMutation.isPending.value ||
+    !deliveryModeAvailability.value[selectedDeliveryMode.value]
+  )
+    return;
+  const requestId = operationRequestId(
+    `delivery-${snapshotId.value}-${selectedDeliveryMode.value}`,
+  );
+  await deliveryMutation.mutateAsync({
+    tenant_id: tenantId.value,
+    snapshot_id: snapshotId.value,
+    mode: selectedDeliveryMode.value,
+    request_id: requestId,
+  });
+}
+
+async function retryDelivery(deliveryId: string): Promise<void> {
+  if (retryDeliveryMutation.isPending.value) return;
+  await retryDeliveryMutation.mutateAsync({
+    tenant_id: tenantId.value,
+    delivery_id: deliveryId,
+    request_id: operationRequestId(`retry-${deliveryId}`),
+  });
+}
+
+async function deleteDelivery(deliveryId: string): Promise<void> {
+  try {
+    await ElMessageBox.confirm('删除后只读视图将立即不可用。确认继续？', '删除只读交付', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    });
+    await deleteDeliveryMutation.mutateAsync({
+      tenant_id: tenantId.value,
+      delivery_id: deliveryId,
+      request_id: operationRequestId(`delete-${deliveryId}`),
+    });
+  } catch {
+    // User cancellation is intentionally silent.
+  }
+}
 
 async function backToArtifact(): Promise<void> {
   await router.push({
     name: 'artifact-detail',
     params: { tenantId: tenantId.value, projectId: projectId.value, artifactId: artifactId.value },
     query: { tab: 'snapshots' },
+  });
+}
+
+async function openObjectStorage(): Promise<void> {
+  if (snapshot.value?.state !== 'ready') return;
+  await router.push({
+    name: 'object-storage-list',
+    params: { tenantId: tenantId.value },
+    query: {
+      snapshotId: snapshotId.value,
+      projectId: projectId.value,
+      artifactId: artifactId.value,
+    },
   });
 }
 </script>
@@ -57,6 +298,12 @@ async function backToArtifact(): Promise<void> {
     >
       <template #actions>
         <el-button :icon="Back" @click="backToArtifact">返回 Artifact</el-button>
+        <el-button
+          v-if="snapshot?.state === 'ready' && s3ReadonlyEnabled"
+          :icon="FolderOpened"
+          @click="openObjectStorage"
+          >对象存储</el-button
+        >
         <el-button
           :icon="RefreshRight"
           :loading="snapshotQuery.isFetching.value"
@@ -83,10 +330,10 @@ async function backToArtifact(): Promise<void> {
         </span>
         <div>
           <small>{{ snapshotStateLabel(snapshot.state) }}</small>
-          <h2>{{ snapshotPhaseLabel(snapshot.phase) }}</h2>
-          <p v-if="snapshot.state === 'creating'">目标 Volume 正在建立只读 FUSE 视图。</p>
-          <p v-else-if="snapshot.state === 'ready'">固定 Commit 已通过只读 FUSE 视图交付。</p>
-          <p v-else>只读视图未能完成交付，请检查 Volume 状态。</p>
+          <h2>只读 Snapshot</h2>
+          <p v-if="snapshot.state === 'creating'">正在冻结 Commit 与 StorageVolume 绑定。</p>
+          <p v-else-if="snapshot.state === 'ready'">Snapshot 已固定，可按需创建独立只读交付。</p>
+          <p v-else>Snapshot 当前不可用于创建只读交付。</p>
         </div>
         <el-tag :type="snapshotStateTagType(snapshot.state)" effect="plain">
           {{ snapshotStateLabel(snapshot.state) }}
@@ -104,8 +351,8 @@ async function backToArtifact(): Promise<void> {
       <section class="content-section snapshot-detail-section">
         <header class="section-heading">
           <div>
-            <span>READ-ONLY PLACEMENT</span>
-            <h2>FUSE 挂载</h2>
+            <span>IMMUTABLE SNAPSHOT</span>
+            <h2>固定数据版本</h2>
           </div>
           <Lock />
         </header>
@@ -171,7 +418,139 @@ async function backToArtifact(): Promise<void> {
               <span v-if="tags.length === 0">暂无 Tag</span>
             </dd>
           </div>
+          <div>
+            <dt>Commit 数据布局</dt>
+            <dd>
+              <el-tag effect="plain">{{
+                snapshot.data_layout === 'whole_file' ? 'WholeFile' : 'FastCDC'
+              }}</el-tag>
+            </dd>
+          </div>
         </dl>
+      </section>
+
+      <section v-if="deliveryCapabilityEnabled" class="content-section delivery-section">
+        <header class="section-heading delivery-section__header">
+          <div>
+            <span>SNAPSHOT DELIVERY</span>
+            <h2>只读交付</h2>
+          </div>
+          <Lock />
+        </header>
+        <ApiProblemAlert
+          v-if="volumeQuery.error.value"
+          :error="volumeQuery.error.value"
+          :retrying="volumeQuery.isFetching.value"
+          @retry="volumeQuery.refetch"
+        />
+        <div class="delivery-toolbar">
+          <el-segmented v-model="selectedDeliveryMode" :options="deliveryModeOptions" />
+          <el-button
+            type="primary"
+            :icon="Plus"
+            :loading="deliveryMutation.isPending.value"
+            :disabled="
+              volumeQuery.isPending.value || !deliveryModeAvailability[selectedDeliveryMode]
+            "
+            @click="createDelivery"
+            >创建交付</el-button
+          >
+        </div>
+        <div class="delivery-mode-status" aria-label="交付模式可用性">
+          <div v-for="mode in ['fuse', 'copy', 'hardlink'] as const" :key="mode">
+            <strong>{{ deliveryModeLabel(mode) }}</strong>
+            <el-tag
+              :type="deliveryModeAvailability[mode] ? 'success' : 'info'"
+              size="small"
+              effect="plain"
+            >
+              {{ deliveryModeAvailability[mode] ? '可用' : '不可用' }}
+            </el-tag>
+            <span v-if="deliveryModeReason(mode)">{{ deliveryModeReason(mode) }}</span>
+          </div>
+        </div>
+        <el-alert
+          v-if="deliveryModeReason(selectedDeliveryMode)"
+          :title="`${deliveryModeLabel(selectedDeliveryMode)} 当前不可用`"
+          :description="deliveryModeReason(selectedDeliveryMode)"
+          type="warning"
+          :closable="false"
+        />
+        <div v-else class="delivery-policy-summary">
+          <span v-if="selectedDeliveryMode === 'copy'">
+            预计需要
+            {{ copyRequiredBytes === undefined ? '未知' : formatBytes(copyRequiredBytes) }}
+            可用空间（含 {{ formatBytes(storageVolume?.copy_reserve_bytes ?? '0') }} 预留）。
+          </span>
+          <span v-else-if="selectedDeliveryMode === 'hardlink'">
+            Volume 策略：{{ storageVolume?.hardlink_policy }}；创建时仍会校验文件系统、inode、BLAKE3
+            与对象封存状态。
+          </span>
+          <span v-else>FUSE 可用性将在创建时由运行环境做最终校验。</span>
+        </div>
+        <ApiProblemAlert
+          v-if="deliveryMutation.error.value"
+          :error="deliveryMutation.error.value"
+        />
+        <ApiProblemAlert
+          v-if="retryDeliveryMutation.error.value"
+          :error="retryDeliveryMutation.error.value"
+        />
+        <ApiProblemAlert
+          v-if="deleteDeliveryMutation.error.value"
+          :error="deleteDeliveryMutation.error.value"
+        />
+        <ApiProblemAlert
+          v-if="deliveryQuery.error.value"
+          :error="deliveryQuery.error.value"
+          :retrying="deliveryQuery.isFetching.value"
+          @retry="deliveryQuery.refetch"
+        />
+        <el-skeleton v-if="deliveryQuery.isPending.value" :rows="3" animated />
+        <el-empty v-else-if="deliveries.length === 0" description="尚未创建只读交付" />
+        <el-table v-else :data="deliveries" size="small" row-key="delivery_id">
+          <el-table-column label="模式" min-width="120">
+            <template #default="scope">{{ deliveryModeLabel(scope.row.mode) }}</template>
+          </el-table-column>
+          <el-table-column label="状态" min-width="110">
+            <template #default="scope">{{ deliveryStateLabel(scope.row.state) }}</template>
+          </el-table-column>
+          <el-table-column prop="target_relative_root" label="目标目录" min-width="260" />
+          <el-table-column prop="file_count" label="文件" width="90" />
+          <el-table-column label="大小" width="110">
+            <template #default="scope">{{ formatBytes(scope.row.size_bytes) }}</template>
+          </el-table-column>
+          <el-table-column label="状态详情" min-width="200">
+            <template #default="scope">
+              <span v-if="scope.row.issue" class="delivery-issue">
+                {{ scope.row.issue.message }}
+                <code>{{ scope.row.issue.code }}</code>
+              </span>
+              <span v-else>--</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="150" fixed="right">
+            <template #default="scope">
+              <el-button
+                v-if="scope.row.state === 'failed' && scope.row.issue?.retryable"
+                text
+                type="primary"
+                :icon="RefreshRight"
+                :loading="retryDeliveryMutation.isPending.value"
+                @click="retryDelivery(scope.row.delivery_id)"
+                >重试</el-button
+              >
+              <el-button
+                text
+                type="danger"
+                :icon="Delete"
+                title="删除只读交付"
+                :disabled="scope.row.state === 'deleted' || deleteDeliveryMutation.isPending.value"
+                @click="deleteDelivery(scope.row.delivery_id)"
+              />
+            </template>
+          </el-table-column>
+        </el-table>
       </section>
     </template>
   </div>
@@ -190,6 +569,76 @@ async function backToArtifact(): Promise<void> {
   padding: 18px;
   border: 1px solid var(--border);
   background: #fff;
+}
+
+.delivery-section {
+  margin-top: 18px;
+}
+
+.delivery-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.delivery-policy-summary {
+  min-height: 20px;
+  margin: 10px 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.delivery-mode-status {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin-bottom: 12px;
+  background: var(--border);
+  border: 1px solid var(--border);
+}
+
+.delivery-mode-status > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px;
+  background: #fff;
+}
+
+.delivery-mode-status span {
+  grid-column: 1 / -1;
+  min-height: 17px;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.delivery-issue {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  color: #b5473c;
+  overflow-wrap: anywhere;
+}
+
+.delivery-issue code {
+  color: inherit;
+  font-size: 10px;
+}
+
+@media (max-width: 700px) {
+  .delivery-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .delivery-mode-status {
+    grid-template-columns: 1fr;
+  }
 }
 
 .snapshot-state-band h2 {

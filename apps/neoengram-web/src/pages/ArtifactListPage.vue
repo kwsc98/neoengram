@@ -13,10 +13,16 @@ import {
 } from '@/api/operations';
 import type { ArtifactInitializationMode } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
+import ResourceDeletionDialog from '@/components/ResourceDeletionDialog.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
-import { supportsResourceBrowser } from '@/features/capabilities';
+import {
+  supportsArtifactCatalog,
+  supportsArtifactCommitGraph,
+  supportsResourceLifecycle,
+} from '@/features/capabilities';
+import { lifecycleResourceVersion } from '@/features/lifecycle';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
 
@@ -50,15 +56,24 @@ const versionQuery = useQuery({
   queryFn: queryApiVersion,
   staleTime: Number.POSITIVE_INFINITY,
 });
-const resourceBrowserEnabled = computed(() =>
-  supportsResourceBrowser(versionQuery.data.value?.data.capabilities),
+const artifactCatalogEnabled = computed(() =>
+  supportsArtifactCatalog(versionQuery.data.value?.data.capabilities),
+);
+const artifactCommitGraphEnabled = computed(() =>
+  supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
+);
+const lifecycleEnabled = computed(
+  () =>
+    supportsResourceLifecycle(versionQuery.data.value?.data.capabilities) &&
+    (tenants.byId(tenantId.value)?.permissions.includes('resource.lifecycle.manage' as never) ??
+      false),
 );
 const sourceArtifactsQuery = useQuery({
   queryKey: computed(() => ['artifacts', tenantId.value, 'artifact-source-options']),
   queryFn: () => queryArtifactList({ tenant_id: tenantId.value, page_size: 100 }),
   enabled: computed(
     () =>
-      resourceBrowserEnabled.value &&
+      artifactCatalogEnabled.value &&
       createOpen.value &&
       createForm.initializationMode === 'derived',
   ),
@@ -90,7 +105,7 @@ const sourceCommitQuery = useQuery({
   enabled: computed(
     () =>
       createOpen.value &&
-      resourceBrowserEnabled.value &&
+      artifactCommitGraphEnabled.value &&
       createForm.initializationMode === 'derived' &&
       Boolean(selectedSourceArtifact.value),
   ),
@@ -235,7 +250,7 @@ async function submitCreate(): Promise<void> {
     </PageHeading>
 
     <form class="resource-toolbar" @submit.prevent="applyFilters">
-      <ProjectFilter v-if="resourceBrowserEnabled" v-model="projectId" :tenant-id="tenantId" />
+      <ProjectFilter v-if="artifactCatalogEnabled" v-model="projectId" :tenant-id="tenantId" />
       <el-input
         v-else
         v-model="projectId"
@@ -283,24 +298,40 @@ async function submitCreate(): Promise<void> {
           <el-table-column label="更新时间" min-width="160">
             <template #default="scope">{{ formatTime(scope.row.updated_at_unix_ms) }}</template>
           </el-table-column>
-          <el-table-column width="54" align="right">
+          <el-table-column :width="lifecycleEnabled ? 96 : 54" align="right">
             <template #default="scope">
-              <el-button
-                text
-                :icon="ArrowRight"
-                title="查看 Artifact"
-                @click="openArtifact(scope.row.project_id, scope.row.artifact_id)"
-              />
+              <div class="row-actions">
+                <ResourceDeletionDialog
+                  v-if="lifecycleEnabled"
+                  :tenant-id="tenantId"
+                  :resource="{
+                    type: 'artifact',
+                    project_id: scope.row.project_id,
+                    artifact_id: scope.row.artifact_id,
+                  }"
+                  :resource-version="lifecycleResourceVersion(scope.row)"
+                  :display-name="scope.row.display_name"
+                />
+                <el-button
+                  text
+                  :icon="ArrowRight"
+                  title="查看 Artifact"
+                  @click="openArtifact(scope.row.project_id, scope.row.artifact_id)"
+                />
+              </div>
             </template>
           </el-table-column>
         </el-table>
         <div class="mobile-resource-list">
-          <button
+          <div
             v-for="artifact in artifactsQuery.data.value?.data.items"
             :key="`${artifact.project_id}/${artifact.artifact_id}`"
-            type="button"
             class="mobile-resource-item"
+            role="button"
+            tabindex="0"
             @click="openArtifact(artifact.project_id, artifact.artifact_id)"
+            @keydown.enter="openArtifact(artifact.project_id, artifact.artifact_id)"
+            @keydown.space.prevent="openArtifact(artifact.project_id, artifact.artifact_id)"
           >
             <span
               ><strong>{{ artifact.display_name }}</strong
@@ -308,9 +339,19 @@ async function submitCreate(): Promise<void> {
             >
             <span
               ><small>{{ artifact.project_id }}</small
+              ><ResourceDeletionDialog
+                v-if="lifecycleEnabled"
+                :tenant-id="tenantId"
+                :resource="{
+                  type: 'artifact',
+                  project_id: artifact.project_id,
+                  artifact_id: artifact.artifact_id,
+                }"
+                :resource-version="lifecycleResourceVersion(artifact)"
+                :display-name="artifact.display_name" />
               ><ArrowRight
             /></span>
-          </button>
+          </div>
         </div>
         <PageCursor
           :has-previous="cursorHistory.length > 0"
@@ -328,7 +369,7 @@ async function submitCreate(): Promise<void> {
       <el-form label-position="top" class="dialog-form">
         <el-form-item label="Project">
           <ProjectFilter
-            v-if="resourceBrowserEnabled"
+            v-if="artifactCatalogEnabled"
             v-model="createForm.projectId"
             :tenant-id="tenantId"
           />
@@ -343,7 +384,7 @@ async function submitCreate(): Promise<void> {
         <el-form-item label="描述">
           <el-input v-model="createForm.description" type="textarea" :rows="3" />
         </el-form-item>
-        <el-form-item v-if="resourceBrowserEnabled" label="初始化方式">
+        <el-form-item v-if="artifactCommitGraphEnabled" label="初始化方式">
           <el-segmented
             v-model="createForm.initializationMode"
             :options="[
@@ -352,7 +393,7 @@ async function submitCreate(): Promise<void> {
             ]"
           />
         </el-form-item>
-        <template v-if="resourceBrowserEnabled && createForm.initializationMode === 'derived'">
+        <template v-if="artifactCommitGraphEnabled && createForm.initializationMode === 'derived'">
           <el-form-item label="来源 Artifact">
             <el-select
               v-model="createForm.sourceArtifactKey"

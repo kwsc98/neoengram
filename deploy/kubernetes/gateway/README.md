@@ -8,9 +8,10 @@
 
 The production PKI prerequisite is the offline Root CA plus a KMS/HSM-backed online Intermediate
 exposed through `WorkloadCertificateIssuer`; neither is supplied by this directory. G1 cutover also
-requires the complete two-replica business E2E and real-cluster failover evidence. Cross-cluster payload
-transfer and read-only S3 are later G2/G3 milestones; Gateway S3 is an access protocol, not a Central
-durability backend. See [`docs/synapse-gateway-architecture.md`](../../../docs/synapse-gateway-architecture.md).
+requires the complete two-replica business E2E and real-cluster failover evidence. The public
+listener in this example exposes the console and read-only S3 access protocol; it does not make
+Gateway or Central a durability backend. See
+[`docs/synapse-gateway-architecture.md`](../../../docs/synapse-gateway-architecture.md).
 
 This directory models one EdgeCluster GatewayPool with two independently managed replicas. It
 uses two explicit `Deployment` documents (`gateway-pool-example-r0` and `gateway-pool-example-r1`)
@@ -28,8 +29,12 @@ Central must persist these per-replica Service origins as the Registry `bootstra
 `synapse-gateway` Service on port `8443` is the Agent Pool entry point; it is not an authority for
 Replica identity and must not be used as a Central Replica endpoint.
 
+The same Pool Service exposes port `443` for a TLS-aware ingress controller to forward
+`console.example.test`, `s3.example.test`, and `*.s3.example.test`. It remains `ClusterIP`; this
+base does not create an Internet-facing load balancer or admit arbitrary source CIDRs.
+
 Register each Replica with `software_version` equal to the deployed `synapse-gateway` package
-version, `supported_protocol_versions: [1]`, and the exact capability set
+version, `wire_version: 1`, and the exact capability set
 `["agent-control-v1", "peer-forward-v1", "route-lease-v1"]`. Central compares the persisted
 values with every Replica hello and fails the connection closed on any mismatch.
 
@@ -52,9 +57,13 @@ this example must:
    only the activation endpoint; it is not proof of an activated workload identity. Put the key, certificate
    and workload CA bundle in the matching identity Secret. The key file must be mode `0440` or stricter after
    projection.
-3. Render the two Secret manifests with real values, keep them in an external secret manager, and
+3. Render the two per-Replica identity/activation Secret manifests with real values, keep them in
+   an external secret manager, and
    apply them before the matching Deployment. The checked-in `REPLACE_WITH_*` values intentionally
    fail closed in the Gateway process.
+   Independently render `public-tls-secret.example.yaml` with a browser-trusted certificate whose
+   SANs cover the console host, S3 host, and wildcard S3 bucket host. Never reuse a Replica workload
+   private key for this Pool-wide public certificate.
 4. Start the Pod and let Central perform challenge/proof, certificate issuance and delivery. The issuer must
    return a GatewayReplica leaf with `clientAuth` and `serverAuth` EKUs, the sole Replica URI SAN shown above,
    and the complete DNS/IP SAN set extracted from the Pool Agent endpoint, optional S3 endpoint, and this
@@ -80,14 +89,39 @@ not durable identities for a Deployment. To add replicas, copy both Deployment/S
 documents, choose a new immutable `GatewayReplicaId`, and register all three endpoint origins in
 Central before changing the Pool state. Do not simply increase `replicas` on either Deployment.
 
+## Public Web/S3 boundary
+
+`SYNAPSE_GATEWAY_PUBLIC_LISTEN` is `0.0.0.0:8080`. The public TLS certificate and key are mounted
+from the separate `synapse-gateway-public-tls-gateway-pool-example` Secret at
+`/var/run/secrets/synapse-gateway/public`; the workload listener Secret is not used for browser
+traffic. `SYNAPSE_GATEWAY_WEB_ROOT` must point at the immutable web assets included by the Gateway
+image (the example uses `/opt/neoengram/web`). The provisioner must set the console/S3 hostnames and
+the private HTTPS `SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM` origin consistently with the DNS SAN on
+the private mTLS terminator's certificate. The Central Fusen process itself currently listens over
+plain HTTP, so this HTTPS origin must be a private sidecar, reverse proxy, or service-mesh endpoint;
+it must verify the Gateway workload identity before forwarding to Central. Both the `/api` proxy and
+private S3 authorization call present the Gateway workload certificate and verify the terminator
+against the configured workload CA. The unauthenticated internal application route
+`POST /internal/s3/authorize` must never be reachable around this boundary.
+
+The NetworkPolicy allows public ingress only from Pods carrying both
+`neoengram.io/public-ingress: "true"` on their namespace and
+`neoengram.io/gateway-public-ingress: "true"` on the Pod, and only on port `8080`. It allows
+Gateway egress to Central only from a namespace labelled `neoengram.io/control-plane: "true"`
+and Pods labelled `app.kubernetes.io/name: neoengram-central`, on port `8080`; DNS and the existing
+peer rules remain separately constrained. For a cross-cluster ingress or Central, render a specific
+`ipBlock` in an overlay instead of widening this example to `0.0.0.0/0`. The Central private S3
+authorization route must remain behind the workload-authenticated ingress boundary.
+
 ## Applying a rendered example
 
-1. Render a namespace and labels for the Central control plane, Agent namespace, and any peer
-   Gateway namespaces. Add cluster-specific `ipBlock` rules to `networkpolicy.yaml` when Central or
-   a peer Gateway is outside this Kubernetes cluster.
-2. Replace the image digest, Pool/Cluster IDs, certificate SANs, trust domain, and all
-   `REPLACE_WITH_*` values in the Secret files using the provisioner. Keep private keys and tokens
-   out of Git and out of ConfigMaps.
+1. Render a namespace and labels for the Central control plane, Agent namespace, the public ingress
+   controller, and any peer Gateway namespaces. Add cluster-specific `ipBlock` rules to
+   `networkpolicy.yaml` when Central, the ingress controller, or a peer Gateway is outside this
+   Kubernetes cluster.
+2. Replace the image digest, Pool/Cluster IDs, certificate SANs, trust domain, public hostnames,
+   Central Service origin, and all `REPLACE_WITH_*` values in the Secret files using the
+   provisioner. Keep private keys and tokens out of Git and out of ConfigMaps.
 3. Run `bash check-manifests.sh`. It validates both fixed Replica documents, unique Secret refs,
    service endpoint selectors, TLS/bootstrap paths, security settings, and the no-business-Volume
    invariant, and renders `kustomization.yaml` when `kubectl` is available. It intentionally
@@ -119,6 +153,7 @@ unable to resume safely and requires an explicit revoke/re-provision recovery pa
 deliberate production blocker, not a durability guarantee supplied by these example manifests.
 
 Health probes use HTTPS because non-loopback listeners fail closed without a TLS identity. The
+public TLS Secret is mounted read-only at `/var/run/secrets/synapse-gateway/public`; the workload
 listener Secret is mounted read-only at `/var/run/secrets/synapse-gateway/listener`; the activation
 Secret is mounted read-only at `/var/run/secrets/synapse-gateway/bootstrap`; and the temporary
 certificate delivery path is `/var/run/secrets/synapse-gateway/workload` during activation. These last two

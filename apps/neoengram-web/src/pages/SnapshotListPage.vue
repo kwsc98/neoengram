@@ -4,26 +4,38 @@ import { useQuery } from '@tanstack/vue-query';
 import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { queryArtifactList, querySnapshotList } from '@/api/operations';
+import { queryApiVersion, queryArtifactList, querySnapshotList } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
+import ResourceDeletionDialog from '@/components/ResourceDeletionDialog.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import ProjectFilter from '@/components/ProjectFilter.vue';
-import {
-  snapshotPhaseLabel,
-  snapshotStateLabel,
-  snapshotStateTagType,
-} from '@/features/snapshots/status';
+import { supportsResourceLifecycle } from '@/features/capabilities';
+import { lifecycleResourceVersion } from '@/features/lifecycle';
+import { snapshotStateLabel, snapshotStateTagType } from '@/features/snapshots/status';
 import { commitTagNames } from '@/utils/commit';
+import { useTenantsStore } from '@/stores/tenants';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
 const route = useRoute();
 const router = useRouter();
+const tenants = useTenantsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
 const projectId = ref(String(route.query.project_id ?? ''));
 const artifactId = ref(String(route.query.artifact_id ?? ''));
 const cursor = ref<string>();
 const cursorHistory = ref<string[]>([]);
+const versionQuery = useQuery({
+  queryKey: ['system', 'version'],
+  queryFn: queryApiVersion,
+  staleTime: Number.POSITIVE_INFINITY,
+});
+const lifecycleEnabled = computed(
+  () =>
+    supportsResourceLifecycle(versionQuery.data.value?.data.capabilities) &&
+    (tenants.byId(tenantId.value)?.permissions.includes('resource.lifecycle.manage' as never) ??
+      false),
+);
 
 const artifactOptionsQuery = useQuery({
   queryKey: computed(() => ['artifacts', tenantId.value, projectId.value, 'snapshot-filter']),
@@ -175,7 +187,6 @@ async function openSnapshot(project: string, artifact: string, snapshotId: strin
                 <el-tag :type="snapshotStateTagType(scope.row.state)" effect="plain">
                   {{ snapshotStateLabel(scope.row.state) }}
                 </el-tag>
-                <small>{{ snapshotPhaseLabel(scope.row.phase) }}</small>
               </div>
             </template>
           </el-table-column>
@@ -211,26 +222,42 @@ async function openSnapshot(project: string, artifact: string, snapshotId: strin
           <el-table-column label="创建时间" min-width="160">
             <template #default="scope">{{ formatTime(scope.row.created_at_unix_ms) }}</template>
           </el-table-column>
-          <el-table-column width="54" align="right">
+          <el-table-column :width="lifecycleEnabled ? 96 : 54" align="right">
             <template #default="scope">
-              <el-button
-                text
-                :icon="ArrowRight"
-                title="查看 Snapshot"
-                @click="
-                  openSnapshot(scope.row.project_id, scope.row.artifact_id, scope.row.snapshot_id)
-                "
-              />
+              <div class="row-actions">
+                <ResourceDeletionDialog
+                  v-if="lifecycleEnabled"
+                  :tenant-id="tenantId"
+                  :resource="{ type: 'snapshot', snapshot_id: scope.row.snapshot_id }"
+                  :resource-version="lifecycleResourceVersion(scope.row)"
+                  :display-name="scope.row.message"
+                />
+                <el-button
+                  text
+                  :icon="ArrowRight"
+                  title="查看 Snapshot"
+                  @click="
+                    openSnapshot(scope.row.project_id, scope.row.artifact_id, scope.row.snapshot_id)
+                  "
+                />
+              </div>
             </template>
           </el-table-column>
         </el-table>
         <div class="mobile-resource-list">
-          <button
+          <div
             v-for="snapshot in snapshotQuery.data.value?.data.items"
             :key="snapshot.snapshot_id"
             class="mobile-resource-item"
-            type="button"
+            role="button"
+            tabindex="0"
             @click="openSnapshot(snapshot.project_id, snapshot.artifact_id, snapshot.snapshot_id)"
+            @keydown.enter="
+              openSnapshot(snapshot.project_id, snapshot.artifact_id, snapshot.snapshot_id)
+            "
+            @keydown.space.prevent="
+              openSnapshot(snapshot.project_id, snapshot.artifact_id, snapshot.snapshot_id)
+            "
           >
             <span
               ><strong>{{ snapshot.message }}</strong
@@ -244,9 +271,15 @@ async function openSnapshot(project: string, artifact: string, snapshotId: strin
               ><small>{{ snapshot.region }} · {{ formatBytes(snapshot.logical_size_bytes) }}</small
               ><el-tag :type="snapshotStateTagType(snapshot.state)" size="small" effect="plain">
                 {{ snapshotStateLabel(snapshot.state) }} </el-tag
+              ><ResourceDeletionDialog
+                v-if="lifecycleEnabled"
+                :tenant-id="tenantId"
+                :resource="{ type: 'snapshot', snapshot_id: snapshot.snapshot_id }"
+                :resource-version="lifecycleResourceVersion(snapshot)"
+                :display-name="snapshot.message" />
               ><ArrowRight
             /></span>
-          </button>
+          </div>
         </div>
         <PageCursor
           :has-previous="cursorHistory.length > 0"

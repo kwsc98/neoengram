@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Envelope",
+  "description": "Strict clean-slate action envelope.",
+  "type": "object",
+  "properties": {
+    "action": {
+      "description": "Stable action identifier, for example `artifact.create` or `agent.session.open`.",
+      "type": "string",
+      "enum": [
+        "agent.enrollment.bootstrap",
+        "agent.enrollment.status.query",
+        "agent.heartbeat",
+        "agent.hello",
+        "agent.job.assignment",
+        "agent.job.decision",
+        "agent.job.index.page.query",
+        "agent.job.manifest.page.query",
+        "agent.job.metadata.batch.stage",
+        "agent.job.metadata.page.stage",
+        "agent.job.report.create",
+        "agent.lifecycle.assignment",
+        "agent.protocol.error",
+        "agent.session.channel.open",
+        "agent.session.close",
+        "agent.session.heartbeat.report",
+        "agent.session.open",
+        "artifact.commit.diff.query",
+        "artifact.commit.graph.query",
+        "artifact.create",
+        "artifact.list.query",
+        "artifact.query",
+        "gateway.bootstrap.certificate",
+        "gateway.bootstrap.challenge",
+        "gateway.control.channel.open",
+        "gateway.peer.forward",
+        "gateway.pool.create",
+        "gateway.pool.drain",
+        "gateway.pool.list.query",
+        "gateway.pool.query",
+        "gateway.pool.update",
+        "gateway.replica.activate",
+        "gateway.replica.create",
+        "gateway.replica.drain",
+        "gateway.replica.list.query",
+        "gateway.replica.revoke",
+        "health.live",
+        "health.ready",
+        "internal.s3.authorize",
+        "internal.s3.read-channel",
+        "internal.s3.read-peer",
+        "job.add.create",
+        "job.add.finalize",
+        "job.query",
+        "playground.change.list.query",
+        "playground.commit.create",
+        "playground.create",
+        "playground.dataset.profile.query",
+        "playground.file.list.query",
+        "playground.file.metadata.query",
+        "playground.list.query",
+        "playground.precommit.cancel",
+        "playground.precommit.query",
+        "playground.precommit.restart",
+        "playground.precommit.start",
+        "playground.query",
+        "project.create",
+        "project.list.query",
+        "resource.deletion.create",
+        "resource.deletion.impact.query",
+        "resource.deletion.list.query",
+        "resource.deletion.query",
+        "resource.deletion.restore",
+        "resource.deletion.retry",
+        "resource.retention-hold.create",
+        "resource.retention-hold.release",
+        "s3.access-point.create",
+        "s3.access-point.disable",
+        "s3.access-point.enable",
+        "s3.access-point.list.query",
+        "s3.access-point.query",
+        "s3.credential.create",
+        "s3.credential.list.query",
+        "s3.credential.revoke",
+        "s3.object.download-url.create",
+        "s3.object.list.query",
+        "snapshot.activity.list.query",
+        "snapshot.create",
+        "snapshot.dataset.profile.query",
+        "snapshot.delivery.create",
+        "snapshot.delivery.delete",
+        "snapshot.delivery.list.query",
+        "snapshot.delivery.query",
+        "snapshot.delivery.retry",
+        "snapshot.file.list.query",
+        "snapshot.list.query",
+        "snapshot.query",
+        "storage.enrollment.approve",
+        "storage.enrollment.list.query",
+        "storage.enrollment.query",
+        "storage.enrollment.recovery.complete",
+        "storage.enrollment.reject",
+        "storage.enrollment.token.create",
+        "storage.volume.create",
+        "storage.volume.list.query",
+        "storage.volume.query",
+        "system.version.query",
+        "tenant.create",
+        "tenant.list.query",
+        "tenant.query"
+      ]
+    },
+    "actor": {
+      "description": "Actor is always present on the wire; `null` is used before an authenticated adapter binds\nan external principal.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ]
+    },
+    "body": true,
+    "deadline": {
+      "description": "Absolute Unix timestamp in milliseconds by which the action must complete.",
+      "$ref": "#/$defs/UnixMillis"
+    },
+    "request_id": {
+      "$ref": "#/$defs/RequestId"
+    },
+    "route_generation": {
+      "description": "Route generation is always present on the wire; `null` is used for actions without a\nGateway route fence.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "session_generation": {
+      "description": "Session generation is always present on the wire; `null` is used for pre-session actions.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "tenant_scope": {
+      "description": "Tenant scope is always present on the wire; `null` is used for actions that are not\ntenant-scoped.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "trace_id": {
+      "$ref": "#/$defs/TraceId"
+    },
+    "wire_version": {
+      "description": "Current wire contract version. Unsupported versions are rejected by [`Envelope::validate`].",
+      "$ref": "#/$defs/ProtocolVersion",
+      "const": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "wire_version",
+    "action",
+    "request_id",
+    "trace_id",
+    "tenant_scope",
+    "actor",
+    "session_generation",
+    "route_generation",
+    "deadline",
+    "body"
+  ],
+  "$defs": {
+    "PrincipalId": {
+      "description": "A validated principal ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "service",
+        "system"
+      ]
+    },
+    "ProtocolVersion": {
+      "description": "The only wire version accepted by the current NeoEngram protocol.",
+      "type": "integer",
+      "const": 1
+    },
+    "RequestId": {
+      "description": "A validated request ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TraceId": {
+      "description": "A validated trace ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "UnixMillis": {
+      "description": "A Unix millisecond timestamp encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    }
+  }
+}

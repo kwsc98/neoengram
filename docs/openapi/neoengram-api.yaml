@@ -6,12 +6,12 @@ info:
   version: 1.0.0
   summary: NeoEngram 用户、CLI 和 UI 使用的非 REST JSON API 契约
   description: |
-    这是 NeoEngram 中心服务的首版公开 API 设计契约。`neoengram-server` 已注册 System、Tenant、
-    StorageVolume、StorageEnrollment、Artifact、Playground、Snapshot、Managed Add Job 和 Gateway
-    Registry 的当前 action；其余 operation 仍是目标契约，不表示已经可以访问。Gateway Registry
+    这是 NeoEngram 中心服务的首版公开 API 设计契约。`neoengram-central` 已注册 System、Tenant、
+    StorageVolume、StorageEnrollment、Artifact、Playground、Snapshot、S3 Access Point、资源生命周期、
+    Managed Add Job 和 Gateway Registry 的当前 action；其余 operation 仍是目标契约，不表示已经可以访问。Gateway Registry
     当前管理 Pool/Replica 资源和显式 activation action；运行时 mTLS 与最多一跳 Replica forwarding 已
-    接入。外部生产 issuer/证书自动切换、完整业务 E2E 和真实集群切换仍待验收；跨集群 payload 与 S3
-    属于后续里程碑。
+    接入。外部生产 issuer/证书自动切换、完整业务 E2E、真实集群切换和跨集群 payload 仍待验收；
+    S3 只读 Access Point 控制面 action 已在本契约中公开。
 
     业务方法使用“模块 / 子域 / 动作”路径，并通过普通 JSON 请求和响应调用；
     路径不包含版本号。除版本查询和健康检查外，调用方必须发送
@@ -33,7 +33,7 @@ info:
 
 servers:
   - url: /
-    description: 与当前 neoengram-server 用户 API origin 相同
+    description: 与当前 neoengram-central 用户 API origin 相同
 
 tags:
   - name: System
@@ -45,13 +45,17 @@ tags:
   - name: StorageEnrollment
     description: Tenant 管理员冻结待接入 PVC descriptor、创建 bootstrap token 并审核脱敏 enrollment 记录
   - name: Project
-    description: 租户内只读 Project 查询方法
+    description: 租户内 Project 创建与查询方法
   - name: Artifact
     description: 租户内 Artifact 创建、查询，以及 Commit 图和文件 Diff 查询方法
   - name: Playground
     description: 租户内 Playground 创建、查询和 Commit 方法
   - name: Snapshot
     description: 绑定 Artifact Commit 的只读 Snapshot 创建与查询方法
+  - name: S3
+    description: 将 Ready Snapshot 通过 Gateway 暴露为只读 S3 Access Point，并管理短期凭证与对象浏览
+  - name: ResourceLifecycle
+    description: Tenant 管理员查询安全删除影响、管理回收站任务与 Retention Hold
   - name: Job
     description: 用户发起和查询的中心权威 Job 方法
   - name: Gateway
@@ -64,11 +68,11 @@ paths:
     post:
       tags: [System]
       operationId: queryApiVersion
-      summary: 查询 API 和 Agent 协议版本
+      summary: 查询当前 API 和 Agent wire 版本
       security: []
       description: |
-        返回当前服务理解的公开 API 版本和 Agent wire protocol 版本。该方法用于
-        版本协商，因此不要求 `NeoEngram-API-Version` 或认证。
+        返回当前服务使用的公开 API 版本和 Agent wire protocol 版本。版本不匹配直接拒绝，
+        不提供版本数组协商，因此不要求 `NeoEngram-API-Version` 或认证。
       parameters:
         - $ref: "#/components/parameters/RequestId"
       requestBody:
@@ -89,13 +93,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApiVersionResponse"
               example:
-                api_versions: [1]
-                agent_protocol_versions: [1]
+                api_version: 1
+                agent_wire_version: 1
                 capabilities:
                   - artifact_catalog
                   - artifact_commit_graph
                   - managed_add
                   - sqlite_authority
+                  - commit_layout_selection_v2
+                  - snapshot_delivery_fuse_v2
+                  - snapshot_delivery_copy_v2
+                  - snapshot_delivery_hardlink_v2
+                  - s3_readonly_access_point
+                  - resource_lifecycle_v1
         "413":
           $ref: "#/components/responses/PayloadTooLargeProblem"
         "422":
@@ -586,7 +596,6 @@ paths:
                     probe:
                       observed_access_mode: read_write
                       descriptor_matches: true
-                      protocol_compatible: true
                       observed_at_unix_ms: "1785168060000"
                     resource_version: "1"
                     created_at_unix_ms: "1785168060000"
@@ -673,7 +682,7 @@ paths:
       description: |
         要求 `storage.enrollment.review` 权限。仅允许批准未过期的 `pending_approval` enrollment；服务端
         必须在一个事务中执行 resource version CAS，校验冻结的 Tenant/Volume/EdgeCluster/Region/
-        access mode/PVC descriptor、probe、协议兼容性和一 PVC 一活动 Agent 唯一约束。initial 审批
+        access mode/PVC descriptor、probe 和一 PVC 一活动 Agent 唯一约束。initial 审批
         创建缺失的 StorageVolume，或精确绑定 descriptor 完全一致且 `unavailable`、无活动 Owner 的
         既有 PVC Volume；replacement 则精确绑定同一 Tenant 下由旧 Owner 占用的既有 Volume。
         `registration_kind=replacement` 时必须显式传 `confirm_replacement=true`，否则返回 409。
@@ -733,7 +742,6 @@ paths:
                   probe:
                     observed_access_mode: read_write
                     descriptor_matches: true
-                    protocol_compatible: true
                     observed_at_unix_ms: "1785168060000"
                   resource_version: "2"
                   created_at_unix_ms: "1785168060000"
@@ -748,14 +756,79 @@ paths:
                   region: cn-east-1
                   backend_type: pvc
                   access_mode: read_write_many
+                  allowed_delivery_modes: [fuse, copy]
+                  hardlink_policy: disabled
+                  max_whole_file_bytes: "107374182400"
+                  copy_reserve_bytes: "10737418240"
                   pvc_reference:
                     namespace: neoengram-data
                     claim_name: vision-data
                   state: unavailable
                   resource_version: "1"
+                  lifecycle:
+                    state: active
+                    generation: "1"
                   created_at_unix_ms: "1785168120000"
                   updated_at_unix_ms: "1785168120000"
                 replayed: false
+        "401":
+          $ref: "#/components/responses/AuthenticationProblem"
+        "403":
+          $ref: "#/components/responses/AuthorizationProblem"
+        "404":
+          $ref: "#/components/responses/StorageEnrollmentNotFoundProblem"
+        "409":
+          $ref: "#/components/responses/StorageEnrollmentConflictProblem"
+        "413":
+          $ref: "#/components/responses/PayloadTooLargeProblem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "429":
+          $ref: "#/components/responses/OverloadedProblem"
+        "500":
+          $ref: "#/components/responses/InternalProblem"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableProblem"
+        "504":
+          $ref: "#/components/responses/RequestTimeoutProblem"
+
+  /api/storage/enrollment/recovery/complete:
+    post:
+      tags: [StorageEnrollment]
+      operationId: completeStorageRecovery
+      summary: 完成 replacement Storage recovery
+      description: |
+        要求 `storage.enrollment.review` 权限。仅用于 replacement Agent 已建立认证 session 并报告
+        Ready mount 后，显式完成 Volume recovery fence。服务端同时校验 enrollment resource version
+        和当前 owner generation；旧 Owner、旧 generation、非 recovery 状态或尚未 Ready 的 mount
+        均返回 409。该动作不会签发凭证，也不接受客户端路径或挂载信息。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompleteStorageRecoveryRequest"
+            example:
+              tenant_id: tenant-a
+              storage_enrollment_id: storage-enrollment-vision-replacement-01
+              expected_resource_version: "4"
+              owner_generation: "2"
+      responses:
+        "200":
+          description: recovery fence 已由当前 Ready Owner 完成
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompleteStorageRecoveryResponse"
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -840,7 +913,6 @@ paths:
                   probe:
                     observed_access_mode: read_write
                     descriptor_matches: false
-                    protocol_compatible: true
                     observed_at_unix_ms: "1785168060000"
                   resource_version: "2"
                   created_at_unix_ms: "1785168060000"
@@ -869,10 +941,64 @@ paths:
         "504":
           $ref: "#/components/responses/RequestTimeoutProblem"
 
+  /api/project/create:
+    post:
+      tags: [Project]
+      operationId: createProject
+      x-neoengram-central-route: true
+      summary: 创建 Project
+      description: |
+        要求 Tenant 内的 `project.create` 权限。相同 Tenant、Project ID 和 canonical 创建内容返回
+        既有 Project 并标记 `replayed=true`；相同 Project ID 对应不同内容时返回冲突。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectRequest"
+            example:
+              tenant_id: tenant-a
+              project_id: project-lab
+              display_name: 算法实验室
+              description: 实验数据和结果
+      responses:
+        "200":
+          description: Project 已创建或相同创建请求被重放
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateProjectResponse"
+        "401":
+          $ref: "#/components/responses/AuthenticationProblem"
+        "403":
+          $ref: "#/components/responses/AuthorizationProblem"
+        "404":
+          $ref: "#/components/responses/ResourceNotFoundProblem"
+        "409":
+          $ref: "#/components/responses/MutationConflictProblem"
+        "413":
+          $ref: "#/components/responses/PayloadTooLargeProblem"
+        "422":
+          $ref: "#/components/responses/ValidationProblem"
+        "500":
+          $ref: "#/components/responses/InternalProblem"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableProblem"
+
   /api/project/list/query:
     post:
       tags: [Project]
       operationId: queryProjectList
+      x-neoengram-central-route: true
       summary: 查询租户内 Project
       description: 分页返回租户内当前 principal 可见的 Project，用于资源筛选。
       security:
@@ -905,6 +1031,7 @@ paths:
                   - tenant_id: tenant-a
                     project_id: project-vision
                     display_name: 视觉数据
+                    resource_version: "2"
                     created_at_unix_ms: "1785167000000"
                     updated_at_unix_ms: "1785167600000"
         "401":
@@ -965,6 +1092,9 @@ paths:
                       mode: empty
                     head_commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                     resource_version: "18"
+                    lifecycle:
+                      state: active
+                      generation: "1"
                     created_at_unix_ms: "1785167000000"
                     updated_at_unix_ms: "1785167600000"
         "401":
@@ -1025,6 +1155,9 @@ paths:
                     mode: empty
                   head_commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                   resource_version: "18"
+                  lifecycle:
+                    state: active
+                    generation: "1"
                   created_at_unix_ms: "1785167000000"
                   updated_at_unix_ms: "1785167600000"
         "401":
@@ -1145,11 +1278,13 @@ paths:
                       parent_commit_id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                       message: 补充夜间道路场景
                       tag_names: [dataset/v4, release-candidate]
+                      data_layout: fast_cdc
                       created_at_unix_ms: "1785167600000"
                     - commit_id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                       parent_commit_id: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
                       message: 完成首轮质量复核
                       tag_names: [v1.0]
+                      data_layout: whole_file
                       created_at_unix_ms: "1785067400000"
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
@@ -1172,6 +1307,7 @@ paths:
     post:
       tags: [Artifact]
       operationId: queryArtifactCommitDiff
+      x-neoengram-central-route: false
       summary: 查询 Commit 文件差异
       description: |
         比较目标 Commit 与指定 base Commit；未提供 `base_commit_id` 时使用目标 Commit 的单一
@@ -1212,6 +1348,7 @@ paths:
                     message: 完成首轮质量复核
                     description: 完成白天场景的质量抽检和标签修订。
                     tag_names: [v1.0]
+                    data_layout: whole_file
                     created_at_unix_ms: "1785067400000"
                   target_commit:
                     commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -1219,6 +1356,7 @@ paths:
                     message: 补充夜间道路场景
                     description: 增加夜间和低照度样本，并更新场景索引。
                     tag_names: [dataset/v4, release-candidate]
+                    data_layout: fast_cdc
                     created_at_unix_ms: "1785167600000"
                   summary:
                     files_added: "1"
@@ -1303,6 +1441,10 @@ paths:
                       digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                     state: ready
                     storage_availability: ready
+                    resource_version: "1"
+                    lifecycle:
+                      state: active
+                      generation: "1"
                     created_at_unix_ms: "1785167000000"
                     updated_at_unix_ms: "1785167600000"
         "401":
@@ -1371,6 +1513,10 @@ paths:
                     digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                   state: ready
                   storage_availability: ready
+                  resource_version: "1"
+                  lifecycle:
+                    state: active
+                    generation: "1"
                   created_at_unix_ms: "1785167000000"
                   updated_at_unix_ms: "1785167600000"
         "401":
@@ -1480,6 +1626,7 @@ paths:
               expected_index_version:
                 revision: "31"
                 digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+              data_layout: fast_cdc
       responses:
         "200":
           description: 已创建或幂等返回的 Pre-commit
@@ -1498,6 +1645,7 @@ paths:
                   playground_id: labeling
                   precommit_id: precommit-july-labels-01
                   precommit_request_id: precommit-request-july-labels
+                  data_layout: fast_cdc
                   attempt: 1
                   state: running
                   phase: queued
@@ -1529,6 +1677,10 @@ paths:
                   state: ready
                   storage_availability: ready
                   active_precommit_id: precommit-july-labels-01
+                  resource_version: "1"
+                  lifecycle:
+                    state: active
+                    generation: "1"
                   created_at_unix_ms: "1785167000000"
                   updated_at_unix_ms: "1785167600000"
                 replayed: false
@@ -1591,6 +1743,7 @@ paths:
                   playground_id: labeling
                   precommit_id: precommit-july-labels-01
                   precommit_request_id: precommit-request-july-labels
+                  data_layout: fast_cdc
                   attempt: 1
                   state: ready
                   phase: idle
@@ -2070,6 +2223,7 @@ paths:
               expected_candidate_index_version:
                 revision: "31"
                 digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+              data_layout: fast_cdc
               message: 完成七月标注复核
               description: 完成夜间场景的人工复核并冻结训练候选。
               tag_names: [dataset/v5, reviewed]
@@ -2144,17 +2298,21 @@ paths:
                     project_id: project-vision
                     artifact_id: road-scenes
                     commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                    data_layout: fast_cdc
                     storage_volume_id: volume-shanghai-archive
                     region: cn-shanghai
                     message: 补充夜间道路场景
                     tag_names: [dataset/v4, release-candidate]
                     state: ready
-                    phase: idle
                     integrity:
                       state: verified
                       files_verified: "864"
                       bytes_verified: "12884901888"
                       verified_at_unix_ms: "1785167700000"
+                    resource_version: "1"
+                    lifecycle:
+                      state: active
+                      generation: "1"
                     created_at_unix_ms: "1785167600000"
                     updated_at_unix_ms: "1785167700000"
                     logical_file_count: "864"
@@ -2214,17 +2372,21 @@ paths:
                   project_id: project-vision
                   artifact_id: road-scenes
                   commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  data_layout: fast_cdc
                   storage_volume_id: volume-shanghai-archive
                   region: cn-shanghai
                   message: 补充夜间道路场景
                   tag_names: [dataset/v4, release-candidate]
                   state: ready
-                  phase: idle
                   integrity:
                     state: verified
                     files_verified: "864"
                     bytes_verified: "12884901888"
                     verified_at_unix_ms: "1785167700000"
+                  resource_version: "1"
+                  lifecycle:
+                    state: active
+                    generation: "1"
                   created_at_unix_ms: "1785167600000"
                   updated_at_unix_ms: "1785167700000"
                   logical_file_count: "864"
@@ -2256,7 +2418,7 @@ paths:
         服务端生成 `snapshot_id`；相同 `snapshot_request_id` 和 payload 返回 `replayed: true`，不同
         request identity 命中同一 Commit/Volume 的未删除 Snapshot 时返回 `placement_reused: true`。
         用途、保留策略和 Dataset Profile 均不是创建参数；Profile 是创建后查询的派生只读元数据。200 返回时
-        Snapshot 记录已持久化且可查询，后续交付由其状态和阶段表达。
+        Snapshot 记录已持久化且可查询；具体物化进度由独立 SnapshotDelivery 表达。
       security:
         - BearerAuth: []
       parameters:
@@ -2293,16 +2455,20 @@ paths:
                   project_id: project-vision
                   artifact_id: road-scenes
                   commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  data_layout: fast_cdc
                   storage_volume_id: volume-shanghai-archive
                   region: cn-shanghai
                   message: 补充夜间道路场景
                   tag_names: [dataset/v4, release-candidate]
                   state: creating
-                  phase: planning
                   integrity:
                     state: pending
                     files_verified: "0"
                     bytes_verified: "0"
+                  resource_version: "1"
+                  lifecycle:
+                    state: active
+                    generation: "1"
                   logical_file_count: "864"
                   logical_size_bytes: "12884901888"
                   created_at_unix_ms: "1785167600000"
@@ -2332,9 +2498,10 @@ paths:
       operationId: retrySnapshotDelivery
       summary: 重试 Snapshot 交付
       description: |
-        对 Abnormal Snapshot 的同一固定 Commit/Volume 交付重新发起 attempt，使状态回到 Creating。
-        相同 `retry_request_id` 和 payload 幂等返回；状态不允许重试时返回 409。200 返回时新的交付
-        attempt 已持久化，后续进度通过 Snapshot 状态、阶段和活动查询。
+        对 failed SnapshotDelivery 的同一固定 Snapshot/Commit/Volume 交付重新发起 attempt，
+        使 Delivery 状态回到 requested，Snapshot 状态保持不变。相同 `request_id` 和 payload
+        幂等返回；状态不允许重试时返回 409。200 返回时新的交付 attempt 已持久化，
+        后续进度通过 SnapshotDelivery 查询。
       security:
         - BearerAuth: []
       parameters:
@@ -2349,11 +2516,11 @@ paths:
               $ref: "#/components/schemas/RetrySnapshotDeliveryRequest"
             example:
               tenant_id: tenant-a
-              snapshot_id: snap-road-main2-sha-01
-              retry_request_id: retry-road-main2-sha-02
+              delivery_id: delivery-road-main2-fuse-01
+              request_id: retry-road-main2-fuse-02
       responses:
         "200":
-          description: 已重新发起或幂等返回的 Snapshot
+          description: 已重新发起或幂等返回的 SnapshotDelivery
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
@@ -2362,24 +2529,20 @@ paths:
               schema:
                 $ref: "#/components/schemas/RetrySnapshotDeliveryResponse"
               example:
-                snapshot:
+                delivery:
+                  delivery_id: delivery-road-main2-fuse-01
                   snapshot_id: snap-road-main2-sha-01
-                  tenant_id: tenant-a
-                  project_id: project-vision
-                  artifact_id: road-scenes
                   commit_id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                   storage_volume_id: volume-shanghai-vision
-                  region: cn-shanghai
-                  message: 完成首轮质量复核
-                  tag_names: [v1.0]
-                  state: creating
-                  phase: planning
-                  integrity:
-                    state: pending
-                    files_verified: "0"
-                    bytes_verified: "0"
-                  logical_file_count: "820"
-                  logical_size_bytes: "11884901888"
+                  mode: fuse
+                  target_relative_root: deliveries/delivery-road-main2-fuse-01
+                  state: requested
+                  source_index_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  delivery_generation: "2"
+                  file_count: "820"
+                  size_bytes: "11884901888"
+                  object_set_digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+                  resource_version: "2"
                   created_at_unix_ms: "1785067400000"
                   updated_at_unix_ms: "1785167800000"
                 replayed: false
@@ -2400,10 +2563,144 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
+  /api/snapshot/delivery/create:
+    post:
+      tags: [Snapshot]
+      operationId: createSnapshotDelivery
+      summary: 创建 Snapshot 只读交付
+      description: 为固定 Snapshot 创建 FUSE、Copy 或 Hardlink 只读交付，目标路径由服务端推导。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSnapshotDeliveryRequest"
+      responses:
+        "200":
+          description: 已创建或幂等返回的交付
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateSnapshotDeliveryResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/snapshot/delivery/query:
+    post:
+      tags: [Snapshot]
+      operationId: querySnapshotDelivery
+      summary: 查询 Snapshot 只读交付
+      description: 返回单个 SnapshotDelivery 的状态、交付模式和物化进度。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuerySnapshotDeliveryRequest"
+      responses:
+        "200":
+          description: 交付详情
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuerySnapshotDeliveryResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+
+  /api/snapshot/delivery/list/query:
+    post:
+      tags: [Snapshot]
+      operationId: querySnapshotDeliveryList
+      summary: 查询 Snapshot 只读交付列表
+      description: 分页返回指定 Snapshot 的所有只读交付。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuerySnapshotDeliveryListRequest"
+      responses:
+        "200":
+          description: 交付列表
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuerySnapshotDeliveryListResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/CursorConflictProblem" }
+
+  /api/snapshot/delivery/delete:
+    post:
+      tags: [Snapshot]
+      operationId: deleteSnapshotDelivery
+      summary: 删除 Snapshot 只读交付
+      description: |
+        将指定 SnapshotDelivery 标记为 `deleting`，并异步卸载 FUSE 或清理 Copy/Hardlink 交付。
+        200 只表示删除流程已持久化；最终 `deleted` 状态通过查询接口获取，相同 `request_id` 和 payload
+        幂等返回同一结果。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteSnapshotDeliveryRequest"
+      responses:
+        "200":
+          description: 已进入异步删除流程或幂等返回的交付
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteSnapshotDeliveryResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+
   /api/snapshot/file/list/query:
     post:
       tags: [Snapshot]
       operationId: querySnapshotFileList
+      x-neoengram-central-route: false
       summary: 查询 Snapshot 文件列表
       description: |
         分页返回 Ready Snapshot 的逻辑文件和目录。Creating 或 Abnormal 状态返回 409；响应不包含
@@ -2465,8 +2762,9 @@ paths:
     post:
       tags: [Snapshot]
       operationId: querySnapshotActivityList
-      summary: 查询 Snapshot 交付活动
-      description: 分页返回 Snapshot 创建、阶段变化、失败、重试和就绪的脱敏活动记录。
+      x-neoengram-central-route: false
+      summary: 查询 Snapshot 活动
+      description: 分页返回 Snapshot 创建、状态变化、失败和就绪的脱敏活动记录；Delivery 重试不改变 Snapshot 活动。
       security:
         - BearerAuth: []
       parameters:
@@ -2498,12 +2796,10 @@ paths:
                   - activity_id: activity-snap-road-main3-ready
                     activity_type: ready
                     summary: Snapshot 已完成完整性校验并可读取
-                    phase: idle
                     created_at_unix_ms: "1785167700000"
                   - activity_id: activity-snap-road-main3-created
                     activity_type: created
                     summary: Snapshot 记录已创建
-                    phase: planning
                     created_at_unix_ms: "1785167600000"
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
@@ -2526,6 +2822,7 @@ paths:
     post:
       tags: [Snapshot]
       operationId: querySnapshotDatasetProfile
+      x-neoengram-central-route: false
       summary: 查询 Snapshot Dataset Profile
       description: 返回固定 Snapshot 的公开数据集画像、Schema、质量和 freshness 摘要。
       security:
@@ -2584,6 +2881,690 @@ paths:
           $ref: "#/components/responses/InternalProblem"
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
+
+  /api/s3/access-point/create:
+    post:
+      tags: [S3]
+      operationId: createS3AccessPoint
+      summary: 为 Ready Snapshot 开启只读 S3 访问
+      description: |
+        要求 `s3.access.manage` 权限。为固定 Snapshot 创建唯一只读 Access Point，并在首次成功
+        响应中返回一组短期凭证。Snapshot 必须为 `ready`，对应 GatewayPool 必须可服务；同一
+        Snapshot 已有停用 Access Point 时必须显式调用 enable，不会通过本方法重新签发凭证。
+        `secret_access_key` 只在首次创建凭证时返回，幂等重放不会再次返回原 Secret。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateS3AccessPointRequest"
+      responses:
+        "200":
+          description: Access Point 与首次凭证
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateS3AccessPointResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "413": { $ref: "#/components/responses/PayloadTooLargeProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/access-point/list/query:
+    post:
+      tags: [S3]
+      operationId: queryS3AccessPointList
+      summary: 分页查询 S3 Access Point
+      description: 要求 `s3.access.read` 权限；仅返回当前 Tenant 可见的 Access Point。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryS3AccessPointListRequest"
+      responses:
+        "200":
+          description: Access Point 页
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryS3AccessPointListResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/access-point/query:
+    post:
+      tags: [S3]
+      operationId: queryS3AccessPoint
+      summary: 查询 S3 Access Point
+      description: 要求 `s3.access.read` 权限；不存在或不可见统一返回 404。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryS3AccessPointRequest"
+      responses:
+        "200":
+          description: Access Point 当前视图
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryS3AccessPointResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/access-point/enable:
+    post:
+      tags: [S3]
+      operationId: enableS3AccessPoint
+      summary: 启用 S3 Access Point
+      description: |
+        要求 `s3.access.manage` 权限。启用只恢复 Access Point 策略，不恢复停用时已撤销的凭证；
+        调用方需要随后创建新凭证。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateS3AccessPointRequest"
+      responses:
+        "200":
+          description: 已启用 Access Point
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateS3AccessPointResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/access-point/disable:
+    post:
+      tags: [S3]
+      operationId: disableS3AccessPoint
+      summary: 停用 S3 Access Point
+      description: |
+        要求 `s3.access.manage` 权限。停用后对象访问立即不可用，所有 active 凭证被撤销，
+        policy generation 单调递增。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateS3AccessPointRequest"
+      responses:
+        "200":
+          description: 已停用 Access Point
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateS3AccessPointResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/credential/create:
+    post:
+      tags: [S3]
+      operationId: createS3Credential
+      summary: 创建 S3 短期凭证
+      description: |
+        要求 `s3.access.manage` 权限。仅 active Access Point 可创建凭证；disabled 状态返回
+        `S3_ACCESS_POINT_DISABLED`。每个 Access Point 最多同时存在两组 active 凭证，
+        `secret_access_key` 只在首次成功响应中返回。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateS3CredentialRequest"
+      responses:
+        "200":
+          description: 新凭证或幂等重放结果
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateS3CredentialResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/credential/list/query:
+    post:
+      tags: [S3]
+      operationId: queryS3CredentialList
+      summary: 查询 Access Point 凭证
+      description: 要求 `s3.access.manage` 权限；响应永不包含 Secret 或加密材料。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryS3CredentialListRequest"
+      responses:
+        "200":
+          description: Access Point 凭证列表
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryS3CredentialListResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/credential/revoke:
+    post:
+      tags: [S3]
+      operationId: revokeS3Credential
+      summary: 撤销 S3 凭证
+      description: 要求 `s3.access.manage` 权限；重复撤销保持 revoked，并返回当前凭证列表。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokeS3CredentialRequest"
+      responses:
+        "200":
+          description: 撤销后的凭证列表
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryS3CredentialListResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/object/list/query:
+    post:
+      tags: [S3]
+      operationId: queryS3ObjectList
+      summary: 浏览只读 S3 对象
+      description: |
+        要求 `s3.access.read` 权限。对象列表来自 Access Point 固定 Commit 的不可变索引；
+        `prefix` 与 `delimiter` 使用 S3 ListObjectsV2 语义，公共目录前缀单独返回。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryS3ObjectListRequest"
+      responses:
+        "200":
+          description: 对象与公共前缀页
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryS3ObjectListResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/object/download-url/create:
+    post:
+      tags: [S3]
+      operationId: createS3DownloadUrl
+      summary: 创建只读对象下载 URL
+      description: |
+        要求 `s3.access.read` 权限。为固定 Commit 中存在的对象创建短期、只读 presigned URL；
+        URL 不授予列举、写入或删除权限，且不会绕过 disabled Access Point。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateS3DownloadUrlRequest"
+      responses:
+        "200":
+          description: 短期下载 URL
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateS3DownloadUrlResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/resource/deletion/impact/query:
+    post:
+      tags: [ResourceLifecycle]
+      operationId: queryResourceDeletionImpact
+      summary: 查询资源安全删除影响
+      description: |
+        要求 `resource.lifecycle.read` 权限。基于当前 Catalog 依赖图返回待删除资源、活动任务、
+        S3 凭证、唯一对象副本与预计清理规模，并签发五分钟有效的 `impact_digest`。该调用只做
+        dry-run，不改变资源状态；Artifact 或 StorageVolume 的子资源仅在显式 `cascade=true` 时纳入。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryDeletionImpactRequest"
+      responses:
+        "200":
+          description: 与当前资源版本和依赖图绑定的删除影响摘要
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryDeletionImpactResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "413": { $ref: "#/components/responses/PayloadTooLargeProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/resource/deletion/create:
+    post:
+      tags: [ResourceLifecycle]
+      operationId: createResourceDeletion
+      summary: 创建安全删除任务
+      description: |
+        要求 `resource.lifecycle.manage` 权限。服务端在 Catalog 事务中重新验证五分钟影响摘要、
+        资源版本与依赖集合，然后原子停止整批资源访问、停用关联 S3 Access Point 并创建删除 Saga。
+        相同 `request_id` 与请求摘要幂等重放原任务；进入 `purging` 后不再允许恢复。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDeletionRequest"
+      responses:
+        "200":
+          description: 已线性化的删除任务
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletionMutationResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "413": { $ref: "#/components/responses/PayloadTooLargeProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/resource/deletion/query:
+    post:
+      tags: [ResourceLifecycle]
+      operationId: queryResourceDeletion
+      summary: 查询删除任务详情
+      description: |
+        要求 `resource.lifecycle.read` 权限。返回删除 Saga 当前阶段、整批目标、错误和所有
+        Retention Hold；永久删除后的资源只可通过本任务视图和保留 tombstone 审计查询。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryDeletionRequest"
+      responses:
+        "200":
+          description: 删除任务与 Retention Hold
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryDeletionResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "413": { $ref: "#/components/responses/PayloadTooLargeProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/resource/deletion/list/query:
+    post:
+      tags: [ResourceLifecycle]
+      operationId: queryResourceDeletionList
+      summary: 分页查询回收站任务
+      description: |
+        要求 `resource.lifecycle.read` 权限。按 Tenant 和可选任务状态分页返回删除批次；
+        普通资源列表仍只返回 `active` 资源，本方法是管理员查看回收站和永久删除记录的入口。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryDeletionListRequest"
+      responses:
+        "200":
+          description: 删除任务页
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryDeletionListResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "413": { $ref: "#/components/responses/PayloadTooLargeProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/resource/deletion/restore:
+    post:
+      tags: [ResourceLifecycle]
+      operationId: restoreResourceDeletion
+      summary: 整批恢复回收站资源
+      description: |
+        要求 `resource.lifecycle.manage` 权限。仅在任务进入 `purging` 前接受恢复，并以固定依赖批次
+        执行；所有目标保持 `restoring`，直到 Agent 物理恢复完成后由 Catalog 原子切回 `active`。
+        已撤销的 S3 凭证、Job 与 Pre-commit 不会随资源自动恢复。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateDeletionRequest"
+      responses:
+        "200":
+          description: 已进入恢复流程的删除任务
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletionMutationResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "413": { $ref: "#/components/responses/PayloadTooLargeProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/resource/deletion/retry:
+    post:
+      tags: [ResourceLifecycle]
+      operationId: retryResourceDeletion
+      summary: 重试阻塞或失败的删除任务
+      description: |
+        要求 `resource.lifecycle.manage` 权限。对 `blocked` 或 `failed` Saga 创建幂等重试，保留原删除
+        ID、依赖批次和生命周期 generation；该方法不能绕过 Retention Hold、唯一副本或 Agent fencing。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateDeletionRequest"
+      responses:
+        "200":
+          description: 已重新进入可推进状态的删除任务
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeletionMutationResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "413": { $ref: "#/components/responses/PayloadTooLargeProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/resource/retention-hold/create:
+    post:
+      tags: [ResourceLifecycle]
+      operationId: createResourceRetentionHold
+      summary: 为删除任务创建 Retention Hold
+      description: |
+        要求 `retention.manage` 权限。Hold 必须记录原因，可永久有效或设置到期时间；它不会恢复
+        资源访问，只阻止删除任务进入 `purging`。相同 `request_id` 和请求摘要幂等返回同一个 Hold。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRetentionHoldRequest"
+      responses:
+        "200":
+          description: 删除任务与新建 Hold
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateRetentionHoldResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "413": { $ref: "#/components/responses/PayloadTooLargeProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/resource/retention-hold/release:
+    post:
+      tags: [ResourceLifecycle]
+      operationId: releaseResourceRetentionHold
+      summary: 释放删除任务的 Retention Hold
+      description: |
+        要求 `retention.manage` 权限。使用删除任务资源版本执行 CAS 并幂等释放指定 Hold；最后一个
+        有效 Hold 释放后，已超过 `purge_after` 的任务立即重新具备进入物理清理阶段的资格。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReleaseRetentionHoldRequest"
+      responses:
+        "200":
+          description: 删除任务与已释放 Hold
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReleaseRetentionHoldResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "413": { $ref: "#/components/responses/PayloadTooLargeProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
 
   /api/gateway/pool/create:
     post:
@@ -3257,7 +4238,7 @@ paths:
     get:
       tags: [Health]
       operationId: liveProbe
-      summary: 检查 neoengramd 进程是否存活
+      summary: 检查 neoengram-central 进程是否存活
       security: []
       description: 不访问 authority；仅表示进程可以处理 HTTP 请求。
       parameters:
@@ -3289,7 +4270,7 @@ paths:
     get:
       tags: [Health]
       operationId: readyProbe
-      summary: 检查 neoengramd 是否可以接收业务请求
+      summary: 检查 neoengram-central 是否可以接收业务请求
       security: []
       description: 至少验证 authority 已打开并通过其后端完整性检查。
       parameters:
@@ -3496,15 +4477,67 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetails"
-          example:
-            type: urn:neoengram:problem:resource-conflict
-            title: Resource mutation conflict
-            status: 409
-            detail: The resource identity or expected version conflicts with current state
-            instance: /api/playground/commit/create
-            code: RESOURCE_CONFLICT
-            request_id: req-20260727-001
-            retryable: false
+          examples:
+            resourceConflict:
+              value:
+                type: urn:neoengram:problem:resource-conflict
+                title: Resource mutation conflict
+                status: 409
+                detail: The resource identity or expected version conflicts with current state
+                instance: /api/playground/commit/create
+                code: RESOURCE_CONFLICT
+                request_id: req-20260727-001
+                retryable: false
+            hardlinkRequiresWholeFile:
+              value:
+                type: urn:neoengram:problem:hardlink-requires-whole-file
+                title: Hardlink delivery requires WholeFile layout
+                status: 409
+                detail: Hardlink delivery is only available for a WholeFile Commit
+                instance: /api/snapshot/delivery/create
+                code: HARDLINK_REQUIRES_WHOLE_FILE
+                request_id: req-20260727-002
+                retryable: false
+            hardlinkCrossFilesystem:
+              value:
+                type: urn:neoengram:problem:hardlink-cross-filesystem
+                title: Hardlink delivery crosses filesystems
+                status: 409
+                detail: The CAS object and delivery target are on different filesystems
+                instance: /api/snapshot/delivery/create
+                code: HARDLINK_CROSS_FILESYSTEM
+                request_id: req-20260727-003
+                retryable: false
+            hardlinkUnsafeVolume:
+              value:
+                type: urn:neoengram:problem:hardlink-unsafe-volume
+                title: Hardlink delivery is unsafe on this volume
+                status: 409
+                detail: The StorageVolume policy does not provide a sealed read-only hardlink boundary
+                instance: /api/snapshot/delivery/create
+                code: HARDLINK_UNSAFE_VOLUME
+                request_id: req-20260727-004
+                retryable: false
+            hardlinkObjectNotSealed:
+              value:
+                type: urn:neoengram:problem:hardlink-object-not-sealed
+                title: Hardlink object is not sealed
+                status: 409
+                detail: The referenced CAS object is not sealed for hardlink delivery
+                instance: /api/snapshot/delivery/create
+                code: HARDLINK_OBJECT_NOT_SEALED
+                request_id: req-20260727-005
+                retryable: false
+            deliveryTargetConflict:
+              value:
+                type: urn:neoengram:problem:delivery-target-conflict
+                title: Delivery target conflict
+                status: 409
+                detail: The derived delivery target is already occupied by another resource
+                instance: /api/snapshot/delivery/create
+                code: DELIVERY_TARGET_CONFLICT
+                request_id: req-20260727-006
+                retryable: false
     StorageEnrollmentConflictProblem:
       description: enrollment identity、状态、绑定或 expected resource version 与当前权威状态冲突
       headers:
@@ -3816,24 +4849,16 @@ components:
       type: object
       additionalProperties: false
       required:
-        - api_versions
-        - agent_protocol_versions
+        - api_version
+        - agent_wire_version
         - capabilities
       properties:
-        api_versions:
-          type: array
-          minItems: 1
-          uniqueItems: true
-          items:
-            type: integer
-            enum: [1]
-        agent_protocol_versions:
-          type: array
-          minItems: 1
-          uniqueItems: true
-          items:
-            type: integer
-            enum: [1]
+        api_version:
+          type: integer
+          enum: [1]
+        agent_wire_version:
+          type: integer
+          enum: [1]
         capabilities:
           type: array
           uniqueItems: true
@@ -4007,7 +5032,7 @@ components:
         - peer_endpoint
         - bootstrap_endpoint
         - software_version
-        - supported_protocol_versions
+        - wire_version
       properties:
         gateway_replica_id:
           $ref: "#/components/schemas/GatewayReplicaId"
@@ -4023,17 +5048,9 @@ components:
           type: string
           minLength: 1
           maxLength: 256
-        supported_protocol_versions:
-          type: array
-          minItems: 1
-          maxItems: 128
-          uniqueItems: true
-          contains:
-            const: 1
-          items:
-            type: integer
-            minimum: 1
-            maximum: 65535
+        wire_version:
+          type: integer
+          const: 1
         capabilities:
           type: array
           maxItems: 128
@@ -4072,7 +5089,8 @@ components:
     ActivateGatewayReplicaRequest:
       type: object
       additionalProperties: false
-      required: [gateway_replica_id, expected_resource_version, activation_token]
+      required:
+        [gateway_replica_id, expected_resource_version, activation_token]
       properties:
         gateway_replica_id:
           $ref: "#/components/schemas/GatewayReplicaId"
@@ -4135,7 +5153,7 @@ components:
         - peer_endpoint
         - bootstrap_endpoint
         - software_version
-        - supported_protocol_versions
+        - wire_version
         - capabilities
         - state
         - credential_state
@@ -4159,15 +5177,9 @@ components:
           type: string
           minLength: 1
           maxLength: 256
-        supported_protocol_versions:
-          type: array
-          minItems: 1
-          maxItems: 128
-          uniqueItems: true
-          items:
-            type: integer
-            minimum: 1
-            maximum: 65535
+        wire_version:
+          type: integer
+          const: 1
         capabilities:
           type: array
           maxItems: 128
@@ -4203,7 +5215,14 @@ components:
 
     GatewayCredentialState:
       type: string
-      enum: [pending_activation, pending_certificate_delivery, active, expired, revoked]
+      enum:
+        [
+          pending_activation,
+          pending_certificate_delivery,
+          active,
+          expired,
+          revoked,
+        ]
 
     GatewayReplicaCount:
       type: integer
@@ -4212,11 +5231,11 @@ components:
 
     GatewayEndpoint:
       type: string
-      description: canonical HTTPS origin；不得包含 userinfo、path、query、fragment 或尾随斜杠。
+      description: canonical HTTPS origin；开发环境允许 literal loopback HTTP origin；不得包含 userinfo、path、query、fragment 或尾随斜杠。
       format: uri
       minLength: 9
       maxLength: 2048
-      pattern: '^https://(?:\[[0-9A-Fa-f:.]+\]|[^@/?#\s:]+)(?::[0-9]{1,5})?$'
+      pattern: '^(?:https://(?:\[[0-9A-Fa-f:.]+\]|[^@/?#\s:]+)(?::[0-9]{1,5})?|http://(?:localhost|127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]{1,5})?)$'
 
     QueryTenantListRequest:
       type: object
@@ -4262,10 +5281,7 @@ components:
 
     CreateTenantRequest:
       type: object
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum: [actor, principal]
+      additionalProperties: false
       required: [tenant_id, display_name]
       properties:
         tenant_id:
@@ -4367,10 +5383,7 @@ components:
 
     CreateStorageVolumeRequest:
       type: object
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum: [actor, principal, credentials, mount_path]
+      additionalProperties: false
       required:
         - tenant_id
         - storage_volume_id
@@ -4394,6 +5407,18 @@ components:
           $ref: "#/components/schemas/StorageBackendType"
         access_mode:
           $ref: "#/components/schemas/StorageAccessMode"
+        allowed_delivery_modes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/SnapshotDeliveryMode"
+        hardlink_policy:
+          $ref: "#/components/schemas/HardlinkPolicy"
+        max_whole_file_bytes:
+          $ref: "#/components/schemas/DecimalU64"
+        copy_reserve_bytes:
+          $ref: "#/components/schemas/DecimalU64"
         pvc_reference:
           $ref: "#/components/schemas/PvcReference"
         nfs_reference:
@@ -4435,8 +5460,13 @@ components:
         - region
         - backend_type
         - access_mode
+        - allowed_delivery_modes
+        - hardlink_policy
+        - max_whole_file_bytes
+        - copy_reserve_bytes
         - state
         - resource_version
+        - lifecycle
         - created_at_unix_ms
         - updated_at_unix_ms
       properties:
@@ -4454,12 +5484,24 @@ components:
           $ref: "#/components/schemas/StorageBackendType"
         access_mode:
           $ref: "#/components/schemas/StorageAccessMode"
+        allowed_delivery_modes:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnapshotDeliveryMode"
+        hardlink_policy:
+          $ref: "#/components/schemas/HardlinkPolicy"
+        max_whole_file_bytes:
+          $ref: "#/components/schemas/DecimalU64"
+        copy_reserve_bytes:
+          $ref: "#/components/schemas/DecimalU64"
         pvc_reference:
           $ref: "#/components/schemas/PvcReference"
         state:
           $ref: "#/components/schemas/StorageVolumeState"
         resource_version:
           $ref: "#/components/schemas/CanonicalU64"
+        lifecycle:
+          $ref: "#/components/schemas/ResourceLifecycleView"
         created_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
         updated_at_unix_ms:
@@ -4615,6 +5657,37 @@ components:
         replayed:
           type: boolean
 
+    CompleteStorageRecoveryRequest:
+      type: object
+      description: |
+        使用 expected_resource_version 和当前 owner_generation 完成 replacement recovery fence。
+        Tenant、Enrollment 与 Owner generation 必须全部匹配服务端当前状态。
+      additionalProperties: false
+      required:
+        - tenant_id
+        - storage_enrollment_id
+        - expected_resource_version
+        - owner_generation
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        storage_enrollment_id:
+          $ref: "#/components/schemas/StorageEnrollmentId"
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        owner_generation:
+          $ref: "#/components/schemas/CanonicalU64"
+
+    CompleteStorageRecoveryResponse:
+      type: object
+      additionalProperties: false
+      required: [enrollment, storage_volume]
+      properties:
+        enrollment:
+          $ref: "#/components/schemas/StorageEnrollmentView"
+        storage_volume:
+          $ref: "#/components/schemas/StorageVolumeView"
+
     RejectStorageEnrollmentRequest:
       type: object
       description: |
@@ -4731,15 +5804,12 @@ components:
       required:
         - observed_access_mode
         - descriptor_matches
-        - protocol_compatible
         - observed_at_unix_ms
       properties:
         observed_access_mode:
           type: string
           enum: [read_only, read_write]
         descriptor_matches:
-          type: boolean
-        protocol_compatible:
           type: boolean
         observed_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
@@ -4817,17 +5887,42 @@ components:
           type: array
           maxItems: 100
           items:
-            $ref: "#/components/schemas/ProjectSummary"
+            $ref: "#/components/schemas/ProjectView"
         next_cursor:
           $ref: "#/components/schemas/PageCursor"
 
-    ProjectSummary:
+    CreateProjectRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, display_name]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        project_id:
+          $ref: "#/components/schemas/ProjectId"
+        display_name:
+          $ref: "#/components/schemas/DisplayName"
+        description:
+          $ref: "#/components/schemas/Description"
+
+    CreateProjectResponse:
+      type: object
+      additionalProperties: false
+      required: [project, replayed]
+      properties:
+        project:
+          $ref: "#/components/schemas/ProjectView"
+        replayed:
+          type: boolean
+
+    ProjectView:
       type: object
       additionalProperties: false
       required:
         - tenant_id
         - project_id
         - display_name
+        - resource_version
         - created_at_unix_ms
         - updated_at_unix_ms
       properties:
@@ -4837,6 +5932,10 @@ components:
           $ref: "#/components/schemas/ProjectId"
         display_name:
           $ref: "#/components/schemas/DisplayName"
+        description:
+          $ref: "#/components/schemas/Description"
+        resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
         created_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
         updated_at_unix_ms:
@@ -4893,10 +5992,7 @@ components:
 
     CreateArtifactRequest:
       type: object
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum: [actor, principal]
+      additionalProperties: false
       required:
         [tenant_id, project_id, artifact_id, display_name, initialization]
       properties:
@@ -4974,6 +6070,7 @@ components:
         - display_name
         - initialization
         - resource_version
+        - lifecycle
         - created_at_unix_ms
         - updated_at_unix_ms
       properties:
@@ -4993,6 +6090,8 @@ components:
           $ref: "#/components/schemas/CommitId"
         resource_version:
           $ref: "#/components/schemas/CanonicalU64"
+        lifecycle:
+          $ref: "#/components/schemas/ResourceLifecycleView"
         created_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
         updated_at_unix_ms:
@@ -5043,7 +6142,7 @@ components:
       type: object
       description: 单 parent 的公开 Commit 节点，不包含 Directory 或 Manifest identity。
       additionalProperties: false
-      required: [commit_id, message, tag_names, created_at_unix_ms]
+      required: [commit_id, message, tag_names, data_layout, created_at_unix_ms]
       properties:
         commit_id:
           $ref: "#/components/schemas/CommitId"
@@ -5061,8 +6160,15 @@ components:
           uniqueItems: true
           items:
             $ref: "#/components/schemas/TagName"
+        data_layout:
+          $ref: "#/components/schemas/DataLayout"
         created_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
+
+    DataLayout:
+      type: string
+      description: Commit 内所有文件使用的统一数据布局。
+      enum: [fast_cdc, whole_file]
 
     QueryArtifactCommitDiffRequest:
       type: object
@@ -5216,10 +6322,7 @@ components:
         创建请求必须引用同 Tenant/Project 下已存在的 Artifact，并明确选择同 Tenant、`state=ready`
         的 StorageVolume。Playground 是该 Artifact 某个固定 Commit 的可写派生视图，不能创建或
         重定义 Artifact；Region 由 Volume 派生，不能由调用方另行指定。
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum: [actor, principal]
+      additionalProperties: false
       required:
         - tenant_id
         - project_id
@@ -5287,6 +6390,8 @@ components:
         - index_version
         - state
         - storage_availability
+        - resource_version
+        - lifecycle
         - created_at_unix_ms
         - updated_at_unix_ms
       properties:
@@ -5318,6 +6423,10 @@ components:
           $ref: "#/components/schemas/PreCommitId"
         issue:
           $ref: "#/components/schemas/ResourceIssueSummary"
+        resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        lifecycle:
+          $ref: "#/components/schemas/ResourceLifecycleView"
         created_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
         updated_at_unix_ms:
@@ -5328,15 +6437,7 @@ components:
       description: |
         创建新 Pre-commit 会话的请求。服务端内部冻结当前 Head；客户端不提交
         `source_head_commit_id`，也不能通过读取页面隐式发送本请求。
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum:
-            - actor
-            - principal
-            - request_digest
-            - source_head_commit_id
-            - expected_head_commit_id
+      additionalProperties: false
       required:
         - tenant_id
         - project_id
@@ -5344,6 +6445,7 @@ components:
         - playground_id
         - precommit_request_id
         - expected_index_version
+        - data_layout
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -5357,6 +6459,8 @@ components:
           $ref: "#/components/schemas/ResourceId"
         expected_index_version:
           $ref: "#/components/schemas/IndexVersion"
+        data_layout:
+          $ref: "#/components/schemas/DataLayout"
 
     StartPreCommitResponse:
       type: object
@@ -5393,10 +6497,7 @@ components:
       description: |
         仅为 abnormal/cancelled 会话创建下一 attempt，保持 `precommit_id`。running/ready 的重新检测
         使用 cancel 后 start，并获得新的会话 ID。
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum: [actor, principal, request_digest]
+      additionalProperties: false
       required:
         [tenant_id, precommit_id, restart_request_id, expected_index_version]
       properties:
@@ -5423,10 +6524,7 @@ components:
 
     CancelPreCommitRequest:
       type: object
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum: [actor, principal, request_digest]
+      additionalProperties: false
       required: [tenant_id, precommit_id, cancel_request_id]
       properties:
         tenant_id:
@@ -5483,6 +6581,7 @@ components:
         - warnings
         - blockers
         - source_index_version
+        - data_layout
         - created_at_unix_ms
         - updated_at_unix_ms
       properties:
@@ -5525,6 +6624,8 @@ components:
             $ref: "#/components/schemas/PreCommitNotice"
         source_index_version:
           $ref: "#/components/schemas/IndexVersion"
+        data_layout:
+          $ref: "#/components/schemas/DataLayout"
         candidate_index_version:
           $ref: "#/components/schemas/IndexVersion"
         diff_summary:
@@ -5590,15 +6691,7 @@ components:
       description: |
         消费 ready/idle Pre-commit 候选。服务端用该 attempt 内部冻结的 Head 执行 CAS；客户端只提交
         expected candidate IndexVersion，不提交 expected/source Head。
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum:
-            - actor
-            - principal
-            - request_digest
-            - source_head_commit_id
-            - expected_head_commit_id
+      additionalProperties: false
       required:
         - tenant_id
         - project_id
@@ -5608,6 +6701,7 @@ components:
         - precommit_id
         - expected_candidate_index_version
         - message
+        - data_layout
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -5623,6 +6717,8 @@ components:
           $ref: "#/components/schemas/PreCommitId"
         expected_candidate_index_version:
           $ref: "#/components/schemas/IndexVersion"
+        data_layout:
+          $ref: "#/components/schemas/DataLayout"
         message:
           type: string
           minLength: 1
@@ -6059,10 +7155,7 @@ components:
         服务端必须验证 Project/Artifact 存在且 Commit 确属该 Artifact；Snapshot 不能创建 Artifact、
         改写 Artifact Head 或在创建后切换 Commit。Region 由 Volume 派生；用途、保留策略和
         Dataset Profile 不属于本请求。
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum: [actor, principal, request_digest]
+      additionalProperties: false
       required:
         - tenant_id
         - project_id
@@ -6096,28 +7189,183 @@ components:
         placement_reused:
           type: boolean
 
-    RetrySnapshotDeliveryRequest:
+    SnapshotDeliveryMode:
+      type: string
+      enum: [fuse, copy, hardlink]
+
+    HardlinkPolicy:
+      type: string
+      enum: [disabled, sealed_acl, trusted_local]
+
+    SnapshotDeliveryState:
+      type: string
+      enum: [requested, validating, materializing, ready, failed, deleting, deleted]
+
+    SnapshotDeliveryView:
       type: object
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum: [actor, principal, request_digest]
-      required: [tenant_id, snapshot_id, retry_request_id]
+      additionalProperties: false
+      required:
+        - delivery_id
+        - snapshot_id
+        - commit_id
+        - storage_volume_id
+        - mode
+        - target_relative_root
+        - state
+        - source_index_digest
+        - delivery_generation
+        - file_count
+        - size_bytes
+        - object_set_digest
+        - resource_version
+        - created_at_unix_ms
+        - updated_at_unix_ms
+      properties:
+        delivery_id:
+          $ref: "#/components/schemas/ResourceId"
+        snapshot_id:
+          $ref: "#/components/schemas/SnapshotId"
+        commit_id:
+          $ref: "#/components/schemas/CommitId"
+        storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        mode:
+          $ref: "#/components/schemas/SnapshotDeliveryMode"
+        target_relative_root:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        state:
+          $ref: "#/components/schemas/SnapshotDeliveryState"
+        source_index_digest:
+          $ref: "#/components/schemas/ContentDigest"
+        delivery_generation:
+          $ref: "#/components/schemas/CanonicalU64"
+        file_count:
+          $ref: "#/components/schemas/CanonicalU64"
+        size_bytes:
+          $ref: "#/components/schemas/CanonicalU64"
+        object_set_digest:
+          $ref: "#/components/schemas/ContentDigest"
+        resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        issue:
+          $ref: "#/components/schemas/ResourceIssueSummary"
+        created_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        updated_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    CreateSnapshotDeliveryRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, snapshot_id, mode, request_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
         snapshot_id:
           $ref: "#/components/schemas/SnapshotId"
-        retry_request_id:
+        mode:
+          $ref: "#/components/schemas/SnapshotDeliveryMode"
+        request_id:
+          $ref: "#/components/schemas/ResourceId"
+
+    CreateSnapshotDeliveryResponse:
+      type: object
+      additionalProperties: false
+      required: [delivery, replayed]
+      properties:
+        delivery:
+          $ref: "#/components/schemas/SnapshotDeliveryView"
+        replayed:
+          type: boolean
+
+    QuerySnapshotDeliveryRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, delivery_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        delivery_id:
+          $ref: "#/components/schemas/ResourceId"
+
+    QuerySnapshotDeliveryResponse:
+      type: object
+      additionalProperties: false
+      required: [delivery]
+      properties:
+        delivery:
+          $ref: "#/components/schemas/SnapshotDeliveryView"
+
+    QuerySnapshotDeliveryListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, snapshot_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        snapshot_id:
+          $ref: "#/components/schemas/SnapshotId"
+        cursor:
+          $ref: "#/components/schemas/PageCursor"
+        page_size:
+          $ref: "#/components/schemas/PageSize"
+
+    QuerySnapshotDeliveryListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/SnapshotDeliveryView"
+        next_cursor:
+          $ref: "#/components/schemas/PageCursor"
+
+    RetrySnapshotDeliveryRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, delivery_id, request_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        delivery_id:
+          $ref: "#/components/schemas/ResourceId"
+        request_id:
           $ref: "#/components/schemas/ResourceId"
 
     RetrySnapshotDeliveryResponse:
       type: object
       additionalProperties: false
-      required: [snapshot, replayed]
+      required: [delivery, replayed]
       properties:
-        snapshot:
-          $ref: "#/components/schemas/SnapshotView"
+        delivery:
+          $ref: "#/components/schemas/SnapshotDeliveryView"
+        replayed:
+          type: boolean
+
+    DeleteSnapshotDeliveryRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, delivery_id, request_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        delivery_id:
+          $ref: "#/components/schemas/ResourceId"
+        request_id:
+          $ref: "#/components/schemas/ResourceId"
+
+    DeleteSnapshotDeliveryResponse:
+      type: object
+      additionalProperties: false
+      required: [delivery, replayed]
+      properties:
+        delivery:
+          $ref: "#/components/schemas/SnapshotDeliveryView"
         replayed:
           type: boolean
 
@@ -6188,13 +7436,11 @@ components:
           $ref: "#/components/schemas/ResourceId"
         activity_type:
           type: string
-          enum: [created, phase_changed, ready, failed, retry_started]
+          enum: [created, status_changed, ready, failed]
         summary:
           type: string
           minLength: 1
           maxLength: 1024
-        phase:
-          $ref: "#/components/schemas/SnapshotPhase"
         issue:
           $ref: "#/components/schemas/ResourceIssueSummary"
         created_at_unix_ms:
@@ -6222,16 +7468,12 @@ components:
       type: string
       enum: [creating, ready, abnormal]
 
-    SnapshotPhase:
-      type: string
-      enum: [planning, materializing, verifying, idle]
-
     SnapshotView:
       type: object
       description: |
-        独立身份、固定 Artifact Commit、单 StorageVolume 和单 Region 的只读交付资源。
-        `tenant_id + project_id + artifact_id + commit_id` 是不可变来源 scope；Snapshot 只是该 Commit
-        的交付视图，不拥有或改写 Artifact 数据权威。
+        独立身份，固定一个 Artifact、Commit、StorageVolume 和 Region 的不可变 Snapshot 资源。
+        `tenant_id + project_id + artifact_id + commit_id` 是不可变来源 scope；只读交付由独立的
+        SnapshotDelivery 资源表达，Snapshot 本身不保存挂载或物化模式，也不拥有或改写 Artifact 数据权威。
       additionalProperties: false
       required:
         - snapshot_id
@@ -6239,13 +7481,15 @@ components:
         - project_id
         - artifact_id
         - commit_id
+        - data_layout
         - storage_volume_id
         - region
         - message
         - tag_names
         - state
-        - phase
         - integrity
+        - resource_version
+        - lifecycle
         - logical_file_count
         - logical_size_bytes
         - created_at_unix_ms
@@ -6261,6 +7505,8 @@ components:
           $ref: "#/components/schemas/ArtifactId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
+        data_layout:
+          $ref: "#/components/schemas/DataLayout"
         storage_volume_id:
           $ref: "#/components/schemas/StorageVolumeId"
         region:
@@ -6277,12 +7523,14 @@ components:
             $ref: "#/components/schemas/TagName"
         state:
           $ref: "#/components/schemas/SnapshotState"
-        phase:
-          $ref: "#/components/schemas/SnapshotPhase"
         issue:
           $ref: "#/components/schemas/ResourceIssueSummary"
         integrity:
           $ref: "#/components/schemas/SnapshotIntegritySummary"
+        resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        lifecycle:
+          $ref: "#/components/schemas/ResourceLifecycleView"
         logical_file_count:
           $ref: "#/components/schemas/CanonicalU64"
         logical_size_bytes:
@@ -6309,12 +7557,837 @@ components:
         verified_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
 
+    ResourceLifecycleState:
+      type: string
+      description: 与资源健康状态独立的访问和删除生命周期。
+      enum: [active, pending_delete, deleting, restoring, deleted]
+
+    ResourceLifecycleView:
+      type: object
+      description: |
+        四类可删除存储资源共享的生命周期 fence。`generation` 在删除、恢复和最终清理时单调增加，
+        Agent assignment、S3 Ticket 和迟到报告必须携带并匹配该值。
+      additionalProperties: false
+      required: [state, generation]
+      properties:
+        state:
+          $ref: "#/components/schemas/ResourceLifecycleState"
+        generation:
+          $ref: "#/components/schemas/PositiveCanonicalU64"
+        active_deletion_id:
+          $ref: "#/components/schemas/DeletionId"
+        delete_requested_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        purge_after_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        deleted_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    ResourceRef:
+      description: Tenant scope 由包含该引用的请求携带，不允许从资源 ID 推断或覆盖。
+      oneOf:
+        - $ref: "#/components/schemas/StorageVolumeResourceRef"
+        - $ref: "#/components/schemas/ArtifactResourceRef"
+        - $ref: "#/components/schemas/PlaygroundResourceRef"
+        - $ref: "#/components/schemas/SnapshotResourceRef"
+      discriminator:
+        propertyName: type
+        mapping:
+          storage_volume: "#/components/schemas/StorageVolumeResourceRef"
+          artifact: "#/components/schemas/ArtifactResourceRef"
+          playground: "#/components/schemas/PlaygroundResourceRef"
+          snapshot: "#/components/schemas/SnapshotResourceRef"
+
+    StorageVolumeResourceRef:
+      type: object
+      additionalProperties: false
+      required: [type, storage_volume_id]
+      properties:
+        type:
+          type: string
+          const: storage_volume
+        storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+
+    ArtifactResourceRef:
+      type: object
+      additionalProperties: false
+      required: [type, project_id, artifact_id]
+      properties:
+        type:
+          type: string
+          const: artifact
+        project_id:
+          $ref: "#/components/schemas/ProjectId"
+        artifact_id:
+          $ref: "#/components/schemas/ArtifactId"
+
+    PlaygroundResourceRef:
+      type: object
+      additionalProperties: false
+      required: [type, project_id, artifact_id, playground_id]
+      properties:
+        type:
+          type: string
+          const: playground
+        project_id:
+          $ref: "#/components/schemas/ProjectId"
+        artifact_id:
+          $ref: "#/components/schemas/ArtifactId"
+        playground_id:
+          $ref: "#/components/schemas/PlaygroundId"
+
+    SnapshotResourceRef:
+      type: object
+      additionalProperties: false
+      required: [type, snapshot_id]
+      properties:
+        type:
+          type: string
+          const: snapshot
+        snapshot_id:
+          $ref: "#/components/schemas/SnapshotId"
+
+    DeletionOperationState:
+      type: string
+      enum:
+        - requested
+        - quiescing
+        - quarantining
+        - recoverable
+        - restoring
+        - purging
+        - finalizing
+        - completed
+        - blocked
+        - failed
+
+    DeletionCompletion:
+      type: string
+      enum: [restored, purged]
+
+    RetentionHoldState:
+      type: string
+      enum: [active, released]
+
+    DeletionTargetView:
+      type: object
+      additionalProperties: false
+      required:
+        - resource
+        - resource_version
+        - lifecycle_generation
+        - requires_agent_cleanup
+      properties:
+        resource:
+          $ref: "#/components/schemas/ResourceRef"
+        resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        lifecycle_generation:
+          $ref: "#/components/schemas/PositiveCanonicalU64"
+        requires_agent_cleanup:
+          type: boolean
+
+    DeletionBlockerView:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        resource:
+          $ref: "#/components/schemas/ResourceRef"
+        message:
+          type: string
+          minLength: 1
+          maxLength: 4096
+
+    DeletionImpactView:
+      type: object
+      description: 五分钟内不可变且与资源版本、依赖集合和删除确认选项绑定的 dry-run 结果。
+      additionalProperties: false
+      required:
+        - tenant_id
+        - root
+        - cascade
+        - confirm_managed_data_erase
+        - targets
+        - active_job_count
+        - active_s3_credential_count
+        - estimated_file_count
+        - estimated_bytes
+        - blockers
+        - issued_at_unix_ms
+        - expires_at_unix_ms
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        root:
+          $ref: "#/components/schemas/ResourceRef"
+        cascade:
+          type: boolean
+        confirm_managed_data_erase:
+          type: boolean
+        targets:
+          type: array
+          maxItems: 10000
+          items:
+            $ref: "#/components/schemas/DeletionTargetView"
+        active_job_count:
+          $ref: "#/components/schemas/CanonicalU64"
+        active_s3_credential_count:
+          $ref: "#/components/schemas/CanonicalU64"
+        estimated_file_count:
+          $ref: "#/components/schemas/CanonicalU64"
+        estimated_bytes:
+          $ref: "#/components/schemas/CanonicalU64"
+        blockers:
+          type: array
+          maxItems: 10000
+          items:
+            $ref: "#/components/schemas/DeletionBlockerView"
+        issued_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        expires_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    DeletionOperationView:
+      type: object
+      description: 固定依赖批次的持久化安全删除 Saga；进入 `purging` 后不可恢复。
+      additionalProperties: false
+      required:
+        - deletion_id
+        - tenant_id
+        - root
+        - state
+        - resource_version
+        - targets
+        - request_id
+        - request_digest
+        - impact_digest
+        - cascade
+        - confirm_managed_data_erase
+        - purge_after_unix_ms
+        - created_at_unix_ms
+        - updated_at_unix_ms
+        - retry_count
+      properties:
+        deletion_id:
+          $ref: "#/components/schemas/DeletionId"
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        root:
+          $ref: "#/components/schemas/ResourceRef"
+        state:
+          $ref: "#/components/schemas/DeletionOperationState"
+        resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        targets:
+          type: array
+          maxItems: 10000
+          items:
+            $ref: "#/components/schemas/DeletionTargetView"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+        request_digest:
+          $ref: "#/components/schemas/ContentDigest"
+        impact_digest:
+          $ref: "#/components/schemas/ContentDigest"
+        cascade:
+          type: boolean
+        confirm_managed_data_erase:
+          type: boolean
+        purge_after_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        created_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        updated_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        completion:
+          $ref: "#/components/schemas/DeletionCompletion"
+        last_error:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        resume_state:
+          allOf:
+            - $ref: "#/components/schemas/DeletionOperationState"
+          description: |
+            `blocked` 或 `failed` 操作的持久化恢复点。重试会返回此阶段；`restoring`
+            表示继续恢复，其余可恢复阶段表示继续删除。非错误状态不返回该字段。
+        retry_count:
+          $ref: "#/components/schemas/CanonicalU64"
+
+    RetentionHoldView:
+      type: object
+      description: 只阻止任务进入物理清理阶段，不恢复或扩大资源访问权限。
+      additionalProperties: false
+      required:
+        - retention_hold_id
+        - tenant_id
+        - deletion_id
+        - reason
+        - state
+        - created_at_unix_ms
+      properties:
+        retention_hold_id:
+          $ref: "#/components/schemas/RetentionHoldId"
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        deletion_id:
+          $ref: "#/components/schemas/DeletionId"
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2048
+        state:
+          $ref: "#/components/schemas/RetentionHoldState"
+        expires_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        created_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        released_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    QueryDeletionImpactRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - tenant_id
+        - resource
+        - cascade
+        - confirm_managed_data_erase
+        - expected_resource_version
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        resource:
+          $ref: "#/components/schemas/ResourceRef"
+        cascade:
+          type: boolean
+        confirm_managed_data_erase:
+          type: boolean
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+
+    QueryDeletionImpactResponse:
+      type: object
+      additionalProperties: false
+      required: [impact, impact_digest]
+      properties:
+        impact:
+          $ref: "#/components/schemas/DeletionImpactView"
+        impact_digest:
+          $ref: "#/components/schemas/ContentDigest"
+
+    CreateDeletionRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - tenant_id
+        - resource
+        - cascade
+        - confirm_managed_data_erase
+        - expected_resource_version
+        - impact_digest
+        - request_id
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        resource:
+          $ref: "#/components/schemas/ResourceRef"
+        cascade:
+          type: boolean
+        confirm_managed_data_erase:
+          type: boolean
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        impact_digest:
+          $ref: "#/components/schemas/ContentDigest"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+
+    QueryDeletionRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, deletion_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        deletion_id:
+          $ref: "#/components/schemas/DeletionId"
+
+    QueryDeletionResponse:
+      type: object
+      additionalProperties: false
+      required: [deletion, retention_holds]
+      properties:
+        deletion:
+          $ref: "#/components/schemas/DeletionOperationView"
+        retention_holds:
+          type: array
+          maxItems: 10000
+          items:
+            $ref: "#/components/schemas/RetentionHoldView"
+
+    QueryDeletionListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        states:
+          type: array
+          maxItems: 10
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/DeletionOperationState"
+        cursor:
+          $ref: "#/components/schemas/PageCursor"
+        page_size:
+          $ref: "#/components/schemas/PageSize"
+
+    QueryDeletionListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/DeletionOperationView"
+        next_cursor:
+          $ref: "#/components/schemas/PageCursor"
+
+    UpdateDeletionRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, deletion_id, request_id, expected_resource_version]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        deletion_id:
+          $ref: "#/components/schemas/DeletionId"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+
+    CreateRetentionHoldRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - tenant_id
+        - deletion_id
+        - request_id
+        - expected_resource_version
+        - reason
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        deletion_id:
+          $ref: "#/components/schemas/DeletionId"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2048
+        expires_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    ReleaseRetentionHoldRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - tenant_id
+        - deletion_id
+        - retention_hold_id
+        - request_id
+        - expected_resource_version
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        deletion_id:
+          $ref: "#/components/schemas/DeletionId"
+        retention_hold_id:
+          $ref: "#/components/schemas/RetentionHoldId"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+        expected_resource_version:
+          $ref: "#/components/schemas/CanonicalU64"
+
+    DeletionMutationResponse:
+      type: object
+      additionalProperties: false
+      required: [deletion, replayed]
+      properties:
+        deletion:
+          $ref: "#/components/schemas/DeletionOperationView"
+        replayed:
+          type: boolean
+
+    CreateRetentionHoldResponse:
+      type: object
+      additionalProperties: false
+      required: [deletion, retention_hold, replayed]
+      properties:
+        deletion:
+          $ref: "#/components/schemas/DeletionOperationView"
+        retention_hold:
+          $ref: "#/components/schemas/RetentionHoldView"
+        replayed:
+          type: boolean
+
+    ReleaseRetentionHoldResponse:
+      type: object
+      additionalProperties: false
+      required: [deletion, retention_hold, replayed]
+      properties:
+        deletion:
+          $ref: "#/components/schemas/DeletionOperationView"
+        retention_hold:
+          $ref: "#/components/schemas/RetentionHoldView"
+        replayed:
+          type: boolean
+
+    CreateS3AccessPointRequest:
+      type: object
+      description: |
+        为同 Tenant 下的 Ready Snapshot 开启只读 S3 Access Point。
+      additionalProperties: false
+      required: [tenant_id, snapshot_id, bucket_name, request_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        snapshot_id:
+          $ref: "#/components/schemas/SnapshotId"
+        bucket_name:
+          $ref: "#/components/schemas/S3BucketName"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+
+    QueryS3AccessPointListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        cursor:
+          $ref: "#/components/schemas/PageCursor"
+        page_size:
+          $ref: "#/components/schemas/PageSize"
+
+    QueryS3AccessPointListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/S3AccessPointView"
+        next_cursor:
+          $ref: "#/components/schemas/PageCursor"
+
+    QueryS3AccessPointRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, access_point_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        access_point_id:
+          $ref: "#/components/schemas/S3AccessPointId"
+
+    QueryS3AccessPointResponse:
+      type: object
+      additionalProperties: false
+      required: [access_point]
+      properties:
+        access_point:
+          $ref: "#/components/schemas/S3AccessPointView"
+
+    UpdateS3AccessPointRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, access_point_id, request_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        access_point_id:
+          $ref: "#/components/schemas/S3AccessPointId"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+
+    UpdateS3AccessPointResponse:
+      type: object
+      additionalProperties: false
+      required: [access_point, replayed]
+      properties:
+        access_point:
+          $ref: "#/components/schemas/S3AccessPointView"
+        replayed:
+          type: boolean
+
+    CreateS3AccessPointResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - access_point
+        - access_key_id
+        - credential_expires_at_unix_ms
+        - replayed
+      properties:
+        access_point:
+          $ref: "#/components/schemas/S3AccessPointView"
+        access_key_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        secret_access_key:
+          type: string
+          writeOnly: true
+          maxLength: 2048
+        credential_expires_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        replayed:
+          type: boolean
+
+    CreateS3CredentialRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, access_point_id, request_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        access_point_id:
+          $ref: "#/components/schemas/S3AccessPointId"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+        expires_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    CreateS3CredentialResponse:
+      type: object
+      additionalProperties: false
+      required: [credential, replayed]
+      properties:
+        credential:
+          $ref: "#/components/schemas/S3CredentialView"
+        secret_access_key:
+          type: string
+          writeOnly: true
+          maxLength: 2048
+        replayed:
+          type: boolean
+
+    QueryS3CredentialListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, access_point_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        access_point_id:
+          $ref: "#/components/schemas/S3AccessPointId"
+
+    QueryS3CredentialListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/S3CredentialView"
+
+    RevokeS3CredentialRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, access_point_id, credential_id, request_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        access_point_id:
+          $ref: "#/components/schemas/S3AccessPointId"
+        credential_id:
+          $ref: "#/components/schemas/S3CredentialId"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+
+    QueryS3ObjectListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, access_point_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        access_point_id:
+          $ref: "#/components/schemas/S3AccessPointId"
+        prefix:
+          $ref: "#/components/schemas/S3ObjectKeyPrefix"
+        delimiter:
+          type: string
+          enum: ["", "/"]
+        cursor:
+          $ref: "#/components/schemas/PageCursor"
+        page_size:
+          $ref: "#/components/schemas/S3PageSize"
+
+    QueryS3ObjectListResponse:
+      type: object
+      additionalProperties: false
+      required: [items, common_prefixes]
+      properties:
+        items:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/S3ObjectEntryView"
+        common_prefixes:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/S3ObjectKeyPrefix"
+        next_cursor:
+          $ref: "#/components/schemas/PageCursor"
+
+    CreateS3DownloadUrlRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, access_point_id, key]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        access_point_id:
+          $ref: "#/components/schemas/S3AccessPointId"
+        key:
+          $ref: "#/components/schemas/S3ObjectKey"
+        expires_seconds:
+          type: integer
+          minimum: 1
+          maximum: 300
+
+    CreateS3DownloadUrlResponse:
+      type: object
+      additionalProperties: false
+      required: [url, expires_at_unix_ms]
+      properties:
+        url:
+          type: string
+          format: uri-reference
+          minLength: 1
+          maxLength: 8192
+        expires_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    S3AccessPointView:
+      type: object
+      additionalProperties: false
+      required:
+        - access_point_id
+        - tenant_id
+        - project_id
+        - artifact_id
+        - snapshot_id
+        - commit_id
+        - bucket_name
+        - endpoint
+        - region
+        - state
+        - policy_generation
+        - created_at_unix_ms
+        - updated_at_unix_ms
+      properties:
+        access_point_id:
+          $ref: "#/components/schemas/S3AccessPointId"
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        project_id:
+          $ref: "#/components/schemas/ProjectId"
+        artifact_id:
+          $ref: "#/components/schemas/ArtifactId"
+        snapshot_id:
+          $ref: "#/components/schemas/SnapshotId"
+        commit_id:
+          $ref: "#/components/schemas/CommitId"
+        bucket_name:
+          $ref: "#/components/schemas/S3BucketName"
+        endpoint:
+          type: string
+          format: uri-reference
+          minLength: 1
+          maxLength: 2048
+        region:
+          $ref: "#/components/schemas/RegionName"
+        state:
+          $ref: "#/components/schemas/S3AccessPointState"
+        policy_generation:
+          $ref: "#/components/schemas/PositiveCanonicalU64"
+        created_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        updated_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    S3CredentialView:
+      type: object
+      additionalProperties: false
+      required:
+        - credential_id
+        - access_point_id
+        - access_key_id
+        - state
+        - expires_at_unix_ms
+        - created_at_unix_ms
+      properties:
+        credential_id:
+          $ref: "#/components/schemas/S3CredentialId"
+        access_point_id:
+          $ref: "#/components/schemas/S3AccessPointId"
+        access_key_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        state:
+          $ref: "#/components/schemas/S3CredentialState"
+        expires_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        created_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+        last_used_at_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
+    S3ObjectEntryView:
+      type: object
+      additionalProperties: false
+      required: [key, entry_type]
+      properties:
+        key:
+          $ref: "#/components/schemas/S3ObjectKey"
+        entry_type:
+          $ref: "#/components/schemas/S3ObjectEntryType"
+        size_bytes:
+          $ref: "#/components/schemas/CanonicalU64"
+        etag:
+          type: string
+          minLength: 1
+          maxLength: 512
+        last_modified_unix_ms:
+          $ref: "#/components/schemas/UnixMillis"
+
     CreateAddJobRequest:
       type: object
       description: |
         公开 Add operation。服务端将认证后的 PrincipalRef 注入 canonical operation 后计算
-        `request_digest` 并写入内部 AddJobSpec；请求中的未知非保留字段按协议兼容规则参与 digest。
-      additionalProperties: true
+        `request_digest` 并写入内部 AddJobSpec；请求字段必须严格匹配本 schema。
+      additionalProperties: false
       required:
         - tenant_id
         - project_id
@@ -6414,36 +8487,7 @@ components:
       description: |
         面向用户的脱敏 Job。不得增加 assignment target、Agent/Volume/Mount identity、
         generation/fencing、PublicationCandidate、Manifest、IndexDelta 或 authority 物理信息。
-      additionalProperties: true
-      propertyNames:
-        not:
-          enum:
-            - accepted
-            - agent_id
-            - agent_mount_id
-            - artifact_placement_id
-            - assignment
-            - assignment_generation
-            - assignment_id
-            - assignment_target
-            - decision_generation
-            - edge_cluster_id
-            - fencing
-            - fencing_token
-            - finalized_ack
-            - generation
-            - index_delta
-            - lease
-            - manifest
-            - manifests
-            - mount_generation
-            - mutations
-            - owner_generation
-            - placement_generation
-            - prepared
-            - publication_candidate
-            - resume_publication
-            - storage_volume_id
+      additionalProperties: false
       required:
         - operation
         - tenant_id
@@ -6485,7 +8529,7 @@ components:
 
     PublicJobProgress:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required:
         - state
         - phase
@@ -6519,7 +8563,7 @@ components:
 
     PublishJobDecision:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required: [outcome, final_state, published_index_version]
       properties:
         outcome:
@@ -6533,7 +8577,7 @@ components:
 
     ConflictJobDecision:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required: [outcome, final_state, current_index_version]
       properties:
         outcome:
@@ -6547,7 +8591,7 @@ components:
 
     RejectJobDecision:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required: [outcome, final_state, error]
       properties:
         outcome:
@@ -6566,7 +8610,7 @@ components:
 
     PublicJobFailure:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required: [final_state, failed_at_unix_ms, stage, error]
       properties:
         final_state:
@@ -6591,7 +8635,7 @@ components:
 
     JobError:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required: [code, message, retryable]
       properties:
         code:
@@ -6608,7 +8652,7 @@ components:
     ProblemDetails:
       type: object
       description: RFC 9457 Problem Details，并携带 NeoEngram 稳定错误字段。
-      additionalProperties: true
+      additionalProperties: false
       required:
         - type
         - title
@@ -6701,6 +8745,14 @@ components:
       $ref: "#/components/schemas/ResourceId"
     SnapshotId:
       $ref: "#/components/schemas/ResourceId"
+    S3AccessPointId:
+      $ref: "#/components/schemas/ResourceId"
+    S3CredentialId:
+      $ref: "#/components/schemas/ResourceId"
+    DeletionId:
+      $ref: "#/components/schemas/ResourceId"
+    RetentionHoldId:
+      $ref: "#/components/schemas/ResourceId"
     JobId:
       $ref: "#/components/schemas/ResourceId"
     RequestId:
@@ -6767,6 +8819,32 @@ components:
       type: string
       enum: [ready, degraded, unavailable]
 
+    S3AccessPointState:
+      type: string
+      enum: [active, disabled]
+
+    S3CredentialState:
+      type: string
+      enum: [active, revoked, expired]
+
+    S3ObjectEntryType:
+      type: string
+      enum: [object, prefix]
+
+    S3BucketName:
+      type: string
+      description: S3 DNS-compatible bucket name; names are globally unique across the control plane.
+      minLength: 3
+      maxLength: 63
+      pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$'
+
+    S3ObjectKey:
+      $ref: "#/components/schemas/LogicalPath"
+
+    S3ObjectKeyPrefix:
+      type: string
+      maxLength: 1024
+
     PermissionName:
       type: string
       minLength: 3
@@ -6786,10 +8864,17 @@ components:
         - storage.enrollment.review
         - artifact.read
         - artifact.create
+        - project.read
+        - project.create
         - playground.read
         - playground.create
         - snapshot.read
         - snapshot.create
+        - s3.access.read
+        - s3.access.manage
+        - resource.lifecycle.read
+        - resource.lifecycle.manage
+        - retention.manage
         - gateway.read
         - gateway.manage
 
@@ -6811,6 +8896,12 @@ components:
       maximum: 100
       default: 50
 
+    S3PageSize:
+      type: integer
+      minimum: 1
+      maximum: 1000
+      default: 100
+
     SearchQuery:
       type: string
       minLength: 1
@@ -6827,6 +8918,11 @@ components:
       minLength: 1
       maxLength: 20
       pattern: "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+
+    DecimalU64:
+      allOf:
+        - $ref: "#/components/schemas/CanonicalU64"
+      description: 无符号整数，编码为 canonical decimal JSON string。
 
     PositiveCanonicalU64:
       allOf:
@@ -6848,7 +8944,7 @@ components:
 
     IndexVersion:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required: [revision, digest]
       properties:
         revision:

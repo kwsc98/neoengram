@@ -1,5 +1,6 @@
-# The Pool Service is the Agent edge entry point. Replica Services are stable, non-load-balanced
-# addresses for Central's persisted control/bootstrap endpoints and for peer forwarding.
+# The Pool Service is the Agent edge and public Web/S3 entry point. An external TLS-aware ingress
+# forwards the console and S3 hostnames to port 443; Replica Services remain stable,
+# non-load-balanced addresses for Central control/bootstrap and peer forwarding.
 apiVersion: v1
 kind: Service
 metadata:
@@ -19,6 +20,10 @@ spec:
     neoengram.io/edge-cluster: edge-example
     neoengram.io/gateway-pool: gateway-pool-example
   ports:
+    - name: public
+      port: 443
+      targetPort: public
+      protocol: TCP
     - name: agent
       port: 8443
       targetPort: agent

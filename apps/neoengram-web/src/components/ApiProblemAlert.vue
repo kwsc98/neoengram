@@ -20,15 +20,15 @@ const title = computed(() => {
     case 403:
       return '当前身份无权执行此操作';
     case 404:
-      return '未找到可见的 Job';
+      return '未找到请求的资源';
     case 408:
-      return 'Job 已超过 deadline';
+      return '请求等待时间过长';
     case 409:
       return '请求与当前状态冲突';
     case 422:
       return '请求未通过校验';
     case 503:
-      return '中心 authority 暂不可用';
+      return '服务暂时不可用';
     default:
       return '请求未完成';
   }

@@ -30,6 +30,7 @@ function precommit(overrides: Partial<PreCommitView> = {}): PreCommitView {
     warnings: [],
     blockers: [],
     source_index_version: { revision: '1', digest: 'sha256:source' },
+    data_layout: 'fast_cdc',
     candidate_index_version: { revision: '2', digest: 'sha256:candidate' },
     created_at_unix_ms: '1',
     updated_at_unix_ms: '2',

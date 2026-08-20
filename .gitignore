@@ -6,7 +6,8 @@
 /apps/neoengram-web/dist/
 /apps/neoengram-web/coverage/
 /apps/neoengram-web/playwright-report/
-/apps/neoengram-web/test-results/
+/apps/neoengram-web/test-results*/
+/apps/neoengram-web/.env.local-gateway
 .neoengram/
 **/*.rs.bk
 .DS_Store

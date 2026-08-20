@@ -1,5 +1,7 @@
 import { http, HttpResponse } from 'msw';
 
+import { runtimeConfig } from '@/config';
+
 import type {
   ApproveStorageEnrollmentRequest,
   ApproveStorageEnrollmentResponse,
@@ -16,6 +18,10 @@ import type {
   CreateArtifactResponse,
   CreatePlaygroundRequest,
   CreatePlaygroundResponse,
+  CreateProjectRequest,
+  CreateProjectResponse,
+  CreateSnapshotDeliveryRequest,
+  CreateSnapshotDeliveryResponse,
   CreateSnapshotRequest,
   CreateSnapshotResponse,
   CreateStorageEnrollmentTokenRequest,
@@ -26,6 +32,8 @@ import type {
   CreateTenantResponse,
   FinalizeAddJobResponse,
   JobView,
+  DeleteSnapshotDeliveryRequest,
+  DeleteSnapshotDeliveryResponse,
   PreCommitView,
   ProblemDetails,
   QueryArtifactListRequest,
@@ -52,6 +60,10 @@ import type {
   QuerySnapshotActivityListResponse,
   QuerySnapshotDatasetProfileRequest,
   QuerySnapshotDatasetProfileResponse,
+  QuerySnapshotDeliveryListRequest,
+  QuerySnapshotDeliveryListResponse,
+  QuerySnapshotDeliveryRequest,
+  QuerySnapshotDeliveryResponse,
   QuerySnapshotFileListRequest,
   QuerySnapshotFileListResponse,
   QuerySnapshotResponse,
@@ -65,6 +77,46 @@ import type {
   RejectStorageEnrollmentResponse,
   RetrySnapshotDeliveryRequest,
   RetrySnapshotDeliveryResponse,
+  SnapshotDeliveryView,
+  CreateS3AccessPointRequest,
+  CreateS3AccessPointResponse,
+  QueryS3AccessPointListRequest,
+  QueryS3AccessPointListResponse,
+  QueryS3AccessPointRequest,
+  QueryS3AccessPointResponse,
+  UpdateS3AccessPointRequest,
+  UpdateS3AccessPointResponse,
+  CreateS3CredentialRequest,
+  CreateS3CredentialResponse,
+  QueryS3CredentialListRequest,
+  QueryS3CredentialListResponse,
+  RevokeS3CredentialRequest,
+  QueryS3ObjectListRequest,
+  QueryS3ObjectListResponse,
+  CreateS3DownloadUrlRequest,
+  CreateS3DownloadUrlResponse,
+  CreateDeletionRequest,
+  CreateRetentionHoldRequest,
+  CreateRetentionHoldResponse,
+  DeletionImpactView,
+  DeletionMutationResponse,
+  DeletionOperationView,
+  DeletionTargetView,
+  QueryDeletionImpactRequest,
+  QueryDeletionImpactResponse,
+  QueryDeletionListRequest,
+  QueryDeletionListResponse,
+  QueryDeletionRequest,
+  QueryDeletionResponse,
+  ReleaseRetentionHoldRequest,
+  ReleaseRetentionHoldResponse,
+  ResourceRef,
+  ResourceLifecycleView,
+  RetentionHoldView,
+  UpdateDeletionRequest,
+  S3AccessPointView,
+  S3CredentialView,
+  S3ObjectEntryView,
   StartPreCommitRequest,
   StartPreCommitResponse,
   QueryStorageVolumeListRequest,
@@ -87,9 +139,13 @@ import {
   resourceKey,
   resetMockData,
   snapshots,
+  s3AccessPoints,
+  s3Credentials,
+  s3Objects,
   storageVolumes,
   tenants,
 } from './data';
+import { resolveMockS3Path } from './s3-files';
 
 interface StoredJob {
   request: CreateAddJobRequest;
@@ -136,6 +192,7 @@ interface PvcOwner {
 
 const jobs = new Map<string, StoredJob>();
 const tenantCreatePayloads = new Map<string, string>();
+const projectCreatePayloads = new Map<string, string>();
 const storageVolumeCreatePayloads = new Map<string, string>();
 const storageEnrollmentTokenRequests = new Map<
   string,
@@ -169,11 +226,32 @@ const snapshotCreateRequests = new Map<
   string,
   { requestJson: string; response: CreateSnapshotResponse }
 >();
+const snapshotDeliveries: SnapshotDeliveryView[] = [];
+const snapshotDeliveryCreateRequests = new Map<
+  string,
+  { requestJson: string; response: CreateSnapshotDeliveryResponse }
+>();
 const snapshotRetryRequests = new Map<
   string,
   { requestJson: string; response: RetrySnapshotDeliveryResponse }
 >();
+const snapshotDeliveryDeleteRequests = new Map<
+  string,
+  { requestJson: string; response: DeleteSnapshotDeliveryResponse }
+>();
 const snapshotQueryCounts = new Map<string, number>();
+const s3AccessPointCreateRequests = new Map<
+  string,
+  { requestJson: string; response: CreateS3AccessPointResponse }
+>();
+const s3CredentialCreateRequests = new Map<
+  string,
+  { requestJson: string; response: CreateS3CredentialResponse }
+>();
+const deletionOperations: DeletionOperationView[] = [];
+const deletionImpacts = new Map<string, DeletionImpactView>();
+const deletionMutationRequests = new Map<string, { requestJson: string; response: unknown }>();
+const retentionHolds: RetentionHoldView[] = [];
 
 const READY_AFTER_QUERY_COUNT = 2;
 
@@ -289,6 +367,203 @@ function contentDigest(value: unknown): string {
     digest += (hash >>> 0).toString(16).padStart(8, '0');
   }
   return digest;
+}
+
+type LifecycleMockResource = {
+  resource_version?: string;
+  lifecycle?: ResourceLifecycleView;
+};
+
+function activeLifecycle(): ResourceLifecycleView {
+  return { state: 'active', generation: '1' };
+}
+
+function resourceIdentity(resource: ResourceRef): string {
+  switch (resource.type) {
+    case 'storage_volume':
+      return resourceKey(resource.type, resource.storage_volume_id);
+    case 'artifact':
+      return resourceKey(resource.type, resource.project_id, resource.artifact_id);
+    case 'playground':
+      return resourceKey(
+        resource.type,
+        resource.project_id,
+        resource.artifact_id,
+        resource.playground_id,
+      );
+    case 'snapshot':
+      return resourceKey(resource.type, resource.snapshot_id);
+  }
+}
+
+function findLifecycleResource(
+  tenantId: string,
+  resource: ResourceRef,
+): LifecycleMockResource | undefined {
+  switch (resource.type) {
+    case 'storage_volume':
+      return storageVolumes.find(
+        (item) =>
+          item.tenant_id === tenantId && item.storage_volume_id === resource.storage_volume_id,
+      );
+    case 'artifact':
+      return artifacts.find(
+        (item) =>
+          item.tenant_id === tenantId &&
+          item.project_id === resource.project_id &&
+          item.artifact_id === resource.artifact_id,
+      );
+    case 'playground':
+      return playgrounds.find(
+        (item) =>
+          item.tenant_id === tenantId &&
+          item.project_id === resource.project_id &&
+          item.artifact_id === resource.artifact_id &&
+          item.playground_id === resource.playground_id,
+      );
+    case 'snapshot':
+      return snapshots.find(
+        (item) => item.tenant_id === tenantId && item.snapshot_id === resource.snapshot_id,
+      );
+  }
+}
+
+function isLifecycleActive(resource: unknown): boolean {
+  return (
+    (resource as LifecycleMockResource).lifecycle?.state !== 'pending_delete' &&
+    (resource as LifecycleMockResource).lifecycle?.state !== 'deleting' &&
+    (resource as LifecycleMockResource).lifecycle?.state !== 'restoring' &&
+    (resource as LifecycleMockResource).lifecycle?.state !== 'deleted'
+  );
+}
+
+function resourceTarget(tenantId: string, resource: ResourceRef): DeletionTargetView | undefined {
+  const found = findLifecycleResource(tenantId, resource);
+  if (!found?.resource_version) return undefined;
+  return {
+    resource,
+    resource_version: found.resource_version,
+    lifecycle_generation: found.lifecycle?.generation ?? '1',
+    requires_agent_cleanup: resource.type !== 'artifact',
+  };
+}
+
+function deletionTargets(
+  tenantId: string,
+  root: ResourceRef,
+  cascade: boolean,
+): DeletionTargetView[] {
+  const refs: ResourceRef[] = [root];
+  if (cascade && root.type === 'artifact') {
+    refs.push(
+      ...playgrounds
+        .filter(
+          (item) =>
+            item.tenant_id === tenantId &&
+            item.project_id === root.project_id &&
+            item.artifact_id === root.artifact_id &&
+            isLifecycleActive(item),
+        )
+        .map((item) => ({
+          type: 'playground' as const,
+          project_id: item.project_id,
+          artifact_id: item.artifact_id,
+          playground_id: item.playground_id,
+        })),
+      ...snapshots
+        .filter(
+          (item) =>
+            item.tenant_id === tenantId &&
+            item.project_id === root.project_id &&
+            item.artifact_id === root.artifact_id &&
+            isLifecycleActive(item),
+        )
+        .map((item) => ({ type: 'snapshot' as const, snapshot_id: item.snapshot_id })),
+    );
+  }
+  if (cascade && root.type === 'storage_volume') {
+    refs.push(
+      ...playgrounds
+        .filter(
+          (item) =>
+            item.tenant_id === tenantId &&
+            item.storage_volume_id === root.storage_volume_id &&
+            isLifecycleActive(item),
+        )
+        .map((item) => ({
+          type: 'playground' as const,
+          project_id: item.project_id,
+          artifact_id: item.artifact_id,
+          playground_id: item.playground_id,
+        })),
+      ...snapshots
+        .filter(
+          (item) =>
+            item.tenant_id === tenantId &&
+            item.storage_volume_id === root.storage_volume_id &&
+            isLifecycleActive(item),
+        )
+        .map((item) => ({ type: 'snapshot' as const, snapshot_id: item.snapshot_id })),
+    );
+  }
+  return [...new Map(refs.map((resource) => [resourceIdentity(resource), resource])).values()]
+    .map((resource) => resourceTarget(tenantId, resource))
+    .filter((target): target is DeletionTargetView => Boolean(target));
+}
+
+function setResourceLifecycle(
+  tenantId: string,
+  target: DeletionTargetView,
+  state: 'active' | 'pending_delete' | 'restoring' | 'deleted',
+  deletionId?: string,
+  purgeAfter?: string,
+): void {
+  const resource = findLifecycleResource(tenantId, target.resource);
+  if (!resource) return;
+  const now = Date.now().toString();
+  resource.resource_version = (BigInt(resource.resource_version ?? '1') + 1n).toString();
+  const lifecycle: NonNullable<LifecycleMockResource['lifecycle']> = {
+    state,
+    generation: (BigInt(target.lifecycle_generation) + 1n).toString(),
+  };
+  if (state !== 'active') {
+    if (deletionId) lifecycle.active_deletion_id = deletionId;
+    lifecycle.delete_requested_at_unix_ms = now;
+    if (purgeAfter) lifecycle.purge_after_unix_ms = purgeAfter;
+  }
+  resource.lifecycle = lifecycle;
+}
+
+function seedDeletionState(): void {
+  deletionOperations.length = 0;
+  deletionImpacts.clear();
+  deletionMutationRequests.clear();
+  retentionHolds.length = 0;
+  const now = Date.now();
+  deletionOperations.push({
+    deletion_id: 'deletion-example-recoverable',
+    tenant_id: 'tenant-a',
+    root: { type: 'snapshot', snapshot_id: 'snapshot-archived-example' },
+    state: 'recoverable',
+    resource_version: '3',
+    targets: [
+      {
+        resource: { type: 'snapshot', snapshot_id: 'snapshot-archived-example' },
+        resource_version: '2',
+        lifecycle_generation: '2',
+        requires_agent_cleanup: true,
+      },
+    ],
+    request_id: 'seed-deletion-request',
+    request_digest: 'a'.repeat(64),
+    impact_digest: 'b'.repeat(64),
+    cascade: false,
+    confirm_managed_data_erase: false,
+    purge_after_unix_ms: (now + 5 * 24 * 60 * 60 * 1_000).toString(),
+    created_at_unix_ms: (now - 2 * 24 * 60 * 60 * 1_000).toString(),
+    updated_at_unix_ms: (now - 60_000).toString(),
+    retry_count: '0',
+  });
 }
 
 function paginate<T>(
@@ -537,7 +812,6 @@ function seedStorageEnrollmentState(): void {
       probe: {
         descriptor_matches: true,
         observed_access_mode: 'read_write',
-        protocol_compatible: true,
         observed_at_unix_ms: createdAtUnixMs,
       },
       resource_version: '1',
@@ -562,7 +836,6 @@ function seedStorageEnrollmentState(): void {
       probe: {
         descriptor_matches: true,
         observed_access_mode: 'read_write',
-        protocol_compatible: true,
         observed_at_unix_ms: createdAtUnixMs,
       },
       resource_version: '1',
@@ -587,7 +860,6 @@ function seedStorageEnrollmentState(): void {
       probe: {
         descriptor_matches: true,
         observed_access_mode: 'read_write',
-        protocol_compatible: true,
         observed_at_unix_ms: createdAtUnixMs,
       },
       resource_version: '1',
@@ -632,6 +904,48 @@ function resolveStorageVolume(
   return storageVolume;
 }
 
+function resolveSnapshotDelivery(
+  tenantId: string,
+  deliveryId: string,
+): { delivery: SnapshotDeliveryView; snapshot: (typeof snapshots)[number] } | undefined {
+  const delivery = snapshotDeliveries.find((item) => item.delivery_id === deliveryId);
+  if (!delivery) return undefined;
+  const snapshot = snapshots.find(
+    (item) => item.tenant_id === tenantId && item.snapshot_id === delivery.snapshot_id,
+  );
+  return snapshot ? { delivery, snapshot } : undefined;
+}
+
+function seedSnapshotDeliveryState(): void {
+  snapshotDeliveries.splice(0, snapshotDeliveries.length);
+  const snapshot = snapshots.find(
+    (item) => item.tenant_id === 'tenant-a' && item.snapshot_id === 'snap-road-main3-sha-01',
+  );
+  if (!snapshot) return;
+  snapshotDeliveries.push({
+    delivery_id: 'delivery-snapshot-main3-01',
+    snapshot_id: snapshot.snapshot_id,
+    commit_id: snapshot.commit_id,
+    storage_volume_id: snapshot.storage_volume_id,
+    mode: 'copy',
+    target_relative_root: `snapshots/${snapshot.project_id}/${snapshot.artifact_id}/${snapshot.snapshot_id}/deliveries/delivery-snapshot-main3-01`,
+    state: 'failed',
+    source_index_digest: snapshot.commit_id,
+    delivery_generation: '1',
+    file_count: snapshot.logical_file_count,
+    size_bytes: snapshot.logical_size_bytes,
+    object_set_digest: snapshot.commit_id,
+    resource_version: '1',
+    issue: {
+      code: 'COPY_INSUFFICIENT_SPACE',
+      message: 'The target Volume does not have enough reserved space',
+      retryable: true,
+    },
+    created_at_unix_ms: snapshot.created_at_unix_ms,
+    updated_at_unix_ms: snapshot.updated_at_unix_ms,
+  });
+}
+
 function seedPreCommitState(): void {
   const playground = playgrounds.find(
     (item) =>
@@ -649,6 +963,7 @@ function seedPreCommitState(): void {
     playground_id: playground.playground_id,
     precommit_id: playground.active_precommit_id,
     precommit_request_id: 'precommit-nightly-seeded',
+    data_layout: 'fast_cdc',
     attempt: 1,
     state: 'running',
     phase: 'hashing',
@@ -678,17 +993,61 @@ function mutationConflict(
   return problem(request, 409, code, 'Resource mutation conflict', detail);
 }
 
-function notFound(
-  request: Request,
-  resource: 'Artifact' | 'Playground' | 'Snapshot',
-): HttpResponse<ProblemDetails> {
+function notFound(request: Request, resource: string): HttpResponse<ProblemDetails> {
   return problem(
     request,
     404,
-    `${resource.toUpperCase()}_NOT_FOUND`,
+    `${resource.toUpperCase().replaceAll(' ', '_')}_NOT_FOUND`,
     `${resource} not found`,
     `The requested ${resource} was not found`,
   );
+}
+
+function s3NotFound(request: Request, resource: string): HttpResponse<ProblemDetails> {
+  return problem(
+    request,
+    404,
+    `S3_${resource.toUpperCase()}_NOT_FOUND`,
+    `${resource} not found`,
+    `The requested S3 ${resource} was not found`,
+  );
+}
+
+function resolveS3AccessPoint(
+  request: Request,
+  tenantId: string,
+  accessPointId: string,
+): S3AccessPointView | HttpResponse<ProblemDetails> {
+  const accessPoint = s3AccessPoints.find(
+    (item) => item.tenant_id === tenantId && item.access_point_id === accessPointId,
+  );
+  return accessPoint ?? s3NotFound(request, 'access point');
+}
+
+function s3ObjectEntries(
+  entries: S3ObjectEntryView[],
+  prefix = '',
+  delimiter = '',
+): S3ObjectEntryView[] {
+  const matching = entries.filter(
+    (entry) => entry.entry_type === 'object' && entry.key.startsWith(prefix),
+  );
+  if (!delimiter) return matching;
+  const values: S3ObjectEntryView[] = [];
+  const prefixes = new Set<string>();
+  for (const entry of matching) {
+    const remainder = entry.key.slice(prefix.length);
+    const separator = remainder.indexOf(delimiter);
+    if (separator === -1) {
+      values.push(entry);
+      continue;
+    }
+    const key = prefix + remainder.slice(0, separator + delimiter.length);
+    if (prefixes.has(key)) continue;
+    prefixes.add(key);
+    values.push({ key, entry_type: 'prefix' });
+  }
+  return values.sort((left, right) => left.key.localeCompare(right.key));
 }
 
 function validateCreate(
@@ -901,16 +1260,78 @@ const mockDatasetProfile: QueryPlaygroundDatasetProfileResponse['profile'] = {
 };
 
 export const handlers = [
+  // In mock mode the Access Point endpoint defaults to the current Web origin. Keep the
+  // object data plane separate from Central's `/api` listener so an anchor download cannot
+  // accidentally turn into a Fusen service invocation.
+  http.get('*/road-scenes-snapshot/*', ({ request }) => {
+    const resolved = resolveMockS3Path(new URL(request.url).pathname);
+    if (!resolved) {
+      return new HttpResponse(
+        '<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>',
+        {
+          status: 404,
+          headers: { 'Content-Type': 'application/xml' },
+        },
+      );
+    }
+    if (!resolved.file) {
+      return new HttpResponse(
+        '<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>',
+        {
+          status: 404,
+          headers: { 'Content-Type': 'application/xml' },
+        },
+      );
+    }
+    const file = resolved.file;
+    const etag = file.etag === undefined ? {} : { ETag: file.etag };
+    return new HttpResponse(file.body, {
+      status: 200,
+      headers: {
+        'Content-Type': file.content_type,
+        'Content-Length': String(new TextEncoder().encode(file.body).byteLength),
+        'Content-Disposition': `attachment; filename="${file.key.split('/').pop() ?? 'download'}"`,
+        ...etag,
+        'Last-Modified': new Date(Number(file.last_modified_unix_ms)).toUTCString(),
+      },
+    });
+  }),
+  http.head('*/road-scenes-snapshot/*', ({ request }) => {
+    const resolved = resolveMockS3Path(new URL(request.url).pathname);
+    if (!resolved?.file) {
+      return new HttpResponse(null, { status: 404 });
+    }
+    const file = resolved.file;
+    const etag = file.etag === undefined ? {} : { ETag: file.etag };
+    return new HttpResponse(null, {
+      status: 200,
+      headers: {
+        'Content-Type': file.content_type,
+        'Content-Length': String(new TextEncoder().encode(file.body).byteLength),
+        ...etag,
+        'Last-Modified': new Date(Number(file.last_modified_unix_ms)).toUTCString(),
+      },
+    });
+  }),
   http.post('*/api/system/version/query', ({ request }) =>
     HttpResponse.json(
       {
-        api_versions: [1],
-        agent_protocol_versions: [1],
+        api_version: 1,
+        agent_wire_version: 1,
         capabilities: [
           'managed_add',
           'artifact_catalog',
+          'artifact_commit_graph',
+          'playground_browser',
+          'playground_materialize',
+          'playground_precommit',
           'snapshot_materialize',
-          'resource_browser',
+          'commit_layout_selection_v2',
+          'snapshot_delivery_fuse_v2',
+          'snapshot_delivery_copy_v2',
+          'snapshot_delivery_hardlink_v2',
+          's3_readonly_access_point',
+          'resource_lifecycle_v1',
           'storage_enrollment',
           'tenant_admin',
           'sqlite_authority',
@@ -1017,9 +1438,14 @@ export const handlers = [
         'storage.enrollment.review',
         'artifact.read',
         'artifact.create',
+        'project.read',
+        'project.create',
         'playground.create',
         'snapshot.create',
         'job.create',
+        'resource.lifecycle.read',
+        'resource.lifecycle.manage',
+        'retention.manage',
       ],
     };
     tenants.push(tenant);
@@ -1037,6 +1463,7 @@ export const handlers = [
     const filtered = storageVolumes.filter(
       (storageVolume) =>
         storageVolume.tenant_id === body.tenant_id &&
+        isLifecycleActive(storageVolume) &&
         (!body.region || storageVolume.region === body.region) &&
         (!body.backend_type || storageVolume.backend_type === body.backend_type) &&
         (!search ||
@@ -1163,11 +1590,16 @@ export const handlers = [
       region: body.region,
       backend_type: body.backend_type,
       access_mode: body.access_mode,
+      allowed_delivery_modes: body.allowed_delivery_modes ?? ['fuse', 'copy'],
+      hardlink_policy: body.hardlink_policy ?? 'disabled',
+      max_whole_file_bytes: body.max_whole_file_bytes ?? '18446744073709551615',
+      copy_reserve_bytes: body.copy_reserve_bytes ?? '0',
       ...(body.backend_type === 'pvc' && body.pvc_reference
         ? { pvc_reference: body.pvc_reference }
         : {}),
       state: 'unavailable',
       resource_version: '1',
+      lifecycle: activeLifecycle(),
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
@@ -1407,7 +1839,6 @@ export const handlers = [
     }
     if (
       !enrollment.probe.descriptor_matches ||
-      !enrollment.probe.protocol_compatible ||
       enrollment.probe.observed_access_mode !== 'read_write'
     ) {
       return mutationConflict(
@@ -1500,9 +1931,14 @@ export const handlers = [
         region: enrollment.region,
         backend_type: 'pvc',
         access_mode: enrollment.access_mode,
+        allowed_delivery_modes: ['fuse', 'copy'],
+        hardlink_policy: 'disabled',
+        max_whole_file_bytes: '18446744073709551615',
+        copy_reserve_bytes: '0',
         pvc_reference: structuredClone(enrollment.pvc_reference),
         state: 'unavailable',
         resource_version: '1',
+        lifecycle: activeLifecycle(),
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
       };
@@ -1634,6 +2070,59 @@ export const handlers = [
     const response: QueryProjectListResponse = page;
     return HttpResponse.json(response, { headers: headers(request) });
   }),
+  http.post('*/api/project/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateProjectRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    if (
+      !RESOURCE_ID_PATTERN.test(body.project_id) ||
+      !body.display_name?.trim() ||
+      (body.description !== undefined && body.description.length > 2048)
+    ) {
+      return problem(
+        request,
+        422,
+        'PROTOCOL_INVALID',
+        'Request validation failed',
+        'project_id and display_name must be valid and description must be at most 2048 characters',
+      );
+    }
+    const key = resourceKey(body.tenant_id, body.project_id);
+    const requestJson = stableJson(body);
+    const existing = projects.find(
+      (project) => project.tenant_id === body.tenant_id && project.project_id === body.project_id,
+    );
+    if (existing) {
+      if (projectCreatePayloads.get(key) !== requestJson) {
+        return mutationConflict(
+          request,
+          'PROJECT_ID_REUSED',
+          'The Project ID already belongs to a different create request',
+        );
+      }
+      const response: CreateProjectResponse = {
+        project: structuredClone(existing),
+        replayed: true,
+      };
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const now = Date.now().toString();
+    const project = {
+      tenant_id: body.tenant_id,
+      project_id: body.project_id,
+      display_name: body.display_name.trim(),
+      ...(body.description?.trim() ? { description: body.description.trim() } : {}),
+      resource_version: '1',
+      created_at_unix_ms: now,
+      updated_at_unix_ms: now,
+    };
+    projects.push(project);
+    projectCreatePayloads.set(key, requestJson);
+    const response: CreateProjectResponse = { project, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
   http.post('*/api/artifact/list/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
@@ -1644,6 +2133,7 @@ export const handlers = [
     const filtered = artifacts.filter(
       (artifact) =>
         artifact.tenant_id === body.tenant_id &&
+        isLifecycleActive(artifact) &&
         (!body.project_id || artifact.project_id === body.project_id) &&
         (!search ||
           artifact.artifact_id.toLocaleLowerCase('zh-CN').includes(search) ||
@@ -1731,6 +2221,7 @@ export const handlers = [
       ...(body.description?.trim() ? { description: body.description.trim() } : {}),
       initialization: structuredClone(initialization),
       resource_version: '1',
+      lifecycle: activeLifecycle(),
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
@@ -1858,6 +2349,7 @@ export const handlers = [
     const filtered = playgrounds.filter(
       (playground) =>
         playground.tenant_id === body.tenant_id &&
+        isLifecycleActive(playground) &&
         (!body.project_id || playground.project_id === body.project_id) &&
         (!body.artifact_id || playground.artifact_id === body.artifact_id) &&
         (!search ||
@@ -1981,6 +2473,8 @@ export const handlers = [
       index_version: indexVersion,
       state: 'creating' as const,
       storage_availability: 'ready' as const,
+      resource_version: '1',
+      lifecycle: activeLifecycle(),
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
@@ -2057,6 +2551,7 @@ export const handlers = [
       playground_id: body.playground_id,
       precommit_id: precommitId,
       precommit_request_id: body.precommit_request_id,
+      data_layout: body.data_layout,
       attempt: 1,
       state: 'running',
       phase: 'queued',
@@ -2433,6 +2928,7 @@ export const handlers = [
       message: body.message.trim(),
       ...(body.description?.trim() ? { description: body.description.trim() } : {}),
       tag_names: tagNames,
+      data_layout: body.data_layout,
       created_at_unix_ms: now,
     };
     graph.nodes.unshift(commit);
@@ -2643,6 +3139,7 @@ export const handlers = [
     const filtered = snapshots.filter(
       (snapshot) =>
         snapshot.tenant_id === body.tenant_id &&
+        isLifecycleActive(snapshot) &&
         (!body.project_id || snapshot.project_id === body.project_id) &&
         (!body.artifact_id || snapshot.artifact_id === body.artifact_id) &&
         (!body.commit_id || snapshot.commit_id === body.commit_id) &&
@@ -2677,7 +3174,6 @@ export const handlers = [
     const snapshotKey = resourceKey(snapshot.tenant_id, snapshot.snapshot_id);
     if (snapshot.state === 'creating' && completesOnThisQuery(snapshotQueryCounts, snapshotKey)) {
       snapshot.state = 'ready';
-      snapshot.phase = 'idle';
       snapshot.integrity = {
         state: 'verified',
         files_verified: snapshot.logical_file_count,
@@ -2755,13 +3251,20 @@ export const handlers = [
       project_id: body.project_id,
       artifact_id: body.artifact_id,
       commit_id: commit.commit_id,
+      data_layout: commit.data_layout,
       storage_volume_id: storageVolume.storage_volume_id,
       region: storageVolume.region,
       message: commit.message,
       tag_names: [...commit.tag_names],
-      state: 'creating' as const,
-      phase: 'materializing' as const,
-      integrity: { state: 'pending' as const, files_verified: '0', bytes_verified: '0' },
+      state: 'ready' as const,
+      integrity: {
+        state: 'verified' as const,
+        files_verified: sameCommitSnapshot?.logical_file_count ?? '864',
+        bytes_verified: sameCommitSnapshot?.logical_size_bytes ?? '12884901888',
+        verified_at_unix_ms: Date.now().toString(),
+      },
+      resource_version: '1',
+      lifecycle: activeLifecycle(),
       logical_file_count: sameCommitSnapshot?.logical_file_count ?? '864',
       logical_size_bytes: sameCommitSnapshot?.logical_size_bytes ?? '12884901888',
       created_at_unix_ms: Date.now().toString(),
@@ -2777,13 +3280,130 @@ export const handlers = [
     snapshotCreateRequests.set(requestKey, { requestJson, response: structuredClone(response) });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
+  http.post('*/api/snapshot/delivery/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateSnapshotDeliveryRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, body.request_id);
+    const requestJson = stableJson(body);
+    const priorRequest = snapshotDeliveryCreateRequests.get(requestKey);
+    if (priorRequest) {
+      if (priorRequest.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'DELIVERY_REQUEST_ID_REUSED',
+          'The delivery request ID already belongs to a different request',
+        );
+      }
+      const response = structuredClone(priorRequest.response);
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const snapshot = snapshots.find(
+      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
+    );
+    if (!snapshot) return notFound(request, 'Snapshot');
+    if (snapshot.state !== 'ready') {
+      return mutationConflict(
+        request,
+        'SNAPSHOT_NOT_READY',
+        'Snapshot deliveries require a Ready Snapshot',
+      );
+    }
+    const storageVolume = storageVolumes.find(
+      (item) =>
+        item.tenant_id === body.tenant_id && item.storage_volume_id === snapshot.storage_volume_id,
+    );
+    if (!storageVolume) return notFound(request, 'StorageVolume');
+    if (!storageVolume.allowed_delivery_modes.includes(body.mode)) {
+      return mutationConflict(
+        request,
+        'DELIVERY_MODE_NOT_ALLOWED',
+        'The StorageVolume policy does not allow this delivery mode',
+      );
+    }
+    if (body.mode === 'hardlink' && snapshot.data_layout !== 'whole_file') {
+      return mutationConflict(
+        request,
+        'HARDLINK_REQUIRES_WHOLE_FILE',
+        'Hardlink delivery requires a WholeFile Commit',
+      );
+    }
+    if (body.mode === 'hardlink' && storageVolume.hardlink_policy === 'disabled') {
+      return mutationConflict(
+        request,
+        'HARDLINK_UNSAFE_VOLUME',
+        'Hardlink delivery requires a sealed or trusted-local Volume policy',
+      );
+    }
+    const now = Date.now().toString();
+    const deliveryId = `delivery-${fingerprint(body)}`;
+    const delivery: SnapshotDeliveryView = {
+      delivery_id: deliveryId,
+      snapshot_id: snapshot.snapshot_id,
+      commit_id: snapshot.commit_id,
+      storage_volume_id: snapshot.storage_volume_id,
+      mode: body.mode,
+      target_relative_root: `snapshots/${snapshot.project_id}/${snapshot.artifact_id}/${snapshot.snapshot_id}/deliveries/${deliveryId}`,
+      state: 'requested',
+      source_index_digest: snapshot.commit_id,
+      delivery_generation: '1',
+      file_count: snapshot.logical_file_count,
+      size_bytes: snapshot.logical_size_bytes,
+      object_set_digest: snapshot.commit_id,
+      resource_version: '1',
+      created_at_unix_ms: now,
+      updated_at_unix_ms: now,
+    };
+    snapshotDeliveries.unshift(delivery);
+    const response: CreateSnapshotDeliveryResponse = { delivery, replayed: false };
+    snapshotDeliveryCreateRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/snapshot/delivery/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QuerySnapshotDeliveryRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const resolved = resolveSnapshotDelivery(body.tenant_id, body.delivery_id);
+    if (!resolved) return notFound(request, 'Snapshot delivery');
+    const response: QuerySnapshotDeliveryResponse = { delivery: resolved.delivery };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/snapshot/delivery/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QuerySnapshotDeliveryListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const snapshot = snapshots.find(
+      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
+    );
+    if (!snapshot) return notFound(request, 'Snapshot');
+    const page = paginate(
+      request,
+      'snapshot-deliveries',
+      { tenant_id: body.tenant_id, snapshot_id: body.snapshot_id },
+      snapshotDeliveries.filter((item) => item.snapshot_id === body.snapshot_id),
+      body,
+    );
+    if (page instanceof HttpResponse) return page;
+    const response: QuerySnapshotDeliveryListResponse = page;
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
   http.post('*/api/snapshot/delivery/retry', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
     const body = (await request.json()) as RetrySnapshotDeliveryRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
-    const requestKey = resourceKey(body.tenant_id, body.retry_request_id);
+    const requestKey = resourceKey(body.tenant_id, body.request_id);
     const requestJson = stableJson(body);
     const priorRequest = snapshotRetryRequests.get(requestKey);
     if (priorRequest) {
@@ -2798,25 +3418,68 @@ export const handlers = [
       response.replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
-    const snapshot = snapshots.find(
-      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
-    );
-    if (!snapshot) return notFound(request, 'Snapshot');
-    if (snapshot.state !== 'abnormal') {
+    const resolved = resolveSnapshotDelivery(body.tenant_id, body.delivery_id);
+    if (!resolved) return notFound(request, 'Snapshot delivery');
+    if (resolved.delivery.state !== 'failed') {
       return mutationConflict(
         request,
-        'SNAPSHOT_INVALID_STATE',
-        'Only an Abnormal Snapshot delivery can be retried',
+        'DELIVERY_INVALID_STATE',
+        'Only a failed Snapshot delivery can be retried',
       );
     }
-    snapshot.state = 'creating';
-    snapshot.phase = 'materializing';
-    snapshot.integrity = { state: 'pending', files_verified: '0', bytes_verified: '0' };
-    delete snapshot.issue;
-    snapshot.updated_at_unix_ms = Date.now().toString();
-    snapshotQueryCounts.set(resourceKey(snapshot.tenant_id, snapshot.snapshot_id), 0);
-    const response: RetrySnapshotDeliveryResponse = { snapshot, replayed: false };
+    const now = Date.now().toString();
+    resolved.delivery.state = 'requested';
+    resolved.delivery.delivery_generation = (
+      BigInt(resolved.delivery.delivery_generation) + 1n
+    ).toString();
+    resolved.delivery.resource_version = (
+      BigInt(resolved.delivery.resource_version) + 1n
+    ).toString();
+    resolved.delivery.updated_at_unix_ms = now;
+    delete resolved.delivery.issue;
+    const response: RetrySnapshotDeliveryResponse = {
+      delivery: resolved.delivery,
+      replayed: false,
+    };
     snapshotRetryRequests.set(requestKey, { requestJson, response: structuredClone(response) });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/snapshot/delivery/delete', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as DeleteSnapshotDeliveryRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, body.request_id);
+    const requestJson = stableJson(body);
+    const priorRequest = snapshotDeliveryDeleteRequests.get(requestKey);
+    if (priorRequest) {
+      if (priorRequest.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'DELIVERY_REQUEST_ID_REUSED',
+          'The delivery request ID already belongs to a different request',
+        );
+      }
+      const response = structuredClone(priorRequest.response);
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const resolved = resolveSnapshotDelivery(body.tenant_id, body.delivery_id);
+    if (!resolved) return notFound(request, 'Snapshot delivery');
+    resolved.delivery.state = 'deleting';
+    resolved.delivery.resource_version = (
+      BigInt(resolved.delivery.resource_version) + 1n
+    ).toString();
+    resolved.delivery.updated_at_unix_ms = Date.now().toString();
+    const response: DeleteSnapshotDeliveryResponse = {
+      delivery: resolved.delivery,
+      replayed: false,
+    };
+    snapshotDeliveryDeleteRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/snapshot/file/list/query', async ({ request }) => {
@@ -2867,7 +3530,6 @@ export const handlers = [
         activity_id: `activity-${snapshot.snapshot_id}-created`,
         activity_type: 'created' as const,
         summary: 'Snapshot 记录已创建并开始区域交付',
-        phase: 'planning' as const,
         created_at_unix_ms: snapshot.created_at_unix_ms,
       },
       ...(snapshot.state === 'ready'
@@ -2876,7 +3538,6 @@ export const handlers = [
               activity_id: `activity-${snapshot.snapshot_id}-ready`,
               activity_type: 'ready' as const,
               summary: 'Snapshot 完整性校验通过并可读取',
-              phase: 'idle' as const,
               created_at_unix_ms: snapshot.updated_at_unix_ms,
             },
           ]
@@ -2887,7 +3548,6 @@ export const handlers = [
               activity_id: `activity-${snapshot.snapshot_id}-failed`,
               activity_type: 'failed' as const,
               summary: snapshot.issue.message,
-              phase: snapshot.phase,
               issue: snapshot.issue,
               created_at_unix_ms: snapshot.updated_at_unix_ms,
             },
@@ -2916,6 +3576,743 @@ export const handlers = [
     );
     if (!snapshot) return notFound(request, 'Snapshot');
     const response: QuerySnapshotDatasetProfileResponse = { profile: mockDatasetProfile };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/access-point/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryS3AccessPointListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const values = s3AccessPoints.filter((item) => item.tenant_id === body.tenant_id);
+    const page = paginate(request, 's3-access-points', { tenant_id: body.tenant_id }, values, body);
+    if (page instanceof HttpResponse) return page;
+    const response: QueryS3AccessPointListResponse = page;
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/access-point/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryS3AccessPointRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const accessPoint = resolveS3AccessPoint(request, body.tenant_id, body.access_point_id);
+    if (accessPoint instanceof HttpResponse) return accessPoint;
+    const response: QueryS3AccessPointResponse = { access_point: accessPoint };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/access-point/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateS3AccessPointRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const snapshot = snapshots.find(
+      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
+    );
+    if (!snapshot) return s3NotFound(request, 'snapshot');
+    if (snapshot.state !== 'ready') {
+      return mutationConflict(
+        request,
+        'SNAPSHOT_INVALID_STATE',
+        'S3 access can only be enabled for a Ready Snapshot',
+      );
+    }
+    if (
+      !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/.test(
+        body.bucket_name,
+      )
+    ) {
+      return problem(
+        request,
+        422,
+        'PROTOCOL_INVALID',
+        'Request validation failed',
+        'bucket_name must be a DNS-compatible bucket name',
+      );
+    }
+    const requestJson = stableJson(body);
+    const requestKey = resourceKey(body.tenant_id, body.request_id);
+    const previous = s3AccessPointCreateRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'REQUEST_ID_REUSED',
+          'The request ID belongs to another S3 request',
+        );
+      }
+      const response = structuredClone(previous.response);
+      response.replayed = true;
+      delete response.secret_access_key;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const existing = s3AccessPoints.find(
+      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
+    );
+    if (existing) {
+      if (existing.bucket_name !== body.bucket_name) {
+        return mutationConflict(
+          request,
+          'SNAPSHOT_S3_ACCESS_POINT_EXISTS',
+          'Snapshot already has a different S3 bucket',
+        );
+      }
+      const response: CreateS3AccessPointResponse = {
+        access_point: existing,
+        access_key_id: 'NGS3ROADREADER01',
+        credential_expires_at_unix_ms: '1790000000000',
+        replayed: true,
+      };
+      s3AccessPointCreateRequests.set(requestKey, {
+        requestJson,
+        response: structuredClone(response),
+      });
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const accessPoint: S3AccessPointView = {
+      access_point_id: `ap-${body.snapshot_id}`,
+      tenant_id: body.tenant_id,
+      project_id: snapshot.project_id,
+      artifact_id: snapshot.artifact_id,
+      snapshot_id: snapshot.snapshot_id,
+      commit_id: snapshot.commit_id,
+      bucket_name: body.bucket_name,
+      endpoint: runtimeConfig.s3Endpoint,
+      region: snapshot.region,
+      state: 'active',
+      policy_generation: '1',
+      created_at_unix_ms: Date.now().toString(),
+      updated_at_unix_ms: Date.now().toString(),
+    };
+    s3AccessPoints.push(accessPoint);
+    if (!s3Objects.has(accessPoint.access_point_id)) s3Objects.set(accessPoint.access_point_id, []);
+    const accessKeyId = `NGS3${accessPoint.access_point_id.slice(-12).toUpperCase()}`;
+    const secretAccessKey = `mock-secret-${crypto.randomUUID()}`;
+    s3Credentials.push({
+      credential_id: `cred-${crypto.randomUUID().slice(0, 8)}`,
+      access_point_id: accessPoint.access_point_id,
+      access_key_id: accessKeyId,
+      state: 'active',
+      expires_at_unix_ms: '1790000000000',
+      created_at_unix_ms: Date.now().toString(),
+    });
+    const response: CreateS3AccessPointResponse = {
+      access_point: accessPoint,
+      access_key_id: accessKeyId,
+      secret_access_key: secretAccessKey,
+      credential_expires_at_unix_ms: '1790000000000',
+      replayed: false,
+    };
+    s3AccessPointCreateRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/access-point/enable', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as UpdateS3AccessPointRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const accessPoint = resolveS3AccessPoint(request, body.tenant_id, body.access_point_id);
+    if (accessPoint instanceof HttpResponse) return accessPoint;
+    accessPoint.state = 'active';
+    accessPoint.policy_generation = (BigInt(accessPoint.policy_generation) + 1n).toString();
+    accessPoint.updated_at_unix_ms = Date.now().toString();
+    const response: UpdateS3AccessPointResponse = { access_point: accessPoint, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/access-point/disable', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as UpdateS3AccessPointRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const accessPoint = resolveS3AccessPoint(request, body.tenant_id, body.access_point_id);
+    if (accessPoint instanceof HttpResponse) return accessPoint;
+    accessPoint.state = 'disabled';
+    for (const credential of s3Credentials) {
+      if (
+        credential.access_point_id === accessPoint.access_point_id &&
+        credential.state === 'active'
+      ) {
+        credential.state = 'revoked';
+      }
+    }
+    accessPoint.policy_generation = (BigInt(accessPoint.policy_generation) + 1n).toString();
+    accessPoint.updated_at_unix_ms = Date.now().toString();
+    const response: UpdateS3AccessPointResponse = { access_point: accessPoint, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/credential/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryS3CredentialListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const accessPoint = resolveS3AccessPoint(request, body.tenant_id, body.access_point_id);
+    if (accessPoint instanceof HttpResponse) return accessPoint;
+    const response: QueryS3CredentialListResponse = {
+      items: s3Credentials.filter((item) => item.access_point_id === accessPoint.access_point_id),
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/credential/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateS3CredentialRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const accessPoint = resolveS3AccessPoint(request, body.tenant_id, body.access_point_id);
+    if (accessPoint instanceof HttpResponse) return accessPoint;
+    if (accessPoint.state !== 'active') {
+      return mutationConflict(
+        request,
+        'S3_ACCESS_POINT_DISABLED',
+        'Enable the S3 access point before issuing credentials',
+      );
+    }
+    const requestJson = stableJson(body);
+    const requestKey = resourceKey(body.tenant_id, body.request_id);
+    const previous = s3CredentialCreateRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(
+          request,
+          'REQUEST_ID_REUSED',
+          'The request ID belongs to another credential request',
+        );
+      }
+      const response = structuredClone(previous.response);
+      response.replayed = true;
+      delete response.secret_access_key;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    if (
+      s3Credentials.filter(
+        (credential) =>
+          credential.access_point_id === accessPoint.access_point_id &&
+          credential.state === 'active',
+      ).length >= 2
+    ) {
+      return mutationConflict(
+        request,
+        'S3_CREDENTIAL_LIMIT',
+        'An Access Point can have at most two active credentials',
+      );
+    }
+    const credential: S3CredentialView = {
+      credential_id: `cred-${crypto.randomUUID().slice(0, 8)}`,
+      access_point_id: accessPoint.access_point_id,
+      access_key_id: `NGS3${crypto.randomUUID().replaceAll('-', '').slice(0, 16).toUpperCase()}`,
+      state: 'active',
+      expires_at_unix_ms: body.expires_at_unix_ms ?? '1790000000000',
+      created_at_unix_ms: Date.now().toString(),
+    };
+    s3Credentials.push(credential);
+    const response: CreateS3CredentialResponse = {
+      credential,
+      secret_access_key: `mock-secret-${crypto.randomUUID()}`,
+      replayed: false,
+    };
+    s3CredentialCreateRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/credential/revoke', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as RevokeS3CredentialRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const accessPoint = resolveS3AccessPoint(request, body.tenant_id, body.access_point_id);
+    if (accessPoint instanceof HttpResponse) return accessPoint;
+    const credential = s3Credentials.find(
+      (item) =>
+        item.access_point_id === accessPoint.access_point_id &&
+        item.credential_id === body.credential_id,
+    );
+    if (!credential) return s3NotFound(request, 'credential');
+    credential.state = 'revoked';
+    const response: QueryS3CredentialListResponse = {
+      items: s3Credentials.filter((item) => item.access_point_id === accessPoint.access_point_id),
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/object/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryS3ObjectListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const accessPoint = resolveS3AccessPoint(request, body.tenant_id, body.access_point_id);
+    if (accessPoint instanceof HttpResponse) return accessPoint;
+    if (accessPoint.state !== 'active') {
+      return mutationConflict(
+        request,
+        'S3_ACCESS_POINT_DISABLED',
+        'The S3 access point is disabled',
+      );
+    }
+    const entries = s3ObjectEntries(
+      s3Objects.get(accessPoint.access_point_id) ?? [],
+      body.prefix,
+      body.delimiter,
+    );
+    const page = paginate(
+      request,
+      's3-objects',
+      {
+        tenant_id: body.tenant_id,
+        access_point_id: body.access_point_id,
+        prefix: body.prefix ?? '',
+        delimiter: body.delimiter ?? '',
+      },
+      entries,
+      body,
+    );
+    if (page instanceof HttpResponse) return page;
+    const response: QueryS3ObjectListResponse = {
+      ...page,
+      common_prefixes: page.items
+        .filter((entry) => entry.entry_type === 'prefix')
+        .map((entry) => entry.key),
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/object/download-url/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateS3DownloadUrlRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const accessPoint = resolveS3AccessPoint(request, body.tenant_id, body.access_point_id);
+    if (accessPoint instanceof HttpResponse) return accessPoint;
+    const object = (s3Objects.get(accessPoint.access_point_id) ?? []).find(
+      (entry) => entry.entry_type === 'object' && entry.key === body.key,
+    );
+    if (!object) return s3NotFound(request, 'object');
+    const expiresSeconds = Math.min(Math.max(body.expires_seconds ?? 900, 60), 86_400);
+    const expiresAt = Date.now() + expiresSeconds * 1000;
+    const response: CreateS3DownloadUrlResponse = {
+      url: `${accessPoint.endpoint}/${accessPoint.bucket_name}/${encodeURIComponent(body.key)}?expires=${expiresAt}`,
+      expires_at_unix_ms: expiresAt.toString(),
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/resource/deletion/impact/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryDeletionImpactRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const root = findLifecycleResource(body.tenant_id, body.resource);
+    if (!root || !isLifecycleActive(root)) return notFound(request, 'Resource');
+    if (root.resource_version !== body.expected_resource_version) {
+      return mutationConflict(
+        request,
+        'RESOURCE_VERSION_CONFLICT',
+        'The resource changed before deletion impact was calculated',
+      );
+    }
+    const targets = deletionTargets(body.tenant_id, body.resource, body.cascade);
+    const dependentTargets = deletionTargets(body.tenant_id, body.resource, true).slice(1);
+    const blockers = [] as DeletionImpactView['blockers'];
+    if (
+      ['artifact', 'storage_volume'].includes(body.resource.type) &&
+      dependentTargets.length > 0 &&
+      !body.cascade
+    ) {
+      blockers.push({
+        code: 'CASCADE_REQUIRED',
+        message: `该资源仍有 ${dependentTargets.length} 个依赖资源，必须显式确认级联处理`,
+      });
+    }
+    if (body.resource.type === 'storage_volume' && !body.confirm_managed_data_erase) {
+      blockers.push({
+        code: 'MANAGED_DATA_ERASE_CONFIRMATION_REQUIRED',
+        message: '删除 StorageVolume 必须确认清理 NeoEngram 受管目录',
+      });
+    }
+    const targetSnapshots = targets
+      .filter((target) => target.resource.type === 'snapshot')
+      .map((target) =>
+        snapshots.find(
+          (snapshot) =>
+            target.resource.type === 'snapshot' &&
+            snapshot.snapshot_id === target.resource.snapshot_id,
+        ),
+      )
+      .filter((snapshot): snapshot is NonNullable<typeof snapshot> => Boolean(snapshot));
+    const targetPlaygrounds = targets
+      .filter((target) => target.resource.type === 'playground')
+      .map((target) =>
+        playgrounds.find(
+          (playground) =>
+            target.resource.type === 'playground' &&
+            playground.project_id === target.resource.project_id &&
+            playground.artifact_id === target.resource.artifact_id &&
+            playground.playground_id === target.resource.playground_id,
+        ),
+      )
+      .filter((playground): playground is NonNullable<typeof playground> => Boolean(playground));
+    const targetSnapshotIds = new Set(targetSnapshots.map((snapshot) => snapshot.snapshot_id));
+    const targetAccessPointIds = new Set(
+      s3AccessPoints
+        .filter(
+          (accessPoint) =>
+            accessPoint.tenant_id === body.tenant_id &&
+            targetSnapshotIds.has(accessPoint.snapshot_id),
+        )
+        .map((accessPoint) => accessPoint.access_point_id),
+    );
+    const activeCredentials = s3Credentials.filter(
+      (credential) =>
+        targetAccessPointIds.has(credential.access_point_id) && credential.state === 'active',
+    ).length;
+    const issuedAt = Date.now();
+    const impact: DeletionImpactView = {
+      tenant_id: body.tenant_id,
+      root: body.resource,
+      cascade: body.cascade,
+      confirm_managed_data_erase: body.confirm_managed_data_erase,
+      targets,
+      active_job_count: targetPlaygrounds
+        .filter((playground) => Boolean(playground.active_precommit_id))
+        .length.toString(),
+      active_s3_credential_count: activeCredentials.toString(),
+      estimated_file_count: targetSnapshots
+        .reduce((sum, snapshot) => sum + BigInt(snapshot.logical_file_count), 0n)
+        .toString(),
+      estimated_bytes: targetSnapshots
+        .reduce((sum, snapshot) => sum + BigInt(snapshot.logical_size_bytes), 0n)
+        .toString(),
+      blockers,
+      issued_at_unix_ms: issuedAt.toString(),
+      expires_at_unix_ms: (issuedAt + 5 * 60_000).toString(),
+    };
+    const impactDigest = contentDigest(impact);
+    deletionImpacts.set(impactDigest, structuredClone(impact));
+    const response: QueryDeletionImpactResponse = { impact, impact_digest: impactDigest };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/resource/deletion/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateDeletionRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, 'create', body.request_id);
+    const requestJson = stableJson(body);
+    const previous = deletionMutationRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
+      }
+      const response = structuredClone(previous.response) as DeletionMutationResponse;
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const impact = deletionImpacts.get(body.impact_digest);
+    if (
+      !impact ||
+      impact.tenant_id !== body.tenant_id ||
+      stableJson(impact.root) !== stableJson(body.resource) ||
+      impact.cascade !== body.cascade ||
+      impact.confirm_managed_data_erase !== body.confirm_managed_data_erase
+    ) {
+      return mutationConflict(
+        request,
+        'DELETION_IMPACT_STALE',
+        'The deletion impact no longer matches the request',
+      );
+    }
+    if (Number(impact.expires_at_unix_ms) <= Date.now()) {
+      return mutationConflict(
+        request,
+        'DELETION_IMPACT_EXPIRED',
+        'The deletion impact has expired',
+      );
+    }
+    if (impact.blockers.length) {
+      return mutationConflict(request, 'DELETION_BLOCKED', impact.blockers[0]!.message);
+    }
+    const root = findLifecycleResource(body.tenant_id, body.resource);
+    if (!root || !isLifecycleActive(root)) return notFound(request, 'Resource');
+    if (root.resource_version !== body.expected_resource_version) {
+      return mutationConflict(
+        request,
+        'RESOURCE_VERSION_CONFLICT',
+        'The resource changed after impact confirmation',
+      );
+    }
+    const now = Date.now();
+    const deletionId = `deletion-${crypto.randomUUID()}`;
+    const purgeAfter = (now + 7 * 24 * 60 * 60 * 1_000).toString();
+    const deletion: DeletionOperationView = {
+      deletion_id: deletionId,
+      tenant_id: body.tenant_id,
+      root: body.resource,
+      state: 'recoverable',
+      resource_version: '1',
+      targets: impact.targets,
+      request_id: body.request_id,
+      request_digest: contentDigest(body),
+      impact_digest: body.impact_digest,
+      cascade: body.cascade,
+      confirm_managed_data_erase: body.confirm_managed_data_erase,
+      purge_after_unix_ms: purgeAfter,
+      created_at_unix_ms: now.toString(),
+      updated_at_unix_ms: now.toString(),
+      retry_count: '0',
+    };
+    for (const target of deletion.targets) {
+      setResourceLifecycle(body.tenant_id, target, 'pending_delete', deletionId, purgeAfter);
+      if (target.resource.type !== 'snapshot') continue;
+      for (const accessPoint of s3AccessPoints) {
+        if (accessPoint.snapshot_id !== target.resource.snapshot_id) continue;
+        accessPoint.state = 'disabled';
+        accessPoint.policy_generation = (BigInt(accessPoint.policy_generation) + 1n).toString();
+        accessPoint.updated_at_unix_ms = now.toString();
+        for (const credential of s3Credentials) {
+          if (credential.access_point_id === accessPoint.access_point_id)
+            credential.state = 'revoked';
+        }
+      }
+    }
+    deletionOperations.unshift(deletion);
+    const response: DeletionMutationResponse = { deletion, replayed: false };
+    deletionMutationRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/resource/deletion/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryDeletionListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const allowedStates = new Set(body.states ?? []);
+    const items = deletionOperations.filter(
+      (deletion) =>
+        deletion.tenant_id === body.tenant_id &&
+        (allowedStates.size === 0 || allowedStates.has(deletion.state)),
+    );
+    const page = paginate(
+      request,
+      'resource-deletions',
+      { tenant_id: body.tenant_id, states: [...allowedStates].sort() },
+      items,
+      body,
+    );
+    if (page instanceof HttpResponse) return page;
+    const response: QueryDeletionListResponse = page;
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/resource/deletion/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryDeletionRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const deletion = deletionOperations.find(
+      (item) => item.tenant_id === body.tenant_id && item.deletion_id === body.deletion_id,
+    );
+    if (!deletion) return notFound(request, 'Deletion operation');
+    const response: QueryDeletionResponse = {
+      deletion,
+      retention_holds: retentionHolds.filter(
+        (hold) => hold.tenant_id === body.tenant_id && hold.deletion_id === body.deletion_id,
+      ),
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/resource/deletion/restore', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as UpdateDeletionRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, 'restore', body.request_id);
+    const requestJson = stableJson(body);
+    const previous = deletionMutationRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
+      }
+      const response = structuredClone(previous.response) as DeletionMutationResponse;
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const deletion = deletionOperations.find(
+      (item) => item.tenant_id === body.tenant_id && item.deletion_id === body.deletion_id,
+    );
+    if (!deletion) return notFound(request, 'Deletion operation');
+    if (deletion.resource_version !== body.expected_resource_version) {
+      return mutationConflict(request, 'RESOURCE_VERSION_CONFLICT', 'Deletion task changed');
+    }
+    if (
+      ['purging', 'finalizing', 'completed'].includes(deletion.state) ||
+      Number(deletion.purge_after_unix_ms) <= Date.now()
+    ) {
+      return mutationConflict(
+        request,
+        'DELETION_NOT_RECOVERABLE',
+        'The deletion task can no longer be restored',
+      );
+    }
+    for (const target of deletion.targets) {
+      setResourceLifecycle(body.tenant_id, target, 'active');
+    }
+    deletion.state = 'completed';
+    deletion.completion = 'restored';
+    deletion.resource_version = (BigInt(deletion.resource_version) + 1n).toString();
+    deletion.updated_at_unix_ms = Date.now().toString();
+    const response: DeletionMutationResponse = { deletion, replayed: false };
+    deletionMutationRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/resource/deletion/retry', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as UpdateDeletionRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, 'retry', body.request_id);
+    const requestJson = stableJson(body);
+    const previous = deletionMutationRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
+      }
+      const response = structuredClone(previous.response) as DeletionMutationResponse;
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const deletion = deletionOperations.find(
+      (item) => item.tenant_id === body.tenant_id && item.deletion_id === body.deletion_id,
+    );
+    if (!deletion) return notFound(request, 'Deletion operation');
+    if (deletion.resource_version !== body.expected_resource_version) {
+      return mutationConflict(request, 'RESOURCE_VERSION_CONFLICT', 'Deletion task changed');
+    }
+    if (!['blocked', 'failed'].includes(deletion.state)) {
+      return mutationConflict(request, 'DELETION_NOT_RETRYABLE', 'Deletion task is not retryable');
+    }
+    deletion.state = 'recoverable';
+    delete deletion.last_error;
+    deletion.retry_count = (BigInt(deletion.retry_count) + 1n).toString();
+    deletion.resource_version = (BigInt(deletion.resource_version) + 1n).toString();
+    deletion.updated_at_unix_ms = Date.now().toString();
+    const response: DeletionMutationResponse = { deletion, replayed: false };
+    deletionMutationRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/resource/retention-hold/create', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateRetentionHoldRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, 'hold-create', body.request_id);
+    const requestJson = stableJson(body);
+    const previous = deletionMutationRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
+      }
+      const response = structuredClone(previous.response) as CreateRetentionHoldResponse;
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const deletion = deletionOperations.find(
+      (item) => item.tenant_id === body.tenant_id && item.deletion_id === body.deletion_id,
+    );
+    if (!deletion) return notFound(request, 'Deletion operation');
+    if (!body.reason.trim()) {
+      return problem(request, 422, 'PROTOCOL_INVALID', 'Reason is required', 'reason is required');
+    }
+    if (deletion.resource_version !== body.expected_resource_version) {
+      return mutationConflict(request, 'RESOURCE_VERSION_CONFLICT', 'Deletion task changed');
+    }
+    const hold: RetentionHoldView = {
+      retention_hold_id: `hold-${crypto.randomUUID()}`,
+      tenant_id: body.tenant_id,
+      deletion_id: body.deletion_id,
+      reason: body.reason.trim(),
+      state: 'active',
+      ...(body.expires_at_unix_ms ? { expires_at_unix_ms: body.expires_at_unix_ms } : {}),
+      created_at_unix_ms: Date.now().toString(),
+    };
+    retentionHolds.push(hold);
+    deletion.resource_version = (BigInt(deletion.resource_version) + 1n).toString();
+    deletion.updated_at_unix_ms = Date.now().toString();
+    const response: CreateRetentionHoldResponse = {
+      deletion,
+      retention_hold: hold,
+      replayed: false,
+    };
+    deletionMutationRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/resource/retention-hold/release', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as ReleaseRetentionHoldRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, 'hold-release', body.request_id);
+    const requestJson = stableJson(body);
+    const previous = deletionMutationRequests.get(requestKey);
+    if (previous) {
+      if (previous.requestJson !== requestJson) {
+        return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
+      }
+      const response = structuredClone(previous.response) as ReleaseRetentionHoldResponse;
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const deletion = deletionOperations.find(
+      (item) => item.tenant_id === body.tenant_id && item.deletion_id === body.deletion_id,
+    );
+    const hold = retentionHolds.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.deletion_id === body.deletion_id &&
+        item.retention_hold_id === body.retention_hold_id,
+    );
+    if (!deletion || !hold) return notFound(request, 'Retention hold');
+    if (deletion.resource_version !== body.expected_resource_version) {
+      return mutationConflict(request, 'RESOURCE_VERSION_CONFLICT', 'Deletion task changed');
+    }
+    hold.state = 'released';
+    hold.released_at_unix_ms = Date.now().toString();
+    deletion.resource_version = (BigInt(deletion.resource_version) + 1n).toString();
+    deletion.updated_at_unix_ms = Date.now().toString();
+    const response: ReleaseRetentionHoldResponse = {
+      deletion,
+      retention_hold: hold,
+      replayed: false,
+    };
+    deletionMutationRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/job/add/create', async ({ request }) => {
@@ -3036,6 +4433,7 @@ export function resetMockJobs(): void {
 export function resetMockState(): void {
   jobs.clear();
   tenantCreatePayloads.clear();
+  projectCreatePayloads.clear();
   storageVolumeCreatePayloads.clear();
   storageEnrollmentTokenRequests.clear();
   storageEnrollmentDecisionRequests.clear();
@@ -3051,12 +4449,21 @@ export function resetMockState(): void {
   precommitSourceHeads.clear();
   precommitMutationRequests.clear();
   snapshotCreateRequests.clear();
+  snapshotDeliveries.splice(0, snapshotDeliveries.length);
+  snapshotDeliveryCreateRequests.clear();
   snapshotRetryRequests.clear();
+  snapshotDeliveryDeleteRequests.clear();
   snapshotQueryCounts.clear();
+  s3AccessPointCreateRequests.clear();
+  s3CredentialCreateRequests.clear();
+  seedDeletionState();
   resetMockData();
   seedStorageEnrollmentState();
   seedPreCommitState();
+  seedSnapshotDeliveryState();
 }
 
 seedStorageEnrollmentState();
 seedPreCommitState();
+seedSnapshotDeliveryState();
+seedDeletionState();

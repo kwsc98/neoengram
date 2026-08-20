@@ -14,7 +14,7 @@ immutable: true
 data:
   agent.yaml: |
     schema_version: 1
-    protocol_version: 1
+    wire_version: 1
     gateway_endpoint: https://synapse-gateway.synapse-gateway-example.svc.cluster.local:8443
     trust_bundle_file: /etc/neoengram/gateway-ca.pem
     gateway_workload_trust_domain: mesh.example.test

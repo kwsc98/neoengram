@@ -33,6 +33,7 @@ const artifact: ArtifactView = {
   initialization: { mode: 'empty' },
   head_commit_id: headCommitId,
   resource_version: '1',
+  lifecycle: { state: 'active', generation: '1' },
   created_at_unix_ms: '1',
   updated_at_unix_ms: '1',
 };
@@ -40,11 +41,11 @@ const artifact: ArtifactView = {
 async function mountPage(playgroundItems: Array<Record<string, unknown>> = []) {
   api.queryApiVersion.mockResolvedValue({
     data: {
-      service: 'neoengram-server',
+      service: 'neoengram-central',
       version: '0.2.0',
       git_commit: 'test',
-      api_versions: [1],
-      agent_protocol_versions: [1],
+      api_version: 1,
+      agent_wire_version: 1,
       capabilities: ['artifact_catalog', 'artifact_commit_graph', 'playground_materialize'],
     },
     requestId: 'request-version',
@@ -68,12 +69,14 @@ async function mountPage(playgroundItems: Array<Record<string, unknown>> = []) {
             parent_commit_id: historicalCommitId,
             message: 'Current head',
             tag_names: [],
+            data_layout: 'fast_cdc',
             created_at_unix_ms: '2',
           },
           {
             commit_id: historicalCommitId,
             message: 'Historical baseline',
             tag_names: [],
+            data_layout: 'fast_cdc',
             created_at_unix_ms: '1',
           },
         ],
