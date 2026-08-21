@@ -6,6 +6,7 @@ import { queryArtifactCommitGraph } from '@/api/operations';
 import type { CommitNode } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import { formatTime } from '@/utils/format';
+import { commitDataLayoutLabel } from '@/utils/commit';
 
 const props = withDefaults(
   defineProps<{
@@ -147,6 +148,9 @@ async function loadMoreCommits(): Promise<void> {
               effect="plain"
             >
               Head
+            </el-tag>
+            <el-tag size="small" effect="plain">
+              {{ commitDataLayoutLabel(commit.data_layout) }}
             </el-tag>
             <code :title="commit.commit_id">{{ shortCommitId(commit.commit_id) }}</code>
           </span>

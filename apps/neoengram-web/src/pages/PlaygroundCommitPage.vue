@@ -50,6 +50,7 @@ import {
   preCommitStateTagType,
 } from '@/features/precommit/status';
 import { useTenantsStore } from '@/stores/tenants';
+import { commitDataLayoutLabel } from '@/utils/commit';
 import { formatBytes, formatCount } from '@/utils/format';
 
 type ChangeFilter = 'all' | PlaygroundChangeEntry['change_type'];
@@ -970,6 +971,10 @@ async function createSnapshot(): Promise<void> {
             <dd>
               <code>{{ createdParentCommitId || '根 Commit' }}</code>
             </dd>
+          </div>
+          <div>
+            <dt>归档模式</dt>
+            <dd>{{ commitDataLayoutLabel(createdCommit.data_layout) }}</dd>
           </div>
           <div>
             <dt>Tags</dt>
