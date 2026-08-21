@@ -2,7 +2,7 @@
 import { Files } from '@element-plus/icons-vue';
 
 import type { CommitTreeItem } from '@/utils/commit-tree';
-import { commitTagNames } from '@/utils/commit';
+import { commitDataLayoutLabel, commitTagNames } from '@/utils/commit';
 import { formatTime } from '@/utils/format';
 
 defineOptions({ name: 'ArtifactCommitTreeNode' });
@@ -89,6 +89,9 @@ const emit = defineEmits<{
             effect="plain"
           >
             {{ tagName }}
+          </el-tag>
+          <el-tag size="small" effect="plain">
+            归档：{{ commitDataLayoutLabel(item.node.data_layout) }}
           </el-tag>
         </div>
       </article>

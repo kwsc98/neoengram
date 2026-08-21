@@ -14,17 +14,26 @@ import { useRoute, useRouter } from 'vue-router';
 
 import {
   createSnapshot,
+  createSnapshotDelivery,
   queryApiVersion,
   queryArtifact,
+  queryArtifactCommitGraph,
   querySnapshot,
+  querySnapshotDeliveryList,
   queryStorageVolumeList,
 } from '@/api/operations';
-import type { CreateSnapshotResponse, StorageVolumeView } from '@/api/types';
+import type {
+  CreateSnapshotDeliveryResponse,
+  CreateSnapshotResponse,
+  SnapshotDeliveryMode,
+  SnapshotDeliveryView,
+  StorageVolumeView,
+} from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
-import { supportsArtifactCommitGraph } from '@/features/capabilities';
+import { supportsArtifactCommitGraph, supportsSnapshotDeliveryMode } from '@/features/capabilities';
 import {
   snapshotIntegrityLabel,
   snapshotIntegrityTagType,
@@ -35,6 +44,7 @@ import {
 import { formatBytes, formatCount } from '@/utils/format';
 
 type Stage = 'commit' | 'placement' | 'delivery';
+type DeliveryMode = SnapshotDeliveryMode;
 
 const route = useRoute();
 const router = useRouter();
@@ -51,6 +61,9 @@ const volumeCursor = ref<string>();
 const volumeCursorHistory = ref<string[]>([]);
 const snapshotRequestId = ref<string>();
 const createOutcome = ref<CreateSnapshotResponse>();
+const selectedDeliveryMode = ref<DeliveryMode>('fuse');
+const deliveryRequestId = ref<string>();
+const deliveryOutcome = ref<CreateSnapshotDeliveryResponse>();
 
 const versionQuery = useQuery({
   queryKey: ['system', 'version'],
@@ -65,6 +78,12 @@ const artifact = computed(() => artifactQuery.data.value?.data.artifact);
 const commitGraphEnabled = computed(() =>
   supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
 );
+const deliveryCapabilityEnabled = computed(() => {
+  const capabilities = versionQuery.data.value?.data.capabilities;
+  return (['fuse', 'copy', 'hardlink'] as const).some((mode) =>
+    supportsSnapshotDeliveryMode(capabilities, mode),
+  );
+});
 
 watch(
   artifact,
@@ -90,6 +109,18 @@ const storageVolumeQuery = useQuery({
   enabled: computed(() => activeStage.value === 'placement'),
 });
 const volumePage = computed(() => storageVolumeQuery.data.value?.data.items ?? []);
+
+const commitGraphQuery = useQuery({
+  queryKey: computed(() => [
+    'artifact-commits',
+    tenantId.value,
+    projectId.value,
+    artifactId.value,
+    'snapshot-create',
+  ]),
+  queryFn: () => queryArtifactCommitGraph(tenantId.value, projectId.value, artifactId.value),
+  enabled: computed(() => commitGraphEnabled.value && Boolean(selectedCommitId.value)),
+});
 
 watch(
   volumePage,
@@ -128,6 +159,104 @@ const deliveryQuery = useQuery({
 const deliverySnapshot = computed(
   () => deliveryQuery.data.value?.data.snapshot ?? createOutcome.value?.snapshot,
 );
+const selectedCommitLayout = computed(
+  () =>
+    commitGraphQuery.data.value?.data.graph.nodes.find(
+      (commit) => commit.commit_id === selectedCommitId.value,
+    )?.data_layout ?? deliverySnapshot.value?.data_layout,
+);
+
+const deliveryModeAvailability = computed<Record<DeliveryMode, boolean>>(() => {
+  const volume = selectedVolume.value;
+  const capabilities = versionQuery.data.value?.data.capabilities;
+  const allowedModes = volume?.allowed_delivery_modes ?? [];
+  return {
+    fuse: supportsSnapshotDeliveryMode(capabilities, 'fuse') && allowedModes.includes('fuse'),
+    copy: supportsSnapshotDeliveryMode(capabilities, 'copy') && allowedModes.includes('copy'),
+    hardlink:
+      supportsSnapshotDeliveryMode(capabilities, 'hardlink') &&
+      allowedModes.includes('hardlink') &&
+      selectedCommitLayout.value === 'whole_file' &&
+      volume?.hardlink_policy !== 'disabled',
+  };
+});
+
+const deliveryModeOptions = computed(() => [
+  { label: 'FUSE', value: 'fuse', disabled: !deliveryModeAvailability.value.fuse },
+  { label: '全部复制', value: 'copy', disabled: !deliveryModeAvailability.value.copy },
+  { label: '硬链接', value: 'hardlink', disabled: !deliveryModeAvailability.value.hardlink },
+]);
+
+function deliveryModeLabel(mode: DeliveryMode): string {
+  return { fuse: 'FUSE', copy: '全部复制', hardlink: '硬链接' }[mode];
+}
+
+function deliveryModeReason(mode: DeliveryMode): string | undefined {
+  const capabilities = versionQuery.data.value?.data.capabilities;
+  if (!supportsSnapshotDeliveryMode(capabilities, mode)) {
+    return 'Central 未声明该交付能力';
+  }
+  const volume = selectedVolume.value;
+  if (!volume) return '请先选择 StorageVolume';
+  if (!volume.allowed_delivery_modes.includes(mode)) {
+    return 'StorageVolume 策略未允许该模式';
+  }
+  if (mode === 'hardlink') {
+    if (!selectedCommitLayout.value) {
+      return commitGraphQuery.isPending.value
+        ? '正在读取 Commit 归档模式'
+        : '无法确认 Commit 归档模式';
+    }
+    if (selectedCommitLayout.value !== 'whole_file') {
+      return '硬链接要求 WholeFile Commit，当前 Commit 为分块归档';
+    }
+    if (volume.hardlink_policy === 'disabled') {
+      return 'StorageVolume 未配置硬链接策略';
+    }
+  }
+  return undefined;
+}
+
+const deliveriesQuery = useQuery({
+  queryKey: computed(() => ['snapshot-deliveries', tenantId.value, createdSnapshotId.value]),
+  queryFn: () =>
+    querySnapshotDeliveryList({
+      tenant_id: tenantId.value,
+      snapshot_id: createdSnapshotId.value,
+      page_size: 100,
+    }),
+  enabled: computed(() => Boolean(createdSnapshotId.value && deliveryCapabilityEnabled.value)),
+  refetchInterval: (query) => {
+    const state = query.state.data?.data.items.find(
+      (item) => item.mode === selectedDeliveryMode.value,
+    )?.state;
+    return state === 'requested' || state === 'validating' || state === 'materializing'
+      ? 1_000
+      : false;
+  },
+});
+const selectedDelivery = computed<SnapshotDeliveryView | undefined>(() => {
+  const created = deliveryOutcome.value?.delivery;
+  const listed = deliveriesQuery.data.value?.data.items.find((delivery) =>
+    created
+      ? delivery.delivery_id === created.delivery_id
+      : delivery.mode === selectedDeliveryMode.value,
+  );
+  return listed ?? created;
+});
+const deliveryMutation = useMutation({ mutationFn: createSnapshotDelivery });
+
+watch(
+  deliveryModeAvailability,
+  (availability) => {
+    if (availability[selectedDeliveryMode.value]) return;
+    const firstAvailable = (['fuse', 'copy', 'hardlink'] as const).find(
+      (mode) => availability[mode],
+    );
+    if (firstAvailable) selectedDeliveryMode.value = firstAvailable;
+  },
+  { immediate: true },
+);
 
 watch([tenantId, projectId, artifactId], () => {
   activeStage.value = 'commit';
@@ -137,7 +266,11 @@ watch([tenantId, projectId, artifactId], () => {
   volumeCursorHistory.value = [];
   snapshotRequestId.value = undefined;
   createOutcome.value = undefined;
+  selectedDeliveryMode.value = 'fuse';
+  deliveryRequestId.value = undefined;
+  deliveryOutcome.value = undefined;
   createMutation.reset();
+  deliveryMutation.reset();
 });
 
 function continueToPlacement(): void {
@@ -152,7 +285,10 @@ function selectVolume(volume: StorageVolumeView): void {
   if (volume.state !== 'ready') return;
   if (selectedVolume.value?.storage_volume_id !== volume.storage_volume_id) {
     snapshotRequestId.value = undefined;
+    deliveryRequestId.value = undefined;
+    deliveryOutcome.value = undefined;
     createMutation.reset();
+    deliveryMutation.reset();
   }
   selectedVolume.value = volume;
 }
@@ -173,6 +309,46 @@ function backToCommit(): void {
   createMutation.reset();
   activeStage.value = 'commit';
 }
+
+function createDeliveryRequestId(): string {
+  return `delivery-${createdSnapshotId.value}-${selectedDeliveryMode.value}`;
+}
+
+async function createDeliveryNow(): Promise<void> {
+  if (
+    deliveryMutation.isPending.value ||
+    deliverySnapshot.value?.state !== 'ready' ||
+    !deliveryModeAvailability.value[selectedDeliveryMode.value]
+  ) {
+    return;
+  }
+  deliveryRequestId.value ??= createDeliveryRequestId();
+  try {
+    const result = await deliveryMutation.mutateAsync({
+      tenant_id: tenantId.value,
+      snapshot_id: createdSnapshotId.value,
+      mode: selectedDeliveryMode.value,
+      request_id: deliveryRequestId.value,
+    });
+    deliveryOutcome.value = result.data;
+    await deliveriesQuery.refetch();
+    ElMessage.success(
+      result.data.replayed
+        ? '已返回同一交付请求'
+        : `${deliveryModeLabel(selectedDeliveryMode.value)} 交付已创建`,
+    );
+  } catch {
+    // Keep the deterministic request identity so a transport retry remains idempotent.
+  }
+}
+
+watch(
+  [() => deliverySnapshot.value?.state, activeStage],
+  ([state, stage]) => {
+    if (stage === 'delivery' && state === 'ready') void createDeliveryNow();
+  },
+  { immediate: true },
+);
 
 async function createSnapshotNow(): Promise<void> {
   if (createMutation.isPending.value) return;
@@ -241,7 +417,7 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
         <span>2</span><strong>选择 Volume</strong>
       </li>
       <li :class="{ active: activeStage === 'delivery' }">
-        <span>3</span><strong>FUSE 交付</strong>
+        <span>3</span><strong>创建交付</strong>
       </li>
     </ol>
 
@@ -308,7 +484,7 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
         <header class="section-heading">
           <div>
             <span>PLACEMENT</span>
-            <h2>选择 FUSE 挂载所在 Volume</h2>
+            <h2>选择 Volume 与交付模式</h2>
           </div>
           <Location />
         </header>
@@ -368,7 +544,40 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
           <small>StorageVolume</small><strong>{{ selectedVolume.display_name }}</strong>
           <code>{{ selectedVolume.storage_volume_id }}</code>
         </div>
-        <div><small>交付方式</small><strong>只读 FUSE</strong></div>
+        <div>
+          <small>交付方式</small>
+          <strong>{{ deliveryModeLabel(selectedDeliveryMode) }}</strong>
+        </div>
+      </section>
+      <section v-if="selectedVolume" class="delivery-choice" aria-label="Snapshot 交付模式">
+        <div class="delivery-choice__heading">
+          <div>
+            <span>DELIVERY MODE</span>
+            <h3>选择只读交付模式</h3>
+          </div>
+          <DocumentCopy />
+        </div>
+        <el-segmented v-model="selectedDeliveryMode" :options="deliveryModeOptions" />
+        <div class="delivery-mode-status" aria-label="交付模式可用性">
+          <div v-for="mode in ['fuse', 'copy', 'hardlink'] as const" :key="mode">
+            <strong>{{ deliveryModeLabel(mode) }}</strong>
+            <el-tag
+              :type="deliveryModeAvailability[mode] ? 'success' : 'info'"
+              size="small"
+              effect="plain"
+            >
+              {{ deliveryModeAvailability[mode] ? '可用' : '不可用' }}
+            </el-tag>
+            <span v-if="deliveryModeReason(mode)">{{ deliveryModeReason(mode) }}</span>
+          </div>
+        </div>
+        <el-alert
+          v-if="deliveryModeReason(selectedDeliveryMode)"
+          :title="`${deliveryModeLabel(selectedDeliveryMode)} 当前不可用`"
+          :description="deliveryModeReason(selectedDeliveryMode)"
+          type="warning"
+          :closable="false"
+        />
       </section>
       <footer class="snapshot-actions">
         <el-button @click="backToCommit">返回 Commit</el-button>
@@ -376,7 +585,10 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
           type="primary"
           :icon="DocumentCopy"
           :loading="createMutation.isPending.value"
-          :disabled="!selectedVolume"
+          :disabled="
+            !selectedVolume ||
+            (deliveryCapabilityEnabled && !deliveryModeAvailability[selectedDeliveryMode])
+          "
           @click="createSnapshotNow"
           >创建 Snapshot</el-button
         >
@@ -385,10 +597,16 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
 
     <template v-else>
       <ApiProblemAlert
-        v-if="deliveryQuery.error.value"
-        :error="deliveryQuery.error.value"
-        :retrying="deliveryQuery.isFetching.value"
-        @retry="deliveryQuery.refetch"
+        v-if="deliveryQuery?.error?.value"
+        :error="deliveryQuery?.error?.value"
+        :retrying="deliveryQuery?.isFetching?.value"
+        @retry="deliveryQuery?.refetch"
+      />
+      <ApiProblemAlert
+        v-if="deliveryMutation.error.value"
+        :error="deliveryMutation.error.value"
+        :retrying="deliveryMutation.isPending.value"
+        @retry="createDeliveryNow"
       />
       <section v-if="deliverySnapshot" class="content-section delivery-panel">
         <div class="delivery-heading">
@@ -400,13 +618,24 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
           <div>
             <small>{{ snapshotStateLabel(deliverySnapshot.state) }}</small>
             <h2>{{ snapshotStateLabel(deliverySnapshot.state) }}</h2>
-            <p>目标 Volume 正在提供该 Commit 的只读 FUSE 视图。</p>
+            <p v-if="deliveryCapabilityEnabled">
+              Snapshot 已固定，正在创建
+              {{ deliveryModeLabel(selectedDeliveryMode) }} 只读交付。
+            </p>
+            <p v-else>Snapshot 已固定，可在详情页按需创建只读交付。</p>
           </div>
         </div>
         <el-alert
           v-if="deliverySnapshot.issue"
           :title="deliverySnapshot.issue.message"
           :description="deliverySnapshot.issue.code"
+          type="error"
+          :closable="false"
+        />
+        <el-alert
+          v-if="selectedDelivery?.issue"
+          :title="selectedDelivery.issue.message"
+          :description="selectedDelivery.issue.code"
           type="error"
           :closable="false"
         />
@@ -444,6 +673,18 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
             </dd>
           </div>
           <div>
+            <dt>交付方式</dt>
+            <dd>
+              <el-tag effect="plain">{{ deliveryModeLabel(selectedDeliveryMode) }}</el-tag>
+            </dd>
+          </div>
+          <div v-if="selectedDelivery">
+            <dt>交付状态</dt>
+            <dd>
+              <el-tag effect="plain">{{ selectedDelivery.state }}</el-tag>
+            </dd>
+          </div>
+          <div>
             <dt>文件</dt>
             <dd>{{ formatCount(deliverySnapshot.logical_file_count) }}</dd>
           </div>
@@ -463,7 +704,8 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
         </div>
       </section>
       <footer class="snapshot-actions">
-        <span v-if="deliverySnapshot?.state === 'creating'">页面会持续刷新交付状态</span>
+        <span v-if="deliverySnapshot?.state === 'creating'">页面会持续刷新 Snapshot 状态</span>
+        <span v-else-if="selectedDelivery?.state">交付状态：{{ selectedDelivery.state }}</span>
         <span v-else />
         <el-button type="primary" @click="openSnapshot">查看 Snapshot</el-button>
       </footer>
@@ -655,6 +897,57 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
   text-overflow: ellipsis;
 }
 
+.delivery-choice {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  background: #fff;
+}
+.delivery-choice__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.delivery-choice__heading > div > span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.delivery-choice__heading h3 {
+  margin: 3px 0 0;
+  font-size: 16px;
+}
+.delivery-choice__heading > svg {
+  width: 22px;
+  color: #167450;
+}
+.delivery-choice :deep(.el-segmented) {
+  width: fit-content;
+  max-width: 100%;
+}
+.delivery-mode-status {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.delivery-mode-status > div {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  background: #fafcfb;
+  font-size: 12px;
+}
+.delivery-mode-status > div > span:last-child {
+  width: 100%;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .delivery-panel {
   margin-top: 16px;
 }
@@ -719,6 +1012,9 @@ function volumeStateLabel(state: StorageVolumeView['state']): string {
   .snapshot-source,
   .delivery-facts,
   .snapshot-selection {
+    grid-template-columns: 1fr;
+  }
+  .delivery-mode-status {
     grid-template-columns: 1fr;
   }
   .snapshot-source__wide {

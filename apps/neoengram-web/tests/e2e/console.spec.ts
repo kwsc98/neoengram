@@ -867,7 +867,7 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   ).toBeVisible();
   await page.getByRole('button', { name: '选择 StorageVolume' }).click();
 
-  await expect(page.getByRole('heading', { name: '选择 FUSE 挂载所在 Volume' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '选择 Volume 与交付模式' })).toBeVisible();
   const degradedVolume = page.getByRole('button', { name: /上海共享归档/ });
   await expect(degradedVolume).toBeVisible();
   await expect(degradedVolume).toBeDisabled();

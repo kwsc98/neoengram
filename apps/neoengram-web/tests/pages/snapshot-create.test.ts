@@ -10,9 +10,12 @@ import SnapshotCreatePage from '@/pages/SnapshotCreatePage.vue';
 
 const api = vi.hoisted(() => ({
   createSnapshot: vi.fn(),
+  createSnapshotDelivery: vi.fn(),
   queryApiVersion: vi.fn(),
   queryArtifact: vi.fn(),
+  queryArtifactCommitGraph: vi.fn(),
   querySnapshot: vi.fn(),
+  querySnapshotDeliveryList: vi.fn(),
   queryStorageVolumeList: vi.fn(),
 }));
 
@@ -25,6 +28,14 @@ const ElButtonStub = {
 const ElTagStub = { template: '<span><slot /></span>' };
 const headCommitId = 'a'.repeat(64);
 const historicalCommitId = 'b'.repeat(64);
+const deliveryCapabilities = [
+  'artifact_catalog',
+  'artifact_commit_graph',
+  'snapshot_materialize',
+  'snapshot_delivery_fuse_v2',
+  'snapshot_delivery_copy_v2',
+  'snapshot_delivery_hardlink_v2',
+];
 
 const artifact = {
   tenant_id: 'tenant-a',
@@ -59,6 +70,15 @@ const degradedVolume = {
   state: 'degraded' as const,
 };
 
+const hardlinkVolume = {
+  ...readyVolume,
+  allowed_delivery_modes: ['fuse', 'copy', 'hardlink'] as const,
+  hardlink_policy: 'sealed_acl' as const,
+  max_whole_file_bytes: '18446744073709551615',
+  copy_reserve_bytes: '0',
+  lifecycle: { state: 'active' as const, generation: '1' },
+};
+
 const snapshot = {
   snapshot_id: 'snapshot-a',
   tenant_id: 'tenant-a',
@@ -78,29 +98,65 @@ const snapshot = {
   updated_at_unix_ms: '2',
 };
 
-function mockBaseQueries(): void {
+type TestSnapshot = Omit<typeof snapshot, 'data_layout'> & {
+  data_layout: 'fast_cdc' | 'whole_file';
+};
+
+interface SnapshotCreateTestOptions {
+  capabilities?: string[];
+  volume?: typeof hardlinkVolume;
+  snapshot?: TestSnapshot;
+}
+
+function mockBaseQueries(options: SnapshotCreateTestOptions = {}): void {
+  const snapshotValue = options.snapshot ?? snapshot;
   api.queryApiVersion.mockResolvedValue({
     data: {
       api_version: 1,
       agent_wire_version: 1,
-      capabilities: ['artifact_catalog', 'artifact_commit_graph', 'snapshot_materialize'],
+      capabilities: options.capabilities ?? [
+        'artifact_catalog',
+        'artifact_commit_graph',
+        'snapshot_materialize',
+      ],
     },
     requestId: 'request-version',
   });
   api.queryArtifact.mockResolvedValue({ data: { artifact }, requestId: 'request-artifact' });
+  api.queryArtifactCommitGraph.mockResolvedValue({
+    data: {
+      graph: {
+        graph_version: '1',
+        head_commit_id: headCommitId,
+        nodes: [
+          {
+            commit_id: historicalCommitId,
+            message: 'Historical baseline',
+            tag_names: [],
+            data_layout: snapshotValue.data_layout,
+            created_at_unix_ms: '1',
+          },
+        ],
+      },
+    },
+    requestId: 'request-commit-graph',
+  });
   api.queryStorageVolumeList.mockResolvedValue({
-    data: { items: [degradedVolume, readyVolume] },
+    data: { items: [degradedVolume, options.volume ?? readyVolume] },
     requestId: 'request-volumes',
   });
   api.createSnapshot.mockResolvedValue({
-    data: { snapshot, replayed: true, placement_reused: true },
+    data: { snapshot: snapshotValue, replayed: true, placement_reused: true },
     requestId: 'request-create',
   });
-  api.querySnapshot.mockResolvedValue({ data: { snapshot }, requestId: 'request-snapshot' });
+  api.querySnapshot.mockResolvedValue({
+    data: { snapshot: snapshotValue },
+    requestId: 'request-snapshot',
+  });
 }
 
-async function mountPage() {
-  mockBaseQueries();
+async function mountPage(options: SnapshotCreateTestOptions = {}) {
+  mockBaseQueries(options);
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [
@@ -255,6 +311,62 @@ describe('Snapshot create page', () => {
 
     resolveCreate(pendingResult);
     await flushPromises();
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('creates the selected delivery mode after a WholeFile Snapshot is created', async () => {
+    const wholeFileSnapshot = { ...snapshot, data_layout: 'whole_file' as const };
+    api.createSnapshotDelivery.mockResolvedValue({
+      data: {
+        delivery: {
+          delivery_id: 'delivery-a',
+          snapshot_id: wholeFileSnapshot.snapshot_id,
+          commit_id: wholeFileSnapshot.commit_id,
+          storage_volume_id: hardlinkVolume.storage_volume_id,
+          mode: 'hardlink',
+          state: 'requested',
+        },
+        replayed: false,
+      },
+      requestId: 'request-delivery',
+    });
+    api.querySnapshotDeliveryList.mockResolvedValue({
+      data: { items: [] },
+      requestId: 'request-deliveries',
+    });
+    const { wrapper, queryClient } = await mountPage({
+      capabilities: deliveryCapabilities,
+      volume: hardlinkVolume,
+      snapshot: wholeFileSnapshot,
+    });
+
+    await elementButton(wrapper, '选择 StorageVolume').trigger('click');
+    await flushPromises();
+    await wrapper.find('.snapshot-volume-list > button:not([disabled])').trigger('click');
+    await flushPromises();
+
+    const modeSelector = wrapper.findComponent({ name: 'ElSegmented' });
+    expect(modeSelector.exists()).toBe(true);
+    const emit = (
+      modeSelector.vm as unknown as {
+        $emit: (event: 'update:modelValue', value: string) => void;
+      }
+    ).$emit;
+    emit.call(modeSelector.vm, 'update:modelValue', 'hardlink');
+    await flushPromises();
+    expect(wrapper.text()).toContain('硬链接可用');
+
+    await elementButton(wrapper, '创建 Snapshot').trigger('click');
+    await flushPromises();
+    await flushPromises();
+
+    expect(api.createSnapshotDelivery.mock.calls[0]?.[0]).toMatchObject({
+      tenant_id: 'tenant-a',
+      snapshot_id: wholeFileSnapshot.snapshot_id,
+      mode: 'hardlink',
+    });
+
     wrapper.unmount();
     queryClient.clear();
   });

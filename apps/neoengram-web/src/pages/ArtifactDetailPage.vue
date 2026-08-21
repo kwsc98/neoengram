@@ -34,7 +34,7 @@ import {
 } from '@/features/precommit/status';
 import { snapshotStateLabel, snapshotStateTagType } from '@/features/snapshots/status';
 import { useTenantsStore } from '@/stores/tenants';
-import { commitTagNames } from '@/utils/commit';
+import { commitDataLayoutLabel, commitTagNames } from '@/utils/commit';
 import { buildCommitTree } from '@/utils/commit-tree';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
@@ -475,6 +475,9 @@ async function showCreateSnapshot(): Promise<void> {
                 >
                   默认基线
                 </el-tag>
+                <el-tag v-if="currentCommit" size="small" effect="plain">
+                  归档：{{ commitDataLayoutLabel(currentCommit.data_layout) }}
+                </el-tag>
               </dd>
               <dd v-else>尚无 Commit</dd>
             </div>
@@ -764,6 +767,14 @@ async function showCreateSnapshot(): Promise<void> {
                 <code>{{ commitDiff.target_commit.parent_commit_id ?? '—' }}</code>
               </dd>
             </div>
+            <div>
+              <dt>归档模式</dt>
+              <dd>
+                <el-tag effect="plain">
+                  {{ commitDataLayoutLabel(commitDiff.target_commit.data_layout) }}
+                </el-tag>
+              </dd>
+            </div>
             <div class="definition-grid__wide">
               <dt>Tags</dt>
               <dd class="tag-list">
@@ -813,6 +824,14 @@ async function showCreateSnapshot(): Promise<void> {
             <div>
               <dt>创建时间</dt>
               <dd>{{ formatTime(commitDiff.base_commit.created_at_unix_ms) }}</dd>
+            </div>
+            <div>
+              <dt>归档模式</dt>
+              <dd>
+                <el-tag effect="plain">
+                  {{ commitDataLayoutLabel(commitDiff.base_commit.data_layout) }}
+                </el-tag>
+              </dd>
             </div>
             <div class="definition-grid__wide">
               <dt>Tags</dt>

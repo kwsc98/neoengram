@@ -399,7 +399,9 @@ describe('Artifact catalog detail', () => {
     expect(siblingNode.attributes('data-depth')).toBe('2');
     expect(headNode.classes()).toContain('commit-node--head');
     expect(headNode.text()).toContain('默认 HEAD');
+    expect(headNode.text()).toContain('归档：分块');
     expect(siblingNode.text()).not.toContain('默认 HEAD');
+    expect(siblingNode.text()).toContain('归档：全文件');
     expect(tree.findAll('.commit-node--tip')).toHaveLength(2);
 
     wrapper.unmount();
