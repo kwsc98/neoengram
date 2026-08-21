@@ -9,4 +9,5 @@ mod lifecycle;
 mod metadata;
 mod object;
 mod outbox;
+mod placement;
 mod precommit;

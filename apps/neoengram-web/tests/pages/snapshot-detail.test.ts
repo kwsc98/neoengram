@@ -12,10 +12,13 @@ import type { RetrySnapshotDeliveryRequest, TenantView } from '@/api/types';
 const api = vi.hoisted(() => ({
   createSnapshotDelivery: vi.fn(),
   deleteSnapshotDelivery: vi.fn(),
+  queryCommitReplication: vi.fn(),
   queryApiVersion: vi.fn(),
   querySnapshot: vi.fn(),
   querySnapshotDeliveryList: vi.fn(),
   queryStorageVolume: vi.fn(),
+  queryStorageVolumeList: vi.fn(),
+  replicateCommit: vi.fn(),
   retrySnapshotDelivery: vi.fn(),
 }));
 vi.mock('@/api/operations', () => api);
@@ -33,11 +36,10 @@ function snapshot(
     artifact_id: 'artifact-a',
     commit_id: commitId,
     data_layout: dataLayout,
-    storage_volume_id: 'volume-a',
-    region: 'cn-shanghai',
     message: 'Freeze training data',
     tag_names: ['dataset/v1'],
     state,
+    data_health: 'available' as const,
     ...(state === 'abnormal'
       ? { issue: { code: 'DELIVERY_FAILED', message: 'Delivery failed', retryable: true } }
       : {}),
@@ -102,9 +104,49 @@ async function mountPage(
     },
     requestId: 'request-volume',
   });
+  api.queryStorageVolumeList.mockResolvedValue({
+    data: {
+      items: [
+        {
+          tenant_id: 'tenant-a',
+          storage_volume_id: 'volume-a',
+          display_name: 'Volume A',
+          edge_cluster_id: 'edge-a',
+          region: 'cn-shanghai',
+          backend_type: 'nfs',
+          access_mode: 'read_write_many',
+          allowed_delivery_modes: ['fuse', 'copy', 'hardlink'],
+          hardlink_policy: 'sealed_acl',
+          max_whole_file_bytes: '1073741824',
+          copy_reserve_bytes: '1024',
+          state: 'ready',
+          resource_version: '1',
+          lifecycle: { state: 'active', generation: '1', resource_version: '1' },
+          created_at_unix_ms: '1',
+          updated_at_unix_ms: '2',
+        },
+      ],
+    },
+    requestId: 'request-volume-list',
+  });
   api.querySnapshotDeliveryList.mockResolvedValue({
     data: { items: [] },
     requestId: 'request-deliveries',
+  });
+  api.queryCommitReplication.mockResolvedValue({
+    data: {
+      replication: {
+        replication_id: 'replication-a',
+        tenant_id: 'tenant-a',
+        commit_id: commitId,
+        target_storage_volume_id: 'volume-a',
+        state: 'published',
+        object_set_digest: 'd'.repeat(64),
+        completed_objects: '3',
+        total_objects: '3',
+      },
+    },
+    requestId: 'request-replication',
   });
   api.createSnapshotDelivery.mockResolvedValue({
     data: { delivery: {}, replayed: false },
@@ -168,7 +210,7 @@ describe('Snapshot detail page', () => {
 
     expect(api.querySnapshot).toHaveBeenCalledWith('tenant-a', 'snapshot-a');
     expect(wrapper.text()).toContain('Snapshot 已固定，可按需创建独立只读交付');
-    expect(wrapper.text()).toContain('volume-a');
+    expect(wrapper.text()).toContain('Volume A');
     expect(wrapper.text()).toContain(commitId);
     expect(wrapper.text()).toContain('只读');
     expect(wrapper.text()).not.toContain('重试交付');
@@ -182,7 +224,7 @@ describe('Snapshot detail page', () => {
 
     expect(wrapper.text()).toContain('创建中');
     expect(wrapper.text()).toContain('只读 Snapshot');
-    expect(wrapper.text()).toContain('正在冻结 Commit 与 StorageVolume 绑定');
+    expect(wrapper.text()).toContain('正在冻结不可变 Commit');
 
     wrapper.unmount();
     queryClient.clear();
@@ -249,28 +291,28 @@ describe('Snapshot detail page', () => {
     queryClient.clear();
   });
 
-  it('applies capabilities, Volume policy and Commit layout to delivery modes', async () => {
+  it('keeps Delivery unavailable until the target PlacementSet is published', async () => {
     const { wrapper, queryClient } = await mountPage();
 
     expect(api.queryStorageVolume).toHaveBeenCalledWith('tenant-a', 'volume-a');
-    expect(wrapper.text()).toContain('FUSE可用');
-    expect(wrapper.text()).toContain('全部复制可用');
+    expect(wrapper.text()).toContain('FUSE不可用');
+    expect(wrapper.text()).toContain('全部复制不可用');
     expect(wrapper.text()).toContain('硬链接不可用');
-    expect(wrapper.text()).toContain('硬链接要求 WholeFile Commit');
+    expect(wrapper.text()).toContain('请先将 Commit 复制到当前目标 Volume');
     const deliveryModeInputs = wrapper.findAll<HTMLInputElement>('.el-segmented__item-input');
     await deliveryModeInputs[1]!.setValue(true);
     await flushPromises();
-    expect(wrapper.text()).toContain('预计需要 1 KiB 可用空间');
+    expect(wrapper.text()).toContain('请先将 Commit 复制到当前目标 Volume');
 
     wrapper.unmount();
     queryClient.clear();
   });
 
-  it('enables Hardlink for a WholeFile Commit on a sealed Volume', async () => {
+  it('keeps Hardlink gated until a WholeFile Commit is replicated', async () => {
     const { wrapper, queryClient } = await mountPage('ready', ['snapshot.read'], 'whole_file');
 
-    expect(wrapper.text()).toContain('硬链接可用');
-    expect(wrapper.text()).not.toContain('硬链接要求 WholeFile Commit');
+    expect(wrapper.text()).toContain('硬链接不可用');
+    expect(wrapper.text()).toContain('请先将 Commit 复制到当前目标 Volume');
 
     wrapper.unmount();
     queryClient.clear();

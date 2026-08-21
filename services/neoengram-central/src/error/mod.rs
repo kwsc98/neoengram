@@ -88,7 +88,9 @@ pub fn map_central_error(error: CentralError) -> Error {
             false,
             None,
         ),
-        CentralErrorCode::ArtifactNotFound | CentralErrorCode::StorageVolumeNotFound => (
+        CentralErrorCode::ArtifactNotFound
+        | CentralErrorCode::StorageVolumeNotFound
+        | CentralErrorCode::ResourceNotFound => (
             ErrorCategory::NotFound,
             None,
             "catalog parent resource not found",

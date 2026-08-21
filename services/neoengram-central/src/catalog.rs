@@ -161,7 +161,7 @@ pub enum PlaygroundState {
     Abnormal,
 }
 
-/// Authoritative immutable Artifact Commit placement on one StorageVolume.
+/// Logical immutable reference to one published Artifact Commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotRecord {
     pub tenant_id: TenantId,
@@ -171,8 +171,6 @@ pub struct SnapshotRecord {
     /// Public idempotency identity. It is never accepted as the Snapshot resource identity.
     pub snapshot_request_id: RequestId,
     pub commit_id: ContentDigest,
-    pub storage_volume_id: StorageVolumeId,
-    pub region: String,
     pub state: SnapshotState,
     pub resource_version: u64,
     pub lifecycle: ResourceLifecycle,
@@ -304,8 +302,6 @@ pub struct SnapshotListRequest {
     pub project_id: Option<ProjectId>,
     pub artifact_id: Option<ArtifactId>,
     pub commit_id: Option<ContentDigest>,
-    pub storage_volume_id: Option<StorageVolumeId>,
-    pub region: Option<String>,
     pub state: Option<SnapshotState>,
     pub after: Option<SnapshotListCursor>,
     pub limit: u16,
@@ -325,8 +321,9 @@ pub struct SnapshotListPage {
 
 /// Independently managed read-only projection of an immutable Snapshot.
 ///
-/// The Snapshot itself remains only the Artifact/Commit/Volume tuple; physical exposure is
-/// represented by one or more of these records.
+/// Physical exposure is represented by one or more [`SnapshotDeliveryRecord`] values. A
+/// Snapshot itself never names a StorageVolume or region; placement is resolved at delivery or
+/// read time from the Commit's published PlacementSet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotDeliveryRecord {
     pub tenant_id: TenantId,
@@ -530,18 +527,10 @@ pub(crate) fn validate_snapshot_delivery_parents(
     if snapshot.tenant_id != delivery.tenant_id
         || snapshot.snapshot_id != delivery.snapshot_id
         || snapshot.commit_id != delivery.commit_id
-        || snapshot.storage_volume_id != delivery.storage_volume_id
     {
         return Err(crate::CentralError::new(
             crate::CentralErrorCode::InvalidState,
             "SnapshotDelivery Snapshot identity changed before creation",
-        )
-        .with_retryable(false));
-    }
-    if snapshot.region != volume.region {
-        return Err(crate::CentralError::new(
-            crate::CentralErrorCode::StorageVolumeRegionMismatch,
-            "SnapshotDelivery Snapshot and StorageVolume regions differ",
         )
         .with_retryable(false));
     }
@@ -558,8 +547,6 @@ pub struct S3AccessPointRecord {
     pub snapshot_id: SnapshotId,
     pub commit_id: ContentDigest,
     pub bucket_name: String,
-    pub gateway_pool_id: neoengram_domain::protocol::GatewayPoolId,
-    pub region: String,
     pub state: S3AccessPointState,
     pub policy_generation: u64,
     pub created_at_unix_ms: UnixMillis,
@@ -687,7 +674,7 @@ pub struct SnapshotInsertRequest {
 pub enum SnapshotInsertOutcome {
     Inserted(SnapshotRecord),
     ExistingRequest(SnapshotRecord),
-    ExistingPlacement(SnapshotRecord),
+    ExistingCommit(SnapshotRecord),
 }
 
 /// One atomic control-catalog publication of an immutable Commit.

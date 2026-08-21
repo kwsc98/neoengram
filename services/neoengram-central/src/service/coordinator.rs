@@ -2239,8 +2239,6 @@ mod tests {
                     snapshot_request_id: RequestId::new("snapshot-request-delivery-replay")
                         .unwrap(),
                     commit_id,
-                    storage_volume_id: storage_volume_id.clone(),
-                    region: "local".to_owned(),
                     state: SnapshotState::Ready,
                     resource_version: 1,
                     lifecycle: ResourceLifecycle::active(),

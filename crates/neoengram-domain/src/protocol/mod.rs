@@ -16,9 +16,11 @@ mod gateway;
 mod ids;
 mod lifecycle;
 mod metadata;
+mod placement;
 mod s3;
 mod scalars;
 pub(crate) mod schema;
+mod transfer;
 pub(crate) mod validation;
 
 pub use crate::core::ContentDigest;
@@ -34,12 +36,14 @@ pub use gateway::*;
 pub use ids::*;
 pub use lifecycle::*;
 pub use metadata::*;
+pub use placement::*;
 pub use s3::*;
 pub use scalars::*;
 pub use schema::{
     action_schema, agent_api_schema, control_schema, enrollment_schema, gateway_schema,
     metadata_schema, snapshot_delivery_schema,
 };
+pub use transfer::*;
 pub use validation::decode_bounded_unique_json;
 
 /// The only wire version emitted by the current protocol.

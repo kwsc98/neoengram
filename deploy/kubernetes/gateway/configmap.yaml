@@ -19,6 +19,7 @@ data:
   SYNAPSE_GATEWAY_AGENT_LISTEN: 0.0.0.0:8081
   SYNAPSE_GATEWAY_CONTROL_LISTEN: 0.0.0.0:8082
   SYNAPSE_GATEWAY_PEER_LISTEN: 0.0.0.0:8083
+  SYNAPSE_GATEWAY_TRANSFER_LISTEN: 0.0.0.0:8084
   # One TLS listener serves the console and read-only S3 API by Host. The public
   # certificate/key are intentionally separate from the workload mTLS identity.
   SYNAPSE_GATEWAY_PUBLIC_LISTEN: 0.0.0.0:8080

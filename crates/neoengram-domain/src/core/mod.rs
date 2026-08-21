@@ -11,7 +11,7 @@ pub mod models;
 mod path;
 
 pub use error::{ValidationError, ValidationErrorKind, ValidationResult};
-pub use ids::{CommitId, ContentDigest, DirectoryId, ManifestId, ObjectId};
+pub use ids::{CommitId, ContentDigest, DirectoryId, ManifestId, ObjectId, ObjectSetDigest};
 pub use models::{
     validate_index_mutation_paths, validate_index_snapshot, ChunkRef, ChunkingStrategy, Commit,
     Directory, DirectoryEntry, DirectoryEntryKind, DirectoryEntryTarget, FileRecord, IndexDelta,

@@ -28,6 +28,10 @@ spec:
       port: 8443
       targetPort: agent
       protocol: TCP
+    - name: transfer
+      port: 8444
+      targetPort: transfer
+      protocol: UDP
 ---
 apiVersion: v1
 kind: Service
@@ -66,6 +70,10 @@ spec:
       port: 10443
       targetPort: peer
       protocol: TCP
+    - name: transfer
+      port: 11444
+      targetPort: transfer
+      protocol: UDP
 ---
 apiVersion: v1
 kind: Service
@@ -102,3 +110,7 @@ spec:
       port: 10443
       targetPort: peer
       protocol: TCP
+    - name: transfer
+      port: 11444
+      targetPort: transfer
+      protocol: UDP

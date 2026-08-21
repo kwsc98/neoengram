@@ -184,13 +184,10 @@ describe('tenant-scoped public resource operations', () => {
     expect(
       (await querySnapshot(snapshot.tenant_id, snapshot.snapshot_id)).data.snapshot,
     ).toMatchObject({ snapshot_id: snapshot.snapshot_id, commit_id: snapshot.commit_id });
-    const regionalCopies = snapshotPage.data.items.filter(
+    const logicalSnapshots = snapshotPage.data.items.filter(
       (item) => item.artifact_id === 'road-scenes' && item.commit_id === mockCommitIds.roadMain3,
     );
-    expect(regionalCopies).toHaveLength(2);
-    expect(new Set(regionalCopies.map((item) => item.region))).toEqual(
-      new Set(['cn-shanghai', 'cn-guangzhou']),
-    );
+    expect(logicalSnapshots).toHaveLength(2);
   });
 
   it('rejects new placement on a non-Ready StorageVolume', async () => {
@@ -203,17 +200,6 @@ describe('tenant-scoped public resource operations', () => {
         storage_volume_id: 'volume-shanghai-archive',
         display_name: '不可用放置测试',
         base_commit_id: mockCommitIds.roadMain3,
-      }),
-    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
-
-    await expect(
-      createSnapshot({
-        tenant_id: 'tenant-a',
-        project_id: 'project-vision',
-        artifact_id: 'road-scenes',
-        commit_id: mockCommitIds.roadMain2,
-        storage_volume_id: 'volume-shanghai-archive',
-        snapshot_request_id: 'snapshot-degraded-placement',
       }),
     ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
 
@@ -235,16 +221,6 @@ describe('tenant-scoped public resource operations', () => {
       }),
     ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
 
-    await expect(
-      createSnapshot({
-        tenant_id: 'tenant-a',
-        project_id: 'project-vision',
-        artifact_id: 'road-scenes',
-        commit_id: mockCommitIds.roadMain2,
-        storage_volume_id: unavailableVolume.storage_volume_id,
-        snapshot_request_id: 'snapshot-unavailable-placement',
-      }),
-    ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
   });
 
   it('derives a Playground from a selected historical Commit or the current Head', async () => {
@@ -558,40 +534,32 @@ describe('tenant-scoped public resource operations', () => {
       project_id: 'project-vision',
       artifact_id: 'road-scenes',
       commit_id: committed.data.commit.commit_id,
-      storage_volume_id: 'volume-guangzhou-delivery',
-      snapshot_request_id: 'snapshot-request-evaluation-guangzhou',
+      request_id: 'snapshot-request-evaluation-guangzhou',
     };
     const firstSnapshot = await createSnapshot(snapshotRequest);
     expect(firstSnapshot.data.replayed).toBe(false);
-    expect(firstSnapshot.data.placement_reused).toBe(false);
     expect(firstSnapshot.data.snapshot.state).toBe('ready');
     expect((await createSnapshot(snapshotRequest)).data.replayed).toBe(true);
     const reusedPlacement = await createSnapshot({
       ...snapshotRequest,
-      snapshot_request_id: 'snapshot-request-evaluation-guangzhou-reused',
+      request_id: 'snapshot-request-evaluation-guangzhou-reused',
     });
     expect(reusedPlacement.data.replayed).toBe(false);
-    expect(reusedPlacement.data.placement_reused).toBe(true);
     expect(reusedPlacement.data.snapshot.snapshot_id).toBe(firstSnapshot.data.snapshot.snapshot_id);
     const readySnapshot = (
       await querySnapshot(snapshotRequest.tenant_id, firstSnapshot.data.snapshot.snapshot_id)
     ).data.snapshot;
-    expect(readySnapshot).toMatchObject({
-      region: 'cn-guangzhou',
-      state: 'ready',
-      integrity: { state: 'verified' },
-    });
+    expect(readySnapshot).toMatchObject({ state: 'ready', integrity: { state: 'verified' } });
 
-    const secondSnapshot = await createSnapshot({
+    const sameLogicalSnapshot = await createSnapshot({
       ...snapshotRequest,
-      storage_volume_id: 'volume-shanghai-vision',
-      snapshot_request_id: 'snapshot-request-evaluation-shanghai',
+      request_id: 'snapshot-request-evaluation-shanghai',
     });
-    expect(secondSnapshot.data.replayed).toBe(false);
-    expect(secondSnapshot.data.snapshot.snapshot_id).not.toBe(
+    expect(sameLogicalSnapshot.data.replayed).toBe(false);
+    expect(sameLogicalSnapshot.data.snapshot.snapshot_id).toBe(
       firstSnapshot.data.snapshot.snapshot_id,
     );
-    expect(secondSnapshot.data.snapshot.commit_id).toBe(firstSnapshot.data.snapshot.commit_id);
+    expect(sameLogicalSnapshot.data.snapshot.commit_id).toBe(firstSnapshot.data.snapshot.commit_id);
   });
 
   it('drives Pre-commit states and returns paginated logical metadata', async () => {

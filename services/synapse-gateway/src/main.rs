@@ -43,6 +43,8 @@ mod peer;
 mod public_listener;
 mod s3_backend;
 mod s3_read_channel;
+#[allow(dead_code)]
+mod transfer_quic;
 mod transport_config;
 mod tunnel;
 
@@ -106,6 +108,10 @@ struct GatewayConfig {
         default_value = DEFAULT_PEER_LISTEN
     )]
     peer_listen: SocketAddr,
+    /// Optional QUIC object-transfer listener. Enabling this endpoint requires workload mTLS
+    /// material even for loopback development, because TransferTicket is a bearer capability.
+    #[arg(long, env = "SYNAPSE_GATEWAY_TRANSFER_LISTEN")]
+    transfer_listen: Option<SocketAddr>,
     /// Optional browser/S3 listener. Existing workload-only deployments remain unchanged until
     /// this address is configured explicitly.
     #[arg(long, env = "SYNAPSE_GATEWAY_PUBLIC_LISTEN")]
@@ -209,9 +215,18 @@ impl GatewayConfig {
         if self.agent_listen == self.control_listen
             || self.agent_listen == self.peer_listen
             || self.control_listen == self.peer_listen
+            || self.transfer_listen.is_some_and(|transfer| {
+                [self.agent_listen, self.control_listen, self.peer_listen].contains(&transfer)
+            })
             || self.public_listen.is_some_and(|public| {
                 [self.agent_listen, self.control_listen, self.peer_listen].contains(&public)
             })
+        {
+            return Err("Gateway listeners must use distinct addresses".into());
+        }
+        if self
+            .transfer_listen
+            .is_some_and(|transfer| self.public_listen.is_some_and(|public| transfer == public))
         {
             return Err("Gateway listeners must use distinct addresses".into());
         }
@@ -256,7 +271,10 @@ impl GatewayConfig {
         }
         let workload_loopback = [self.agent_listen, self.control_listen, self.peer_listen]
             .iter()
-            .all(|address| address.ip().is_loopback());
+            .all(|address| address.ip().is_loopback())
+            && self
+                .transfer_listen
+                .is_none_or(|address| address.ip().is_loopback());
         if let Some(public_listen) = self.public_listen {
             if !matches!(self.central_upstream.scheme(), "http" | "https")
                 || self.central_upstream.host_str().is_none()
@@ -320,7 +338,10 @@ impl GatewayConfig {
         }
         let listeners_are_exposed = [self.agent_listen, self.control_listen, self.peer_listen]
             .iter()
-            .any(|address| !address.ip().is_loopback());
+            .any(|address| !address.ip().is_loopback())
+            || self
+                .transfer_listen
+                .is_some_and(|address| !address.ip().is_loopback());
         let tls_is_configured = self.transport.tls_certificate_file.is_some()
             || self.transport.tls_private_key_file.is_some()
             || self.transport.tls_client_ca_file.is_some();
@@ -344,6 +365,16 @@ impl GatewayConfig {
         {
             return Err(
                 "SYNAPSE_GATEWAY_WORKLOAD_TRUST_DOMAIN is required for TLS or exposed listeners"
+                    .into(),
+            );
+        }
+        if self.transfer_listen.is_some()
+            && (self.transport.tls_certificate_file.is_none()
+                || self.transport.tls_private_key_file.is_none()
+                || self.transport.tls_client_ca_file.is_none())
+        {
+            return Err(
+                "QUIC transfer listener requires the workload certificate, private key, and client CA"
                     .into(),
             );
         }
@@ -515,6 +546,19 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
             config.peer_listen,
         ])?
         .map(|config| config.map(TlsAcceptor::from));
+    let transfer_tls = if config.transfer_listen.is_some() {
+        Some(config.transport.load_quic_server_config()?)
+    } else {
+        None
+    };
+    // Build the matching client policy up front as well. The peer relay uses this same policy;
+    // validating both directions at startup prevents a listener that can receive transfers but
+    // cannot establish the required one-hop mTLS connection after activation.
+    let _transfer_client_tls = if config.transfer_listen.is_some() {
+        Some(config.transport.load_quic_client_config()?)
+    } else {
+        None
+    };
     let public_tls = match (
         config.public_tls_certificate_file.as_deref(),
         config.public_tls_private_key_file.as_deref(),
@@ -548,6 +592,10 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         config.workload_trust_domain.clone().map(Arc::<str>::from),
         allow_loopback_http,
     ));
+    let transfer_fence = transfer_quic::QuicTransferFence::new(
+        identity.gateway_pool_id.clone(),
+        identity.edge_cluster_id.clone(),
+    );
     let tunnel = Arc::new(GatewayTunnel::with_peer_forwarder(
         identity,
         peer_forwarder.clone(),
@@ -565,6 +613,14 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
             address.ip().is_loopback(),
         )),
         None => None,
+    };
+    let transfer = match (config.transfer_listen, transfer_tls) {
+        (Some(address), Some(tls)) => Some(
+            transfer_quic::QuicTransferListener::bind(address, tls, transfer_fence)
+                .map_err(std::io::Error::other)?,
+        ),
+        (None, None) => None,
+        _ => unreachable!("transfer listener and TLS configuration are paired"),
     };
     let lifecycle = GatewayLifecycle::default();
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -641,8 +697,15 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
             )
             .with_s3_backend(s3_backend)
             .with_central_client(central_client),
-            shutdown_receiver,
+            shutdown_receiver.clone(),
         );
+    }
+    if let Some(transfer) = transfer {
+        listeners.spawn(transfer_quic::serve(
+            transfer,
+            config.max_connections_per_listener,
+            shutdown_receiver.clone(),
+        ));
     }
 
     let drain_duration = config
@@ -1832,6 +1895,28 @@ mod tests {
         config.peer_listen = DEFAULT_PEER_LISTEN.parse().unwrap();
         config.max_request_bytes = MAX_CONFIGURED_REQUEST_BYTES + 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn transfer_listener_requires_workload_mtls_material() {
+        let mut config = GatewayConfig::try_parse_from([
+            "synapse-gateway",
+            "--edge-cluster-id",
+            "cluster-a",
+            "--gateway-pool-id",
+            "pool-a",
+            "--gateway-replica-id",
+            "replica-a",
+        ])
+        .unwrap();
+        config.transfer_listen = Some("127.0.0.1:8084".parse().unwrap());
+        config.workload_trust_domain = Some("mesh.example.test".to_owned());
+        assert!(config.validate().is_err());
+
+        config.transport.tls_certificate_file = Some("/listener.crt".into());
+        config.transport.tls_private_key_file = Some("/listener.key".into());
+        config.transport.tls_client_ca_file = Some("/workload-ca.crt".into());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

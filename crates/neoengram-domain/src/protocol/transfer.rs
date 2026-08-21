@@ -1,0 +1,866 @@
+//! QUIC data-plane transfer contracts.
+//!
+//! Control messages remain strict Envelope/NDJSON.  Object bytes never use JSON: this module
+//! defines the small, bounded, length-prefixed binary frame used on a QUIC transfer stream.  The
+//! codec is transport-neutral and can be used by Quinn, a test transport, or a future archive
+//! backend without coupling the domain crate to a network runtime.
+
+use std::{fmt, str::FromStr};
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use super::placement::{CommitObjectSet, ObjectSet};
+use crate::{
+    AgentId, CommitId, ContentDigest, DecimalU64, EdgeClusterId, GatewayPoolId, MountGeneration,
+    ObjectId, PlacementId, ProtocolError, ProtocolResult, RouteGeneration, SessionGeneration,
+    StorageVolumeId, TenantId, TransferId, UnixMillis,
+};
+
+/// ALPN negotiated by all object transfer QUIC connections.
+pub const TRANSFER_ALPN: &str = "neoengram-transfer-v1";
+/// Maximum encoded frame, including the four-byte length prefix and one-byte kind.
+pub const MAX_TRANSFER_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum ObjectChunk payload accepted by one frame.  Ranges larger than this are split by the
+/// transfer scheduler rather than allowing an unbounded allocation in a Gateway or Agent.
+pub const MAX_TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_TRANSFER_STRING_BYTES: usize = 4096;
+const MAX_TRANSFER_OBJECTS: usize = 65_535;
+
+/// The physical endpoints bound into a short-lived TransferTicket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransferEndpoint {
+    pub placement_id: PlacementId,
+    pub agent_id: AgentId,
+    pub gateway_pool_id: GatewayPoolId,
+    pub edge_cluster_id: EdgeClusterId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_volume_id: Option<StorageVolumeId>,
+}
+
+impl TransferEndpoint {
+    pub fn validate(&self) -> ProtocolResult<()> {
+        if self.placement_id.as_str().is_empty()
+            || self.agent_id.as_str().is_empty()
+            || self.gateway_pool_id.as_str().is_empty()
+            || self.edge_cluster_id.as_str().is_empty()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "transfer_endpoint",
+                reason: "endpoint identities must not be empty".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Central-issued, short-lived capability for exactly one object-set transfer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransferTicket {
+    pub transfer_id: TransferId,
+    pub tenant_id: TenantId,
+    pub commit_id: CommitId,
+    pub object_set_digest: ContentDigest,
+    pub source: TransferEndpoint,
+    pub target: TransferEndpoint,
+    pub session_generation: SessionGeneration,
+    pub mount_generation: MountGeneration,
+    pub route_generation: RouteGeneration,
+    pub deadline_unix_ms: UnixMillis,
+    pub max_bytes: DecimalU64,
+    /// The exact Object IDs permitted by this capability.  An empty list is valid for an empty
+    /// Commit and is never interpreted as “all objects”.
+    pub allowed_objects: Vec<ObjectId>,
+}
+
+impl TransferTicket {
+    pub fn validate(&self) -> ProtocolResult<()> {
+        self.source.validate()?;
+        self.target.validate()?;
+        for (field, value) in [
+            ("session_generation", self.session_generation.get()),
+            ("mount_generation", self.mount_generation.get()),
+            ("route_generation", self.route_generation.get()),
+        ] {
+            if value == 0 {
+                return Err(ProtocolError::InvalidField {
+                    field,
+                    reason: "must be greater than zero".to_owned(),
+                });
+            }
+        }
+        if self.deadline_unix_ms.get() == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "deadline_unix_ms",
+                reason: "must be a positive Unix timestamp".to_owned(),
+            });
+        }
+        if self.allowed_objects.len() > MAX_TRANSFER_OBJECTS {
+            return Err(ProtocolError::LimitExceeded {
+                limit_name: "allowed_objects",
+                limit: MAX_TRANSFER_OBJECTS,
+                actual: self.allowed_objects.len(),
+            });
+        }
+        let mut sorted = self.allowed_objects.clone();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ProtocolError::InvalidField {
+                field: "allowed_objects",
+                reason: "object IDs must be unique".to_owned(),
+            });
+        }
+        if sorted != self.allowed_objects {
+            return Err(ProtocolError::InvalidField {
+                field: "allowed_objects",
+                reason: "object IDs must be in ascending canonical order".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn allows(&self, object_id: ObjectId) -> bool {
+        self.allowed_objects.binary_search(&object_id).is_ok()
+    }
+}
+
+/// Frame kind tags are stable and intentionally not serde/JSON representations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum FrameKind {
+    OpenTransfer = 1,
+    ObjectRequest = 2,
+    ObjectChunk = 3,
+    ObjectProof = 4,
+    ObjectAck = 5,
+    CommitObjectSet = 6,
+    TransferError = 7,
+    CloseTransfer = 8,
+}
+
+impl TryFrom<u8> for FrameKind {
+    type Error = TransferFrameError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Ok(match value {
+            1 => Self::OpenTransfer,
+            2 => Self::ObjectRequest,
+            3 => Self::ObjectChunk,
+            4 => Self::ObjectProof,
+            5 => Self::ObjectAck,
+            6 => Self::CommitObjectSet,
+            7 => Self::TransferError,
+            8 => Self::CloseTransfer,
+            _ => return Err(TransferFrameError::UnknownKind(value)),
+        })
+    }
+}
+
+/// A binary object-transfer frame.  All object bytes are carried only by `ObjectChunk`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum TransferFrame {
+    OpenTransfer(TransferTicket),
+    ObjectRequest(ObjectRequest),
+    ObjectChunk(ObjectChunk),
+    ObjectProof(ObjectProof),
+    ObjectAck(ObjectAck),
+    CommitObjectSet(CommitObjectSet),
+    TransferError(TransferError),
+    CloseTransfer(CloseTransfer),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRequest {
+    pub object_id: ObjectId,
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectChunk {
+    pub object_id: ObjectId,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+impl ObjectChunk {
+    pub fn new(
+        object_id: ObjectId,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Self, TransferFrameError> {
+        if bytes.len() > MAX_TRANSFER_CHUNK_BYTES {
+            return Err(TransferFrameError::LimitExceeded {
+                field: "bytes",
+                limit: MAX_TRANSFER_CHUNK_BYTES,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self {
+            object_id,
+            offset,
+            bytes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectProof {
+    pub object_id: ObjectId,
+    pub digest: ContentDigest,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectAck {
+    pub object_id: ObjectId,
+    pub offset: u64,
+    pub length: u64,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TransferErrorCode {
+    InvalidTicket = 1,
+    Fenced = 2,
+    SourceUnavailable = 3,
+    DataUnavailable = 4,
+    DigestMismatch = 5,
+    DeadlineExceeded = 6,
+    Cancelled = 7,
+    Internal = 8,
+}
+
+impl TryFrom<u8> for TransferErrorCode {
+    type Error = TransferFrameError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Ok(match value {
+            1 => Self::InvalidTicket,
+            2 => Self::Fenced,
+            3 => Self::SourceUnavailable,
+            4 => Self::DataUnavailable,
+            5 => Self::DigestMismatch,
+            6 => Self::DeadlineExceeded,
+            7 => Self::Cancelled,
+            8 => Self::Internal,
+            _ => return Err(TransferFrameError::UnknownErrorCode(value)),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferError {
+    pub code: TransferErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseTransfer {
+    pub committed: bool,
+}
+
+/// Errors returned by the bounded binary codec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferFrameError {
+    Truncated,
+    UnknownKind(u8),
+    UnknownErrorCode(u8),
+    InvalidField(&'static str),
+    InvalidIdentifier(String),
+    InvalidDigest,
+    InvalidUtf8,
+    LimitExceeded {
+        field: &'static str,
+        limit: usize,
+        actual: usize,
+    },
+}
+
+impl fmt::Display for TransferFrameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("truncated transfer frame"),
+            Self::UnknownKind(kind) => write!(formatter, "unknown transfer frame kind {kind}"),
+            Self::UnknownErrorCode(code) => write!(formatter, "unknown transfer error code {code}"),
+            Self::InvalidField(field) => write!(formatter, "invalid transfer field {field}"),
+            Self::InvalidIdentifier(value) => {
+                write!(formatter, "invalid transfer identifier {value}")
+            }
+            Self::InvalidDigest => formatter.write_str("invalid transfer digest"),
+            Self::InvalidUtf8 => formatter.write_str("invalid UTF-8 in transfer frame"),
+            Self::LimitExceeded {
+                field,
+                limit,
+                actual,
+            } => {
+                write!(
+                    formatter,
+                    "transfer field {field} exceeds {limit}: {actual}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TransferFrameError {}
+
+impl TransferFrame {
+    /// Encodes exactly one length-prefixed frame.
+    pub fn encode(&self) -> Result<Vec<u8>, TransferFrameError> {
+        let mut payload = Vec::new();
+        match self {
+            Self::OpenTransfer(ticket) => {
+                ticket
+                    .validate()
+                    .map_err(|_| TransferFrameError::InvalidField("ticket"))?;
+                payload.push(FrameKind::OpenTransfer as u8);
+                encode_ticket(&mut payload, ticket)?;
+            }
+            Self::ObjectRequest(request) => {
+                if request.length == 0 {
+                    return Err(TransferFrameError::InvalidField("length"));
+                }
+                payload.push(FrameKind::ObjectRequest as u8);
+                put_object_id(&mut payload, request.object_id);
+                put_u64(&mut payload, request.offset);
+                put_u64(&mut payload, request.length);
+            }
+            Self::ObjectChunk(chunk) => {
+                if chunk.bytes.len() > MAX_TRANSFER_CHUNK_BYTES {
+                    return Err(TransferFrameError::LimitExceeded {
+                        field: "bytes",
+                        limit: MAX_TRANSFER_CHUNK_BYTES,
+                        actual: chunk.bytes.len(),
+                    });
+                }
+                payload.push(FrameKind::ObjectChunk as u8);
+                put_object_id(&mut payload, chunk.object_id);
+                put_u64(&mut payload, chunk.offset);
+                put_bytes(&mut payload, &chunk.bytes)?;
+            }
+            Self::ObjectProof(proof) => {
+                payload.push(FrameKind::ObjectProof as u8);
+                put_object_id(&mut payload, proof.object_id);
+                put_digest(&mut payload, proof.digest);
+                put_u64(&mut payload, proof.size);
+            }
+            Self::ObjectAck(ack) => {
+                payload.push(FrameKind::ObjectAck as u8);
+                put_object_id(&mut payload, ack.object_id);
+                put_u64(&mut payload, ack.offset);
+                put_u64(&mut payload, ack.length);
+                payload.push(u8::from(ack.accepted));
+            }
+            Self::CommitObjectSet(set) => {
+                set.validate()
+                    .map_err(|_| TransferFrameError::InvalidField("object_set"))?;
+                payload.push(FrameKind::CommitObjectSet as u8);
+                encode_commit_object_set(&mut payload, set)?;
+            }
+            Self::TransferError(error) => {
+                if error.message.len() > MAX_TRANSFER_STRING_BYTES {
+                    return Err(TransferFrameError::LimitExceeded {
+                        field: "message",
+                        limit: MAX_TRANSFER_STRING_BYTES,
+                        actual: error.message.len(),
+                    });
+                }
+                payload.push(FrameKind::TransferError as u8);
+                payload.push(error.code as u8);
+                put_string(&mut payload, &error.message)?;
+            }
+            Self::CloseTransfer(close) => {
+                payload.push(FrameKind::CloseTransfer as u8);
+                payload.push(u8::from(close.committed));
+            }
+        }
+        let total = payload
+            .len()
+            .checked_add(4)
+            .ok_or(TransferFrameError::LimitExceeded {
+                field: "frame",
+                limit: MAX_TRANSFER_FRAME_BYTES,
+                actual: usize::MAX,
+            })?;
+        if total > MAX_TRANSFER_FRAME_BYTES {
+            return Err(TransferFrameError::LimitExceeded {
+                field: "frame",
+                limit: MAX_TRANSFER_FRAME_BYTES,
+                actual: total,
+            });
+        }
+        let length =
+            u32::try_from(payload.len()).map_err(|_| TransferFrameError::LimitExceeded {
+                field: "frame",
+                limit: u32::MAX as usize,
+                actual: payload.len(),
+            })?;
+        let mut encoded = Vec::with_capacity(total);
+        encoded.extend_from_slice(&length.to_be_bytes());
+        encoded.extend_from_slice(&payload);
+        Ok(encoded)
+    }
+
+    /// Decodes exactly one frame and rejects trailing bytes.
+    pub fn decode(encoded: &[u8]) -> Result<Self, TransferFrameError> {
+        if encoded.len() < 5 {
+            return Err(TransferFrameError::Truncated);
+        }
+        if encoded.len() > MAX_TRANSFER_FRAME_BYTES {
+            return Err(TransferFrameError::LimitExceeded {
+                field: "frame",
+                limit: MAX_TRANSFER_FRAME_BYTES,
+                actual: encoded.len(),
+            });
+        }
+        let declared =
+            u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+        if declared != encoded.len() - 4 {
+            return Err(TransferFrameError::InvalidField("length_prefix"));
+        }
+        let mut reader = Reader::new(&encoded[4..]);
+        let kind = FrameKind::try_from(reader.byte()?)?;
+        let frame = match kind {
+            FrameKind::OpenTransfer => Self::OpenTransfer(decode_ticket(&mut reader)?),
+            FrameKind::ObjectRequest => Self::ObjectRequest(ObjectRequest {
+                object_id: reader.object_id()?,
+                offset: reader.u64()?,
+                length: reader.u64_nonzero("length")?,
+            }),
+            FrameKind::ObjectChunk => {
+                let object_id = reader.object_id()?;
+                let offset = reader.u64()?;
+                let bytes = reader.bytes(MAX_TRANSFER_CHUNK_BYTES)?;
+                Self::ObjectChunk(ObjectChunk {
+                    object_id,
+                    offset,
+                    bytes,
+                })
+            }
+            FrameKind::ObjectProof => Self::ObjectProof(ObjectProof {
+                object_id: reader.object_id()?,
+                digest: reader.digest()?,
+                size: reader.u64()?,
+            }),
+            FrameKind::ObjectAck => Self::ObjectAck(ObjectAck {
+                object_id: reader.object_id()?,
+                offset: reader.u64()?,
+                length: reader.u64()?,
+                accepted: match reader.byte()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(TransferFrameError::InvalidField("accepted")),
+                },
+            }),
+            FrameKind::CommitObjectSet => {
+                Self::CommitObjectSet(decode_commit_object_set(&mut reader)?)
+            }
+            FrameKind::TransferError => Self::TransferError(TransferError {
+                code: TransferErrorCode::try_from(reader.byte()?)?,
+                message: reader.string()?,
+            }),
+            FrameKind::CloseTransfer => Self::CloseTransfer(CloseTransfer {
+                committed: match reader.byte()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(TransferFrameError::InvalidField("committed")),
+                },
+            }),
+        };
+        if !reader.finished() {
+            return Err(TransferFrameError::InvalidField("trailing_bytes"));
+        }
+        Ok(frame)
+    }
+}
+
+fn encode_ticket(out: &mut Vec<u8>, ticket: &TransferTicket) -> Result<(), TransferFrameError> {
+    put_string(out, ticket.transfer_id.as_str())?;
+    put_string(out, ticket.tenant_id.as_str())?;
+    put_digest(out, ticket.commit_id.digest());
+    put_digest(out, ticket.object_set_digest);
+    encode_endpoint(out, &ticket.source)?;
+    encode_endpoint(out, &ticket.target)?;
+    put_u64(out, ticket.session_generation.get());
+    put_u64(out, ticket.mount_generation.get());
+    put_u64(out, ticket.route_generation.get());
+    put_u64(out, ticket.deadline_unix_ms.get());
+    put_u64(out, ticket.max_bytes.get());
+    let count = u16::try_from(ticket.allowed_objects.len()).map_err(|_| {
+        TransferFrameError::LimitExceeded {
+            field: "allowed_objects",
+            limit: MAX_TRANSFER_OBJECTS,
+            actual: ticket.allowed_objects.len(),
+        }
+    })?;
+    out.extend_from_slice(&count.to_be_bytes());
+    for object_id in &ticket.allowed_objects {
+        put_object_id(out, *object_id);
+    }
+    Ok(())
+}
+
+fn decode_ticket(reader: &mut Reader<'_>) -> Result<TransferTicket, TransferFrameError> {
+    let ticket = TransferTicket {
+        transfer_id: reader.id("transfer ID")?,
+        tenant_id: reader.id("tenant ID")?,
+        commit_id: CommitId::from_digest(reader.digest()?),
+        object_set_digest: reader.digest()?,
+        source: decode_endpoint(reader)?,
+        target: decode_endpoint(reader)?,
+        session_generation: SessionGeneration::new(reader.u64_nonzero("session_generation")?),
+        mount_generation: MountGeneration::new(reader.u64_nonzero("mount_generation")?),
+        route_generation: RouteGeneration::new(reader.u64_nonzero("route_generation")?),
+        deadline_unix_ms: UnixMillis::new(reader.u64_nonzero("deadline_unix_ms")?),
+        max_bytes: DecimalU64::new(reader.u64()?),
+        allowed_objects: {
+            let count = reader.u16()? as usize;
+            if count > MAX_TRANSFER_OBJECTS {
+                return Err(TransferFrameError::LimitExceeded {
+                    field: "allowed_objects",
+                    limit: MAX_TRANSFER_OBJECTS,
+                    actual: count,
+                });
+            }
+            let mut objects = Vec::with_capacity(count);
+            for _ in 0..count {
+                objects.push(reader.object_id()?);
+            }
+            objects
+        },
+    };
+    ticket
+        .validate()
+        .map_err(|_| TransferFrameError::InvalidField("ticket"))?;
+    Ok(ticket)
+}
+
+fn encode_endpoint(
+    out: &mut Vec<u8>,
+    endpoint: &TransferEndpoint,
+) -> Result<(), TransferFrameError> {
+    put_string(out, endpoint.placement_id.as_str())?;
+    put_string(out, endpoint.agent_id.as_str())?;
+    put_string(out, endpoint.gateway_pool_id.as_str())?;
+    put_string(out, endpoint.edge_cluster_id.as_str())?;
+    match &endpoint.storage_volume_id {
+        Some(volume) => {
+            out.push(1);
+            put_string(out, volume.as_str())?;
+        }
+        None => out.push(0),
+    }
+    Ok(())
+}
+
+fn decode_endpoint(reader: &mut Reader<'_>) -> Result<TransferEndpoint, TransferFrameError> {
+    let endpoint = TransferEndpoint {
+        placement_id: reader.id("placement ID")?,
+        agent_id: reader.id("agent ID")?,
+        gateway_pool_id: reader.id("gateway pool ID")?,
+        edge_cluster_id: reader.id("edge cluster ID")?,
+        storage_volume_id: match reader.byte()? {
+            0 => None,
+            1 => Some(reader.id("storage volume ID")?),
+            _ => return Err(TransferFrameError::InvalidField("storage_volume_id")),
+        },
+    };
+    endpoint
+        .validate()
+        .map_err(|_| TransferFrameError::InvalidField("endpoint"))?;
+    Ok(endpoint)
+}
+
+fn encode_commit_object_set(
+    out: &mut Vec<u8>,
+    set: &CommitObjectSet,
+) -> Result<(), TransferFrameError> {
+    put_string(out, set.tenant_id.as_str())?;
+    put_digest(out, set.commit_id.digest());
+    put_digest(out, set.object_set.object_set_digest);
+    let count = u32::try_from(set.object_set.objects.len()).map_err(|_| {
+        TransferFrameError::LimitExceeded {
+            field: "objects",
+            limit: MAX_TRANSFER_OBJECTS,
+            actual: set.object_set.objects.len(),
+        }
+    })?;
+    out.extend_from_slice(&count.to_be_bytes());
+    for object in &set.object_set.objects {
+        put_object_id(out, object.object_id);
+        put_u64(out, object.size.get());
+        put_u64(out, object.ordinal.get());
+        out.push(match object.encoding {
+            super::placement::ObjectEncoding::Raw => 0,
+            super::placement::ObjectEncoding::Zstd => 1,
+        });
+    }
+    Ok(())
+}
+
+fn decode_commit_object_set(
+    reader: &mut Reader<'_>,
+) -> Result<CommitObjectSet, TransferFrameError> {
+    let tenant_id = reader.id("tenant ID")?;
+    let commit_id = CommitId::from_digest(reader.digest()?);
+    let object_set_digest = reader.digest()?;
+    let count = reader.u32()? as usize;
+    if count > MAX_TRANSFER_OBJECTS {
+        return Err(TransferFrameError::LimitExceeded {
+            field: "objects",
+            limit: MAX_TRANSFER_OBJECTS,
+            actual: count,
+        });
+    }
+    let mut objects = Vec::with_capacity(count);
+    for _ in 0..count {
+        let object_id = reader.object_id()?;
+        let size = reader.u64()?;
+        let ordinal = reader.u64()?;
+        let encoding = match reader.byte()? {
+            0 => super::placement::ObjectEncoding::Raw,
+            1 => super::placement::ObjectEncoding::Zstd,
+            _ => return Err(TransferFrameError::InvalidField("encoding")),
+        };
+        objects.push(super::placement::CommitObject::new(
+            object_id, size, encoding, ordinal,
+        ));
+    }
+    let object_set = ObjectSet {
+        object_set_digest,
+        objects,
+    };
+    let set = CommitObjectSet {
+        tenant_id,
+        commit_id,
+        object_set,
+    };
+    set.validate()
+        .map_err(|_| TransferFrameError::InvalidField("object_set"))?;
+    Ok(set)
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_object_id(out: &mut Vec<u8>, object_id: ObjectId) {
+    out.extend_from_slice(object_id.as_bytes());
+}
+
+fn put_digest(out: &mut Vec<u8>, digest: ContentDigest) {
+    out.extend_from_slice(digest.as_bytes());
+}
+
+fn put_string(out: &mut Vec<u8>, value: &str) -> Result<(), TransferFrameError> {
+    if value.len() > MAX_TRANSFER_STRING_BYTES || value.len() > u16::MAX as usize {
+        return Err(TransferFrameError::LimitExceeded {
+            field: "string",
+            limit: MAX_TRANSFER_STRING_BYTES,
+            actual: value.len(),
+        });
+    }
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), TransferFrameError> {
+    if bytes.len() > MAX_TRANSFER_CHUNK_BYTES || bytes.len() > u32::MAX as usize {
+        return Err(TransferFrameError::LimitExceeded {
+            field: "bytes",
+            limit: MAX_TRANSFER_CHUNK_BYTES,
+            actual: bytes.len(),
+        });
+    }
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+struct Reader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Reader<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8], TransferFrameError> {
+        let end = self
+            .offset
+            .checked_add(count)
+            .ok_or(TransferFrameError::Truncated)?;
+        if end > self.bytes.len() {
+            return Err(TransferFrameError::Truncated);
+        }
+        let result = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(result)
+    }
+
+    fn byte(&mut self) -> Result<u8, TransferFrameError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, TransferFrameError> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("checked length"),
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32, TransferFrameError> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("checked length"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, TransferFrameError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("checked length"),
+        ))
+    }
+
+    fn u64_nonzero(&mut self, field: &'static str) -> Result<u64, TransferFrameError> {
+        let value = self.u64()?;
+        if value == 0 {
+            return Err(TransferFrameError::InvalidField(field));
+        }
+        Ok(value)
+    }
+
+    fn digest(&mut self) -> Result<ContentDigest, TransferFrameError> {
+        Ok(ContentDigest::from_bytes(
+            self.take(32)?.try_into().expect("checked length"),
+        ))
+    }
+
+    fn object_id(&mut self) -> Result<ObjectId, TransferFrameError> {
+        Ok(ObjectId::from_bytes(
+            self.take(32)?.try_into().expect("checked length"),
+        ))
+    }
+
+    fn string(&mut self) -> Result<String, TransferFrameError> {
+        let length = self.u16()? as usize;
+        if length > MAX_TRANSFER_STRING_BYTES {
+            return Err(TransferFrameError::LimitExceeded {
+                field: "string",
+                limit: MAX_TRANSFER_STRING_BYTES,
+                actual: length,
+            });
+        }
+        String::from_utf8(self.take(length)?.to_vec()).map_err(|_| TransferFrameError::InvalidUtf8)
+    }
+
+    fn bytes(&mut self, max: usize) -> Result<Vec<u8>, TransferFrameError> {
+        let length = self.u32()? as usize;
+        if length > max {
+            return Err(TransferFrameError::LimitExceeded {
+                field: "bytes",
+                limit: max,
+                actual: length,
+            });
+        }
+        Ok(self.take(length)?.to_vec())
+    }
+
+    fn id<T>(&mut self, kind: &'static str) -> Result<T, TransferFrameError>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        self.string()?
+            .parse()
+            .map_err(|error| TransferFrameError::InvalidIdentifier(format!("{kind}: {error}")))
+    }
+
+    fn finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BackendId, PlacementGeneration};
+
+    fn object(byte: u8) -> ObjectId {
+        ObjectId::from_bytes([byte; 32])
+    }
+
+    fn ticket() -> TransferTicket {
+        TransferTicket {
+            transfer_id: TransferId::new("transfer-1").unwrap(),
+            tenant_id: TenantId::new("tenant-1").unwrap(),
+            commit_id: CommitId::from_bytes([8; 32]),
+            object_set_digest: ContentDigest::from_bytes([9; 32]),
+            source: TransferEndpoint {
+                placement_id: PlacementId::new("placement-src").unwrap(),
+                agent_id: AgentId::new("agent-src").unwrap(),
+                gateway_pool_id: GatewayPoolId::new("gateway-src").unwrap(),
+                edge_cluster_id: EdgeClusterId::new("cluster-src").unwrap(),
+                storage_volume_id: Some(StorageVolumeId::new("volume-src").unwrap()),
+            },
+            target: TransferEndpoint {
+                placement_id: PlacementId::new("placement-dst").unwrap(),
+                agent_id: AgentId::new("agent-dst").unwrap(),
+                gateway_pool_id: GatewayPoolId::new("gateway-dst").unwrap(),
+                edge_cluster_id: EdgeClusterId::new("cluster-dst").unwrap(),
+                storage_volume_id: Some(StorageVolumeId::new("volume-dst").unwrap()),
+            },
+            session_generation: SessionGeneration::new(1),
+            mount_generation: MountGeneration::new(1),
+            route_generation: RouteGeneration::new(1),
+            deadline_unix_ms: UnixMillis::new(100),
+            max_bytes: DecimalU64::new(1000),
+            allowed_objects: vec![object(1), object(2)],
+        }
+    }
+
+    #[test]
+    fn ticket_round_trips_in_binary_without_json() {
+        let frame = TransferFrame::OpenTransfer(ticket());
+        let bytes = frame.encode().unwrap();
+        assert_eq!(
+            u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize,
+            bytes.len() - 4
+        );
+        assert_eq!(TransferFrame::decode(&bytes).unwrap(), frame);
+    }
+
+    #[test]
+    fn object_chunk_rejects_oversized_payload_and_trailing_bytes() {
+        let frame = TransferFrame::ObjectChunk(ObjectChunk {
+            object_id: object(1),
+            offset: 0,
+            bytes: vec![1, 2, 3],
+        });
+        let mut bytes = frame.encode().unwrap();
+        bytes.push(0);
+        assert!(TransferFrame::decode(&bytes).is_err());
+        assert!(ObjectChunk::new(object(1), 0, vec![0; MAX_TRANSFER_CHUNK_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn unknown_frame_kind_is_rejected() {
+        assert!(matches!(
+            TransferFrame::decode(&[0, 0, 0, 1, 99]),
+            Err(TransferFrameError::UnknownKind(99))
+        ));
+    }
+
+    #[allow(dead_code)]
+    fn _keep_imports_used() {
+        let _ = BackendId::new("backend");
+        let _ = PlacementGeneration::new(1);
+    }
+}

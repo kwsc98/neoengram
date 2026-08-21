@@ -14,6 +14,7 @@ categories = ["development-tools", "filesystem"]
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 blake3.workspace = true
 fastcdc.workspace = true
 fs2.workspace = true

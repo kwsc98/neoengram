@@ -16,6 +16,8 @@ import type {
   CreateAddJobResponse,
   CreateArtifactRequest,
   CreateArtifactResponse,
+  CreateCommitReplicationRequest,
+  CreateCommitReplicationResponse,
   CreatePlaygroundRequest,
   CreatePlaygroundResponse,
   CreateProjectRequest,
@@ -40,6 +42,10 @@ import type {
   QueryArtifactListResponse,
   QueryArtifactCommitDiffResponse,
   QueryArtifactResponse,
+  QueryCommitReplicationRequest,
+  QueryCommitReplicationResponse,
+  QueryCommitAvailabilityRequest,
+  QueryCommitAvailabilityResponse,
   QueryPlaygroundListRequest,
   QueryPlaygroundListResponse,
   QueryPlaygroundChangeListRequest,
@@ -240,6 +246,8 @@ const snapshotDeliveryDeleteRequests = new Map<
   { requestJson: string; response: DeleteSnapshotDeliveryResponse }
 >();
 const snapshotQueryCounts = new Map<string, number>();
+const commitReplications = new Map<string, CreateCommitReplicationResponse['replication']>();
+const commitReplicationRequests = new Map<string, { requestJson: string; response: CreateCommitReplicationResponse }>();
 const s3AccessPointCreateRequests = new Map<
   string,
   { requestJson: string; response: CreateS3AccessPointResponse }
@@ -484,12 +492,7 @@ function deletionTargets(
   if (cascade && root.type === 'storage_volume') {
     refs.push(
       ...playgrounds
-        .filter(
-          (item) =>
-            item.tenant_id === tenantId &&
-            item.storage_volume_id === root.storage_volume_id &&
-            isLifecycleActive(item),
-        )
+        .filter((item) => item.tenant_id === tenantId && isLifecycleActive(item))
         .map((item) => ({
           type: 'playground' as const,
           project_id: item.project_id,
@@ -497,12 +500,7 @@ function deletionTargets(
           playground_id: item.playground_id,
         })),
       ...snapshots
-        .filter(
-          (item) =>
-            item.tenant_id === tenantId &&
-            item.storage_volume_id === root.storage_volume_id &&
-            isLifecycleActive(item),
-        )
+        .filter((item) => item.tenant_id === tenantId && isLifecycleActive(item))
         .map((item) => ({ type: 'snapshot' as const, snapshot_id: item.snapshot_id })),
     );
   }
@@ -926,7 +924,7 @@ function seedSnapshotDeliveryState(): void {
     delivery_id: 'delivery-snapshot-main3-01',
     snapshot_id: snapshot.snapshot_id,
     commit_id: snapshot.commit_id,
-    storage_volume_id: snapshot.storage_volume_id,
+    storage_volume_id: 'volume-shanghai-vision',
     mode: 'copy',
     target_relative_root: `snapshots/${snapshot.project_id}/${snapshot.artifact_id}/${snapshot.snapshot_id}/deliveries/delivery-snapshot-main3-01`,
     state: 'failed',
@@ -3143,8 +3141,6 @@ export const handlers = [
         (!body.project_id || snapshot.project_id === body.project_id) &&
         (!body.artifact_id || snapshot.artifact_id === body.artifact_id) &&
         (!body.commit_id || snapshot.commit_id === body.commit_id) &&
-        (!body.region || snapshot.region === body.region) &&
-        (!body.storage_volume_id || snapshot.storage_volume_id === body.storage_volume_id) &&
         (!body.state || snapshot.state === body.state),
     );
     const filters = {
@@ -3152,8 +3148,6 @@ export const handlers = [
       project_id: body.project_id ?? '',
       artifact_id: body.artifact_id ?? '',
       commit_id: body.commit_id ?? '',
-      region: body.region ?? '',
-      storage_volume_id: body.storage_volume_id ?? '',
       state: body.state ?? '',
     };
     const page = paginate(request, 'snapshots', filters, filtered, body);
@@ -3191,7 +3185,7 @@ export const handlers = [
     const body = (await request.json()) as CreateSnapshotRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
-    const requestKey = resourceKey(body.tenant_id, body.snapshot_request_id);
+    const requestKey = resourceKey(body.tenant_id, body.request_id);
     const requestJson = stableJson(body);
     const priorRequest = snapshotCreateRequests.get(requestKey);
     if (priorRequest) {
@@ -3211,21 +3205,16 @@ export const handlers = [
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.commit_id === body.commit_id &&
-        item.storage_volume_id === body.storage_volume_id,
+        item.commit_id === body.commit_id,
     );
     if (existing) {
       const response: CreateSnapshotResponse = {
         snapshot: existing,
         replayed: false,
-        placement_reused: true,
       };
       snapshotCreateRequests.set(requestKey, { requestJson, response: structuredClone(response) });
       return HttpResponse.json(response, { headers: headers(request) });
     }
-
-    const storageVolume = resolveStorageVolume(request, body.tenant_id, body.storage_volume_id);
-    if (storageVolume instanceof HttpResponse) return storageVolume;
 
     const graph = commitGraphs.get(resourceKey(body.tenant_id, body.project_id, body.artifact_id));
     const commit = graph?.nodes.find((node) => node.commit_id === body.commit_id);
@@ -3246,17 +3235,16 @@ export const handlers = [
         item.commit_id === body.commit_id,
     );
     const snapshot = {
-      snapshot_id: `snap-${body.artifact_id}-${storageVolume.region}-${Date.now().toString(36)}`,
+      snapshot_id: `snap-${body.artifact_id}-${Date.now().toString(36)}`,
       tenant_id: body.tenant_id,
       project_id: body.project_id,
       artifact_id: body.artifact_id,
       commit_id: commit.commit_id,
       data_layout: commit.data_layout,
-      storage_volume_id: storageVolume.storage_volume_id,
-      region: storageVolume.region,
       message: commit.message,
       tag_names: [...commit.tag_names],
       state: 'ready' as const,
+      data_health: 'available' as const,
       integrity: {
         state: 'verified' as const,
         files_verified: sameCommitSnapshot?.logical_file_count ?? '864',
@@ -3275,9 +3263,84 @@ export const handlers = [
     const response: CreateSnapshotResponse = {
       snapshot,
       replayed: false,
-      placement_reused: false,
     };
     snapshotCreateRequests.set(requestKey, { requestJson, response: structuredClone(response) });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/commit/replicate', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CreateCommitReplicationRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const requestKey = resourceKey(body.tenant_id, body.request_id);
+    const requestJson = stableJson(body);
+    const prior = commitReplicationRequests.get(requestKey);
+    if (prior) {
+      if (prior.requestJson !== requestJson) {
+        return mutationConflict(request, 'REPLICATION_REQUEST_ID_REUSED', 'The replication request ID is already bound to another request');
+      }
+      const response = structuredClone(prior.response);
+      response.replayed = true;
+      return HttpResponse.json(response, { headers: headers(request) });
+    }
+    const volume = storageVolumes.find(
+      (item) => item.tenant_id === body.tenant_id && item.storage_volume_id === body.target_storage_volume_id,
+    );
+    if (!volume) return notFound(request, 'StorageVolume');
+    if (volume.state !== 'ready') {
+      return mutationConflict(request, 'STORAGE_VOLUME_NOT_READY', 'Replication targets require a Ready StorageVolume');
+    }
+    const replicationId = `replication-${fingerprint(body).slice(0, 24)}`;
+    const replication = {
+      replication_id: replicationId,
+      tenant_id: body.tenant_id,
+      commit_id: body.commit_id,
+      target_storage_volume_id: body.target_storage_volume_id,
+      state: 'published' as const,
+      object_set_digest: body.commit_id,
+      completed_objects: '1',
+      total_objects: '1',
+    };
+    const response: CreateCommitReplicationResponse = { replication, replayed: false };
+    commitReplications.set(resourceKey(body.tenant_id, replicationId), replication);
+    commitReplicationRequests.set(requestKey, { requestJson, response: structuredClone(response) });
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/commit/replication/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryCommitReplicationRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const replication = commitReplications.get(resourceKey(body.tenant_id, body.replication_id));
+    if (!replication) return notFound(request, 'Replication');
+    const response: QueryCommitReplicationResponse = { replication };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/commit/availability/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryCommitAvailabilityRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const verified_storage_volume_ids = [...commitReplications.values()]
+      .filter(
+        (item) =>
+          item.tenant_id === body.tenant_id &&
+          item.commit_id === body.commit_id &&
+          item.state === 'published',
+      )
+      .map((item) => item.target_storage_volume_id);
+    const response: QueryCommitAvailabilityResponse = {
+      availability: {
+        commit_id: body.commit_id,
+        data_health: 'available',
+        verified_placements: String(verified_storage_volume_ids.length),
+        missing_objects: '0',
+        verified_storage_volume_ids,
+      },
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/snapshot/delivery/create', async ({ request }) => {
@@ -3314,7 +3377,8 @@ export const handlers = [
     }
     const storageVolume = storageVolumes.find(
       (item) =>
-        item.tenant_id === body.tenant_id && item.storage_volume_id === snapshot.storage_volume_id,
+        item.tenant_id === body.tenant_id &&
+        item.storage_volume_id === body.target_storage_volume_id,
     );
     if (!storageVolume) return notFound(request, 'StorageVolume');
     if (!storageVolume.allowed_delivery_modes.includes(body.mode)) {
@@ -3322,6 +3386,22 @@ export const handlers = [
         request,
         'DELIVERY_MODE_NOT_ALLOWED',
         'The StorageVolume policy does not allow this delivery mode',
+      );
+    }
+    const placement = [...commitReplications.values()].find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.commit_id === snapshot.commit_id &&
+        item.target_storage_volume_id === body.target_storage_volume_id &&
+        item.state === 'published',
+    );
+    if (!placement) {
+      return problem(
+        request,
+        409,
+        'PLACEMENT_NOT_PUBLISHED',
+        'PlacementSet is not published',
+        'Replicate the Commit to the target Volume before creating Delivery',
       );
     }
     if (body.mode === 'hardlink' && snapshot.data_layout !== 'whole_file') {
@@ -3344,7 +3424,7 @@ export const handlers = [
       delivery_id: deliveryId,
       snapshot_id: snapshot.snapshot_id,
       commit_id: snapshot.commit_id,
-      storage_volume_id: snapshot.storage_volume_id,
+      storage_volume_id: body.target_storage_volume_id,
       mode: body.mode,
       target_relative_root: `snapshots/${snapshot.project_id}/${snapshot.artifact_id}/${snapshot.snapshot_id}/deliveries/${deliveryId}`,
       state: 'requested',
@@ -3679,7 +3759,8 @@ export const handlers = [
       commit_id: snapshot.commit_id,
       bucket_name: body.bucket_name,
       endpoint: runtimeConfig.s3Endpoint,
-      region: snapshot.region,
+      region:
+        storageVolumes.find((volume) => volume.tenant_id === snapshot.tenant_id)?.region ?? 'local',
       state: 'active',
       policy_generation: '1',
       created_at_unix_ms: Date.now().toString(),
@@ -4449,6 +4530,8 @@ export function resetMockState(): void {
   precommitSourceHeads.clear();
   precommitMutationRequests.clear();
   snapshotCreateRequests.clear();
+  commitReplications.clear();
+  commitReplicationRequests.clear();
   snapshotDeliveries.splice(0, snapshotDeliveries.length);
   snapshotDeliveryCreateRequests.clear();
   snapshotRetryRequests.clear();

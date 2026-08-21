@@ -33,12 +33,13 @@ use crate::{
     agent_transport::RegistryAgentApiHandler,
     controller::{
         ArtifactApiServer, ArtifactController, GatewayRegistryApiServer, GatewayRegistryController,
-        JobApiServer, JobController, PlaygroundApiServer, PlaygroundController, ProjectApiServer,
-        ProjectController, ResourceLifecycleApiServer, ResourceLifecycleController, S3ApiServer,
-        S3AuthorizationApiServer, S3AuthorizationController, S3Controller, SnapshotApiServer,
-        SnapshotController, StorageEnrollmentApiServer, StorageEnrollmentController,
-        StorageVolumeApiServer, StorageVolumeController, SystemApiServer, SystemController,
-        TenantApiServer, TenantController,
+        JobApiServer, JobController, PlacementApiServer, PlacementController, PlaygroundApiServer,
+        PlaygroundController, ProjectApiServer, ProjectController, ResourceLifecycleApiServer,
+        ResourceLifecycleController, S3ApiServer, S3AuthorizationApiServer,
+        S3AuthorizationController, S3Controller, SnapshotApiServer, SnapshotController,
+        StorageEnrollmentApiServer, StorageEnrollmentController, StorageVolumeApiServer,
+        StorageVolumeController, SystemApiServer, SystemController, TenantApiServer,
+        TenantController,
     },
     error::{application_error, map_central_error, NeoEngramProblemEncoder},
     gateway_activation_transport::{GatewayBootstrapTransport, GatewayReplicaActivationClient},
@@ -611,6 +612,10 @@ impl AppState {
             clock.clone(),
         )
         .with_lifecycle_objects(authority_store.objects());
+        let catalog = match authority_store.placement() {
+            Some(placement) => catalog.with_placement_repository(placement),
+            None => catalog,
+        };
         let catalog = match authority_lifecycle {
             Some(authority_lifecycle) => catalog.with_lifecycle_authority(authority_lifecycle),
             None => catalog,
@@ -770,6 +775,9 @@ impl AppState {
                 self.catalog.clone(),
             )))
             .interface(SnapshotApiServer::new(SnapshotController::new(
+                self.catalog.clone(),
+            )))
+            .interface(PlacementApiServer::new(PlacementController::new(
                 self.catalog.clone(),
             )))
             .interface(ResourceLifecycleApiServer::new(

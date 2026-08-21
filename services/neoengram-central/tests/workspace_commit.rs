@@ -166,10 +166,6 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         .unwrap()
         .unwrap();
     let commit_digest: ContentDigest = committed.commit.commit_id.into();
-    assert_eq!(
-        committed.commit.source_storage_volume_id.as_str(),
-        "volume-a"
-    );
     assert_eq!(artifact.head_commit_id, Some(commit_digest));
     assert_eq!(playground.head_commit_id, Some(commit_digest));
     assert!(components
@@ -514,12 +510,14 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             },
         )
         .await
-        .unwrap_err();
+        .unwrap();
     assert_eq!(
-        cross_volume_playground.code().as_str(),
-        "playground_volume_has_no_commit_data"
+        cross_volume_playground.playground.storage_volume_id,
+        "volume-b"
     );
-    let cross_volume_snapshot = catalog
+    // Workspace creation may target any ready Volume. Hydration resolves a readable Commit
+    // Placement independently, while explicit Replicate remains the durable copy operation.
+    let source_derived_snapshot = catalog
         .create_snapshot(
             &identity,
             CreateSnapshotRequest {
@@ -527,15 +525,14 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
                 project_id: project_id.to_string(),
                 artifact_id: artifact_id.to_string(),
                 commit_id: committed.commit.commit_id.to_string(),
-                storage_volume_id: "volume-b".to_owned(),
-                snapshot_request_id: "snapshot-request-cross-volume".to_owned(),
+                request_id: "snapshot-request-cross-volume".to_owned(),
             },
         )
         .await
-        .unwrap_err();
+        .unwrap();
     assert_eq!(
-        cross_volume_snapshot.code().as_str(),
-        "snapshot_volume_has_no_commit_data"
+        source_derived_snapshot.snapshot.commit_id,
+        committed.commit.commit_id.to_string()
     );
 
     let historical_playground_id = PlaygroundId::new("playground-historical").unwrap();
@@ -822,10 +819,10 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
                 source_playground_id: playground_id.clone(),
-                source_storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
                 source_precommit_id: precommit_id,
                 commit_request_id: RequestId::new("commit-request-publication-window").unwrap(),
                 commit_id,
+                object_set_digest: ContentDigest::from_bytes([8; 32]),
                 root_directory_id,
                 parent_commit_id: None,
                 index_version: source,
@@ -904,8 +901,7 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
                 project_id: project_id.to_string(),
                 artifact_id: artifact_id.to_string(),
                 commit_id: commit_id.to_string(),
-                storage_volume_id: "volume-a".to_owned(),
-                snapshot_request_id: "snapshot-request-unpublished-base".to_owned(),
+                request_id: "snapshot-request-unpublished-base".to_owned(),
             },
         )
         .await

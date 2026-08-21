@@ -52,6 +52,8 @@ tags:
     description: 租户内 Playground 创建、查询和 Commit 方法
   - name: Snapshot
     description: 绑定 Artifact Commit 的只读 Snapshot 创建与查询方法
+  - name: Placement
+    description: Commit 对象副本、数据健康和目标 Volume Workspace 操作
   - name: S3
     description: 将 Ready Snapshot 通过 Gateway 暴露为只读 S3 Access Point，并管理短期凭证与对象浏览
   - name: ResourceLifecycle
@@ -1231,6 +1233,144 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
+  /api/commit/replicate:
+    post:
+      tags: [Placement]
+      operationId: replicateCommit
+      summary: 将 Commit 复制到目标 Volume
+      description: 创建显式对象级复制任务；目标 PlacementSet 完整校验并发布前不可用于 Delivery。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCommitReplicationRequest"
+      responses:
+        "200":
+          description: 复制任务已排队或幂等重放
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateCommitReplicationResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/commit/replication/query:
+    post:
+      tags: [Placement]
+      operationId: queryCommitReplication
+      summary: 查询复制任务
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryCommitReplicationRequest"
+      responses:
+        "200":
+          description: 复制任务
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryCommitReplicationResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+
+  /api/commit/availability/query:
+    post:
+      tags: [Placement]
+      operationId: queryCommitAvailability
+      summary: 查询 Commit 数据健康
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryCommitAvailabilityRequest"
+      responses:
+        "200":
+          description: Commit 健康状态
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryCommitAvailabilityResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+
+  /api/workspace/create:
+    post:
+      tags: [Placement]
+      operationId: createWorkspace
+      summary: 在目标 Volume 创建 Workspace
+      description: Workspace 是唯一可写数据面；Central 自动从已发布 Placement 选择可用源。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWorkspaceRequest"
+      responses:
+        "200":
+          description: Workspace 已创建或幂等重放
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateWorkspaceResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
   /api/artifact/commit/graph/query:
     post:
       tags: [Artifact]
@@ -2260,7 +2400,8 @@ paths:
       operationId: querySnapshotList
       summary: 查询租户内 Snapshot
       description: |
-        按 Project、Artifact、Commit、Region、StorageVolume 或状态分页查询独立 Snapshot。
+        按 Project、Artifact、Commit 或状态分页查询独立逻辑 Snapshot；物理副本由 Placement
+        动态解析，不作为 Snapshot 筛选条件。
         opaque cursor 与全部筛选条件绑定。
       security:
         - BearerAuth: []
@@ -2412,13 +2553,10 @@ paths:
       operationId: createSnapshot
       summary: 创建 Snapshot
       description: |
-        为指定 Artifact Commit 和 StorageVolume 创建单区域只读 Snapshot。Commit 必须是该 Artifact
-        已发布历史中的 Commit，未被任何 Head 可达、也未确认的 Commit 返回 404。所选 StorageVolume
-        必须属于同一 Tenant 且 `state=ready`；`degraded` 或 `unavailable` 均拒绝新放置并返回 409。
-        服务端生成 `snapshot_id`；相同 `snapshot_request_id` 和 payload 返回 `replayed: true`，不同
-        request identity 命中同一 Commit/Volume 的未删除 Snapshot 时返回 `placement_reused: true`。
-        用途、保留策略和 Dataset Profile 均不是创建参数；Profile 是创建后查询的派生只读元数据。200 返回时
-        Snapshot 记录已持久化且可查询；具体物化进度由独立 SnapshotDelivery 表达。
+        为指定 Artifact 的固定 Commit 创建逻辑 Snapshot。Snapshot 不绑定 StorageVolume 或 Region；
+        对象副本由 Placement authority 管理，复制与只读交付是独立动作。相同 `request_id` 和 payload
+        返回 `replayed: true`。200 返回时
+        Snapshot 记录已持久化且可查询，具体物化进度由独立 SnapshotDelivery 表达。
       security:
         - BearerAuth: []
       parameters:
@@ -2436,8 +2574,7 @@ paths:
               project_id: project-vision
               artifact_id: road-scenes
               commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-              storage_volume_id: volume-shanghai-archive
-              snapshot_request_id: snapshot-request-main3-shanghai
+              request_id: snapshot-request-main3-shanghai
       responses:
         "200":
           description: 已创建或幂等返回的 Snapshot
@@ -2456,8 +2593,6 @@ paths:
                   artifact_id: road-scenes
                   commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                   data_layout: fast_cdc
-                  storage_volume_id: volume-shanghai-archive
-                  region: cn-shanghai
                   message: 补充夜间道路场景
                   tag_names: [dataset/v4, release-candidate]
                   state: creating
@@ -2474,7 +2609,6 @@ paths:
                   created_at_unix_ms: "1785167600000"
                   updated_at_unix_ms: "1785167600000"
                 replayed: false
-                placement_reused: false
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -7106,10 +7240,6 @@ components:
           $ref: "#/components/schemas/ArtifactId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
-        region:
-          $ref: "#/components/schemas/RegionName"
-        storage_volume_id:
-          $ref: "#/components/schemas/StorageVolumeId"
         state:
           $ref: "#/components/schemas/SnapshotState"
         cursor:
@@ -7148,21 +7278,172 @@ components:
         snapshot:
           $ref: "#/components/schemas/SnapshotView"
 
+    CreateCommitReplicationRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, commit_id, target_storage_volume_id, request_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        commit_id:
+          $ref: "#/components/schemas/CommitId"
+        target_storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+
+    QueryCommitReplicationRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, replication_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        replication_id:
+          $ref: "#/components/schemas/ResourceId"
+
+    QueryCommitAvailabilityRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, commit_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        commit_id:
+          $ref: "#/components/schemas/CommitId"
+
+    CreateWorkspaceRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, project_id, artifact_id, target_storage_volume_id, request_id]
+      properties:
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        project_id:
+          $ref: "#/components/schemas/ProjectId"
+        artifact_id:
+          $ref: "#/components/schemas/ArtifactId"
+        base_commit_id:
+          $ref: "#/components/schemas/CommitId"
+        target_storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        request_id:
+          $ref: "#/components/schemas/RequestId"
+
+    ReplicationView:
+      type: object
+      additionalProperties: false
+      required: [replication_id, tenant_id, commit_id, target_storage_volume_id, state, object_set_digest, completed_objects, total_objects]
+      properties:
+        replication_id:
+          $ref: "#/components/schemas/ResourceId"
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        commit_id:
+          $ref: "#/components/schemas/CommitId"
+        target_storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        state:
+          type: string
+          enum: [queued, planning, transferring, verifying, published, failed, cancelled]
+        object_set_digest:
+          $ref: "#/components/schemas/ContentDigest"
+        completed_objects:
+          $ref: "#/components/schemas/CanonicalU64"
+        total_objects:
+          $ref: "#/components/schemas/CanonicalU64"
+        issue:
+          $ref: "#/components/schemas/ResourceIssueSummary"
+
+    CreateCommitReplicationResponse:
+      type: object
+      additionalProperties: false
+      required: [replication, replayed]
+      properties:
+        replication:
+          $ref: "#/components/schemas/ReplicationView"
+        replayed:
+          type: boolean
+
+    QueryCommitReplicationResponse:
+      type: object
+      additionalProperties: false
+      required: [replication]
+      properties:
+        replication:
+          $ref: "#/components/schemas/ReplicationView"
+
+    CommitAvailabilityView:
+      type: object
+      additionalProperties: false
+      required: [commit_id, data_health, verified_placements, missing_objects, verified_storage_volume_ids]
+      properties:
+        commit_id:
+          $ref: "#/components/schemas/CommitId"
+        data_health:
+          type: string
+          enum: [available, degraded, unavailable]
+        verified_placements:
+          $ref: "#/components/schemas/CanonicalU64"
+        missing_objects:
+          $ref: "#/components/schemas/CanonicalU64"
+        verified_storage_volume_ids:
+          type: array
+          items:
+            $ref: "#/components/schemas/StorageVolumeId"
+
+    QueryCommitAvailabilityResponse:
+      type: object
+      additionalProperties: false
+      required: [availability]
+      properties:
+        availability:
+          $ref: "#/components/schemas/CommitAvailabilityView"
+
+    WorkspaceView:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, tenant_id, project_id, artifact_id, target_storage_volume_id, lifecycle]
+      properties:
+        workspace_id:
+          $ref: "#/components/schemas/ResourceId"
+        tenant_id:
+          $ref: "#/components/schemas/TenantId"
+        project_id:
+          $ref: "#/components/schemas/ProjectId"
+        artifact_id:
+          $ref: "#/components/schemas/ArtifactId"
+        base_commit_id:
+          $ref: "#/components/schemas/CommitId"
+        target_storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        lifecycle:
+          type: string
+          enum: [provisioning, active, unavailable, deleting, deleted]
+
+    CreateWorkspaceResponse:
+      type: object
+      additionalProperties: false
+      required: [workspace, replayed]
+      properties:
+        workspace:
+          $ref: "#/components/schemas/WorkspaceView"
+        replayed:
+          type: boolean
+
     CreateSnapshotRequest:
       type: object
       description: |
-        选择同 Tenant、`state=ready` 的 StorageVolume，为指定 Artifact 的固定 Commit 创建 Snapshot。
-        服务端必须验证 Project/Artifact 存在且 Commit 确属该 Artifact；Snapshot 不能创建 Artifact、
-        改写 Artifact Head 或在创建后切换 Commit。Region 由 Volume 派生；用途、保留策略和
-        Dataset Profile 不属于本请求。
+        为指定 Artifact 的固定 Commit 创建逻辑 Snapshot。服务端必须验证 Project/Artifact 存在
+        且 Commit 确属该 Artifact；Snapshot 不能创建 Artifact、改写 Artifact Head 或在创建后
+        切换 Commit。Commit 的源 Placement 由服务端解析，客户端不能为 Snapshot 选择 Volume。
       additionalProperties: false
       required:
         - tenant_id
         - project_id
         - artifact_id
         - commit_id
-        - storage_volume_id
-        - snapshot_request_id
+        - request_id
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -7172,21 +7453,17 @@ components:
           $ref: "#/components/schemas/ArtifactId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
-        storage_volume_id:
-          $ref: "#/components/schemas/StorageVolumeId"
-        snapshot_request_id:
+        request_id:
           $ref: "#/components/schemas/ResourceId"
 
     CreateSnapshotResponse:
       type: object
       additionalProperties: false
-      required: [snapshot, replayed, placement_reused]
+      required: [snapshot, replayed]
       properties:
         snapshot:
           $ref: "#/components/schemas/SnapshotView"
         replayed:
-          type: boolean
-        placement_reused:
           type: boolean
 
     SnapshotDeliveryMode:
@@ -7259,12 +7536,14 @@ components:
     CreateSnapshotDeliveryRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, snapshot_id, mode, request_id]
+      required: [tenant_id, snapshot_id, target_storage_volume_id, mode, request_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
         snapshot_id:
           $ref: "#/components/schemas/SnapshotId"
+        target_storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
         mode:
           $ref: "#/components/schemas/SnapshotDeliveryMode"
         request_id:
@@ -7471,7 +7750,7 @@ components:
     SnapshotView:
       type: object
       description: |
-        独立身份，固定一个 Artifact、Commit、StorageVolume 和 Region 的不可变 Snapshot 资源。
+        独立身份，固定一个 Artifact 和 Commit 的不可变逻辑 Snapshot 资源。
         `tenant_id + project_id + artifact_id + commit_id` 是不可变来源 scope；只读交付由独立的
         SnapshotDelivery 资源表达，Snapshot 本身不保存挂载或物化模式，也不拥有或改写 Artifact 数据权威。
       additionalProperties: false
@@ -7482,11 +7761,10 @@ components:
         - artifact_id
         - commit_id
         - data_layout
-        - storage_volume_id
-        - region
         - message
         - tag_names
         - state
+        - data_health
         - integrity
         - resource_version
         - lifecycle
@@ -7507,10 +7785,6 @@ components:
           $ref: "#/components/schemas/CommitId"
         data_layout:
           $ref: "#/components/schemas/DataLayout"
-        storage_volume_id:
-          $ref: "#/components/schemas/StorageVolumeId"
-        region:
-          $ref: "#/components/schemas/RegionName"
         message:
           type: string
           minLength: 1
@@ -7523,6 +7797,10 @@ components:
             $ref: "#/components/schemas/TagName"
         state:
           $ref: "#/components/schemas/SnapshotState"
+        data_health:
+          type: string
+          description: Commit object availability resolved from the currently published PlacementSets.
+          enum: [available, degraded, unavailable]
         issue:
           $ref: "#/components/schemas/ResourceIssueSummary"
         integrity:

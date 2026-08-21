@@ -187,9 +187,6 @@ const snapshotQuery = useQuery({
 });
 const artifactPlaygrounds = computed(() => playgroundQuery.data.value?.data.items ?? []);
 const artifactSnapshots = computed(() => snapshotQuery.data.value?.data.items ?? []);
-const availableRegions = computed(() => [
-  ...new Set(artifactSnapshots.value.map((snapshot) => snapshot.region)),
-]);
 const detailRefreshing = computed(
   () =>
     artifactQuery.isFetching.value ||
@@ -524,15 +521,6 @@ async function showCreateSnapshot(): Promise<void> {
               <dt>Snapshots</dt>
               <dd>{{ artifactSnapshots.length }}</dd>
             </div>
-            <div v-if="snapshotMaterializeEnabled" class="definition-grid__wide">
-              <dt>可用区域</dt>
-              <dd class="tag-list">
-                <el-tag v-for="region in availableRegions" :key="region" effect="plain">
-                  {{ region }}
-                </el-tag>
-                <span v-if="availableRegions.length === 0">尚无区域交付</span>
-              </dd>
-            </div>
             <div>
               <dt>创建时间</dt>
               <dd>{{ formatTime(artifact.created_at_unix_ms) }}</dd>
@@ -672,7 +660,7 @@ async function showCreateSnapshot(): Promise<void> {
               </span>
               <span class="relation-list__aside">
                 <small>
-                  {{ snapshot.region }} · {{ formatCount(snapshot.logical_file_count) }} files ·
+                  {{ formatCount(snapshot.logical_file_count) }} files ·
                   {{ formatBytes(snapshot.logical_size_bytes) }}
                 </small>
                 <el-tag :type="snapshotStateTagType(snapshot.state)" effect="plain">

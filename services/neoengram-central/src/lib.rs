@@ -22,6 +22,7 @@ pub mod identity;
 pub mod mapper;
 pub mod memory;
 pub mod model;
+pub mod placement_authority;
 pub mod ports;
 pub mod precommit;
 pub mod registry_memory;
@@ -51,6 +52,7 @@ pub use mapper::sqlite::authority::{
 };
 pub use memory::*;
 pub use model::*;
+pub use placement_authority::*;
 pub use ports::*;
 pub use precommit::*;
 pub use registry_memory::InMemoryAgentRegistry;

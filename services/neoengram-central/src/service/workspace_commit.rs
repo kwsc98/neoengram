@@ -1,5 +1,7 @@
 use std::{fmt, str::FromStr, sync::Arc};
 
+use std::collections::BTreeMap;
+
 use crate::{
     canonical_commit_id_with_layout, AdvancePlaygroundCommitRequest, AuthorityStore, CentralError,
     CentralErrorCode, CentralResult, Clock, CommitRecord, ControlCatalogRepository, IndexKey,
@@ -9,10 +11,12 @@ use crate::{
 };
 use fusen_rs::{Error, ErrorCategory};
 use neoengram_domain::core::{
-    ChunkingStrategy, CommitId, ContentDigest, FileRecord, IndexVersion, LogicalPath,
+    ChunkingStrategy, CommitId, ContentDigest, FileRecord, IndexVersion, LogicalPath, ObjectId,
 };
 use neoengram_domain::protocol::{
-    ArtifactId, CommitDataLayout, IndexRevision, JobState, PlaygroundId, ProjectId, RequestId,
+    ArtifactId, BackendId, CommitDataLayout, CommitObject, CommitObjectSet, CommitPlacementSet,
+    CommitPlacementSetState, DecimalU64, IndexRevision, JobState, ObjectEncoding, ObjectPlacement,
+    PlacementGeneration, PlacementSetId, PlacementState, PlaygroundId, ProjectId, RequestId,
     TenantId, WireIndexVersion,
 };
 use neoengram_runtime::engine::{
@@ -41,6 +45,7 @@ pub struct WorkspaceCommitService {
     precommits: Arc<dyn PreCommitRepository>,
     jobs: Arc<dyn JobRepository>,
     indexes: Arc<dyn IndexPublisher>,
+    placement: Option<Arc<dyn crate::PlacementRepository>>,
     policy: Arc<StaticRbacPolicy>,
     clock: Arc<dyn Clock>,
     publication_lock: Mutex<()>,
@@ -69,6 +74,7 @@ impl WorkspaceCommitService {
             precommits,
             jobs: authority.jobs(),
             indexes: authority.publisher(),
+            placement: authority.placement(),
             policy,
             clock,
             publication_lock: Mutex::new(()),
@@ -243,7 +249,6 @@ impl WorkspaceCommitService {
                 .ok_or_else(|| internal_error("the committed Commit record is missing"))?;
             if stored.commit_request_id != commit_request_id
                 || stored.source_playground_id != playground_id
-                || stored.source_storage_volume_id != playground.storage_volume_id
                 || stored.source_precommit_id != precommit_id
                 || !same_index_version(&stored.index_version, &expected_candidate)
                 || stored.message != request.message
@@ -322,6 +327,10 @@ impl WorkspaceCommitService {
                 &NoopProgressSink,
             )
             .map_err(commit_graph_error)?;
+            let object_set_digest = self
+                .build_object_set_for_records(&tenant_id, &artifact_id, &reader.records)
+                .await?
+                .object_set_digest;
             self.precommits
                 .commit(PreCommitCommitRequest {
                     key: key.clone(),
@@ -332,10 +341,10 @@ impl WorkspaceCommitService {
                         project_id: project_id.clone(),
                         artifact_id: artifact_id.clone(),
                         source_playground_id: playground_id.clone(),
-                        source_storage_volume_id: playground.storage_volume_id.clone(),
                         source_precommit_id: precommit_id,
                         commit_request_id,
                         commit_id: canonical_commit_id_with_layout(graph.commit_id, data_layout),
+                        object_set_digest,
                         root_directory_id: graph.commit.root_directory_id,
                         parent_commit_id: graph.commit.parent,
                         index_version: expected_candidate,
@@ -350,6 +359,13 @@ impl WorkspaceCommitService {
                 .await
                 .map_err(map_central_error)?
         };
+
+        // A Commit is logical metadata only. The first physical copy is represented by a
+        // complete, verified PlacementSet on the Workspace's volume. This publication is
+        // idempotent so a retry after a process interruption converges without changing the
+        // immutable Commit record.
+        self.publish_initial_placement(&authority_outcome.commit, &playground)
+            .await?;
 
         if authority_outcome
             .consumed_precommit
@@ -386,6 +402,168 @@ impl WorkspaceCommitService {
             replayed: authority_outcome.replayed || head_replayed,
         })
     }
+
+    async fn publish_initial_placement(
+        &self,
+        commit: &CommitRecord,
+        playground: &PlaygroundRecord,
+    ) -> Result<(), Error> {
+        let Some(placement) = &self.placement else {
+            // Standalone/unit compositions may intentionally omit the placement authority. The
+            // durable Commit remains valid; production composition always installs this port.
+            return Ok(());
+        };
+
+        // A replay must not infer a new physical origin from a potentially moved Workspace. Once
+        // any complete PlacementSet is published, the initial-copy fence is immutable and the
+        // explicit Replicate action is the only way to add another copy.
+        if placement
+            .published_placement_set(&commit.tenant_id, &commit.commit_id.into())
+            .await
+            .map_err(map_central_error)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let object_set = self.build_commit_object_set(commit).await?;
+        if object_set.object_set.object_set_digest != commit.object_set_digest {
+            return Err(commit_integrity_error(
+                "Commit ObjectSet digest differs from its immutable Commit identity",
+            ));
+        }
+        let backend_id = BackendId::new(playground.storage_volume_id.to_string())
+            .map_err(|_| internal_error("invalid workspace backend identity"))?;
+        let volume = self
+            .catalog
+            .get_storage_volume(&commit.tenant_id, &playground.storage_volume_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("storage volume"))?;
+        let region = neoengram_domain::protocol::RegionId::new(volume.region.clone()).ok();
+        let generation = PlacementGeneration::new(1);
+        let mut placement_records = Vec::with_capacity(object_set.object_set.objects.len());
+        for object in &object_set.object_set.objects {
+            let placement_record = ObjectPlacement {
+                tenant_id: commit.tenant_id.clone(),
+                object_id: object.object_id,
+                backend_id: backend_id.clone(),
+                storage_volume_id: Some(playground.storage_volume_id.clone()),
+                archive_id: None,
+                edge_cluster_id: Some(volume.edge_cluster_id.clone()),
+                gateway_pool_id: None,
+                region: region.clone(),
+                placement_generation: generation,
+                state: PlacementState::Verified,
+                verified_size: object.size,
+                verified_digest: object.object_id.digest(),
+                failure_domain: format!("volume:{}", playground.storage_volume_id),
+            };
+            placement_records.push(placement_record);
+        }
+
+        let placement_set_id =
+            placement_set_id_for(&commit.tenant_id, &commit.commit_id, &backend_id)?;
+        let placement_set = CommitPlacementSet {
+            placement_set_id,
+            tenant_id: commit.tenant_id.clone(),
+            commit_id: commit.commit_id,
+            backend_id,
+            storage_volume_id: Some(playground.storage_volume_id.clone()),
+            archive_id: None,
+            object_set_digest: object_set.object_set.object_set_digest,
+            object_count: DecimalU64::new(object_set.object_set.object_count() as u64),
+            verified_object_count: DecimalU64::new(object_set.object_set.object_count() as u64),
+            placement_generation: generation,
+            state: CommitPlacementSetState::Published,
+        };
+        placement
+            .publish_initial_placement(object_set, placement_records, placement_set)
+            .await
+            .map_err(map_central_error)?;
+        Ok(())
+    }
+
+    async fn build_commit_object_set(
+        &self,
+        commit: &CommitRecord,
+    ) -> Result<CommitObjectSet, Error> {
+        let object_set = self
+            .build_object_set_for_records(&commit.tenant_id, &commit.artifact_id, &commit.records)
+            .await?;
+        Ok(CommitObjectSet {
+            tenant_id: commit.tenant_id.clone(),
+            commit_id: commit.commit_id,
+            object_set,
+        })
+    }
+
+    async fn build_object_set_for_records(
+        &self,
+        tenant_id: &TenantId,
+        artifact_id: &ArtifactId,
+        records: &[FileRecord],
+    ) -> Result<neoengram_domain::protocol::ObjectSet, Error> {
+        let mut objects = BTreeMap::<ObjectId, u64>::new();
+        for record in records {
+            let manifest = self
+                .indexes
+                .manifest(tenant_id, artifact_id, record.manifest_id)
+                .await
+                .map_err(map_central_error)?
+                .ok_or_else(|| {
+                    commit_integrity_error(format!(
+                        "Commit file {} references a missing immutable Manifest",
+                        record.path
+                    ))
+                })?;
+            manifest.validate().map_err(|error| {
+                commit_integrity_error(format!(
+                    "Commit file {} references an invalid Manifest: {error}",
+                    record.path
+                ))
+            })?;
+            for chunk in manifest.chunks {
+                if let Some(existing) = objects.insert(chunk.object_id, chunk.size) {
+                    if existing != chunk.size {
+                        return Err(commit_integrity_error(format!(
+                            "Object {} has conflicting sizes in Commit manifests",
+                            chunk.object_id
+                        )));
+                    }
+                }
+            }
+        }
+        let object_list = objects
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (object_id, size))| {
+                CommitObject::new(object_id, size, ObjectEncoding::Raw, ordinal as u64)
+            })
+            .collect();
+        let object_set =
+            neoengram_domain::protocol::ObjectSet::new(object_list).map_err(|error| {
+                commit_integrity_error(format!("invalid Commit ObjectSet: {error}"))
+            })?;
+        Ok(object_set)
+    }
+}
+
+fn placement_set_id_for(
+    tenant_id: &TenantId,
+    commit_id: &CommitId,
+    backend_id: &BackendId,
+) -> Result<PlacementSetId, Error> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"neoengram-placement-set-v1\0");
+    hasher.update(tenant_id.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(commit_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(backend_id.as_str().as_bytes());
+    let digest = hasher.finalize().to_hex();
+    PlacementSetId::new(format!("placement-set-{}", &digest[..32]))
+        .map_err(|_| internal_error("invalid PlacementSet identity"))
 }
 
 async fn validate_candidate_layout(
@@ -961,10 +1139,10 @@ mod tests {
             project_id: project_id(),
             artifact_id: artifact_id(),
             source_playground_id: playground_id(),
-            source_storage_volume_id: storage_volume_id(),
             source_precommit_id: PreCommitId::new(format!("precommit-{commit_id}")).unwrap(),
             commit_request_id: RequestId::new(format!("request-{commit_id}")).unwrap(),
             commit_id,
+            object_set_digest: ContentDigest::from_bytes([0; 32]),
             data_layout: neoengram_domain::protocol::CommitDataLayout::FastCdc,
             root_directory_id: DirectoryId::from_bytes([8; 32]),
             parent_commit_id,

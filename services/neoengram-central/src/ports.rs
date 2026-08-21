@@ -709,6 +709,139 @@ pub trait ControlCatalogRepository: Send + Sync {
     ) -> CentralResult<crate::LifecycleAssignmentOutboxRecord>;
 }
 
+/// Durable Placement-first authority. This port deliberately stores only immutable metadata and
+/// transfer/workspace state; object bytes remain owned by Agent/Gateway data-plane backends.
+#[async_trait]
+pub trait PlacementRepository: Send + Sync {
+    /// Returns the immutable object manifest required by a Commit, if it has been staged.
+    async fn get_commit_object_set(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Option<neoengram_domain::protocol::CommitObjectSet>>;
+    /// Inserts a Commit object set exactly once. Replays return the original set; conflicting
+    /// metadata for the same tenant/Commit is rejected.
+    async fn insert_commit_object_set(
+        &self,
+        object_set: neoengram_domain::protocol::CommitObjectSet,
+    ) -> CentralResult<neoengram_domain::protocol::CommitObjectSet>;
+    async fn get_placement_set(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+        backend_id: &neoengram_domain::protocol::BackendId,
+    ) -> CentralResult<Option<neoengram_domain::protocol::CommitPlacementSet>>;
+    /// Returns every published complete-object-set placement for a Commit in stable backend order.
+    /// Readers may probe the returned candidates and fail over without persisting a source Volume
+    /// on the logical Commit row.
+    async fn published_placement_sets(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Vec<neoengram_domain::protocol::CommitPlacementSet>>;
+    /// Returns the first published placement for callers that only need a deterministic default.
+    async fn published_placement_set(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Option<neoengram_domain::protocol::CommitPlacementSet>> {
+        Ok(self
+            .published_placement_sets(tenant_id, commit_id)
+            .await?
+            .into_iter()
+            .next())
+    }
+    /// Publishes or stages one complete-object-set fence. Publication validation is enforced by
+    /// the domain model before it reaches the database.
+    async fn insert_placement_set(
+        &self,
+        placement_set: neoengram_domain::protocol::CommitPlacementSet,
+    ) -> CentralResult<neoengram_domain::protocol::CommitPlacementSet>;
+    /// Publishes the first complete copy for a newly committed dataset. Implementations should
+    /// persist the ObjectSet, verified object placements, and publication fence in one durable
+    /// transaction; the default keeps lightweight in-memory adapters behaviorally equivalent.
+    async fn publish_initial_placement(
+        &self,
+        object_set: neoengram_domain::protocol::CommitObjectSet,
+        placements: Vec<neoengram_domain::protocol::ObjectPlacement>,
+        placement_set: neoengram_domain::protocol::CommitPlacementSet,
+    ) -> CentralResult<(
+        neoengram_domain::protocol::CommitObjectSet,
+        neoengram_domain::protocol::CommitPlacementSet,
+    )> {
+        let stored = self.insert_commit_object_set(object_set).await?;
+        for placement in placements {
+            self.insert_object_placement(placement).await?;
+        }
+        let published = self.insert_placement_set(placement_set).await?;
+        Ok((stored, published))
+    }
+    async fn insert_object_placement(
+        &self,
+        placement: neoengram_domain::protocol::ObjectPlacement,
+    ) -> CentralResult<neoengram_domain::protocol::ObjectPlacement>;
+    /// Advances one Placement state without changing its immutable identity or generation.
+    /// `Lost` is an explicit administrative declaration; ordinary Agent disconnects should use
+    /// `Retiring`/`Deleted` and leave the logical Commit intact.
+    async fn set_object_placement_state(
+        &self,
+        tenant_id: &TenantId,
+        object_id: &neoengram_domain::core::ObjectId,
+        backend_id: &neoengram_domain::protocol::BackendId,
+        placement_generation: neoengram_domain::protocol::PlacementGeneration,
+        state: neoengram_domain::protocol::PlacementState,
+    ) -> CentralResult<neoengram_domain::protocol::ObjectPlacement>;
+    async fn object_placements(
+        &self,
+        tenant_id: &TenantId,
+        object_id: &neoengram_domain::core::ObjectId,
+    ) -> CentralResult<Vec<neoengram_domain::protocol::ObjectPlacement>>;
+    async fn get_replication(
+        &self,
+        tenant_id: &TenantId,
+        replication_id: &neoengram_domain::protocol::ReplicationId,
+    ) -> CentralResult<Option<crate::ReplicationRecord>>;
+    async fn get_replication_by_request_id(
+        &self,
+        tenant_id: &TenantId,
+        request_id: &neoengram_domain::protocol::RequestId,
+    ) -> CentralResult<Option<crate::ReplicationRecord>>;
+    async fn insert_replication(
+        &self,
+        record: crate::ReplicationRecord,
+    ) -> CentralResult<crate::ReplicationRecord>;
+    /// Inserts or advances one object checkpoint. Replays with the same payload are idempotent;
+    /// an offset may only move forward for the same replication/object identity.
+    async fn upsert_replication_object(
+        &self,
+        record: crate::ReplicationObjectRecord,
+    ) -> CentralResult<crate::ReplicationObjectRecord>;
+    async fn list_replication_objects(
+        &self,
+        tenant_id: &TenantId,
+        replication_id: &neoengram_domain::protocol::ReplicationId,
+    ) -> CentralResult<Vec<crate::ReplicationObjectRecord>>;
+    async fn get_workspace(
+        &self,
+        tenant_id: &TenantId,
+        workspace_id: &neoengram_domain::protocol::WorkspaceId,
+    ) -> CentralResult<Option<crate::WorkspaceRecord>>;
+    async fn get_workspace_by_request_id(
+        &self,
+        tenant_id: &TenantId,
+        request_id: &neoengram_domain::protocol::RequestId,
+    ) -> CentralResult<Option<crate::WorkspaceRecord>>;
+    async fn insert_workspace(
+        &self,
+        record: crate::WorkspaceRecord,
+    ) -> CentralResult<crate::WorkspaceRecord>;
+    async fn commit_availability(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<crate::CommitAvailabilityRecord>;
+}
+
 #[async_trait]
 pub trait Authorizer: Send + Sync {
     async fn authorize(&self, request: &AuthorizationRequest) -> CentralResult<()>;
@@ -1018,6 +1151,7 @@ pub struct AuthorityStore {
     gateway_registry: Option<Arc<dyn GatewayRegistryRepository>>,
     control_catalog: Option<Arc<dyn ControlCatalogRepository>>,
     authority_lifecycle: Option<Arc<dyn AuthorityLifecycleRepository>>,
+    placement: Option<Arc<dyn PlacementRepository>>,
     capabilities: AuthorityCapabilities,
 }
 
@@ -1045,6 +1179,7 @@ impl AuthorityStore {
             gateway_registry: None,
             control_catalog: None,
             authority_lifecycle: None,
+            placement: None,
             capabilities,
         }
     }
@@ -1137,6 +1272,17 @@ impl AuthorityStore {
     #[must_use]
     pub fn authority_lifecycle(&self) -> Option<Arc<dyn AuthorityLifecycleRepository>> {
         self.authority_lifecycle.clone()
+    }
+
+    #[must_use]
+    pub fn with_placement(mut self, repository: Arc<dyn PlacementRepository>) -> Self {
+        self.placement = Some(repository);
+        self
+    }
+
+    #[must_use]
+    pub fn placement(&self) -> Option<Arc<dyn PlacementRepository>> {
+        self.placement.clone()
     }
 
     #[must_use]

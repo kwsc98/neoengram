@@ -122,6 +122,23 @@ resource_id!(MessageId, "message ID");
 resource_id!(RequestId, "request ID");
 resource_id!(TraceId, "trace ID");
 resource_id!(PrincipalId, "principal ID");
+// Placement-first storage and transfer identities.  These are deliberately opaque resource
+// identifiers rather than paths or legacy artifact-placement keys; the authority assigns them and
+// every wire boundary validates them with the same strict grammar as the existing IDs.
+resource_id!(BackendId, "storage backend ID");
+resource_id!(ArchiveId, "archive ID");
+resource_id!(RegionId, "region ID");
+resource_id!(PlacementId, "object placement ID");
+resource_id!(PlacementSetId, "commit placement set ID");
+resource_id!(ReplicationId, "replication ID");
+resource_id!(TransferId, "transfer ID");
+resource_id!(WorkspaceId, "workspace ID");
+
+/// Alias used by placement APIs when the backend is specifically a storage volume or archive.
+pub type StorageBackendId = BackendId;
+
+/// Alias emphasizing that a placement set belongs to a Commit.
+pub type CommitPlacementSetId = PlacementSetId;
 
 #[cfg(test)]
 mod tests {

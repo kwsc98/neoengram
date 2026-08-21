@@ -15,10 +15,6 @@ pub struct QuerySnapshotListRequest {
     #[serde(default)]
     pub commit_id: Option<String>,
     #[serde(default)]
-    pub region: Option<String>,
-    #[serde(default)]
-    pub storage_volume_id: Option<String>,
-    #[serde(default)]
     pub state: Option<String>,
     #[serde(default)]
     pub cursor: Option<String>,
@@ -58,8 +54,7 @@ pub struct CreateSnapshotRequest {
     pub project_id: String,
     pub artifact_id: String,
     pub commit_id: String,
-    pub storage_volume_id: String,
-    pub snapshot_request_id: String,
+    pub request_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -68,7 +63,6 @@ pub struct CreateSnapshotRequest {
 pub struct CreateSnapshotResponse {
     pub snapshot: SnapshotView,
     pub replayed: bool,
-    pub placement_reused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -82,11 +76,13 @@ pub struct SnapshotView {
     pub commit_id: String,
     /// Denormalized Commit layout for the read-only console; Commit remains authoritative.
     pub data_layout: DataLayout,
-    pub storage_volume_id: String,
-    pub region: String,
     pub message: String,
     pub tag_names: Vec<String>,
     pub state: String,
+    /// Dynamic health of the Commit's verified PlacementSet copies.  This is independent from
+    /// the logical Snapshot lifecycle/state and therefore changes when a Volume is lost or
+    /// another replica is published.
+    pub data_health: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<ResourceIssueSummary>,
     pub integrity: SnapshotIntegritySummary,

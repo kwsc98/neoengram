@@ -110,11 +110,11 @@ Tenant、StorageVolume、Artifact、Commit、Playground、Snapshot 与 `JobView`
 StorageVolume 的稳定逻辑 ID、region、EdgeCluster 和公开 PVC reference 可用于放置与运维识别；
 不得包含 Assignment target、Agent/Mount identity、generation、fencing token、NFS export、凭据、
 PublicationCandidate、Manifest、IndexDelta、物理路径或数据库信息。跨租户查询按
-对应资源的 `*_NOT_FOUND` 返回 404，不能泄漏目标资源是否存在。Artifact 不携带放置字段；
-Playground 和 Snapshot 的 Region 始终由所选 StorageVolume 派生。
+对应资源的 `*_NOT_FOUND` 返回 404，不能泄漏目标资源是否存在。Artifact 和 Snapshot 不携带物理放置字段；
+Playground 的 Region 由所选 StorageVolume 派生，Snapshot 的数据健康由当前已发布 PlacementSet 动态解析。
 
-只有 `state=ready` 的 StorageVolume 可以承接新的 Playground 或 Snapshot；`degraded` 和
-`unavailable` 均拒绝新放置，但已有资源的公开元数据仍可查询。P0 Dashboard 只展示当前 Tenant、
+只有 `state=ready` 的 StorageVolume 可以承接新的 Playground、Workspace 或 SnapshotDelivery；`degraded` 和
+`unavailable` 均拒绝新的物化或复制目标，但已有资源的公开元数据仍可查询。P0 Dashboard 只展示当前 Tenant、
 系统健康和资源导航；资源数量、关注项、区域统计、最近版本与跨资源活动依赖 P1 聚合接口。
 
 Storage Enrollment 使用三个权限：创建 bootstrap token 需要 `storage.enrollment.create`，列表和详情
@@ -135,11 +135,12 @@ probe 才能推进到 `enrolled` 和 `ready`；拒绝进入终态 `rejected`。
 
 资源 mutation 同样只接受公开 DTO：StorageVolume 登记已有 PVC/NFS，不负责创建底层存储资源。
 Artifact 创建必须通过 discriminator 明确选择空初始化，或从同 Tenant 另一 Artifact 的明确 Commit
-派生；派生来源显式携带来源 Project。Playground 和 Snapshot 创建各自选择一个同 Tenant Volume。
+派生；派生来源显式携带来源 Project。Playground/Workspace 和 SnapshotDelivery 创建各自选择一个同 Tenant Volume。
 
-Playground 继续使用完整资源 identity 幂等创建。Snapshot create 使用稳定 request identity；同一
-Commit/Volume 的重复创建返回已有未删除 Snapshot，同一 Commit 选择其他 Volume 时创建新的
-`snapshot_id`。每个 Snapshot 始终是单 Region、单 Volume，不能静默迁移或返回 placements 数组。
+Playground 继续使用完整资源 identity 幂等创建。Snapshot create 使用稳定 request identity，只创建
+`snapshot_id + commit_id` 的逻辑引用，不选择或绑定 Volume/Region；同一 Tenant/Artifact/Commit
+只保留一个活动逻辑 Snapshot。需要物理副本时显式调用 Commit Replicate，完成后再创建独立的
+SnapshotDelivery 并选择目标 Volume 和模式。
 Playground 的主状态仅为 Creating、Ready、Abnormal；扫描、哈希、上传和校验属于独立 Pre-commit。
 Pre-commit start 创建新的 `precommit_id`，并在服务端内部冻结当前 Head；running/ready 的重新检测
 使用 cancel 后 start，abnormal/cancelled 的失败重试才使用 restart，在同一 ID 上令 `attempt + 1`。

@@ -134,6 +134,19 @@ export type CreateSnapshotResponse = Omit<
   components['schemas']['CreateSnapshotResponse'],
   'snapshot'
 > & { snapshot: SnapshotView };
+export type CreateCommitReplicationRequest =
+  components['schemas']['CreateCommitReplicationRequest'];
+export type CreateCommitReplicationResponse =
+  components['schemas']['CreateCommitReplicationResponse'];
+export type QueryCommitReplicationRequest = components['schemas']['QueryCommitReplicationRequest'];
+export type QueryCommitReplicationResponse =
+  components['schemas']['QueryCommitReplicationResponse'];
+export type QueryCommitAvailabilityRequest =
+  components['schemas']['QueryCommitAvailabilityRequest'];
+export type QueryCommitAvailabilityResponse =
+  components['schemas']['QueryCommitAvailabilityResponse'];
+export type CreateWorkspaceRequest = components['schemas']['CreateWorkspaceRequest'];
+export type CreateWorkspaceResponse = components['schemas']['CreateWorkspaceResponse'];
 export type RetrySnapshotDeliveryRequest = components['schemas']['RetrySnapshotDeliveryRequest'];
 export type RetrySnapshotDeliveryResponse = components['schemas']['RetrySnapshotDeliveryResponse'];
 export type QuerySnapshotFileListRequest = components['schemas']['QuerySnapshotFileListRequest'];

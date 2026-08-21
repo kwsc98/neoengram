@@ -398,12 +398,13 @@ impl ResourceLifecycleCoordinator {
                 volumes.insert(storage_volume_id.clone());
             }
             ResourceRef::Snapshot { snapshot_id } => {
-                let snapshot = self
+                // Snapshots are logical Commit references. They do not own a physical Volume;
+                // object placements are retained and garbage-collected independently.
+                let _ = self
                     .catalog
                     .get_snapshot_for_lifecycle(&operation.tenant_id, snapshot_id)
                     .await?
                     .ok_or_else(|| invalid("Snapshot deletion target no longer exists"))?;
-                volumes.insert(snapshot.storage_volume_id);
             }
             ResourceRef::Playground {
                 project_id,
@@ -431,13 +432,7 @@ impl ResourceLifecycleCoordinator {
                 for target in &operation.targets {
                     match &target.resource {
                         ResourceRef::Snapshot { snapshot_id } => {
-                            if let Some(snapshot) = self
-                                .catalog
-                                .get_snapshot_for_lifecycle(&operation.tenant_id, snapshot_id)
-                                .await?
-                            {
-                                volumes.insert(snapshot.storage_volume_id);
-                            }
+                            let _ = snapshot_id;
                         }
                         ResourceRef::Playground {
                             project_id,
@@ -625,28 +620,10 @@ impl ResourceLifecycleCoordinator {
                 })
             }
             ResourceRef::Snapshot { snapshot_id } => {
-                let snapshot = self
-                    .catalog
-                    .get_snapshot_for_lifecycle(&operation.tenant_id, snapshot_id)
-                    .await?
-                    .ok_or_else(|| invalid("Snapshot deletion target no longer exists"))?;
-                if &snapshot.storage_volume_id != storage_volume_id {
-                    return Err(internal(
-                        "Snapshot lifecycle command resolved an unrelated Volume",
-                    ));
-                }
-                Ok(AgentResourceLifecycleScope::Snapshot {
-                    project_id: snapshot.project_id,
-                    artifact_id: snapshot.artifact_id.clone(),
-                    snapshot_id: snapshot.snapshot_id,
-                    storage_volume_id: storage_volume_id.clone(),
-                    artifact_placement_id: placement_id(
-                        &operation.tenant_id,
-                        &snapshot.artifact_id,
-                        storage_volume_id,
-                    )?,
-                    placement_generation: PlacementGeneration::new(1),
-                })
+                let _ = (snapshot_id, storage_volume_id);
+                Err(invalid(
+                    "Snapshot logical resources do not have an Agent lifecycle scope",
+                ))
             }
         }
     }

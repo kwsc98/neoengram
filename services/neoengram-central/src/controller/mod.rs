@@ -297,6 +297,7 @@ mod action_registry_tests {
             ArtifactApiClient::descriptor().unwrap(),
             PlaygroundApiClient::descriptor().unwrap(),
             SnapshotApiClient::descriptor().unwrap(),
+            PlacementApiClient::descriptor().unwrap(),
             S3ApiClient::descriptor().unwrap(),
             S3AuthorizationApiClient::descriptor().unwrap(),
             ResourceLifecycleApiClient::descriptor().unwrap(),

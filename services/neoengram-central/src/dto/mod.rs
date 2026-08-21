@@ -13,6 +13,8 @@ mod precommit;
 pub use precommit::*;
 mod playground;
 pub use playground::*;
+mod placement;
+pub use placement::*;
 mod snapshot;
 pub use snapshot::*;
 mod snapshot_delivery;
