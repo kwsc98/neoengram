@@ -7,6 +7,7 @@
 
 pub mod engine;
 pub mod fs;
+pub mod object_backend;
 
 // The local repository application is part of the runtime boundary.  Keeping the composition
 // root here means the CLI and managed agent share the same storage/worktree implementation while
@@ -16,5 +17,6 @@ mod local;
 
 pub use engine::*;
 pub use fs::*;
+pub use object_backend::*;
 
 include!("standalone_api.rs");

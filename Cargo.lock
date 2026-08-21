@@ -1686,6 +1686,7 @@ name = "neoengram-runtime"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "blake3",
  "fastcdc",
  "fs2",
@@ -2994,6 +2995,7 @@ dependencies = [
  "hyper-util",
  "neoengram-domain",
  "percent-encoding",
+ "quinn",
  "rcgen",
  "ring",
  "rustix",

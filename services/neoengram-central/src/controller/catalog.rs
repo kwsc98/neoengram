@@ -6,43 +6,133 @@ use crate::{
     dto::{
         CancelPreCommitRequest, CancelPreCommitResponse, CommitPlaygroundRequest,
         CommitPlaygroundResponse, CreateArtifactRequest, CreateArtifactResponse,
-        CreateDeletionRequest, CreatePlaygroundRequest, CreatePlaygroundResponse,
-        CreateProjectRequest, CreateProjectResponse, CreateRetentionHoldRequest,
-        CreateRetentionHoldResponse, CreateS3AccessPointRequest, CreateS3AccessPointResponse,
-        CreateS3CredentialRequest, CreateS3CredentialResponse, CreateS3DownloadUrlRequest,
-        CreateS3DownloadUrlResponse, CreateSnapshotDeliveryRequest, CreateSnapshotDeliveryResponse,
-        CreateSnapshotRequest, CreateSnapshotResponse, CreateStorageVolumeRequest,
-        CreateStorageVolumeResponse, CreateTenantRequest, CreateTenantResponse,
+        CreateCommitReplicationRequest, CreateCommitReplicationResponse, CreateDeletionRequest,
+        CreatePlaygroundRequest, CreatePlaygroundResponse, CreateProjectRequest,
+        CreateProjectResponse, CreateRetentionHoldRequest, CreateRetentionHoldResponse,
+        CreateS3AccessPointRequest, CreateS3AccessPointResponse, CreateS3CredentialRequest,
+        CreateS3CredentialResponse, CreateS3DownloadUrlRequest, CreateS3DownloadUrlResponse,
+        CreateSnapshotDeliveryRequest, CreateSnapshotDeliveryResponse, CreateSnapshotRequest,
+        CreateSnapshotResponse, CreateStorageVolumeRequest, CreateStorageVolumeResponse,
+        CreateTenantRequest, CreateTenantResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
         DeleteSnapshotDeliveryRequest, DeleteSnapshotDeliveryResponse, DeletionMutationResponse,
         InternalS3AuthorizeRequest, InternalS3AuthorizeResponse, QueryArtifactCommitGraphRequest,
         QueryArtifactCommitGraphResponse, QueryArtifactListRequest, QueryArtifactListResponse,
-        QueryArtifactRequest, QueryArtifactResponse, QueryDeletionImpactRequest,
-        QueryDeletionImpactResponse, QueryDeletionListRequest, QueryDeletionListResponse,
-        QueryDeletionRequest, QueryDeletionResponse, QueryPlaygroundChangeListRequest,
-        QueryPlaygroundChangeListResponse, QueryPlaygroundDatasetProfileRequest,
-        QueryPlaygroundDatasetProfileResponse, QueryPlaygroundFileListRequest,
-        QueryPlaygroundFileListResponse, QueryPlaygroundFileMetadataRequest,
-        QueryPlaygroundFileMetadataResponse, QueryPlaygroundListRequest,
-        QueryPlaygroundListResponse, QueryPlaygroundRequest, QueryPlaygroundResponse,
-        QueryPreCommitRequest, QueryPreCommitResponse, QueryProjectListRequest,
-        QueryProjectListResponse, QueryS3AccessPointListRequest, QueryS3AccessPointListResponse,
-        QueryS3AccessPointRequest, QueryS3AccessPointResponse, QueryS3CredentialListRequest,
-        QueryS3CredentialListResponse, QueryS3ObjectListRequest, QueryS3ObjectListResponse,
-        QuerySnapshotDeliveryListRequest, QuerySnapshotDeliveryListResponse,
-        QuerySnapshotDeliveryRequest, QuerySnapshotDeliveryResponse, QuerySnapshotListRequest,
-        QuerySnapshotListResponse, QuerySnapshotRequest, QuerySnapshotResponse,
-        QueryStorageVolumeListRequest, QueryStorageVolumeListResponse, QueryStorageVolumeRequest,
-        QueryStorageVolumeResponse, QueryTenantListRequest, QueryTenantListResponse,
-        QueryTenantRequest, QueryTenantResponse, ReleaseRetentionHoldRequest,
-        ReleaseRetentionHoldResponse, RestartPreCommitRequest, RestartPreCommitResponse,
-        RetrySnapshotDeliveryRequest, RetrySnapshotDeliveryResponse, RevokeS3CredentialRequest,
-        StartPreCommitRequest, StartPreCommitResponse, UpdateDeletionRequest,
-        UpdateS3AccessPointRequest, UpdateS3AccessPointResponse,
+        QueryArtifactRequest, QueryArtifactResponse, QueryCommitAvailabilityRequest,
+        QueryCommitAvailabilityResponse, QueryCommitReplicationRequest,
+        QueryCommitReplicationResponse, QueryDeletionImpactRequest, QueryDeletionImpactResponse,
+        QueryDeletionListRequest, QueryDeletionListResponse, QueryDeletionRequest,
+        QueryDeletionResponse, QueryPlaygroundChangeListRequest, QueryPlaygroundChangeListResponse,
+        QueryPlaygroundDatasetProfileRequest, QueryPlaygroundDatasetProfileResponse,
+        QueryPlaygroundFileListRequest, QueryPlaygroundFileListResponse,
+        QueryPlaygroundFileMetadataRequest, QueryPlaygroundFileMetadataResponse,
+        QueryPlaygroundListRequest, QueryPlaygroundListResponse, QueryPlaygroundRequest,
+        QueryPlaygroundResponse, QueryPreCommitRequest, QueryPreCommitResponse,
+        QueryProjectListRequest, QueryProjectListResponse, QueryS3AccessPointListRequest,
+        QueryS3AccessPointListResponse, QueryS3AccessPointRequest, QueryS3AccessPointResponse,
+        QueryS3CredentialListRequest, QueryS3CredentialListResponse, QueryS3ObjectListRequest,
+        QueryS3ObjectListResponse, QuerySnapshotDeliveryListRequest,
+        QuerySnapshotDeliveryListResponse, QuerySnapshotDeliveryRequest,
+        QuerySnapshotDeliveryResponse, QuerySnapshotListRequest, QuerySnapshotListResponse,
+        QuerySnapshotRequest, QuerySnapshotResponse, QueryStorageVolumeListRequest,
+        QueryStorageVolumeListResponse, QueryStorageVolumeRequest, QueryStorageVolumeResponse,
+        QueryTenantListRequest, QueryTenantListResponse, QueryTenantRequest, QueryTenantResponse,
+        ReleaseRetentionHoldRequest, ReleaseRetentionHoldResponse, RestartPreCommitRequest,
+        RestartPreCommitResponse, RetrySnapshotDeliveryRequest, RetrySnapshotDeliveryResponse,
+        RevokeS3CredentialRequest, StartPreCommitRequest, StartPreCommitResponse,
+        UpdateDeletionRequest, UpdateS3AccessPointRequest, UpdateS3AccessPointResponse,
     },
     service::CatalogService,
 };
 
 use super::authenticated_identity;
+
+#[interface(name = "neoengram.placement")]
+pub trait PlacementApi {
+    #[fusen_rs::method(method = "POST", path = "/api/commit/replicate")]
+    async fn replicate_commit(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: CreateCommitReplicationRequest,
+    ) -> Result<Response<CreateCommitReplicationResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/commit/replication/query")]
+    async fn query_commit_replication(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: QueryCommitReplicationRequest,
+    ) -> Result<Response<QueryCommitReplicationResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/commit/availability/query")]
+    async fn query_commit_availability(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: QueryCommitAvailabilityRequest,
+    ) -> Result<Response<QueryCommitAvailabilityResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/create")]
+    async fn create_workspace(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: CreateWorkspaceRequest,
+    ) -> Result<Response<CreateWorkspaceResponse>, Error>;
+}
+
+pub struct PlacementController {
+    service: Arc<CatalogService>,
+}
+
+impl PlacementController {
+    #[must_use]
+    pub fn new(service: Arc<CatalogService>) -> Self {
+        Self { service }
+    }
+}
+
+impl PlacementApi for PlacementController {
+    async fn replicate_commit(
+        &self,
+        call: Call,
+        request: CreateCommitReplicationRequest,
+    ) -> Result<Response<CreateCommitReplicationResponse>, Error> {
+        self.service
+            .create_commit_replication(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn query_commit_replication(
+        &self,
+        call: Call,
+        request: QueryCommitReplicationRequest,
+    ) -> Result<Response<QueryCommitReplicationResponse>, Error> {
+        self.service
+            .query_commit_replication(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn query_commit_availability(
+        &self,
+        call: Call,
+        request: QueryCommitAvailabilityRequest,
+    ) -> Result<Response<QueryCommitAvailabilityResponse>, Error> {
+        self.service
+            .query_commit_availability(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn create_workspace(
+        &self,
+        call: Call,
+        request: CreateWorkspaceRequest,
+    ) -> Result<Response<CreateWorkspaceResponse>, Error> {
+        self.service
+            .create_workspace(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+}
 
 #[interface(name = "neoengram.tenant")]
 pub trait TenantApi {

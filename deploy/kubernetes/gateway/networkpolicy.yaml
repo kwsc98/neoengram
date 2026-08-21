@@ -46,6 +46,8 @@ spec:
       ports:
         - protocol: TCP
           port: 8081
+        - protocol: UDP
+          port: 8084
     # Central reaches the Replica bootstrap listener and the mTLS control listener.
     # Add an ipBlock in the cluster overlay when Central is outside this cluster.
     - from:
@@ -69,6 +71,8 @@ spec:
       ports:
         - protocol: TCP
           port: 8083
+        - protocol: UDP
+          port: 8084
     # Keep same-namespace peer traffic working for this single-cluster example.
     - from:
         - podSelector:
@@ -78,6 +82,8 @@ spec:
       ports:
         - protocol: TCP
           port: 8083
+        - protocol: UDP
+          port: 8084
   egress:
     # Console API proxying and S3 authorization reach only the private Central
     # Service Pods. Cross-cluster Central requires a narrowly rendered ipBlock.
@@ -103,6 +109,8 @@ spec:
       ports:
         - protocol: TCP
           port: 8083
+        - protocol: UDP
+          port: 8084
     - to:
         - podSelector:
             matchLabels:
@@ -111,6 +119,8 @@ spec:
       ports:
         - protocol: TCP
           port: 8083
+        - protocol: UDP
+          port: 8084
     # DNS only; no broad egress to Central or Volume/Storage networks.
     - to:
         - namespaceSelector:

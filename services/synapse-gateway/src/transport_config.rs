@@ -6,6 +6,7 @@ use std::{
 };
 
 use clap::Args;
+use neoengram_domain::protocol::TRANSFER_ALPN;
 use rustls::{client::ClientConfig, server::WebPkiClientVerifier, RootCertStore, ServerConfig};
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use x509_parser::{
@@ -361,6 +362,89 @@ impl GatewayTransportConfig {
         Ok([Some(agent), Some(control), Some(peer)])
     }
 
+    /// Builds the server-only rustls policy used by the QUIC transfer listener.  QUIC has a
+    /// distinct ALPN and always requires workload mTLS, even on loopback, because transfer
+    /// tickets are bearer capabilities for object bytes.
+    pub(crate) fn load_quic_server_config(
+        &self,
+    ) -> Result<Arc<ServerConfig>, GatewayTransportConfigError> {
+        let (Some(certificate_path), Some(private_key_path), Some(ca_path)) = (
+            &self.tls_certificate_file,
+            &self.tls_private_key_file,
+            &self.tls_client_ca_file,
+        ) else {
+            return Err(GatewayTransportConfigError::MissingClientCa);
+        };
+        let certificate_pem =
+            read_bounded_file(certificate_path, "certificate", MAX_CERTIFICATE_CHAIN_BYTES)?;
+        let private_key_pem =
+            read_bounded_file(private_key_path, "private key", MAX_PRIVATE_KEY_BYTES)?;
+        let certificates = CertificateDer::pem_slice_iter(&certificate_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| GatewayTransportConfigError::InvalidFile {
+                kind: "certificate",
+                message: error.to_string(),
+            })?;
+        if certificates.is_empty() {
+            return Err(GatewayTransportConfigError::EmptyCertificateChain);
+        }
+        let private_key = PrivateKeyDer::from_pem_slice(&private_key_pem)
+            .map_err(|_| GatewayTransportConfigError::MissingPrivateKey)?;
+        let roots = load_client_roots(ca_path)?;
+        let mut server = build_server_config(
+            &certificates,
+            &private_key,
+            Some(&roots),
+            ClientAuthentication::Required,
+        )?;
+        Arc::get_mut(&mut server)
+            .expect("new QUIC TLS configuration must have one owner")
+            .alpn_protocols = vec![TRANSFER_ALPN.as_bytes().to_vec()];
+        Ok(server)
+    }
+
+    /// Builds the mTLS client policy for a Gateway-to-Gateway QUIC hop.  It intentionally uses a
+    /// separate ALPN from the H2 peer forwarder and disables TLS resumption so a rotated workload
+    /// credential is checked on every transfer connection.
+    pub(crate) fn load_quic_client_config(
+        &self,
+    ) -> Result<Arc<ClientConfig>, GatewayTransportConfigError> {
+        let (Some(certificate_path), Some(private_key_path), Some(ca_path)) = (
+            &self.tls_certificate_file,
+            &self.tls_private_key_file,
+            &self.tls_client_ca_file,
+        ) else {
+            return Err(GatewayTransportConfigError::MissingClientCa);
+        };
+        let certificate_pem =
+            read_bounded_file(certificate_path, "certificate", MAX_CERTIFICATE_CHAIN_BYTES)?;
+        let private_key_pem =
+            read_bounded_file(private_key_path, "private key", MAX_PRIVATE_KEY_BYTES)?;
+        let certificates = CertificateDer::pem_slice_iter(&certificate_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| GatewayTransportConfigError::InvalidFile {
+                kind: "certificate",
+                message: error.to_string(),
+            })?;
+        if certificates.is_empty() {
+            return Err(GatewayTransportConfigError::EmptyCertificateChain);
+        }
+        let private_key = PrivateKeyDer::from_pem_slice(&private_key_pem)
+            .map_err(|_| GatewayTransportConfigError::MissingPrivateKey)?;
+        let roots = load_client_roots(ca_path)?;
+        let provider: Arc<rustls::crypto::CryptoProvider> =
+            rustls::crypto::aws_lc_rs::default_provider().into();
+        let mut client = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|error| GatewayTransportConfigError::InvalidTlsIdentity(error.to_string()))?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certificates, private_key)
+            .map_err(|error| GatewayTransportConfigError::InvalidTlsIdentity(error.to_string()))?;
+        client.resumption = rustls::client::Resumption::disabled();
+        client.alpn_protocols = vec![TRANSFER_ALPN.as_bytes().to_vec()];
+        Ok(Arc::new(client))
+    }
+
     /// Builds the server-only TLS policy used by the public console/S3 listener.  The public
     /// listener intentionally has no workload client-CA verifier; workload mTLS remains confined
     /// to the Agent, Central-control, and peer listeners above.
@@ -582,6 +666,44 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
             .unwrap()
             .unwrap();
         assert_eq!(server.alpn_protocols, vec![b"h2".to_vec()]);
+    }
+
+    #[test]
+    fn quic_identity_requires_client_ca_and_uses_transfer_alpn() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("certificate.pem");
+        let private_key = directory.path().join("private-key.pem");
+        let client_ca = directory.path().join("client-ca.pem");
+        fs::write(&certificate, TEST_CERTIFICATE).unwrap();
+        fs::write(&private_key, TEST_PRIVATE_KEY).unwrap();
+        let config_without_ca = GatewayTransportConfig {
+            tls_certificate_file: Some(certificate.clone()),
+            tls_private_key_file: Some(private_key.clone()),
+            tls_client_ca_file: None,
+        };
+        assert!(matches!(
+            config_without_ca.load_quic_server_config(),
+            Err(GatewayTransportConfigError::MissingClientCa)
+        ));
+
+        fs::write(&client_ca, TEST_CERTIFICATE).unwrap();
+        let config = GatewayTransportConfig {
+            tls_certificate_file: Some(certificate),
+            tls_private_key_file: Some(private_key),
+            tls_client_ca_file: Some(client_ca),
+        };
+        let server = config.load_quic_server_config().unwrap();
+        assert_eq!(
+            server.alpn_protocols,
+            vec![TRANSFER_ALPN.as_bytes().to_vec()]
+        );
+        assert!(!server.session_storage.can_cache());
+        let client = config.load_quic_client_config().unwrap();
+        assert_eq!(
+            client.alpn_protocols,
+            vec![TRANSFER_ALPN.as_bytes().to_vec()]
+        );
+        assert!(format!("{:?}", client.resumption).contains("Disabled"));
     }
 
     #[test]

@@ -1,11 +1,13 @@
-use std::{fmt, str::FromStr};
+use std::{borrow::Cow, fmt, str::FromStr};
 
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{ValidationError, ValidationErrorKind, ValidationResult};
 
 const DIGEST_BYTES: usize = 32;
 const DIGEST_HEX_LEN: usize = DIGEST_BYTES * 2;
+const DIGEST_PATTERN: &str = r"^[0-9a-f]{64}$";
 
 /// A validated 256-bit BLAKE3 digest.
 ///
@@ -35,6 +37,12 @@ impl ContentDigest {
         self.to_string()
     }
 }
+
+/// Digest of a Commit's complete immutable ObjectSet.
+///
+/// This remains a transparent alias of `ContentDigest` so callers can use one canonical digest
+/// encoding while making the field's semantic role explicit in APIs.
+pub type ObjectSetDigest = ContentDigest;
 
 impl fmt::Display for ContentDigest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -113,6 +121,26 @@ impl<'de> Deserialize<'de> for ContentDigest {
     }
 }
 
+impl JsonSchema for ContentDigest {
+    fn schema_name() -> Cow<'static, str> {
+        "ContentDigest".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::ContentDigest").into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "description": "A canonical lowercase BLAKE3-256 digest.",
+            "type": "string",
+            "minLength": DIGEST_HEX_LEN,
+            "maxLength": DIGEST_HEX_LEN,
+            "pattern": DIGEST_PATTERN
+        })
+    }
+}
+
 macro_rules! typed_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -186,6 +214,20 @@ macro_rules! typed_id {
         impl From<$name> for ContentDigest {
             fn from(value: $name) -> Self {
                 value.0
+            }
+        }
+
+        impl JsonSchema for $name {
+            fn schema_name() -> Cow<'static, str> {
+                stringify!($name).into()
+            }
+
+            fn schema_id() -> Cow<'static, str> {
+                concat!(module_path!(), "::", stringify!($name)).into()
+            }
+
+            fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+                ContentDigest::json_schema(generator)
             }
         }
     };

@@ -10,6 +10,7 @@ mod gateway_certificate;
 mod health;
 mod job;
 mod keyring;
+mod placement;
 mod resource_lifecycle;
 mod s3_envelope;
 mod snapshot_delivery;

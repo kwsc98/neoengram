@@ -20,7 +20,7 @@ const LOCK_FILE_NAME: &str = "authority.lock";
 // Agent Registry identity is accepted here; a directory containing an older database must be
 // initialized afresh.
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4155;
-const SQLITE_SCHEMA_VERSION: i64 = 12;
+const SQLITE_SCHEMA_VERSION: i64 = 13;
 const LEGACY_DATABASE_FILES: &[&str] = &[
     "agent-registry.sqlite3",
     "gateway-registry.sqlite3",
@@ -236,6 +236,133 @@ CREATE TABLE lifecycle_cleanup_records (
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
     PRIMARY KEY (tenant_id, deletion_id, target_id, action)
 ) STRICT;
+
+CREATE TABLE objects (
+    tenant_id TEXT NOT NULL,
+    object_id BLOB NOT NULL CHECK (length(object_id) = 32),
+    size INTEGER NOT NULL CHECK (size >= 0),
+    encoding TEXT NOT NULL CHECK (encoding IN ('raw', 'zstd')),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    PRIMARY KEY (tenant_id, object_id)
+) STRICT;
+
+CREATE TABLE commit_objects (
+    tenant_id TEXT NOT NULL,
+    commit_id BLOB NOT NULL CHECK (length(commit_id) = 32),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    object_id BLOB NOT NULL CHECK (length(object_id) = 32),
+    size INTEGER NOT NULL CHECK (size >= 0),
+    encoding TEXT NOT NULL CHECK (encoding IN ('raw', 'zstd')),
+    PRIMARY KEY (tenant_id, commit_id, ordinal),
+    UNIQUE (tenant_id, commit_id, object_id),
+    FOREIGN KEY (tenant_id, object_id) REFERENCES objects (tenant_id, object_id)
+) STRICT;
+
+CREATE TABLE commit_object_sets (
+    tenant_id TEXT NOT NULL,
+    commit_id BLOB NOT NULL CHECK (length(commit_id) = 32),
+    object_set_digest BLOB NOT NULL CHECK (length(object_set_digest) = 32),
+    object_count INTEGER NOT NULL CHECK (object_count >= 0),
+    PRIMARY KEY (tenant_id, commit_id)
+) STRICT;
+
+CREATE TABLE commit_placement_sets (
+    tenant_id TEXT NOT NULL,
+    placement_set_id TEXT NOT NULL,
+    commit_id BLOB NOT NULL CHECK (length(commit_id) = 32),
+    backend_id TEXT NOT NULL,
+    storage_volume_id TEXT,
+    archive_id TEXT,
+    object_set_digest BLOB NOT NULL CHECK (length(object_set_digest) = 32),
+    object_count INTEGER NOT NULL CHECK (object_count >= 0),
+    verified_object_count INTEGER NOT NULL CHECK (verified_object_count >= 0),
+    placement_generation INTEGER NOT NULL CHECK (placement_generation > 0),
+    state TEXT NOT NULL CHECK (state IN ('staged', 'published', 'retiring', 'deleted')),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    PRIMARY KEY (tenant_id, placement_set_id),
+    CHECK ((storage_volume_id IS NULL) <> (archive_id IS NULL)),
+    UNIQUE (tenant_id, commit_id, backend_id),
+    CHECK (verified_object_count <= object_count),
+    CHECK (state <> 'published' OR verified_object_count = object_count)
+) STRICT;
+
+CREATE INDEX commit_placement_sets_lookup
+    ON commit_placement_sets (tenant_id, commit_id, state, backend_id);
+
+CREATE TABLE placement_objects (
+    tenant_id TEXT NOT NULL,
+    placement_id TEXT NOT NULL,
+    object_id BLOB NOT NULL CHECK (length(object_id) = 32),
+    backend_id TEXT NOT NULL,
+    storage_volume_id TEXT,
+    archive_id TEXT,
+    edge_cluster_id TEXT,
+    gateway_pool_id TEXT,
+    region TEXT,
+    placement_generation INTEGER NOT NULL CHECK (placement_generation > 0),
+    state TEXT NOT NULL CHECK (state IN ('verified', 'retiring', 'deleted', 'lost')),
+    verified_size INTEGER NOT NULL CHECK (verified_size >= 0),
+    verified_digest BLOB NOT NULL CHECK (length(verified_digest) = 32),
+    failure_domain TEXT NOT NULL CHECK (length(failure_domain) BETWEEN 1 AND 256),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    PRIMARY KEY (tenant_id, placement_id),
+    CHECK ((storage_volume_id IS NULL) <> (archive_id IS NULL)),
+    UNIQUE (tenant_id, object_id, backend_id, placement_generation)
+) STRICT;
+
+CREATE INDEX placement_objects_lookup
+    ON placement_objects (tenant_id, object_id, state, backend_id);
+
+CREATE TABLE replications (
+    tenant_id TEXT NOT NULL,
+    replication_id TEXT NOT NULL,
+    commit_id BLOB NOT NULL CHECK (length(commit_id) = 32),
+    target_backend_id TEXT NOT NULL,
+    target_storage_volume_id TEXT,
+    target_archive_id TEXT,
+    object_set_digest BLOB NOT NULL CHECK (length(object_set_digest) = 32),
+    completed_objects INTEGER NOT NULL CHECK (completed_objects >= 0),
+    total_objects INTEGER NOT NULL CHECK (total_objects >= 0),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'planning', 'transferring', 'verifying', 'published', 'failed', 'cancelled')),
+    request_id TEXT NOT NULL,
+    error_code TEXT,
+    error_message TEXT,
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    PRIMARY KEY (tenant_id, replication_id),
+    UNIQUE (tenant_id, request_id),
+    CHECK ((target_storage_volume_id IS NULL) <> (target_archive_id IS NULL))
+) STRICT;
+
+CREATE TABLE replication_objects (
+    tenant_id TEXT NOT NULL,
+    replication_id TEXT NOT NULL,
+    object_id BLOB NOT NULL CHECK (length(object_id) = 32),
+    offset INTEGER NOT NULL CHECK (offset >= 0),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'transferring', 'verified', 'failed')),
+    retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0),
+    PRIMARY KEY (tenant_id, replication_id, object_id),
+    FOREIGN KEY (tenant_id, replication_id)
+        REFERENCES replications (tenant_id, replication_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE TABLE workspaces (
+    tenant_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    base_commit_id BLOB CHECK (base_commit_id IS NULL OR length(base_commit_id) = 32),
+    target_storage_volume_id TEXT NOT NULL,
+    lifecycle TEXT NOT NULL CHECK (lifecycle IN ('provisioning', 'active', 'unavailable', 'deleting', 'deleted')),
+    created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    PRIMARY KEY (tenant_id, workspace_id),
+    UNIQUE (tenant_id, request_id)
+) STRICT;
 "#;
 
 /// Returns the complete current authority schema. Context-specific table definitions remain
@@ -437,7 +564,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 12")
+        sqlx::query("PRAGMA user_version = 13")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;

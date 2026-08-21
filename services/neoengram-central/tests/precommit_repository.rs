@@ -69,7 +69,6 @@ async fn precommit_contract_runs_against_sqlite_and_recovers() {
     assert_eq!(commit.message, "publish candidate");
     assert_eq!(commit.root_directory_id, DirectoryId::from_bytes([6; 32]));
     assert_eq!(commit.records, frozen_records());
-    assert_eq!(commit.source_storage_volume_id.as_str(), "volume-a");
 }
 
 async fn run_contract(store: AuthorityStore) -> ContractResult {
@@ -289,11 +288,10 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
             source_playground_id: playground_id.clone(),
-            source_storage_volume_id: neoengram_domain::protocol::StorageVolumeId::new("volume-a")
-                .unwrap(),
             source_precommit_id: key.precommit_id.clone(),
             commit_request_id: RequestId::new("commit-a").unwrap(),
             commit_id,
+            object_set_digest: ContentDigest::from_bytes([8; 32]),
             root_directory_id,
             parent_commit_id: None,
             index_version: candidate,

@@ -5,18 +5,14 @@ import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
-import PageCursor from '@/components/PageCursor.vue';
 import SnapshotCreatePage from '@/pages/SnapshotCreatePage.vue';
 
 const api = vi.hoisted(() => ({
   createSnapshot: vi.fn(),
-  createSnapshotDelivery: vi.fn(),
   queryApiVersion: vi.fn(),
   queryArtifact: vi.fn(),
   queryArtifactCommitGraph: vi.fn(),
   querySnapshot: vi.fn(),
-  querySnapshotDeliveryList: vi.fn(),
-  queryStorageVolumeList: vi.fn(),
 }));
 
 vi.mock('@/api/operations', () => api);
@@ -25,18 +21,8 @@ const ElButtonStub = {
   emits: ['click'],
   template: '<button type="button" @click="$emit(\'click\')"><slot /></button>',
 };
-const ElTagStub = { template: '<span><slot /></span>' };
 const headCommitId = 'a'.repeat(64);
 const historicalCommitId = 'b'.repeat(64);
-const deliveryCapabilities = [
-  'artifact_catalog',
-  'artifact_commit_graph',
-  'snapshot_materialize',
-  'snapshot_delivery_fuse_v2',
-  'snapshot_delivery_copy_v2',
-  'snapshot_delivery_hardlink_v2',
-];
-
 const artifact = {
   tenant_id: 'tenant-a',
   project_id: 'project-a',
@@ -48,37 +34,6 @@ const artifact = {
   created_at_unix_ms: '1',
   updated_at_unix_ms: '2',
 };
-
-const readyVolume = {
-  tenant_id: 'tenant-a',
-  storage_volume_id: 'volume-ready',
-  display_name: 'Ready volume',
-  edge_cluster_id: 'cluster-a',
-  region: 'cn-shanghai',
-  backend_type: 'pvc' as const,
-  access_mode: 'read_only_many' as const,
-  state: 'ready' as const,
-  resource_version: '1',
-  created_at_unix_ms: '1',
-  updated_at_unix_ms: '2',
-};
-
-const degradedVolume = {
-  ...readyVolume,
-  storage_volume_id: 'volume-degraded',
-  display_name: 'Degraded volume',
-  state: 'degraded' as const,
-};
-
-const hardlinkVolume = {
-  ...readyVolume,
-  allowed_delivery_modes: ['fuse', 'copy', 'hardlink'] as const,
-  hardlink_policy: 'sealed_acl' as const,
-  max_whole_file_bytes: '18446744073709551615',
-  copy_reserve_bytes: '0',
-  lifecycle: { state: 'active' as const, generation: '1' },
-};
-
 const snapshot = {
   snapshot_id: 'snapshot-a',
   tenant_id: 'tenant-a',
@@ -86,11 +41,10 @@ const snapshot = {
   artifact_id: 'artifact-a',
   commit_id: historicalCommitId,
   data_layout: 'fast_cdc' as const,
-  storage_volume_id: 'volume-ready',
-  region: 'cn-shanghai',
   message: 'Historical baseline',
   tag_names: [],
   state: 'ready' as const,
+  data_health: 'available' as const,
   integrity: { state: 'verified' as const, files_verified: '3', bytes_verified: '30' },
   logical_file_count: '3',
   logical_size_bytes: '30',
@@ -98,28 +52,9 @@ const snapshot = {
   updated_at_unix_ms: '2',
 };
 
-type TestSnapshot = Omit<typeof snapshot, 'data_layout'> & {
-  data_layout: 'fast_cdc' | 'whole_file';
-};
-
-interface SnapshotCreateTestOptions {
-  capabilities?: string[];
-  volume?: typeof hardlinkVolume;
-  snapshot?: TestSnapshot;
-}
-
-function mockBaseQueries(options: SnapshotCreateTestOptions = {}): void {
-  const snapshotValue = options.snapshot ?? snapshot;
+function mockBaseQueries(): void {
   api.queryApiVersion.mockResolvedValue({
-    data: {
-      api_version: 1,
-      agent_wire_version: 1,
-      capabilities: options.capabilities ?? [
-        'artifact_catalog',
-        'artifact_commit_graph',
-        'snapshot_materialize',
-      ],
-    },
+    data: { api_version: 1, agent_wire_version: 1, capabilities: ['artifact_commit_graph'] },
     requestId: 'request-version',
   });
   api.queryArtifact.mockResolvedValue({ data: { artifact }, requestId: 'request-artifact' });
@@ -133,7 +68,7 @@ function mockBaseQueries(options: SnapshotCreateTestOptions = {}): void {
             commit_id: historicalCommitId,
             message: 'Historical baseline',
             tag_names: [],
-            data_layout: snapshotValue.data_layout,
+            data_layout: 'fast_cdc',
             created_at_unix_ms: '1',
           },
         ],
@@ -141,22 +76,15 @@ function mockBaseQueries(options: SnapshotCreateTestOptions = {}): void {
     },
     requestId: 'request-commit-graph',
   });
-  api.queryStorageVolumeList.mockResolvedValue({
-    data: { items: [degradedVolume, options.volume ?? readyVolume] },
-    requestId: 'request-volumes',
-  });
   api.createSnapshot.mockResolvedValue({
-    data: { snapshot: snapshotValue, replayed: true, placement_reused: true },
+    data: { snapshot, replayed: true },
     requestId: 'request-create',
   });
-  api.querySnapshot.mockResolvedValue({
-    data: { snapshot: snapshotValue },
-    requestId: 'request-snapshot',
-  });
+  api.querySnapshot.mockResolvedValue({ data: { snapshot }, requestId: 'request-snapshot' });
 }
 
-async function mountPage(options: SnapshotCreateTestOptions = {}) {
-  mockBaseQueries(options);
+async function mountPage() {
+  mockBaseQueries();
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [
@@ -166,11 +94,7 @@ async function mountPage(options: SnapshotCreateTestOptions = {}) {
         component: SnapshotCreatePage,
       },
       { path: '/artifact', name: 'artifact-detail', component: { template: '<div />' } },
-      {
-        path: '/snapshot/:snapshotId',
-        name: 'snapshot-detail',
-        component: { template: '<div />' },
-      },
+      { path: '/snapshot/:snapshotId', name: 'snapshot-detail', component: { template: '<div />' } },
     ],
   });
   await router.push(
@@ -183,7 +107,7 @@ async function mountPage(options: SnapshotCreateTestOptions = {}) {
   const wrapper = shallowMount(SnapshotCreatePage, {
     global: {
       plugins: [ElementPlus, [VueQueryPlugin, { queryClient }], router],
-      stubs: { ElButton: ElButtonStub, ElTag: ElTagStub },
+      stubs: { ElButton: ElButtonStub },
     },
   });
   await flushPromises();
@@ -199,10 +123,8 @@ function elementButton(wrapper: VueWrapper, label: string) {
 afterEach(() => vi.clearAllMocks());
 
 describe('Snapshot create page', () => {
-  it('uses ArtifactCommitSelect and submits the exact historical Commit with a Ready Volume', async () => {
+  it('creates a logical Snapshot without selecting a Volume', async () => {
     const { wrapper, queryClient } = await mountPage();
-
-    expect(api.queryArtifact).toHaveBeenCalledWith('tenant-a', 'project-a', 'artifact-a');
     const commitSelect = wrapper.findComponent(ArtifactCommitSelect);
     expect(commitSelect.props()).toMatchObject({
       tenantId: 'tenant-a',
@@ -212,161 +134,46 @@ describe('Snapshot create page', () => {
       modelValue: historicalCommitId,
       allowHistory: true,
     });
-
-    await elementButton(wrapper, '选择 StorageVolume').trigger('click');
-    await flushPromises();
-    expect(wrapper.text()).toContain('Ready volume');
-    expect(wrapper.text()).toContain('Degraded volume');
-    expect(
-      wrapper
-        .findAll('.snapshot-volume-list > button')
-        .find((item) => item.text().includes('Degraded volume'))
-        ?.attributes('disabled'),
-    ).toBeDefined();
-
-    await wrapper.find('.snapshot-volume-list > button:not([disabled])').trigger('click');
     api.createSnapshot
       .mockRejectedValueOnce(new TypeError('transport interrupted'))
-      .mockResolvedValueOnce({
-        data: { snapshot, replayed: true, placement_reused: true },
-        requestId: 'request-create-retry',
-      });
+      .mockResolvedValueOnce({ data: { snapshot, replayed: true }, requestId: 'retry' });
     await elementButton(wrapper, '创建 Snapshot').trigger('click');
     await flushPromises();
     await elementButton(wrapper, '创建 Snapshot').trigger('click');
     await flushPromises();
-
     expect(api.createSnapshot).toHaveBeenCalledTimes(2);
-    const requests = (api.createSnapshot.mock.calls as unknown[][]).map(
-      ([request]) => request as Record<string, unknown>,
-    );
-    expect(requests[0]).toMatchObject({
+    const first = api.createSnapshot.mock.calls[0]?.[0] as Record<string, unknown>;
+    const second = api.createSnapshot.mock.calls[1]?.[0] as Record<string, unknown>;
+    expect(first).toMatchObject({
       tenant_id: 'tenant-a',
       project_id: 'project-a',
       artifact_id: 'artifact-a',
       commit_id: historicalCommitId,
-      storage_volume_id: 'volume-ready',
     });
-    expect(requests[0]?.snapshot_request_id).toMatch(/^snapshot-request-/);
-    expect(requests[1]).toEqual(requests[0]);
-    expect(api.querySnapshot).toHaveBeenCalledWith('tenant-a', 'snapshot-a');
-    expect(wrapper.text()).toContain('幂等重放');
-    expect(wrapper.text()).toContain('复用现有放置');
-
+    expect(first).not.toHaveProperty('storage_volume_id');
+    expect(first).not.toHaveProperty('region');
+    expect(first.request_id).toMatch(/^snapshot-request-/);
+    expect(second).toEqual(first);
+    expect(wrapper.text()).toContain('请在详情页先复制到目标 Volume');
     wrapper.unmount();
     queryClient.clear();
   });
 
-  it('forwards the StorageVolume cursor and keeps unavailable placements disabled', async () => {
+  it('ignores duplicate clicks while Snapshot creation is pending', async () => {
     const { wrapper, queryClient } = await mountPage();
-    api.queryStorageVolumeList
-      .mockResolvedValueOnce({
-        data: { items: [degradedVolume], next_cursor: 'volume-page-2' },
-        requestId: 'request-volume-page-1',
-      })
-      .mockResolvedValueOnce({
-        data: { items: [readyVolume] },
-        requestId: 'request-volume-page-2',
-      });
-
-    await elementButton(wrapper, '选择 StorageVolume').trigger('click');
-    await flushPromises();
-    expect(wrapper.find('.snapshot-volume-list > button').attributes('disabled')).toBeDefined();
-    wrapper.findComponent(PageCursor).vm.$emit('next');
-    await flushPromises();
-
-    expect(api.queryStorageVolumeList).toHaveBeenLastCalledWith({
-      tenant_id: 'tenant-a',
-      page_size: 20,
-      cursor: 'volume-page-2',
-    });
-    expect(wrapper.text()).toContain('Ready volume');
-
-    wrapper.unmount();
-    queryClient.clear();
-  });
-
-  it('ignores duplicate create clicks while the first request is pending', async () => {
-    const { wrapper, queryClient } = await mountPage();
-    await elementButton(wrapper, '选择 StorageVolume').trigger('click');
-    await flushPromises();
-    await wrapper.find('.snapshot-volume-list > button:not([disabled])').trigger('click');
-
-    const pendingResult = {
-      data: { snapshot, replayed: false, placement_reused: false },
-      requestId: 'request-create-pending',
-    };
-    let resolveCreate!: (value: typeof pendingResult) => void;
+    let resolveCreate!: (value: unknown) => void;
     api.createSnapshot.mockImplementationOnce(
       () =>
-        new Promise<typeof pendingResult>((resolve) => {
+        new Promise((resolve) => {
           resolveCreate = resolve;
         }),
     );
-
-    const createButton = elementButton(wrapper, '创建 Snapshot');
-    await createButton.trigger('click');
-    await createButton.trigger('click');
+    const button = elementButton(wrapper, '创建 Snapshot');
+    await button.trigger('click');
+    await button.trigger('click');
     expect(api.createSnapshot).toHaveBeenCalledTimes(1);
-
-    resolveCreate(pendingResult);
+    resolveCreate({ data: { snapshot, replayed: false }, requestId: 'pending' });
     await flushPromises();
-    wrapper.unmount();
-    queryClient.clear();
-  });
-
-  it('creates the selected delivery mode after a WholeFile Snapshot is created', async () => {
-    const wholeFileSnapshot = { ...snapshot, data_layout: 'whole_file' as const };
-    api.createSnapshotDelivery.mockResolvedValue({
-      data: {
-        delivery: {
-          delivery_id: 'delivery-a',
-          snapshot_id: wholeFileSnapshot.snapshot_id,
-          commit_id: wholeFileSnapshot.commit_id,
-          storage_volume_id: hardlinkVolume.storage_volume_id,
-          mode: 'hardlink',
-          state: 'requested',
-        },
-        replayed: false,
-      },
-      requestId: 'request-delivery',
-    });
-    api.querySnapshotDeliveryList.mockResolvedValue({
-      data: { items: [] },
-      requestId: 'request-deliveries',
-    });
-    const { wrapper, queryClient } = await mountPage({
-      capabilities: deliveryCapabilities,
-      volume: hardlinkVolume,
-      snapshot: wholeFileSnapshot,
-    });
-
-    await elementButton(wrapper, '选择 StorageVolume').trigger('click');
-    await flushPromises();
-    await wrapper.find('.snapshot-volume-list > button:not([disabled])').trigger('click');
-    await flushPromises();
-
-    const modeSelector = wrapper.findComponent({ name: 'ElSegmented' });
-    expect(modeSelector.exists()).toBe(true);
-    const emit = (
-      modeSelector.vm as unknown as {
-        $emit: (event: 'update:modelValue', value: string) => void;
-      }
-    ).$emit;
-    emit.call(modeSelector.vm, 'update:modelValue', 'hardlink');
-    await flushPromises();
-    expect(wrapper.text()).toContain('硬链接可用');
-
-    await elementButton(wrapper, '创建 Snapshot').trigger('click');
-    await flushPromises();
-    await flushPromises();
-
-    expect(api.createSnapshotDelivery.mock.calls[0]?.[0]).toMatchObject({
-      tenant_id: 'tenant-a',
-      snapshot_id: wholeFileSnapshot.snapshot_id,
-      mode: 'hardlink',
-    });
-
     wrapper.unmount();
     queryClient.clear();
   });

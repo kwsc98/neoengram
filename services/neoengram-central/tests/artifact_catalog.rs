@@ -416,8 +416,9 @@ async fn playground_requires_an_artifact_and_freezes_the_authoritative_head() {
             create_playground_request("playground-inherited", None),
         )
         .await
-        .unwrap_err();
-    assert_eq!(inherited.code().as_str(), "catalog_internal");
+        .unwrap();
+    assert!(!inherited.replayed);
+    assert_eq!(inherited.playground.base_commit_id, Some(head.to_string()));
 
     let missing_commit = service
         .create_playground(

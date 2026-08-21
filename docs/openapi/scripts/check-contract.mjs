@@ -1027,10 +1027,9 @@ assertSameMembers(
     "project_id",
     "artifact_id",
     "commit_id",
-    "storage_volume_id",
-    "snapshot_request_id",
+    "request_id",
   ],
-  "Snapshot create must bind Commit, Volume, and request identity",
+  "Snapshot create must bind Commit and request identity",
 );
 assert(
   !createSnapshotRequest.properties.snapshot_id,
@@ -1050,7 +1049,7 @@ assert(
 );
 assertSameMembers(
   document.components.schemas.CreateSnapshotResponse.required,
-  ["snapshot", "replayed", "placement_reused"],
+  ["snapshot", "replayed"],
   "Snapshot create replay signals changed",
 );
 
@@ -1392,14 +1391,21 @@ assert(
   "Commit diff must not expose internal content identities or locations",
 );
 
-for (const schemaName of ["PlaygroundView", "SnapshotView"]) {
-  const view = document.components.schemas[schemaName];
-  assert(
-    view.required.includes("storage_volume_id") &&
-      view.required.includes("region"),
-    `${schemaName} must expose its public storage placement`,
-  );
-}
+const playgroundView = document.components.schemas.PlaygroundView;
+assert(
+  playgroundView.required.includes("storage_volume_id") &&
+    playgroundView.required.includes("region"),
+  "PlaygroundView must expose its public storage placement",
+);
+const snapshotView = document.components.schemas.SnapshotView;
+assert(
+  snapshotView.required.includes("data_health"),
+  "SnapshotView must expose dynamic Commit data health",
+);
+assert(
+  !snapshotView.properties.storage_volume_id && !snapshotView.properties.region,
+  "SnapshotView must not bind a physical Volume or Region",
+);
 assertSameMembers(
   document.components.schemas.PlaygroundView.required.filter((field) =>
     ["tenant_id", "project_id", "artifact_id"].includes(field),
@@ -1426,14 +1432,18 @@ assert(
   "ArtifactView must remain placement- and Ref-free",
 );
 
-for (const schemaName of ["CreatePlaygroundRequest", "CreateSnapshotRequest"]) {
-  assert(
-    document.components.schemas[schemaName].required.includes(
-      "storage_volume_id",
-    ),
-    `${schemaName} must select a StorageVolume`,
-  );
-}
+assert(
+  document.components.schemas.CreatePlaygroundRequest.required.includes(
+    "storage_volume_id",
+  ),
+  "CreatePlaygroundRequest must select a StorageVolume",
+);
+assert(
+  !document.components.schemas.CreateSnapshotRequest.required.includes(
+    "storage_volume_id",
+  ),
+  "CreateSnapshotRequest must remain placement-free",
+);
 
 assertSameMembers(
   document.components.schemas.StorageVolumeState.enum,
@@ -1481,8 +1491,14 @@ assertDescriptionIncludes(
 );
 assertDescriptionIncludes(
   createSnapshotRequest,
-  ["state=ready", "Region", "用途", "保留策略", "Dataset Profile"],
-  "Snapshot P0 creation boundary is not documented",
+  [
+    "固定 Commit",
+    "不能创建 Artifact",
+    "切换 Commit",
+    "源 Placement",
+    "不能为 Snapshot 选择 Volume",
+  ],
+  "Snapshot placement-free creation boundary is not documented",
 );
 
 const startPreCommit = document.paths["/api/playground/precommit/start"].post;
@@ -1518,16 +1534,22 @@ for (const schemaName of [
   );
 }
 
-for (const operationId of ["createPlayground", "createSnapshot"]) {
-  const [path, [method]] = Object.entries(expectedOperations).find(
-    ([, [, candidate]]) => candidate === operationId,
-  );
-  assertDescriptionIncludes(
-    document.paths[path][method],
-    ["state=ready", "degraded", "unavailable", "409"],
-    `${operationId} ready-only placement rejection is not documented`,
-  );
-}
+const [playgroundCreatePath, [playgroundCreateMethod]] = Object.entries(
+  expectedOperations,
+).find(([, [, candidate]]) => candidate === "createPlayground");
+assertDescriptionIncludes(
+  document.paths[playgroundCreatePath][playgroundCreateMethod],
+  ["state=ready", "degraded", "unavailable", "409"],
+  "createPlayground ready-only placement rejection is not documented",
+);
+const [snapshotCreatePath, [snapshotCreateMethod]] = Object.entries(
+  expectedOperations,
+).find(([, [, candidate]]) => candidate === "createSnapshot");
+assertDescriptionIncludes(
+  document.paths[snapshotCreatePath][snapshotCreateMethod],
+  ["不绑定 StorageVolume", "复制", "交付"],
+  "createSnapshot placement-first semantics are not documented",
+);
 
 assertDescriptionIncludes(
   document.components.schemas.DatasetProfileView,

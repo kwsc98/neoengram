@@ -181,11 +181,29 @@ async function openSnapshot(project: string, artifact: string, snapshotId: strin
             >
           </el-table-column>
           <el-table-column prop="artifact_id" label="Artifact" min-width="160" />
-          <el-table-column label="状态" min-width="145">
+          <el-table-column label="状态" min-width="190">
             <template #default="scope">
               <div class="state-stack">
                 <el-tag :type="snapshotStateTagType(scope.row.state)" effect="plain">
                   {{ snapshotStateLabel(scope.row.state) }}
+                </el-tag>
+                <el-tag
+                  :type="
+                    scope.row.data_health === 'available'
+                      ? 'success'
+                      : scope.row.data_health === 'degraded'
+                        ? 'warning'
+                        : 'danger'
+                  "
+                  effect="plain"
+                >
+                  {{
+                    scope.row.data_health === 'available'
+                      ? '数据可用'
+                      : scope.row.data_health === 'degraded'
+                        ? '数据降级'
+                        : '数据不可用'
+                  }}
                 </el-tag>
               </div>
             </template>
@@ -202,14 +220,6 @@ async function openSnapshot(project: string, artifact: string, snapshotId: strin
                   {{ tagName }}
                 </el-tag>
                 <span v-if="commitTagNames(scope.row.tag_names).length === 0">—</span>
-              </div>
-            </template>
-          </el-table-column>
-          <el-table-column label="放置" min-width="190">
-            <template #default="scope">
-              <div class="table-placement">
-                <strong>{{ scope.row.region }}</strong>
-                <code>{{ scope.row.storage_volume_id }}</code>
               </div>
             </template>
           </el-table-column>
@@ -268,9 +278,27 @@ async function openSnapshot(project: string, artifact: string, snapshotId: strin
               </small></span
             >
             <span
-              ><small>{{ snapshot.region }} · {{ formatBytes(snapshot.logical_size_bytes) }}</small
+              ><small>{{ formatBytes(snapshot.logical_size_bytes) }}</small
               ><el-tag :type="snapshotStateTagType(snapshot.state)" size="small" effect="plain">
                 {{ snapshotStateLabel(snapshot.state) }} </el-tag
+              ><el-tag
+                :type="
+                  snapshot.data_health === 'available'
+                    ? 'success'
+                    : snapshot.data_health === 'degraded'
+                      ? 'warning'
+                      : 'danger'
+                "
+                size="small"
+                effect="plain"
+              >
+                {{
+                  snapshot.data_health === 'available'
+                    ? '可用'
+                    : snapshot.data_health === 'degraded'
+                      ? '降级'
+                      : '不可用'
+                }} </el-tag
               ><ResourceDeletionDialog
                 v-if="lifecycleEnabled"
                 :tenant-id="tenantId"

@@ -210,7 +210,7 @@ async fn clean_catalog_creates_current_snapshot_and_delivery_schema() {
         .fetch_one(&mut connection)
         .await
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let snapshot_columns: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM pragma_table_info('snapshot_catalog_records') ORDER BY cid",
@@ -230,8 +230,6 @@ async fn clean_catalog_creates_current_snapshot_and_delivery_schema() {
             "snapshot_id",
             "snapshot_request_id",
             "commit_digest",
-            "storage_volume_id",
-            "region",
             "state",
             "resource_version",
             "lifecycle_state",
@@ -248,6 +246,16 @@ async fn clean_catalog_creates_current_snapshot_and_delivery_schema() {
     assert!(!snapshot_columns
         .iter()
         .any(|column| column == "relative_root"));
+
+    let access_point_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('s3_access_point_records') ORDER BY cid",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    assert!(!access_point_columns
+        .iter()
+        .any(|column| { column == "gateway_pool_id" || column == "region" }));
 
     let delivery_columns: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM pragma_table_info('snapshot_delivery_records') ORDER BY cid",
@@ -1711,8 +1719,6 @@ async fn create_active_s3_access_point(repository: &Arc<dyn ControlCatalogReposi
                 snapshot_id: id(SnapshotId::new, "snapshot-a"),
                 commit_id: ContentDigest::from_bytes([7; 32]),
                 bucket_name: "lifecycle-bucket".to_owned(),
-                gateway_pool_id: id(GatewayPoolId::new, "pool-a"),
-                region: "cn-shanghai".to_owned(),
                 state: S3AccessPointState::Active,
                 policy_generation: 1,
                 created_at_unix_ms: UnixMillis::new(300),
@@ -1780,8 +1786,6 @@ async fn seed_s3_catalog(
                 snapshot_id: id(SnapshotId::new, "snapshot-a"),
                 snapshot_request_id: id(RequestId::new, "snapshot-request-a"),
                 commit_id: ContentDigest::from_bytes([7; 32]),
-                storage_volume_id: id(StorageVolumeId::new, "volume-a"),
-                region: "cn-shanghai".to_owned(),
                 state: SnapshotState::Ready,
                 resource_version: 1,
                 lifecycle: ResourceLifecycle::active(),
@@ -2113,6 +2117,7 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
     mismatched_parent.delivery_id = id(SnapshotDeliveryId::new, "delivery-parent-mismatch");
     mismatched_parent.create_request_id = id(RequestId::new, "delivery-parent-mismatch-create");
     mismatched_parent.storage_volume_id = id(StorageVolumeId::new, "volume-b");
+    mismatched_parent.commit_id = ContentDigest::from_bytes([8; 32]);
     mismatched_parent.mode = SnapshotDeliveryMode::Copy;
     mismatched_parent.target_relative_root = LogicalPath::parse(
         "snapshots/project-a/artifact-a/snapshot-a/deliveries/delivery-parent-mismatch",
@@ -2230,6 +2235,7 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
     fenced_snapshot_delivery.create_request_id =
         id(RequestId::new, "delivery-fenced-snapshot-create");
     fenced_snapshot_delivery.mode = SnapshotDeliveryMode::Copy;
+    fenced_snapshot_delivery.commit_id = ContentDigest::from_bytes([8; 32]);
     fenced_snapshot_delivery.target_relative_root = LogicalPath::parse(
         "snapshots/project-a/artifact-a/snapshot-a/deliveries/delivery-fenced-snapshot",
     )
@@ -2262,8 +2268,6 @@ async fn exercise_s3_mutation_ledger(repository: Arc<dyn ControlCatalogRepositor
         snapshot_id: id(SnapshotId::new, "snapshot-a"),
         commit_id: ContentDigest::from_bytes([7; 32]),
         bucket_name: "contract-bucket".to_owned(),
-        gateway_pool_id: id(GatewayPoolId::new, "pool-a"),
-        region: "cn-shanghai".to_owned(),
         state: S3AccessPointState::Active,
         policy_generation: 1,
         created_at_unix_ms: UnixMillis::new(250),

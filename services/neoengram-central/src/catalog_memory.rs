@@ -775,18 +775,6 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                     .is_none_or(|id| &record.artifact_id == id)
             })
             .filter(|record| request.commit_id.is_none_or(|id| record.commit_id == id))
-            .filter(|record| {
-                request
-                    .storage_volume_id
-                    .as_ref()
-                    .is_none_or(|id| &record.storage_volume_id == id)
-            })
-            .filter(|record| {
-                request
-                    .region
-                    .as_ref()
-                    .is_none_or(|region| &record.region == region)
-            })
             .filter(|record| request.state.is_none_or(|state| record.state == state))
             .filter(|record| {
                 request
@@ -824,7 +812,6 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         } = request;
         validate_new_resource(record.resource_version, &record.lifecycle, "Snapshot")?;
         let artifacts = lock(&self.artifacts)?;
-        let volumes = lock(&self.volumes)?;
         let mut snapshots = lock(&self.snapshots)?;
 
         if let Some(existing) = snapshots.values().find(|existing| {
@@ -846,10 +833,9 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 && existing.project_id == record.project_id
                 && existing.artifact_id == record.artifact_id
                 && existing.commit_id == record.commit_id
-                && existing.storage_volume_id == record.storage_volume_id
         }) {
             require_active(&existing.lifecycle, "Snapshot")?;
-            return Ok(SnapshotInsertOutcome::ExistingPlacement(existing.clone()));
+            return Ok(SnapshotInsertOutcome::ExistingCommit(existing.clone()));
         }
         let artifact = artifacts
             .get(&(record.tenant_id.clone(), record.artifact_id.clone()))
@@ -872,27 +858,6 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             if artifact.head_commit_id != expected {
                 return Err(artifact_head_changed());
             }
-        }
-        let volume = volumes
-            .get(&(record.tenant_id.clone(), record.storage_volume_id.clone()))
-            .ok_or_else(|| {
-                catalog_parent_error(
-                    CentralErrorCode::StorageVolumeNotFound,
-                    "Snapshot StorageVolume does not exist",
-                )
-            })?;
-        require_active(&volume.lifecycle, "Snapshot StorageVolume")?;
-        if volume.state != StorageVolumeState::Ready {
-            return Err(catalog_parent_error(
-                CentralErrorCode::StorageVolumeNotReady,
-                "Snapshot StorageVolume is not ready",
-            ));
-        }
-        if record.region != volume.region {
-            return Err(catalog_parent_error(
-                CentralErrorCode::StorageVolumeRegionMismatch,
-                "Snapshot region must match the StorageVolume region",
-            ));
         }
         snapshots.insert(
             (record.tenant_id.clone(), record.snapshot_id.clone()),
@@ -2627,32 +2592,12 @@ pub(crate) fn build_deletion_impact(
                         true,
                     )
                 })
-                .chain(
-                    snapshots
-                        .values()
-                        .filter(|record| {
-                            record.tenant_id == request.tenant_id
-                                && record.storage_volume_id == *storage_volume_id
-                                && record.lifecycle.state != ResourceLifecycleState::Deleted
-                        })
-                        .map(|record| {
-                            deletion_target(
-                                ResourceRef::Snapshot {
-                                    snapshot_id: record.snapshot_id.clone(),
-                                },
-                                record.resource_version,
-                                &record.lifecycle,
-                                true,
-                            )
-                        }),
-                )
                 .collect::<Vec<_>>();
             if !dependencies.is_empty() && !request.cascade {
                 blockers.push(neoengram_domain::protocol::DeletionBlocker {
                     code: "DEPENDENCIES_REQUIRE_CASCADE".to_owned(),
                     resource: Some(request.root.clone()),
-                    message: "StorageVolume still contains Playground or Snapshot resources"
-                        .to_owned(),
+                    message: "StorageVolume still contains Playground resources".to_owned(),
                 });
             }
             if !request.confirm_managed_data_erase {
@@ -3471,8 +3416,6 @@ fn snapshot_request_matches(existing: &SnapshotRecord, requested: &SnapshotRecor
         && existing.artifact_id == requested.artifact_id
         && existing.snapshot_request_id == requested.snapshot_request_id
         && existing.commit_id == requested.commit_id
-        && existing.storage_volume_id == requested.storage_volume_id
-        && existing.region == requested.region
 }
 
 fn validate_limit(limit: u16) -> CentralResult<()> {
@@ -3547,7 +3490,6 @@ fn require_s3_snapshot(
             snapshot.project_id == access_point.project_id
                 && snapshot.artifact_id == access_point.artifact_id
                 && snapshot.commit_id == access_point.commit_id
-                && snapshot.region == access_point.region
         })
         .ok_or_else(|| conflict("S3 Access Point Snapshot binding does not exist"))?;
     require_active(&snapshot.lifecycle, "S3 Access Point Snapshot")?;
@@ -3583,8 +3525,6 @@ fn same_s3_access_point_create_identity(
         && existing.snapshot_id == requested.snapshot_id
         && existing.commit_id == requested.commit_id
         && existing.bucket_name == requested.bucket_name
-        && existing.gateway_pool_id == requested.gateway_pool_id
-        && existing.region == requested.region
 }
 
 fn same_s3_mutation_identity(existing: &S3MutationRecord, requested: &S3MutationRecord) -> bool {

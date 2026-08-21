@@ -102,6 +102,9 @@ spec:
             - name: peer
               containerPort: 8083
               protocol: TCP
+            - name: transfer
+              containerPort: 8084
+              protocol: UDP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -270,6 +273,9 @@ spec:
             - name: peer
               containerPort: 8083
               protocol: TCP
+            - name: transfer
+              containerPort: 8084
+              protocol: UDP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -314,6 +314,17 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
     public_action("POST", "/api/artifact/list/query", "queryArtifactList"),
     public_action("POST", "/api/artifact/query", "queryArtifact"),
     public_action("POST", "/api/artifact/create", "createArtifact"),
+    public_action("POST", "/api/commit/replicate", "replicateCommit"),
+    public_action(
+        "POST",
+        "/api/commit/replication/query",
+        "queryCommitReplication",
+    ),
+    public_action(
+        "POST",
+        "/api/commit/availability/query",
+        "queryCommitAvailability",
+    ),
     public_action(
         "POST",
         "/api/artifact/commit/graph/query",
@@ -396,6 +407,7 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
         "/api/snapshot/delivery/delete",
         "deleteSnapshotDelivery",
     ),
+    public_action("POST", "/api/workspace/create", "createWorkspace"),
     documented_action(
         "POST",
         "/api/snapshot/file/list/query",

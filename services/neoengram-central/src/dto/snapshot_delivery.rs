@@ -31,6 +31,7 @@ pub enum SnapshotDeliveryState {
 pub struct CreateSnapshotDeliveryRequest {
     pub tenant_id: String,
     pub snapshot_id: String,
+    pub target_storage_volume_id: String,
     pub mode: SnapshotDeliveryMode,
     pub request_id: String,
 }

@@ -17,10 +17,14 @@ import { useRoute, useRouter } from 'vue-router';
 import {
   createSnapshotDelivery,
   deleteSnapshotDelivery,
+  queryCommitAvailability,
+  queryCommitReplication,
   queryApiVersion,
   querySnapshot,
   querySnapshotDeliveryList,
   queryStorageVolume,
+  queryStorageVolumeList,
+  replicateCommit,
   retrySnapshotDelivery,
 } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
@@ -77,17 +81,62 @@ const snapshotQuery = useQuery({
 const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
 const tags = computed(() => commitTagNames(snapshot.value?.tag_names ?? []));
 const selectedDeliveryMode = ref<'fuse' | 'copy' | 'hardlink'>('fuse');
+const targetVolumeId = ref('');
+const replicationTargetVolumeId = ref('');
+const replicationId = ref('');
 const deliveryCapabilityEnabled = computed(() =>
   supportsSnapshotDelivery(versionQuery.data.value?.data.capabilities),
 );
 const volumeQuery = useQuery({
-  queryKey: computed(() => ['storage-volume', tenantId.value, snapshot.value?.storage_volume_id]),
-  queryFn: () => queryStorageVolume(tenantId.value, snapshot.value!.storage_volume_id),
-  enabled: computed(() =>
-    Boolean(snapshot.value?.storage_volume_id && deliveryCapabilityEnabled.value),
-  ),
+  queryKey: computed(() => ['storage-volume', tenantId.value, targetVolumeId.value]),
+  queryFn: () => queryStorageVolume(tenantId.value, targetVolumeId.value),
+  enabled: computed(() => Boolean(targetVolumeId.value && deliveryCapabilityEnabled.value)),
   staleTime: 30_000,
 });
+const volumeListQuery = useQuery({
+  queryKey: computed(() => ['storage-volumes', tenantId.value, 'snapshot-detail']),
+  queryFn: () => queryStorageVolumeList({ tenant_id: tenantId.value, page_size: 100 }),
+  enabled: computed(() => Boolean(snapshot.value && deliveryCapabilityEnabled.value)),
+});
+const targetVolumes = computed(() => volumeListQuery.data.value?.data.items ?? []);
+watchEffect(() => {
+  if (!targetVolumeId.value) {
+    targetVolumeId.value =
+      targetVolumes.value.find((volume) => volume.state === 'ready')?.storage_volume_id ?? '';
+  }
+  if (!replicationTargetVolumeId.value) {
+    replicationTargetVolumeId.value =
+      targetVolumes.value.find((volume) => volume.state === 'ready')?.storage_volume_id ?? '';
+  }
+});
+const replicationMutation = useMutation({ mutationFn: replicateCommit });
+const replicationQuery = useQuery({
+  queryKey: computed(() => ['commit-replication', tenantId.value, replicationId.value]),
+  queryFn: () =>
+    queryCommitReplication({ tenant_id: tenantId.value, replication_id: replicationId.value }),
+  enabled: computed(() => Boolean(replicationId.value)),
+  refetchInterval: (query) => {
+    const state = query.state.data?.data.replication.state;
+    return state && !['published', 'failed', 'cancelled'].includes(state) ? 1_000 : false;
+  },
+});
+  const replication = computed(() => replicationQuery.data.value?.data.replication);
+const availabilityQuery = useQuery({
+  queryKey: computed(() => ['commit-availability', tenantId.value, snapshot.value?.commit_id]),
+  queryFn: () =>
+    queryCommitAvailability({ tenant_id: tenantId.value, commit_id: snapshot.value!.commit_id }),
+  enabled: computed(() => Boolean(snapshot.value?.commit_id)),
+  refetchInterval: 2_000,
+});
+const availableVolumeIds = computed(
+  () => availabilityQuery.data.value?.data.availability.verified_storage_volume_ids ?? [],
+);
+const targetPlacementPublished = computed(
+  () =>
+    (replication.value?.state === 'published' &&
+      replication.value.target_storage_volume_id === targetVolumeId.value) ||
+    availableVolumeIds.value.includes(targetVolumeId.value),
+);
 const storageVolume = computed(() => volumeQuery.data.value?.data.storage_volume);
 const deliveryModeAvailability = computed(() => {
   const capabilities = versionQuery.data.value?.data.capabilities;
@@ -95,12 +144,15 @@ const deliveryModeAvailability = computed(() => {
   const layout = snapshot.value?.data_layout;
   return {
     fuse:
+      targetPlacementPublished.value &&
       supportsSnapshotDeliveryMode(capabilities, 'fuse') &&
       Boolean(volume?.allowed_delivery_modes.includes('fuse')),
     copy:
+      targetPlacementPublished.value &&
       supportsSnapshotDeliveryMode(capabilities, 'copy') &&
       Boolean(volume?.allowed_delivery_modes.includes('copy')),
     hardlink:
+      targetPlacementPublished.value &&
       supportsSnapshotDeliveryMode(capabilities, 'hardlink') &&
       Boolean(volume?.allowed_delivery_modes.includes('hardlink')) &&
       layout === 'whole_file' &&
@@ -116,7 +168,11 @@ const deliveryQuery = useQuery({
       page_size: 100,
     }),
   enabled: computed(() =>
-    Boolean(snapshot.value?.state === 'ready' && deliveryCapabilityEnabled.value),
+    Boolean(
+      snapshot.value?.state === 'ready' &&
+      snapshot.value.data_health !== 'unavailable' &&
+      deliveryCapabilityEnabled.value,
+    ),
   ),
 });
 const deliveryMutation = useMutation({
@@ -185,6 +241,8 @@ watchEffect(() => {
 });
 
 function deliveryModeReason(mode: 'fuse' | 'copy' | 'hardlink'): string | undefined {
+  if (snapshot.value?.data_health === 'unavailable') return 'Snapshot 当前没有可用对象副本';
+  if (!targetPlacementPublished.value) return '请先将 Commit 复制到当前目标 Volume，并等待 PlacementSet published';
   const capabilities = versionQuery.data.value?.data.capabilities;
   if (!supportsSnapshotDeliveryMode(capabilities, mode)) {
     return 'Central 未声明该交付能力';
@@ -227,6 +285,7 @@ function deliveryStateLabel(state: string): string {
 async function createDelivery(): Promise<void> {
   if (
     snapshot.value?.state !== 'ready' ||
+    snapshot.value.data_health === 'unavailable' ||
     deliveryMutation.isPending.value ||
     !deliveryModeAvailability.value[selectedDeliveryMode.value]
   )
@@ -237,9 +296,32 @@ async function createDelivery(): Promise<void> {
   await deliveryMutation.mutateAsync({
     tenant_id: tenantId.value,
     snapshot_id: snapshotId.value,
+    target_storage_volume_id: targetVolumeId.value,
     mode: selectedDeliveryMode.value,
     request_id: requestId,
   });
+}
+
+async function replicateSnapshot(): Promise<void> {
+  if (
+    !snapshot.value ||
+    snapshot.value.state !== 'ready' ||
+    !replicationTargetVolumeId.value ||
+    replicationMutation.isPending.value
+  ) {
+    return;
+  }
+  const result = await replicationMutation.mutateAsync({
+    tenant_id: tenantId.value,
+    commit_id: snapshot.value.commit_id,
+    target_storage_volume_id: replicationTargetVolumeId.value,
+    request_id: operationRequestId(
+      `replicate-${snapshot.value.commit_id}-${replicationTargetVolumeId.value}`,
+    ),
+  });
+  replicationId.value = result.data.replication.replication_id;
+  ElMessage.success(result.data.replayed ? '已返回同一复制请求' : 'Commit 复制已排队');
+  await replicationQuery.refetch();
 }
 
 async function retryDelivery(deliveryId: string): Promise<void> {
@@ -331,8 +413,11 @@ async function openObjectStorage(): Promise<void> {
         <div>
           <small>{{ snapshotStateLabel(snapshot.state) }}</small>
           <h2>只读 Snapshot</h2>
-          <p v-if="snapshot.state === 'creating'">正在冻结 Commit 与 StorageVolume 绑定。</p>
-          <p v-else-if="snapshot.state === 'ready'">Snapshot 已固定，可按需创建独立只读交付。</p>
+          <p v-if="snapshot.state === 'creating'">正在冻结不可变 Commit。</p>
+          <p v-else-if="snapshot.state === 'ready' && snapshot.data_health !== 'unavailable'">
+            Snapshot 已固定，可按需创建独立只读交付。
+          </p>
+          <p v-else-if="snapshot.state === 'ready'">Snapshot 元数据仍在，但当前没有可用副本。</p>
           <p v-else>Snapshot 当前不可用于创建只读交付。</p>
         </div>
         <el-tag :type="snapshotStateTagType(snapshot.state)" effect="plain">
@@ -364,16 +449,6 @@ async function openObjectStorage(): Promise<void> {
             </dd>
           </div>
           <div>
-            <dt>StorageVolume</dt>
-            <dd>
-              <code>{{ snapshot.storage_volume_id }}</code>
-            </dd>
-          </div>
-          <div>
-            <dt>Region</dt>
-            <dd>{{ snapshot.region }}</dd>
-          </div>
-          <div>
             <dt>访问模式</dt>
             <dd><el-tag type="success" effect="plain">只读</el-tag></dd>
           </div>
@@ -389,6 +464,29 @@ async function openObjectStorage(): Promise<void> {
               <el-tag :type="snapshotIntegrityTagType(snapshot.integrity.state)" effect="plain">{{
                 snapshotIntegrityLabel(snapshot.integrity.state)
               }}</el-tag>
+            </dd>
+          </div>
+          <div>
+            <dt>数据健康</dt>
+            <dd>
+              <el-tag
+                :type="
+                  snapshot.data_health === 'available'
+                    ? 'success'
+                    : snapshot.data_health === 'degraded'
+                      ? 'warning'
+                      : 'danger'
+                "
+                effect="plain"
+              >
+                {{
+                  snapshot.data_health === 'available'
+                    ? '可用'
+                    : snapshot.data_health === 'degraded'
+                      ? '降级'
+                      : '不可用'
+                }}
+              </el-tag>
             </dd>
           </div>
           <div>
@@ -430,6 +528,52 @@ async function openObjectStorage(): Promise<void> {
       </section>
 
       <section v-if="deliveryCapabilityEnabled" class="content-section delivery-section">
+        <section class="replication-panel" aria-label="Commit 复制">
+          <header class="section-heading">
+            <div>
+              <span>COMMIT PLACEMENT</span>
+              <h2>先复制 Commit，再创建交付</h2>
+            </div>
+            <RefreshRight />
+          </header>
+          <p class="replication-explanation">
+            Snapshot 不绑定磁盘。选择目标 Volume 后显式复制完整 ObjectSet；目标 PlacementSet 发布前不会对 Delivery 或 S3 可见。
+          </p>
+          <div class="delivery-toolbar">
+            <el-select
+              v-model="replicationTargetVolumeId"
+              placeholder="选择复制目标 StorageVolume"
+              style="min-width: 280px"
+            >
+              <el-option
+                v-for="volume in targetVolumes"
+                :key="volume.storage_volume_id"
+                :label="`${volume.display_name} (${volume.region})`"
+                :value="volume.storage_volume_id"
+                :disabled="volume.state !== 'ready'"
+              />
+            </el-select>
+            <el-button
+              type="primary"
+              :loading="replicationMutation.isPending.value"
+              :disabled="!replicationTargetVolumeId || snapshot.state !== 'ready'"
+              @click="replicateSnapshot"
+            >
+              复制 Commit
+            </el-button>
+          </div>
+          <ApiProblemAlert v-if="replicationMutation.error.value" :error="replicationMutation.error.value" />
+          <ApiProblemAlert v-if="replicationQuery.error.value" :error="replicationQuery.error.value" />
+          <div v-if="replication" class="replication-status">
+            <span>任务 <code>{{ replication.replication_id }}</code></span>
+            <el-tag
+              :type="replication.state === 'published' ? 'success' : replication.state === 'failed' ? 'danger' : 'warning'"
+              effect="plain"
+            >{{ replication.state }}</el-tag>
+            <span>{{ replication.completed_objects }} / {{ replication.total_objects }} objects</span>
+            <span v-if="replication.issue">{{ replication.issue.message }}</span>
+          </div>
+        </section>
         <header class="section-heading delivery-section__header">
           <div>
             <span>SNAPSHOT DELIVERY</span>
@@ -444,13 +588,28 @@ async function openObjectStorage(): Promise<void> {
           @retry="volumeQuery.refetch"
         />
         <div class="delivery-toolbar">
+          <el-select
+            v-model="targetVolumeId"
+            placeholder="选择目标 StorageVolume"
+            style="min-width: 240px"
+          >
+            <el-option
+              v-for="volume in targetVolumes"
+              :key="volume.storage_volume_id"
+              :label="`${volume.display_name} (${volume.region})`"
+              :value="volume.storage_volume_id"
+              :disabled="volume.state !== 'ready'"
+            />
+          </el-select>
           <el-segmented v-model="selectedDeliveryMode" :options="deliveryModeOptions" />
           <el-button
             type="primary"
             :icon="Plus"
             :loading="deliveryMutation.isPending.value"
             :disabled="
-              volumeQuery.isPending.value || !deliveryModeAvailability[selectedDeliveryMode]
+              volumeQuery.isPending.value ||
+              !targetVolumeId ||
+              !deliveryModeAvailability[selectedDeliveryMode]
             "
             @click="createDelivery"
             >创建交付</el-button
@@ -559,6 +718,28 @@ async function openObjectStorage(): Promise<void> {
 <style scoped>
 .snapshot-detail-page {
   max-width: 1120px;
+}
+
+.replication-panel {
+  margin-bottom: 18px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  background: #fff;
+}
+
+.replication-explanation {
+  margin: 12px 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.replication-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  color: var(--muted);
 }
 
 .snapshot-state-band {

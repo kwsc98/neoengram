@@ -72,6 +72,14 @@ import type {
   RetrySnapshotDeliveryResponse,
   CreateSnapshotDeliveryRequest,
   CreateSnapshotDeliveryResponse,
+  CreateCommitReplicationRequest,
+  CreateCommitReplicationResponse,
+  QueryCommitReplicationRequest,
+  QueryCommitReplicationResponse,
+  QueryCommitAvailabilityRequest,
+  QueryCommitAvailabilityResponse,
+  CreateWorkspaceRequest,
+  CreateWorkspaceResponse,
   QuerySnapshotDeliveryRequest,
   QuerySnapshotDeliveryResponse,
   QuerySnapshotDeliveryListRequest,
@@ -501,6 +509,38 @@ export async function createSnapshot(
   return unwrap(
     await apiClient.POST('/api/snapshot/create', { body: request, params: versionHeader }),
   ) as ApiResult<CreateSnapshotResponse>;
+}
+
+export async function replicateCommit(
+  request: CreateCommitReplicationRequest,
+): Promise<ApiResult<CreateCommitReplicationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/replicate', { body: request, params: versionHeader }),
+  );
+}
+
+export async function queryCommitReplication(
+  request: QueryCommitReplicationRequest,
+): Promise<ApiResult<QueryCommitReplicationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/replication/query', { body: request, params: versionHeader }),
+  );
+}
+
+export async function queryCommitAvailability(
+  request: QueryCommitAvailabilityRequest,
+): Promise<ApiResult<QueryCommitAvailabilityResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/availability/query', { body: request, params: versionHeader }),
+  );
+}
+
+export async function createWorkspace(
+  request: CreateWorkspaceRequest,
+): Promise<ApiResult<CreateWorkspaceResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/workspace/create', { body: request, params: versionHeader }),
+  );
 }
 
 export async function retrySnapshotDelivery(

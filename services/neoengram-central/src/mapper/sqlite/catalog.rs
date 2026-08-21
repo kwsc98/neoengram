@@ -61,7 +61,7 @@ const PLAYGROUND_COLUMNS: &str = "tenant_id, project_id, artifact_id, playground
     active_deletion_id, delete_requested_at_unix_ms, purge_after_unix_ms, deleted_at_unix_ms, \
     created_at_unix_ms, updated_at_unix_ms";
 const SNAPSHOT_COLUMNS: &str = "tenant_id, project_id, artifact_id, snapshot_id, \
-    snapshot_request_id, commit_digest, storage_volume_id, region, state, \
+    snapshot_request_id, commit_digest, state, \
     resource_version, lifecycle_state, lifecycle_generation, active_deletion_id, \
     delete_requested_at_unix_ms, purge_after_unix_ms, deleted_at_unix_ms, created_at_unix_ms, \
     updated_at_unix_ms";
@@ -70,7 +70,7 @@ const SNAPSHOT_DELIVERY_COLUMNS: &str = "tenant_id, delivery_id, create_request_
     delivery_generation, file_count, size_bytes, object_set_digest, resource_version, issue_code, \
     issue_message, issue_retryable, created_at_unix_ms, updated_at_unix_ms";
 const S3_ACCESS_POINT_COLUMNS: &str = "access_point_id, tenant_id, project_id, artifact_id, \
-    snapshot_id, commit_digest, bucket_name, gateway_pool_id, region, state, policy_generation, \
+    snapshot_id, commit_digest, bucket_name, state, policy_generation, \
     created_at_unix_ms, updated_at_unix_ms";
 const S3_CREDENTIAL_COLUMNS: &str = "credential_id, access_point_id, access_key_id, \
     encrypted_secret, state, expires_at_unix_ms, created_at_unix_ms, last_used_at_unix_ms";
@@ -1255,14 +1255,6 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 .push(" AND commit_digest = ")
                 .push_bind(commit_id.as_bytes().as_slice());
         }
-        if let Some(volume_id) = &request.storage_volume_id {
-            query
-                .push(" AND storage_volume_id = ")
-                .push_bind(volume_id.as_str());
-        }
-        if let Some(region) = &request.region {
-            query.push(" AND region = ").push_bind(region);
-        }
         if let Some(state) = request.state {
             query
                 .push(" AND state = ")
@@ -1322,17 +1314,16 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             transaction.commit().await.map_err(storage_error)?;
             return Ok(SnapshotInsertOutcome::ExistingRequest(existing));
         }
-        let placement_sql = format!(
+        let commit_sql = format!(
             "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records \
              WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? \
-               AND commit_digest = ? AND storage_volume_id = ?"
+               AND commit_digest = ?"
         );
-        if let Some(existing) = sqlx::query(&placement_sql)
+        if let Some(existing) = sqlx::query(&commit_sql)
             .bind(record.tenant_id.as_str())
             .bind(record.project_id.as_str())
             .bind(record.artifact_id.as_str())
             .bind(record.commit_id.as_bytes().as_slice())
-            .bind(record.storage_volume_id.as_str())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(storage_error)?
@@ -1341,7 +1332,7 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         {
             require_active(&existing.lifecycle, "Snapshot")?;
             transaction.commit().await.map_err(storage_error)?;
-            return Ok(SnapshotInsertOutcome::ExistingPlacement(existing));
+            return Ok(SnapshotInsertOutcome::ExistingCommit(existing));
         }
         let artifact_sql = format!(
             "SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records \
@@ -1375,44 +1366,13 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 return Err(artifact_head_changed());
             }
         }
-        let volume_sql = format!(
-            "SELECT {VOLUME_COLUMNS} FROM storage_volume_catalog_records \
-             WHERE tenant_id = ? AND storage_volume_id = ?"
-        );
-        let volume = sqlx::query(&volume_sql)
-            .bind(record.tenant_id.as_str())
-            .bind(record.storage_volume_id.as_str())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(storage_error)?
-            .map(decode_volume)
-            .transpose()?
-            .ok_or_else(|| {
-                catalog_parent_error(
-                    CentralErrorCode::StorageVolumeNotFound,
-                    "Snapshot StorageVolume does not exist",
-                )
-            })?;
-        require_active(&volume.lifecycle, "Snapshot StorageVolume")?;
-        if volume.state != StorageVolumeState::Ready {
-            return Err(catalog_parent_error(
-                CentralErrorCode::StorageVolumeNotReady,
-                "Snapshot StorageVolume is not ready",
-            ));
-        }
-        if record.region != volume.region {
-            return Err(catalog_parent_error(
-                CentralErrorCode::StorageVolumeRegionMismatch,
-                "Snapshot region must match the StorageVolume region",
-            ));
-        }
         let result = sqlx::query(
             "INSERT INTO snapshot_catalog_records \
              (tenant_id, project_id, artifact_id, snapshot_id, snapshot_request_id, commit_digest, \
-              storage_volume_id, region, state, created_at_unix_ms, \
+              state, created_at_unix_ms, \
               resource_version, lifecycle_state, lifecycle_generation, active_deletion_id, \
               delete_requested_at_unix_ms, purge_after_unix_ms, deleted_at_unix_ms, \
-             updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.tenant_id.as_str())
         .bind(record.project_id.as_str())
@@ -1420,8 +1380,6 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         .bind(record.snapshot_id.as_str())
         .bind(record.snapshot_request_id.as_str())
         .bind(record.commit_id.as_bytes().as_slice())
-        .bind(record.storage_volume_id.as_str())
-        .bind(&record.region)
         .bind(snapshot_state_name(record.state))
         .bind(as_i64(record.created_at_unix_ms)?)
         .bind(record.resource_version.to_string())
@@ -4578,7 +4536,7 @@ async fn require_active_s3_snapshot(
     let sql = format!(
         "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records \
          WHERE tenant_id = ? AND snapshot_id = ? AND project_id = ? AND artifact_id = ? \
-           AND commit_digest = ? AND region = ?"
+           AND commit_digest = ?"
     );
     let snapshot = sqlx::query(&sql)
         .bind(access_point.tenant_id.as_str())
@@ -4586,7 +4544,6 @@ async fn require_active_s3_snapshot(
         .bind(access_point.project_id.as_str())
         .bind(access_point.artifact_id.as_str())
         .bind(access_point.commit_id.as_bytes().as_slice())
-        .bind(&access_point.region)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(storage_error)?
@@ -4623,8 +4580,8 @@ async fn insert_s3_access_point_row(
     sqlx::query(
         "INSERT INTO s3_access_point_records \
          (access_point_id, tenant_id, project_id, artifact_id, snapshot_id, commit_digest, \
-          bucket_name, gateway_pool_id, region, state, policy_generation, created_at_unix_ms, \
-          updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          bucket_name, state, policy_generation, created_at_unix_ms, updated_at_unix_ms) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(record.access_point_id.as_str())
     .bind(record.tenant_id.as_str())
@@ -4633,8 +4590,6 @@ async fn insert_s3_access_point_row(
     .bind(record.snapshot_id.as_str())
     .bind(record.commit_id.as_bytes().as_slice())
     .bind(&record.bucket_name)
-    .bind(record.gateway_pool_id.as_str())
-    .bind(&record.region)
     .bind(s3_access_point_state_name(record.state))
     .bind(i64::try_from(record.policy_generation).map_err(|_| {
         CentralError::new(
@@ -5261,11 +5216,6 @@ fn decode_snapshot(row: SqliteRow) -> CentralResult<SnapshotRecord> {
             row.try_get("commit_digest").map_err(storage_error)?,
             "Snapshot Commit digest",
         )?,
-        storage_volume_id: parse_id(
-            row.try_get("storage_volume_id").map_err(storage_error)?,
-            StorageVolumeId::new,
-        )?,
-        region: row.try_get("region").map_err(storage_error)?,
         state: parse_snapshot_state(row.try_get("state").map_err(storage_error)?)?,
         resource_version: parse_u64(
             row.try_get("resource_version").map_err(storage_error)?,
@@ -5443,11 +5393,6 @@ fn decode_s3_access_point(row: SqliteRow) -> CentralResult<S3AccessPointRecord> 
             "S3 Access Point Commit digest",
         )?,
         bucket_name: row.try_get("bucket_name").map_err(storage_error)?,
-        gateway_pool_id: parse_id(
-            row.try_get("gateway_pool_id").map_err(storage_error)?,
-            neoengram_domain::protocol::GatewayPoolId::new,
-        )?,
-        region: row.try_get("region").map_err(storage_error)?,
         state: parse_s3_access_point_state(row.try_get("state").map_err(storage_error)?)?,
         policy_generation,
         created_at_unix_ms: unix_ms(row.try_get("created_at_unix_ms").map_err(storage_error)?)?,
@@ -5583,8 +5528,6 @@ fn snapshot_request_matches(existing: &SnapshotRecord, requested: &SnapshotRecor
         && existing.artifact_id == requested.artifact_id
         && existing.snapshot_request_id == requested.snapshot_request_id
         && existing.commit_id == requested.commit_id
-        && existing.storage_volume_id == requested.storage_volume_id
-        && existing.region == requested.region
 }
 
 fn validate_limit(limit: u16) -> CentralResult<()> {
@@ -5802,8 +5745,6 @@ fn same_s3_access_point_create_identity(
         && existing.snapshot_id == requested.snapshot_id
         && existing.commit_id == requested.commit_id
         && existing.bucket_name == requested.bucket_name
-        && existing.gateway_pool_id == requested.gateway_pool_id
-        && existing.region == requested.region
 }
 
 fn same_s3_mutation_identity(existing: &S3MutationRecord, requested: &S3MutationRecord) -> bool {

@@ -198,6 +198,7 @@ pub struct CatalogService {
     storage_availability: Option<Arc<dyn StorageAvailabilityProvider>>,
     s3_placement: Option<Arc<dyn S3PlacementProvider>>,
     gateway_registry: Option<Arc<dyn crate::GatewayRegistryRepository>>,
+    pub(crate) placement: Option<Arc<dyn crate::PlacementRepository>>,
     lifecycle_objects: Option<Arc<dyn crate::ObjectCatalog>>,
     lifecycle_authority: Option<Arc<dyn AuthorityLifecycleRepository>>,
     s3_read_revocations: Option<Arc<dyn S3ReadRevocationPublisher>>,
@@ -229,6 +230,7 @@ impl CatalogService {
             storage_availability: None,
             s3_placement: None,
             gateway_registry: None,
+            placement: None,
             lifecycle_objects: None,
             lifecycle_authority: None,
             s3_read_revocations: None,
@@ -296,6 +298,15 @@ impl CatalogService {
         gateway_registry: Arc<dyn crate::GatewayRegistryRepository>,
     ) -> Self {
         self.gateway_registry = Some(gateway_registry);
+        self
+    }
+
+    #[must_use]
+    pub fn with_placement_repository(
+        mut self,
+        placement: Arc<dyn crate::PlacementRepository>,
+    ) -> Self {
+        self.placement = Some(placement);
         self
     }
 
@@ -1208,40 +1219,17 @@ impl CatalogService {
         // baseline.
         let (base_commit_id, artifact_head) = match requested_base_commit_id {
             Some(commit_id) => {
-                let commit = self
-                    .load_published_commit(&artifact, CommitId::from_digest(commit_id))
+                // A Workspace may be created on any ready Volume. Central resolves a readable
+                // source Placement for hydration; the target Volume is never required to be the
+                // Commit's existing physical location.
+                self.load_published_commit(&artifact, CommitId::from_digest(commit_id))
                     .await?;
-                let source_storage_volume_id =
-                    self.commit_source_storage_volume_id(&commit).await?;
-                require_commit_on_volume(
-                    &source_storage_volume_id,
-                    &storage_volume_id,
-                    "playground_volume_has_no_commit_data",
-                    "PLAYGROUND_VOLUME_HAS_NO_COMMIT_DATA",
-                    "the selected StorageVolume does not hold this Commit's immutable objects",
-                )?;
                 (Some(commit_id), ArtifactHeadExpectation::Any)
             }
-            None => {
-                if let Some(commit_id) = artifact.head_commit_id {
-                    let commit = self
-                        .load_published_commit(&artifact, CommitId::from_digest(commit_id))
-                        .await?;
-                    let source_storage_volume_id =
-                        self.commit_source_storage_volume_id(&commit).await?;
-                    require_commit_on_volume(
-                        &source_storage_volume_id,
-                        &storage_volume_id,
-                        "playground_volume_has_no_commit_data",
-                        "PLAYGROUND_VOLUME_HAS_NO_COMMIT_DATA",
-                        "the selected StorageVolume does not hold the Artifact Head Commit's immutable objects",
-                    )?;
-                }
-                (
-                    artifact.head_commit_id,
-                    ArtifactHeadExpectation::Exact(artifact.head_commit_id),
-                )
-            }
+            None => (
+                artifact.head_commit_id,
+                ArtifactHeadExpectation::Exact(artifact.head_commit_id),
+            ),
         };
         let volume = self
             .repository
@@ -1316,8 +1304,6 @@ impl CatalogService {
                     .map_err(|_| invalid_request("commit_id must be a 64-character digest"))
             })
             .transpose()?;
-        let storage_volume_id = request.storage_volume_id.map(parse_volume_id).transpose()?;
-        let region = request.region.map(validate_region).transpose()?;
         let state = request
             .state
             .as_deref()
@@ -1329,8 +1315,6 @@ impl CatalogService {
             project_id: project_id.as_ref().map(ToString::to_string),
             artifact_id: artifact_id.as_ref().map(ToString::to_string),
             commit_id: commit_id.map(|id| id.to_string()),
-            storage_volume_id: storage_volume_id.as_ref().map(ToString::to_string),
-            region: region.clone(),
             state: state.map(snapshot_state_name).map(str::to_owned),
         };
         let after = request
@@ -1345,8 +1329,6 @@ impl CatalogService {
                 project_id,
                 artifact_id,
                 commit_id,
-                storage_volume_id,
-                region,
                 state,
                 after,
                 limit: page_size,
@@ -1403,9 +1385,8 @@ impl CatalogService {
             .await?;
         let project_id = parse_project_id(request.project_id)?;
         let artifact_id = parse_artifact_id(request.artifact_id)?;
-        let storage_volume_id = parse_volume_id(request.storage_volume_id)?;
-        let snapshot_request_id = RequestId::new(request.snapshot_request_id)
-            .map_err(|error| invalid_request(format!("snapshot_request_id: {error}")))?;
+        let snapshot_request_id = RequestId::new(request.request_id)
+            .map_err(|error| invalid_request(format!("request_id: {error}")))?;
         let commit_id = ContentDigest::from_str(&request.commit_id)
             .map_err(|_| invalid_request("commit_id must be a 64-character digest"))?;
         let snapshot_id = deterministic_snapshot_id(&tenant_id, &snapshot_request_id)?;
@@ -1419,7 +1400,6 @@ impl CatalogService {
             if existing.project_id != project_id
                 || existing.artifact_id != artifact_id
                 || existing.commit_id != commit_id
-                || existing.storage_volume_id != storage_volume_id
                 || existing.snapshot_request_id != snapshot_request_id
             {
                 return Err(catalog_conflict(
@@ -1431,7 +1411,6 @@ impl CatalogService {
             return Ok(CreateSnapshotResponse {
                 snapshot: self.snapshot_view(&existing).await?,
                 replayed: true,
-                placement_reused: false,
             });
         }
         let artifact = self
@@ -1445,28 +1424,6 @@ impl CatalogService {
         let commit = self
             .load_published_commit(&artifact, CommitId::from_digest(commit_id))
             .await?;
-        let source_storage_volume_id = self.commit_source_storage_volume_id(&commit).await?;
-        require_commit_on_volume(
-            &source_storage_volume_id,
-            &storage_volume_id,
-            "snapshot_volume_has_no_commit_data",
-            "SNAPSHOT_VOLUME_HAS_NO_COMMIT_DATA",
-            "the selected StorageVolume does not hold this Commit's immutable objects",
-        )?;
-        let volume = self
-            .repository
-            .get_storage_volume(&tenant_id, &storage_volume_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("storage volume"))?;
-        require_active_for_mutation(&volume.lifecycle, "StorageVolume")?;
-        if volume.state != StorageVolumeState::Ready {
-            return Err(catalog_conflict(
-                "storage_volume_not_ready",
-                "STORAGE_VOLUME_NOT_READY",
-                "the selected StorageVolume is not ready for Snapshot placement",
-            ));
-        }
         let now = self.clock.now();
         let outcome = self
             .repository
@@ -1478,8 +1435,6 @@ impl CatalogService {
                     snapshot_id,
                     snapshot_request_id,
                     commit_id,
-                    storage_volume_id,
-                    region: volume.region,
                     state: SnapshotState::Ready,
                     resource_version: 1,
                     lifecycle: ResourceLifecycle::active(),
@@ -1490,10 +1445,10 @@ impl CatalogService {
             })
             .await
             .map_err(snapshot_mutation_error)?;
-        let (record, replayed, placement_reused) = match outcome {
-            SnapshotInsertOutcome::Inserted(record) => (record, false, false),
-            SnapshotInsertOutcome::ExistingRequest(record) => (record, true, false),
-            SnapshotInsertOutcome::ExistingPlacement(record) => (record, false, true),
+        let (record, replayed) = match outcome {
+            SnapshotInsertOutcome::Inserted(record) => (record, false),
+            SnapshotInsertOutcome::ExistingRequest(record) => (record, true),
+            SnapshotInsertOutcome::ExistingCommit(record) => (record, false),
         };
         // Commit was loaded before the fenced insert. Retain this assertion so a corrupted
         // repository cannot dispatch a different immutable Index than the public response.
@@ -1503,7 +1458,6 @@ impl CatalogService {
         Ok(CreateSnapshotResponse {
             snapshot: self.snapshot_view(&record).await?,
             replayed,
-            placement_reused,
         })
     }
 
@@ -2113,40 +2067,21 @@ impl CatalogService {
                 replayed: true,
             });
         }
-        let volume = self
+        let artifact = self
             .repository
-            .get_storage_volume(&tenant_id, &snapshot.storage_volume_id)
+            .get_artifact(&tenant_id, &snapshot.project_id, &snapshot.artifact_id)
             .await
             .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("storage volume"))?;
-        let gateway_registry = self.gateway_registry.as_ref().ok_or_else(|| {
-            application_error(
-                ErrorCategory::Unavailable,
-                "gateway_registry_unavailable",
-                "GATEWAY_REGISTRY_UNAVAILABLE",
-                "Gateway registry is not configured",
-                true,
-            )
-        })?;
-        let pool = gateway_registry
-            .get_pool_by_edge_cluster(&volume.edge_cluster_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("gateway pool"))?;
-        if pool.state != GatewayPoolState::Ready {
-            return Err(catalog_conflict(
-                "gateway_pool_not_ready",
-                "GATEWAY_POOL_NOT_READY",
-                "GatewayPool is not ready for S3 exposure",
-            ));
-        }
-        if pool.s3_endpoint.is_none() {
-            return Err(catalog_conflict(
-                "gateway_s3_endpoint_not_configured",
-                "GATEWAY_S3_ENDPOINT_NOT_CONFIGURED",
-                "GatewayPool has no public S3 endpoint configured",
-            ));
-        }
+            .ok_or_else(|| resource_not_found("artifact"))?;
+        let commit = self
+            .load_published_commit(&artifact, CommitId::from_digest(snapshot.commit_id))
+            .await?;
+        // Access Points retain only logical Snapshot/Commit identity. Resolve the current
+        // source placement and Gateway route while creating the endpoint, but do not persist
+        // either the Volume-derived region or GatewayPool binding.
+        let (_, _, _, _pool) = self
+            .resolve_s3_route_for_commit(&tenant_id, &commit, self.clock.now())
+            .await?;
         let now = mutation.created_at_unix_ms;
         let record = S3AccessPointRecord {
             access_point_id: request_access_point_id,
@@ -2156,8 +2091,6 @@ impl CatalogService {
             snapshot_id: snapshot.snapshot_id.clone(),
             commit_id: snapshot.commit_id,
             bucket_name,
-            gateway_pool_id: pool.gateway_pool_id,
-            region: snapshot.region.clone(),
             state: S3AccessPointState::Active,
             policy_generation: 1,
             created_at_unix_ms: now,
@@ -2333,9 +2266,26 @@ impl CatalogService {
         let Some(publisher) = &self.s3_read_revocations else {
             return;
         };
+        let Ok(commit) = self.load_s3_access_point_commit(access_point).await else {
+            tracing::warn!(
+                access_point_id = %access_point.access_point_id,
+                "cannot resolve Access Point placement for S3 revocation"
+            );
+            return;
+        };
+        let Ok((_, _, route, _)) = self
+            .resolve_s3_route_for_commit(&access_point.tenant_id, &commit, self.clock.now())
+            .await
+        else {
+            tracing::warn!(
+                access_point_id = %access_point.access_point_id,
+                "cannot resolve Gateway route for S3 revocation"
+            );
+            return;
+        };
         publisher
             .publish_s3_read_revocation(
-                &access_point.gateway_pool_id,
+                &route.gateway_pool_id,
                 GatewayS3ReadRevocation {
                     tenant_id: access_point.tenant_id.clone(),
                     snapshot_id: access_point.snapshot_id.clone(),
@@ -2489,7 +2439,7 @@ impl CatalogService {
         request
             .validate_signed_operation_binding()
             .map_err(|_| s3_access_denied())?;
-        let gateway_pool_id =
+        let requested_gateway_pool_id =
             neoengram_domain::protocol::GatewayPoolId::new(request.gateway_pool_id)
                 .map_err(|_| s3_access_denied())?;
         let access_point = self
@@ -2498,9 +2448,26 @@ impl CatalogService {
             .await
             .map_err(map_central_error)?
             .ok_or_else(s3_access_denied)?;
-        if access_point.state != S3AccessPointState::Active
-            || access_point.gateway_pool_id != gateway_pool_id
-        {
+        if access_point.state != S3AccessPointState::Active {
+            return Err(s3_access_denied());
+        }
+        let snapshot = self
+            .repository
+            .get_snapshot(&access_point.tenant_id, &access_point.snapshot_id)
+            .await
+            .map_err(map_central_error)?
+            .filter(|snapshot| {
+                snapshot.state == SnapshotState::Ready && snapshot.lifecycle.is_active()
+            })
+            .ok_or_else(s3_snapshot_unavailable)?;
+        if snapshot.commit_id != access_point.commit_id {
+            return Err(s3_snapshot_unavailable());
+        }
+        let commit = self.load_s3_access_point_commit(&access_point).await?;
+        let (volume, _placement, route, _pool) = self
+            .resolve_s3_route_for_commit(&access_point.tenant_id, &commit, self.clock.now())
+            .await?;
+        if route.gateway_pool_id != requested_gateway_pool_id {
             return Err(s3_access_denied());
         }
         self.expire_s3_credentials(&access_point.access_point_id)
@@ -2509,7 +2476,7 @@ impl CatalogService {
             .sigv4
             .credential_scope()
             .map_err(|_| s3_access_denied())?;
-        if service != "s3" || credential_region != access_point.region {
+        if service != "s3" || credential_region != volume.region {
             return Err(s3_access_denied());
         }
         let now = self.clock.now();
@@ -2538,40 +2505,17 @@ impl CatalogService {
             .verify_at(secret.as_slice(), now.get() / 1000)
             .map_err(|_| s3_access_denied())?;
         if claims.access_key_id != credential.access_key_id
-            || claims.region != access_point.region
+            || claims.region != volume.region
             || claims.service != "s3"
         {
             return Err(s3_access_denied());
         }
-        self.ensure_s3_gateway_pool_ready(&access_point.gateway_pool_id)
+        self.ensure_s3_gateway_pool_ready(&route.gateway_pool_id)
             .await?;
-        let snapshot = self
-            .repository
-            .get_snapshot(&access_point.tenant_id, &access_point.snapshot_id)
-            .await
-            .map_err(map_central_error)?
-            .filter(|snapshot| {
-                snapshot.state == SnapshotState::Ready && snapshot.lifecycle.is_active()
-            })
-            .ok_or_else(s3_snapshot_unavailable)?;
-        if snapshot.commit_id != access_point.commit_id {
-            return Err(s3_snapshot_unavailable());
-        }
-        let commit = self
-            .precommit_repository()?
-            .get_commit(
-                &access_point.tenant_id,
-                &access_point.project_id,
-                &access_point.artifact_id,
-                CommitId::from_digest(access_point.commit_id),
-            )
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(s3_snapshot_unavailable)?;
         let response = match request.operation {
             S3AuthorizeOperation::HeadBucket | S3AuthorizeOperation::GetBucketLocation => {
                 Ok(S3AuthorizeResponse::Bucket {
-                    region: access_point.region,
+                    region: volume.region,
                 })
             }
             S3AuthorizeOperation::ListObjectsV2 {
@@ -2810,27 +2754,9 @@ impl CatalogService {
         sigv4_expires_at_unix_seconds: u64,
         now: UnixMillis,
     ) -> Result<S3ReadTicket, Error> {
-        let placement = self
-            .s3_placement
-            .as_ref()
-            .ok_or_else(s3_snapshot_unavailable)?
-            .current_placement(&access_point.tenant_id, &snapshot.storage_volume_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(s3_snapshot_unavailable)?;
-        let route = self
-            .gateway_registry
-            .as_ref()
-            .ok_or_else(s3_snapshot_unavailable)?
-            .get_agent_route(&placement.agent_id)
-            .await
-            .map_err(map_central_error)?
-            .filter(|route| {
-                route.is_active_at(now)
-                    && route.gateway_pool_id == access_point.gateway_pool_id
-                    && route.session_generation == placement.session_generation
-            })
-            .ok_or_else(s3_snapshot_unavailable)?;
+        let (_, placement, route, _) = self
+            .resolve_s3_route_for_commit(&access_point.tenant_id, commit, now)
+            .await?;
         let owner_replica = self
             .gateway_registry
             .as_ref()
@@ -3141,11 +3067,15 @@ impl CatalogService {
                 .map_err(|_| internal_catalog_error())?,
         );
         let endpoint = self.s3_endpoint_for_access_point(&access_point).await?;
+        let commit = self.load_s3_access_point_commit(&access_point).await?;
+        let (volume, _, _, _) = self
+            .resolve_s3_route_for_commit(&access_point.tenant_id, &commit, now)
+            .await?;
         let url = presign_s3_get(&S3PresignRequest {
             endpoint: &endpoint,
             bucket: &access_point.bucket_name,
             key: &key,
-            region: &access_point.region,
+            region: &volume.region,
             access_key_id: &credential.access_key_id,
             secret: &secret,
             now_unix_seconds: now.get() / 1_000,
@@ -3330,10 +3260,152 @@ impl CatalogService {
         }
     }
 
+    /// Resolves the current data placement and Gateway route for a Commit. Access Point records
+    /// intentionally do not cache this information: Volume failures, replica promotion and
+    /// Gateway route changes must take effect without rewriting S3 metadata.
+    async fn resolve_s3_route_for_commit(
+        &self,
+        tenant_id: &TenantId,
+        commit: &CommitRecord,
+        now: UnixMillis,
+    ) -> Result<
+        (
+            StorageVolumeRecord,
+            S3AgentPlacement,
+            crate::AgentRouteLease,
+            crate::GatewayPoolRecord,
+        ),
+        Error,
+    > {
+        let placement_provider = self
+            .s3_placement
+            .as_ref()
+            .ok_or_else(s3_snapshot_unavailable)?;
+        let registry = self
+            .gateway_registry
+            .as_ref()
+            .ok_or_else(s3_snapshot_unavailable)?;
+        let placement_authority = self
+            .placement
+            .as_ref()
+            .ok_or_else(s3_snapshot_unavailable)?;
+        // S3 is placement-first: only a published complete PlacementSet can make a Commit
+        // readable.  The logical Commit has no physical source Volume fallback, even when its
+        // historical publication metadata happens to contain one.
+        let commit_digest = ContentDigest::from(commit.commit_id);
+        let object_set = placement_authority
+            .get_commit_object_set(tenant_id, &commit_digest)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(s3_snapshot_unavailable)?;
+        let published_sets = placement_authority
+            .published_placement_sets(tenant_id, &commit_digest)
+            .await
+            .map_err(map_central_error)?;
+        let mut volume_ids = Vec::new();
+        for placement_set in published_sets {
+            let Some(volume_id) = placement_set.storage_volume_id.clone() else {
+                continue;
+            };
+            if placement_set.object_set_digest != object_set.object_set.object_set_digest
+                || placement_set.object_count.get() != object_set.object_set.object_count() as u64
+            {
+                continue;
+            }
+            // Publication is an immutable fence, while individual copies can later be lost or
+            // retired. Re-check every required object against the same backend and generation so
+            // S3 never routes to a partially readable PlacementSet.
+            let mut complete = true;
+            for object in &object_set.object_set.objects {
+                let placements = placement_authority
+                    .object_placements(tenant_id, &object.object_id)
+                    .await
+                    .map_err(map_central_error)?;
+                if !placements.iter().any(|placement| {
+                    placement.backend_id == placement_set.backend_id
+                        && placement.placement_generation == placement_set.placement_generation
+                        && placement.storage_volume_id.as_ref() == Some(&volume_id)
+                        && placement.archive_id == placement_set.archive_id
+                        && placement.readable()
+                        && placement.verified_size.get() == object.size.get()
+                        && placement.verified_digest == object.object_id.digest()
+                }) {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete {
+                volume_ids.push(volume_id);
+            }
+        }
+        volume_ids.sort();
+        volume_ids.dedup();
+        for volume_id in volume_ids {
+            let Some(volume) = self
+                .repository
+                .get_storage_volume(tenant_id, &volume_id)
+                .await
+                .map_err(map_central_error)?
+            else {
+                continue;
+            };
+            let Some(placement) = placement_provider
+                .current_placement(tenant_id, &volume_id)
+                .await
+                .map_err(map_central_error)?
+            else {
+                continue;
+            };
+            let Some(route) = registry
+                .get_agent_route(&placement.agent_id)
+                .await
+                .map_err(map_central_error)?
+                .filter(|route| {
+                    route.is_active_at(now)
+                        && route.session_generation == placement.session_generation
+                })
+            else {
+                continue;
+            };
+            let Some(pool) = registry
+                .get_pool(&route.gateway_pool_id)
+                .await
+                .map_err(map_central_error)?
+                .filter(|pool| pool.state == GatewayPoolState::Ready)
+            else {
+                continue;
+            };
+            return Ok((volume, placement, route, pool));
+        }
+        Err(s3_snapshot_unavailable())
+    }
+
+    async fn load_s3_access_point_commit(
+        &self,
+        access_point: &S3AccessPointRecord,
+    ) -> Result<CommitRecord, Error> {
+        let artifact = self
+            .repository
+            .get_artifact(
+                &access_point.tenant_id,
+                &access_point.project_id,
+                &access_point.artifact_id,
+            )
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(s3_snapshot_unavailable)?;
+        self.load_published_commit(&artifact, CommitId::from_digest(access_point.commit_id))
+            .await
+    }
+
     async fn s3_access_point_view(
         &self,
         record: &S3AccessPointRecord,
     ) -> Result<S3AccessPointView, Error> {
+        let commit = self.load_s3_access_point_commit(record).await?;
+        let (volume, _, _, pool) = self
+            .resolve_s3_route_for_commit(&record.tenant_id, &commit, self.clock.now())
+            .await?;
         Ok(S3AccessPointView {
             access_point_id: record.access_point_id.to_string(),
             tenant_id: record.tenant_id.to_string(),
@@ -3342,8 +3414,12 @@ impl CatalogService {
             snapshot_id: record.snapshot_id.to_string(),
             commit_id: record.commit_id.to_string(),
             bucket_name: record.bucket_name.clone(),
-            endpoint: self.s3_endpoint_for_access_point(record).await?,
-            region: record.region.clone(),
+            endpoint: pool
+                .s3_endpoint
+                .map(|endpoint| endpoint.trim_end_matches('/').to_owned())
+                .filter(|endpoint| !endpoint.is_empty())
+                .ok_or_else(s3_snapshot_unavailable)?,
+            region: volume.region,
             state: s3_access_point_state_name(record.state).to_owned(),
             policy_generation: record.policy_generation.to_string(),
             created_at_unix_ms: record.created_at_unix_ms.to_string(),
@@ -3355,20 +3431,10 @@ impl CatalogService {
         &self,
         record: &S3AccessPointRecord,
     ) -> Result<String, Error> {
-        let registry = self.gateway_registry.as_ref().ok_or_else(|| {
-            application_error(
-                ErrorCategory::Unavailable,
-                "gateway_registry_unavailable",
-                "GATEWAY_REGISTRY_UNAVAILABLE",
-                "Gateway registry is not configured",
-                true,
-            )
-        })?;
-        let pool = registry
-            .get_pool(&record.gateway_pool_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(s3_snapshot_unavailable)?;
+        let commit = self.load_s3_access_point_commit(record).await?;
+        let (_, _, _, pool) = self
+            .resolve_s3_route_for_commit(&record.tenant_id, &commit, self.clock.now())
+            .await?;
         pool.s3_endpoint
             .map(|endpoint| endpoint.trim_end_matches('/').to_owned())
             .filter(|endpoint| !endpoint.is_empty())
@@ -4031,13 +4097,6 @@ impl CatalogService {
             .ok_or_else(|| resource_not_found("commit"))
     }
 
-    async fn commit_source_storage_volume_id(
-        &self,
-        commit: &CommitRecord,
-    ) -> Result<StorageVolumeId, Error> {
-        Ok(commit.source_storage_volume_id.clone())
-    }
-
     async fn load_commit_records(
         &self,
         tenant_id: &TenantId,
@@ -4293,6 +4352,39 @@ impl CatalogService {
             SnapshotState::Abnormal => ("failed", None),
         };
         let verified = record.state == SnapshotState::Ready;
+        // Snapshot lifecycle is logical and immutable; physical data health is resolved from
+        // the current published PlacementSets so a lost Volume never turns into a logical
+        // deletion, and a newly published replica is visible without rewriting the Snapshot.
+        let data_health = if let Some(placement) = &self.placement {
+            placement
+                .commit_availability(&record.tenant_id, &record.commit_id)
+                .await
+                .map_err(map_central_error)?
+                .data_health
+        } else if verified {
+            neoengram_domain::protocol::DataHealth::Available
+        } else {
+            neoengram_domain::protocol::DataHealth::Unavailable
+        };
+        let data_health_name = format!("{data_health:?}").to_ascii_lowercase();
+        let issue = if record.state == SnapshotState::Abnormal
+            || matches!(
+                data_health,
+                neoengram_domain::protocol::DataHealth::Unavailable
+            ) {
+            Some(ResourceIssueSummary {
+                code: if record.state == SnapshotState::Abnormal {
+                    "SNAPSHOT_UNAVAILABLE".to_owned()
+                } else {
+                    "DATA_UNAVAILABLE".to_owned()
+                },
+                message: "the immutable Snapshot data is unavailable".to_owned(),
+                retryable: true,
+                occurred_at_unix_ms: Some(record.updated_at_unix_ms.to_string()),
+            })
+        } else {
+            None
+        };
         Ok(SnapshotView {
             snapshot_id: record.snapshot_id.to_string(),
             tenant_id: record.tenant_id.to_string(),
@@ -4303,17 +4395,11 @@ impl CatalogService {
                 CommitDataLayout::FastCdc => crate::dto::DataLayout::FastCdc,
                 CommitDataLayout::WholeFile => crate::dto::DataLayout::WholeFile,
             },
-            storage_volume_id: record.storage_volume_id.to_string(),
-            region: record.region.clone(),
             message: commit.message,
             tag_names: commit.tag_names,
             state: snapshot_state_name(record.state).to_owned(),
-            issue: (record.state == SnapshotState::Abnormal).then(|| ResourceIssueSummary {
-                code: "SNAPSHOT_UNAVAILABLE".to_owned(),
-                message: "the immutable Snapshot data is unavailable".to_owned(),
-                retryable: true,
-                occurred_at_unix_ms: Some(record.updated_at_unix_ms.to_string()),
-            }),
+            data_health: data_health_name,
+            issue,
             integrity: SnapshotIntegritySummary {
                 state: integrity_state.to_owned(),
                 files_verified: if verified {
@@ -4662,8 +4748,6 @@ enum CursorScope {
         project_id: Option<String>,
         artifact_id: Option<String>,
         commit_id: Option<String>,
-        storage_volume_id: Option<String>,
-        region: Option<String>,
         state: Option<String>,
     },
     S3AccessPoint {
@@ -5902,20 +5986,6 @@ fn catalog_conflict(code: &'static str, neo_code: &'static str, message: &'stati
     application_error(ErrorCategory::Conflict, code, neo_code, message, false)
 }
 
-fn require_commit_on_volume(
-    source_storage_volume_id: &StorageVolumeId,
-    target_storage_volume_id: &StorageVolumeId,
-    code: &'static str,
-    neo_code: &'static str,
-    message: &'static str,
-) -> Result<(), Error> {
-    if source_storage_volume_id == target_storage_volume_id {
-        Ok(())
-    } else {
-        Err(catalog_conflict(code, neo_code, message))
-    }
-}
-
 fn catalog_mutation_error(error: crate::CentralError, reused_code: &'static str) -> Error {
     match error.code() {
         crate::CentralErrorCode::InvalidState => catalog_conflict(
@@ -5971,23 +6041,12 @@ fn playground_mutation_error(error: crate::CentralError) -> Error {
 fn snapshot_mutation_error(error: crate::CentralError) -> Error {
     match error.code() {
         crate::CentralErrorCode::ArtifactNotFound => resource_not_found("artifact"),
-        crate::CentralErrorCode::StorageVolumeNotFound => resource_not_found("storage volume"),
         crate::CentralErrorCode::ArtifactHeadMismatch if error.retryable() => application_error(
             ErrorCategory::Conflict,
             "artifact_head_changed",
             "ARTIFACT_HEAD_MISMATCH",
             "the Artifact Head changed before Snapshot creation; retry the request",
             true,
-        ),
-        crate::CentralErrorCode::StorageVolumeNotReady => catalog_conflict(
-            "storage_volume_not_ready",
-            "STORAGE_VOLUME_NOT_READY",
-            "the selected StorageVolume is not ready for Snapshot placement",
-        ),
-        crate::CentralErrorCode::StorageVolumeRegionMismatch => catalog_conflict(
-            "storage_volume_region_mismatch",
-            "STORAGE_VOLUME_REGION_MISMATCH",
-            "the selected StorageVolume region changed before Snapshot placement",
         ),
         _ => catalog_mutation_error(error, "snapshot_request_id_reused"),
     }
@@ -6501,8 +6560,6 @@ mod s3_cursor_tests {
             snapshot_id: SnapshotId::new("snapshot-a").unwrap(),
             commit_id: ContentDigest::hash(b"commit-a"),
             bucket_name: "dataset-a".to_owned(),
-            gateway_pool_id: GatewayPoolId::new("pool-a").unwrap(),
-            region: "us-east-1".to_owned(),
             state: S3AccessPointState::Disabled,
             policy_generation: 9,
             created_at_unix_ms: UnixMillis::new(1),
@@ -6521,19 +6578,9 @@ mod s3_cursor_tests {
             .calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, access_point.gateway_pool_id);
-        assert_eq!(calls[0].1.tenant_id, access_point.tenant_id);
-        assert_eq!(calls[0].1.snapshot_id, access_point.snapshot_id);
-        assert_eq!(
-            calls[0].1.minimum_snapshot_lifecycle_generation,
-            LifecycleGeneration::new(6)
-        );
-        assert_eq!(calls[0].1.bucket, access_point.bucket_name);
-        assert_eq!(
-            calls[0].1.minimum_access_point_policy_generation,
-            ResourceVersion::new(9)
-        );
+        // The route is resolved from the current Commit placement. This isolated fixture does
+        // not install a Commit/Agent route, so revocation fails closed without publishing.
+        assert!(calls.is_empty());
     }
 
     #[test]

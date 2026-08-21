@@ -173,6 +173,8 @@ expect_count 1 '^immutable: true$' "$public_tls_secret"
 
 expect_count 2 '^            - name: public$' "$deployments"
 expect_count 2 '^              containerPort: 8080$' "$deployments"
+expect_count 2 '^            - name: transfer$' "$deployments"
+expect_count 2 '^              containerPort: 8084$' "$deployments"
 expect_count 2 '^              mountPath: /var/run/secrets/synapse-gateway/public$' "$deployments"
 expect_count 2 '^            secretName: synapse-gateway-public-tls-gateway-pool-example$' "$deployments"
 
@@ -193,7 +195,7 @@ fi
 # publish the Pending Pods or activation deadlocks on a readiness check that requires control mTLS.
 expect_count 3 '^kind: Service$' "$services"
 expect_count 2 '^  publishNotReadyAddresses: true$' "$services"
-for port in agent control peer; do
+for port in agent control peer transfer; do
   rg -q "^    - name: ${port}$" "$services" || fail "Gateway Services are missing ${port}"
 done
 expect_count 1 '^    - name: public$' "$services"
@@ -216,7 +218,7 @@ rg -q 'neoengram\.io/gateway-public-ingress: "true"' "$network_policy" || \
   fail "public ingress must be pod-scoped"
 rg -q 'app\.kubernetes\.io/name: neoengram-central' "$network_policy" || \
   fail "Central egress must be pod-scoped"
-for port in 8080 8081 8082 8083; do
+for port in 8080 8081 8082 8083 8084; do
   rg -q "port: ${port}$" "$network_policy" || \
     fail "NetworkPolicy is missing listener port ${port}"
 done

@@ -12,8 +12,9 @@ use neoengram_domain::core::{
 };
 use neoengram_domain::protocol::{
     AgentId, ArtifactId, DecimalU64, JobAssignment, JobState, MetadataBatchDescriptor,
-    MetadataBatchId, MetadataBatchPage, ObjectReceiptId, PlacementGeneration, ResourceRef,
-    ResourceVersion, StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
+    MetadataBatchId, MetadataBatchPage, ObjectReceiptId, PlacementGeneration, ReplicationId,
+    RequestId, ResourceRef, ResourceVersion, StorageVolumeId, TenantId, UnixMillis,
+    WireIndexVersion, WorkspaceId,
 };
 
 use crate::{
@@ -35,6 +36,8 @@ use crate::{
     PreCommitRecord, PreCommitRepository, PreCommitRestartRequest, PreCommitStartRequest,
     PreCommitState, PublishedIndex, StagedMetadataBatch,
 };
+
+use crate::{CommitAvailabilityRecord, PlacementRepository, ReplicationRecord, WorkspaceRecord};
 
 #[derive(Debug, Default)]
 pub struct AllowAllAuthorizer;
@@ -133,6 +136,639 @@ impl JobRepository for InMemoryJobRepository {
         }
         jobs.insert(key, job.clone());
         Ok(job)
+    }
+}
+
+/// In-memory counterpart of the Placement authority used by service tests and local runs.
+///
+/// Request IDs are indexed separately from resource IDs so retries return the exact original
+/// record.  Object bytes are deliberately absent: this repository models only immutable
+/// placement/transfer metadata, just like the SQLite authority.
+#[derive(Debug, Default)]
+pub struct InMemoryPlacementRepository {
+    commit_object_sets: Mutex<
+        BTreeMap<
+            (TenantId, neoengram_domain::core::ContentDigest),
+            neoengram_domain::protocol::CommitObjectSet,
+        >,
+    >,
+    placement_sets: Mutex<
+        BTreeMap<
+            (
+                TenantId,
+                neoengram_domain::core::ContentDigest,
+                neoengram_domain::protocol::BackendId,
+            ),
+            neoengram_domain::protocol::CommitPlacementSet,
+        >,
+    >,
+    object_placements: Mutex<
+        BTreeMap<
+            (TenantId, neoengram_domain::core::ObjectId),
+            Vec<neoengram_domain::protocol::ObjectPlacement>,
+        >,
+    >,
+    replications: Mutex<BTreeMap<(TenantId, ReplicationId), ReplicationRecord>>,
+    replication_objects:
+        Mutex<BTreeMap<(TenantId, ReplicationId, ObjectId), crate::ReplicationObjectRecord>>,
+    replication_requests: Mutex<BTreeMap<(TenantId, RequestId), ReplicationId>>,
+    workspaces: Mutex<BTreeMap<(TenantId, WorkspaceId), WorkspaceRecord>>,
+    workspace_requests: Mutex<BTreeMap<(TenantId, RequestId), WorkspaceId>>,
+}
+
+#[async_trait]
+impl PlacementRepository for InMemoryPlacementRepository {
+    async fn get_commit_object_set(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Option<neoengram_domain::protocol::CommitObjectSet>> {
+        Ok(lock(&self.commit_object_sets)?
+            .get(&(tenant_id.clone(), *commit_id))
+            .cloned())
+    }
+
+    async fn insert_commit_object_set(
+        &self,
+        object_set: neoengram_domain::protocol::CommitObjectSet,
+    ) -> CentralResult<neoengram_domain::protocol::CommitObjectSet> {
+        object_set.validate().map_err(CentralError::from)?;
+        let key = (object_set.tenant_id.clone(), object_set.commit_id.into());
+        let mut values = lock(&self.commit_object_sets)?;
+        if let Some(existing) = values.get(&key) {
+            return if existing == &object_set {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "Commit object set is already bound to another payload",
+                ))
+            };
+        }
+        values.insert(key, object_set.clone());
+        Ok(object_set)
+    }
+
+    async fn get_placement_set(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+        backend_id: &neoengram_domain::protocol::BackendId,
+    ) -> CentralResult<Option<neoengram_domain::protocol::CommitPlacementSet>> {
+        Ok(lock(&self.placement_sets)?
+            .get(&(tenant_id.clone(), *commit_id, backend_id.clone()))
+            .cloned())
+    }
+
+    async fn published_placement_sets(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Vec<neoengram_domain::protocol::CommitPlacementSet>> {
+        Ok(lock(&self.placement_sets)?
+            .iter()
+            .filter(|((tenant, digest, _), set)| {
+                tenant == tenant_id
+                    && digest == commit_id
+                    && set.state == neoengram_domain::protocol::CommitPlacementSetState::Published
+            })
+            .map(|(_, set)| set.clone())
+            .collect())
+    }
+
+    async fn insert_placement_set(
+        &self,
+        placement_set: neoengram_domain::protocol::CommitPlacementSet,
+    ) -> CentralResult<neoengram_domain::protocol::CommitPlacementSet> {
+        placement_set.validate().map_err(CentralError::from)?;
+        let key = (
+            placement_set.tenant_id.clone(),
+            placement_set.commit_id.into(),
+            placement_set.backend_id.clone(),
+        );
+        let mut values = lock(&self.placement_sets)?;
+        if let Some(existing) = values.get(&key) {
+            return if existing == &placement_set {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "Commit placement set is already bound to another payload",
+                ))
+            };
+        }
+        values.insert(key, placement_set.clone());
+        Ok(placement_set)
+    }
+
+    async fn publish_initial_placement(
+        &self,
+        object_set: neoengram_domain::protocol::CommitObjectSet,
+        placements: Vec<neoengram_domain::protocol::ObjectPlacement>,
+        placement_set: neoengram_domain::protocol::CommitPlacementSet,
+    ) -> CentralResult<(
+        neoengram_domain::protocol::CommitObjectSet,
+        neoengram_domain::protocol::CommitPlacementSet,
+    )> {
+        object_set.validate().map_err(CentralError::from)?;
+        placement_set.validate().map_err(CentralError::from)?;
+        if !placement_set.published()
+            || object_set.tenant_id != placement_set.tenant_id
+            || object_set.commit_id != placement_set.commit_id
+            || object_set.object_set.object_set_digest != placement_set.object_set_digest
+            || object_set.object_set.object_count() as u64 != placement_set.object_count.get()
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "initial PlacementSet does not match the Commit ObjectSet",
+            ));
+        }
+        let by_object = placements
+            .iter()
+            .map(|placement| (placement.object_id, placement))
+            .collect::<BTreeMap<_, _>>();
+        if by_object.len() != placements.len()
+            || by_object.len() != object_set.object_set.object_count()
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "initial PlacementSet must contain exactly one copy of every Commit object",
+            ));
+        }
+        for object in &object_set.object_set.objects {
+            let placement = by_object.get(&object.object_id).ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "initial PlacementSet is missing a Commit object",
+                )
+            })?;
+            placement.validate().map_err(CentralError::from)?;
+            if placement.tenant_id != object_set.tenant_id
+                || placement.backend_id != placement_set.backend_id
+                || placement.storage_volume_id != placement_set.storage_volume_id
+                || placement.archive_id != placement_set.archive_id
+                || placement.placement_generation != placement_set.placement_generation
+                || placement.state != neoengram_domain::protocol::PlacementState::Verified
+                || placement.verified_size != object.size
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "initial object Placement does not match its publication fence",
+                ));
+            }
+        }
+
+        // Hold all three maps while validating and applying the batch. The in-memory adapter is
+        // used by service tests, so this mirrors SQLite's all-or-nothing publication boundary.
+        let commit_key = (object_set.tenant_id.clone(), object_set.commit_id.into());
+        let placement_key = (
+            placement_set.tenant_id.clone(),
+            placement_set.commit_id.into(),
+            placement_set.backend_id.clone(),
+        );
+        let mut commit_sets = lock(&self.commit_object_sets)?;
+        let mut placement_sets = lock(&self.placement_sets)?;
+        let mut object_placements = lock(&self.object_placements)?;
+        if let Some(existing) = placement_sets.values().find(|existing| {
+            existing.tenant_id == object_set.tenant_id
+                && existing.commit_id == object_set.commit_id
+                && existing.state == neoengram_domain::protocol::CommitPlacementSetState::Published
+        }) {
+            let stored_object_set = commit_sets.get(&commit_key).ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::Internal,
+                    "published PlacementSet is missing its Commit ObjectSet",
+                )
+            })?;
+            if stored_object_set != &object_set {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "Commit object set is already bound to another payload",
+                ));
+            }
+            return Ok((stored_object_set.clone(), existing.clone()));
+        }
+        if let Some(existing) = commit_sets.get(&commit_key) {
+            if existing != &object_set {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "Commit object set is already bound to another payload",
+                ));
+            }
+        }
+        if let Some(existing) = placement_sets.get(&placement_key) {
+            if existing != &placement_set {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "Commit placement set is already bound to another payload",
+                ));
+            }
+        }
+        for placement in &placements {
+            let entries =
+                object_placements.get(&(placement.tenant_id.clone(), placement.object_id));
+            if let Some(existing) = entries.and_then(|entries| {
+                entries.iter().find(|existing| {
+                    existing.backend_id == placement.backend_id
+                        && existing.placement_generation == placement.placement_generation
+                })
+            }) {
+                if existing != placement {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        "Object placement is already bound to another payload",
+                    ));
+                }
+            }
+        }
+        commit_sets.insert(commit_key, object_set.clone());
+        placement_sets.insert(placement_key, placement_set.clone());
+        for placement in placements {
+            object_placements
+                .entry((placement.tenant_id.clone(), placement.object_id))
+                .or_default()
+                .push(placement);
+        }
+        Ok((object_set, placement_set))
+    }
+
+    async fn insert_object_placement(
+        &self,
+        placement: neoengram_domain::protocol::ObjectPlacement,
+    ) -> CentralResult<neoengram_domain::protocol::ObjectPlacement> {
+        placement.validate().map_err(CentralError::from)?;
+        let key = (placement.tenant_id.clone(), placement.object_id);
+        let mut values = lock(&self.object_placements)?;
+        let entries = values.entry(key).or_default();
+        if let Some(existing) = entries.iter().find(|existing| {
+            existing.backend_id == placement.backend_id
+                && existing.placement_generation == placement.placement_generation
+        }) {
+            return if existing == &placement {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "Object placement is already bound to another payload",
+                ))
+            };
+        }
+        entries.push(placement.clone());
+        Ok(placement)
+    }
+
+    async fn set_object_placement_state(
+        &self,
+        tenant_id: &TenantId,
+        object_id: &neoengram_domain::core::ObjectId,
+        backend_id: &neoengram_domain::protocol::BackendId,
+        placement_generation: neoengram_domain::protocol::PlacementGeneration,
+        state: neoengram_domain::protocol::PlacementState,
+    ) -> CentralResult<neoengram_domain::protocol::ObjectPlacement> {
+        let key = (tenant_id.clone(), *object_id);
+        let mut values = lock(&self.object_placements)?;
+        let entries = values.get_mut(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "object placement does not exist",
+            )
+        })?;
+        let placement = entries
+            .iter_mut()
+            .find(|placement| {
+                placement.backend_id == *backend_id
+                    && placement.placement_generation == placement_generation
+            })
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "object placement does not exist",
+                )
+            })?;
+        if placement.state == state {
+            return Ok(placement.clone());
+        }
+        if matches!(
+            placement.state,
+            neoengram_domain::protocol::PlacementState::Deleted
+        ) && !matches!(state, neoengram_domain::protocol::PlacementState::Deleted)
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "deleted object placement cannot be revived",
+            ));
+        }
+        placement.state = state;
+        Ok(placement.clone())
+    }
+
+    async fn object_placements(
+        &self,
+        tenant_id: &TenantId,
+        object_id: &neoengram_domain::core::ObjectId,
+    ) -> CentralResult<Vec<neoengram_domain::protocol::ObjectPlacement>> {
+        Ok(lock(&self.object_placements)?
+            .get(&(tenant_id.clone(), *object_id))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn get_replication(
+        &self,
+        tenant_id: &TenantId,
+        replication_id: &ReplicationId,
+    ) -> CentralResult<Option<ReplicationRecord>> {
+        Ok(lock(&self.replications)?
+            .get(&(tenant_id.clone(), replication_id.clone()))
+            .cloned())
+    }
+
+    async fn get_replication_by_request_id(
+        &self,
+        tenant_id: &TenantId,
+        request_id: &RequestId,
+    ) -> CentralResult<Option<ReplicationRecord>> {
+        let Some(replication_id) = lock(&self.replication_requests)?
+            .get(&(tenant_id.clone(), request_id.clone()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        self.get_replication(tenant_id, &replication_id).await
+    }
+
+    async fn insert_replication(
+        &self,
+        record: ReplicationRecord,
+    ) -> CentralResult<ReplicationRecord> {
+        let key = (record.tenant_id.clone(), record.replication_id.clone());
+        let request_key = (record.tenant_id.clone(), record.request_id.clone());
+        let mut records = lock(&self.replications)?;
+        if let Some(existing) = records.get(&key) {
+            return if existing == &record {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "replication ID is already bound to another record",
+                ))
+            };
+        }
+        if let Some(existing_id) = lock(&self.replication_requests)?.get(&request_key) {
+            let existing = records
+                .get(&(record.tenant_id.clone(), existing_id.clone()))
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::Internal,
+                        "replication request index is inconsistent",
+                    )
+                })?;
+            return if existing.commit_id == record.commit_id
+                && existing.target_storage_volume_id == record.target_storage_volume_id
+                && existing.object_set_digest == record.object_set_digest
+            {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "replication request ID is already bound to another payload",
+                ))
+            };
+        }
+        records.insert(key, record.clone());
+        lock(&self.replication_requests)?.insert(request_key, record.replication_id.clone());
+        Ok(record)
+    }
+
+    async fn upsert_replication_object(
+        &self,
+        record: crate::ReplicationObjectRecord,
+    ) -> CentralResult<crate::ReplicationObjectRecord> {
+        if self
+            .get_replication(&record.tenant_id, &record.replication_id)
+            .await?
+            .is_none()
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "replication object references a missing Replication",
+            ));
+        }
+        let key = (
+            record.tenant_id.clone(),
+            record.replication_id.clone(),
+            record.object_id,
+        );
+        let mut records = lock(&self.replication_objects)?;
+        if let Some(existing) = records.get(&key) {
+            if existing == &record {
+                return Ok(existing.clone());
+            }
+            if record.offset < existing.offset
+                || record.retry_count < existing.retry_count
+                || record.updated_at_unix_ms < existing.updated_at_unix_ms
+            {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "replication object checkpoint cannot move backwards",
+                ));
+            }
+        }
+        records.insert(key, record.clone());
+        Ok(record)
+    }
+
+    async fn list_replication_objects(
+        &self,
+        tenant_id: &TenantId,
+        replication_id: &ReplicationId,
+    ) -> CentralResult<Vec<crate::ReplicationObjectRecord>> {
+        Ok(lock(&self.replication_objects)?
+            .iter()
+            .filter(|((tenant, replication, _), _)| {
+                tenant == tenant_id && replication == replication_id
+            })
+            .map(|(_, record)| record.clone())
+            .collect())
+    }
+
+    async fn get_workspace(
+        &self,
+        tenant_id: &TenantId,
+        workspace_id: &WorkspaceId,
+    ) -> CentralResult<Option<WorkspaceRecord>> {
+        Ok(lock(&self.workspaces)?
+            .get(&(tenant_id.clone(), workspace_id.clone()))
+            .cloned())
+    }
+
+    async fn get_workspace_by_request_id(
+        &self,
+        tenant_id: &TenantId,
+        request_id: &RequestId,
+    ) -> CentralResult<Option<WorkspaceRecord>> {
+        let Some(workspace_id) = lock(&self.workspace_requests)?
+            .get(&(tenant_id.clone(), request_id.clone()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        self.get_workspace(tenant_id, &workspace_id).await
+    }
+
+    async fn insert_workspace(&self, record: WorkspaceRecord) -> CentralResult<WorkspaceRecord> {
+        let key = (record.tenant_id.clone(), record.workspace_id.clone());
+        let request_key = (record.tenant_id.clone(), record.request_id.clone());
+        let mut records = lock(&self.workspaces)?;
+        if let Some(existing) = records.get(&key) {
+            return if existing == &record {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "workspace ID is already bound to another record",
+                ))
+            };
+        }
+        if let Some(existing_id) = lock(&self.workspace_requests)?.get(&request_key) {
+            let existing = records
+                .get(&(record.tenant_id.clone(), existing_id.clone()))
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::Internal,
+                        "workspace request index is inconsistent",
+                    )
+                })?;
+            return if existing.project_id == record.project_id
+                && existing.artifact_id == record.artifact_id
+                && existing.base_commit_id == record.base_commit_id
+                && existing.target_storage_volume_id == record.target_storage_volume_id
+            {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "workspace request ID is already bound to another payload",
+                ))
+            };
+        }
+        records.insert(key, record.clone());
+        lock(&self.workspace_requests)?.insert(request_key, record.workspace_id.clone());
+        Ok(record)
+    }
+
+    async fn commit_availability(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<CommitAvailabilityRecord> {
+        let Some(object_set) = lock(&self.commit_object_sets)?
+            .get(&(tenant_id.clone(), *commit_id))
+            .cloned()
+        else {
+            return Ok(CommitAvailabilityRecord {
+                tenant_id: tenant_id.clone(),
+                commit_id: *commit_id,
+                data_health: neoengram_domain::protocol::DataHealth::Unavailable,
+                verified_placements: 0,
+                missing_objects: 0,
+                verified_storage_volume_ids: Vec::new(),
+            });
+        };
+        let published = lock(&self.placement_sets)?
+            .iter()
+            .filter(|((tenant, digest, _), set)| {
+                tenant == tenant_id
+                    && digest == commit_id
+                    && set.state == neoengram_domain::protocol::CommitPlacementSetState::Published
+            })
+            .map(|((_, _, backend), set)| {
+                (
+                    backend.clone(),
+                    set.placement_generation,
+                    set.storage_volume_id.clone(),
+                    set.archive_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let placements = lock(&self.object_placements)?;
+        let mut verified_storage_volume_ids = std::collections::BTreeSet::new();
+        let mut complete_placements = 0_u64;
+        let mut missing_objects = 0_u64;
+        let mut degraded = false;
+        for object in &object_set.object_set.objects {
+            let copies = placements
+                .get(&(tenant_id.clone(), object.object_id))
+                .into_iter()
+                .flatten()
+                .filter(|copy| {
+                    published
+                        .iter()
+                        .any(|(backend, generation, volume, archive)| {
+                            backend == &copy.backend_id
+                                && *generation == copy.placement_generation
+                                && volume == &copy.storage_volume_id
+                                && archive == &copy.archive_id
+                        })
+                })
+                .collect::<Vec<_>>();
+            let readable = copies
+                .iter()
+                .filter(|copy| {
+                    copy.state == neoengram_domain::protocol::PlacementState::Verified
+                        && copy.verified_size.get() == object.size.get()
+                        && copy.verified_digest == object.object_id.digest()
+                })
+                .count();
+            if readable == 0 {
+                missing_objects = missing_objects.saturating_add(1);
+            }
+            if copies.iter().any(|copy| {
+                copy.state != neoengram_domain::protocol::PlacementState::Verified
+                    || copy.verified_size.get() != object.size.get()
+                    || copy.verified_digest != object.object_id.digest()
+            }) {
+                degraded = true;
+            }
+        }
+        for (backend, generation, volume, archive) in &published {
+            let complete = object_set.object_set.objects.iter().all(|object| {
+                placements
+                    .get(&(tenant_id.clone(), object.object_id))
+                    .into_iter()
+                    .flatten()
+                    .any(|copy| {
+                        copy.backend_id == *backend
+                            && copy.placement_generation == *generation
+                            && copy.storage_volume_id == *volume
+                            && copy.archive_id == *archive
+                            && copy.state == neoengram_domain::protocol::PlacementState::Verified
+                            && copy.verified_size.get() == object.size.get()
+                            && copy.verified_digest == object.object_id.digest()
+                    })
+            });
+            if complete {
+                complete_placements = complete_placements.saturating_add(1);
+                if let Some(volume) = volume {
+                    verified_storage_volume_ids.insert(volume.clone());
+                }
+            }
+        }
+        let data_health = if missing_objects > 0 {
+            neoengram_domain::protocol::DataHealth::Unavailable
+        } else if degraded {
+            neoengram_domain::protocol::DataHealth::Degraded
+        } else {
+            neoengram_domain::protocol::DataHealth::Available
+        };
+        Ok(CommitAvailabilityRecord {
+            tenant_id: tenant_id.clone(),
+            commit_id: *commit_id,
+            data_health,
+            verified_placements: complete_placements,
+            missing_objects,
+            verified_storage_volume_ids: verified_storage_volume_ids.into_iter().collect(),
+        })
     }
 }
 
@@ -1987,6 +2623,7 @@ pub struct InMemoryComponents {
     pub agent_registry: Arc<InMemoryAgentRegistry>,
     pub gateway_registry: Arc<crate::InMemoryGatewayRegistry>,
     pub control_catalog: Arc<crate::InMemoryControlCatalog>,
+    pub placement: Arc<InMemoryPlacementRepository>,
     pub clock: Arc<InMemoryClock>,
 }
 
@@ -2011,6 +2648,7 @@ impl InMemoryComponents {
             publisher.clone(),
             precommits.clone(),
         ));
+        let placement = Arc::new(InMemoryPlacementRepository::default());
         Self {
             authorizer: Arc::new(AllowAllAuthorizer),
             jobs,
@@ -2024,6 +2662,7 @@ impl InMemoryComponents {
             agent_registry,
             gateway_registry,
             control_catalog: Arc::new(crate::InMemoryControlCatalog::default()),
+            placement,
             clock: Arc::new(InMemoryClock::new(now_ms)),
         }
     }
@@ -2052,6 +2691,7 @@ impl InMemoryComponents {
         .with_agent_registry(self.agent_registry.clone())
         .with_gateway_registry(self.gateway_registry.clone())
         .with_control_catalog(self.control_catalog.clone())
+        .with_placement(self.placement.clone())
         .with_authority_lifecycle(self.authority_lifecycle.clone())
     }
 }

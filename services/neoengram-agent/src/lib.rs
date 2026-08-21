@@ -15,6 +15,7 @@ mod error;
 mod execution;
 mod health;
 mod identity;
+mod replication;
 mod resource_lifecycle;
 mod runtime;
 mod s3_channel;
@@ -47,6 +48,7 @@ pub use identity::{
     has_pending_outbound_reports, load_or_create_identity, load_persisted_identity,
     signing_key_from_identity, AgentSigningKey, PersistedIdentitySummary,
 };
+pub use replication::{ReplicationProgressSink, ReplicationWorker};
 pub use runtime::{
     run, run_with, run_with_development_directory_probe, run_with_transports,
     DevelopmentDirectoryProbe, FilesystemProbe, MountProbe,

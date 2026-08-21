@@ -14,8 +14,8 @@ use crate::{
 use fusen_rs::{Error, ErrorCategory};
 use neoengram_domain::core::{ContentDigest, FileRecord, ObjectId};
 use neoengram_domain::protocol::{
-    CommitDataLayout, DeliveryGeneration, SnapshotDeliveryId, SnapshotDeliveryMode,
-    SnapshotDeliveryOperation, SnapshotDeliveryState, SnapshotId, TenantId,
+    BackendId, CommitDataLayout, DeliveryGeneration, SnapshotDeliveryId, SnapshotDeliveryMode,
+    SnapshotDeliveryOperation, SnapshotDeliveryState, SnapshotId, StorageVolumeId, TenantId,
 };
 
 use crate::{
@@ -59,6 +59,11 @@ fn parse_snapshot(value: String) -> Result<SnapshotId, Error> {
 
 fn parse_delivery(value: String) -> Result<SnapshotDeliveryId, Error> {
     SnapshotDeliveryId::new(value).map_err(|error| invalid_request(format!("delivery_id: {error}")))
+}
+
+fn parse_volume(value: String) -> Result<StorageVolumeId, Error> {
+    StorageVolumeId::new(value)
+        .map_err(|error| invalid_request(format!("target_storage_volume_id: {error}")))
 }
 
 fn to_mode(value: DeliveryModeBody) -> SnapshotDeliveryMode {
@@ -150,18 +155,6 @@ fn deterministic_delivery_id(
         blake3::hash(format!("{tenant_id}\0{snapshot_id}\0{mode}\0{request_id}").as_bytes());
     SnapshotDeliveryId::new(format!("delivery-{}", &digest.to_hex()[..32]))
         .map_err(|error| invalid_request(format!("delivery ID: {error}")))
-}
-
-fn object_set_digest(records: &[FileRecord]) -> ContentDigest {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"neoengram-snapshot-delivery-object-set-v1\0");
-    for record in records {
-        hasher.update(record.path.as_str().as_bytes());
-        hasher.update(record.manifest_id.as_bytes());
-        hasher.update(&record.total_size.to_le_bytes());
-        hasher.update(&record.chunk_count.to_le_bytes());
-    }
-    ContentDigest::from_bytes(*hasher.finalize().as_bytes())
 }
 
 fn delivery_mutation_digest(
@@ -263,6 +256,7 @@ impl CatalogService {
         self.require_tenant(identity, Permission::SnapshotCreate, &tenant_id)
             .await?;
         let snapshot_id = parse_snapshot(request.snapshot_id)?;
+        let target_storage_volume_id = parse_volume(request.target_storage_volume_id)?;
         let mode = to_mode(request.mode);
         let request_id = neoengram_domain::protocol::RequestId::new(request.request_id)
             .map_err(|error| invalid_request(format!("request_id: {error}")))?;
@@ -272,7 +266,10 @@ impl CatalogService {
             .await
             .map_err(map_central_error)?
         {
-            if existing.snapshot_id != snapshot_id || existing.mode != mode {
+            if existing.snapshot_id != snapshot_id
+                || existing.mode != mode
+                || existing.storage_volume_id != target_storage_volume_id
+            {
                 return Err(mutation_id_reused());
             }
             self.best_effort_schedule_snapshot_delivery(&existing).await;
@@ -326,7 +323,7 @@ impl CatalogService {
             .ok_or_else(|| resource_not_found("commit"))?;
         let volume = self
             .repository
-            .get_storage_volume(&tenant_id, &snapshot.storage_volume_id)
+            .get_storage_volume(&tenant_id, &target_storage_volume_id)
             .await
             .map_err(map_central_error)?
             .ok_or_else(|| resource_not_found("storage volume"))?;
@@ -346,6 +343,36 @@ impl CatalogService {
                 "STORAGE_VOLUME_NOT_READY",
                 "the target StorageVolume is not ready",
                 true,
+            ));
+        }
+        // Delivery is visible only after the target Volume has a published complete object set.
+        // Replication and Delivery are separate authority operations: a queued or partial target
+        // must never be treated as readable merely because the Snapshot exists.
+        let placement = self.placement.as_ref().ok_or_else(|| {
+            application_error(
+                ErrorCategory::Unavailable,
+                "placement_authority_unavailable",
+                "PLACEMENT_AUTHORITY_UNAVAILABLE",
+                "Placement authority is unavailable",
+                true,
+            )
+        })?;
+        let backend_id = BackendId::new(target_storage_volume_id.to_string())
+            .map_err(|error| invalid_request(format!("target_storage_volume_id: {error}")))?;
+        let published = placement
+            .get_placement_set(&tenant_id, &snapshot.commit_id, &backend_id)
+            .await
+            .map_err(map_central_error)?
+            .is_some_and(|set| {
+                set.published() && set.storage_volume_id.as_ref() == Some(&target_storage_volume_id)
+            });
+        if !published {
+            return Err(application_error(
+                ErrorCategory::Conflict,
+                "snapshot_target_volume_has_no_commit_data",
+                "SNAPSHOT_TARGET_VOLUME_HAS_NO_COMMIT_DATA",
+                "the target StorageVolume does not hold this Commit's immutable objects; replicate the Commit first",
+                false,
             ));
         }
         if !volume.allowed_delivery_modes.contains(&mode) {
@@ -422,7 +449,7 @@ impl CatalogService {
             )
         })?;
         coordinator
-            .preflight_snapshot_delivery(&tenant_id, &volume.storage_volume_id, mode)
+            .preflight_snapshot_delivery(&tenant_id, &target_storage_volume_id, mode)
             .await
             .map_err(map_central_error)?;
         let retention_roots = if mode == SnapshotDeliveryMode::Hardlink {
@@ -437,7 +464,7 @@ impl CatalogService {
             create_request_id: request_id.clone(),
             snapshot_id: snapshot_id.clone(),
             commit_id: snapshot.commit_id,
-            storage_volume_id: snapshot.storage_volume_id.clone(),
+            storage_volume_id: target_storage_volume_id,
             mode,
             target_relative_root,
             state: SnapshotDeliveryState::Requested,
@@ -445,7 +472,10 @@ impl CatalogService {
             delivery_generation: DeliveryGeneration::new(1),
             file_count,
             size_bytes,
-            object_set_digest: object_set_digest(records),
+            // Delivery is a physical view of the Commit, so its object-set identity must be the
+            // immutable Commit identity. Recomputing a second file-record digest here would let
+            // Delivery and Replication disagree about which objects are required.
+            object_set_digest: commit.object_set_digest,
             resource_version: 1,
             issue_code: None,
             issue_message: None,

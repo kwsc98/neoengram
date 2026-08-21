@@ -9,7 +9,7 @@ use neoengram_domain::core::{
 };
 use neoengram_domain::protocol::{
     ArtifactId, CommitDataLayout, JobId, ProjectId, ProtocolError, RequestId, ResourceVersion,
-    StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
+    TenantId, UnixMillis, WireIndexVersion,
 };
 use serde::{Deserialize, Serialize};
 
@@ -389,14 +389,11 @@ pub struct CommitRecord {
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
     pub source_playground_id: neoengram_domain::protocol::PlaygroundId,
-    /// Immutable placement provenance for the objects referenced by this Commit.
-    ///
-    /// The new Commit protocol requires this field. Missing placement provenance fails closed at
-    /// decode time because a Commit cannot be mounted or delivered safely without it.
-    pub source_storage_volume_id: StorageVolumeId,
     pub source_precommit_id: PreCommitId,
     pub commit_request_id: RequestId,
     pub commit_id: CommitId,
+    /// Immutable content-set identity shared with the Placement authority.
+    pub object_set_digest: neoengram_domain::core::ContentDigest,
     /// Canonical root produced while sealing this exact frozen Index snapshot.
     pub root_directory_id: DirectoryId,
     pub parent_commit_id: Option<CommitId>,
@@ -809,8 +806,8 @@ pub(crate) fn same_commit_request(
         && left.commit.project_id == right.commit.project_id
         && left.commit.artifact_id == right.commit.artifact_id
         && left.commit.source_playground_id == right.commit.source_playground_id
-        && left.commit.source_storage_volume_id == right.commit.source_storage_volume_id
         && left.commit.source_precommit_id == right.commit.source_precommit_id
+        && left.commit.object_set_digest == right.commit.object_set_digest
         && same_index_version(
             &left.expected_candidate_index_version,
             &right.expected_candidate_index_version,

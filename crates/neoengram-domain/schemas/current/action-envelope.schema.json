@@ -30,6 +30,9 @@
         "artifact.create",
         "artifact.list.query",
         "artifact.query",
+        "commit.availability.query",
+        "commit.replicate",
+        "commit.replication.query",
         "gateway.bootstrap.certificate",
         "gateway.bootstrap.challenge",
         "gateway.control.channel.open",
@@ -107,7 +110,8 @@
         "system.version.query",
         "tenant.create",
         "tenant.list.query",
-        "tenant.query"
+        "tenant.query",
+        "workspace.create"
       ]
     },
     "actor": {
