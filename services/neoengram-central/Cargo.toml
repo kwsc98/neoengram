@@ -36,7 +36,7 @@ libc.workspace = true
 neoengram-domain.workspace = true
 neoengram-runtime.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }
-rcgen = { version = "0.13.2", features = ["x509-parser"] }
+rcgen = { version = "0.14.9", features = ["x509-parser"] }
 ring = "0.17.14"
 rustls = "0.23"
 rustls-pki-types = "1.15"
