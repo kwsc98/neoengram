@@ -6,6 +6,16 @@ export function supportsArtifactCommitGraph(capabilities: readonly string[] | un
   return capabilities?.includes('artifact_commit_graph') ?? false;
 }
 
+export function supportsArtifactCommitDiff(capabilities: readonly string[] | undefined): boolean {
+  return capabilities?.includes('artifact_commit_diff') ?? false;
+}
+
+export function supportsArtifactCommitReplication(
+  capabilities: readonly string[] | undefined,
+): boolean {
+  return capabilities?.includes('artifact_commit_replication') ?? false;
+}
+
 export function supportsPlaygroundMaterialize(
   capabilities: readonly string[] | undefined,
 ): boolean {

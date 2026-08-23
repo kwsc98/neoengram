@@ -5,10 +5,12 @@ use neoengram_domain::protocol::{
     DeletionOperationState, DeletionProof, DeletionProofId, DeletionProofResult, Envelope,
     EnvelopeHeader, ErrorCode, Extensions, IndexRevision, JobAssignment, JobDecision, JobFinalized,
     JobState, LifecycleEvent, LifecycleEventId, LifecycleEventKind, MessageId, PrincipalKind,
-    PublishDecision, RequestId, ResourceLifecycleReport, ResourceLifecycleReportState,
-    ResourceVersion, SessionGeneration, SnapshotDeliveryAssignment, SnapshotDeliveryState, TraceId,
-    UnixMillis, WireIndexVersion, WorkspaceMaterializeAssignment, AGENT_JOB_ASSIGNMENT_ACTION,
-    AGENT_JOB_DECISION_ACTION, AGENT_LIFECYCLE_ASSIGNMENT_ACTION, CURRENT_WIRE_VERSION,
+    PublishDecision, ReplicationAssignment, ReplicationObjectState, ReplicationProgressReport,
+    ReplicationState, RequestId, ResourceLifecycleReport, ResourceLifecycleReportState,
+    ResourceVersion, SessionGeneration, SignedTransferTicket, SnapshotDeliveryAssignment,
+    SnapshotDeliveryState, TraceId, TransferEndpoint, TransferTicket, UnixMillis, WireIndexVersion,
+    WorkspaceMaterializeAssignment, AGENT_JOB_ASSIGNMENT_ACTION, AGENT_JOB_DECISION_ACTION,
+    AGENT_LIFECYCLE_ASSIGNMENT_ACTION, AGENT_REPLICATION_ASSIGNMENT_ACTION, CURRENT_WIRE_VERSION,
 };
 
 use crate::{
@@ -25,12 +27,15 @@ use crate::{
     CreateAddJobResult, CreateSnapshotDeliveryRequest, CreateSnapshotDeliveryResult,
     CreateWorkspaceMaterializationRequest, CreateWorkspaceMaterializationResult,
     ExpireAddJobRequest, ExpireAddJobResult, FinalizeAddRequest, FinalizeAddResult,
-    IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, IndexPublisher,
-    JobInsertOutcome, JobOperation, JobRecord, JobRepository, MetadataBatchStager,
-    MetadataBatchSubmission, ObjectCatalog, PublicationCandidate, QueryJobRequest, QueryJobResult,
-    ReceiveReportRequest, ReceiveReportResult, ResumePublicationRequest, StageMetadataBatchRequest,
-    StageMetadataBatchResult,
+    FinalizeReplicationRequest, IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest,
+    IndexPublisher, JobInsertOutcome, JobOperation, JobRecord, JobRepository, MetadataBatchStager,
+    MetadataBatchSubmission, ObjectCatalog, PlacementRepository, PublicationCandidate,
+    QueryJobRequest, QueryJobResult, ReceiveReportRequest, ReceiveReportResult,
+    ReplicationObjectRecord, ReplicationRecord, ReplicationStateTransitionRequest,
+    ResumePublicationRequest, StageMetadataBatchRequest, StageMetadataBatchResult,
 };
+
+use crate::service::{CentralCommandKeyring, DEFAULT_CENTRAL_COMMAND_TTL_MS};
 
 const CONTROL_ERROR_MESSAGE_LIMIT: usize = 4096;
 
@@ -69,6 +74,18 @@ fn assignment_deadline(assignment: &JobAssignment) -> UnixMillis {
     }
 }
 
+fn replication_ticket_deadline(now: UnixMillis) -> CentralResult<UnixMillis> {
+    now.get()
+        .checked_add(DEFAULT_CENTRAL_COMMAND_TTL_MS)
+        .map(UnixMillis::new)
+        .ok_or_else(|| {
+            invalid(
+                CentralErrorCode::DeadlineExceeded,
+                "replication ticket deadline overflowed",
+            )
+        })
+}
+
 fn lifecycle_event_id(
     assignment_id: &neoengram_domain::protocol::LifecycleAssignmentId,
     report_digest: &neoengram_domain::protocol::ContentDigest,
@@ -96,7 +113,96 @@ pub struct ControlPlane {
     audit: Arc<dyn AuditSink>,
     catalog: Option<Arc<dyn ControlCatalogRepository>>,
     agent_registry: Option<Arc<dyn AgentRegistryRepository>>,
+    placement: Option<Arc<dyn PlacementRepository>>,
+    replication_ticket_keyring: Option<Arc<CentralCommandKeyring>>,
     clock: Arc<dyn Clock>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationReportResult {
+    pub resource_version: ResourceVersion,
+    pub replayed: bool,
+}
+
+async fn validate_replication_report_binding(
+    placement: &dyn PlacementRepository,
+    tenant_id: &neoengram_domain::protocol::TenantId,
+    current: &ReplicationRecord,
+    report: &ReplicationProgressReport,
+) -> CentralResult<()> {
+    match report {
+        ReplicationProgressReport::State {
+            state,
+            completed_objects,
+            completed_bytes,
+            ..
+        } => {
+            if *completed_objects > current.total_objects || *completed_bytes > current.total_bytes
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "replication progress exceeds its frozen total",
+                ));
+            }
+            if *state == ReplicationState::Published && current.state != ReplicationState::Published
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "Published state requires a placement publication report",
+                ));
+            }
+        }
+        ReplicationProgressReport::Object {
+            object_id,
+            offset,
+            state,
+            ..
+        } => {
+            let object_set = placement
+                .get_commit_object_set(tenant_id, &current.commit_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::InvalidState,
+                        "Commit ObjectSet is missing",
+                    )
+                })?;
+            let expected = object_set
+                .object_set
+                .objects
+                .iter()
+                .find(|object| object.object_id == *object_id)
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::AssignmentMismatch,
+                        "object is outside the frozen ObjectSet",
+                    )
+                })?;
+            if *offset > expected.size.get()
+                || (*state == ReplicationObjectState::Verified && *offset != expected.size.get())
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "replication object checkpoint has an invalid offset",
+                ));
+            }
+        }
+        ReplicationProgressReport::Published {
+            commit_id,
+            object_set_digest,
+            ..
+        } => {
+            if commit_id.digest() != current.commit_id
+                || *object_set_digest != current.object_set_digest
+            {
+                return Err(invalid(
+                    CentralErrorCode::AssignmentMismatch,
+                    "replication publication differs from its frozen Commit/ObjectSet",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ControlPlane {
@@ -117,8 +223,27 @@ impl ControlPlane {
             audit: authority.audit(),
             catalog: authority.control_catalog(),
             agent_registry: authority.agent_registry(),
+            placement: authority.placement(),
+            replication_ticket_keyring: None,
             clock,
         }
+    }
+
+    /// Installs the Placement authority used to schedule and finalize Commit replication. The
+    /// optional form keeps the Job-only control plane usable in focused unit tests.
+    #[must_use]
+    pub fn with_placement_repository(mut self, placement: Arc<dyn PlacementRepository>) -> Self {
+        self.placement = Some(placement);
+        self
+    }
+
+    /// Installs the Central signing keyring used for Agent replication assignments. Without a
+    /// signer, replication remains durable and queryable but is intentionally not delivered to a
+    /// data-plane Agent.
+    #[must_use]
+    pub fn with_replication_ticket_keyring(mut self, keyring: Arc<CentralCommandKeyring>) -> Self {
+        self.replication_ticket_keyring = Some(keyring);
+        self
     }
 
     /// Derives the current Agent delivery set from the durable assignment outbox and Job CAS.
@@ -267,43 +392,465 @@ impl ControlPlane {
         if messages.len() == limit {
             return Ok(messages);
         }
-        let Some(catalog) = &self.catalog else {
-            return Ok(messages);
-        };
-        for record in catalog
-            .pending_lifecycle_assignments_for_agent(agent_id, limit.saturating_sub(messages.len()))
-            .await?
-        {
-            let assignment = &record.assignment;
-            if assignment.session_generation != session_generation {
-                continue;
-            }
-            catalog
-                .get_deletion_operation(
-                    &assignment.assignment.tenant_id,
-                    &assignment.assignment.deletion_id,
+        if let Some(catalog) = &self.catalog {
+            for record in catalog
+                .pending_lifecycle_assignments_for_agent(
+                    agent_id,
+                    limit.saturating_sub(messages.len()),
                 )
                 .await?
-                .ok_or_else(|| {
-                    invalid(
-                        CentralErrorCode::Internal,
-                        "lifecycle outbox references a missing deletion operation",
+            {
+                let assignment = &record.assignment;
+                if assignment.session_generation != session_generation {
+                    continue;
+                }
+                catalog
+                    .get_deletion_operation(
+                        &assignment.assignment.tenant_id,
+                        &assignment.assignment.deletion_id,
                     )
-                })?;
-            let envelope = action_envelope(
-                AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
-                MessageId::new(format!("lifecycle-{}", assignment.assignment.assignment_id))?,
-                assignment.assignment.tenant_id.clone(),
-                session_generation,
-                assignment.assignment.deadline_unix_ms,
-                ControlMessage::LifecycleAssignment(Box::new(assignment.clone())),
-            )?;
-            messages.push(envelope);
-            if messages.len() == limit {
-                break;
+                    .await?
+                    .ok_or_else(|| {
+                        invalid(
+                            CentralErrorCode::Internal,
+                            "lifecycle outbox references a missing deletion operation",
+                        )
+                    })?;
+                let envelope = action_envelope(
+                    AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
+                    MessageId::new(format!("lifecycle-{}", assignment.assignment.assignment_id))?,
+                    assignment.assignment.tenant_id.clone(),
+                    session_generation,
+                    assignment.assignment.deadline_unix_ms,
+                    ControlMessage::LifecycleAssignment(Box::new(assignment.clone())),
+                )?;
+                messages.push(envelope);
+                if messages.len() == limit {
+                    break;
+                }
+            }
+        }
+
+        // Replication commands are derived from the Placement authority rather than the Job
+        // outbox. They remain deliverable throughout an active attempt so a reconnect can resume
+        // the same staging offsets, while the immutable attempt/object-set/route fences are
+        // rechecked before every delivery.
+        if messages.len() < limit {
+            if let (Some(placement), Some(_keyring), Some(agent_registry)) = (
+                &self.placement,
+                &self.replication_ticket_keyring,
+                &self.agent_registry,
+            ) {
+                let Some(agent_record) = agent_registry.get_by_agent(agent_id).await? else {
+                    return Ok(messages);
+                };
+                let tenant_id = agent_record.enrollment.tenant_id;
+                for replication in placement
+                    .list_replications_for_agent(&tenant_id, agent_id)
+                    .await?
+                {
+                    if messages.len() == limit
+                        || !matches!(
+                            replication.state,
+                            ReplicationState::Queued
+                                | ReplicationState::Planning
+                                | ReplicationState::Transferring
+                                | ReplicationState::Verifying
+                        )
+                        || replication.target_session_generation != Some(session_generation)
+                    {
+                        continue;
+                    }
+                    let Some(assignment) = self.replication_assignment(&replication).await? else {
+                        continue;
+                    };
+                    let deadline = assignment.signed_ticket.as_ticket().deadline_unix_ms;
+                    let envelope = action_envelope(
+                        AGENT_REPLICATION_ASSIGNMENT_ACTION,
+                        MessageId::new(format!(
+                            "replication-{}-{}",
+                            assignment.replication_id, assignment.attempt
+                        ))?,
+                        assignment.tenant_id.clone(),
+                        session_generation,
+                        deadline,
+                        ControlMessage::ReplicationAssignment(Box::new(assignment)),
+                    )?;
+                    messages.push(envelope);
+                }
             }
         }
         Ok(messages)
+    }
+
+    async fn replication_assignment(
+        &self,
+        current: &ReplicationRecord,
+    ) -> CentralResult<Option<ReplicationAssignment>> {
+        let (Some(placement), Some(keyring)) = (&self.placement, &self.replication_ticket_keyring)
+        else {
+            return Ok(None);
+        };
+        let mut record = current.clone();
+        if record.state == ReplicationState::Queued {
+            record = placement
+                .transition_replication(ReplicationStateTransitionRequest {
+                    tenant_id: record.tenant_id.clone(),
+                    replication_id: record.replication_id.clone(),
+                    expected_state: ReplicationState::Queued,
+                    expected_attempt: record.attempt,
+                    next_state: ReplicationState::Planning,
+                    completed_objects: record.completed_objects,
+                    completed_bytes: record.completed_bytes,
+                    issue_code: None,
+                    issue_message: None,
+                    updated_at_unix_ms: self.clock.now(),
+                })
+                .await?;
+        }
+        let object_set = placement
+            .get_commit_object_set(&record.tenant_id, &record.commit_id)
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "Commit ObjectSet disappeared",
+                )
+            })?;
+        if object_set.object_set.object_set_digest != record.object_set_digest {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "replication ObjectSet differs from its frozen authority record",
+            ));
+        }
+        let source_placement_id = record
+            .source_placement_set_id
+            .as_ref()
+            .map(|value| neoengram_domain::protocol::PlacementId::new(value.to_string()))
+            .transpose()?;
+        let target_placement_id = record
+            .target_placement_set_id
+            .as_ref()
+            .map(|value| neoengram_domain::protocol::PlacementId::new(value.to_string()))
+            .transpose()?;
+        let (
+            Some(artifact_id),
+            Some(source_placement_id),
+            Some(target_placement_id),
+            Some(source_volume_id),
+            Some(source_edge_cluster_id),
+            Some(source_gateway_pool_id),
+            Some(source_agent_id),
+            Some(source_session_generation),
+            Some(source_mount_generation),
+            Some(source_route_generation),
+            Some(target_edge_cluster_id),
+            Some(target_gateway_pool_id),
+            Some(target_agent_id),
+            Some(target_session_generation),
+            Some(target_mount_generation),
+            Some(target_route_generation),
+            Some(transfer_id),
+        ) = (
+            record.artifact_id.clone(),
+            source_placement_id,
+            target_placement_id,
+            record.source_storage_volume_id.clone(),
+            record.source_edge_cluster_id.clone(),
+            record.source_gateway_pool_id.clone(),
+            record.source_agent_id.clone(),
+            record.source_session_generation,
+            record.source_mount_generation,
+            record.source_route_generation,
+            record.target_edge_cluster_id.clone(),
+            record.target_gateway_pool_id.clone(),
+            record.target_agent_id.clone(),
+            record.target_session_generation,
+            record.target_mount_generation,
+            record.target_route_generation,
+            record.transfer_id.clone(),
+        )
+        else {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            ));
+        };
+        let mut allowed_objects = object_set
+            .object_set
+            .objects
+            .iter()
+            .map(|object| object.object_id)
+            .collect::<Vec<_>>();
+        allowed_objects.sort_unstable();
+        let ticket = TransferTicket {
+            transfer_id,
+            tenant_id: record.tenant_id.clone(),
+            artifact_id: artifact_id.clone(),
+            commit_id: neoengram_domain::CommitId::from_digest(record.commit_id),
+            object_set_digest: record.object_set_digest,
+            source: TransferEndpoint {
+                placement_id: source_placement_id,
+                agent_id: source_agent_id,
+                gateway_pool_id: source_gateway_pool_id,
+                edge_cluster_id: source_edge_cluster_id,
+                storage_volume_id: Some(source_volume_id),
+            },
+            target: TransferEndpoint {
+                placement_id: target_placement_id,
+                agent_id: target_agent_id,
+                gateway_pool_id: target_gateway_pool_id,
+                edge_cluster_id: target_edge_cluster_id,
+                storage_volume_id: Some(record.target_storage_volume_id.clone()),
+            },
+            source_session_generation,
+            source_mount_generation,
+            source_route_generation,
+            session_generation: target_session_generation,
+            mount_generation: target_mount_generation,
+            route_generation: target_route_generation,
+            deadline_unix_ms: replication_ticket_deadline(self.clock.now())?,
+            max_bytes: neoengram_domain::protocol::DecimalU64::new(record.total_bytes),
+            allowed_objects,
+        };
+        let signed_ticket = keyring
+            .sign_transfer_ticket(ticket, self.clock.now(), DEFAULT_CENTRAL_COMMAND_TTL_MS)
+            .await
+            .map_err(|error| invalid(CentralErrorCode::Internal, error.to_string()))?;
+        let assignment = ReplicationAssignment {
+            replication_id: record.replication_id,
+            tenant_id: record.tenant_id,
+            artifact_id,
+            commit_id: neoengram_domain::CommitId::from_digest(record.commit_id),
+            attempt: record.attempt,
+            signed_ticket: SignedTransferTicket {
+                ticket: signed_ticket.ticket,
+                central_signature: signed_ticket.central_signature,
+            },
+            object_set: object_set.object_set,
+            extensions: Extensions::new(),
+        };
+        assignment.validate()?;
+        Ok(Some(assignment))
+    }
+
+    /// Applies one authenticated Agent replication checkpoint. Object reports are persisted before
+    /// the final publication report; only `Published` invokes the PlacementRepository atomic
+    /// finalize operation that makes the target copy visible to availability/S3 consumers.
+    pub async fn receive_replication_report(
+        &self,
+        tenant_id: &neoengram_domain::protocol::TenantId,
+        agent_id: &AgentId,
+        session_generation: SessionGeneration,
+        report: ReplicationProgressReport,
+    ) -> CentralResult<ReplicationReportResult> {
+        report.validate()?;
+        if report.tenant_id() != tenant_id {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "replication report tenant differs from its authenticated session",
+            ));
+        }
+        let placement = self.placement.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::Internal,
+                "placement authority is unavailable for replication reports",
+            )
+        })?;
+        let replication_id = report.replication_id().clone();
+        let current = placement
+            .get_replication(tenant_id, &replication_id)
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "replication does not exist",
+                )
+            })?;
+        if current.target_agent_id.as_ref() != Some(agent_id) {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "replication report is not bound to the target Agent",
+            ));
+        }
+        if current.attempt != report.attempt() {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication report belongs to a superseded attempt",
+            ));
+        }
+        validate_replication_report_binding(placement.as_ref(), tenant_id, &current, &report)
+            .await?;
+        // Cancellation is authoritative for its fenced attempt. An Agent may reconnect with
+        // reports that were durably queued before it observed the cancellation; acknowledge and
+        // discard those reports so its outbox can drain without changing checkpoints or making a
+        // target Placement visible.
+        if current.state == ReplicationState::Cancelled {
+            return Ok(ReplicationReportResult {
+                resource_version: ResourceVersion::new(1),
+                replayed: true,
+            });
+        }
+        if current.target_session_generation != Some(session_generation) {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "replication report is not bound to the target Agent session",
+            ));
+        }
+        let now = self.clock.now();
+        let mut replayed = false;
+        match report {
+            ReplicationProgressReport::State {
+                state,
+                completed_objects,
+                completed_bytes,
+                issue_code,
+                issue_message,
+                ..
+            } => {
+                if state == ReplicationState::Published
+                    || (current.state == state
+                        && current.completed_objects == completed_objects
+                        && current.completed_bytes == completed_bytes
+                        && current.issue_code == issue_code
+                        && current.issue_message == issue_message)
+                {
+                    replayed = true;
+                } else {
+                    placement
+                        .transition_replication(ReplicationStateTransitionRequest {
+                            tenant_id: tenant_id.clone(),
+                            replication_id,
+                            expected_state: current.state,
+                            expected_attempt: current.attempt,
+                            next_state: state,
+                            completed_objects,
+                            completed_bytes,
+                            issue_code,
+                            issue_message,
+                            updated_at_unix_ms: now,
+                        })
+                        .await?;
+                }
+            }
+            ReplicationProgressReport::Object {
+                object_id,
+                offset,
+                state,
+                ..
+            } => {
+                let checkpoint = ReplicationObjectRecord {
+                    tenant_id: tenant_id.clone(),
+                    replication_id,
+                    object_id,
+                    offset,
+                    state,
+                    retry_count: current.attempt,
+                    updated_at_unix_ms: now,
+                };
+                placement.upsert_replication_object(checkpoint).await?;
+            }
+            ReplicationProgressReport::Published {
+                commit_id,
+                object_set_digest,
+                ..
+            } => {
+                if current.state == ReplicationState::Published {
+                    replayed = true;
+                } else {
+                    let object_set = placement
+                        .get_commit_object_set(tenant_id, &current.commit_id)
+                        .await?
+                        .ok_or_else(|| {
+                            invalid(
+                                CentralErrorCode::InvalidState,
+                                "Commit ObjectSet is missing",
+                            )
+                        })?;
+                    let backend_id = neoengram_domain::protocol::BackendId::new(
+                        current.target_backend_id.clone(),
+                    )?;
+                    let placement_generation =
+                        current.target_placement_generation.ok_or_else(|| {
+                            invalid(
+                                CentralErrorCode::InvalidState,
+                                "target placement generation is missing",
+                            )
+                        })?;
+                    let placements = object_set
+                        .object_set
+                        .objects
+                        .iter()
+                        .map(|object| neoengram_domain::protocol::ObjectPlacement {
+                            tenant_id: tenant_id.clone(),
+                            object_id: object.object_id,
+                            backend_id: backend_id.clone(),
+                            storage_volume_id: Some(current.target_storage_volume_id.clone()),
+                            archive_id: None,
+                            edge_cluster_id: current.target_edge_cluster_id.clone(),
+                            gateway_pool_id: current.target_gateway_pool_id.clone(),
+                            region: None,
+                            placement_generation,
+                            state: neoengram_domain::protocol::PlacementState::Verified,
+                            verified_size: object.size,
+                            verified_digest: object.object_id.digest(),
+                            failure_domain: format!(
+                                "cluster/{}/pool/{}/volume/{}",
+                                current
+                                    .target_edge_cluster_id
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_default(),
+                                current
+                                    .target_gateway_pool_id
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_default(),
+                                current.target_storage_volume_id,
+                            ),
+                        })
+                        .collect::<Vec<_>>();
+                    let placement_set_id =
+                        current.target_placement_set_id.clone().ok_or_else(|| {
+                            invalid(
+                                CentralErrorCode::InvalidState,
+                                "target PlacementSet ID is missing",
+                            )
+                        })?;
+                    let placement_set = neoengram_domain::protocol::CommitPlacementSet {
+                        placement_set_id,
+                        tenant_id: tenant_id.clone(),
+                        commit_id,
+                        backend_id,
+                        storage_volume_id: Some(current.target_storage_volume_id.clone()),
+                        archive_id: None,
+                        object_set_digest,
+                        object_count: neoengram_domain::protocol::DecimalU64::new(
+                            current.total_objects,
+                        ),
+                        verified_object_count: neoengram_domain::protocol::DecimalU64::new(
+                            current.total_objects,
+                        ),
+                        placement_generation,
+                        state: neoengram_domain::protocol::CommitPlacementSetState::Published,
+                    };
+                    placement
+                        .finalize_replication(FinalizeReplicationRequest {
+                            tenant_id: tenant_id.clone(),
+                            replication_id,
+                            expected_attempt: current.attempt,
+                            placements,
+                            placement_set,
+                            finalized_at_unix_ms: now,
+                        })
+                        .await?;
+                }
+            }
+        }
+        Ok(ReplicationReportResult {
+            resource_version: ResourceVersion::new(1),
+            replayed,
+        })
     }
 
     /// Applies one lifecycle report against its exact durable command and generation fences.
@@ -2560,10 +3107,124 @@ mod tests {
         action_envelope, bounded_control_error_message, AGENT_JOB_ASSIGNMENT_ACTION,
         CONTROL_ERROR_MESSAGE_LIMIT,
     };
+    use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
     use neoengram_domain::protocol::{
-        ControlError, ControlMessage, ErrorCode, Extensions, MessageId, SessionGeneration,
-        TenantId, UnixMillis,
+        AgentId, ArtifactId, CommitObject, CommitObjectSet, ControlError, ControlMessage,
+        EdgeClusterId, ErrorCode, Extensions, GatewayPoolId, MessageId, MountGeneration,
+        ObjectEncoding, ObjectSet, PlacementGeneration, PlacementSetId, ReplicationId,
+        ReplicationObjectState, ReplicationProgressReport, ReplicationState, RequestId,
+        RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, UnixMillis,
     };
+
+    use crate::{
+        CancelReplicationRequest, InMemoryComponents, PlacementRepository, ReplicationObjectRecord,
+        ReplicationRecord,
+    };
+
+    struct ReplicationFixture {
+        tenant_id: TenantId,
+        target_agent_id: AgentId,
+        object_id: ObjectId,
+        object_set: CommitObjectSet,
+        replication: ReplicationRecord,
+    }
+
+    fn replication_fixture(state: ReplicationState, completed: bool) -> ReplicationFixture {
+        let tenant_id = TenantId::new("tenant-cancelled-report").unwrap();
+        let target_agent_id = AgentId::new("agent-cancelled-report").unwrap();
+        let target_session_generation = SessionGeneration::new(7);
+        let object_id = ObjectId::from_bytes([3; 32]);
+        let commit_id = ContentDigest::from_bytes([4; 32]);
+        let object_set = ObjectSet::new(vec![CommitObject::new(
+            object_id,
+            12,
+            ObjectEncoding::Raw,
+            0,
+        )])
+        .unwrap();
+        let commit_object_set = CommitObjectSet {
+            tenant_id: tenant_id.clone(),
+            commit_id: CommitId::from_digest(commit_id),
+            object_set,
+        };
+        let (completed_objects, completed_bytes) = if completed { (1, 12) } else { (0, 0) };
+        let replication = ReplicationRecord {
+            tenant_id: tenant_id.clone(),
+            replication_id: ReplicationId::new("replication-cancelled-report").unwrap(),
+            artifact_id: Some(ArtifactId::new("artifact-cancelled-report").unwrap()),
+            commit_id,
+            target_backend_id: "backend-cancelled-report".to_owned(),
+            target_storage_volume_id: StorageVolumeId::new("volume-cancelled-report").unwrap(),
+            source_placement_set_id: None,
+            source_backend_id: None,
+            source_storage_volume_id: None,
+            source_edge_cluster_id: None,
+            source_gateway_pool_id: None,
+            source_placement_generation: None,
+            source_agent_id: None,
+            source_session_generation: None,
+            source_mount_generation: None,
+            source_route_generation: None,
+            target_edge_cluster_id: Some(EdgeClusterId::new("cluster-cancelled-report").unwrap()),
+            target_gateway_pool_id: Some(GatewayPoolId::new("pool-cancelled-report").unwrap()),
+            target_placement_generation: Some(PlacementGeneration::new(1)),
+            target_agent_id: Some(target_agent_id.clone()),
+            target_session_generation: Some(target_session_generation),
+            target_mount_generation: Some(MountGeneration::new(2)),
+            target_route_generation: Some(RouteGeneration::new(3)),
+            transfer_route_id: None,
+            transfer_id: None,
+            target_placement_set_id: Some(
+                PlacementSetId::new("placement-set-cancelled-report").unwrap(),
+            ),
+            staging_id: Some("staging-cancelled-report".to_owned()),
+            object_set_digest: commit_object_set.object_set.object_set_digest,
+            state,
+            request_id: RequestId::new("request-cancelled-report").unwrap(),
+            attempt: 1,
+            completed_objects,
+            total_objects: 1,
+            completed_bytes,
+            total_bytes: 12,
+            issue_code: None,
+            issue_message: None,
+            created_at_unix_ms: UnixMillis::new(10),
+            updated_at_unix_ms: UnixMillis::new(10),
+        };
+        ReplicationFixture {
+            tenant_id,
+            target_agent_id,
+            object_id,
+            object_set: commit_object_set,
+            replication,
+        }
+    }
+
+    async fn insert_and_cancel(
+        components: &InMemoryComponents,
+        fixture: &ReplicationFixture,
+    ) -> ReplicationRecord {
+        components
+            .placement
+            .insert_commit_object_set(fixture.object_set.clone())
+            .await
+            .unwrap();
+        components
+            .placement
+            .insert_replication(fixture.replication.clone())
+            .await
+            .unwrap();
+        components
+            .placement
+            .cancel_replication(CancelReplicationRequest {
+                tenant_id: fixture.tenant_id.clone(),
+                replication_id: fixture.replication.replication_id.clone(),
+                expected_attempt: fixture.replication.attempt,
+                updated_at_unix_ms: UnixMillis::new(20),
+            })
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn control_error_messages_are_bounded_on_utf8_boundaries() {
@@ -2603,5 +3264,137 @@ mod tests {
             envelope.header.session_generation,
             Some(SessionGeneration::new(1))
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_replication_acks_queued_failure_without_changing_cancellation() {
+        let components = InMemoryComponents::new(30);
+        let fixture = replication_fixture(ReplicationState::Transferring, false);
+        let cancelled = insert_and_cancel(&components, &fixture).await;
+        let control = components.control_plane();
+
+        let result = control
+            .receive_replication_report(
+                &fixture.tenant_id,
+                &fixture.target_agent_id,
+                SessionGeneration::new(8),
+                ReplicationProgressReport::State {
+                    replication_id: fixture.replication.replication_id.clone(),
+                    tenant_id: fixture.tenant_id.clone(),
+                    attempt: fixture.replication.attempt,
+                    state: ReplicationState::Failed,
+                    completed_objects: 0,
+                    completed_bytes: 0,
+                    issue_code: Some("SOURCE_UNAVAILABLE".to_owned()),
+                    issue_message: Some("source disconnected before cancellation".to_owned()),
+                    extensions: Extensions::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(result.replayed);
+        assert_eq!(
+            components
+                .placement
+                .get_replication(&fixture.tenant_id, &fixture.replication.replication_id)
+                .await
+                .unwrap(),
+            Some(cancelled)
+        );
+        assert!(components
+            .placement
+            .list_replication_objects(&fixture.tenant_id, &fixture.replication.replication_id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_replication_discards_stale_publication_without_publishing_placement() {
+        let components = InMemoryComponents::new(30);
+        let fixture = replication_fixture(ReplicationState::Verifying, true);
+        components
+            .placement
+            .insert_commit_object_set(fixture.object_set.clone())
+            .await
+            .unwrap();
+        components
+            .placement
+            .insert_replication(fixture.replication.clone())
+            .await
+            .unwrap();
+        let checkpoint = ReplicationObjectRecord {
+            tenant_id: fixture.tenant_id.clone(),
+            replication_id: fixture.replication.replication_id.clone(),
+            object_id: fixture.object_id,
+            offset: 12,
+            state: ReplicationObjectState::Verified,
+            retry_count: fixture.replication.attempt,
+            updated_at_unix_ms: UnixMillis::new(11),
+        };
+        components
+            .placement
+            .upsert_replication_object(checkpoint.clone())
+            .await
+            .unwrap();
+        let cancelled = components
+            .placement
+            .cancel_replication(CancelReplicationRequest {
+                tenant_id: fixture.tenant_id.clone(),
+                replication_id: fixture.replication.replication_id.clone(),
+                expected_attempt: fixture.replication.attempt,
+                updated_at_unix_ms: UnixMillis::new(20),
+            })
+            .await
+            .unwrap();
+        let control = components.control_plane();
+
+        let result = control
+            .receive_replication_report(
+                &fixture.tenant_id,
+                &fixture.target_agent_id,
+                SessionGeneration::new(8),
+                ReplicationProgressReport::Published {
+                    replication_id: fixture.replication.replication_id.clone(),
+                    tenant_id: fixture.tenant_id.clone(),
+                    attempt: fixture.replication.attempt,
+                    commit_id: fixture.object_set.commit_id,
+                    object_set_digest: fixture.object_set.object_set.object_set_digest,
+                    extensions: Extensions::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(result.replayed);
+        assert_eq!(
+            components
+                .placement
+                .get_replication(&fixture.tenant_id, &fixture.replication.replication_id)
+                .await
+                .unwrap(),
+            Some(cancelled)
+        );
+        assert_eq!(
+            components
+                .placement
+                .list_replication_objects(&fixture.tenant_id, &fixture.replication.replication_id)
+                .await
+                .unwrap(),
+            vec![checkpoint]
+        );
+        assert!(components
+            .placement
+            .commit_placement_sets(&fixture.tenant_id, &fixture.replication.commit_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(components
+            .placement
+            .object_placements(&fixture.tenant_id, &fixture.object_id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

@@ -303,6 +303,7 @@ pub enum AgentReport {
     Finalized(JobFinalized),
     Failed(JobFailed),
     Lifecycle(Box<ResourceLifecycleReport>),
+    Replication(Box<neoengram_domain::protocol::ReplicationProgressReport>),
 }
 
 impl AgentReport {
@@ -315,6 +316,7 @@ impl AgentReport {
             Self::Finalized(report) => ControlMessage::Finalized(report),
             Self::Failed(report) => ControlMessage::Failed(report),
             Self::Lifecycle(report) => ControlMessage::LifecycleReport(report),
+            Self::Replication(report) => ControlMessage::ReplicationReport(report),
         }
     }
 }

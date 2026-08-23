@@ -16,11 +16,13 @@ use crate::{CentralError, CentralErrorCode, CentralResult};
 
 const DATABASE_FILE_NAME: &str = "authority.sqlite3";
 const LOCK_FILE_NAME: &str = "authority.lock";
-// `NEAU` identifies the consolidated clean-slate authority database.  No prior authority or
-// Agent Registry identity is accepted here; a directory containing an older database must be
-// initialized afresh.
+// `NEAU` identifies the consolidated authority database. Older consolidated schema versions are
+// migrated in place; legacy split-database layouts remain rejected below.
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4155;
-const SQLITE_SCHEMA_VERSION: i64 = 13;
+const SQLITE_SCHEMA_VERSION: i64 = 16;
+const PREVIOUS_SQLITE_SCHEMA_VERSION: i64 = 15;
+const ARTIFACT_SCOPE_SQLITE_SCHEMA_VERSION: i64 = 14;
+const LEGACY_SQLITE_SCHEMA_VERSION: i64 = 13;
 const LEGACY_DATABASE_FILES: &[&str] = &[
     "agent-registry.sqlite3",
     "gateway-registry.sqlite3",
@@ -322,18 +324,63 @@ CREATE TABLE replications (
     target_backend_id TEXT NOT NULL,
     target_storage_volume_id TEXT,
     target_archive_id TEXT,
+    source_placement_set_id TEXT,
+    source_backend_id TEXT,
+    source_storage_volume_id TEXT,
+    source_edge_cluster_id TEXT,
+    source_gateway_pool_id TEXT,
+    source_placement_generation INTEGER CHECK (source_placement_generation IS NULL OR source_placement_generation > 0),
+    source_agent_id TEXT,
+    source_session_generation INTEGER CHECK (source_session_generation IS NULL OR source_session_generation > 0),
+    source_mount_generation INTEGER CHECK (source_mount_generation IS NULL OR source_mount_generation > 0),
+    source_route_generation INTEGER CHECK (source_route_generation IS NULL OR source_route_generation > 0),
+    target_edge_cluster_id TEXT,
+    target_gateway_pool_id TEXT,
+    target_placement_generation INTEGER CHECK (target_placement_generation IS NULL OR target_placement_generation > 0),
+    target_agent_id TEXT,
+    target_session_generation INTEGER CHECK (target_session_generation IS NULL OR target_session_generation > 0),
+    target_mount_generation INTEGER CHECK (target_mount_generation IS NULL OR target_mount_generation > 0),
+    target_route_generation INTEGER CHECK (target_route_generation IS NULL OR target_route_generation > 0),
+    transfer_route_id TEXT,
+    transfer_id TEXT,
+    target_placement_set_id TEXT,
+    staging_id TEXT,
     object_set_digest BLOB NOT NULL CHECK (length(object_set_digest) = 32),
     completed_objects INTEGER NOT NULL CHECK (completed_objects >= 0),
     total_objects INTEGER NOT NULL CHECK (total_objects >= 0),
+    completed_bytes INTEGER NOT NULL CHECK (completed_bytes >= 0),
+    total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
     state TEXT NOT NULL CHECK (state IN ('queued', 'planning', 'transferring', 'verifying', 'published', 'failed', 'cancelled')),
     request_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt > 0),
     error_code TEXT,
     error_message TEXT,
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
     PRIMARY KEY (tenant_id, replication_id),
     UNIQUE (tenant_id, request_id),
-    CHECK ((target_storage_volume_id IS NULL) <> (target_archive_id IS NULL))
+    CHECK ((target_storage_volume_id IS NULL) <> (target_archive_id IS NULL)),
+    CHECK (completed_objects <= total_objects),
+    CHECK (completed_bytes <= total_bytes),
+    CHECK (source_placement_set_id IS NULL OR (source_backend_id IS NOT NULL AND source_storage_volume_id IS NOT NULL AND source_placement_generation IS NOT NULL)),
+    CHECK (source_edge_cluster_id IS NULL OR source_gateway_pool_id IS NOT NULL),
+    CHECK (source_gateway_pool_id IS NULL OR source_edge_cluster_id IS NOT NULL),
+    CHECK (target_edge_cluster_id IS NULL OR target_gateway_pool_id IS NOT NULL),
+    CHECK (target_gateway_pool_id IS NULL OR target_edge_cluster_id IS NOT NULL),
+    CHECK (state <> 'published' OR target_placement_set_id IS NOT NULL)
+) STRICT;
+
+CREATE UNIQUE INDEX replications_active_target
+    ON replications (tenant_id, commit_id, target_backend_id)
+    WHERE state IN ('queued', 'planning', 'transferring', 'verifying');
+
+CREATE TABLE replication_artifacts (
+    tenant_id TEXT NOT NULL,
+    replication_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, replication_id),
+    FOREIGN KEY (tenant_id, replication_id)
+        REFERENCES replications (tenant_id, replication_id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE replication_objects (
@@ -564,7 +611,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 13")
+        sqlx::query("PRAGMA user_version = 16")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -576,12 +623,267 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             "SQLite authority application_id {application_id} is unsupported"
         )));
     }
+    if user_version == LEGACY_SQLITE_SCHEMA_VERSION {
+        migrate_schema_v13_to_v14(pool).await?;
+        migrate_schema_v14_to_v15(pool).await?;
+        migrate_schema_v15_to_v16(pool).await?;
+        return validate_current_schema(pool).await;
+    }
+    if user_version == ARTIFACT_SCOPE_SQLITE_SCHEMA_VERSION {
+        migrate_schema_v14_to_v15(pool).await?;
+        migrate_schema_v15_to_v16(pool).await?;
+        return validate_current_schema(pool).await;
+    }
+    if user_version == PREVIOUS_SQLITE_SCHEMA_VERSION {
+        migrate_schema_v15_to_v16(pool).await?;
+        return validate_current_schema(pool).await;
+    }
     if user_version != SQLITE_SCHEMA_VERSION {
         return Err(storage_corruption(format!(
             "SQLite authority schema {user_version} is unsupported; initialize a clean current-format database"
         )));
     }
     validate_current_schema(pool).await
+}
+
+/// Migrate the first placement-aware authority schema to the current replication contract.
+///
+/// SQLite cannot alter a table's CHECK constraints in place. Rebuild both replication tables in
+/// one transaction so an interrupted upgrade leaves the version-13 database untouched. Existing
+/// records retain their immutable request/target identity. New route and Placement bindings are
+/// intentionally left unset: the next Planning pass selects and freezes a healthy source. Byte
+/// progress is reconstructed from the immutable Commit objects and durable object checkpoints.
+async fn migrate_schema_v13_to_v14(pool: &SqlitePool) -> CentralResult<()> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+
+    // A v13 Published record did not persist its target PlacementSet identity. It is safe to
+    // migrate only when the matching published set already exists; otherwise fail closed rather
+    // than making an unavailable/ambiguous copy appear Published after restart.
+    let orphaned_published: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM replications AS r \
+         WHERE r.state = 'published' \
+           AND NOT EXISTS (\
+               SELECT 1 FROM commit_placement_sets AS p \
+               WHERE p.tenant_id = r.tenant_id \
+                 AND p.commit_id = r.commit_id \
+                 AND p.backend_id = r.target_backend_id \
+                 AND p.storage_volume_id IS r.target_storage_volume_id \
+                 AND p.archive_id IS r.target_archive_id \
+                 AND p.state = 'published'\
+           )",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    if orphaned_published != 0 {
+        return Err(storage_corruption(
+            "cannot migrate Published replication without a matching published PlacementSet",
+        ));
+    }
+
+    let invalid_progress: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM replications \
+         WHERE completed_objects < 0 OR total_objects < 0 OR completed_objects > total_objects",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    if invalid_progress != 0 {
+        return Err(storage_corruption(
+            "cannot migrate replication with invalid object progress",
+        ));
+    }
+
+    sqlx::query("ALTER TABLE replications RENAME TO replications_v13")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+
+    let replications_schema = embedded_table_schema("replications")?;
+    // The old table was renamed above, so the canonical name is available. Creating the current
+    // table directly preserves the exact embedded SQL text; SQLite's ALTER TABLE rename would
+    // otherwise persist quoted identifiers and fail strict schema validation on reopen.
+    sqlx::raw_sql(&replications_schema)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+
+    // The two correlated sums are deliberately computed from durable authority data instead of
+    // trusting the old UI counters. `MIN` keeps a partially written legacy offset within the
+    // frozen total while retaining resumable progress.
+    sqlx::query(
+        "INSERT INTO replications (\
+            tenant_id, replication_id, commit_id, target_backend_id, target_storage_volume_id,\
+            target_archive_id, source_placement_set_id, source_backend_id, source_storage_volume_id,\
+            source_edge_cluster_id, source_gateway_pool_id, source_placement_generation,\
+            source_agent_id, source_session_generation, source_mount_generation, source_route_generation,\
+            target_edge_cluster_id, target_gateway_pool_id, target_placement_generation,\
+            target_agent_id, target_session_generation, target_mount_generation, target_route_generation,\
+            transfer_route_id, transfer_id, target_placement_set_id, staging_id, object_set_digest,\
+            completed_objects, total_objects, completed_bytes, total_bytes, state, request_id, attempt,\
+            error_code, error_message, created_at_unix_ms, updated_at_unix_ms\
+        )\
+        SELECT r.tenant_id, r.replication_id, r.commit_id, r.target_backend_id,\
+               r.target_storage_volume_id, r.target_archive_id,\
+               NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,\
+               CASE WHEN r.state = 'published' THEN (\
+                   SELECT p.placement_generation FROM commit_placement_sets AS p \
+                   WHERE p.tenant_id = r.tenant_id AND p.commit_id = r.commit_id \
+                     AND p.backend_id = r.target_backend_id \
+                     AND p.storage_volume_id IS r.target_storage_volume_id \
+                     AND p.archive_id IS r.target_archive_id AND p.state = 'published' \
+                   ORDER BY p.updated_at_unix_ms DESC, p.placement_set_id LIMIT 1\
+               ) ELSE NULL END,\
+               NULL, NULL, NULL, NULL, NULL, NULL,\
+               CASE WHEN r.state = 'published' THEN (\
+                   SELECT p.placement_set_id FROM commit_placement_sets AS p \
+                   WHERE p.tenant_id = r.tenant_id AND p.commit_id = r.commit_id \
+                     AND p.backend_id = r.target_backend_id \
+                     AND p.storage_volume_id IS r.target_storage_volume_id \
+                     AND p.archive_id IS r.target_archive_id AND p.state = 'published' \
+                   ORDER BY p.updated_at_unix_ms DESC, p.placement_set_id LIMIT 1\
+               ) ELSE NULL END,\
+               NULL, r.object_set_digest, r.completed_objects, r.total_objects,\
+               CASE WHEN r.state = 'published' THEN \
+                   COALESCE((SELECT SUM(c.size) FROM commit_objects AS c \
+                             WHERE c.tenant_id = r.tenant_id AND c.commit_id = r.commit_id), 0) \
+               ELSE MIN( \
+                   COALESCE((SELECT SUM(o.offset) FROM replication_objects AS o \
+                             WHERE o.tenant_id = r.tenant_id AND o.replication_id = r.replication_id \
+                               AND o.state IN ('transferring', 'verified')), 0),\
+                   COALESCE((SELECT SUM(c.size) FROM commit_objects AS c \
+                             WHERE c.tenant_id = r.tenant_id AND c.commit_id = r.commit_id), 0)\
+               ) END,\
+               COALESCE((SELECT SUM(c.size) FROM commit_objects AS c \
+                         WHERE c.tenant_id = r.tenant_id AND c.commit_id = r.commit_id), 0), \
+               r.state, r.request_id, 1, r.error_code, r.error_message,\
+               r.created_at_unix_ms, r.updated_at_unix_ms \
+        FROM replications_v13 AS r",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| storage_error(format!("migration v14 replication insert failed: {error}")))?;
+
+    // Preserve old checkpoints in a temporary table while replacing the child table. This also
+    // avoids carrying a foreign key to replications_v13 into the current schema.
+    sqlx::query(
+        "CREATE TEMP TABLE replication_objects_migration AS \
+         SELECT tenant_id, replication_id, object_id, offset, state, retry_count, updated_at_unix_ms \
+         FROM replication_objects",
+    )
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+
+    sqlx::query("DROP TABLE replication_objects")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("DROP TABLE replications_v13")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    let replication_objects_schema = embedded_table_schema("replication_objects")?;
+    sqlx::raw_sql(&replication_objects_schema)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query(
+        "INSERT INTO replication_objects \
+         (tenant_id, replication_id, object_id, offset, state, retry_count, updated_at_unix_ms) \
+         SELECT tenant_id, replication_id, object_id, offset, state, retry_count, updated_at_unix_ms \
+         FROM replication_objects_migration",
+    )
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("DROP TABLE replication_objects_migration")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query("PRAGMA user_version = 14")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+/// Adds the artifact namespace used by the artifact-scoped Volume CAS. Existing v14 rows are
+/// intentionally left without a scope; they remain queryable for audit/retry but Central will
+/// fail closed before issuing a replication assignment for them.
+async fn migrate_schema_v14_to_v15(pool: &SqlitePool) -> CentralResult<()> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    // A test/upgrade fixture may have retained the companion table while rebuilding the v13
+    // replication tables. Recreate it so its foreign key points at the new `replications` table.
+    sqlx::query("DROP TABLE IF EXISTS replication_artifacts")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::raw_sql(
+        "CREATE TABLE replication_artifacts (\
+            tenant_id TEXT NOT NULL,\
+            replication_id TEXT NOT NULL,\
+            artifact_id TEXT NOT NULL,\
+            PRIMARY KEY (tenant_id, replication_id),\
+            FOREIGN KEY (tenant_id, replication_id)\
+                REFERENCES replications (tenant_id, replication_id) ON DELETE CASCADE\
+        ) STRICT;",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    sqlx::query("PRAGMA user_version = 15")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+/// Adds an atomic fence against duplicate active transfers for one Commit/target backend.
+async fn migrate_schema_v15_to_v16(pool: &SqlitePool) -> CentralResult<()> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    let duplicate_active_targets: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (\
+             SELECT 1 FROM replications \
+             WHERE state IN ('queued', 'planning', 'transferring', 'verifying') \
+             GROUP BY tenant_id, commit_id, target_backend_id HAVING count(*) > 1\
+         )",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    if duplicate_active_targets != 0 {
+        return Err(storage_corruption(
+            "cannot migrate authority with duplicate active Commit replication targets",
+        ));
+    }
+    sqlx::raw_sql(
+        "CREATE UNIQUE INDEX replications_active_target \
+         ON replications (tenant_id, commit_id, target_backend_id) \
+         WHERE state IN ('queued', 'planning', 'transferring', 'verifying');",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    sqlx::query("PRAGMA user_version = 16")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+fn embedded_table_schema(table: &str) -> CentralResult<String> {
+    schema_sql()
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .find_map(|statement| {
+            let (object_type, name) = schema_object(statement).ok()?;
+            (object_type == "table" && name == table).then(|| statement.to_owned())
+        })
+        .ok_or_else(|| {
+            storage_corruption(format!("embedded SQLite schema table {table} is missing"))
+        })
 }
 
 async fn validate_current_schema(pool: &SqlitePool) -> CentralResult<()> {

@@ -6,8 +6,8 @@
 > 能力状态、架构不变量和研究结论以 [`implementation-plan.md`](implementation-plan.md) 为准。
 > 面向用户的产品语义和验收主链路见
 > [`centralized-agent-product.md`](centralized-agent-product.md)。
-> Synapse Gateway 的专项目标架构见
-> [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。
+> NeoEngram Gateway 的专项目标架构见
+> [`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md)。
 
 ## 当前基线
 
@@ -57,7 +57,7 @@
 | R4 | 进行中 | H2 全双工 Agent session、Job delivery、重连、运行时 mTLS 和有界背压已实现；生产凭据轮换、Ingress 断流矩阵待完成 | A1 / A2 |
 | R5 | 已完成 | Volume-local Chunk CAS、ObjectPlacement evidence 和端到端 Managed Add；Server 零 payload | P2 / A4 |
 | R6 | 后续 | 中心 Commit/Ref CAS、固定 Snapshot 和 DatasetProfile | P1 / P2 |
-| G0 | 已完成 | 冻结 Synapse Gateway 专项架构、权威边界、切换策略和阶段验收 | Gateway docs |
+| G0 | 已完成 | 冻结 NeoEngram Gateway 专项架构、权威边界、切换策略和阶段验收 | Gateway docs |
 | G1 | 进行中 | Gateway Registry、管理面、H2+mTLS 实际隧道、RouteLease、命令签名、入队前最多一次 peer fallback/入队后仅 outbox 重投边界已完成；loopback listener/H2/peer harness 已通过，完整 Central/Registry/outbox/签名双 Replica E2E、外部生产凭据、真实集群 readiness/failover 与一次性切换待完成 | Gateway control |
 | G2 | 后续 | TransferRoute/Ticket/Session；源 Agent -> 源 Gateway -> 目标 Gateway -> 目标 Agent，Server 零 payload | Gateway data |
 | G3 | 后续 | 固定 Commit/Snapshot 的只读 S3：SigV4、LIST/HEAD/GET/Range | Gateway S3 |

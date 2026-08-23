@@ -334,6 +334,25 @@ impl RegistryAgentApiHandler {
         if request.payload.report.header.session_generation != Some(generation) {
             return Err(AgentHttpError::session_fenced());
         }
+        if let ControlMessage::ReplicationReport(report) = &request.payload.report.body {
+            let result = self
+                .require_control()?
+                .receive_replication_report(
+                    &request.payload.tenant_id,
+                    &request.agent_id,
+                    generation,
+                    report.as_ref().clone(),
+                )
+                .await
+                .map_err(map_registry_error)?;
+            return encode(&AgentActionAcceptedResponse {
+                wire_version: CURRENT_WIRE_VERSION,
+                request_id: request.request_id,
+                resource_version: result.resource_version,
+                replayed: result.replayed,
+                extensions: Extensions::new(),
+            });
+        }
         let report = match request.payload.report.body {
             ControlMessage::Accepted(value) => crate::AgentReport::Accepted(value),
             ControlMessage::Progress(value) => crate::AgentReport::Progress(value),
@@ -861,6 +880,24 @@ impl RegistryAgentApiHandler {
                         extensions: Extensions::new(),
                     }));
                 }
+                if let ControlMessage::ReplicationReport(report) = &payload.report.body {
+                    let result = self
+                        .require_control()?
+                        .receive_replication_report(
+                            &payload.tenant_id,
+                            &context.agent_id,
+                            context.session_generation,
+                            report.as_ref().clone(),
+                        )
+                        .await
+                        .map_err(map_registry_error)?;
+                    return Ok(AppliedChannelFrame::Continue(AgentChannelAck {
+                        acknowledged_sequence: sequence,
+                        resource_version: result.resource_version,
+                        replayed: result.replayed,
+                        extensions: Extensions::new(),
+                    }));
+                }
                 let report = match &payload.report.body {
                     ControlMessage::Accepted(value) => crate::AgentReport::Accepted(value.clone()),
                     ControlMessage::Progress(value) => crate::AgentReport::Progress(value.clone()),
@@ -979,6 +1016,10 @@ impl RegistryAgentApiHandler {
                 ControlMessage::LifecycleAssignment(value) => (
                     AgentChannelDownstreamMessage::LifecycleAssignment(value),
                     ChannelDeliveryPolicy::OncePerConnection,
+                ),
+                ControlMessage::ReplicationAssignment(value) => (
+                    AgentChannelDownstreamMessage::ReplicationAssignment(value),
+                    ChannelDeliveryPolicy::RedeliverAfter(AGENT_CHANNEL_REDELIVERY_INTERVAL),
                 ),
                 ControlMessage::Decision(value) => (
                     AgentChannelDownstreamMessage::Decision(value),
@@ -1135,6 +1176,7 @@ impl RegistryAgentApiHandler {
             AgentChannelDownstreamMessage::Assignment(_)
                 | AgentChannelDownstreamMessage::Decision(_)
                 | AgentChannelDownstreamMessage::LifecycleAssignment(_)
+                | AgentChannelDownstreamMessage::ReplicationAssignment(_)
         ) {
             return Ok(());
         }

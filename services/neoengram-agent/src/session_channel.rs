@@ -9,7 +9,7 @@ use bytes::Bytes;
 use neoengram_domain::protocol::{
     AgentChannelDownstreamFrame, AgentChannelNdjsonDecoder, AgentChannelUpstreamFrame,
     AgentResourceLifecycleAssignment, AssignmentOperation, JobAssignment, JobDecision,
-    SessionGeneration, TenantId,
+    ReplicationAssignment, SessionGeneration, TenantId,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -139,6 +139,7 @@ pub(crate) fn spawn_response_reader(
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum AgentWork {
     Assignment(JobAssignment),
+    Replication(ReplicationAssignment),
     Lifecycle(AgentResourceLifecycleAssignment),
     Recovery(LedgerRecord),
     Decision(JobDecision),
@@ -152,6 +153,7 @@ impl AgentWork {
                 AssignmentOperation::WorkspaceMaterialize { input, .. } => input.job_id.to_string(),
                 AssignmentOperation::SnapshotDelivery { input, .. } => input.job_id.to_string(),
             },
+            Self::Replication(assignment) => format!("replication:{}", assignment.replication_id),
             Self::Lifecycle(assignment) => {
                 // Every phase and retry in one deletion batch mutates the same durable
                 // quarantine journal. Keep those commands ordered even when Central redelivers
@@ -307,6 +309,7 @@ async fn execute_fenced_work(
     }
     match item.work {
         AgentWork::Assignment(assignment) => processor.handle_assignment(assignment).await,
+        AgentWork::Replication(assignment) => processor.handle_replication(assignment).await,
         AgentWork::Lifecycle(assignment) => {
             if assignment.session_generation != item.generation {
                 return Err(AgentDaemonError::Session(

@@ -806,6 +806,7 @@ assertSameMembers(
     "storage.enrollment.review",
     "artifact.read",
     "artifact.create",
+    "artifact.commit.replicate",
     "project.read",
     "project.create",
     "playground.read",
@@ -828,13 +829,14 @@ const advertisedCapabilities = resolveRef(
 ).content["application/json"].example.capabilities;
 assert(
   [
+    "artifact_commit_replication",
     "commit_layout_selection_v2",
     "snapshot_delivery_fuse_v2",
     "snapshot_delivery_copy_v2",
     "snapshot_delivery_hardlink_v2",
     "resource_lifecycle_v1",
   ].every((capability) => advertisedCapabilities.includes(capability)),
-  "version query example must advertise the new Commit and SnapshotDelivery capabilities",
+  "version query example must advertise the new Commit replication and SnapshotDelivery capabilities",
 );
 
 assertSameMembers(

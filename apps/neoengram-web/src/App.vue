@@ -3,7 +3,7 @@ import {
   Box,
   Close,
   Collection,
-  Coin,
+  Connection,
   DataAnalysis,
   Delete,
   DocumentCopy,
@@ -118,8 +118,8 @@ const navGroups = computed(() => {
       items: [
         {
           name: 'storage-volume-list',
-          label: '存储资源',
-          icon: Coin,
+          label: '集群与存储',
+          icon: Connection,
           params: { tenantId },
         },
       ],

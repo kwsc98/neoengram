@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::core::{ContentDigest, LogicalPath};
+use crate::core::{ContentDigest, LogicalPath, ObjectId};
 use schemars::JsonSchema;
 use serde::{de, Deserialize, Deserializer, Serialize};
 
@@ -10,14 +10,17 @@ use super::validation::{
 };
 use crate::{
     AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
-    CommitDataLayout, ComputeNodeId, DecimalU64, DecisionGeneration, DeletionId, EdgeClusterId,
-    Envelope, Extensions, FencingToken, JobId, LeaseId, LifecycleAssignmentId, LifecycleGeneration,
-    MetadataBatchDescriptor, MountGeneration, OwnerGeneration, PlacementGeneration, PrincipalId,
-    ProjectId, ProtocolError, ProtocolResult, ProtocolVersion, RequestId, ResourceLifecycleAction,
+    CommitDataLayout, CommitId, ComputeNodeId, DecimalU64, DecisionGeneration, DeletionId,
+    EdgeClusterId, Envelope, Extensions, FencingToken, JobId, LeaseId, LifecycleAssignmentId,
+    LifecycleGeneration, MetadataBatchDescriptor, MountGeneration, ObjectSet, OwnerGeneration,
+    PlacementGeneration, PrincipalId, ProjectId, ProtocolError, ProtocolResult, ProtocolVersion,
+    ReplicationId, ReplicationObjectState, ReplicationState, RequestId, ResourceLifecycleAction,
     ResourceLifecycleAssignment, ResourceRef, ResourceVersion, SessionGeneration,
-    SnapshotDeliveryAssignment, SnapshotId, StorageVolumeId, TenantId, TraceId, UnixMillis,
-    VolumeMarkerId, WireIndexVersion, AGENT_JOB_REPORT_ACTION, AGENT_PROTOCOL_ERROR_ACTION,
-    CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
+    SignedTransferTicket, SnapshotDeliveryAssignment, SnapshotId, StorageVolumeId, TenantId,
+    TraceId, UnixMillis, VolumeMarkerId, WireIndexVersion, AGENT_JOB_REPORT_ACTION,
+    AGENT_PROTOCOL_ERROR_ACTION, AGENT_REPLICATION_ASSIGNMENT_ACTION,
+    AGENT_REPLICATION_REPORT_ACTION, CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES,
+    MAX_RECORDS_PER_PAGE,
 };
 
 /// Returns the action identity that must accompany a control message body.
@@ -35,6 +38,8 @@ pub fn control_action(message: &ControlMessage) -> &'static str {
         ControlMessage::Decision(_) => crate::AGENT_JOB_DECISION_ACTION,
         ControlMessage::LifecycleAssignment(_) => crate::AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
         ControlMessage::LifecycleReport(_) => AGENT_JOB_REPORT_ACTION,
+        ControlMessage::ReplicationAssignment(_) => AGENT_REPLICATION_ASSIGNMENT_ACTION,
+        ControlMessage::ReplicationReport(_) => AGENT_REPLICATION_REPORT_ACTION,
         ControlMessage::Error(_) => AGENT_PROTOCOL_ERROR_ACTION,
     }
 }
@@ -127,6 +132,8 @@ pub fn decode_control_envelope(bytes: &[u8]) -> ProtocolResult<Envelope<ControlM
             | crate::AGENT_JOB_DECISION_ACTION
             | crate::AGENT_LIFECYCLE_ASSIGNMENT_ACTION
             | AGENT_JOB_REPORT_ACTION
+            | AGENT_REPLICATION_ASSIGNMENT_ACTION
+            | AGENT_REPLICATION_REPORT_ACTION
             | AGENT_PROTOCOL_ERROR_ACTION
             | "agent.hello"
             | "agent.heartbeat"
@@ -177,6 +184,10 @@ pub enum ControlMessage {
     LifecycleAssignment(Box<AgentResourceLifecycleAssignment>),
     #[serde(rename = "resource.lifecycle.report")]
     LifecycleReport(Box<ResourceLifecycleReport>),
+    #[serde(rename = "replication.assignment")]
+    ReplicationAssignment(Box<ReplicationAssignment>),
+    #[serde(rename = "replication.report")]
+    ReplicationReport(Box<ReplicationProgressReport>),
     #[serde(rename = "protocol.error")]
     Error(ControlError),
 }
@@ -197,6 +208,8 @@ impl ControlMessage {
                 | "job.finalized"
                 | "resource.lifecycle.assignment"
                 | "resource.lifecycle.report"
+                | "replication.assignment"
+                | "replication.report"
                 | "protocol.error"
         )
     }
@@ -214,6 +227,8 @@ impl ControlMessage {
             Self::Finalized(message) => message.validate(),
             Self::LifecycleAssignment(message) => message.validate(),
             Self::LifecycleReport(message) => message.validate(),
+            Self::ReplicationAssignment(message) => message.validate(),
+            Self::ReplicationReport(message) => message.validate(),
             Self::Error(message) => message.validate(),
         }
     }
@@ -863,6 +878,248 @@ impl JobAssignment {
     pub fn validate(&self) -> ProtocolResult<()> {
         self.assignment.validate()?;
         validate_extension_keys(&self.extensions, &["assignment"])
+    }
+}
+
+/// Central's immutable command for one fenced Commit object replication attempt.
+///
+/// The signed ticket binds the physical source/target route and expiry. The ObjectSet is carried
+/// alongside it so an Agent can execute without consulting Central during a reconnect; validation
+/// requires both representations to describe exactly the same object identities and digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationAssignment {
+    pub replication_id: ReplicationId,
+    pub tenant_id: TenantId,
+    /// Artifact namespace bound by the Central-signed transfer ticket.
+    pub artifact_id: ArtifactId,
+    pub commit_id: CommitId,
+    pub attempt: u64,
+    pub signed_ticket: SignedTransferTicket,
+    pub object_set: ObjectSet,
+    #[serde(default, flatten)]
+    pub extensions: Extensions,
+}
+
+impl ReplicationAssignment {
+    pub fn validate(&self) -> ProtocolResult<()> {
+        if self.attempt == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "attempt",
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        self.signed_ticket.validate()?;
+        self.object_set.validate()?;
+        let ticket = self.signed_ticket.as_ticket();
+        if ticket.tenant_id != self.tenant_id {
+            return Err(ProtocolError::InvalidField {
+                field: "tenant_id",
+                reason: "does not match the signed transfer ticket".to_owned(),
+            });
+        }
+        if ticket.artifact_id != self.artifact_id {
+            return Err(ProtocolError::InvalidField {
+                field: "artifact_id",
+                reason: "does not match the signed transfer ticket".to_owned(),
+            });
+        }
+        if ticket.commit_id != self.commit_id {
+            return Err(ProtocolError::InvalidField {
+                field: "commit_id",
+                reason: "does not match the signed transfer ticket".to_owned(),
+            });
+        }
+        if ticket.object_set_digest != self.object_set.object_set_digest {
+            return Err(ProtocolError::InvalidDigest(
+                "ObjectSet digest does not match the signed transfer ticket".to_owned(),
+            ));
+        }
+        let mut allowed = self
+            .object_set
+            .objects
+            .iter()
+            .map(|object| object.object_id)
+            .collect::<Vec<_>>();
+        allowed.sort_unstable();
+        if ticket.allowed_objects != allowed {
+            return Err(ProtocolError::InvalidField {
+                field: "signed_ticket.allowed_objects",
+                reason: "does not match the assigned ObjectSet".to_owned(),
+            });
+        }
+        let total_bytes = self.object_set.total_bytes()?;
+        if total_bytes > ticket.max_bytes.get() {
+            return Err(ProtocolError::InvalidField {
+                field: "object_set",
+                reason: "total bytes exceed the signed transfer ticket limit".to_owned(),
+            });
+        }
+        validate_extension_keys(
+            &self.extensions,
+            &[
+                "replication_id",
+                "tenant_id",
+                "artifact_id",
+                "commit_id",
+                "attempt",
+                "signed_ticket",
+                "object_set",
+            ],
+        )
+    }
+}
+
+/// Durable Agent-to-Central checkpoint emitted while executing a ReplicationAssignment.
+///
+/// State events carry aggregate counters, object events carry the last fsync-confirmed byte
+/// boundary, and Published is the final publication fence. The attempt is repeated on every
+/// event so Central can reject reports from a superseded retry without consulting Agent state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    tag = "event",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ReplicationProgressReport {
+    State {
+        replication_id: ReplicationId,
+        tenant_id: TenantId,
+        attempt: u64,
+        state: ReplicationState,
+        completed_objects: u64,
+        completed_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issue_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issue_message: Option<String>,
+        #[serde(default, flatten)]
+        extensions: Extensions,
+    },
+    Object {
+        replication_id: ReplicationId,
+        tenant_id: TenantId,
+        attempt: u64,
+        object_id: ObjectId,
+        offset: u64,
+        state: ReplicationObjectState,
+        #[serde(default, flatten)]
+        extensions: Extensions,
+    },
+    Published {
+        replication_id: ReplicationId,
+        tenant_id: TenantId,
+        attempt: u64,
+        commit_id: CommitId,
+        object_set_digest: ContentDigest,
+        #[serde(default, flatten)]
+        extensions: Extensions,
+    },
+}
+
+impl ReplicationProgressReport {
+    #[must_use]
+    pub fn replication_id(&self) -> &ReplicationId {
+        match self {
+            Self::State { replication_id, .. }
+            | Self::Object { replication_id, .. }
+            | Self::Published { replication_id, .. } => replication_id,
+        }
+    }
+
+    #[must_use]
+    pub fn tenant_id(&self) -> &TenantId {
+        match self {
+            Self::State { tenant_id, .. }
+            | Self::Object { tenant_id, .. }
+            | Self::Published { tenant_id, .. } => tenant_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn attempt(&self) -> u64 {
+        match self {
+            Self::State { attempt, .. }
+            | Self::Object { attempt, .. }
+            | Self::Published { attempt, .. } => *attempt,
+        }
+    }
+
+    pub fn validate(&self) -> ProtocolResult<()> {
+        let (replication_id, tenant_id, attempt) = match self {
+            Self::State {
+                replication_id,
+                tenant_id,
+                attempt,
+                issue_code,
+                issue_message,
+                ..
+            } => {
+                if let Some(code) = issue_code {
+                    validate_nonempty_limited("issue_code", code, 128)?;
+                }
+                if let Some(message) = issue_message {
+                    validate_nonempty_limited("issue_message", message, 4096)?;
+                }
+                (replication_id, tenant_id, attempt)
+            }
+            Self::Object {
+                replication_id,
+                tenant_id,
+                attempt,
+                ..
+            } => (replication_id, tenant_id, attempt),
+            Self::Published {
+                replication_id,
+                tenant_id,
+                attempt,
+                ..
+            } => (replication_id, tenant_id, attempt),
+        };
+        if *attempt == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "attempt",
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        let _ = (replication_id, tenant_id);
+        match self {
+            Self::State { extensions, .. } => validate_extension_keys(
+                extensions,
+                &[
+                    "replication_id",
+                    "tenant_id",
+                    "attempt",
+                    "state",
+                    "completed_objects",
+                    "completed_bytes",
+                    "issue_code",
+                    "issue_message",
+                ],
+            ),
+            Self::Object { extensions, .. } => validate_extension_keys(
+                extensions,
+                &[
+                    "replication_id",
+                    "tenant_id",
+                    "attempt",
+                    "object_id",
+                    "offset",
+                    "state",
+                ],
+            ),
+            Self::Published { extensions, .. } => validate_extension_keys(
+                extensions,
+                &[
+                    "replication_id",
+                    "tenant_id",
+                    "attempt",
+                    "commit_id",
+                    "object_set_digest",
+                ],
+            ),
+        }
     }
 }
 

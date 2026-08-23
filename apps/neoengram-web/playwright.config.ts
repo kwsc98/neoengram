@@ -30,10 +30,10 @@ export default defineConfig({
   },
   webServer: {
     command:
-      `SYNAPSE_WEB_E2E_GATEWAY=1 VITE_E2E_GATEWAY_MOCKS=true ` +
+      `NEOENGRAM_WEB_E2E_GATEWAY=1 VITE_E2E_GATEWAY_MOCKS=true ` +
       `VITE_GATEWAY_ENDPOINT=http://127.0.0.1:${gatewayAgentPort} ` +
       `VITE_S3_ENDPOINT=http://127.0.0.1:${webPort} npx vite build --mode mock && ` +
-      `cargo run -p synapse-gateway --offline -- ` +
+      `cargo run -p neoengram-gateway --offline -- ` +
       `--edge-cluster-id edge-playwright ` +
       `--gateway-pool-id pool-playwright ` +
       `--gateway-replica-id replica-playwright ` +

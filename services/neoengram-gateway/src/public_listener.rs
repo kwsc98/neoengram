@@ -313,7 +313,7 @@ where
         return Ok(json_response(
             StatusCode::OK,
             serde_json::json!({
-                "service": "synapse-gateway",
+                "service": "neoengram-gateway",
                 "listener": "public",
                 "status": "live"
             }),
@@ -330,7 +330,7 @@ where
             json_response(
                 StatusCode::OK,
                 serde_json::json!({
-                    "service": "synapse-gateway",
+                    "service": "neoengram-gateway",
                     "listener": "public",
                     "status": "ready",
                     "centralConfigured": state.central_upstream.is_some()

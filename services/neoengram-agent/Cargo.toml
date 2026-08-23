@@ -5,6 +5,7 @@ publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -26,6 +27,7 @@ hyper = { version = "1.11", features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 neoengram-domain.workspace = true
 neoengram-runtime.workspace = true
+quinn.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }
 ring = "0.17.14"
 rusqlite.workspace = true

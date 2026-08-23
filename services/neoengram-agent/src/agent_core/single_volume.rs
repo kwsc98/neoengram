@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use neoengram_domain::protocol::{
     AddAssignment, AgentBootId, AgentId, AgentInstallationId, AgentMountId,
-    AgentMountIdentityDigest, AgentMountStatusReport, AgentResourceLifecycleAssignment,
+    AgentMountIdentityDigest, AgentMountStatusReport, AgentResourceLifecycleAssignment, DecimalU64,
     EdgeClusterId, Extensions, MountAccessMode, MountGeneration, OwnerGeneration, ResourceHealth,
     SequenceNumber, SessionGeneration, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId,
 };
@@ -143,6 +143,7 @@ impl SingleVolumeAgentConfig {
                 mount_identity_digest: probe.mount_identity_digest,
                 access_mode: probe.access_mode,
                 health,
+                available_bytes: DecimalU64::new(probe.available_bytes),
                 observed_at_unix_ms: probe.observed_at_unix_ms,
                 extensions: Extensions::new(),
             },
@@ -224,6 +225,7 @@ pub struct SingleVolumeMountProbe {
     pub mount_identity_digest: AgentMountIdentityDigest,
     pub access_mode: MountAccessMode,
     pub health: ResourceHealth,
+    pub available_bytes: u64,
     pub observed_at_unix_ms: UnixMillis,
 }
 
@@ -318,6 +320,7 @@ mod tests {
             ),
             access_mode: MountAccessMode::ReadWrite,
             health: ResourceHealth::Ready,
+            available_bytes: 1_000_000,
             observed_at_unix_ms: UnixMillis::new(100),
         }
     }

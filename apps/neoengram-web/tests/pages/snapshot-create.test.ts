@@ -94,7 +94,11 @@ async function mountPage() {
         component: SnapshotCreatePage,
       },
       { path: '/artifact', name: 'artifact-detail', component: { template: '<div />' } },
-      { path: '/snapshot/:snapshotId', name: 'snapshot-detail', component: { template: '<div />' } },
+      {
+        path: '/snapshot/:snapshotId',
+        name: 'snapshot-detail',
+        component: { template: '<div />' },
+      },
     ],
   });
   await router.push(

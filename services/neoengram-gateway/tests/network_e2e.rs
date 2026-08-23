@@ -90,7 +90,7 @@ impl GatewayProcess {
         // instead of treating a bind collision as a Gateway protocol failure.
         for attempt in 0..8 {
             let ports = GatewayPorts::allocate();
-            let child = Command::new(env!("CARGO_BIN_EXE_synapse-gateway"))
+            let child = Command::new(env!("CARGO_BIN_EXE_neoengram-gateway"))
                 .args([
                     "--edge-cluster-id",
                     EDGE_CLUSTER_ID,
@@ -105,7 +105,7 @@ impl GatewayProcess {
                     "--peer-listen",
                     &GatewayPorts::address(ports.peer).to_string(),
                     "--log",
-                    "synapse_gateway=error",
+                    "neoengram_gateway=error",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

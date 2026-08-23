@@ -14,8 +14,8 @@ use neoengram_domain::core::{
     Manifest, ObjectId, ObjectSpec,
 };
 use neoengram_domain::protocol::{
-    AddAssignment, AgentId, AgentMountId, DecimalU64, Extensions, IndexDeltaRecord, JobDecision,
-    ManifestRecord, MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage,
+    AddAssignment, AgentId, AgentMountId, ArtifactId, DecimalU64, Extensions, IndexDeltaRecord,
+    JobDecision, ManifestRecord, MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage,
     MetadataBatchRecords, MetadataBatchScope, MountGeneration, ObjectReceiptId,
     ObjectReceiptRecord, OwnerGeneration, S3ReadTicket, SnapshotDeliveryAssignment,
     StorageVolumeId, TenantId, UnixMillis, WireChunkRef, WireChunkingStrategy,
@@ -29,6 +29,7 @@ use neoengram_runtime::engine::{
 use neoengram_runtime::fs::{
     rename_no_replace, sync_directory, LocalWorktree, LooseObjectStore, SystemClock, VerifiedRoot,
 };
+use neoengram_runtime::VolumeCasBackend;
 
 /// FastCDC's configured maximum chunk size and the maximum durable loose-object size.
 pub const MAX_AGENT_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
@@ -779,6 +780,21 @@ impl FilesystemExecution {
     /// Creates and validates the Volume-owned CAS root before the Agent becomes ready.
     pub fn initialize(&self) -> AgentResult<()> {
         self.volume_objects_root().map(|_| ())
+    }
+
+    /// Opens the physical CAS namespace used by Commit replication for this Agent's Volume.
+    ///
+    /// Managed Add already stores objects below the artifact-scoped path on disk.  Replication
+    /// uses the same path through the runtime's placement backend, so a copied object is visible
+    /// to normal checkout/S3 readers only after the Central PlacementSet publication fence.
+    pub fn replication_backend(
+        &self,
+        tenant_id: TenantId,
+        artifact_id: ArtifactId,
+    ) -> AgentResult<VolumeCasBackend> {
+        let root = self.volume_objects_root()?;
+        VolumeCasBackend::open_or_create_artifact_scoped(root.as_path(), tenant_id, artifact_id)
+            .map_err(AgentError::from)
     }
 
     fn worktree(&self, assignment: &AddAssignment) -> AgentResult<LocalWorktree> {

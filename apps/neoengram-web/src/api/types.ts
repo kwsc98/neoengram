@@ -15,6 +15,10 @@ export type QueryTenantResponse = components['schemas']['QueryTenantResponse'];
 export type CreateTenantRequest = components['schemas']['CreateTenantRequest'];
 export type CreateTenantResponse = components['schemas']['CreateTenantResponse'];
 export type TenantView = components['schemas']['TenantView'];
+export type QueryGatewayPoolListRequest = components['schemas']['QueryGatewayPoolListRequest'];
+export type QueryGatewayPoolListResponse = components['schemas']['GatewayPoolListResponse'];
+export type GatewayPoolView = components['schemas']['GatewayPoolView'];
+export type GatewayPoolState = components['schemas']['GatewayPoolState'];
 export type QueryStorageVolumeListRequest = components['schemas']['QueryStorageVolumeListRequest'];
 export type QueryStorageVolumeListResponse =
   components['schemas']['QueryStorageVolumeListResponse'];
@@ -141,6 +145,25 @@ export type CreateCommitReplicationResponse =
 export type QueryCommitReplicationRequest = components['schemas']['QueryCommitReplicationRequest'];
 export type QueryCommitReplicationResponse =
   components['schemas']['QueryCommitReplicationResponse'];
+export type QueryCommitReplicationTicketRequest =
+  components['schemas']['QueryCommitReplicationTicketRequest'];
+export type QueryCommitReplicationTicketResponse =
+  components['schemas']['QueryCommitReplicationTicketResponse'];
+export type QueryCommitReplicationListRequest =
+  components['schemas']['QueryCommitReplicationListRequest'];
+export type QueryCommitReplicationListResponse =
+  components['schemas']['QueryCommitReplicationListResponse'];
+export type QueryCommitPlacementListRequest =
+  components['schemas']['QueryCommitPlacementListRequest'];
+export type QueryCommitPlacementListResponse =
+  components['schemas']['QueryCommitPlacementListResponse'];
+export type RetryCommitReplicationRequest = components['schemas']['RetryCommitReplicationRequest'];
+export type RetryCommitReplicationResponse =
+  components['schemas']['RetryCommitReplicationResponse'];
+export type CancelCommitReplicationRequest =
+  components['schemas']['CancelCommitReplicationRequest'];
+export type CancelCommitReplicationResponse =
+  components['schemas']['CancelCommitReplicationResponse'];
 export type QueryCommitAvailabilityRequest =
   components['schemas']['QueryCommitAvailabilityRequest'];
 export type QueryCommitAvailabilityResponse =

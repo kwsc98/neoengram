@@ -8,7 +8,7 @@ command -v rg >/dev/null || fail "ripgrep is required"
 
 rg -q '^members = \["crates/\*", "services/\*", "apps/neoengram-cli"\]$' Cargo.toml || fail "workspace layout changed"
 metadata="$(cargo metadata --no-deps --format-version 1 --locked)"
-expected=$'neoengram\nneoengram-agent\nneoengram-central\nneoengram-domain\nneoengram-runtime\nsynapse-gateway'
+expected=$'neoengram\nneoengram-agent\nneoengram-central\nneoengram-domain\nneoengram-gateway\nneoengram-runtime'
 actual="$(jq -r '.packages[].name' <<<"$metadata" | sort)"
 [[ "$actual" == "$expected" ]] || { printf '%s\n' "$actual" >&2; fail "legacy package remains in workspace"; }
 
@@ -25,7 +25,7 @@ deps() {
 [[ "$(deps neoengram-runtime)" == "neoengram-domain" ]] || fail "runtime must depend only on domain"
 [[ "$(deps neoengram-agent)" == $'neoengram-domain\nneoengram-runtime' ]] || fail "agent boundary changed"
 [[ "$(deps neoengram-central)" == $'neoengram-domain\nneoengram-runtime' ]] || fail "central must be canonical"
-[[ "$(deps synapse-gateway)" == "neoengram-domain" ]] || fail "gateway must depend only on domain"
+[[ "$(deps neoengram-gateway)" == "neoengram-domain" ]] || fail "gateway must depend only on domain"
 
 jq -e '.packages[] | select(.name == "neoengram-central") |
   any(.targets[]; .name == "neoengram-central" and (.kind | index("bin")))' <<<"$metadata" >/dev/null ||
@@ -70,7 +70,7 @@ if [[ "$controller_routes" != "$registry_routes" ]]; then
 fi
 
 test -f apps/neoengram-cli/Cargo.toml || fail "CLI must live under apps/neoengram-cli"
-if rg -n '\b(sqlx|rusqlite|fusen|neoengram-server|neoengramd)\b' services/synapse-gateway/src services/synapse-gateway/Cargo.toml; then
+if rg -n '\b(sqlx|rusqlite|fusen|neoengram-server|neoengramd)\b' services/neoengram-gateway/src services/neoengram-gateway/Cargo.toml; then
   fail "Gateway must not own Central storage or HTTP business adapters"
 fi
 if rg -n 'agent_bind|AgentMessageListQuery|message-list' deploy docs crates services apps; then

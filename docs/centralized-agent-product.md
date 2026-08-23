@@ -1,6 +1,6 @@
 # NeoEngram 中心化 Agent 产品定义
 
-> 状态：基于 2026-08-03 OpenAPI v1 收敛 P0 产品口径，并于 2026-08-09 纳入 Synapse Gateway
+> 状态：基于 2026-08-03 OpenAPI v1 收敛 P0 产品口径，并于 2026-08-09 纳入 NeoEngram Gateway
 > 目标拓扑；公开契约是 P0 Web 的权威边界。
 >
 > 适用对象：产品、设计、前端、OpenAPI、`neoengram-central`、Agent 和测试团队。
@@ -15,7 +15,7 @@
 生产与交付流程。技术权威边界和实现细节见
 [`agent-central-control.md`](agent-central-control.md)，能力状态和研发顺序见
 [`implementation-plan.md`](implementation-plan.md)。Gateway 的专项权威边界见
-[`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。
+[`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md)。
 
 ## 1. 产品定位
 

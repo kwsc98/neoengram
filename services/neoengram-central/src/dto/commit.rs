@@ -36,6 +36,62 @@ pub struct QueryArtifactCommitGraphResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
+pub struct QueryArtifactCommitDiffRequest {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub artifact_id: String,
+    pub commit_id: String,
+    #[serde(default)]
+    pub base_commit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryArtifactCommitDiffResponse {
+    pub diff: CommitDiffView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct CommitDiffView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<CommitNodeView>,
+    pub target_commit: CommitNodeView,
+    pub summary: CommitDiffSummary,
+    pub changes: Vec<CommitDiffEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct CommitDiffSummary {
+    pub files_added: String,
+    pub files_modified: String,
+    pub files_deleted: String,
+    pub files_renamed: String,
+    pub bytes_added: String,
+    pub bytes_removed: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct CommitDiffEntry {
+    pub change_type: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_size_bytes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_size_bytes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
 pub struct CommitGraphView {
     pub graph_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]

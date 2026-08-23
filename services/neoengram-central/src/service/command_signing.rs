@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 use async_trait::async_trait;
 use neoengram_domain::protocol::{
     CentralSignedPayload, CertificateGeneration, ContentDigest, Ed25519PublicKeySpki,
-    Ed25519Signature, Extensions, GatewayOpaqueBytes, UnixMillis,
+    Ed25519Signature, Extensions, GatewayOpaqueBytes, SignedTransferTicket, TransferTicket,
+    UnixMillis,
 };
 use thiserror::Error;
 
@@ -387,6 +388,44 @@ impl CentralCommandKeyring {
             .verify(verification_key.public_key_spki())
             .map_err(|_| CentralCommandSecurityError::SignerResponseMismatch)?;
         Ok(signed)
+    }
+
+    /// Signs one immutable transfer capability using the same key lifecycle and TTL checks as
+    /// Central-to-Agent control commands. The ticket bytes are the signed payload, so a receiver
+    /// can reject any endpoint, generation, ObjectSet, or byte-limit mutation before opening QUIC.
+    pub async fn sign_transfer_ticket(
+        &self,
+        ticket: TransferTicket,
+        signed_at_unix_ms: UnixMillis,
+        ttl_ms: u64,
+    ) -> Result<SignedTransferTicket, CentralCommandSecurityError> {
+        let payload = SignedTransferTicket::payload_bytes(&ticket).map_err(|error| {
+            CentralCommandSecurityError::InvalidSignedPayload(error.to_string())
+        })?;
+        let signed = self
+            .sign_with_ttl_ms(
+                GatewayOpaqueBytes::new(payload).map_err(|error| {
+                    CentralCommandSecurityError::InvalidSignedPayload(error.to_string())
+                })?,
+                signed_at_unix_ms,
+                ttl_ms,
+            )
+            .await?;
+        SignedTransferTicket::new(ticket, signed)
+            .map_err(|error| CentralCommandSecurityError::InvalidSignedPayload(error.to_string()))
+    }
+
+    pub fn verify_transfer_ticket(
+        &self,
+        ticket: &SignedTransferTicket,
+        now_unix_ms: UnixMillis,
+    ) -> Result<(), CentralCommandSecurityError> {
+        ticket.validate().map_err(|error| {
+            CentralCommandSecurityError::InvalidSignedPayload(error.to_string())
+        })?;
+        self.trust_bundle
+            .verify_at(&ticket.central_signature, now_unix_ms)
+            .map(|_| ())
     }
 
     #[must_use]

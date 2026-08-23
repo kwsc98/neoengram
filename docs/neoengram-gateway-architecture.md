@@ -1,4 +1,4 @@
-# Synapse Gateway 架构
+# NeoEngram Gateway 架构
 
 > 决策状态：**已确认的目标架构；G1 控制面正在实施，尚不可上线**。
 >
@@ -334,7 +334,7 @@ mTLS 保护每一跳，端到端 Ed25519 签名保护权威 payload：
 
 ## 7. 服务与部署边界
 
-新增 `services/synapse-gateway` 作为独立 binary。它只依赖 domain 以及网络、TLS、签名和观测
+新增 `services/neoengram-gateway` 作为独立 binary。它只依赖 domain 以及网络、TLS、签名和观测
 组件，不得依赖：
 
 - `neoengram-central` 的 Authority datasource/mapper；
@@ -471,7 +471,7 @@ S3 key 使用现有 `LogicalPath` 受限文件路径语义，拒绝空段、`.`�
 - 两个 Replica 下 Agent 可经任意入口建立唯一 RouteLease，Central 命令最多一跳到达 owner；
 - owner 退出后，在旧 Lease 失效前没有第二个活动 owner，之后 Agent 可用新 generation 恢复；
 - loopback 双 Replica listener/H2/peer 协议 harness 已通过
-  （`cargo test -p synapse-gateway --test network_e2e --locked --offline`）；该测试手工注入
+  （`cargo test -p neoengram-gateway --test network_e2e --locked --offline`）；该测试手工注入
   `RouteGranted`/`RouteFenced` 和未签名的转发 payload，不经过真实 Central Registry 的原子
   `acquire_agent_session_route`、durable outbox、命令签名或完整 report/finalize 业务链，不能作为完整双
   Replica 业务 E2E 证据；
@@ -491,7 +491,7 @@ forwarding 一跳命中/失败、队列使用率、H2 flow-control stall、帧�
 
 ## 13. 架构决策记录
 
-### 2026-08-09：Synapse Gateway 成为每集群固定入口
+### 2026-08-09：NeoEngram Gateway 成为每集群固定入口
 
 决定用每个 EdgeCluster 一个多副本 GatewayPool 统一承载 Central/Agent 控制连接，并作为后续跨集群
 传输和 S3 入口。此前“Agent 直接连接 Central”“Gateway 只是可选的 source Volume 只读端点”以及

@@ -31,6 +31,8 @@ import type {
   QueryArtifactListRequest,
   QueryArtifactListResponse,
   QueryArtifactResponse,
+  QueryGatewayPoolListRequest,
+  QueryGatewayPoolListResponse,
   QueryPlaygroundListRequest,
   QueryPlaygroundListResponse,
   QueryPlaygroundChangeListRequest,
@@ -76,6 +78,16 @@ import type {
   CreateCommitReplicationResponse,
   QueryCommitReplicationRequest,
   QueryCommitReplicationResponse,
+  QueryCommitReplicationTicketRequest,
+  QueryCommitReplicationTicketResponse,
+  QueryCommitReplicationListRequest,
+  QueryCommitReplicationListResponse,
+  QueryCommitPlacementListRequest,
+  QueryCommitPlacementListResponse,
+  RetryCommitReplicationRequest,
+  RetryCommitReplicationResponse,
+  CancelCommitReplicationRequest,
+  CancelCommitReplicationResponse,
   QueryCommitAvailabilityRequest,
   QueryCommitAvailabilityResponse,
   CreateWorkspaceRequest,
@@ -169,6 +181,17 @@ export async function createTenant(
 ): Promise<ApiResult<CreateTenantResponse>> {
   return unwrap(
     await apiClient.POST('/api/tenant/create', { body: request, params: versionHeader }),
+  );
+}
+
+export async function queryGatewayPoolList(
+  request: QueryGatewayPoolListRequest = {},
+): Promise<ApiResult<QueryGatewayPoolListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/gateway/pool/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
   );
 }
 
@@ -527,11 +550,69 @@ export async function queryCommitReplication(
   );
 }
 
+export async function queryCommitReplicationTicket(
+  request: QueryCommitReplicationTicketRequest,
+): Promise<ApiResult<QueryCommitReplicationTicketResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/replication/ticket/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryCommitReplicationList(
+  request: QueryCommitReplicationListRequest,
+): Promise<ApiResult<QueryCommitReplicationListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/replication/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryCommitPlacementList(
+  request: QueryCommitPlacementListRequest,
+): Promise<ApiResult<QueryCommitPlacementListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/placements/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function retryCommitReplication(
+  request: RetryCommitReplicationRequest,
+): Promise<ApiResult<RetryCommitReplicationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/replication/retry', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function cancelCommitReplication(
+  request: CancelCommitReplicationRequest,
+): Promise<ApiResult<CancelCommitReplicationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/replication/cancel', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
 export async function queryCommitAvailability(
   request: QueryCommitAvailabilityRequest,
 ): Promise<ApiResult<QueryCommitAvailabilityResponse>> {
   return unwrap(
-    await apiClient.POST('/api/commit/availability/query', { body: request, params: versionHeader }),
+    await apiClient.POST('/api/commit/availability/query', {
+      body: request,
+      params: versionHeader,
+    }),
   );
 }
 

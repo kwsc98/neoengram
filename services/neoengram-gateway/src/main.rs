@@ -52,7 +52,7 @@ use bootstrap::{
     validate_workload_trust_domain, BootstrapError, GatewayBootstrap, GatewayBootstrapConfig,
 };
 use peer::H2PeerForwarder;
-use transport_config::GatewayTransportConfig;
+use transport_config::{GatewayTransferTlsConfig, GatewayTransportConfig};
 #[cfg(test)]
 use tunnel::NDJSON_CONTENT_TYPE;
 use tunnel::{
@@ -64,7 +64,7 @@ const DEFAULT_CONTROL_LISTEN: &str = "0.0.0.0:8082";
 const DEFAULT_PEER_LISTEN: &str = "0.0.0.0:8083";
 const DEFAULT_CONSOLE_HOST: &str = "localhost";
 // Local development uses path-style S3 against the Gateway's loopback public listener. Production
-// deployments override this with their DNS name (or a literal IP) through SYNAPSE_GATEWAY_S3_HOST.
+// deployments override this with their DNS name (or a literal IP) through NEOENGRAM_GATEWAY_S3_HOST.
 const DEFAULT_S3_HOST: &str = "127.0.0.1";
 const DEFAULT_WEB_ROOT: &str = "apps/neoengram-web/dist";
 const DEFAULT_CENTRAL_UPSTREAM: &str = "http://127.0.0.1:8080";
@@ -82,115 +82,136 @@ const CONTROL_H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "synapse-gateway", version, about)]
+#[command(name = "neoengram-gateway", version, about)]
 struct GatewayConfig {
-    #[arg(long, env = "SYNAPSE_GATEWAY_EDGE_CLUSTER_ID")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_EDGE_CLUSTER_ID")]
     edge_cluster_id: String,
-    #[arg(long, env = "SYNAPSE_GATEWAY_POOL_ID")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_POOL_ID")]
     gateway_pool_id: String,
-    #[arg(long, env = "SYNAPSE_GATEWAY_REPLICA_ID")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_REPLICA_ID")]
     gateway_replica_id: String,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_AGENT_LISTEN",
+        env = "NEOENGRAM_GATEWAY_AGENT_LISTEN",
         default_value = DEFAULT_AGENT_LISTEN
     )]
     agent_listen: SocketAddr,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_CONTROL_LISTEN",
+        env = "NEOENGRAM_GATEWAY_CONTROL_LISTEN",
         default_value = DEFAULT_CONTROL_LISTEN
     )]
     control_listen: SocketAddr,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_PEER_LISTEN",
+        env = "NEOENGRAM_GATEWAY_PEER_LISTEN",
         default_value = DEFAULT_PEER_LISTEN
     )]
     peer_listen: SocketAddr,
     /// Optional QUIC object-transfer listener. Enabling this endpoint requires workload mTLS
     /// material even for loopback development, because TransferTicket is a bearer capability.
-    #[arg(long, env = "SYNAPSE_GATEWAY_TRANSFER_LISTEN")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_LISTEN")]
     transfer_listen: Option<SocketAddr>,
+    /// Selects which endpoint tuple this Gateway fences before relaying toward the source.
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_RELAY_ROLE")]
+    transfer_relay_role: Option<transfer_quic::TransferRelayRole>,
+    /// Static next QUIC hop toward the source: target Gateway to source Gateway, or source
+    /// Gateway to source Agent. The signed ticket never supplies this address.
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM")]
+    transfer_upstream: Option<SocketAddr>,
+    /// TLS ServerName expected from the configured transfer upstream.
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM_SERVER_NAME")]
+    transfer_upstream_server_name: Option<String>,
+    /// Optional current session generation for the endpoint selected by transfer_relay_role.
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_SESSION_GENERATION")]
+    transfer_session_generation: Option<u64>,
+    /// Optional current mount generation for the endpoint selected by transfer_relay_role.
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_MOUNT_GENERATION")]
+    transfer_mount_generation: Option<u64>,
+    /// Optional current route generation for the endpoint selected by transfer_relay_role.
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_ROUTE_GENERATION")]
+    transfer_route_generation: Option<u64>,
     /// Optional browser/S3 listener. Existing workload-only deployments remain unchanged until
     /// this address is configured explicitly.
-    #[arg(long, env = "SYNAPSE_GATEWAY_PUBLIC_LISTEN")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_PUBLIC_LISTEN")]
     public_listen: Option<SocketAddr>,
     /// Public TLS certificate for browser/S3 clients.  Workload mTLS files above are separate.
-    #[arg(long, env = "SYNAPSE_GATEWAY_PUBLIC_TLS_CERTIFICATE_FILE")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_PUBLIC_TLS_CERTIFICATE_FILE")]
     public_tls_certificate_file: Option<std::path::PathBuf>,
     /// Public TLS private key matching `public_tls_certificate_file`.
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_PUBLIC_TLS_PRIVATE_KEY_FILE",
+        env = "NEOENGRAM_GATEWAY_PUBLIC_TLS_PRIVATE_KEY_FILE",
         hide_env_values = true
     )]
     public_tls_private_key_file: Option<std::path::PathBuf>,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_CONSOLE_HOST",
+        env = "NEOENGRAM_GATEWAY_CONSOLE_HOST",
         default_value = DEFAULT_CONSOLE_HOST
     )]
     console_host: String,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_S3_HOST",
+        env = "NEOENGRAM_GATEWAY_S3_HOST",
         default_value = DEFAULT_S3_HOST
     )]
     s3_host: String,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_WEB_ROOT",
+        env = "NEOENGRAM_GATEWAY_WEB_ROOT",
         default_value = DEFAULT_WEB_ROOT
     )]
     web_root: std::path::PathBuf,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM",
+        env = "NEOENGRAM_GATEWAY_CENTRAL_API_UPSTREAM",
         default_value = DEFAULT_CENTRAL_UPSTREAM
     )]
     central_upstream: url::Url,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_S3_MAX_STREAMS",
+        env = "NEOENGRAM_GATEWAY_S3_MAX_STREAMS",
         default_value_t = DEFAULT_PUBLIC_MAX_STREAMS
     )]
     s3_max_streams: usize,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_MAX_CONNECTIONS_PER_LISTENER",
+        env = "NEOENGRAM_GATEWAY_MAX_CONNECTIONS_PER_LISTENER",
         default_value_t = 1024
     )]
     max_connections_per_listener: usize,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_MAX_IN_FLIGHT_REQUESTS_PER_LISTENER",
+        env = "NEOENGRAM_GATEWAY_MAX_IN_FLIGHT_REQUESTS_PER_LISTENER",
         default_value_t = 256
     )]
     max_in_flight_requests_per_listener: usize,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_MAX_REQUEST_BYTES",
+        env = "NEOENGRAM_GATEWAY_MAX_REQUEST_BYTES",
         default_value_t = MAX_CONFIGURED_REQUEST_BYTES
     )]
     max_request_bytes: usize,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_REQUEST_DEADLINE_MILLIS",
+        env = "NEOENGRAM_GATEWAY_REQUEST_DEADLINE_MILLIS",
         default_value_t = 10_000
     )]
     request_deadline_millis: u64,
     /// Long-lived SPIFFE trust domain used to bind every workload certificate.
-    #[arg(long, env = "SYNAPSE_GATEWAY_WORKLOAD_TRUST_DOMAIN")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_WORKLOAD_TRUST_DOMAIN")]
     workload_trust_domain: Option<String>,
     #[command(flatten)]
     transport: GatewayTransportConfig,
     #[command(flatten)]
+    transfer_transport: GatewayTransferTlsConfig,
+    #[command(flatten)]
     bootstrap: GatewayBootstrapConfig,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_LOG",
-        default_value = "synapse_gateway=info"
+        env = "NEOENGRAM_GATEWAY_LOG",
+        default_value = "neoengram_gateway=info"
     )]
     log: String,
     /// Signals the Gateway process to enter drain before Kubernetes sends SIGTERM.
@@ -198,7 +219,7 @@ struct GatewayConfig {
     pre_stop_drain: bool,
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_PRE_STOP_DRAIN_SECONDS",
+        env = "NEOENGRAM_GATEWAY_PRE_STOP_DRAIN_SECONDS",
         default_value_t = 20
     )]
     pre_stop_drain_seconds: u64,
@@ -207,11 +228,11 @@ struct GatewayConfig {
 impl GatewayConfig {
     fn validate(&self) -> Result<(), String> {
         neoengram_domain::protocol::EdgeClusterId::new(&self.edge_cluster_id)
-            .map_err(|error| format!("SYNAPSE_GATEWAY_EDGE_CLUSTER_ID is invalid: {error}"))?;
+            .map_err(|error| format!("NEOENGRAM_GATEWAY_EDGE_CLUSTER_ID is invalid: {error}"))?;
         neoengram_domain::protocol::GatewayPoolId::new(&self.gateway_pool_id)
-            .map_err(|error| format!("SYNAPSE_GATEWAY_POOL_ID is invalid: {error}"))?;
+            .map_err(|error| format!("NEOENGRAM_GATEWAY_POOL_ID is invalid: {error}"))?;
         neoengram_domain::protocol::GatewayReplicaId::new(&self.gateway_replica_id)
-            .map_err(|error| format!("SYNAPSE_GATEWAY_REPLICA_ID is invalid: {error}"))?;
+            .map_err(|error| format!("NEOENGRAM_GATEWAY_REPLICA_ID is invalid: {error}"))?;
         if self.agent_listen == self.control_listen
             || self.agent_listen == self.peer_listen
             || self.control_listen == self.peer_listen
@@ -229,6 +250,62 @@ impl GatewayConfig {
             .is_some_and(|transfer| self.public_listen.is_some_and(|public| transfer == public))
         {
             return Err("Gateway listeners must use distinct addresses".into());
+        }
+        let relay_fields = [
+            self.transfer_relay_role.is_some(),
+            self.transfer_upstream.is_some(),
+            self.transfer_upstream_server_name.is_some(),
+        ];
+        if relay_fields.iter().any(|configured| *configured)
+            && !relay_fields.iter().all(|configured| *configured)
+        {
+            return Err(
+                "transfer relay role, upstream, and upstream ServerName must be configured together"
+                    .into(),
+            );
+        }
+        if self.transfer_relay_role.is_some() && self.transfer_listen.is_none() {
+            return Err("transfer listener is required when transfer relay is configured".into());
+        }
+        if self
+            .transfer_upstream
+            .zip(self.transfer_listen)
+            .is_some_and(|(upstream, listener)| upstream == listener)
+        {
+            return Err("transfer upstream must differ from the local transfer listener".into());
+        }
+        if let Some(server_name) = &self.transfer_upstream_server_name {
+            rustls_pki_types::ServerName::try_from(server_name.clone())
+                .map_err(|error| format!("transfer upstream ServerName is invalid: {error}"))?;
+        }
+        let generation_fields = [
+            self.transfer_session_generation,
+            self.transfer_mount_generation,
+            self.transfer_route_generation,
+        ];
+        let configured_generations = generation_fields
+            .iter()
+            .filter(|generation| generation.is_some())
+            .count();
+        if configured_generations != 0 && configured_generations != generation_fields.len() {
+            return Err(
+                "transfer session, mount, and route generations must be configured together".into(),
+            );
+        }
+        if configured_generations != 0 && self.transfer_relay_role.is_none() {
+            return Err("transfer generations require a configured relay role".into());
+        }
+        if self.transfer_relay_role.is_some() && configured_generations == 0 {
+            return Err(
+                "transfer relay requires session, mount, and route generations for fencing".into(),
+            );
+        }
+        if generation_fields
+            .iter()
+            .flatten()
+            .any(|generation| *generation == 0)
+        {
+            return Err("transfer generations must be greater than zero".into());
         }
         let console_host = public_listener::normalize_configured_host(&self.console_host)
             .ok_or_else(|| "console_host must be a valid hostname without a port".to_owned())?;
@@ -330,6 +407,9 @@ impl GatewayConfig {
         self.transport
             .validate_listener_exposure([self.agent_listen, self.control_listen, self.peer_listen])
             .map_err(|error| error.to_string())?;
+        self.transfer_transport
+            .validate()
+            .map_err(|error| error.to_string())?;
         self.bootstrap
             .validate()
             .map_err(|error| error.to_string())?;
@@ -344,7 +424,8 @@ impl GatewayConfig {
                 .is_some_and(|address| !address.ip().is_loopback());
         let tls_is_configured = self.transport.tls_certificate_file.is_some()
             || self.transport.tls_private_key_file.is_some()
-            || self.transport.tls_client_ca_file.is_some();
+            || self.transport.tls_client_ca_file.is_some()
+            || self.transfer_transport.is_configured();
         let bootstrap_is_configured = self.bootstrap.private_key_file.is_some()
             || self.bootstrap.activation_token_file.is_some()
             || self.bootstrap.certificate_chain_file.is_some();
@@ -364,22 +445,33 @@ impl GatewayConfig {
             && self.workload_trust_domain.is_none()
         {
             return Err(
-                "SYNAPSE_GATEWAY_WORKLOAD_TRUST_DOMAIN is required for TLS or exposed listeners"
+                "NEOENGRAM_GATEWAY_WORKLOAD_TRUST_DOMAIN is required for TLS or exposed listeners"
                     .into(),
             );
         }
-        if self.transfer_listen.is_some()
-            && (self.transport.tls_certificate_file.is_none()
-                || self.transport.tls_private_key_file.is_none()
-                || self.transport.tls_client_ca_file.is_none())
+        if self.transfer_listen.is_some() && !self.transfer_transport.is_configured() {
+            return Err(
+                "QUIC transfer listener requires the dedicated transfer certificate, private key, and client CA"
+                    .into(),
+            );
+        }
+        if self.transfer_listen.is_none() && self.transfer_transport.is_configured() {
+            return Err(
+                "dedicated transfer TLS material requires a configured transfer listener".into(),
+            );
+        }
+        if bootstrap_is_configured
+            && (self.transfer_relay_role.is_some()
+                || self.transfer_upstream.is_some()
+                || self.transfer_upstream_server_name.is_some()
+                || configured_generations != 0)
         {
             return Err(
-                "QUIC transfer listener requires the workload certificate, private key, and client CA"
-                    .into(),
+                "transfer relay routing cannot be enabled while Gateway bootstrap is active".into(),
             );
         }
         EnvFilter::try_new(&self.log)
-            .map_err(|error| format!("SYNAPSE_GATEWAY_LOG is invalid: {error}"))?;
+            .map_err(|error| format!("NEOENGRAM_GATEWAY_LOG is invalid: {error}"))?;
         Ok(())
     }
 
@@ -538,6 +630,20 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
             config.workload_trust_domain.as_deref(),
         )?;
     }
+    if config.transfer_listen.is_some() {
+        if config.bootstrap.private_key_file.is_some() {
+            config
+                .transfer_transport
+                .validate_local_bootstrap_server_identity()?;
+        } else {
+            config.transfer_transport.validate_local_identity(
+                identity.edge_cluster_id.as_str(),
+                identity.gateway_pool_id.as_str(),
+                identity.gateway_replica_id.as_str(),
+                config.workload_trust_domain.as_deref(),
+            )?;
+        }
+    }
     let [agent_tls, control_tls, peer_server_tls] = config
         .transport
         .load_server_configs([
@@ -547,15 +653,15 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         ])?
         .map(|config| config.map(TlsAcceptor::from));
     let transfer_tls = if config.transfer_listen.is_some() {
-        Some(config.transport.load_quic_server_config()?)
+        Some(config.transfer_transport.load_server_config()?)
     } else {
         None
     };
     // Build the matching client policy up front as well. The peer relay uses this same policy;
     // validating both directions at startup prevents a listener that can receive transfers but
     // cannot establish the required one-hop mTLS connection after activation.
-    let _transfer_client_tls = if config.transfer_listen.is_some() {
-        Some(config.transport.load_quic_client_config()?)
+    let transfer_client_tls = if config.transfer_listen.is_some() {
+        Some(config.transfer_transport.load_client_config()?)
     } else {
         None
     };
@@ -592,10 +698,20 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         config.workload_trust_domain.clone().map(Arc::<str>::from),
         allow_loopback_http,
     ));
-    let transfer_fence = transfer_quic::QuicTransferFence::new(
+    let mut transfer_fence = transfer_quic::QuicTransferFence::for_role(
+        config
+            .transfer_relay_role
+            .unwrap_or(transfer_quic::TransferRelayRole::Target),
         identity.gateway_pool_id.clone(),
         identity.edge_cluster_id.clone(),
     );
+    if let (Some(session), Some(mount), Some(route)) = (
+        config.transfer_session_generation,
+        config.transfer_mount_generation,
+        config.transfer_route_generation,
+    ) {
+        transfer_fence = transfer_fence.with_generations(session, mount, route);
+    }
     let tunnel = Arc::new(GatewayTunnel::with_peer_forwarder(
         identity,
         peer_forwarder.clone(),
@@ -614,12 +730,28 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         )),
         None => None,
     };
-    let transfer = match (config.transfer_listen, transfer_tls) {
-        (Some(address), Some(tls)) => Some(
-            transfer_quic::QuicTransferListener::bind(address, tls, transfer_fence)
-                .map_err(std::io::Error::other)?,
-        ),
-        (None, None) => None,
+    let transfer = match (config.transfer_listen, transfer_tls, transfer_client_tls) {
+        (Some(address), Some(server_tls), Some(client_tls)) => {
+            let mut listener =
+                transfer_quic::QuicTransferListener::bind(address, server_tls, transfer_fence)
+                    .map_err(std::io::Error::other)?;
+            if let (Some(upstream), Some(server_name)) = (
+                config.transfer_upstream,
+                config.transfer_upstream_server_name.as_deref(),
+            ) {
+                let connector = transfer_quic::QuinnTransferConnectionFactory::bind(
+                    upstream,
+                    Arc::<str>::from(server_name),
+                    client_tls,
+                )
+                .map_err(std::io::Error::other)?;
+                listener = listener.with_relay(Arc::new(
+                    transfer_quic::ConnectedTransferRelay::new(Arc::new(connector)),
+                ));
+            }
+            Some(listener)
+        }
+        (None, None, None) => None,
         _ => unreachable!("transfer listener and TLS configuration are paired"),
     };
     let lifecycle = GatewayLifecycle::default();
@@ -943,7 +1075,7 @@ where
             StatusCode::OK,
             JSON_CONTENT_TYPE,
             serde_json::json!({
-                "service": "synapse-gateway",
+                "service": "neoengram-gateway",
                 "listener": state.role.as_str(),
                 "status": "live"
             }),
@@ -973,7 +1105,7 @@ where
                 StatusCode::OK,
                 JSON_CONTENT_TYPE,
                 serde_json::json!({
-                    "service": "synapse-gateway",
+                    "service": "neoengram-gateway",
                     "listener": state.role.as_str(),
                     "status": "ready"
                 }),
@@ -1105,7 +1237,7 @@ where
             PeerAuth::Development => (
                 request
                     .headers()
-                    .get("x-synapse-source-replica")
+                    .get("x-neoengram-source-replica")
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| {
                         neoengram_domain::protocol::GatewayReplicaId::new(value).ok()
@@ -1873,7 +2005,7 @@ mod tests {
     #[test]
     fn configuration_requires_distinct_bounded_listeners() {
         let mut config = GatewayConfig::try_parse_from([
-            "synapse-gateway",
+            "neoengram-gateway",
             "--edge-cluster-id",
             "cluster-a",
             "--gateway-pool-id",
@@ -1898,9 +2030,9 @@ mod tests {
     }
 
     #[test]
-    fn transfer_listener_requires_workload_mtls_material() {
+    fn transfer_listener_requires_dedicated_mtls_material() {
         let mut config = GatewayConfig::try_parse_from([
-            "synapse-gateway",
+            "neoengram-gateway",
             "--edge-cluster-id",
             "cluster-a",
             "--gateway-pool-id",
@@ -1909,20 +2041,77 @@ mod tests {
             "replica-a",
         ])
         .unwrap();
+        config.agent_listen = "127.0.0.1:8081".parse().unwrap();
+        config.control_listen = "127.0.0.1:8082".parse().unwrap();
+        config.peer_listen = "127.0.0.1:8083".parse().unwrap();
         config.transfer_listen = Some("127.0.0.1:8084".parse().unwrap());
         config.workload_trust_domain = Some("mesh.example.test".to_owned());
         assert!(config.validate().is_err());
 
-        config.transport.tls_certificate_file = Some("/listener.crt".into());
-        config.transport.tls_private_key_file = Some("/listener.key".into());
-        config.transport.tls_client_ca_file = Some("/workload-ca.crt".into());
+        config.transfer_transport.transfer_tls_certificate_file =
+            Some("/transfer-listener.crt".into());
+        config.transfer_transport.transfer_tls_private_key_file =
+            Some("/transfer-listener.key".into());
+        config.transfer_transport.transfer_tls_client_ca_file = Some("/transfer-ca.crt".into());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn transfer_relay_requires_a_complete_role_route_and_generation_tuple() {
+        let mut config = GatewayConfig::try_parse_from([
+            "neoengram-gateway",
+            "--edge-cluster-id",
+            "cluster-a",
+            "--gateway-pool-id",
+            "pool-a",
+            "--gateway-replica-id",
+            "replica-a",
+            "--transfer-listen",
+            "127.0.0.1:8084",
+            "--transfer-relay-role",
+            "target",
+            "--transfer-tls-certificate-file",
+            "/transfer-listener.crt",
+            "--transfer-tls-private-key-file",
+            "/transfer-listener.key",
+            "--transfer-tls-client-ca-file",
+            "/transfer-ca.crt",
+            "--workload-trust-domain",
+            "mesh.example.test",
+        ])
+        .unwrap();
+        config.agent_listen = "127.0.0.1:8081".parse().unwrap();
+        config.control_listen = "127.0.0.1:8082".parse().unwrap();
+        config.peer_listen = "127.0.0.1:8083".parse().unwrap();
+        assert!(config.validate().is_err());
+
+        config.transfer_upstream = Some("127.0.0.1:8184".parse().unwrap());
+        config.transfer_upstream_server_name = Some("localhost".to_owned());
+        assert!(config.validate().is_err());
+        config.transfer_session_generation = Some(3);
+        config.transfer_mount_generation = Some(4);
+        assert!(config.validate().is_err());
+        config.transfer_route_generation = Some(5);
+        config.validate().unwrap();
+
+        config.bootstrap.private_key_file = Some("/bootstrap-private-key.pem".into());
+        config.bootstrap.activation_token_file = Some("/bootstrap-token".into());
+        config.bootstrap.certificate_chain_file = Some("/bootstrap-chain.pem".into());
+        assert!(config.validate().is_err());
+
+        config.transfer_relay_role = None;
+        config.transfer_upstream = None;
+        config.transfer_upstream_server_name = None;
+        config.transfer_session_generation = None;
+        config.transfer_mount_generation = None;
+        config.transfer_route_generation = None;
+        config.validate().unwrap();
     }
 
     #[test]
     fn public_hostnames_are_compared_after_dns_normalization() {
         let mut config = GatewayConfig::try_parse_from([
-            "synapse-gateway",
+            "neoengram-gateway",
             "--edge-cluster-id",
             "cluster-a",
             "--gateway-pool-id",
@@ -1942,7 +2131,7 @@ mod tests {
     #[test]
     fn pre_stop_drain_helper_has_a_bounded_wait() {
         let config = GatewayConfig::try_parse_from([
-            "synapse-gateway",
+            "neoengram-gateway",
             "--edge-cluster-id",
             "cluster-a",
             "--gateway-pool-id",
@@ -1972,7 +2161,7 @@ mod tests {
     #[test]
     fn exposed_or_tls_gateway_requires_a_workload_trust_domain() {
         let mut config = GatewayConfig::try_parse_from([
-            "synapse-gateway",
+            "neoengram-gateway",
             "--edge-cluster-id",
             "cluster-a",
             "--gateway-pool-id",
@@ -2007,7 +2196,7 @@ mod tests {
     #[test]
     fn exposed_gateway_rejects_plain_central_upstream() {
         let mut config = GatewayConfig::try_parse_from([
-            "synapse-gateway",
+            "neoengram-gateway",
             "--edge-cluster-id",
             "cluster-a",
             "--gateway-pool-id",
@@ -2032,7 +2221,7 @@ mod tests {
     #[test]
     fn https_central_upstream_requires_workload_client_material() {
         let mut config = GatewayConfig::try_parse_from([
-            "synapse-gateway",
+            "neoengram-gateway",
             "--edge-cluster-id",
             "cluster-a",
             "--gateway-pool-id",
@@ -2049,7 +2238,7 @@ mod tests {
     #[test]
     fn workload_only_gateway_does_not_validate_unused_central_upstream() {
         let mut config = GatewayConfig::try_parse_from([
-            "synapse-gateway",
+            "neoengram-gateway",
             "--edge-cluster-id",
             "cluster-a",
             "--gateway-pool-id",

@@ -7,18 +7,26 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import SnapshotDetailPage from '@/pages/SnapshotDetailPage.vue';
 import { useTenantsStore } from '@/stores/tenants';
-import type { RetrySnapshotDeliveryRequest, TenantView } from '@/api/types';
+import type {
+  CreateCommitReplicationRequest,
+  RetrySnapshotDeliveryRequest,
+  TenantView,
+} from '@/api/types';
 
 const api = vi.hoisted(() => ({
   createSnapshotDelivery: vi.fn(),
+  cancelCommitReplication: vi.fn(),
   deleteSnapshotDelivery: vi.fn(),
-  queryCommitReplication: vi.fn(),
   queryApiVersion: vi.fn(),
+  queryCommitAvailability: vi.fn(),
+  queryCommitReplicationList: vi.fn(),
+  queryGatewayPoolList: vi.fn(),
   querySnapshot: vi.fn(),
   querySnapshotDeliveryList: vi.fn(),
   queryStorageVolume: vi.fn(),
   queryStorageVolumeList: vi.fn(),
   replicateCommit: vi.fn(),
+  retryCommitReplication: vi.fn(),
   retrySnapshotDelivery: vi.fn(),
 }));
 vi.mock('@/api/operations', () => api);
@@ -62,7 +70,7 @@ function snapshot(
 
 async function mountPage(
   state: 'creating' | 'ready' | 'abnormal' = 'ready',
-  permissions: TenantView['permissions'] = ['s3.access.read'],
+  permissions: TenantView['permissions'] = ['s3.access.read', 'artifact.commit.replicate'],
   dataLayout: 'fast_cdc' | 'whole_file' = 'fast_cdc',
 ) {
   api.queryApiVersion.mockResolvedValue({
@@ -70,6 +78,7 @@ async function mountPage(
       api_version: 1,
       capabilities: [
         's3_readonly_access_point',
+        'artifact_commit_replication',
         'snapshot_delivery_fuse_v2',
         'snapshot_delivery_copy_v2',
         'snapshot_delivery_hardlink_v2',
@@ -133,20 +142,85 @@ async function mountPage(
     data: { items: [] },
     requestId: 'request-deliveries',
   });
-  api.queryCommitReplication.mockResolvedValue({
+  api.queryCommitReplicationList.mockResolvedValue({
+    data: {
+      replications: [],
+    },
+    requestId: 'request-replications',
+  });
+  api.queryCommitAvailability.mockResolvedValue({
+    data: {
+      availability: {
+        commit_id: commitId,
+        data_health: 'available',
+        verified_placements: '1',
+        missing_objects: '0',
+        verified_storage_volume_ids: [],
+      },
+    },
+    requestId: 'request-availability',
+  });
+  api.queryGatewayPoolList.mockResolvedValue({
+    data: { items: [] },
+    requestId: 'request-gateway-pools',
+  });
+  api.replicateCommit.mockResolvedValue({
     data: {
       replication: {
         replication_id: 'replication-a',
         tenant_id: 'tenant-a',
+        artifact_id: 'artifact-a',
         commit_id: commitId,
         target_storage_volume_id: 'volume-a',
-        state: 'published',
+        attempt: '1',
+        state: 'queued',
         object_set_digest: 'd'.repeat(64),
-        completed_objects: '3',
+        completed_objects: '0',
         total_objects: '3',
+        completed_bytes: '0',
+        total_bytes: '30',
+      },
+      replayed: false,
+    },
+    requestId: 'request-replicate',
+  });
+  api.retryCommitReplication.mockResolvedValue({
+    data: {
+      replication: {
+        replication_id: 'replication-a',
+        tenant_id: 'tenant-a',
+        artifact_id: 'artifact-a',
+        commit_id: commitId,
+        target_storage_volume_id: 'volume-a',
+        attempt: '2',
+        state: 'queued',
+        object_set_digest: 'd'.repeat(64),
+        completed_objects: '0',
+        total_objects: '3',
+        completed_bytes: '0',
+        total_bytes: '30',
       },
     },
-    requestId: 'request-replication',
+    requestId: 'request-retry-replication',
+  });
+  api.cancelCommitReplication.mockResolvedValue({
+    data: {
+      replication: {
+        replication_id: 'replication-a',
+        tenant_id: 'tenant-a',
+        artifact_id: 'artifact-a',
+        commit_id: commitId,
+        target_storage_volume_id: 'volume-a',
+        attempt: '1',
+        state: 'cancelled',
+        object_set_digest: 'd'.repeat(64),
+        completed_objects: '0',
+        total_objects: '3',
+        completed_bytes: '0',
+        total_bytes: '30',
+      },
+    },
+    requestId: 'request-cancel-replication',
   });
   api.createSnapshotDelivery.mockResolvedValue({
     data: { delivery: {}, replayed: false },
@@ -291,6 +365,24 @@ describe('Snapshot detail page', () => {
     queryClient.clear();
   });
 
+  it('hides Commit replication when Central does not advertise the capability', async () => {
+    api.queryApiVersion.mockResolvedValueOnce({
+      data: {
+        api_version: 1,
+        capabilities: ['snapshot_delivery_copy_v2'],
+      },
+      requestId: 'request-version',
+    });
+    const { wrapper, queryClient } = await mountPage('ready', ['artifact.commit.replicate']);
+
+    expect(wrapper.find('[aria-label="Commit 复制"]').exists()).toBe(false);
+    expect(api.queryCommitReplicationList).not.toHaveBeenCalled();
+    expect(api.replicateCommit).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
   it('keeps Delivery unavailable until the target PlacementSet is published', async () => {
     const { wrapper, queryClient } = await mountPage();
 
@@ -313,6 +405,170 @@ describe('Snapshot detail page', () => {
 
     expect(wrapper.text()).toContain('硬链接不可用');
     expect(wrapper.text()).toContain('请先将 Commit 复制到当前目标 Volume');
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('creates a Commit replication with project scope and a bounded stable request ID', async () => {
+    const { wrapper, queryClient } = await mountPage();
+
+    expect(api.queryCommitReplicationList).toHaveBeenCalledWith({
+      tenant_id: 'tenant-a',
+      commit_id: commitId,
+    });
+    expect(api.queryGatewayPoolList).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain('路由由 Central 校验');
+
+    await wrapper
+      .findAllComponents(ElButton)
+      .find((button) => button.text().trim() === '复制 Commit')!
+      .trigger('click');
+    await flushPromises();
+
+    const request = api.replicateCommit.mock.calls[0]?.[0] as
+      CreateCommitReplicationRequest | undefined;
+    expect(request).toMatchObject({
+      tenant_id: 'tenant-a',
+      project_id: 'project-a',
+      artifact_id: 'artifact-a',
+      commit_id: commitId,
+      target_storage_volume_id: 'volume-a',
+    });
+    expect(request?.request_id).toMatch(/^commit-replicate-[a-f0-9]{32}$/);
+    expect(request?.request_id.length).toBeLessThanOrEqual(128);
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('restores and cancels an active Commit replication after opening the page', async () => {
+    api.queryCommitReplicationList.mockResolvedValueOnce({
+      data: {
+        replications: [
+          {
+            replication_id: 'replication-active',
+            tenant_id: 'tenant-a',
+            artifact_id: 'artifact-a',
+            commit_id: commitId,
+            target_storage_volume_id: 'volume-a',
+            attempt: '7',
+            state: 'transferring',
+            object_set_digest: 'd'.repeat(64),
+            completed_objects: '2',
+            total_objects: '3',
+            completed_bytes: '20',
+            total_bytes: '30',
+          },
+        ],
+      },
+      requestId: 'request-active-replication',
+    });
+    const { wrapper, queryClient } = await mountPage();
+
+    expect(wrapper.text()).toContain('replication-active');
+    expect(wrapper.text()).toContain('2 / 3 objects');
+    expect(
+      wrapper
+        .findAllComponents(ElButton)
+        .find((button) => button.text().trim() === '复制进行中')
+        ?.attributes('disabled'),
+    ).toBeDefined();
+
+    await wrapper
+      .findAllComponents(ElButton)
+      .find((button) => button.text().trim() === '取消')!
+      .trigger('click');
+    await flushPromises();
+
+    expect(api.cancelCommitReplication.mock.calls[0]?.[0]).toEqual({
+      tenant_id: 'tenant-a',
+      replication_id: 'replication-active',
+      expected_attempt: '7',
+    });
+    expect(api.replicateCommit).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('retries the failed task instead of creating another task for the same target', async () => {
+    api.queryCommitReplicationList.mockResolvedValueOnce({
+      data: {
+        replications: [
+          {
+            replication_id: 'replication-failed',
+            tenant_id: 'tenant-a',
+            artifact_id: 'artifact-a',
+            commit_id: commitId,
+            target_storage_volume_id: 'volume-a',
+            attempt: '3',
+            state: 'failed',
+            object_set_digest: 'd'.repeat(64),
+            completed_objects: '1',
+            total_objects: '3',
+            completed_bytes: '10',
+            total_bytes: '30',
+            issue: { code: 'ROUTE_LOST', message: 'Route lease expired', retryable: true },
+          },
+        ],
+      },
+      requestId: 'request-failed-replication',
+    });
+    const { wrapper, queryClient } = await mountPage();
+
+    expect(wrapper.text()).toContain('Route lease expired');
+    await wrapper
+      .findAllComponents(ElButton)
+      .find((button) => button.text().trim() === '重试')!
+      .trigger('click');
+    await flushPromises();
+
+    expect(api.retryCommitReplication.mock.calls[0]?.[0]).toEqual({
+      tenant_id: 'tenant-a',
+      replication_id: 'replication-failed',
+      expected_attempt: '3',
+    });
+    expect(api.replicateCommit).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('uses visible Gateway health to disable an unavailable cluster route', async () => {
+    api.queryGatewayPoolList.mockResolvedValueOnce({
+      data: {
+        items: [
+          {
+            gateway_pool_id: 'pool-a',
+            edge_cluster_id: 'edge-a',
+            display_name: 'Gateway A',
+            agent_endpoint: 'https://gateway.example.test',
+            desired_replicas: 1,
+            minimum_ready_replicas: 1,
+            state: 'draining',
+            config_generation: '1',
+            resource_version: '1',
+            created_at_unix_ms: '1',
+            updated_at_unix_ms: '1',
+          },
+        ],
+      },
+      requestId: 'request-gateway-pools',
+    });
+    const { wrapper, queryClient } = await mountPage('ready', [
+      'artifact.commit.replicate',
+      'gateway.read',
+    ]);
+
+    expect(api.queryGatewayPoolList).toHaveBeenCalledWith({});
+    expect(wrapper.text()).toContain('路由不可用');
+    expect(
+      wrapper
+        .findAllComponents(ElButton)
+        .find((button) => button.text().trim() === '复制 Commit')
+        ?.attributes('disabled'),
+    ).toBeDefined();
 
     wrapper.unmount();
     queryClient.clear();

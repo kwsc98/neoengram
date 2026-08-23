@@ -16,12 +16,12 @@ Add Job 流程，并可查看 Commit 描述、Tags、父 Commit 信息和文件 
 连接完整真实中心。这不代表其余 OpenAPI、PostgreSQL、生产凭据签发/轮换、跨 Volume 数据路由或 HA 已经实现。能力状态和后续路线统一见
 [`implementation-plan.md`](implementation-plan.md)。
 
-2026-08-09 已确认 `services/synapse-gateway` 的目标架构。G1 已加入协议、Registry/管理 API、
+2026-08-09 已确认 `services/neoengram-gateway` 的目标架构。G1 已加入协议、Registry/管理 API、
 三 listener、Central outbound tunnel、工作负载证书校验、端到端命令签名和一跳 peer forwarding，
 Agent 配置也已切到 Gateway-only；双 Replica listener/H2/peer harness 和真实 Registry RouteLease 接管
 契约已分别通过，但完整业务 E2E、外部生产凭据适配、真实集群故障/就绪和切换验收仍未完成。目标状态由
 Central 主动连接每个 EdgeCluster 的 GatewayPool，Agent 只连接本集群 Gateway。Gateway 的完整边界见
-[`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)，在端到端契约测试和部署切换完成前
+[`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md)，在端到端契约测试和部署切换完成前
 不得把部分骨架标记为可用 Gateway 能力。
 
 ## Workspace 与职责
@@ -33,7 +33,7 @@ crates/
 services/
 ├── neoengram-central/     # Central authority + HTTP composition
 ├── neoengram-agent/       # Agent state machine + Gateway transport adapter
-└── synapse-gateway/       # 三 listener + activation + mTLS + 一跳 peer forwarding
+└── neoengram-gateway/       # 三 listener + activation + mTLS + 一跳 peer forwarding
 apps/
 ├── neoengram-cli/         # Clap、cwd 输入、typed Result/progress/diagnostic 的唯一终端渲染入口（package 名仍为 neoengram）
 └── neoengram-web/         # 独立 Vue 3 SPA；公开 OpenAPI 生成类型与 MSW 开发适配器
@@ -97,7 +97,7 @@ scope，服务端仍从认证结果执行 RBAC，不能信任浏览器选择。
   Agent 主动建立 channel，Assignment/Decision 由 server 权威状态派生并通过 channel 下推。Server
   不提供 Chunk missing/upload payload action；`AssignJob`、
   `ExpireAddJob`、`ResumePublication` 仍是内部方法，不能注册为 HTTP 路由。
-- 目标 `synapse-gateway` 只依赖 domain 以及网络、TLS、签名和观测组件；禁止依赖
+- 目标 `neoengram-gateway` 只依赖 domain 以及网络、TLS、签名和观测组件；禁止依赖
   `neoengram-central` datasource/mapper、engine、fs、standalone、Volume adapter 或 authority schema。它不挂载
   StorageVolume，也不持久化 metadata/object。Gateway 是唯一 Agent 网络入口。
 - `neoengram-agent` 的生产依赖只有 `neoengram-domain` 和 `neoengram-runtime`，不依赖 standalone、Central
@@ -112,11 +112,11 @@ neoengram CLI -> neoengram-runtime <- neoengram-agent
 
 neoengram-web -> public OpenAPI/action contract -> neoengram-central -> domain/runtime
 
-生产控制链：neoengram-central -> synapse-gateway <- neoengram-agent
+生产控制链：neoengram-central -> neoengram-gateway <- neoengram-agent
 
 G1 控制面：Agent 配置已切 Gateway-only，Gateway 到 Central 的 H2/mTLS tunnel 和一跳 forwarding 已接入
 
-目标：neoengram-central -> synapse-gateway <- neoengram-agent
+目标：neoengram-central -> neoengram-gateway <- neoengram-agent
                                   |
                                   +-> domain
 ```

@@ -2353,6 +2353,7 @@ mod tests {
                 observed_volume_marker: Some(marker_id),
                 observed_access_mode: Some(MountAccessMode::ReadWrite),
                 reported_health: Some(ResourceHealth::Ready),
+                available_bytes: Some(u64::MAX),
                 health: ResourceHealth::Ready,
                 observed_at_unix_ms: Some(UnixMillis::new(100)),
             },

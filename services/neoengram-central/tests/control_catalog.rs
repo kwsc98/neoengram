@@ -210,7 +210,7 @@ async fn clean_catalog_creates_current_snapshot_and_delivery_schema() {
         .fetch_one(&mut connection)
         .await
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 16);
 
     let snapshot_columns: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM pragma_table_info('snapshot_catalog_records') ORDER BY cid",

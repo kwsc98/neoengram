@@ -4,42 +4,49 @@ use fusen_rs::{interface, Call, Error, Response};
 
 use crate::{
     dto::{
-        CancelPreCommitRequest, CancelPreCommitResponse, CommitPlaygroundRequest,
-        CommitPlaygroundResponse, CreateArtifactRequest, CreateArtifactResponse,
-        CreateCommitReplicationRequest, CreateCommitReplicationResponse, CreateDeletionRequest,
-        CreatePlaygroundRequest, CreatePlaygroundResponse, CreateProjectRequest,
-        CreateProjectResponse, CreateRetentionHoldRequest, CreateRetentionHoldResponse,
-        CreateS3AccessPointRequest, CreateS3AccessPointResponse, CreateS3CredentialRequest,
-        CreateS3CredentialResponse, CreateS3DownloadUrlRequest, CreateS3DownloadUrlResponse,
-        CreateSnapshotDeliveryRequest, CreateSnapshotDeliveryResponse, CreateSnapshotRequest,
-        CreateSnapshotResponse, CreateStorageVolumeRequest, CreateStorageVolumeResponse,
-        CreateTenantRequest, CreateTenantResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+        CancelCommitReplicationRequest, CancelCommitReplicationResponse, CancelPreCommitRequest,
+        CancelPreCommitResponse, CommitPlaygroundRequest, CommitPlaygroundResponse,
+        CreateArtifactRequest, CreateArtifactResponse, CreateCommitReplicationRequest,
+        CreateCommitReplicationResponse, CreateDeletionRequest, CreatePlaygroundRequest,
+        CreatePlaygroundResponse, CreateProjectRequest, CreateProjectResponse,
+        CreateRetentionHoldRequest, CreateRetentionHoldResponse, CreateS3AccessPointRequest,
+        CreateS3AccessPointResponse, CreateS3CredentialRequest, CreateS3CredentialResponse,
+        CreateS3DownloadUrlRequest, CreateS3DownloadUrlResponse, CreateSnapshotDeliveryRequest,
+        CreateSnapshotDeliveryResponse, CreateSnapshotRequest, CreateSnapshotResponse,
+        CreateStorageVolumeRequest, CreateStorageVolumeResponse, CreateTenantRequest,
+        CreateTenantResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
         DeleteSnapshotDeliveryRequest, DeleteSnapshotDeliveryResponse, DeletionMutationResponse,
-        InternalS3AuthorizeRequest, InternalS3AuthorizeResponse, QueryArtifactCommitGraphRequest,
+        InternalS3AuthorizeRequest, InternalS3AuthorizeResponse, QueryArtifactCommitDiffRequest,
+        QueryArtifactCommitDiffResponse, QueryArtifactCommitGraphRequest,
         QueryArtifactCommitGraphResponse, QueryArtifactListRequest, QueryArtifactListResponse,
         QueryArtifactRequest, QueryArtifactResponse, QueryCommitAvailabilityRequest,
-        QueryCommitAvailabilityResponse, QueryCommitReplicationRequest,
-        QueryCommitReplicationResponse, QueryDeletionImpactRequest, QueryDeletionImpactResponse,
-        QueryDeletionListRequest, QueryDeletionListResponse, QueryDeletionRequest,
-        QueryDeletionResponse, QueryPlaygroundChangeListRequest, QueryPlaygroundChangeListResponse,
-        QueryPlaygroundDatasetProfileRequest, QueryPlaygroundDatasetProfileResponse,
-        QueryPlaygroundFileListRequest, QueryPlaygroundFileListResponse,
-        QueryPlaygroundFileMetadataRequest, QueryPlaygroundFileMetadataResponse,
-        QueryPlaygroundListRequest, QueryPlaygroundListResponse, QueryPlaygroundRequest,
-        QueryPlaygroundResponse, QueryPreCommitRequest, QueryPreCommitResponse,
-        QueryProjectListRequest, QueryProjectListResponse, QueryS3AccessPointListRequest,
-        QueryS3AccessPointListResponse, QueryS3AccessPointRequest, QueryS3AccessPointResponse,
-        QueryS3CredentialListRequest, QueryS3CredentialListResponse, QueryS3ObjectListRequest,
-        QueryS3ObjectListResponse, QuerySnapshotDeliveryListRequest,
-        QuerySnapshotDeliveryListResponse, QuerySnapshotDeliveryRequest,
-        QuerySnapshotDeliveryResponse, QuerySnapshotListRequest, QuerySnapshotListResponse,
-        QuerySnapshotRequest, QuerySnapshotResponse, QueryStorageVolumeListRequest,
-        QueryStorageVolumeListResponse, QueryStorageVolumeRequest, QueryStorageVolumeResponse,
-        QueryTenantListRequest, QueryTenantListResponse, QueryTenantRequest, QueryTenantResponse,
-        ReleaseRetentionHoldRequest, ReleaseRetentionHoldResponse, RestartPreCommitRequest,
-        RestartPreCommitResponse, RetrySnapshotDeliveryRequest, RetrySnapshotDeliveryResponse,
-        RevokeS3CredentialRequest, StartPreCommitRequest, StartPreCommitResponse,
-        UpdateDeletionRequest, UpdateS3AccessPointRequest, UpdateS3AccessPointResponse,
+        QueryCommitAvailabilityResponse, QueryCommitPlacementListRequest,
+        QueryCommitPlacementListResponse, QueryCommitReplicationListRequest,
+        QueryCommitReplicationListResponse, QueryCommitReplicationRequest,
+        QueryCommitReplicationResponse, QueryCommitReplicationTicketRequest,
+        QueryCommitReplicationTicketResponse, QueryDeletionImpactRequest,
+        QueryDeletionImpactResponse, QueryDeletionListRequest, QueryDeletionListResponse,
+        QueryDeletionRequest, QueryDeletionResponse, QueryPlaygroundChangeListRequest,
+        QueryPlaygroundChangeListResponse, QueryPlaygroundDatasetProfileRequest,
+        QueryPlaygroundDatasetProfileResponse, QueryPlaygroundFileListRequest,
+        QueryPlaygroundFileListResponse, QueryPlaygroundFileMetadataRequest,
+        QueryPlaygroundFileMetadataResponse, QueryPlaygroundListRequest,
+        QueryPlaygroundListResponse, QueryPlaygroundRequest, QueryPlaygroundResponse,
+        QueryPreCommitRequest, QueryPreCommitResponse, QueryProjectListRequest,
+        QueryProjectListResponse, QueryS3AccessPointListRequest, QueryS3AccessPointListResponse,
+        QueryS3AccessPointRequest, QueryS3AccessPointResponse, QueryS3CredentialListRequest,
+        QueryS3CredentialListResponse, QueryS3ObjectListRequest, QueryS3ObjectListResponse,
+        QuerySnapshotDeliveryListRequest, QuerySnapshotDeliveryListResponse,
+        QuerySnapshotDeliveryRequest, QuerySnapshotDeliveryResponse, QuerySnapshotListRequest,
+        QuerySnapshotListResponse, QuerySnapshotRequest, QuerySnapshotResponse,
+        QueryStorageVolumeListRequest, QueryStorageVolumeListResponse, QueryStorageVolumeRequest,
+        QueryStorageVolumeResponse, QueryTenantListRequest, QueryTenantListResponse,
+        QueryTenantRequest, QueryTenantResponse, ReleaseRetentionHoldRequest,
+        ReleaseRetentionHoldResponse, RestartPreCommitRequest, RestartPreCommitResponse,
+        RetryCommitReplicationRequest, RetryCommitReplicationResponse,
+        RetrySnapshotDeliveryRequest, RetrySnapshotDeliveryResponse, RevokeS3CredentialRequest,
+        StartPreCommitRequest, StartPreCommitResponse, UpdateDeletionRequest,
+        UpdateS3AccessPointRequest, UpdateS3AccessPointResponse,
     },
     service::CatalogService,
 };
@@ -61,6 +68,41 @@ pub trait PlacementApi {
         #[param(context)] call: Call,
         #[param(body)] request: QueryCommitReplicationRequest,
     ) -> Result<Response<QueryCommitReplicationResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/commit/replication/ticket/query")]
+    async fn query_commit_replication_ticket(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: QueryCommitReplicationTicketRequest,
+    ) -> Result<Response<QueryCommitReplicationTicketResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/commit/replication/list/query")]
+    async fn query_commit_replication_list(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: QueryCommitReplicationListRequest,
+    ) -> Result<Response<QueryCommitReplicationListResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/commit/placements/query")]
+    async fn query_commit_placement_list(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: QueryCommitPlacementListRequest,
+    ) -> Result<Response<QueryCommitPlacementListResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/commit/replication/retry")]
+    async fn retry_commit_replication(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: RetryCommitReplicationRequest,
+    ) -> Result<Response<RetryCommitReplicationResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/commit/replication/cancel")]
+    async fn cancel_commit_replication(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: CancelCommitReplicationRequest,
+    ) -> Result<Response<CancelCommitReplicationResponse>, Error>;
 
     #[fusen_rs::method(method = "POST", path = "/api/commit/availability/query")]
     async fn query_commit_availability(
@@ -107,6 +149,61 @@ impl PlacementApi for PlacementController {
     ) -> Result<Response<QueryCommitReplicationResponse>, Error> {
         self.service
             .query_commit_replication(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn query_commit_replication_ticket(
+        &self,
+        call: Call,
+        request: QueryCommitReplicationTicketRequest,
+    ) -> Result<Response<QueryCommitReplicationTicketResponse>, Error> {
+        self.service
+            .query_commit_replication_ticket(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn query_commit_replication_list(
+        &self,
+        call: Call,
+        request: QueryCommitReplicationListRequest,
+    ) -> Result<Response<QueryCommitReplicationListResponse>, Error> {
+        self.service
+            .query_commit_replication_list(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn query_commit_placement_list(
+        &self,
+        call: Call,
+        request: QueryCommitPlacementListRequest,
+    ) -> Result<Response<QueryCommitPlacementListResponse>, Error> {
+        self.service
+            .query_commit_placement_list(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn retry_commit_replication(
+        &self,
+        call: Call,
+        request: RetryCommitReplicationRequest,
+    ) -> Result<Response<RetryCommitReplicationResponse>, Error> {
+        self.service
+            .retry_commit_replication(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn cancel_commit_replication(
+        &self,
+        call: Call,
+        request: CancelCommitReplicationRequest,
+    ) -> Result<Response<CancelCommitReplicationResponse>, Error> {
+        self.service
+            .cancel_commit_replication(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
@@ -221,6 +318,13 @@ pub trait ArtifactApi {
         #[param(context)] call: Call,
         #[param(body)] request: QueryArtifactCommitGraphRequest,
     ) -> Result<Response<QueryArtifactCommitGraphResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/artifact/commit/diff/query")]
+    async fn query_artifact_commit_diff(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: QueryArtifactCommitDiffRequest,
+    ) -> Result<Response<QueryArtifactCommitDiffResponse>, Error>;
 
     #[fusen_rs::method(method = "POST", path = "/api/artifact/create")]
     async fn create_artifact(
@@ -687,6 +791,17 @@ impl ArtifactApi for ArtifactController {
     ) -> Result<Response<QueryArtifactCommitGraphResponse>, Error> {
         self.service
             .query_artifact_commit_graph(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn query_artifact_commit_diff(
+        &self,
+        call: Call,
+        request: QueryArtifactCommitDiffRequest,
+    ) -> Result<Response<QueryArtifactCommitDiffResponse>, Error> {
+        self.service
+            .query_artifact_commit_diff(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }

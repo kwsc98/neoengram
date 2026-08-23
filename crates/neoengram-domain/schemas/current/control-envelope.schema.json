@@ -21,6 +21,8 @@
         "agent.job.report.create",
         "agent.lifecycle.assignment",
         "agent.protocol.error",
+        "agent.replication.assignment",
+        "agent.replication.report",
         "agent.session.channel.open",
         "agent.session.close",
         "agent.session.heartbeat.report",
@@ -31,8 +33,13 @@
         "artifact.list.query",
         "artifact.query",
         "commit.availability.query",
+        "commit.placements.query",
         "commit.replicate",
+        "commit.replication.cancel",
+        "commit.replication.list.query",
         "commit.replication.query",
+        "commit.replication.retry",
+        "commit.replication.ticket.query",
         "gateway.bootstrap.certificate",
         "gateway.bootstrap.challenge",
         "gateway.control.channel.open",
@@ -652,6 +659,54 @@
         }
       ]
     },
+    "CentralSignedPayload": {
+      "description": "Central-signed bytes carried unchanged through Gateway hops.",
+      "type": "object",
+      "properties": {
+        "certificate_generation": {
+          "$ref": "#/$defs/CertificateGeneration"
+        },
+        "expires_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "key_id": {
+          "type": "string",
+          "maxLength": 1024,
+          "minLength": 1
+        },
+        "payload": {
+          "$ref": "#/$defs/GatewayOpaqueBytes"
+        },
+        "payload_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "signature": {
+          "$ref": "#/$defs/Ed25519Signature"
+        },
+        "signed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        }
+      },
+      "required": [
+        "key_id",
+        "certificate_generation",
+        "signed_at_unix_ms",
+        "expires_at_unix_ms",
+        "payload_digest",
+        "payload",
+        "signature"
+      ]
+    },
+    "CertificateGeneration": {
+      "description": "A certificate generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
     "CommitDataLayout": {
       "description": "The layout frozen for one Commit and all of its manifests.",
       "type": "string",
@@ -660,12 +715,51 @@
         "whole_file"
       ]
     },
+    "CommitId": {
+      "description": "A canonical lowercase BLAKE3-256 digest.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "CommitObject": {
+      "description": "One immutable object required by a Commit.  The ordinal is part of the ObjectSet identity and\nmakes transfer planning deterministic.",
+      "type": "object",
+      "properties": {
+        "encoding": {
+          "$ref": "#/$defs/ObjectEncoding"
+        },
+        "object_id": {
+          "$ref": "#/$defs/ObjectId"
+        },
+        "ordinal": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "size": {
+          "$ref": "#/$defs/DecimalU64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "object_id",
+        "size",
+        "encoding",
+        "ordinal"
+      ]
+    },
     "ComputeNodeId": {
       "description": "A validated compute node ID wire identifier.",
       "type": "string",
       "maxLength": 128,
       "minLength": 1,
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ContentDigest": {
+      "description": "A canonical lowercase BLAKE3-256 digest.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
     },
     "ControlError": {
       "description": "No extension members are accepted by the current protocol.",
@@ -882,6 +976,38 @@
           "type": "object",
           "properties": {
             "payload": {
+              "$ref": "#/$defs/ReplicationAssignment"
+            },
+            "type": {
+              "type": "string",
+              "const": "replication.assignment"
+            }
+          },
+          "required": [
+            "type",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "$ref": "#/$defs/ReplicationProgressReport"
+            },
+            "type": {
+              "type": "string",
+              "const": "replication.report"
+            }
+          },
+          "required": [
+            "type",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "payload": {
               "$ref": "#/$defs/ControlError"
             },
             "type": {
@@ -924,6 +1050,13 @@
       "minLength": 1,
       "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
     },
+    "Ed25519Signature": {
+      "description": "Canonical 64-byte Ed25519 signature, encoded as base64url without padding.",
+      "type": "string",
+      "maxLength": 86,
+      "minLength": 86,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
     "EdgeClusterId": {
       "description": "A validated edge cluster ID wire identifier.",
       "type": "string",
@@ -943,6 +1076,20 @@
       "maxLength": 20,
       "minLength": 1,
       "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "GatewayOpaqueBytes": {
+      "description": "Opaque bytes encoded as canonical base64url without padding.",
+      "type": "string",
+      "maxLength": 12582912,
+      "minLength": 0,
+      "pattern": "^[A-Za-z0-9_-]*$"
+    },
+    "GatewayPoolId": {
+      "description": "A validated gateway pool ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     },
     "HardlinkPolicy": {
       "type": "string",
@@ -1482,6 +1629,41 @@
         "health"
       ]
     },
+    "ObjectEncoding": {
+      "description": "Encoding of an immutable object in a CAS backend.",
+      "type": "string",
+      "enum": [
+        "raw",
+        "zstd"
+      ]
+    },
+    "ObjectId": {
+      "description": "A canonical lowercase BLAKE3-256 digest.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ObjectSet": {
+      "description": "Canonical object set attached to an immutable Commit.",
+      "type": "object",
+      "properties": {
+        "object_set_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "objects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommitObject"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "object_set_digest",
+        "objects"
+      ]
+    },
     "OwnerGeneration": {
       "description": "A owner generation encoded as a canonical decimal JSON string.",
       "type": "string",
@@ -1495,6 +1677,13 @@
       "maxLength": 20,
       "minLength": 1,
       "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "PlacementId": {
+      "description": "A validated object placement ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     },
     "PlaygroundId": {
       "description": "A validated playground ID wire identifier.",
@@ -1599,6 +1788,242 @@
             "error"
           ]
         }
+      ]
+    },
+    "ReplicationAssignment": {
+      "description": "Central's immutable command for one fenced Commit object replication attempt.\n\nThe signed ticket binds the physical source/target route and expiry. The ObjectSet is carried\nalongside it so an Agent can execute without consulting Central during a reconnect; validation\nrequires both representations to describe exactly the same object identities and digest.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "description": "Artifact namespace bound by the Central-signed transfer ticket.",
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "attempt": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "commit_id": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "object_set": {
+          "$ref": "#/$defs/ObjectSet"
+        },
+        "replication_id": {
+          "$ref": "#/$defs/ReplicationId"
+        },
+        "signed_ticket": {
+          "$ref": "#/$defs/SignedTransferTicket"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "replication_id",
+        "tenant_id",
+        "artifact_id",
+        "commit_id",
+        "attempt",
+        "signed_ticket",
+        "object_set"
+      ]
+    },
+    "ReplicationId": {
+      "description": "A validated replication ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ReplicationObjectState": {
+      "description": "Durable progress state for one object inside a Replication.",
+      "type": "string",
+      "enum": [
+        "queued",
+        "transferring",
+        "verified",
+        "failed"
+      ]
+    },
+    "ReplicationProgressReport": {
+      "description": "Durable Agent-to-Central checkpoint emitted while executing a ReplicationAssignment.\n\nState events carry aggregate counters, object events carry the last fsync-confirmed byte\nboundary, and Published is the final publication fence. The attempt is repeated on every\nevent so Central can reject reports from a superseded retry without consulting Agent state.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "state"
+            },
+            "payload": {
+              "description": "No extension members are accepted by the current protocol.",
+              "type": "object",
+              "properties": {
+                "attempt": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "completed_bytes": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "completed_objects": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "issue_code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "issue_message": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "replication_id": {
+                  "$ref": "#/$defs/ReplicationId"
+                },
+                "state": {
+                  "$ref": "#/$defs/ReplicationState"
+                },
+                "tenant_id": {
+                  "$ref": "#/$defs/TenantId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "replication_id",
+                "tenant_id",
+                "attempt",
+                "state",
+                "completed_objects",
+                "completed_bytes"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "object"
+            },
+            "payload": {
+              "description": "No extension members are accepted by the current protocol.",
+              "type": "object",
+              "properties": {
+                "attempt": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "object_id": {
+                  "$ref": "#/$defs/ObjectId"
+                },
+                "offset": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "replication_id": {
+                  "$ref": "#/$defs/ReplicationId"
+                },
+                "state": {
+                  "$ref": "#/$defs/ReplicationObjectState"
+                },
+                "tenant_id": {
+                  "$ref": "#/$defs/TenantId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "replication_id",
+                "tenant_id",
+                "attempt",
+                "object_id",
+                "offset",
+                "state"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "published"
+            },
+            "payload": {
+              "description": "No extension members are accepted by the current protocol.",
+              "type": "object",
+              "properties": {
+                "attempt": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "commit_id": {
+                  "$ref": "#/$defs/CommitId"
+                },
+                "object_set_digest": {
+                  "$ref": "#/$defs/ContentDigest"
+                },
+                "replication_id": {
+                  "$ref": "#/$defs/ReplicationId"
+                },
+                "tenant_id": {
+                  "$ref": "#/$defs/TenantId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "replication_id",
+                "tenant_id",
+                "attempt",
+                "commit_id",
+                "object_set_digest"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "payload"
+          ]
+        }
+      ]
+    },
+    "ReplicationState": {
+      "description": "Explicit object replication state.",
+      "type": "string",
+      "enum": [
+        "queued",
+        "planning",
+        "transferring",
+        "verifying",
+        "published",
+        "failed",
+        "cancelled"
       ]
     },
     "RequestId": {
@@ -1899,6 +2324,13 @@
       "minLength": 1,
       "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
     },
+    "RouteGeneration": {
+      "description": "A route generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
     "RunningJobObservation": {
       "description": "No extension members are accepted by the current protocol.",
       "type": "object",
@@ -1936,6 +2368,23 @@
       "maxLength": 20,
       "minLength": 1,
       "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "SignedTransferTicket": {
+      "description": "A Central-authenticated transfer capability. The unsigned ticket remains a value object for\ndeterministic local workers; network-facing hops carry this envelope so the exact Tenant,\nObjectSet, endpoints, generations, byte limit, and expiry are signed together.",
+      "type": "object",
+      "properties": {
+        "central_signature": {
+          "$ref": "#/$defs/CentralSignedPayload"
+        },
+        "ticket": {
+          "$ref": "#/$defs/TransferTicket"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ticket",
+        "central_signature"
+      ]
     },
     "SnapshotDeliveryAction": {
       "type": "string",
@@ -2108,6 +2557,128 @@
       "maxLength": 128,
       "minLength": 1,
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TransferEndpoint": {
+      "description": "The physical endpoints bound into a short-lived TransferTicket.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "edge_cluster_id": {
+          "$ref": "#/$defs/EdgeClusterId"
+        },
+        "gateway_pool_id": {
+          "$ref": "#/$defs/GatewayPoolId"
+        },
+        "placement_id": {
+          "$ref": "#/$defs/PlacementId"
+        },
+        "storage_volume_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StorageVolumeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "placement_id",
+        "agent_id",
+        "gateway_pool_id",
+        "edge_cluster_id"
+      ]
+    },
+    "TransferId": {
+      "description": "A validated transfer ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TransferTicket": {
+      "description": "Central-issued, short-lived capability for exactly one object-set transfer.",
+      "type": "object",
+      "properties": {
+        "allowed_objects": {
+          "description": "The exact Object IDs permitted by this capability.  An empty list is valid for an empty\nCommit and is never interpreted as “all objects”.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ObjectId"
+          }
+        },
+        "artifact_id": {
+          "description": "Artifact namespace for the artifact-scoped Volume CAS. This is signed together with the\nrest of the transfer capability so an assignment cannot redirect bytes into another\nartifact's object namespace.",
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "commit_id": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "max_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "object_set_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "route_generation": {
+          "$ref": "#/$defs/RouteGeneration"
+        },
+        "session_generation": {
+          "description": "Target route fences used by the receiving Agent/Gateway.",
+          "$ref": "#/$defs/SessionGeneration"
+        },
+        "source": {
+          "$ref": "#/$defs/TransferEndpoint"
+        },
+        "source_mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "source_route_generation": {
+          "$ref": "#/$defs/RouteGeneration"
+        },
+        "source_session_generation": {
+          "description": "Source route fences are kept separately from the target Agent fences. A relay must not\nreuse a target session or mount generation when it opens the source side of a transfer.",
+          "$ref": "#/$defs/SessionGeneration"
+        },
+        "target": {
+          "$ref": "#/$defs/TransferEndpoint"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "transfer_id": {
+          "$ref": "#/$defs/TransferId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "transfer_id",
+        "tenant_id",
+        "artifact_id",
+        "commit_id",
+        "object_set_digest",
+        "source",
+        "target",
+        "source_session_generation",
+        "source_mount_generation",
+        "source_route_generation",
+        "session_generation",
+        "mount_generation",
+        "route_generation",
+        "deadline_unix_ms",
+        "max_bytes",
+        "allowed_objects"
+      ]
     },
     "UnixMillis": {
       "description": "A Unix millisecond timestamp encoded as a canonical decimal JSON string.",

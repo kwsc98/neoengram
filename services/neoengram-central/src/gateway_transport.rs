@@ -407,6 +407,7 @@ async fn forward_agent_frame_via_authority(
         neoengram_domain::protocol::AgentChannelDownstreamMessage::Assignment(_)
             | neoengram_domain::protocol::AgentChannelDownstreamMessage::Decision(_)
             | neoengram_domain::protocol::AgentChannelDownstreamMessage::LifecycleAssignment(_)
+            | neoengram_domain::protocol::AgentChannelDownstreamMessage::ReplicationAssignment(_)
     ) {
         return Err(GatewaySessionError::Protocol(
             "peer forwarding accepts only Agent Job or lifecycle command frames",
@@ -490,6 +491,7 @@ fn forwarded_command_generation(
         neoengram_domain::protocol::AgentChannelDownstreamMessage::Assignment(_)
             | neoengram_domain::protocol::AgentChannelDownstreamMessage::Decision(_)
             | neoengram_domain::protocol::AgentChannelDownstreamMessage::LifecycleAssignment(_)
+            | neoengram_domain::protocol::AgentChannelDownstreamMessage::ReplicationAssignment(_)
     )
     .then_some(downstream.session_generation)
 }

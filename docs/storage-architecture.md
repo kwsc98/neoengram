@@ -1,10 +1,10 @@
 # 当前仓库存储架构
 
-> 本文同时记录当前 Standalone/Managed 存储实现和已确认的 Synapse Gateway 目标边界。
+> 本文同时记录当前 Standalone/Managed 存储实现和已确认的 NeoEngram Gateway 目标边界。
 > Gateway Registry、管理面、H2/mTLS 控制 tunnel 和一跳 Replica forwarding 已进入 G1；固定 Ready Snapshot 的
 > 一期只读 S3 Access Point、Gateway Web/S3 listener 和 Agent 流式读取已经实现，公网 DNS/TLS、生产凭据
 > provisioner 与真实双 Replica 故障演练仍属于部署验收项。Gateway 也没有任何 Volume/CAS I/O 能力；其专项设计见
-> [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。
+> [`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md)。
 
 NeoEngram `0.2.0` 的本地仓库格式为 9。升级允许破坏兼容性：实现明确拒绝所有旧
 格式，不读取、不迁移，也不提供自动回退。仓库格式 9 将可移植内容模型和规范 digest 收敛到
@@ -89,7 +89,7 @@ Managed 模式使用不同的权威边界：
   Assignment 的 Tenant、Artifact、StorageVolume、ArtifactPlacement 和 `placement_generation`；
 - Agent 的 identity、Ledger、outbound 和 candidate 位于独立 `state_dir`，不得在业务 Volume 上创建
   SQLite/WAL；状态盘丢失不会删除 Volume 中的业务对象；
-- 当前 P0 不实现跨 Volume 对象复制、强 storage-side fencing、Synapse Gateway payload 数据链或生产数据库。目标
+- 当前 P0 不实现跨 Volume 对象复制、强 storage-side fencing、NeoEngram Gateway payload 数据链或生产数据库。目标
   复制链路固定为源 Agent -> 源 GatewayPool -> 目标 GatewayPool -> 目标 Agent；Server 仍只下发计划
   和记录凭证，不进入 payload 路径。
 
@@ -119,7 +119,7 @@ chunk ordinal 重组，拒绝缺口、重复和 metadata 变化，再复算完�
 publisher 在同一原子边界持久化这些 canonical Manifests 与新 IndexVersion，因此 staging TTL 清理后
 Index 仍可解析；Conflict/Rejected 不发布候选 Manifest。
 
-### Synapse Gateway 存储边界
+### NeoEngram Gateway 存储边界
 
 2026-08-09 已确认每个 EdgeCluster 使用一个多副本 GatewayPool 作为控制入口和后续数据/S3 入口。
 这项网络拓扑调整不改变任何存储权威：

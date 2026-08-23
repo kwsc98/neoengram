@@ -82,7 +82,7 @@ export default defineConfig(({ command, mode }) => {
   const gatewayE2eBuild =
     command === 'build' &&
     mode === 'mock' &&
-    process.env.SYNAPSE_WEB_E2E_GATEWAY === '1' &&
+    process.env.NEOENGRAM_WEB_E2E_GATEWAY === '1' &&
     process.env.VITE_E2E_GATEWAY_MOCKS === 'true';
   if (
     command === 'build' &&

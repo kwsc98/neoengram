@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use super::placement::{CommitObjectSet, ObjectSet};
 use crate::{
-    AgentId, CommitId, ContentDigest, DecimalU64, EdgeClusterId, GatewayPoolId, MountGeneration,
-    ObjectId, PlacementId, ProtocolError, ProtocolResult, RouteGeneration, SessionGeneration,
-    StorageVolumeId, TenantId, TransferId, UnixMillis,
+    AgentId, ArtifactId, CentralSignedPayload, CommitId, ContentDigest, DecimalU64, EdgeClusterId,
+    GatewayPoolId, MountGeneration, ObjectId, PlacementId, ProtocolError, ProtocolResult,
+    RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, TransferId, UnixMillis,
 };
 
 /// ALPN negotiated by all object transfer QUIC connections.
@@ -61,10 +61,20 @@ impl TransferEndpoint {
 pub struct TransferTicket {
     pub transfer_id: TransferId,
     pub tenant_id: TenantId,
+    /// Artifact namespace for the artifact-scoped Volume CAS. This is signed together with the
+    /// rest of the transfer capability so an assignment cannot redirect bytes into another
+    /// artifact's object namespace.
+    pub artifact_id: ArtifactId,
     pub commit_id: CommitId,
     pub object_set_digest: ContentDigest,
     pub source: TransferEndpoint,
     pub target: TransferEndpoint,
+    /// Source route fences are kept separately from the target Agent fences. A relay must not
+    /// reuse a target session or mount generation when it opens the source side of a transfer.
+    pub source_session_generation: SessionGeneration,
+    pub source_mount_generation: MountGeneration,
+    pub source_route_generation: RouteGeneration,
+    /// Target route fences used by the receiving Agent/Gateway.
     pub session_generation: SessionGeneration,
     pub mount_generation: MountGeneration,
     pub route_generation: RouteGeneration,
@@ -75,11 +85,74 @@ pub struct TransferTicket {
     pub allowed_objects: Vec<ObjectId>,
 }
 
+/// A Central-authenticated transfer capability. The unsigned ticket remains a value object for
+/// deterministic local workers; network-facing hops carry this envelope so the exact Tenant,
+/// ObjectSet, endpoints, generations, byte limit, and expiry are signed together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SignedTransferTicket {
+    pub ticket: TransferTicket,
+    pub central_signature: CentralSignedPayload,
+}
+
+impl SignedTransferTicket {
+    pub fn payload_bytes(ticket: &TransferTicket) -> ProtocolResult<Vec<u8>> {
+        serde_json::to_vec(ticket).map_err(|error| ProtocolError::Serialization(error.to_string()))
+    }
+
+    pub fn new(
+        ticket: TransferTicket,
+        central_signature: CentralSignedPayload,
+    ) -> ProtocolResult<Self> {
+        ticket.validate()?;
+        central_signature.validate()?;
+        if central_signature.payload.as_bytes() != Self::payload_bytes(&ticket)? {
+            return Err(ProtocolError::InvalidField {
+                field: "central_signature",
+                reason: "signature payload does not match TransferTicket".to_owned(),
+            });
+        }
+        Ok(Self {
+            ticket,
+            central_signature,
+        })
+    }
+
+    pub fn validate(&self) -> ProtocolResult<()> {
+        self.ticket.validate()?;
+        self.central_signature.validate()?;
+        if self.central_signature.payload.as_bytes() != Self::payload_bytes(&self.ticket)? {
+            return Err(ProtocolError::InvalidField {
+                field: "central_signature",
+                reason: "signature payload does not match TransferTicket".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn as_ticket(&self) -> &TransferTicket {
+        &self.ticket
+    }
+}
+
 impl TransferTicket {
     pub fn validate(&self) -> ProtocolResult<()> {
         self.source.validate()?;
         self.target.validate()?;
         for (field, value) in [
+            (
+                "source_session_generation",
+                self.source_session_generation.get(),
+            ),
+            (
+                "source_mount_generation",
+                self.source_mount_generation.get(),
+            ),
+            (
+                "source_route_generation",
+                self.source_route_generation.get(),
+            ),
             ("session_generation", self.session_generation.get()),
             ("mount_generation", self.mount_generation.get()),
             ("route_generation", self.route_generation.get()),
@@ -139,6 +212,7 @@ enum FrameKind {
     CommitObjectSet = 6,
     TransferError = 7,
     CloseTransfer = 8,
+    OpenTransferSigned = 9,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -154,6 +228,7 @@ impl TryFrom<u8> for FrameKind {
             6 => Self::CommitObjectSet,
             7 => Self::TransferError,
             8 => Self::CloseTransfer,
+            9 => Self::OpenTransferSigned,
             _ => return Err(TransferFrameError::UnknownKind(value)),
         })
     }
@@ -164,6 +239,7 @@ impl TryFrom<u8> for FrameKind {
 #[allow(clippy::large_enum_variant)]
 pub enum TransferFrame {
     OpenTransfer(TransferTicket),
+    OpenTransferSigned(SignedTransferTicket),
     ObjectRequest(ObjectRequest),
     ObjectChunk(ObjectChunk),
     ObjectProof(ObjectProof),
@@ -322,6 +398,13 @@ impl TransferFrame {
                 payload.push(FrameKind::OpenTransfer as u8);
                 encode_ticket(&mut payload, ticket)?;
             }
+            Self::OpenTransferSigned(ticket) => {
+                ticket
+                    .validate()
+                    .map_err(|_| TransferFrameError::InvalidField("signed_ticket"))?;
+                payload.push(FrameKind::OpenTransferSigned as u8);
+                encode_signed_ticket(&mut payload, ticket)?;
+            }
             Self::ObjectRequest(request) => {
                 if request.length == 0 {
                     return Err(TransferFrameError::InvalidField("length"));
@@ -428,6 +511,9 @@ impl TransferFrame {
         let kind = FrameKind::try_from(reader.byte()?)?;
         let frame = match kind {
             FrameKind::OpenTransfer => Self::OpenTransfer(decode_ticket(&mut reader)?),
+            FrameKind::OpenTransferSigned => {
+                Self::OpenTransferSigned(decode_signed_ticket(&mut reader)?)
+            }
             FrameKind::ObjectRequest => Self::ObjectRequest(ObjectRequest {
                 object_id: reader.object_id()?,
                 offset: reader.u64()?,
@@ -483,10 +569,14 @@ impl TransferFrame {
 fn encode_ticket(out: &mut Vec<u8>, ticket: &TransferTicket) -> Result<(), TransferFrameError> {
     put_string(out, ticket.transfer_id.as_str())?;
     put_string(out, ticket.tenant_id.as_str())?;
+    put_string(out, ticket.artifact_id.as_str())?;
     put_digest(out, ticket.commit_id.digest());
     put_digest(out, ticket.object_set_digest);
     encode_endpoint(out, &ticket.source)?;
     encode_endpoint(out, &ticket.target)?;
+    put_u64(out, ticket.source_session_generation.get());
+    put_u64(out, ticket.source_mount_generation.get());
+    put_u64(out, ticket.source_route_generation.get());
     put_u64(out, ticket.session_generation.get());
     put_u64(out, ticket.mount_generation.get());
     put_u64(out, ticket.route_generation.get());
@@ -506,14 +596,52 @@ fn encode_ticket(out: &mut Vec<u8>, ticket: &TransferTicket) -> Result<(), Trans
     Ok(())
 }
 
+fn encode_signed_ticket(
+    out: &mut Vec<u8>,
+    ticket: &SignedTransferTicket,
+) -> Result<(), TransferFrameError> {
+    let encoded = serde_json::to_vec(ticket)
+        .map_err(|_| TransferFrameError::InvalidField("signed_ticket"))?;
+    if encoded.len() > MAX_TRANSFER_FRAME_BYTES {
+        return Err(TransferFrameError::LimitExceeded {
+            field: "signed_ticket",
+            limit: MAX_TRANSFER_FRAME_BYTES,
+            actual: encoded.len(),
+        });
+    }
+    put_bytes(out, &encoded)
+}
+
+fn decode_signed_ticket(
+    reader: &mut Reader<'_>,
+) -> Result<SignedTransferTicket, TransferFrameError> {
+    let bytes = reader.bytes(MAX_TRANSFER_FRAME_BYTES)?;
+    let ticket: SignedTransferTicket = serde_json::from_slice(&bytes)
+        .map_err(|_| TransferFrameError::InvalidField("signed_ticket"))?;
+    ticket
+        .validate()
+        .map_err(|_| TransferFrameError::InvalidField("signed_ticket"))?;
+    Ok(ticket)
+}
+
 fn decode_ticket(reader: &mut Reader<'_>) -> Result<TransferTicket, TransferFrameError> {
     let ticket = TransferTicket {
         transfer_id: reader.id("transfer ID")?,
         tenant_id: reader.id("tenant ID")?,
+        artifact_id: reader.id("artifact ID")?,
         commit_id: CommitId::from_digest(reader.digest()?),
         object_set_digest: reader.digest()?,
         source: decode_endpoint(reader)?,
         target: decode_endpoint(reader)?,
+        source_session_generation: SessionGeneration::new(
+            reader.u64_nonzero("source_session_generation")?,
+        ),
+        source_mount_generation: MountGeneration::new(
+            reader.u64_nonzero("source_mount_generation")?,
+        ),
+        source_route_generation: RouteGeneration::new(
+            reader.u64_nonzero("source_route_generation")?,
+        ),
         session_generation: SessionGeneration::new(reader.u64_nonzero("session_generation")?),
         mount_generation: MountGeneration::new(reader.u64_nonzero("mount_generation")?),
         route_generation: RouteGeneration::new(reader.u64_nonzero("route_generation")?),
@@ -801,6 +929,7 @@ mod tests {
         TransferTicket {
             transfer_id: TransferId::new("transfer-1").unwrap(),
             tenant_id: TenantId::new("tenant-1").unwrap(),
+            artifact_id: ArtifactId::new("artifact-1").unwrap(),
             commit_id: CommitId::from_bytes([8; 32]),
             object_set_digest: ContentDigest::from_bytes([9; 32]),
             source: TransferEndpoint {
@@ -817,6 +946,9 @@ mod tests {
                 edge_cluster_id: EdgeClusterId::new("cluster-dst").unwrap(),
                 storage_volume_id: Some(StorageVolumeId::new("volume-dst").unwrap()),
             },
+            source_session_generation: SessionGeneration::new(4),
+            source_mount_generation: MountGeneration::new(5),
+            source_route_generation: RouteGeneration::new(6),
             session_generation: SessionGeneration::new(1),
             mount_generation: MountGeneration::new(1),
             route_generation: RouteGeneration::new(1),

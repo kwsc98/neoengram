@@ -948,6 +948,56 @@ code {
   color: var(--muted);
   font-size: 12px;
 }
+.commit-replication-target {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+}
+.commit-placement-list,
+.commit-replication-list {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+}
+.commit-placement-list__heading {
+  padding: 10px 4px 6px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.commit-placement-row,
+.commit-replication-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 4px;
+  border-bottom: 1px solid var(--line);
+}
+.commit-placement-row > span:first-child,
+.commit-replication-row > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+.commit-placement-row small,
+.commit-replication-row small {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.commit-replication-row__issue {
+  color: var(--danger) !important;
+}
+.commit-replication-row__actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
 .diff-summary {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));

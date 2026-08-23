@@ -439,8 +439,111 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 查询复制任务 */
+        /**
+         * 查询复制任务
+         * @description 查询单个 Commit 复制任务及其当前对象和字节进度。
+         */
         post: operations["queryCommitReplication"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/commit/replication/ticket/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询复制传输票据
+         * @description 返回绑定 Tenant、Commit、ObjectSet、源/目标 Placement 和路由代次的短期传输票据。
+         */
+        post: operations["queryCommitReplicationTicket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/commit/replication/list/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Commit 的复制任务
+         * @description 查询指定 Commit 的全部复制任务及其目标副本状态。
+         */
+        post: operations["queryCommitReplicationList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/commit/replication/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 重试失败的 Commit 复制
+         * @description 使用当前 attempt fence 重新排队失败或取消的 Commit 复制任务。
+         */
+        post: operations["retryCommitReplication"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/commit/replication/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 取消 Commit 复制
+         * @description 取消仍在进行中的 Commit 复制任务并保留临时数据供后续清理。
+         */
+        post: operations["cancelCommitReplication"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/commit/placements/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 查询 Commit Placement 列表
+         * @description 查询 Commit 已发布、可用于读取的物理 PlacementSet 列表。
+         */
+        post: operations["queryCommitPlacementList"];
         delete?: never;
         options?: never;
         head?: never;
@@ -456,7 +559,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 查询 Commit 数据健康 */
+        /**
+         * 查询 Commit 数据健康
+         * @description 根据已发布 PlacementSet 计算 Commit 当前对象可用性。
+         */
         post: operations["queryCommitAvailability"];
         delete?: never;
         options?: never;
@@ -2664,6 +2770,8 @@ export interface components {
         };
         CreateCommitReplicationRequest: {
             tenant_id: components["schemas"]["TenantId"];
+            project_id: components["schemas"]["ProjectId"];
+            artifact_id: components["schemas"]["ArtifactId"];
             commit_id: components["schemas"]["CommitId"];
             target_storage_volume_id: components["schemas"]["StorageVolumeId"];
             request_id: components["schemas"]["RequestId"];
@@ -2671,6 +2779,28 @@ export interface components {
         QueryCommitReplicationRequest: {
             tenant_id: components["schemas"]["TenantId"];
             replication_id: components["schemas"]["ResourceId"];
+        };
+        QueryCommitReplicationTicketRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            replication_id: components["schemas"]["ResourceId"];
+        };
+        QueryCommitReplicationListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            commit_id: components["schemas"]["CommitId"];
+        };
+        RetryCommitReplicationRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            replication_id: components["schemas"]["ResourceId"];
+            expected_attempt: components["schemas"]["CanonicalU64"];
+        };
+        CancelCommitReplicationRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            replication_id: components["schemas"]["ResourceId"];
+            expected_attempt: components["schemas"]["CanonicalU64"];
+        };
+        QueryCommitPlacementListRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            commit_id: components["schemas"]["CommitId"];
         };
         QueryCommitAvailabilityRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -2687,13 +2817,35 @@ export interface components {
         ReplicationView: {
             replication_id: components["schemas"]["ResourceId"];
             tenant_id: components["schemas"]["TenantId"];
+            artifact_id?: components["schemas"]["ArtifactId"];
             commit_id: components["schemas"]["CommitId"];
             target_storage_volume_id: components["schemas"]["StorageVolumeId"];
+            attempt: components["schemas"]["CanonicalU64"];
             /** @enum {string} */
             state: "queued" | "planning" | "transferring" | "verifying" | "published" | "failed" | "cancelled";
             object_set_digest: components["schemas"]["ContentDigest"];
             completed_objects: components["schemas"]["CanonicalU64"];
             total_objects: components["schemas"]["CanonicalU64"];
+            source_placement_set_id?: components["schemas"]["ResourceId"];
+            source_storage_volume_id?: components["schemas"]["StorageVolumeId"];
+            source_edge_cluster_id?: components["schemas"]["ResourceId"];
+            source_gateway_pool_id?: components["schemas"]["ResourceId"];
+            source_agent_id?: components["schemas"]["ResourceId"];
+            source_session_generation?: components["schemas"]["CanonicalU64"];
+            source_mount_generation?: components["schemas"]["CanonicalU64"];
+            source_route_generation?: components["schemas"]["CanonicalU64"];
+            target_edge_cluster_id?: components["schemas"]["ResourceId"];
+            target_gateway_pool_id?: components["schemas"]["ResourceId"];
+            target_agent_id?: components["schemas"]["ResourceId"];
+            target_session_generation?: components["schemas"]["CanonicalU64"];
+            target_mount_generation?: components["schemas"]["CanonicalU64"];
+            target_route_generation?: components["schemas"]["CanonicalU64"];
+            transfer_route_id?: components["schemas"]["ResourceId"];
+            transfer_id?: components["schemas"]["ResourceId"];
+            target_placement_set_id?: components["schemas"]["ResourceId"];
+            staging_id?: components["schemas"]["ResourceId"];
+            completed_bytes: components["schemas"]["CanonicalU64"];
+            total_bytes: components["schemas"]["CanonicalU64"];
             issue?: components["schemas"]["ResourceIssueSummary"];
         };
         CreateCommitReplicationResponse: {
@@ -2702,6 +2854,73 @@ export interface components {
         };
         QueryCommitReplicationResponse: {
             replication: components["schemas"]["ReplicationView"];
+        };
+        TransferEndpoint: {
+            placement_id: components["schemas"]["ResourceId"];
+            agent_id: components["schemas"]["ResourceId"];
+            gateway_pool_id: components["schemas"]["GatewayPoolId"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            storage_volume_id?: components["schemas"]["StorageVolumeId"];
+        };
+        TransferTicket: {
+            transfer_id: components["schemas"]["ResourceId"];
+            tenant_id: components["schemas"]["TenantId"];
+            artifact_id: components["schemas"]["ArtifactId"];
+            commit_id: components["schemas"]["CommitId"];
+            object_set_digest: components["schemas"]["ContentDigest"];
+            source: components["schemas"]["TransferEndpoint"];
+            target: components["schemas"]["TransferEndpoint"];
+            source_session_generation?: components["schemas"]["CanonicalU64"];
+            source_mount_generation?: components["schemas"]["CanonicalU64"];
+            source_route_generation?: components["schemas"]["CanonicalU64"];
+            session_generation: components["schemas"]["CanonicalU64"];
+            mount_generation: components["schemas"]["CanonicalU64"];
+            route_generation: components["schemas"]["CanonicalU64"];
+            deadline_unix_ms: components["schemas"]["UnixMillis"];
+            max_bytes: components["schemas"]["DecimalU64"];
+            allowed_objects: components["schemas"]["ContentDigest"][];
+        };
+        CentralSignedPayload: {
+            key_id: string;
+            certificate_generation: components["schemas"]["CanonicalU64"];
+            signed_at_unix_ms: components["schemas"]["UnixMillis"];
+            expires_at_unix_ms: components["schemas"]["UnixMillis"];
+            payload_digest: components["schemas"]["ContentDigest"];
+            payload: string;
+            signature: string;
+            extensions?: Record<string, never>;
+        };
+        SignedTransferTicket: {
+            ticket: components["schemas"]["TransferTicket"];
+            central_signature: components["schemas"]["CentralSignedPayload"];
+        };
+        QueryCommitReplicationTicketResponse: {
+            ticket: components["schemas"]["TransferTicket"];
+            signed_ticket?: components["schemas"]["SignedTransferTicket"];
+        };
+        RetryCommitReplicationResponse: {
+            replication: components["schemas"]["ReplicationView"];
+        };
+        CancelCommitReplicationResponse: {
+            replication: components["schemas"]["ReplicationView"];
+        };
+        QueryCommitReplicationListResponse: {
+            replications: components["schemas"]["ReplicationView"][];
+        };
+        CommitPlacementView: {
+            placement_set_id: components["schemas"]["ResourceId"];
+            commit_id: components["schemas"]["CommitId"];
+            backend_id: components["schemas"]["ResourceId"];
+            storage_volume_id?: components["schemas"]["StorageVolumeId"];
+            object_set_digest: components["schemas"]["ContentDigest"];
+            object_count: components["schemas"]["CanonicalU64"];
+            verified_object_count: components["schemas"]["CanonicalU64"];
+            placement_generation: components["schemas"]["CanonicalU64"];
+            /** @enum {string} */
+            state: "staged" | "published" | "retiring" | "deleted";
+        };
+        QueryCommitPlacementListResponse: {
+            placements: components["schemas"]["CommitPlacementView"][];
         };
         CommitAvailabilityView: {
             commit_id: components["schemas"]["CommitId"];
@@ -3388,7 +3607,7 @@ export interface components {
         S3ObjectKey: components["schemas"]["LogicalPath"];
         S3ObjectKeyPrefix: string;
         /** @enum {string} */
-        PermissionName: "job.create" | "job.read" | "job.finalize" | "tenant.read" | "tenant.create" | "tenant.admin" | "storage.read" | "storage.create" | "storage.enrollment.create" | "storage.enrollment.read" | "storage.enrollment.review" | "artifact.read" | "artifact.create" | "project.read" | "project.create" | "playground.read" | "playground.create" | "snapshot.read" | "snapshot.create" | "s3.access.read" | "s3.access.manage" | "resource.lifecycle.read" | "resource.lifecycle.manage" | "retention.manage" | "gateway.read" | "gateway.manage";
+        PermissionName: "job.create" | "job.read" | "job.finalize" | "tenant.read" | "tenant.create" | "tenant.admin" | "storage.read" | "storage.create" | "storage.enrollment.create" | "storage.enrollment.read" | "storage.enrollment.review" | "artifact.read" | "artifact.create" | "artifact.commit.replicate" | "project.read" | "project.create" | "playground.read" | "playground.create" | "snapshot.read" | "snapshot.create" | "s3.access.read" | "s3.access.manage" | "resource.lifecycle.read" | "resource.lifecycle.manage" | "retention.manage" | "gateway.read" | "gateway.manage";
         TagName: string;
         /** @description 服务端生成、与资源 scope、筛选条件和排序绑定的不透明分页 token。 */
         PageCursor: string;
@@ -3807,6 +4026,8 @@ export interface operations {
                      *       "capabilities": [
                      *         "artifact_catalog",
                      *         "artifact_commit_graph",
+                     *         "artifact_commit_diff",
+                     *         "artifact_commit_replication",
                      *         "managed_add",
                      *         "sqlite_authority",
                      *         "commit_layout_selection_v2",
@@ -5116,6 +5337,236 @@ export interface operations {
             500: components["responses"]["InternalProblem"];
         };
     };
+    queryCommitReplicationTicket: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryCommitReplicationTicketRequest"];
+            };
+        };
+        responses: {
+            /** @description 短期传输票据 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryCommitReplicationTicketResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+            503: components["responses"]["ServiceUnavailableProblem"];
+        };
+    };
+    queryCommitReplicationList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryCommitReplicationListRequest"];
+            };
+        };
+        responses: {
+            /** @description 复制任务列表 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryCommitReplicationListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+        };
+    };
+    retryCommitReplication: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetryCommitReplicationRequest"];
+            };
+        };
+        responses: {
+            /** @description 重试任务 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetryCommitReplicationResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+        };
+    };
+    cancelCommitReplication: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CancelCommitReplicationRequest"];
+            };
+        };
+        responses: {
+            /** @description 取消任务 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelCommitReplicationResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+        };
+    };
+    queryCommitPlacementList: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryCommitPlacementListRequest"];
+            };
+        };
+        responses: {
+            /** @description Placement 列表 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryCommitPlacementListResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            422: components["responses"]["ValidationProblem"];
+            500: components["responses"]["InternalProblem"];
+        };
+    };
     queryCommitAvailability: {
         parameters: {
             query?: never;
@@ -5434,7 +5885,6 @@ export interface operations {
                  *       "tenant_id": "tenant-a",
                  *       "project_id": "project-vision",
                  *       "artifact_id": "road-scenes",
-                 *       "region": "cn-shanghai",
                  *       "state": "ready",
                  *       "page_size": 50
                  *     }
@@ -6432,7 +6882,6 @@ export interface operations {
                  *       "tenant_id": "tenant-a",
                  *       "project_id": "project-vision",
                  *       "artifact_id": "road-scenes",
-                 *       "region": "cn-shanghai",
                  *       "state": "ready",
                  *       "page_size": 50
                  *     }
@@ -6458,14 +6907,13 @@ export interface operations {
                      *           "artifact_id": "road-scenes",
                      *           "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *           "data_layout": "fast_cdc",
-                     *           "storage_volume_id": "volume-shanghai-archive",
-                     *           "region": "cn-shanghai",
                      *           "message": "补充夜间道路场景",
                      *           "tag_names": [
                      *             "dataset/v4",
                      *             "release-candidate"
                      *           ],
                      *           "state": "ready",
+                     *           "data_health": "available",
                      *           "integrity": {
                      *             "state": "verified",
                      *             "files_verified": "864",
@@ -6549,14 +6997,13 @@ export interface operations {
                      *         "artifact_id": "road-scenes",
                      *         "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                      *         "data_layout": "fast_cdc",
-                     *         "storage_volume_id": "volume-shanghai-archive",
-                     *         "region": "cn-shanghai",
                      *         "message": "补充夜间道路场景",
                      *         "tag_names": [
                      *           "dataset/v4",
                      *           "release-candidate"
                      *         ],
                      *         "state": "ready",
+                     *         "data_health": "available",
                      *         "integrity": {
                      *           "state": "verified",
                      *           "files_verified": "864",
@@ -6647,6 +7094,7 @@ export interface operations {
                      *           "release-candidate"
                      *         ],
                      *         "state": "creating",
+                     *         "data_health": "unavailable",
                      *         "integrity": {
                      *           "state": "pending",
                      *           "files_verified": "0",

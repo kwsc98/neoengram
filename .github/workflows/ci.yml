@@ -18,8 +18,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-      - name: Install Rust 1.97.0
-        uses: dtolnay/rust-toolchain@1.97.0
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
       - name: Install Node.js 22.12.0
@@ -118,8 +118,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-      - name: Install Rust 1.97.0
-        uses: dtolnay/rust-toolchain@1.97.0
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@1.97.1
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
       - name: Run default-feature tests
@@ -150,10 +150,8 @@ jobs:
             "$mount_root/.neoengram-volume-marker"
 
           NEOENGRAM_REAL_MOUNT_PROBE_ROOT="$mount_root" \
-            cargo test --locked -p neoengram-agent \
-              --test linux_mount_probe \
-              detects_real_mount_boundary_and_read_write_capabilities \
-              -- --ignored --exact
+            PROJECT_TEST_AGENT_SUITE=mount-probe \
+            scripts/project-test.sh --no-install module agent
 
   test-all-features:
     name: Test all features (Linux)
@@ -161,8 +159,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-      - name: Install Rust 1.97.0
-        uses: dtolnay/rust-toolchain@1.97.0
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@1.97.1
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
       - name: Run all-feature tests
@@ -191,12 +189,42 @@ jobs:
         working-directory: apps/neoengram-web
 
   msrv:
-    name: Minimum Rust 1.97.0
+    name: Minimum Rust 1.97.1
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-      - name: Install Rust 1.97.0
-        uses: dtolnay/rust-toolchain@1.97.0
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@1.97.1
       - name: Check minimum supported Rust version
         run: cargo check --workspace --all-targets --all-features --locked
+
+  project-modules:
+    name: Project test modules
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - name: Install Node.js 22.12.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          cache: npm
+          cache-dependency-path: |
+            docs/openapi/package-lock.json
+            apps/neoengram-web/package-lock.json
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+      - name: Install JavaScript dependencies
+        run: |
+          npm ci --prefix docs/openapi --ignore-scripts
+          npm ci --prefix apps/neoengram-web
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: apps/neoengram-web
+      - name: Run project test modules
+        run: scripts/project-test.sh --no-install modules

@@ -97,7 +97,7 @@ impl LocalS3SecretEnvelope {
             .keys
             .get(self.active_key_id.as_ref())
             .expect("active local S3 envelope key is present");
-        blake3::derive_key("synapse s3 continuation token signing v1", key)
+        blake3::derive_key("neoengram s3 continuation token signing v1", key)
     }
 
     fn active_key(&self) -> (&str, &[u8; 32]) {
@@ -282,7 +282,7 @@ fn open(
 }
 
 fn dek_aad(key_id: &str, context: &[u8]) -> Vec<u8> {
-    let mut aad = b"synapse-s3-dek-v2\0".to_vec();
+    let mut aad = b"neoengram-s3-dek-v2\0".to_vec();
     aad.extend_from_slice(key_id.as_bytes());
     aad.push(0);
     aad.extend_from_slice(context);
@@ -290,7 +290,7 @@ fn dek_aad(key_id: &str, context: &[u8]) -> Vec<u8> {
 }
 
 fn secret_aad(context: &[u8]) -> Vec<u8> {
-    let mut aad = b"synapse-s3-secret-v2\0".to_vec();
+    let mut aad = b"neoengram-s3-secret-v2\0".to_vec();
     aad.extend_from_slice(context);
     aad
 }

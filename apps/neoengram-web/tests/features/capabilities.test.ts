@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   supportsArtifactCatalog,
+  supportsArtifactCommitDiff,
   supportsArtifactCommitGraph,
+  supportsArtifactCommitReplication,
   supportsCommitLayoutSelection,
   supportsPlaygroundBrowser,
   supportsPlaygroundMaterialize,
@@ -16,6 +18,8 @@ describe('server capability gates', () => {
   it('exposes the Artifact catalog without enabling an aggregate browser', () => {
     expect(supportsArtifactCatalog(['artifact_catalog'])).toBe(true);
     expect(supportsArtifactCommitGraph(['artifact_catalog'])).toBe(false);
+    expect(supportsArtifactCommitDiff(['artifact_catalog'])).toBe(false);
+    expect(supportsArtifactCommitReplication(['artifact_catalog'])).toBe(false);
     expect(supportsSnapshotMaterialize(['artifact_catalog'])).toBe(false);
   });
 
@@ -31,6 +35,10 @@ describe('server capability gates', () => {
 
   it('gates workspace surfaces independently when the server advertises granular capabilities', () => {
     expect(supportsArtifactCommitGraph(['artifact_commit_graph'])).toBe(true);
+    expect(supportsArtifactCommitDiff(['artifact_commit_graph'])).toBe(false);
+    expect(supportsArtifactCommitDiff(['artifact_commit_diff'])).toBe(true);
+    expect(supportsArtifactCommitReplication(['artifact_commit_diff'])).toBe(false);
+    expect(supportsArtifactCommitReplication(['artifact_commit_replication'])).toBe(true);
     expect(supportsPlaygroundMaterialize(['playground_materialize'])).toBe(true);
     expect(supportsPlaygroundBrowser(['playground_materialize'])).toBe(false);
     expect(supportsPlaygroundBrowser(['playground_browser'])).toBe(true);
@@ -42,6 +50,8 @@ describe('server capability gates', () => {
   it('keeps both resource families hidden when neither capability is declared', () => {
     expect(supportsArtifactCatalog(['managed_add'])).toBe(false);
     expect(supportsArtifactCommitGraph(undefined)).toBe(false);
+    expect(supportsArtifactCommitDiff(undefined)).toBe(false);
+    expect(supportsArtifactCommitReplication(undefined)).toBe(false);
     expect(supportsPlaygroundMaterialize(undefined)).toBe(false);
     expect(supportsPlaygroundBrowser(undefined)).toBe(false);
     expect(supportsPlaygroundPreCommit(undefined)).toBe(false);

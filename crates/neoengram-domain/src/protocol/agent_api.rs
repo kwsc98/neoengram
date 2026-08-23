@@ -11,9 +11,9 @@ use crate::{
     AgentMountStatusReport, AgentResourceLifecycleAssignment, CentralSignedPayload, ControlError,
     ControlMessage, DecimalU64, Envelope, Extensions, IndexDeltaRecord, JobAssignment, JobDecision,
     JobId, MessageId, MetadataBatchDescriptor, MetadataBatchPage, ProtocolError, ProtocolResult,
-    ProtocolVersion, RequestId, ResourceVersion, SequenceNumber, SessionGeneration, SessionId,
-    TenantId, UnixMillis, WireChunkRef, WireChunkingStrategy, WireIndexVersion,
-    CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
+    ProtocolVersion, ReplicationAssignment, RequestId, ResourceVersion, SequenceNumber,
+    SessionGeneration, SessionId, TenantId, UnixMillis, WireChunkRef, WireChunkingStrategy,
+    WireIndexVersion, CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
 };
 
 pub const AGENT_REQUEST_SIGNING_DOMAIN_V1: &str = "neoengram-agent-request-v1";
@@ -643,6 +643,8 @@ pub enum AgentChannelDownstreamMessage {
     Decision(JobDecision),
     #[serde(rename = "resource.lifecycle.assignment")]
     LifecycleAssignment(Box<AgentResourceLifecycleAssignment>),
+    #[serde(rename = "replication.assignment")]
+    ReplicationAssignment(Box<ReplicationAssignment>),
     #[serde(rename = "channel.ack")]
     Ack(AgentChannelAck),
     #[serde(rename = "protocol.error")]
@@ -658,6 +660,7 @@ impl AgentChannelDownstreamMessage {
                 | "job.assignment"
                 | "job.decision"
                 | "resource.lifecycle.assignment"
+                | "replication.assignment"
                 | "channel.ack"
                 | "protocol.error"
         )
@@ -758,6 +761,7 @@ impl AgentChannelUpstreamFrame {
                         | ControlMessage::Failed(_)
                         | ControlMessage::Finalized(_)
                         | ControlMessage::LifecycleReport(_)
+                        | ControlMessage::ReplicationReport(_)
                 ) {
                     return Err(invalid_channel_field(
                         "payload.report.type",
@@ -964,6 +968,15 @@ impl AgentChannelDownstreamFrame {
                 }
                 payload.validate()?;
             }
+            AgentChannelDownstreamMessage::ReplicationAssignment(payload) => {
+                if self.correlation_id.is_some() {
+                    return Err(invalid_channel_field(
+                        "correlation_id",
+                        "Replication Assignment is a new delivery and cannot correlate an upstream frame",
+                    ));
+                }
+                payload.validate()?;
+            }
             AgentChannelDownstreamMessage::Ack(payload) => {
                 if self.correlation_id.is_none() {
                     return Err(invalid_channel_field(
@@ -986,6 +999,7 @@ impl AgentChannelDownstreamFrame {
             AgentChannelDownstreamMessage::Assignment(_)
                 | AgentChannelDownstreamMessage::Decision(_)
                 | AgentChannelDownstreamMessage::LifecycleAssignment(_)
+                | AgentChannelDownstreamMessage::ReplicationAssignment(_)
         ) {
             return Err(invalid_channel_field(
                 "message",

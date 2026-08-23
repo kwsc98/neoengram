@@ -14,4 +14,12 @@ impl StorageAvailabilityProvider for ReadyStorageAvailability {
     ) -> CentralResult<DerivedVolumeState> {
         Ok(DerivedVolumeState::Ready)
     }
+
+    async fn current_available_bytes(
+        &self,
+        _tenant_id: &TenantId,
+        _storage_volume_id: &StorageVolumeId,
+    ) -> CentralResult<Option<u64>> {
+        Ok(Some(u64::MAX))
+    }
 }

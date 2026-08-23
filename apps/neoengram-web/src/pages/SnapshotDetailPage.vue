@@ -11,29 +11,44 @@ import {
 } from '@element-plus/icons-vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { computed, ref, watchEffect } from 'vue';
+import { computed, ref, watch, watchEffect } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import {
   createSnapshotDelivery,
+  cancelCommitReplication,
   deleteSnapshotDelivery,
   queryCommitAvailability,
-  queryCommitReplication,
+  queryCommitReplicationList,
   queryApiVersion,
+  queryGatewayPoolList,
   querySnapshot,
   querySnapshotDeliveryList,
   queryStorageVolume,
   queryStorageVolumeList,
   replicateCommit,
+  retryCommitReplication,
   retrySnapshotDelivery,
 } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import {
+  commitReplicationRequestId,
+  findActiveCommitReplication,
+  findCommitReplicationForTarget,
+  isCommitReplicationActive,
+} from '@/features/commit-replication';
+import {
+  supportsArtifactCommitReplication,
   supportsS3ReadonlyAccessPoint,
   supportsSnapshotDelivery,
   supportsSnapshotDeliveryMode,
 } from '@/features/capabilities';
+import {
+  groupStorageVolumesByCluster,
+  isReplicationTargetSelectable,
+  selectableReplicationVolumes,
+} from '@/features/storage/cluster-groups';
 import {
   snapshotIntegrityLabel,
   snapshotIntegrityTagType,
@@ -83,9 +98,17 @@ const tags = computed(() => commitTagNames(snapshot.value?.tag_names ?? []));
 const selectedDeliveryMode = ref<'fuse' | 'copy' | 'hardlink'>('fuse');
 const targetVolumeId = ref('');
 const replicationTargetVolumeId = ref('');
-const replicationId = ref('');
+const replicationTargetTouched = ref(false);
 const deliveryCapabilityEnabled = computed(() =>
   supportsSnapshotDelivery(versionQuery.data.value?.data.capabilities),
+);
+const replicationCapabilityEnabled = computed(
+  () =>
+    supportsArtifactCommitReplication(versionQuery.data.value?.data.capabilities) &&
+    (tenants.byId(tenantId.value)?.permissions.includes('artifact.commit.replicate') ?? false),
+);
+const gatewayInventoryEnabled = computed(
+  () => tenants.byId(tenantId.value)?.permissions.includes('gateway.read') ?? false,
 );
 const volumeQuery = useQuery({
   queryKey: computed(() => ['storage-volume', tenantId.value, targetVolumeId.value]),
@@ -96,38 +119,99 @@ const volumeQuery = useQuery({
 const volumeListQuery = useQuery({
   queryKey: computed(() => ['storage-volumes', tenantId.value, 'snapshot-detail']),
   queryFn: () => queryStorageVolumeList({ tenant_id: tenantId.value, page_size: 100 }),
-  enabled: computed(() => Boolean(snapshot.value && deliveryCapabilityEnabled.value)),
+  enabled: computed(() =>
+    Boolean(
+      snapshot.value && (deliveryCapabilityEnabled.value || replicationCapabilityEnabled.value),
+    ),
+  ),
 });
 const targetVolumes = computed(() => volumeListQuery.data.value?.data.items ?? []);
+const gatewayPoolQuery = useQuery({
+  queryKey: computed(() => ['gateway-pools', tenantId.value, 'snapshot-commit-replication']),
+  queryFn: () => queryGatewayPoolList({}),
+  enabled: computed(
+    () =>
+      Boolean(snapshot.value && replicationCapabilityEnabled.value) &&
+      gatewayInventoryEnabled.value,
+  ),
+  staleTime: 15_000,
+});
+const storageClusters = computed(() =>
+  groupStorageVolumesByCluster(targetVolumes.value, gatewayPoolQuery.data.value?.data.items ?? [], {
+    gatewayInventoryAvailable: gatewayPoolQuery.isSuccess.value,
+  }),
+);
+const replicationTargetVolumes = computed(() =>
+  selectableReplicationVolumes(storageClusters.value),
+);
+const selectedReplicationTargetGroup = computed(() =>
+  storageClusters.value.find((group) =>
+    group.volumes.some((volume) => volume.storage_volume_id === replicationTargetVolumeId.value),
+  ),
+);
+const replicationMutation = useMutation({ mutationFn: replicateCommit });
+const retryReplicationMutation = useMutation({ mutationFn: retryCommitReplication });
+const cancelReplicationMutation = useMutation({ mutationFn: cancelCommitReplication });
+const replicationListQuery = useQuery({
+  queryKey: computed(() => [
+    'commit-replications',
+    tenantId.value,
+    snapshot.value?.commit_id,
+    'snapshot-detail',
+  ]),
+  queryFn: () =>
+    queryCommitReplicationList({
+      tenant_id: tenantId.value,
+      commit_id: snapshot.value!.commit_id,
+    }),
+  enabled: computed(() => replicationCapabilityEnabled.value && Boolean(snapshot.value?.commit_id)),
+  refetchInterval: (query) => {
+    const items = query.state.data?.data.replications ?? [];
+    return items.some((item) => isCommitReplicationActive(item.state)) ? 1_000 : false;
+  },
+});
+const commitReplications = computed(() => replicationListQuery.data.value?.data.replications ?? []);
+const replication = computed(() =>
+  findCommitReplicationForTarget(commitReplications.value, replicationTargetVolumeId.value),
+);
+const activeReplication = computed(() => findActiveCommitReplication(commitReplications.value));
 watchEffect(() => {
   if (!targetVolumeId.value) {
     targetVolumeId.value =
       targetVolumes.value.find((volume) => volume.state === 'ready')?.storage_volume_id ?? '';
   }
-  if (!replicationTargetVolumeId.value) {
-    replicationTargetVolumeId.value =
-      targetVolumes.value.find((volume) => volume.state === 'ready')?.storage_volume_id ?? '';
+  const targetIsSelectable = replicationTargetVolumes.value.some(
+    (volume) => volume.storage_volume_id === replicationTargetVolumeId.value,
+  );
+  const activeTargetIsSelectable = replicationTargetVolumes.value.some(
+    (volume) => volume.storage_volume_id === activeReplication.value?.target_storage_volume_id,
+  );
+  if (!replicationTargetTouched.value && activeReplication.value && activeTargetIsSelectable) {
+    replicationTargetVolumeId.value = activeReplication.value.target_storage_volume_id;
+  } else if (!targetIsSelectable) {
+    replicationTargetVolumeId.value = replicationTargetVolumes.value[0]?.storage_volume_id ?? '';
   }
 });
-const replicationMutation = useMutation({ mutationFn: replicateCommit });
-const replicationQuery = useQuery({
-  queryKey: computed(() => ['commit-replication', tenantId.value, replicationId.value]),
-  queryFn: () =>
-    queryCommitReplication({ tenant_id: tenantId.value, replication_id: replicationId.value }),
-  enabled: computed(() => Boolean(replicationId.value)),
-  refetchInterval: (query) => {
-    const state = query.state.data?.data.replication.state;
-    return state && !['published', 'failed', 'cancelled'].includes(state) ? 1_000 : false;
-  },
-});
-  const replication = computed(() => replicationQuery.data.value?.data.replication);
 const availabilityQuery = useQuery({
   queryKey: computed(() => ['commit-availability', tenantId.value, snapshot.value?.commit_id]),
   queryFn: () =>
     queryCommitAvailability({ tenant_id: tenantId.value, commit_id: snapshot.value!.commit_id }),
   enabled: computed(() => Boolean(snapshot.value?.commit_id)),
-  refetchInterval: 2_000,
+  refetchInterval: () =>
+    commitReplications.value.some((item) => isCommitReplicationActive(item.state)) ? 1_000 : false,
 });
+watch(
+  commitReplications,
+  (next, previous) => {
+    if (
+      previous?.some((item) => isCommitReplicationActive(item.state)) &&
+      !next.some((item) => isCommitReplicationActive(item.state))
+    ) {
+      void availabilityQuery.refetch();
+    }
+  },
+  { deep: true },
+);
 const availableVolumeIds = computed(
   () => availabilityQuery.data.value?.data.availability.verified_storage_volume_ids ?? [],
 );
@@ -136,6 +220,17 @@ const targetPlacementPublished = computed(
     (replication.value?.state === 'published' &&
       replication.value.target_storage_volume_id === targetVolumeId.value) ||
     availableVolumeIds.value.includes(targetVolumeId.value),
+);
+const replicationActionLabel = computed(() => {
+  if (replication.value?.state === 'published') return '副本已发布';
+  if (replication.value && isCommitReplicationActive(replication.value.state)) return '复制进行中';
+  if (replication.value?.state === 'failed' || replication.value?.state === 'cancelled') {
+    return '请重试任务';
+  }
+  return '复制 Commit';
+});
+const replicationTargetBlocked = computed(
+  () => !replicationTargetVolumeId.value || Boolean(replication.value),
 );
 const storageVolume = computed(() => volumeQuery.data.value?.data.storage_volume);
 const deliveryModeAvailability = computed(() => {
@@ -242,7 +337,8 @@ watchEffect(() => {
 
 function deliveryModeReason(mode: 'fuse' | 'copy' | 'hardlink'): string | undefined {
   if (snapshot.value?.data_health === 'unavailable') return 'Snapshot 当前没有可用对象副本';
-  if (!targetPlacementPublished.value) return '请先将 Commit 复制到当前目标 Volume，并等待 PlacementSet published';
+  if (!targetPlacementPublished.value)
+    return '请先将 Commit 复制到当前目标 Volume，并等待 PlacementSet published';
   const capabilities = versionQuery.data.value?.data.capabilities;
   if (!supportsSnapshotDeliveryMode(capabilities, mode)) {
     return 'Central 未声明该交付能力';
@@ -307,21 +403,64 @@ async function replicateSnapshot(): Promise<void> {
     !snapshot.value ||
     snapshot.value.state !== 'ready' ||
     !replicationTargetVolumeId.value ||
-    replicationMutation.isPending.value
+    replicationMutation.isPending.value ||
+    replicationTargetBlocked.value
   ) {
     return;
   }
   const result = await replicationMutation.mutateAsync({
     tenant_id: tenantId.value,
+    project_id: snapshot.value.project_id,
+    artifact_id: snapshot.value.artifact_id,
     commit_id: snapshot.value.commit_id,
     target_storage_volume_id: replicationTargetVolumeId.value,
-    request_id: operationRequestId(
-      `replicate-${snapshot.value.commit_id}-${replicationTargetVolumeId.value}`,
-    ),
+    request_id: commitReplicationRequestId({
+      tenantId: tenantId.value,
+      projectId: snapshot.value.project_id,
+      artifactId: snapshot.value.artifact_id,
+      commitId: snapshot.value.commit_id,
+      targetStorageVolumeId: replicationTargetVolumeId.value,
+    }),
   });
-  replicationId.value = result.data.replication.replication_id;
   ElMessage.success(result.data.replayed ? '已返回同一复制请求' : 'Commit 复制已排队');
-  await replicationQuery.refetch();
+  await replicationListQuery.refetch();
+}
+
+async function retryReplication(): Promise<void> {
+  const current = replication.value;
+  if (!current || retryReplicationMutation.isPending.value) return;
+  await retryReplicationMutation.mutateAsync({
+    tenant_id: tenantId.value,
+    replication_id: current.replication_id,
+    expected_attempt: current.attempt,
+  });
+  ElMessage.success('复制任务已重新提交');
+  await replicationListQuery.refetch();
+}
+
+async function cancelReplication(): Promise<void> {
+  const current = replication.value;
+  if (!current || cancelReplicationMutation.isPending.value) return;
+  await cancelReplicationMutation.mutateAsync({
+    tenant_id: tenantId.value,
+    replication_id: current.replication_id,
+    expected_attempt: current.attempt,
+  });
+  ElMessage.success('复制任务已取消');
+  await replicationListQuery.refetch();
+}
+
+function changeReplicationTarget(): void {
+  replicationTargetTouched.value = true;
+  replicationMutation.reset();
+}
+
+function replicationRouteLabel(state: 'ready' | 'unavailable' | 'unknown'): string {
+  return {
+    ready: '路由 Ready',
+    unavailable: '路由不可用',
+    unknown: '路由由 Central 校验',
+  }[state];
 }
 
 async function retryDelivery(deliveryId: string): Promise<void> {
@@ -527,8 +666,15 @@ async function openObjectStorage(): Promise<void> {
         </dl>
       </section>
 
-      <section v-if="deliveryCapabilityEnabled" class="content-section delivery-section">
-        <section class="replication-panel" aria-label="Commit 复制">
+      <section
+        v-if="deliveryCapabilityEnabled || replicationCapabilityEnabled"
+        class="content-section delivery-section"
+      >
+        <section
+          v-if="replicationCapabilityEnabled"
+          class="replication-panel"
+          aria-label="Commit 复制"
+        >
           <header class="section-heading">
             <div>
               <span>COMMIT PLACEMENT</span>
@@ -537,44 +683,156 @@ async function openObjectStorage(): Promise<void> {
             <RefreshRight />
           </header>
           <p class="replication-explanation">
-            Snapshot 不绑定磁盘。选择目标 Volume 后显式复制完整 ObjectSet；目标 PlacementSet 发布前不会对 Delivery 或 S3 可见。
+            Snapshot 不绑定磁盘。选择目标 Volume 后显式复制完整 ObjectSet；目标 PlacementSet
+            发布前不会对 Delivery 或 S3 可见。
           </p>
+          <ApiProblemAlert
+            v-if="volumeListQuery.error.value"
+            :error="volumeListQuery.error.value"
+            :retrying="volumeListQuery.isFetching.value"
+            @retry="volumeListQuery.refetch"
+          />
+          <ApiProblemAlert
+            v-if="gatewayPoolQuery.error.value"
+            :error="gatewayPoolQuery.error.value"
+            :retrying="gatewayPoolQuery.isFetching.value"
+            @retry="gatewayPoolQuery.refetch"
+          />
           <div class="delivery-toolbar">
             <el-select
               v-model="replicationTargetVolumeId"
-              placeholder="选择复制目标 StorageVolume"
-              style="min-width: 280px"
+              placeholder="选择 Gateway 集群 / StorageVolume"
+              :loading="
+                volumeListQuery.isPending.value ||
+                (gatewayInventoryEnabled && gatewayPoolQuery.isPending.value)
+              "
+              :disabled="replicationTargetVolumes.length === 0"
+              style="min-width: min(100%, 360px)"
+              @change="changeReplicationTarget"
             >
-              <el-option
-                v-for="volume in targetVolumes"
-                :key="volume.storage_volume_id"
-                :label="`${volume.display_name} (${volume.region})`"
-                :value="volume.storage_volume_id"
-                :disabled="volume.state !== 'ready'"
-              />
+              <el-option-group
+                v-for="group in storageClusters"
+                :key="group.edgeClusterId"
+                :label="`${group.gatewayPool?.display_name ?? group.edgeClusterId} · ${group.edgeClusterId} · ${replicationRouteLabel(group.routeState)}`"
+              >
+                <el-option
+                  v-for="volume in group.volumes"
+                  :key="volume.storage_volume_id"
+                  :label="`${volume.display_name} · ${volume.region}`"
+                  :value="volume.storage_volume_id"
+                  :disabled="!isReplicationTargetSelectable(group, volume)"
+                />
+              </el-option-group>
             </el-select>
             <el-button
               type="primary"
               :loading="replicationMutation.isPending.value"
-              :disabled="!replicationTargetVolumeId || snapshot.state !== 'ready'"
+              :disabled="replicationTargetBlocked || snapshot.state !== 'ready'"
               @click="replicateSnapshot"
             >
-              复制 Commit
+              {{ replicationActionLabel }}
             </el-button>
           </div>
-          <ApiProblemAlert v-if="replicationMutation.error.value" :error="replicationMutation.error.value" />
-          <ApiProblemAlert v-if="replicationQuery.error.value" :error="replicationQuery.error.value" />
-          <div v-if="replication" class="replication-status">
-            <span>任务 <code>{{ replication.replication_id }}</code></span>
+          <div v-if="selectedReplicationTargetGroup" class="tag-list">
+            <el-tag effect="plain">
+              Gateway 集群：{{
+                selectedReplicationTargetGroup.gatewayPool?.display_name ??
+                selectedReplicationTargetGroup.edgeClusterId
+              }}
+            </el-tag>
+            <el-tag effect="plain">
+              Region：{{ selectedReplicationTargetGroup.regions.join(', ') }}
+            </el-tag>
             <el-tag
-              :type="replication.state === 'published' ? 'success' : replication.state === 'failed' ? 'danger' : 'warning'"
+              :type="
+                selectedReplicationTargetGroup.routeState === 'ready'
+                  ? 'success'
+                  : selectedReplicationTargetGroup.routeState === 'unavailable'
+                    ? 'danger'
+                    : 'info'
+              "
               effect="plain"
-            >{{ replication.state }}</el-tag>
-            <span>{{ replication.completed_objects }} / {{ replication.total_objects }} objects</span>
+            >
+              {{ replicationRouteLabel(selectedReplicationTargetGroup.routeState) }}
+            </el-tag>
+          </div>
+          <div v-else-if="storageClusters.length" class="tag-list" aria-label="Gateway 集群路由">
+            <el-tag
+              v-for="group in storageClusters"
+              :key="group.edgeClusterId"
+              :type="group.routeState === 'unavailable' ? 'danger' : 'info'"
+              effect="plain"
+            >
+              {{ group.gatewayPool?.display_name ?? group.edgeClusterId }} ·
+              {{ group.regions.join(', ') }} · {{ replicationRouteLabel(group.routeState) }}
+            </el-tag>
+          </div>
+          <ApiProblemAlert
+            v-if="replicationMutation.error.value"
+            :error="replicationMutation.error.value"
+          />
+          <ApiProblemAlert
+            v-if="replicationListQuery.error.value"
+            :error="replicationListQuery.error.value"
+            :retrying="replicationListQuery.isFetching.value"
+            @retry="replicationListQuery.refetch"
+          />
+          <ApiProblemAlert
+            v-if="availabilityQuery.error.value"
+            :error="availabilityQuery.error.value"
+            :retrying="availabilityQuery.isFetching.value"
+            @retry="availabilityQuery.refetch"
+          />
+          <ApiProblemAlert
+            v-if="retryReplicationMutation.error.value"
+            :error="retryReplicationMutation.error.value"
+          />
+          <ApiProblemAlert
+            v-if="cancelReplicationMutation.error.value"
+            :error="cancelReplicationMutation.error.value"
+          />
+          <div v-if="replication" class="replication-status">
+            <span
+              >任务 <code>{{ replication.replication_id }}</code></span
+            >
+            <el-tag
+              :type="
+                replication.state === 'published'
+                  ? 'success'
+                  : replication.state === 'failed'
+                    ? 'danger'
+                    : 'warning'
+              "
+              effect="plain"
+              >{{ replication.state }}</el-tag
+            >
+            <span
+              >{{ replication.completed_objects }} / {{ replication.total_objects }} objects</span
+            >
+            <span
+              >{{ formatBytes(replication.completed_bytes) }} /
+              {{ formatBytes(replication.total_bytes) }}</span
+            >
             <span v-if="replication.issue">{{ replication.issue.message }}</span>
+            <el-button
+              v-if="['failed', 'cancelled'].includes(replication.state)"
+              size="small"
+              :loading="retryReplicationMutation.isPending.value"
+              @click="retryReplication"
+              >重试</el-button
+            >
+            <el-button
+              v-else-if="isCommitReplicationActive(replication.state)"
+              size="small"
+              type="danger"
+              plain
+              :loading="cancelReplicationMutation.isPending.value"
+              @click="cancelReplication"
+              >取消</el-button
+            >
           </div>
         </section>
-        <header class="section-heading delivery-section__header">
+        <header v-if="deliveryCapabilityEnabled" class="section-heading delivery-section__header">
           <div>
             <span>SNAPSHOT DELIVERY</span>
             <h2>只读交付</h2>
@@ -582,12 +840,12 @@ async function openObjectStorage(): Promise<void> {
           <Lock />
         </header>
         <ApiProblemAlert
-          v-if="volumeQuery.error.value"
+          v-if="deliveryCapabilityEnabled && volumeQuery.error.value"
           :error="volumeQuery.error.value"
           :retrying="volumeQuery.isFetching.value"
           @retry="volumeQuery.refetch"
         />
-        <div class="delivery-toolbar">
+        <div v-if="deliveryCapabilityEnabled" class="delivery-toolbar">
           <el-select
             v-model="targetVolumeId"
             placeholder="选择目标 StorageVolume"

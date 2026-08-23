@@ -12,8 +12,8 @@ use super::validation::{
 };
 use crate::{
     domain_separated_jcs_bytes, AgentBootId, AgentEnrollmentId, AgentEnrollmentTokenId, AgentId,
-    AgentInstallationId, AgentMountId, CertificateGeneration, EdgeClusterId, Extensions,
-    MountAccessMode, MountGeneration, OwnerGeneration, ProtocolError, ProtocolResult,
+    AgentInstallationId, AgentMountId, CertificateGeneration, DecimalU64, EdgeClusterId,
+    Extensions, MountAccessMode, MountGeneration, OwnerGeneration, ProtocolError, ProtocolResult,
     ProtocolVersion, RequestId, ResourceHealth, ResourceVersion, SequenceNumber, SessionGeneration,
     StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId, CURRENT_WIRE_VERSION,
     MAX_AGENT_ENROLLMENT_MESSAGE_BYTES,
@@ -1384,6 +1384,8 @@ pub struct AgentMountStatusReport {
     pub mount_identity_digest: AgentMountIdentityDigest,
     pub access_mode: MountAccessMode,
     pub health: ResourceHealth,
+    /// Bytes currently available to staging and CAS publication on this exact mounted Volume.
+    pub available_bytes: DecimalU64,
     pub observed_at_unix_ms: UnixMillis,
     #[serde(default, flatten)]
     pub extensions: Extensions,
@@ -1414,6 +1416,7 @@ impl AgentMountStatusReport {
                 "mount_identity_digest",
                 "access_mode",
                 "health",
+                "available_bytes",
                 "observed_at_unix_ms",
             ],
         )

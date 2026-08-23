@@ -5,8 +5,9 @@ use fusen_rs::ErrorCategory;
 use neoengram_central::{
     dto::{
         ArtifactInitialization as ArtifactInitializationBody, CreateArtifactRequest,
-        CreatePlaygroundRequest, QueryArtifactCommitGraphRequest, QueryArtifactListRequest,
-        QueryArtifactRequest, QueryPlaygroundRequest,
+        CreateDeletionRequest, CreatePlaygroundRequest, QueryArtifactCommitGraphRequest,
+        QueryArtifactListRequest, QueryArtifactRequest, QueryDeletionImpactRequest,
+        QueryPlaygroundRequest, ResourceRefBody,
     },
     AuthenticatedIdentity, CatalogService, Permission, StaticRbacPolicy,
     StorageAvailabilityProvider, SystemService,
@@ -37,6 +38,14 @@ impl StorageAvailabilityProvider for FixedStorageAvailability {
     ) -> CentralResult<DerivedVolumeState> {
         Ok(self.0)
     }
+
+    async fn current_available_bytes(
+        &self,
+        _tenant_id: &TenantId,
+        _storage_volume_id: &StorageVolumeId,
+    ) -> CentralResult<Option<u64>> {
+        Ok(Some(u64::MAX))
+    }
 }
 
 #[test]
@@ -50,6 +59,10 @@ fn api_version_advertises_the_minimal_artifact_catalog() {
         .capabilities
         .iter()
         .any(|capability| capability == "artifact_commit_graph"));
+    assert!(!version
+        .capabilities
+        .iter()
+        .any(|capability| capability == "artifact_commit_replication"));
     assert!(!version
         .capabilities
         .iter()
@@ -78,6 +91,10 @@ fn api_version_advertises_the_minimal_artifact_catalog() {
         .capabilities
         .iter()
         .any(|capability| capability == "snapshot_materialize"));
+    assert!(storage_enabled
+        .capabilities
+        .iter()
+        .any(|capability| capability == "artifact_commit_replication"));
     for capability in [
         "commit_layout_selection_v2",
         "snapshot_delivery_fuse_v2",
@@ -709,6 +726,84 @@ async fn playground_create_rejects_an_unreachable_live_storage_volume() {
         .unwrap_err();
     assert_eq!(error.category(), ErrorCategory::Conflict);
     assert_eq!(error.code().as_str(), "storage_volume_unavailable");
+}
+
+#[tokio::test]
+async fn deletion_create_uses_the_saved_impact_snapshot_after_time_moves() {
+    let components = InMemoryComponents::new(1_000);
+    let tenant_id = TenantId::new("tenant-a").unwrap();
+    insert_tenant(&components, tenant_id.clone()).await;
+    components
+        .control_catalog
+        .insert_artifact(ArtifactRecord {
+            tenant_id: tenant_id.clone(),
+            project_id: ProjectId::new("project-a").unwrap(),
+            artifact_id: ArtifactId::new("artifact-a").unwrap(),
+            display_name: "Artifact A".to_owned(),
+            description: None,
+            initialization: ArtifactInitialization::Empty,
+            head_commit_id: None,
+            resource_version: 1,
+            lifecycle: neoengram_domain::protocol::ResourceLifecycle::active(),
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+
+    let policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-a",
+            [tenant_id.to_string()],
+            [
+                Permission::ResourceLifecycleRead,
+                Permission::ResourceLifecycleManage,
+            ],
+        )
+        .unwrap(),
+    );
+    let service = CatalogService::new(
+        components.control_catalog.clone(),
+        components.publisher.clone(),
+        policy,
+        components.clock.clone(),
+    );
+    let resource = ResourceRefBody::Artifact {
+        project_id: "project-a".to_owned(),
+        artifact_id: "artifact-a".to_owned(),
+    };
+    let impact = service
+        .query_deletion_impact(
+            &identity(),
+            QueryDeletionImpactRequest {
+                tenant_id: tenant_id.to_string(),
+                resource: resource.clone(),
+                cascade: false,
+                confirm_managed_data_erase: false,
+                expected_resource_version: "1".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    components.clock.advance(1).unwrap();
+
+    let created = service
+        .create_deletion(
+            &identity(),
+            CreateDeletionRequest {
+                tenant_id: tenant_id.to_string(),
+                resource,
+                cascade: false,
+                confirm_managed_data_erase: false,
+                expected_resource_version: "1".to_owned(),
+                impact_digest: impact.impact_digest,
+                request_id: "delete-artifact-request".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.deletion.state, "requested");
+    assert!(!created.replayed);
 }
 
 fn catalog_service(
