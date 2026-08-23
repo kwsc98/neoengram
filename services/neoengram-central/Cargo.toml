@@ -31,7 +31,7 @@ http = "1.4"
 http-body-util = "0.1"
 hyper = { version = "1.11", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
-jsonwebtoken = { version = "=10.2.0", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["rust_crypto"] }
 libc.workspace = true
 neoengram-domain.workspace = true
 neoengram-runtime.workspace = true
