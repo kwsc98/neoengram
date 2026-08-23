@@ -81,26 +81,26 @@ fi
 expect_count 2 '^kind: Deployment$' "$deployments"
 expect_count 2 '^  replicas: 1$' "$deployments"
 expect_count 2 '^    type: Recreate$' "$deployments"
-if rg -n 'fieldPath: metadata\.(name|uid)|SYNAPSE_GATEWAY_REPLICA_ID[^\n]*metadata' "$deployments"; then
+if rg -n 'fieldPath: metadata\.(name|uid)|NEOENGRAM_GATEWAY_REPLICA_ID[^\n]*metadata' "$deployments"; then
   fail "GatewayReplicaId must not be derived from Pod metadata"
 fi
 for replica in r0 r1; do
   replica_id="gateway-pool-example-${replica}"
-  rg -Uq -- "- name: SYNAPSE_GATEWAY_REPLICA_ID\n[[:space:]]+value: ${replica_id}$" \
+  rg -Uq -- "- name: NEOENGRAM_GATEWAY_REPLICA_ID\n[[:space:]]+value: ${replica_id}$" \
     "$deployments" || fail "missing fixed GatewayReplicaId ${replica_id}"
-  rg -q "secretName: synapse-gateway-identity-${replica_id}$" "$deployments" || \
+  rg -q "secretName: neoengram-gateway-identity-${replica_id}$" "$deployments" || \
     fail "${replica_id} must use its own listener identity Secret"
-  rg -q "secretName: synapse-gateway-activation-${replica_id}$" "$deployments" || \
+  rg -q "secretName: neoengram-gateway-activation-${replica_id}$" "$deployments" || \
     fail "${replica_id} must use its own activation Secret"
-  rg -q "name: synapse-gateway-identity-${replica_id}$" "$identity_secrets" || \
+  rg -q "name: neoengram-gateway-identity-${replica_id}$" "$identity_secrets" || \
     fail "missing identity Secret example for ${replica_id}"
-  rg -q "name: synapse-gateway-activation-${replica_id}$" "$activation_secrets" || \
+  rg -q "name: neoengram-gateway-activation-${replica_id}$" "$activation_secrets" || \
     fail "missing activation Secret example for ${replica_id}"
-  rg -q "name: synapse-gateway-${replica_id}$" "$services" || \
+  rg -q "name: neoengram-gateway-${replica_id}$" "$services" || \
     fail "missing stable per-Replica Service for ${replica_id}"
 done
-expect_count 2 '^            secretName: synapse-gateway-identity-' "$deployments"
-expect_count 2 '^            secretName: synapse-gateway-activation-' "$deployments"
+expect_count 2 '^            secretName: neoengram-gateway-identity-' "$deployments"
+expect_count 2 '^            secretName: neoengram-gateway-activation-' "$deployments"
 
 expect_count 2 '^      automountServiceAccountToken: false$' "$deployments"
 expect_count 2 '^        runAsNonRoot: true$' "$deployments"
@@ -123,37 +123,55 @@ expect_count 2 '^                  neoengram\.io/gateway-pool: gateway-pool-exam
 if rg -q '^          preferredDuringSchedulingIgnoredDuringExecution:$' "$deployments"; then
   fail "Gateway replicas require hard hostname anti-affinity within one GatewayPool"
 fi
-rg -q '^  SYNAPSE_GATEWAY_PRE_STOP_DRAIN_SECONDS: "20"$' "$config" || \
+rg -q '^  NEOENGRAM_GATEWAY_PRE_STOP_DRAIN_SECONDS: "20"$' "$config" || \
   fail "Gateway preStop drain interval must leave time for SIGTERM shutdown"
 
 for setting in \
-  SYNAPSE_GATEWAY_BOOTSTRAP_PRIVATE_KEY_FILE \
-  SYNAPSE_GATEWAY_BOOTSTRAP_ACTIVATION_TOKEN_FILE \
-  SYNAPSE_GATEWAY_BOOTSTRAP_CERTIFICATE_CHAIN_FILE; do
+  NEOENGRAM_GATEWAY_BOOTSTRAP_PRIVATE_KEY_FILE \
+  NEOENGRAM_GATEWAY_BOOTSTRAP_ACTIVATION_TOKEN_FILE \
+  NEOENGRAM_GATEWAY_BOOTSTRAP_CERTIFICATE_CHAIN_FILE; do
   rg -q "$setting" "$deployments" || fail "Gateway bootstrap setting $setting is missing"
   if rg -q "$setting" "$config"; then
     fail "short-lived Gateway bootstrap setting $setting must not be stored in the shared ConfigMap"
   fi
 done
-rg -q '^  SYNAPSE_GATEWAY_WORKLOAD_TRUST_DOMAIN: ' "$config" || \
+rg -q '^  NEOENGRAM_GATEWAY_WORKLOAD_TRUST_DOMAIN: ' "$config" || \
   fail "long-lived Gateway workload trust domain is missing from the ConfigMap"
-rg -q '^  SYNAPSE_GATEWAY_TLS_CERTIFICATE_FILE: /var/run/secrets/synapse-gateway/listener/tls\.crt$' \
+rg -q '^  NEOENGRAM_GATEWAY_TLS_CERTIFICATE_FILE: /var/run/secrets/neoengram-gateway/listener/tls\.crt$' \
   "$config" || fail "Gateway listener certificate path is missing or inconsistent"
-rg -q '^  SYNAPSE_GATEWAY_TLS_PRIVATE_KEY_FILE: /var/run/secrets/synapse-gateway/listener/tls\.key$' \
+rg -q '^  NEOENGRAM_GATEWAY_TLS_PRIVATE_KEY_FILE: /var/run/secrets/neoengram-gateway/listener/tls\.key$' \
   "$config" || fail "Gateway listener private-key path is missing or inconsistent"
-rg -q '^  SYNAPSE_GATEWAY_TLS_CLIENT_CA_FILE: /var/run/secrets/synapse-gateway/listener/ca\.crt$' \
+rg -q '^  NEOENGRAM_GATEWAY_TLS_CLIENT_CA_FILE: /var/run/secrets/neoengram-gateway/listener/ca\.crt$' \
   "$config" || fail "Gateway workload CA path is missing or inconsistent"
-rg -q '^  SYNAPSE_GATEWAY_PUBLIC_LISTEN: 0\.0\.0\.0:8080$' "$config" || \
+rg -q '^  NEOENGRAM_GATEWAY_TRANSFER_TLS_CERTIFICATE_FILE: /var/run/secrets/neoengram-gateway/listener/tls\.crt$' \
+  "$config" || fail "Gateway transfer certificate path is missing or inconsistent"
+rg -q '^  NEOENGRAM_GATEWAY_TRANSFER_TLS_PRIVATE_KEY_FILE: /var/run/secrets/neoengram-gateway/listener/tls\.key$' \
+  "$config" || fail "Gateway transfer private-key path is missing or inconsistent"
+rg -q '^  NEOENGRAM_GATEWAY_TRANSFER_TLS_CLIENT_CA_FILE: /var/run/secrets/neoengram-gateway/listener/ca\.crt$' \
+  "$config" || fail "Gateway transfer client CA path is missing or inconsistent"
+for setting in \
+  NEOENGRAM_GATEWAY_TRANSFER_TLS_CERTIFICATE_FILE \
+  NEOENGRAM_GATEWAY_TRANSFER_TLS_PRIVATE_KEY_FILE \
+  NEOENGRAM_GATEWAY_TRANSFER_TLS_CLIENT_CA_FILE \
+  NEOENGRAM_GATEWAY_TRANSFER_RELAY_ROLE \
+  NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM \
+  NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM_SERVER_NAME \
+  NEOENGRAM_GATEWAY_TRANSFER_SESSION_GENERATION \
+  NEOENGRAM_GATEWAY_TRANSFER_MOUNT_GENERATION \
+  NEOENGRAM_GATEWAY_TRANSFER_ROUTE_GENERATION; do
+  rg -q "$setting" "$readme" || fail "Gateway transfer setting $setting is missing from README"
+done
+rg -q '^  NEOENGRAM_GATEWAY_PUBLIC_LISTEN: 0\.0\.0\.0:8080$' "$config" || \
   fail "Gateway public listener must be explicitly enabled on port 8080"
-rg -q '^  SYNAPSE_GATEWAY_PUBLIC_TLS_CERTIFICATE_FILE: /var/run/secrets/synapse-gateway/public/tls\.crt$' \
+rg -q '^  NEOENGRAM_GATEWAY_PUBLIC_TLS_CERTIFICATE_FILE: /var/run/secrets/neoengram-gateway/public/tls\.crt$' \
   "$config" || fail "Gateway public certificate path is missing or inconsistent"
-rg -q '^  SYNAPSE_GATEWAY_PUBLIC_TLS_PRIVATE_KEY_FILE: /var/run/secrets/synapse-gateway/public/tls\.key$' \
+rg -q '^  NEOENGRAM_GATEWAY_PUBLIC_TLS_PRIVATE_KEY_FILE: /var/run/secrets/neoengram-gateway/public/tls\.key$' \
   "$config" || fail "Gateway public private-key path is missing or inconsistent"
-for setting in SYNAPSE_GATEWAY_CONSOLE_HOST SYNAPSE_GATEWAY_S3_HOST \
-  SYNAPSE_GATEWAY_WEB_ROOT SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM SYNAPSE_GATEWAY_S3_MAX_STREAMS; do
+for setting in NEOENGRAM_GATEWAY_CONSOLE_HOST NEOENGRAM_GATEWAY_S3_HOST \
+  NEOENGRAM_GATEWAY_WEB_ROOT NEOENGRAM_GATEWAY_CENTRAL_API_UPSTREAM NEOENGRAM_GATEWAY_S3_MAX_STREAMS; do
   rg -q "^  ${setting}: " "$config" || fail "Gateway public setting ${setting} is missing"
 done
-rg -q '^  SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM: https://[^/]+:8080$' "$config" || \
+rg -q '^  NEOENGRAM_GATEWAY_CENTRAL_API_UPSTREAM: https://[^/]+:8080$' "$config" || \
   fail "Gateway Central upstream must be a private origin-form HTTPS URL"
 
 expect_count 2 '^type: kubernetes\.io/tls$' "$identity_secrets"
@@ -165,7 +183,7 @@ expect_count 2 '^  activation-token: \|$' "$activation_secrets"
 expect_count 2 '^immutable: true$' "$identity_secrets"
 expect_count 2 '^immutable: true$' "$activation_secrets"
 expect_count 1 '^kind: Secret$' "$public_tls_secret"
-expect_count 1 '^  name: synapse-gateway-public-tls-gateway-pool-example$' "$public_tls_secret"
+expect_count 1 '^  name: neoengram-gateway-public-tls-gateway-pool-example$' "$public_tls_secret"
 expect_count 1 '^type: kubernetes\.io/tls$' "$public_tls_secret"
 expect_count 1 '^  tls\.crt: \|$' "$public_tls_secret"
 expect_count 1 '^  tls\.key: \|$' "$public_tls_secret"
@@ -175,8 +193,8 @@ expect_count 2 '^            - name: public$' "$deployments"
 expect_count 2 '^              containerPort: 8080$' "$deployments"
 expect_count 2 '^            - name: transfer$' "$deployments"
 expect_count 2 '^              containerPort: 8084$' "$deployments"
-expect_count 2 '^              mountPath: /var/run/secrets/synapse-gateway/public$' "$deployments"
-expect_count 2 '^            secretName: synapse-gateway-public-tls-gateway-pool-example$' "$deployments"
+expect_count 2 '^              mountPath: /var/run/secrets/neoengram-gateway/public$' "$deployments"
+expect_count 2 '^            secretName: neoengram-gateway-public-tls-gateway-pool-example$' "$deployments"
 
 # Only a bounded, memory-backed certificate delivery directory is writable. Gateway must never
 # receive a business Volume, durable PVC, host path, storage adapter, or object payload mount.
@@ -202,7 +220,7 @@ expect_count 1 '^    - name: public$' "$services"
 expect_count 1 '^      port: 443$' "$services"
 expect_count 1 '^      targetPort: public$' "$services"
 rg -q '^  minAvailable: 1$' "$pdb" || fail "Gateway PDB must preserve one replica"
-rg -Uq '^  selector:\n    matchLabels:\n      app\.kubernetes\.io/name: synapse-gateway$' "$pdb" || \
+rg -Uq '^  selector:\n    matchLabels:\n      app\.kubernetes\.io/name: neoengram-gateway$' "$pdb" || \
   fail "Gateway PDB selector indentation is invalid"
 
 rg -q '^kind: NetworkPolicy$' "$network_policy" || fail "Gateway NetworkPolicy is required"

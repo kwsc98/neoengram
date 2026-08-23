@@ -1,5 +1,14 @@
 <script setup lang="ts">
-import { Check, Close, CopyDocument, Key, Plus, Search } from '@element-plus/icons-vue';
+import {
+  Check,
+  Close,
+  Coin,
+  Connection,
+  CopyDocument,
+  Key,
+  Plus,
+  Search,
+} from '@element-plus/icons-vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { computed, reactive, ref, watch } from 'vue';
@@ -10,6 +19,7 @@ import {
   queryApiVersion,
   createStorageEnrollmentToken,
   createStorageVolume,
+  queryGatewayPoolList,
   queryStorageEnrollmentList,
   queryStorageVolumeList,
   rejectStorageEnrollment,
@@ -19,6 +29,7 @@ import type {
   ApproveStorageEnrollmentRequest,
   CreateStorageEnrollmentTokenRequest,
   CreateStorageEnrollmentTokenResponse,
+  GatewayPoolState,
   RejectStorageEnrollmentRequest,
   StorageAccessMode,
   StorageBackendType,
@@ -33,6 +44,7 @@ import PageHeading from '@/components/PageHeading.vue';
 import { runtimeConfig } from '@/config';
 import { supportsResourceLifecycle } from '@/features/capabilities';
 import { lifecycleResourceVersion } from '@/features/lifecycle';
+import { groupStorageVolumesByCluster } from '@/features/storage/cluster-groups';
 import {
   buildAgentConfig,
   canonicalGatewayEndpoint,
@@ -53,6 +65,7 @@ const permissions = computed(() => tenants.byId(tenantId.value)?.permissions ?? 
 const canCreateNfs = computed(() => permissions.value.includes('storage.create'));
 const canCreateEnrollment = computed(() => permissions.value.includes('storage.enrollment.create'));
 const canReadEnrollments = computed(() => permissions.value.includes('storage.enrollment.read'));
+const canReadGateways = computed(() => permissions.value.includes('gateway.read'));
 const canReviewEnrollments = computed(() =>
   permissions.value.includes('storage.enrollment.review'),
 );
@@ -139,6 +152,21 @@ const storageVolumesQuery = useQuery({
   refetchInterval: 5_000,
   refetchIntervalInBackground: false,
 });
+
+const gatewayPoolsQuery = useQuery({
+  queryKey: ['gateway-pools'],
+  enabled: canReadGateways,
+  queryFn: () => queryGatewayPoolList({ page_size: 255 }),
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
+});
+
+const storageClusters = computed(() =>
+  groupStorageVolumesByCluster(
+    storageVolumesQuery.data.value?.data.items ?? [],
+    canReadGateways.value ? (gatewayPoolsQuery.data.value?.data.items ?? []) : [],
+  ),
+);
 
 const enrollmentsQuery = useQuery({
   queryKey: computed(() => [
@@ -540,6 +568,21 @@ function volumeStateType(state: string): TagType {
   return 'danger';
 }
 
+function gatewayPoolStateType(state: GatewayPoolState): TagType {
+  if (state === 'ready') return 'success';
+  if (state === 'provisioning' || state === 'draining') return 'warning';
+  return 'info';
+}
+
+function gatewayPoolStateLabel(state: GatewayPoolState): string {
+  return {
+    provisioning: '配置中',
+    ready: '就绪',
+    draining: '排空中',
+    disabled: '已停用',
+  }[state];
+}
+
 function enrollmentStateLabel(state: StorageEnrollmentState): string {
   return {
     pending_approval: '待审批',
@@ -571,7 +614,7 @@ function fingerprintSummary(value: string): string {
 
 <template>
   <div class="page storage-page">
-    <PageHeading title="存储资源" :description="`${tenantId} 内按区域接入的 StorageVolume`">
+    <PageHeading title="集群与存储" :description="`${tenantId} 的 Gateway 集群与磁盘`">
       <template #actions>
         <el-button v-if="canCreateNfs" :icon="Plus" @click="openNfsCreate">登记 NFS</el-button>
         <el-button v-if="canCreateEnrollment" type="primary" :icon="Key" @click="openEnrollment">
@@ -581,7 +624,7 @@ function fingerprintSummary(value: string): string {
     </PageHeading>
 
     <el-tabs v-model="activeView" class="storage-tabs">
-      <el-tab-pane label="已登记" name="volumes">
+      <el-tab-pane label="集群与磁盘" name="volumes">
         <form class="resource-toolbar storage-toolbar" @submit.prevent="applyFilters">
           <el-input v-model="region" clearable placeholder="Region，例如 cn-shanghai" />
           <el-select v-model="backendType" clearable placeholder="全部后端">
@@ -598,91 +641,172 @@ function fingerprintSummary(value: string): string {
           :retrying="storageVolumesQuery.isFetching.value"
           @retry="storageVolumesQuery.refetch"
         />
+        <ApiProblemAlert
+          v-if="canReadGateways && gatewayPoolsQuery.error.value"
+          :error="gatewayPoolsQuery.error.value"
+          :retrying="gatewayPoolsQuery.isFetching.value"
+          @retry="gatewayPoolsQuery.refetch"
+        />
 
-        <section class="content-section resource-section">
-          <el-skeleton v-if="storageVolumesQuery.isPending.value" :rows="7" animated />
+        <section class="cluster-browser" aria-label="Gateway 集群与磁盘">
+          <el-skeleton
+            v-if="storageVolumesQuery.isPending.value"
+            class="cluster-browser__loading"
+            :rows="7"
+            animated
+          />
           <el-empty
-            v-else-if="!storageVolumesQuery.data.value?.data.items.length"
+            v-else-if="!storageClusters.length"
+            class="cluster-browser__empty"
             description="当前筛选下没有 StorageVolume"
             :image-size="78"
           />
           <template v-else>
-            <el-table
-              :data="storageVolumesQuery.data.value?.data.items"
-              class="resource-table desktop-table"
-            >
-              <el-table-column label="StorageVolume" min-width="240">
-                <template #default="scope">
-                  <div class="resource-identity">
-                    <strong>{{ scope.row.display_name }}</strong>
-                    <code>{{ scope.row.storage_volume_id }}</code>
-                  </div>
-                </template>
-              </el-table-column>
-              <el-table-column prop="region" label="Region" min-width="135" />
-              <el-table-column prop="edge_cluster_id" label="EdgeCluster" min-width="180" />
-              <el-table-column label="后端" min-width="180">
-                <template #default="scope">
-                  <strong>{{ scope.row.backend_type.toUpperCase() }}</strong>
-                  <small v-if="scope.row.pvc_reference" class="table-secondary">
-                    {{ scope.row.pvc_reference.namespace }}/{{ scope.row.pvc_reference.claim_name }}
-                  </small>
-                </template>
-              </el-table-column>
-              <el-table-column label="状态" width="110">
-                <template #default="scope">
-                  <el-tag :type="volumeStateType(scope.row.state)" effect="plain">
-                    {{ scope.row.state }}
-                  </el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="更新时间" min-width="160">
-                <template #default="scope">{{ formatTime(scope.row.updated_at_unix_ms) }}</template>
-              </el-table-column>
-              <el-table-column v-if="lifecycleEnabled" label="操作" width="70" align="right">
-                <template #default="scope">
-                  <ResourceDeletionDialog
-                    :tenant-id="tenantId"
-                    :resource="{
-                      type: 'storage_volume',
-                      storage_volume_id: scope.row.storage_volume_id,
-                    }"
-                    :resource-version="lifecycleResourceVersion(scope.row)"
-                    :display-name="scope.row.display_name"
-                  />
-                </template>
-              </el-table-column>
-            </el-table>
-            <div class="mobile-resource-list">
-              <div
-                v-for="storageVolume in storageVolumesQuery.data.value?.data.items"
-                :key="storageVolume.storage_volume_id"
-                class="mobile-resource-item mobile-resource-item--static"
+            <div class="gateway-cluster-list">
+              <section
+                v-for="cluster in storageClusters"
+                :key="cluster.edgeClusterId"
+                class="gateway-cluster"
+                :aria-labelledby="`gateway-cluster-${cluster.edgeClusterId}`"
               >
-                <span>
-                  <strong>{{ storageVolume.display_name }}</strong>
-                  <code>{{ storageVolume.storage_volume_id }}</code>
-                </span>
-                <span>
-                  <small
-                    >{{ storageVolume.region }} ·
-                    {{ storageVolume.backend_type.toUpperCase() }}</small
+                <header class="gateway-cluster__header">
+                  <div class="gateway-cluster__identity">
+                    <span class="gateway-cluster__icon" aria-hidden="true"><Connection /></span>
+                    <span>
+                      <small>Gateway 集群</small>
+                      <strong :id="`gateway-cluster-${cluster.edgeClusterId}`">
+                        {{ cluster.gatewayPool?.display_name ?? cluster.edgeClusterId }}
+                      </strong>
+                      <span class="gateway-cluster__ids">
+                        <code>{{ cluster.edgeClusterId }}</code>
+                        <code v-if="cluster.gatewayPool">
+                          {{ cluster.gatewayPool.gateway_pool_id }}
+                        </code>
+                      </span>
+                    </span>
+                  </div>
+
+                  <dl class="gateway-cluster__facts">
+                    <div>
+                      <dt>Agent 入口</dt>
+                      <dd>
+                        <code>{{ cluster.gatewayPool?.agent_endpoint ?? '未公开' }}</code>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>磁盘状态</dt>
+                      <dd>
+                        <strong>{{ cluster.readyVolumeCount }}/{{ cluster.volumes.length }}</strong>
+                        <span>就绪</span>
+                      </dd>
+                    </div>
+                  </dl>
+
+                  <div class="gateway-cluster__state">
+                    <el-tag
+                      v-if="cluster.gatewayPool"
+                      :type="gatewayPoolStateType(cluster.gatewayPool.state)"
+                      effect="plain"
+                    >
+                      {{ gatewayPoolStateLabel(cluster.gatewayPool.state) }}
+                    </el-tag>
+                    <el-tag v-else type="info" effect="plain">EdgeCluster</el-tag>
+                    <small v-if="cluster.gatewayPool">
+                      副本 {{ cluster.gatewayPool.desired_replicas }} · 最低
+                      {{ cluster.gatewayPool.minimum_ready_replicas }}
+                    </small>
+                  </div>
+                </header>
+
+                <div class="gateway-cluster__volume-heading">
+                  <Coin aria-hidden="true" />
+                  <strong>磁盘</strong>
+                  <span>{{ cluster.regions.join(' · ') }}</span>
+                </div>
+
+                <el-table :data="cluster.volumes" class="resource-table desktop-table">
+                  <el-table-column label="StorageVolume" min-width="230">
+                    <template #default="scope">
+                      <div class="resource-identity">
+                        <strong>{{ scope.row.display_name }}</strong>
+                        <code>{{ scope.row.storage_volume_id }}</code>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column prop="region" label="Region" min-width="125" />
+                  <el-table-column label="后端" min-width="180">
+                    <template #default="scope">
+                      <strong>{{ scope.row.backend_type.toUpperCase() }}</strong>
+                      <small v-if="scope.row.pvc_reference" class="table-secondary">
+                        {{ scope.row.pvc_reference.namespace }}/{{
+                          scope.row.pvc_reference.claim_name
+                        }}
+                      </small>
+                    </template>
+                  </el-table-column>
+                  <el-table-column prop="access_mode" label="访问模式" min-width="155" />
+                  <el-table-column label="状态" width="105">
+                    <template #default="scope">
+                      <el-tag :type="volumeStateType(scope.row.state)" effect="plain">
+                        {{ scope.row.state }}
+                      </el-tag>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="更新时间" min-width="155">
+                    <template #default="scope">
+                      {{ formatTime(scope.row.updated_at_unix_ms) }}
+                    </template>
+                  </el-table-column>
+                  <el-table-column v-if="lifecycleEnabled" label="操作" width="70" align="right">
+                    <template #default="scope">
+                      <ResourceDeletionDialog
+                        :tenant-id="tenantId"
+                        :resource="{
+                          type: 'storage_volume',
+                          storage_volume_id: scope.row.storage_volume_id,
+                        }"
+                        :resource-version="lifecycleResourceVersion(scope.row)"
+                        :display-name="scope.row.display_name"
+                      />
+                    </template>
+                  </el-table-column>
+                </el-table>
+
+                <div class="mobile-resource-list">
+                  <div
+                    v-for="storageVolume in cluster.volumes"
+                    :key="storageVolume.storage_volume_id"
+                    class="mobile-resource-item mobile-resource-item--static"
                   >
-                  <el-tag :type="volumeStateType(storageVolume.state)" size="small" effect="plain">
-                    {{ storageVolume.state }}
-                  </el-tag>
-                  <ResourceDeletionDialog
-                    v-if="lifecycleEnabled"
-                    :tenant-id="tenantId"
-                    :resource="{
-                      type: 'storage_volume',
-                      storage_volume_id: storageVolume.storage_volume_id,
-                    }"
-                    :resource-version="lifecycleResourceVersion(storageVolume)"
-                    :display-name="storageVolume.display_name"
-                  />
-                </span>
-              </div>
+                    <span>
+                      <strong>{{ storageVolume.display_name }}</strong>
+                      <code>{{ storageVolume.storage_volume_id }}</code>
+                    </span>
+                    <span>
+                      <small>
+                        {{ storageVolume.region }} · {{ storageVolume.backend_type.toUpperCase() }}
+                      </small>
+                      <el-tag
+                        :type="volumeStateType(storageVolume.state)"
+                        size="small"
+                        effect="plain"
+                      >
+                        {{ storageVolume.state }}
+                      </el-tag>
+                      <ResourceDeletionDialog
+                        v-if="lifecycleEnabled"
+                        :tenant-id="tenantId"
+                        :resource="{
+                          type: 'storage_volume',
+                          storage_volume_id: storageVolume.storage_volume_id,
+                        }"
+                        :resource-version="lifecycleResourceVersion(storageVolume)"
+                        :display-name="storageVolume.display_name"
+                      />
+                    </span>
+                  </div>
+                </div>
+              </section>
             </div>
             <PageCursor
               :has-previous="cursorHistory.length > 0"
@@ -1031,6 +1155,183 @@ function fingerprintSummary(value: string): string {
   margin-bottom: 18px;
 }
 
+.cluster-browser {
+  margin-top: 22px;
+}
+
+.cluster-browser__loading,
+.cluster-browser__empty {
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.gateway-cluster-list {
+  display: grid;
+  gap: 16px;
+}
+
+.gateway-cluster {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.gateway-cluster__header {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.15fr) minmax(360px, 1fr) auto;
+  align-items: center;
+  gap: 22px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--line);
+  background: #f1f5f3;
+}
+
+.gateway-cluster__identity {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.gateway-cluster__identity > span:last-child,
+.gateway-cluster__identity strong,
+.gateway-cluster__identity small {
+  min-width: 0;
+  display: block;
+}
+
+.gateway-cluster__identity small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.gateway-cluster__identity strong {
+  margin-top: 3px;
+  overflow: hidden;
+  font-size: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-cluster__icon {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--green-dark);
+  background: #dceae3;
+}
+
+.gateway-cluster__icon svg {
+  width: 19px;
+  height: 19px;
+}
+
+.gateway-cluster__ids {
+  min-width: 0;
+  display: flex;
+  gap: 8px;
+  margin-top: 5px;
+}
+
+.gateway-cluster__ids code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-cluster__ids code + code::before {
+  content: '/';
+  margin-right: 8px;
+  color: #a0aaa5;
+}
+
+.gateway-cluster__facts {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  margin: 0;
+}
+
+.gateway-cluster__facts div {
+  min-width: 0;
+}
+
+.gateway-cluster__facts dt {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.gateway-cluster__facts dd {
+  min-width: 0;
+  margin: 0;
+}
+
+.gateway-cluster__facts code {
+  display: block;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-cluster__facts dd span {
+  margin-left: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.gateway-cluster__state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.gateway-cluster__state small {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.gateway-cluster__volume-heading {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.gateway-cluster__volume-heading svg {
+  width: 16px;
+  height: 16px;
+  color: var(--green);
+}
+
+.gateway-cluster__volume-heading span {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.cluster-browser > .page-cursor {
+  margin-top: 2px;
+  border-top: 0;
+}
+
 .enrollment-section {
   min-height: 260px;
 }
@@ -1126,6 +1427,58 @@ function fingerprintSummary(value: string): string {
 }
 
 @media (max-width: 720px) {
+  .gateway-cluster__header {
+    grid-template-columns: 1fr;
+    gap: 14px;
+    padding: 16px;
+  }
+
+  .gateway-cluster__facts {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .gateway-cluster__state {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .gateway-cluster__volume-heading {
+    padding: 0 16px;
+  }
+
+  .gateway-cluster .mobile-resource-item:last-child {
+    border-bottom: 0;
+  }
+
+  .gateway-cluster .mobile-resource-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .gateway-cluster .mobile-resource-item > span:first-child {
+    padding-right: 4px;
+  }
+
+  .gateway-cluster .mobile-resource-item > span:last-child {
+    max-width: 150px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+
+  .gateway-cluster .mobile-resource-item > span:last-child small {
+    width: 100%;
+    text-align: right;
+  }
+
+  .gateway-cluster .mobile-resource-item strong,
+  .gateway-cluster .mobile-resource-item code {
+    max-width: none;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
   .token-metadata {
     grid-template-columns: 1fr;
   }
@@ -1151,6 +1504,17 @@ function fingerprintSummary(value: string): string {
   .enrollment-mobile-item .row-actions {
     flex: 0 0 auto;
     margin-left: auto;
+  }
+}
+
+@media (min-width: 721px) and (max-width: 1050px) {
+  .gateway-cluster__header {
+    grid-template-columns: minmax(240px, 1fr) auto;
+  }
+
+  .gateway-cluster__facts {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 }
 </style>

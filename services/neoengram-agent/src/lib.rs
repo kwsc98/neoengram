@@ -16,6 +16,7 @@ mod execution;
 mod health;
 mod identity;
 mod replication;
+mod replication_quic;
 mod resource_lifecycle;
 mod runtime;
 mod s3_channel;
@@ -28,14 +29,15 @@ mod snapshot_mount;
 mod snapshot_reader;
 mod status_clock;
 mod tls;
+mod transfer_quic;
 
 pub use agent_core::*;
 pub use backoff::EnrollmentBackoff;
 pub use client::{EnrollmentClient, EnrollmentClientError, ReqwestEnrollmentClient};
 pub use command_trust::CentralCommandTrustBundle;
 pub use config::{
-    AgentConfig, LoggingConfig, LoggingFormat, PvcReference, RegistrationConfig, SessionConfig,
-    StorageAccessMode, StorageBackendType, StorageConfig,
+    AgentConfig, LoggingConfig, LoggingFormat, PvcReference, RegistrationConfig, ReplicationConfig,
+    SessionConfig, StorageAccessMode, StorageBackendType, StorageConfig,
 };
 pub use error::{AgentDaemonError, AgentDaemonResult};
 pub use execution::{
@@ -48,7 +50,15 @@ pub use identity::{
     has_pending_outbound_reports, load_or_create_identity, load_persisted_identity,
     signing_key_from_identity, AgentSigningKey, PersistedIdentitySummary,
 };
-pub use replication::{ReplicationProgressSink, ReplicationWorker};
+pub use replication::{
+    DurableReplicationProgressSink, MountedVolumeReplicationExecutor,
+    ReplicationAssignmentExecutor, ReplicationProgressSink, ReplicationWorker,
+};
+pub use replication_quic::{
+    run_quic_sink_stream, serve_quic_source_connection, serve_quic_source_stream,
+    serve_quic_source_stream_from_ticket, QuicTransferClient, QuicTransferClientConfig,
+    QuicTransferError, QuicTransferIdentity, QuicTransferNetwork, QuicTransferNetworkConfig,
+};
 pub use runtime::{
     run, run_with, run_with_development_directory_probe, run_with_transports,
     DevelopmentDirectoryProbe, FilesystemProbe, MountProbe,
@@ -71,4 +81,8 @@ pub use snapshot_mount::{
 pub use snapshot_reader::{
     ImmutableByteRange, ImmutableObjectHead, ImmutableSnapshotReader, S3SnapshotSource,
     SnapshotCasReader, SnapshotCasReaderFactory,
+};
+pub use transfer_quic::{
+    AgentTransferError, AgentTransferFrameChannel, AgentTransferSinkSession,
+    AgentTransferSourceSession,
 };

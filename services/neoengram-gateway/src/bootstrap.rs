@@ -38,7 +38,7 @@ pub(crate) struct GatewayBootstrapConfig {
     /// PEM PKCS#8 Ed25519 key used only for Replica activation proof-of-possession.
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_BOOTSTRAP_PRIVATE_KEY_FILE",
+        env = "NEOENGRAM_GATEWAY_BOOTSTRAP_PRIVATE_KEY_FILE",
         hide_env_values = true
     )]
     pub(crate) private_key_file: Option<PathBuf>,
@@ -46,13 +46,13 @@ pub(crate) struct GatewayBootstrapConfig {
     /// File containing the one-time activation token returned by Central.
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_BOOTSTRAP_ACTIVATION_TOKEN_FILE",
+        env = "NEOENGRAM_GATEWAY_BOOTSTRAP_ACTIVATION_TOKEN_FILE",
         hide_env_values = true
     )]
     pub(crate) activation_token_file: Option<PathBuf>,
 
     /// Destination for the atomically installed leaf and issuer PEM chain.
-    #[arg(long, env = "SYNAPSE_GATEWAY_BOOTSTRAP_CERTIFICATE_CHAIN_FILE")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_BOOTSTRAP_CERTIFICATE_CHAIN_FILE")]
     pub(crate) certificate_chain_file: Option<PathBuf>,
 }
 

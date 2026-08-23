@@ -2428,6 +2428,7 @@ async fn run_crash_recovery(repository: Arc<dyn AgentRegistryRepository>) {
         ))
         .await
         .unwrap();
+    assert_eq!(ready.record.mount.available_bytes, Some(1_000_000));
     clock.advance(101).unwrap();
     assert_eq!(
         service
@@ -3546,6 +3547,7 @@ fn mount_report(
         mount_identity_digest: mount_identity_digest(),
         access_mode: MountAccessMode::ReadWrite,
         health: ResourceHealth::Ready,
+        available_bytes: neoengram_domain::protocol::DecimalU64::new(1_000_000),
         observed_at_unix_ms: UnixMillis::new(observed_at),
         extensions: Extensions::new(),
     }

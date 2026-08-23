@@ -5,10 +5,11 @@ resolver = "2"
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.97.0"
+rust-version = "1.97.1"
+authors = ["王思诚 <kwsc98@gmail.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/kwsc98/synapse"
-homepage = "https://github.com/kwsc98/synapse"
+repository = "https://github.com/kwsc98/neoengram"
+homepage = "https://github.com/kwsc98/neoengram"
 documentation = "https://docs.rs/neoengram"
 readme = "README.md"
 keywords = ["version-control", "datasets", "machine-learning", "content-addressed"]

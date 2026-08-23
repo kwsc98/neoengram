@@ -1,12 +1,12 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: synapse-gateway-config-gateway-pool-example
-  namespace: synapse-gateway-example
+  name: neoengram-gateway-config-gateway-pool-example
+  namespace: neoengram-gateway-example
   annotations:
     neoengram.io/example-only: "external-provisioner-required"
   labels:
-    app.kubernetes.io/name: synapse-gateway
+    app.kubernetes.io/name: neoengram-gateway
     app.kubernetes.io/component: edge-gateway
     neoengram.io/edge-cluster: edge-example
     neoengram.io/gateway-pool: gateway-pool-example
@@ -14,38 +14,45 @@ immutable: true
 data:
   # The EdgeCluster and Pool identities are immutable for this example. Each
   # explicit Deployment document supplies its own stable Replica identity.
-  SYNAPSE_GATEWAY_EDGE_CLUSTER_ID: edge-example
-  SYNAPSE_GATEWAY_POOL_ID: gateway-pool-example
-  SYNAPSE_GATEWAY_AGENT_LISTEN: 0.0.0.0:8081
-  SYNAPSE_GATEWAY_CONTROL_LISTEN: 0.0.0.0:8082
-  SYNAPSE_GATEWAY_PEER_LISTEN: 0.0.0.0:8083
-  SYNAPSE_GATEWAY_TRANSFER_LISTEN: 0.0.0.0:8084
+  NEOENGRAM_GATEWAY_EDGE_CLUSTER_ID: edge-example
+  NEOENGRAM_GATEWAY_POOL_ID: gateway-pool-example
+  NEOENGRAM_GATEWAY_AGENT_LISTEN: 0.0.0.0:8081
+  NEOENGRAM_GATEWAY_CONTROL_LISTEN: 0.0.0.0:8082
+  NEOENGRAM_GATEWAY_PEER_LISTEN: 0.0.0.0:8083
+  NEOENGRAM_GATEWAY_TRANSFER_LISTEN: 0.0.0.0:8084
+  # Transfer uses a dedicated QUIC TLS policy. The example points at the activated
+  # workload identity Secret; its ca.crt must be a bundle containing the Gateway
+  # workload CA and the Agent replication CA. Production overlays may mount a
+  # separately provisioned transfer Secret at these same paths.
+  NEOENGRAM_GATEWAY_TRANSFER_TLS_CERTIFICATE_FILE: /var/run/secrets/neoengram-gateway/listener/tls.crt
+  NEOENGRAM_GATEWAY_TRANSFER_TLS_PRIVATE_KEY_FILE: /var/run/secrets/neoengram-gateway/listener/tls.key
+  NEOENGRAM_GATEWAY_TRANSFER_TLS_CLIENT_CA_FILE: /var/run/secrets/neoengram-gateway/listener/ca.crt
   # One TLS listener serves the console and read-only S3 API by Host. The public
   # certificate/key are intentionally separate from the workload mTLS identity.
-  SYNAPSE_GATEWAY_PUBLIC_LISTEN: 0.0.0.0:8080
-  SYNAPSE_GATEWAY_PUBLIC_TLS_CERTIFICATE_FILE: /var/run/secrets/synapse-gateway/public/tls.crt
-  SYNAPSE_GATEWAY_PUBLIC_TLS_PRIVATE_KEY_FILE: /var/run/secrets/synapse-gateway/public/tls.key
-  SYNAPSE_GATEWAY_CONSOLE_HOST: console.example.test
-  SYNAPSE_GATEWAY_S3_HOST: s3.example.test
-  SYNAPSE_GATEWAY_WEB_ROOT: /opt/neoengram/web
+  NEOENGRAM_GATEWAY_PUBLIC_LISTEN: 0.0.0.0:8080
+  NEOENGRAM_GATEWAY_PUBLIC_TLS_CERTIFICATE_FILE: /var/run/secrets/neoengram-gateway/public/tls.crt
+  NEOENGRAM_GATEWAY_PUBLIC_TLS_PRIVATE_KEY_FILE: /var/run/secrets/neoengram-gateway/public/tls.key
+  NEOENGRAM_GATEWAY_CONSOLE_HOST: console.example.test
+  NEOENGRAM_GATEWAY_S3_HOST: s3.example.test
+  NEOENGRAM_GATEWAY_WEB_ROOT: /opt/neoengram/web
   # Render this to a private Central mTLS terminator or service-mesh origin. The
   # Gateway workload certificate authenticates this HTTPS connection; the
   # terminator forwards to Central's plain-HTTP Fusen listener, and NetworkPolicy
   # additionally permits only labelled control-plane Pods on this port.
-  SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM: https://central-api.neoengram-control-example.svc.cluster.local:8080
-  SYNAPSE_GATEWAY_S3_MAX_STREAMS: "128"
-  SYNAPSE_GATEWAY_TLS_CERTIFICATE_FILE: /var/run/secrets/synapse-gateway/listener/tls.crt
-  SYNAPSE_GATEWAY_TLS_PRIVATE_KEY_FILE: /var/run/secrets/synapse-gateway/listener/tls.key
-  SYNAPSE_GATEWAY_TLS_CLIENT_CA_FILE: /var/run/secrets/synapse-gateway/listener/ca.crt
+  NEOENGRAM_GATEWAY_CENTRAL_API_UPSTREAM: https://central-api.neoengram-control-example.svc.cluster.local:8080
+  NEOENGRAM_GATEWAY_S3_MAX_STREAMS: "128"
+  NEOENGRAM_GATEWAY_TLS_CERTIFICATE_FILE: /var/run/secrets/neoengram-gateway/listener/tls.crt
+  NEOENGRAM_GATEWAY_TLS_PRIVATE_KEY_FILE: /var/run/secrets/neoengram-gateway/listener/tls.key
+  NEOENGRAM_GATEWAY_TLS_CLIENT_CA_FILE: /var/run/secrets/neoengram-gateway/listener/ca.crt
   # This is a long-lived workload identity boundary, not a bootstrap secret. The
   # three per-Replica bootstrap path settings live only in each Deployment and
   # are removed together after certificate promotion.
-  SYNAPSE_GATEWAY_WORKLOAD_TRUST_DOMAIN: mesh.example.test
-  SYNAPSE_GATEWAY_MAX_CONNECTIONS_PER_LISTENER: "1024"
-  SYNAPSE_GATEWAY_MAX_IN_FLIGHT_REQUESTS_PER_LISTENER: "256"
-  SYNAPSE_GATEWAY_MAX_REQUEST_BYTES: "1048576"
-  SYNAPSE_GATEWAY_REQUEST_DEADLINE_MILLIS: "10000"
+  NEOENGRAM_GATEWAY_WORKLOAD_TRUST_DOMAIN: mesh.example.test
+  NEOENGRAM_GATEWAY_MAX_CONNECTIONS_PER_LISTENER: "1024"
+  NEOENGRAM_GATEWAY_MAX_IN_FLIGHT_REQUESTS_PER_LISTENER: "256"
+  NEOENGRAM_GATEWAY_MAX_REQUEST_BYTES: "1048576"
+  NEOENGRAM_GATEWAY_REQUEST_DEADLINE_MILLIS: "10000"
   # The preStop helper marks readiness false and leaves 40 seconds of the Pod
   # termination grace period for SIGTERM shutdown after endpoint propagation.
-  SYNAPSE_GATEWAY_PRE_STOP_DRAIN_SECONDS: "20"
-  SYNAPSE_GATEWAY_LOG: synapse_gateway=info
+  NEOENGRAM_GATEWAY_PRE_STOP_DRAIN_SECONDS: "20"
+  NEOENGRAM_GATEWAY_LOG: neoengram_gateway=info

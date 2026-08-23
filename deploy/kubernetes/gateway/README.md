@@ -1,4 +1,4 @@
-# Synapse Gateway Kubernetes example
+# NeoEngram Gateway Kubernetes example
 
 > **This directory is an example template, not a production activation bundle.**
 > The PEM and activation-token values are placeholders. Do not apply these files to a
@@ -11,7 +11,7 @@ exposed through `WorkloadCertificateIssuer`; neither is supplied by this directo
 requires the complete two-replica business E2E and real-cluster failover evidence. The public
 listener in this example exposes the console and read-only S3 access protocol; it does not make
 Gateway or Central a durability backend. See
-[`docs/synapse-gateway-architecture.md`](../../../docs/synapse-gateway-architecture.md).
+[`docs/neoengram-gateway-architecture.md`](../../../docs/neoengram-gateway-architecture.md).
 
 This directory models one EdgeCluster GatewayPool with two independently managed replicas. It
 uses two explicit `Deployment` documents (`gateway-pool-example-r0` and `gateway-pool-example-r1`)
@@ -21,19 +21,19 @@ all replica credentials to every Pod. Each document therefore fixes all of the f
 
 | Replica | `GatewayReplicaId` | listener Secret | activation Secret | Central bootstrap Service |
 | --- | --- | --- | --- | --- |
-| r0 | `gateway-pool-example-r0` | `synapse-gateway-identity-gateway-pool-example-r0` | `synapse-gateway-activation-gateway-pool-example-r0` | `https://synapse-gateway-gateway-pool-example-r0.synapse-gateway-example.svc.cluster.local:8443` |
-| r1 | `gateway-pool-example-r1` | `synapse-gateway-identity-gateway-pool-example-r1` | `synapse-gateway-activation-gateway-pool-example-r1` | `https://synapse-gateway-gateway-pool-example-r1.synapse-gateway-example.svc.cluster.local:8443` |
+| r0 | `gateway-pool-example-r0` | `neoengram-gateway-identity-gateway-pool-example-r0` | `neoengram-gateway-activation-gateway-pool-example-r0` | `https://neoengram-gateway-gateway-pool-example-r0.neoengram-gateway-example.svc.cluster.local:8443` |
+| r1 | `gateway-pool-example-r1` | `neoengram-gateway-identity-gateway-pool-example-r1` | `neoengram-gateway-activation-gateway-pool-example-r1` | `https://neoengram-gateway-gateway-pool-example-r1.neoengram-gateway-example.svc.cluster.local:8443` |
 
 Central must persist these per-replica Service origins as the Registry `bootstrap_endpoint`,
 `control_endpoint` (port `9443`) and `peer_endpoint` (port `10443`). The load-balanced
-`synapse-gateway` Service on port `8443` is the Agent Pool entry point; it is not an authority for
+`neoengram-gateway` Service on port `8443` is the Agent Pool entry point; it is not an authority for
 Replica identity and must not be used as a Central Replica endpoint.
 
 The same Pool Service exposes port `443` for a TLS-aware ingress controller to forward
 `console.example.test`, `s3.example.test`, and `*.s3.example.test`. It remains `ClusterIP`; this
 base does not create an Internet-facing load balancer or admit arbitrary source CIDRs.
 
-Register each Replica with `software_version` equal to the deployed `synapse-gateway` package
+Register each Replica with `software_version` equal to the deployed `neoengram-gateway` package
 version, `wire_version: 1`, and the exact capability set
 `["agent-control-v1", "peer-forward-v1", "route-lease-v1"]`. Central compares the persisted
 values with every Replica hello and fails the connection closed on any mismatch.
@@ -77,8 +77,8 @@ this example must:
    after ACK would break the Registry fingerprint binding. This example does not include that
    controller or Secret-manager integration, so it is not a production activation solution.
 5. After the restart, verify the Registry certificate fingerprint, sole URI SAN, DNS/IP SAN set, EKUs and
-   generation. Keep `SYNAPSE_GATEWAY_WORKLOAD_TRUST_DOMAIN` as a required long-lived runtime setting, but
-   remove the three `SYNAPSE_GATEWAY_BOOTSTRAP_*` path settings, the bootstrap volume/mount, and the
+   generation. Keep `NEOENGRAM_GATEWAY_WORKLOAD_TRUST_DOMAIN` as a required long-lived runtime setting, but
+   remove the three `NEOENGRAM_GATEWAY_BOOTSTRAP_*` path settings, the bootstrap volume/mount, and the
    one-time activation Secret from that Replica's rendered Deployment. The listener TLS key remains in the
    promoted workload identity Secret; removing its separate bootstrap-path reference does not remove the
    active identity. Revoke the token according to the Central runbook. Never silently reuse a Secret for a
@@ -91,12 +91,12 @@ Central before changing the Pool state. Do not simply increase `replicas` on eit
 
 ## Public Web/S3 boundary
 
-`SYNAPSE_GATEWAY_PUBLIC_LISTEN` is `0.0.0.0:8080`. The public TLS certificate and key are mounted
-from the separate `synapse-gateway-public-tls-gateway-pool-example` Secret at
-`/var/run/secrets/synapse-gateway/public`; the workload listener Secret is not used for browser
-traffic. `SYNAPSE_GATEWAY_WEB_ROOT` must point at the immutable web assets included by the Gateway
+`NEOENGRAM_GATEWAY_PUBLIC_LISTEN` is `0.0.0.0:8080`. The public TLS certificate and key are mounted
+from the separate `neoengram-gateway-public-tls-gateway-pool-example` Secret at
+`/var/run/secrets/neoengram-gateway/public`; the workload listener Secret is not used for browser
+traffic. `NEOENGRAM_GATEWAY_WEB_ROOT` must point at the immutable web assets included by the Gateway
 image (the example uses `/opt/neoengram/web`). The provisioner must set the console/S3 hostnames and
-the private HTTPS `SYNAPSE_GATEWAY_CENTRAL_API_UPSTREAM` origin consistently with the DNS SAN on
+the private HTTPS `NEOENGRAM_GATEWAY_CENTRAL_API_UPSTREAM` origin consistently with the DNS SAN on
 the private mTLS terminator's certificate. The Central Fusen process itself currently listens over
 plain HTTP, so this HTTPS origin must be a private sidecar, reverse proxy, or service-mesh endpoint;
 it must verify the Gateway workload identity before forwarding to Central. Both the `/api` proxy and
@@ -112,6 +112,45 @@ and Pods labelled `app.kubernetes.io/name: neoengram-central`, on port `8080`; D
 peer rules remain separately constrained. For a cross-cluster ingress or Central, render a specific
 `ipBlock` in an overlay instead of widening this example to `0.0.0.0/0`. The Central private S3
 authorization route must remain behind the workload-authenticated ingress boundary.
+
+## Commit transfer relay plane
+
+The transfer listener is a separate QUIC/mTLS plane on UDP `8084` (Pool Service port `8444`). The
+ConfigMap wires the dedicated settings below to the activated listener Secret for this example:
+
+```text
+NEOENGRAM_GATEWAY_TRANSFER_TLS_CERTIFICATE_FILE
+NEOENGRAM_GATEWAY_TRANSFER_TLS_PRIVATE_KEY_FILE
+NEOENGRAM_GATEWAY_TRANSFER_TLS_CLIENT_CA_FILE
+```
+
+The `ca.crt` value must be a PEM bundle that trusts both the Gateway workload CA and the Agent
+replication CA. A production overlay may mount a separate transfer Secret, but it must keep these
+three paths complete and independent from the HTTP/H2 listener configuration. Transfer ALPN is
+`neoengram-transfer-v1`; Central is never a payload proxy and Gateway Pods never mount a business
+Volume.
+
+Relay routing is deliberately overlay-specific. A target Gateway accepts the target Agent hop and
+forwards to the source Gateway; a source Gateway accepts that hop and forwards to the source Agent.
+When a relay is enabled, all of the following values are required together:
+
+```text
+NEOENGRAM_GATEWAY_TRANSFER_RELAY_ROLE=target|source
+NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM=<fixed-next-hop-address>
+NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM_SERVER_NAME=<upstream-TLS-server-name>
+NEOENGRAM_GATEWAY_TRANSFER_SESSION_GENERATION=<current-session-generation>
+NEOENGRAM_GATEWAY_TRANSFER_MOUNT_GENERATION=<current-mount-generation>
+NEOENGRAM_GATEWAY_TRANSFER_ROUTE_GENERATION=<current-route-generation>
+```
+
+The checked-in base leaves the role, upstream, and generation values unset, so it can bind the
+authenticated listener while remaining fail-closed until the provisioner renders a route lease.
+During the bootstrap phase the listener may use the server-auth bootstrap certificate, but Gateway
+rejects any relay route; remove the bootstrap path settings and roll the Pod with the promoted
+workload certificate before enabling a source/target relay.
+Do not put a source Agent address in a ticket or derive an upstream from request data. If any route
+generation changes, drain and roll the affected Gateway with the new complete tuple; a stale tuple
+must reject the ticket before the first object frame.
 
 ## Applying a rendered example
 
@@ -143,7 +182,7 @@ as `Draining`, fences the control session, and closes active streams; if Central
 local renewal fence remains in force and unreleased leases expire at their normal short TTL.
 Kubernetes then sends `SIGTERM`; the 60-second termination grace period leaves 40 seconds for final
 connection shutdown after the endpoint-removal interval. The image
-entrypoint must be the `synapse-gateway` binary so `/proc/1/exe` cannot resolve to a shell or supervisor.
+entrypoint must be the `neoengram-gateway` binary so `/proc/1/exe` cannot resolve to a shell or supervisor.
 
 The Gateway mounts only per-replica Secrets and a small `emptyDir.medium: Memory` certificate
 delivery buffer. It never mounts a PVC, host path, NFS export, CAS directory, Volume, or object
@@ -153,9 +192,9 @@ unable to resume safely and requires an explicit revoke/re-provision recovery pa
 deliberate production blocker, not a durability guarantee supplied by these example manifests.
 
 Health probes use HTTPS because non-loopback listeners fail closed without a TLS identity. The
-public TLS Secret is mounted read-only at `/var/run/secrets/synapse-gateway/public`; the workload
-listener Secret is mounted read-only at `/var/run/secrets/synapse-gateway/listener`; the activation
-Secret is mounted read-only at `/var/run/secrets/synapse-gateway/bootstrap`; and the temporary
-certificate delivery path is `/var/run/secrets/synapse-gateway/workload` during activation. These last two
+public TLS Secret is mounted read-only at `/var/run/secrets/neoengram-gateway/public`; the workload
+listener Secret is mounted read-only at `/var/run/secrets/neoengram-gateway/listener`; the activation
+Secret is mounted read-only at `/var/run/secrets/neoengram-gateway/bootstrap`; and the temporary
+certificate delivery path is `/var/run/secrets/neoengram-gateway/workload` during activation. These last two
 mounts and all three bootstrap path settings are absent from the post-activation overlay. The workload trust
 domain remains configured independently; a TLS or non-loopback Gateway refuses to start without it.

@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::Read,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
 };
 
@@ -39,6 +40,9 @@ pub struct AgentConfig {
     pub storage: StorageConfig,
     pub registration: RegistrationConfig,
     pub session: SessionConfig,
+    /// Optional Agent-to-Agent QUIC data-plane settings.  The block is disabled when omitted.
+    #[serde(default)]
+    pub replication: ReplicationConfig,
     pub logging: LoggingConfig,
 }
 
@@ -110,9 +114,149 @@ impl AgentConfig {
         self.storage.validate(&self.storage_volume_id)?;
         self.registration.validate()?;
         self.session.validate()?;
+        self.replication.validate()?;
         self.logging.validate()?;
         Ok(())
     }
+
+    /// Returns the configured target-Gateway transfer endpoint as an IP socket address. DNS
+    /// names are intentionally rejected here so the signed route and configured network hop are
+    /// separate, deterministic inputs.
+    pub fn replication_gateway_socket_addr(&self) -> AgentDaemonResult<Option<SocketAddr>> {
+        self.replication.gateway_socket_addr()
+    }
+
+    /// Returns the configured listener endpoint as an IP socket address when Agent QUIC is
+    /// enabled.
+    pub fn replication_listen_socket_addr(&self) -> AgentDaemonResult<Option<SocketAddr>> {
+        self.replication.listen_socket_addr()
+    }
+}
+
+/// Optional Agent QUIC transport configuration. A target Agent connects only to its target
+/// Gateway; the source endpoint remains a listener reached through both configured Gateways.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationConfig {
+    /// QUIC listener URL, for example `quic://127.0.0.1:9191`.
+    #[serde(default)]
+    pub listen_endpoint: Option<Url>,
+    /// Target Gateway URL used by this Agent when Central assigns a remote source, for example
+    /// `quic://127.0.0.1:9191`.
+    #[serde(default)]
+    pub gateway_endpoint: Option<Url>,
+    /// PEM certificate chain used by the QUIC server and client.
+    #[serde(default)]
+    pub tls_certificate_file: Option<PathBuf>,
+    /// PKCS#8 or RSA private key used by the QUIC server and client.
+    #[serde(default)]
+    pub tls_private_key_file: Option<PathBuf>,
+    /// PEM CA bundle used for mutual TLS peer verification.
+    #[serde(default)]
+    pub tls_ca_file: Option<PathBuf>,
+}
+
+impl ReplicationConfig {
+    fn validate(&self) -> AgentDaemonResult<()> {
+        let has_endpoint = self.listen_endpoint.is_some() || self.gateway_endpoint.is_some();
+        let tls_values = [
+            self.tls_certificate_file.as_ref(),
+            self.tls_private_key_file.as_ref(),
+            self.tls_ca_file.as_ref(),
+        ];
+        let tls_count = tls_values.iter().filter(|value| value.is_some()).count();
+        if has_endpoint && tls_count != tls_values.len() {
+            return Err(configuration(
+                "replication TLS certificate, private key, and CA are required when an endpoint is configured",
+            ));
+        }
+        if !has_endpoint && tls_count != 0 {
+            return Err(configuration(
+                "replication TLS material cannot be configured without a QUIC endpoint",
+            ));
+        }
+        for (name, path) in [
+            (
+                "replication.tls_certificate_file",
+                self.tls_certificate_file.as_ref(),
+            ),
+            (
+                "replication.tls_private_key_file",
+                self.tls_private_key_file.as_ref(),
+            ),
+            ("replication.tls_ca_file", self.tls_ca_file.as_ref()),
+        ] {
+            if let Some(path) = path {
+                validate_absolute_normal_path(name, path)?;
+            }
+        }
+        if let Some(endpoint) = &self.listen_endpoint {
+            validate_quic_endpoint("replication.listen_endpoint", endpoint, true)?;
+        }
+        if let Some(endpoint) = &self.gateway_endpoint {
+            validate_quic_endpoint("replication.gateway_endpoint", endpoint, false)?;
+        }
+        Ok(())
+    }
+
+    fn listen_socket_addr(&self) -> AgentDaemonResult<Option<SocketAddr>> {
+        self.listen_endpoint
+            .as_ref()
+            .map(|endpoint| endpoint_socket_addr("replication.listen_endpoint", endpoint))
+            .transpose()
+    }
+
+    fn gateway_socket_addr(&self) -> AgentDaemonResult<Option<SocketAddr>> {
+        self.gateway_endpoint
+            .as_ref()
+            .map(|endpoint| endpoint_socket_addr("replication.gateway_endpoint", endpoint))
+            .transpose()
+    }
+}
+
+fn validate_quic_endpoint(
+    name: &str,
+    endpoint: &Url,
+    allow_zero_port: bool,
+) -> AgentDaemonResult<()> {
+    if !matches!(endpoint.scheme(), "quic" | "quic+tls")
+        || endpoint.username() != ""
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || !(endpoint.path().is_empty() || endpoint.path() == "/")
+    {
+        return Err(configuration(format!(
+            "{name} must be a canonical quic://host:port URL"
+        )));
+    }
+    let Some(host) = endpoint.host_str() else {
+        return Err(configuration(format!("{name} must include an IP host")));
+    };
+    host.parse::<IpAddr>()
+        .map_err(|_| configuration(format!("{name} must use an IP host")))?;
+    let port = endpoint
+        .port()
+        .ok_or_else(|| configuration(format!("{name} must include a port")))?;
+    if port == 0 && !allow_zero_port {
+        return Err(configuration(format!(
+            "{name} source port must be non-zero"
+        )));
+    }
+    Ok(())
+}
+
+fn endpoint_socket_addr(name: &str, endpoint: &Url) -> AgentDaemonResult<SocketAddr> {
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| configuration(format!("{name} has no host")))?;
+    let ip = host
+        .parse::<IpAddr>()
+        .map_err(|_| configuration(format!("{name} host is not an IP address")))?;
+    let port = endpoint
+        .port()
+        .ok_or_else(|| configuration(format!("{name} has no port")))?;
+    Ok(SocketAddr::new(ip, port))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -454,6 +598,23 @@ logging:
 
         config.gateway_endpoint = Url::parse("http://127.0.0.1:8080/").unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn optional_replication_transport_requires_complete_tls_scope() {
+        let mut config: AgentConfig = serde_yaml::from_str(VALID_CONFIG).unwrap();
+        assert!(config.replication_listen_socket_addr().unwrap().is_none());
+        config.replication.listen_endpoint = Some(Url::parse("quic://127.0.0.1:9191").unwrap());
+        config.replication.gateway_endpoint = Some(Url::parse("quic://127.0.0.1:9292").unwrap());
+        assert!(config.validate().is_err());
+        config.replication.tls_certificate_file = Some(PathBuf::from("/etc/neoengram/cert.pem"));
+        config.replication.tls_private_key_file = Some(PathBuf::from("/etc/neoengram/key.pem"));
+        config.replication.tls_ca_file = Some(PathBuf::from("/etc/neoengram/ca.pem"));
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.replication_listen_socket_addr().unwrap(),
+            Some("127.0.0.1:9191".parse().unwrap())
+        );
     }
 
     #[test]

@@ -402,7 +402,7 @@ impl S3PeerReader for H2PeerForwarder {
             .header(CONTENT_TYPE, S3_READ_CHANNEL_CONTENT_TYPE)
             .header(ACCEPT, "application/octet-stream")
             .header(
-                "x-synapse-source-replica",
+                "x-neoengram-source-replica",
                 self.identity.gateway_replica_id.as_str(),
             )
             .body(Full::new(Bytes::from(open)))

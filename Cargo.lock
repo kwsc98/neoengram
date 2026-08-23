@@ -1599,6 +1599,7 @@ dependencies = [
  "neoengram-central",
  "neoengram-domain",
  "neoengram-runtime",
+ "quinn",
  "rcgen",
  "reqwest",
  "ring",
@@ -1679,6 +1680,39 @@ dependencies = [
  "unicode-casefold",
  "unicode-normalization",
  "url",
+]
+
+[[package]]
+name = "neoengram-gateway"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "clap",
+ "getrandom 0.4.3",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "neoengram-domain",
+ "percent-encoding",
+ "quinn",
+ "rcgen",
+ "ring",
+ "rustix",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "x509-parser",
 ]
 
 [[package]]
@@ -2977,39 +3011,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "synapse-gateway"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "base64",
- "bytes",
- "clap",
- "getrandom 0.4.3",
- "http",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "neoengram-domain",
- "percent-encoding",
- "quinn",
- "rcgen",
- "ring",
- "rustix",
- "rustls",
- "rustls-pki-types",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
- "url",
- "x509-parser",
 ]
 
 [[package]]

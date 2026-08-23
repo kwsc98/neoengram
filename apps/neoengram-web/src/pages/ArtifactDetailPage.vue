@@ -7,12 +7,19 @@ import { useRoute, useRouter } from 'vue-router';
 
 import {
   createPlayground,
+  cancelCommitReplication,
   queryApiVersion,
   queryArtifact,
   queryArtifactCommitDiff,
   queryArtifactCommitGraph,
+  queryCommitPlacementList,
+  queryCommitReplicationList,
+  queryGatewayPoolList,
   queryPlaygroundList,
   querySnapshotList,
+  queryStorageVolumeList,
+  replicateCommit,
+  retryCommitReplication,
 } from '@/api/operations';
 import type { CommitNode } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
@@ -21,10 +28,22 @@ import ArtifactCommitTree from '@/components/ArtifactCommitTree.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
 import {
+  commitReplicationRequestId,
+  findCommitReplicationForTarget,
+  isCommitReplicationActive,
+} from '@/features/commit-replication';
+import {
+  supportsArtifactCommitReplication,
+  supportsArtifactCommitDiff,
   supportsArtifactCommitGraph,
   supportsPlaygroundMaterialize,
   supportsSnapshotMaterialize,
 } from '@/features/capabilities';
+import {
+  groupStorageVolumesByCluster,
+  isReplicationTargetSelectable,
+  selectableReplicationVolumes,
+} from '@/features/storage/cluster-groups';
 import {
   playgroundLifecycleLabel,
   playgroundLifecycleTagType,
@@ -53,6 +72,22 @@ const versionQuery = useQuery({
 const artifactCommitGraphEnabled = computed(() =>
   supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
 );
+const artifactCommitDiffEnabled = computed(() =>
+  supportsArtifactCommitDiff(versionQuery.data.value?.data.capabilities),
+);
+const artifactCommitReplicationEnabled = computed(
+  () =>
+    supportsArtifactCommitReplication(versionQuery.data.value?.data.capabilities) &&
+    (tenants.byId(tenantId.value)?.permissions.includes('artifact.commit.replicate') ?? false),
+);
+const gatewayInventoryEnabled = computed(
+  () => tenants.byId(tenantId.value)?.permissions.includes('gateway.read') ?? false,
+);
+const artifactCommitDetailEnabled = computed(
+  () =>
+    artifactCommitGraphEnabled.value &&
+    (artifactCommitDiffEnabled.value || artifactCommitReplicationEnabled.value),
+);
 const playgroundMaterializeEnabled = computed(() =>
   supportsPlaygroundMaterialize(versionQuery.data.value?.data.capabilities),
 );
@@ -72,6 +107,7 @@ const loadingMoreCommits = ref(false);
 const loadMoreCommitsError = ref<unknown>();
 const selectedCommitId = ref('');
 const commitDetailOpen = ref(false);
+const replicationTargetVolumeId = ref('');
 const createPlaygroundOpen = ref(false);
 const mutationError = ref('');
 const playgroundForm = reactive({
@@ -87,6 +123,9 @@ const canCreateSnapshot = computed(
     (tenants.byId(tenantId.value)?.permissions.includes('snapshot.create') ?? false),
 );
 const createPlaygroundMutation = useMutation({ mutationFn: createPlayground });
+const replicationMutation = useMutation({ mutationFn: replicateCommit });
+const retryReplicationMutation = useMutation({ mutationFn: retryCommitReplication });
+const cancelReplicationMutation = useMutation({ mutationFn: cancelCommitReplication });
 
 const artifactQuery = useQuery({
   queryKey: computed(() => ['artifact', tenantId.value, projectId.value, artifactId.value]),
@@ -137,10 +176,138 @@ const commitDiffQuery = useQuery({
     ),
   enabled: computed(
     () =>
-      artifactCommitGraphEnabled.value && commitDetailOpen.value && Boolean(selectedCommitId.value),
+      artifactCommitDiffEnabled.value && commitDetailOpen.value && Boolean(selectedCommitId.value),
   ),
 });
 const commitDiff = computed(() => commitDiffQuery.data.value?.data.diff);
+const selectedCommit = computed(() =>
+  commitNodes.value.find((commit) => commit.commit_id === selectedCommitId.value),
+);
+const commitDetailCommit = computed(() => commitDiff.value?.target_commit ?? selectedCommit.value);
+const storageVolumeQuery = useQuery({
+  queryKey: computed(() => ['storage-volumes', tenantId.value, 'artifact-commit-replication']),
+  queryFn: () => queryStorageVolumeList({ tenant_id: tenantId.value, page_size: 100 }),
+  enabled: computed(() => artifactCommitReplicationEnabled.value && commitDetailOpen.value),
+  staleTime: 15_000,
+});
+const gatewayPoolQuery = useQuery({
+  queryKey: computed(() => ['gateway-pools', tenantId.value, 'artifact-commit-replication']),
+  queryFn: () => queryGatewayPoolList({}),
+  enabled: computed(
+    () =>
+      artifactCommitReplicationEnabled.value &&
+      commitDetailOpen.value &&
+      gatewayInventoryEnabled.value,
+  ),
+  staleTime: 15_000,
+});
+const replicationListQuery = useQuery({
+  queryKey: computed(() => [
+    'commit-replications',
+    tenantId.value,
+    selectedCommitId.value,
+    'artifact-detail',
+  ]),
+  queryFn: () =>
+    queryCommitReplicationList({ tenant_id: tenantId.value, commit_id: selectedCommitId.value }),
+  enabled: computed(
+    () =>
+      artifactCommitReplicationEnabled.value &&
+      commitDetailOpen.value &&
+      Boolean(selectedCommitId.value),
+  ),
+  refetchInterval: (query) => {
+    const items = query.state.data?.data.replications ?? [];
+    return items.some((item) => isCommitReplicationActive(item.state)) ? 1_000 : false;
+  },
+});
+const placementListQuery = useQuery({
+  queryKey: computed(() => [
+    'commit-placements',
+    tenantId.value,
+    selectedCommitId.value,
+    'artifact-detail',
+  ]),
+  queryFn: () =>
+    queryCommitPlacementList({ tenant_id: tenantId.value, commit_id: selectedCommitId.value }),
+  enabled: computed(
+    () =>
+      artifactCommitReplicationEnabled.value &&
+      commitDetailOpen.value &&
+      Boolean(selectedCommitId.value),
+  ),
+  refetchInterval: () => {
+    const items = replicationListQuery.data.value?.data.replications ?? [];
+    return items.some((item) => isCommitReplicationActive(item.state)) ? 1_000 : false;
+  },
+});
+const storageClusters = computed(() =>
+  groupStorageVolumesByCluster(
+    storageVolumeQuery.data.value?.data.items ?? [],
+    gatewayPoolQuery.data.value?.data.items ?? [],
+    { gatewayInventoryAvailable: gatewayPoolQuery.isSuccess.value },
+  ),
+);
+const replicationTargetVolumes = computed(() =>
+  selectableReplicationVolumes(storageClusters.value),
+);
+const selectedReplicationTargetGroup = computed(() =>
+  storageClusters.value.find((group) =>
+    group.volumes.some((volume) => volume.storage_volume_id === replicationTargetVolumeId.value),
+  ),
+);
+const commitReplications = computed(() => replicationListQuery.data.value?.data.replications ?? []);
+const selectedTargetReplication = computed(() =>
+  findCommitReplicationForTarget(commitReplications.value, replicationTargetVolumeId.value),
+);
+const commitPlacements = computed(() => placementListQuery.data.value?.data.placements ?? []);
+const selectedTargetPublished = computed(
+  () =>
+    selectedTargetReplication.value?.state === 'published' ||
+    commitPlacements.value.some(
+      (placement) =>
+        placement.state === 'published' &&
+        placement.storage_volume_id === replicationTargetVolumeId.value,
+    ),
+);
+const replicationActionLabel = computed(() => {
+  if (selectedTargetPublished.value) return '副本已发布';
+  const state = selectedTargetReplication.value?.state;
+  if (state && isCommitReplicationActive(state)) return '复制进行中';
+  if (state === 'failed' || state === 'cancelled') return '请重试任务';
+  return '复制 Commit';
+});
+const replicationTargetBlocked = computed(
+  () =>
+    !replicationTargetVolumeId.value ||
+    Boolean(selectedTargetReplication.value) ||
+    selectedTargetPublished.value,
+);
+watch(
+  commitReplications,
+  (next, previous) => {
+    if (
+      previous?.some((item) => isCommitReplicationActive(item.state)) &&
+      !next.some((item) => isCommitReplicationActive(item.state))
+    ) {
+      void placementListQuery.refetch();
+    }
+  },
+  { deep: true },
+);
+watch(
+  [
+    selectedCommitId,
+    () => replicationTargetVolumes.value.map((volume) => volume.storage_volume_id).join(','),
+  ],
+  () => {
+    const available = replicationTargetVolumes.value;
+    if (!available.some((volume) => volume.storage_volume_id === replicationTargetVolumeId.value)) {
+      replicationTargetVolumeId.value = available[0]?.storage_volume_id ?? '';
+    }
+  },
+  { immediate: true },
+);
 const playgroundQuery = useQuery({
   queryKey: computed(() => [
     'playgrounds',
@@ -218,7 +385,7 @@ watch(
 );
 
 watch(
-  [() => route.query.commit_id, artifactCommitGraphEnabled],
+  [() => route.query.commit_id, artifactCommitDetailEnabled],
   ([commitId, enabled]) => {
     selectedCommitId.value = enabled ? String(commitId ?? '') : '';
     commitDetailOpen.value = Boolean(selectedCommitId.value);
@@ -232,7 +399,7 @@ watch(artifactScopeKey, () => {
   nextCommitCursor.value = undefined;
   loadingMoreCommits.value = false;
   loadMoreCommitsError.value = undefined;
-  selectedCommitId.value = artifactCommitGraphEnabled.value
+  selectedCommitId.value = artifactCommitDetailEnabled.value
     ? String(route.query.commit_id ?? '')
     : '';
   commitDetailOpen.value = Boolean(selectedCommitId.value);
@@ -247,9 +414,76 @@ async function changeTab(tab: string | number): Promise<void> {
 }
 
 async function showCommitDetail(commitId: string): Promise<void> {
+  if (!artifactCommitDetailEnabled.value) return;
   selectedCommitId.value = commitId;
   commitDetailOpen.value = true;
   await router.replace({ query: { tab: 'commits', commit_id: commitId } });
+}
+
+async function replicateSelectedCommit(): Promise<void> {
+  if (
+    !artifactCommitReplicationEnabled.value ||
+    !selectedCommitId.value ||
+    !replicationTargetVolumeId.value ||
+    replicationMutation.isPending.value ||
+    replicationTargetBlocked.value
+  ) {
+    return;
+  }
+  const result = await replicationMutation.mutateAsync({
+    tenant_id: tenantId.value,
+    project_id: projectId.value,
+    artifact_id: artifactId.value,
+    commit_id: selectedCommitId.value,
+    target_storage_volume_id: replicationTargetVolumeId.value,
+    request_id: commitReplicationRequestId({
+      tenantId: tenantId.value,
+      projectId: projectId.value,
+      artifactId: artifactId.value,
+      commitId: selectedCommitId.value,
+      targetStorageVolumeId: replicationTargetVolumeId.value,
+    }),
+  });
+  ElMessage.success(result.data.replayed ? '已返回同一复制请求' : 'Commit 复制已排队');
+  await Promise.all([replicationListQuery.refetch(), placementListQuery.refetch()]);
+}
+
+function changeReplicationTarget(): void {
+  replicationMutation.reset();
+}
+
+function replicationRouteLabel(state: 'ready' | 'unavailable' | 'unknown'): string {
+  return {
+    ready: '路由 Ready',
+    unavailable: '路由不可用',
+    unknown: '路由由 Central 校验',
+  }[state];
+}
+
+async function retrySelectedReplication(
+  replication: (typeof commitReplications.value)[number],
+): Promise<void> {
+  if (retryReplicationMutation.isPending.value) return;
+  await retryReplicationMutation.mutateAsync({
+    tenant_id: tenantId.value,
+    replication_id: replication.replication_id,
+    expected_attempt: replication.attempt,
+  });
+  ElMessage.success('复制任务已重新提交');
+  await replicationListQuery.refetch();
+}
+
+async function cancelSelectedReplication(
+  replication: (typeof commitReplications.value)[number],
+): Promise<void> {
+  if (cancelReplicationMutation.isPending.value) return;
+  await cancelReplicationMutation.mutateAsync({
+    tenant_id: tenantId.value,
+    replication_id: replication.replication_id,
+    expected_attempt: replication.attempt,
+  });
+  ElMessage.success('复制任务已取消');
+  await replicationListQuery.refetch();
 }
 
 async function closeCommitDetail(): Promise<void> {
@@ -723,43 +957,47 @@ async function showCreateSnapshot(): Promise<void> {
     </el-dialog>
 
     <el-drawer
-      v-if="artifactCommitGraphEnabled"
+      v-if="artifactCommitDetailEnabled"
       v-model="commitDetailOpen"
       title="Commit 详情"
       size="min(720px, 100vw)"
       @closed="closeCommitDetail"
     >
       <ApiProblemAlert
-        v-if="commitDiffQuery.error.value"
+        v-if="artifactCommitDiffEnabled && commitDiffQuery.error.value"
         :error="commitDiffQuery.error.value"
         :retrying="commitDiffQuery.isFetching.value"
         @retry="commitDiffQuery.refetch"
       />
-      <el-skeleton v-if="commitDiffQuery.isPending.value" :rows="10" animated />
-      <template v-else-if="commitDiff">
+      <el-skeleton
+        v-if="artifactCommitDiffEnabled && commitDiffQuery.isPending.value"
+        :rows="10"
+        animated
+      />
+      <template v-else-if="commitDetailCommit">
         <section class="commit-detail-section">
           <div class="section-heading section-heading--inline">
             <div>
-              <h2>{{ commitDiff.target_commit.message }}</h2>
-              <code>{{ commitDiff.target_commit.commit_id }}</code>
+              <h2>{{ commitDetailCommit.message }}</h2>
+              <code>{{ commitDetailCommit.commit_id }}</code>
             </div>
           </div>
           <dl class="definition-grid definition-grid--scope">
             <div>
               <dt>创建时间</dt>
-              <dd>{{ formatTime(commitDiff.target_commit.created_at_unix_ms) }}</dd>
+              <dd>{{ formatTime(commitDetailCommit.created_at_unix_ms) }}</dd>
             </div>
             <div>
               <dt>Parent</dt>
               <dd>
-                <code>{{ commitDiff.target_commit.parent_commit_id ?? '—' }}</code>
+                <code>{{ commitDetailCommit.parent_commit_id ?? '—' }}</code>
               </dd>
             </div>
             <div>
               <dt>归档模式</dt>
               <dd>
                 <el-tag effect="plain">
-                  {{ commitDataLayoutLabel(commitDiff.target_commit.data_layout) }}
+                  {{ commitDataLayoutLabel(commitDetailCommit.data_layout) }}
                 </el-tag>
               </dd>
             </div>
@@ -767,25 +1005,222 @@ async function showCreateSnapshot(): Promise<void> {
               <dt>Tags</dt>
               <dd class="tag-list">
                 <el-tag
-                  v-for="tagName in commitTagNames(commitDiff.target_commit.tag_names)"
+                  v-for="tagName in commitTagNames(commitDetailCommit.tag_names)"
                   :key="tagName"
                   effect="plain"
                 >
                   {{ tagName }}
                 </el-tag>
-                <span v-if="commitTagNames(commitDiff.target_commit.tag_names).length === 0">
+                <span v-if="commitTagNames(commitDetailCommit.tag_names).length === 0">
                   暂无 Tag
                 </span>
               </dd>
             </div>
             <div class="definition-grid__wide">
               <dt>详细描述</dt>
-              <dd>{{ commitDiff.target_commit.description ?? '—' }}</dd>
+              <dd>{{ commitDetailCommit.description ?? '—' }}</dd>
             </div>
           </dl>
         </section>
 
-        <section class="commit-detail-section commit-parent-section">
+        <section
+          v-if="artifactCommitReplicationEnabled"
+          class="commit-detail-section commit-replication-section"
+        >
+          <div class="section-heading section-heading--inline">
+            <div>
+              <span>COMMIT PLACEMENT</span>
+              <h2>复制到集群 / 磁盘</h2>
+              <p>
+                先选 Gateway 集群，再选择其下的 StorageVolume。用户不需要选择 Agent 或 Gateway
+                Replica。
+              </p>
+            </div>
+            <RefreshRight />
+          </div>
+          <ApiProblemAlert
+            v-if="storageVolumeQuery.error.value"
+            :error="storageVolumeQuery.error.value"
+          />
+          <ApiProblemAlert
+            v-if="gatewayPoolQuery.error.value"
+            :error="gatewayPoolQuery.error.value"
+          />
+          <ApiProblemAlert
+            v-if="replicationListQuery.error.value"
+            :error="replicationListQuery.error.value"
+            :retrying="replicationListQuery.isFetching.value"
+            @retry="replicationListQuery.refetch"
+          />
+          <ApiProblemAlert
+            v-if="placementListQuery.error.value"
+            :error="placementListQuery.error.value"
+            :retrying="placementListQuery.isFetching.value"
+            @retry="placementListQuery.refetch"
+          />
+          <ApiProblemAlert
+            v-if="replicationMutation.error.value"
+            :error="replicationMutation.error.value"
+          />
+          <ApiProblemAlert
+            v-if="retryReplicationMutation.error.value"
+            :error="retryReplicationMutation.error.value"
+          />
+          <ApiProblemAlert
+            v-if="cancelReplicationMutation.error.value"
+            :error="cancelReplicationMutation.error.value"
+          />
+          <div class="commit-replication-target">
+            <el-select
+              v-model="replicationTargetVolumeId"
+              placeholder="选择 Gateway 集群 / StorageVolume"
+              :loading="
+                storageVolumeQuery.isPending.value ||
+                (gatewayInventoryEnabled && gatewayPoolQuery.isPending.value)
+              "
+              :disabled="replicationTargetVolumes.length === 0"
+              style="min-width: min(100%, 360px)"
+              @change="changeReplicationTarget"
+            >
+              <el-option-group
+                v-for="group in storageClusters"
+                :key="group.edgeClusterId"
+                :label="`${group.gatewayPool?.display_name ?? group.edgeClusterId} · ${group.edgeClusterId} · ${replicationRouteLabel(group.routeState)}`"
+              >
+                <el-option
+                  v-for="volume in group.volumes"
+                  :key="volume.storage_volume_id"
+                  :label="`${volume.display_name} · ${volume.region}`"
+                  :value="volume.storage_volume_id"
+                  :disabled="!isReplicationTargetSelectable(group, volume)"
+                />
+              </el-option-group>
+            </el-select>
+            <el-button
+              type="primary"
+              :loading="replicationMutation.isPending.value"
+              :disabled="replicationTargetBlocked"
+              @click="replicateSelectedCommit"
+              >{{ replicationActionLabel }}</el-button
+            >
+          </div>
+          <div v-if="selectedReplicationTargetGroup" class="tag-list">
+            <el-tag effect="plain">
+              Gateway 集群：{{
+                selectedReplicationTargetGroup.gatewayPool?.display_name ??
+                selectedReplicationTargetGroup.edgeClusterId
+              }}
+            </el-tag>
+            <el-tag effect="plain">
+              Region：{{ selectedReplicationTargetGroup.regions.join(', ') }}
+            </el-tag>
+            <el-tag
+              :type="
+                selectedReplicationTargetGroup.routeState === 'ready'
+                  ? 'success'
+                  : selectedReplicationTargetGroup.routeState === 'unavailable'
+                    ? 'danger'
+                    : 'info'
+              "
+              effect="plain"
+            >
+              {{ replicationRouteLabel(selectedReplicationTargetGroup.routeState) }}
+            </el-tag>
+          </div>
+          <div v-else-if="storageClusters.length" class="tag-list" aria-label="Gateway 集群路由">
+            <el-tag
+              v-for="group in storageClusters"
+              :key="group.edgeClusterId"
+              :type="group.routeState === 'unavailable' ? 'danger' : 'info'"
+              effect="plain"
+            >
+              {{ group.gatewayPool?.display_name ?? group.edgeClusterId }} ·
+              {{ group.regions.join(', ') }} · {{ replicationRouteLabel(group.routeState) }}
+            </el-tag>
+          </div>
+          <div v-if="commitPlacements.length" class="commit-placement-list">
+            <div class="commit-placement-list__heading">已验证副本</div>
+            <div
+              v-for="placement in commitPlacements"
+              :key="placement.placement_set_id"
+              class="commit-placement-row"
+            >
+              <span>
+                <strong>{{ placement.storage_volume_id ?? placement.backend_id }}</strong>
+                <small
+                  >Generation {{ placement.placement_generation }} ·
+                  {{ placement.verified_object_count }} /
+                  {{ placement.object_count }} objects</small
+                >
+              </span>
+              <el-tag
+                :type="placement.state === 'published' ? 'success' : 'warning'"
+                effect="plain"
+              >
+                {{ placement.state }}
+              </el-tag>
+            </div>
+          </div>
+          <div v-if="commitReplications.length" class="commit-replication-list">
+            <div class="commit-placement-list__heading">复制任务</div>
+            <div
+              v-for="replication in commitReplications"
+              :key="replication.replication_id"
+              class="commit-replication-row"
+            >
+              <span>
+                <strong>{{ replication.target_storage_volume_id }}</strong>
+                <small
+                  ><code>{{ replication.replication_id }}</code></small
+                >
+                <small>
+                  {{ replication.completed_objects }} / {{ replication.total_objects }} objects ·
+                  {{ formatBytes(replication.completed_bytes) }} /
+                  {{ formatBytes(replication.total_bytes) }}
+                </small>
+                <small v-if="replication.issue" class="commit-replication-row__issue">{{
+                  replication.issue.message
+                }}</small>
+              </span>
+              <span class="commit-replication-row__actions">
+                <el-tag
+                  :type="
+                    replication.state === 'published'
+                      ? 'success'
+                      : replication.state === 'failed'
+                        ? 'danger'
+                        : 'warning'
+                  "
+                  effect="plain"
+                >
+                  {{ replication.state }}
+                </el-tag>
+                <el-button
+                  v-if="['failed', 'cancelled'].includes(replication.state)"
+                  size="small"
+                  :loading="retryReplicationMutation.isPending.value"
+                  @click="retrySelectedReplication(replication)"
+                  >重试</el-button
+                >
+                <el-button
+                  v-else-if="isCommitReplicationActive(replication.state)"
+                  size="small"
+                  type="danger"
+                  plain
+                  :loading="cancelReplicationMutation.isPending.value"
+                  @click="cancelSelectedReplication(replication)"
+                  >取消</el-button
+                >
+              </span>
+            </div>
+          </div>
+          <el-empty
+            v-else-if="!replicationListQuery.isPending.value"
+            description="此 Commit 尚无复制任务"
+          />
+        </section>
+
+        <section v-if="commitDiff" class="commit-detail-section commit-parent-section">
           <div class="section-heading section-heading--inline">
             <div>
               <h2>父 Commit</h2>
@@ -843,7 +1278,7 @@ async function showCreateSnapshot(): Promise<void> {
           </dl>
         </section>
 
-        <section class="commit-detail-section">
+        <section v-if="commitDiff" class="commit-detail-section">
           <div class="section-heading">
             <h2>文件 Diff</h2>
           </div>
@@ -871,7 +1306,16 @@ async function showCreateSnapshot(): Promise<void> {
             </div>
           </div>
           <div class="diff-list">
-            <div v-for="change in commitDiff.changes" :key="`${change.change_type}:${change.path}`">
+            <el-empty
+              v-if="commitDiff.changes.length === 0"
+              description="与基线没有文件变化"
+              :image-size="64"
+            />
+            <div
+              v-for="change in commitDiff.changes"
+              v-else
+              :key="`${change.change_type}:${change.path}`"
+            >
               <el-tag :type="diffTagType(change.change_type)" effect="plain">
                 {{ diffTypeLabel(change.change_type) }}
               </el-tag>

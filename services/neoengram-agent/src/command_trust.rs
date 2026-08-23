@@ -12,7 +12,7 @@ use std::{
 
 use neoengram_domain::protocol::{
     AgentChannelDownstreamFrame, AgentChannelDownstreamMessage, CentralSignedPayload,
-    CertificateGeneration, Ed25519PublicKeySpki, S3ReadTicket, UnixMillis,
+    CertificateGeneration, Ed25519PublicKeySpki, S3ReadTicket, SignedTransferTicket, UnixMillis,
 };
 use serde::Deserialize;
 
@@ -173,6 +173,7 @@ impl CentralCommandTrustBundle {
             AgentChannelDownstreamMessage::Assignment(_)
                 | AgentChannelDownstreamMessage::Decision(_)
                 | AgentChannelDownstreamMessage::LifecycleAssignment(_)
+                | AgentChannelDownstreamMessage::ReplicationAssignment(_)
         ) {
             return Ok(());
         }
@@ -212,6 +213,26 @@ impl CentralCommandTrustBundle {
                     reason: error.to_owned(),
                 }
             }),
+            self,
+            now_unix_ms,
+        )
+    }
+
+    /// Verifies a Central-issued replication ticket before any source object is opened or any
+    /// target staging file is created.
+    pub(crate) fn verify_transfer_ticket(
+        &self,
+        ticket: &SignedTransferTicket,
+        now_unix_ms: UnixMillis,
+    ) -> AgentDaemonResult<()> {
+        if ticket.ticket.deadline_unix_ms != ticket.central_signature.expires_at_unix_ms {
+            return Err(command_rejected(
+                "Central transfer signature expiry does not match the ticket deadline",
+            ));
+        }
+        verify_signature(
+            &ticket.central_signature,
+            SignedTransferTicket::payload_bytes(&ticket.ticket),
             self,
             now_unix_ms,
         )

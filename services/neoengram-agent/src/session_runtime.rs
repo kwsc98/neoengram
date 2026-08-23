@@ -23,20 +23,21 @@ use neoengram_domain::protocol::{
     ArtifactId, ControlError, DecimalU64, ErrorCode, Extensions, IndexDeltaRecord, IndexRevision,
     JobAccepted, JobAssignment, JobDecision, JobFailed, JobFailureStage, JobId, JobProgress,
     JobState, MetadataBatchDescriptor, MetadataBatchPage, MountGeneration, OwnerGeneration,
-    PlaygroundId, RequestId, ResourceLifecycleReport, ResourceLifecycleReportState,
-    ResourceVersion, SessionGeneration, SnapshotId, TenantId, TraceId, UnixMillis,
-    WireIndexVersion, WorkspaceMaterializeAssignment, AGENT_JOB_INDEX_PAGE_QUERY_PATH,
-    AGENT_JOB_MANIFEST_PAGE_QUERY_PATH, AGENT_JOB_METADATA_BATCH_STAGE_PATH,
-    AGENT_JOB_METADATA_PAGE_STAGE_PATH, AGENT_JOB_REPORT_CREATE_PATH, AGENT_SESSION_CLOSE_PATH,
-    AGENT_SESSION_HEARTBEAT_REPORT_PATH, AGENT_SESSION_OPEN_PATH, CURRENT_WIRE_VERSION,
-    MAX_RECORDS_PER_PAGE,
+    PlaygroundId, ReplicationAssignment, ReplicationId, ReplicationState, RequestId,
+    ResourceLifecycleReport, ResourceLifecycleReportState, ResourceVersion, SessionGeneration,
+    SnapshotId, TenantId, TraceId, UnixMillis, WireIndexVersion, WorkspaceMaterializeAssignment,
+    AGENT_JOB_INDEX_PAGE_QUERY_PATH, AGENT_JOB_MANIFEST_PAGE_QUERY_PATH,
+    AGENT_JOB_METADATA_BATCH_STAGE_PATH, AGENT_JOB_METADATA_PAGE_STAGE_PATH,
+    AGENT_JOB_REPORT_CREATE_PATH, AGENT_SESSION_CLOSE_PATH, AGENT_SESSION_HEARTBEAT_REPORT_PATH,
+    AGENT_SESSION_OPEN_PATH, CURRENT_WIRE_VERSION, MAX_RECORDS_PER_PAGE,
 };
 use tokio::runtime::Handle;
 
 use crate::{
     resource_lifecycle::{LifecycleJobGate, ResourceLifecycleExecutor},
     AgentDaemonError, AgentDaemonResult, AgentRequestSigner, AgentSessionClient, AgentSessionFence,
-    AuthoritativeIndexSnapshot, CentralCommandTrustBundle, ExecutionBridge,
+    AuthoritativeIndexSnapshot, CentralCommandTrustBundle, DurableReplicationProgressSink,
+    ExecutionBridge, ReplicationAssignmentExecutor, ReplicationProgressSink,
     SnapshotDeliveryMaterializer, SnapshotDeliveryMountManager, WorkspaceMaterializationFile,
     WorkspaceMaterializationSnapshot, WorkspaceMaterializer,
 };
@@ -44,6 +45,14 @@ use crate::{
 #[async_trait]
 pub trait AgentMessageProcessor: Send + Sync {
     async fn handle_assignment(&self, assignment: JobAssignment) -> AgentDaemonResult<()>;
+    async fn handle_replication(
+        &self,
+        _assignment: ReplicationAssignment,
+    ) -> AgentDaemonResult<()> {
+        Err(AgentDaemonError::Session(
+            "replication assignments are not supported by this Agent processor".to_owned(),
+        ))
+    }
     async fn handle_lifecycle_assignment(
         &self,
         assignment: AgentResourceLifecycleAssignment,
@@ -66,6 +75,7 @@ pub struct CoreAgentMessageProcessor {
     lifecycle_journal: Option<Arc<dyn LifecycleJournal>>,
     lifecycle_binding: Option<(SingleVolumeAgentConfig, SessionGeneration)>,
     lifecycle_executor: Option<Arc<dyn ResourceLifecycleExecutor>>,
+    replication_executor: Option<Arc<dyn ReplicationAssignmentExecutor>>,
     lifecycle_job_gate: Arc<LifecycleJobGate>,
 }
 
@@ -82,6 +92,7 @@ impl CoreAgentMessageProcessor {
             lifecycle_journal: None,
             lifecycle_binding: None,
             lifecycle_executor: None,
+            replication_executor: None,
             lifecycle_job_gate: Arc::new(LifecycleJobGate::default()),
         }
     }
@@ -106,6 +117,7 @@ impl CoreAgentMessageProcessor {
             lifecycle_journal: None,
             lifecycle_binding: None,
             lifecycle_executor: None,
+            replication_executor: None,
             lifecycle_job_gate: Arc::new(LifecycleJobGate::default()),
         }
     }
@@ -127,6 +139,7 @@ impl CoreAgentMessageProcessor {
             lifecycle_journal: None,
             lifecycle_binding: None,
             lifecycle_executor: None,
+            replication_executor: None,
             lifecycle_job_gate: Arc::new(LifecycleJobGate::default()),
         }
     }
@@ -171,6 +184,15 @@ impl CoreAgentMessageProcessor {
         executor: Arc<dyn ResourceLifecycleExecutor>,
     ) -> Self {
         self.lifecycle_executor = Some(executor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_replication_executor(
+        mut self,
+        executor: Arc<dyn ReplicationAssignmentExecutor>,
+    ) -> Self {
+        self.replication_executor = Some(executor);
         self
     }
 }
@@ -291,6 +313,33 @@ impl AgentMessageProcessor for CoreAgentMessageProcessor {
                 }
             }
         }
+    }
+
+    async fn handle_replication(&self, assignment: ReplicationAssignment) -> AgentDaemonResult<()> {
+        let executor = self.replication_executor.clone().ok_or_else(|| {
+            AgentDaemonError::Session(
+                "replication assignment received before the data-plane executor was configured"
+                    .to_owned(),
+            )
+        })?;
+        let reports = self.reports.clone().ok_or_else(|| {
+            AgentDaemonError::Session(
+                "replication assignment received without a durable report queue".to_owned(),
+            )
+        })?;
+        let clock = self.clock.clone().ok_or_else(|| {
+            AgentDaemonError::Session("replication assignment received without a clock".to_owned())
+        })?;
+        tokio::task::spawn_blocking(move || {
+            assignment
+                .validate()
+                .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+            let progress = DurableReplicationProgressSink::new(assignment.clone(), reports, clock);
+            let result = executor.execute(&assignment, &progress);
+            settle_replication_execution(&assignment.replication_id, &progress, result)
+        })
+        .await
+        .map_err(join_error)?
     }
 
     async fn handle_lifecycle_assignment(
@@ -518,7 +567,7 @@ fn queued_workspace_state(
                 &report.assignment_id,
                 report.assignment_generation,
             ),
-            AgentReport::Lifecycle(_) => continue,
+            AgentReport::Lifecycle(_) | AgentReport::Replication(_) => continue,
         };
         if job_id != &assignment.job_id {
             continue;
@@ -1075,7 +1124,7 @@ fn queued_delivery_state(
                 &report.assignment_id,
                 report.assignment_generation,
             ),
-            AgentReport::Lifecycle(_) => continue,
+            AgentReport::Lifecycle(_) | AgentReport::Replication(_) => continue,
         };
         if job_id != &assignment.job_id {
             continue;
@@ -2113,6 +2162,19 @@ fn session_error(error: impl std::fmt::Display) -> AgentDaemonError {
     AgentDaemonError::Session(error.to_string())
 }
 
+fn settle_replication_execution(
+    replication_id: &ReplicationId,
+    progress: &dyn ReplicationProgressSink,
+    result: AgentDaemonResult<()>,
+) -> AgentDaemonResult<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    progress.state(replication_id, ReplicationState::Failed)?;
+    tracing::warn!(%replication_id, %error, "Replication task failed");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, sync::Mutex};
@@ -2203,6 +2265,55 @@ mod tests {
         fn now_unix_ms(&self) -> AgentResult<u64> {
             Ok(1_000)
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingReplicationProgress(Mutex<Vec<ReplicationState>>);
+
+    impl ReplicationProgressSink for RecordingReplicationProgress {
+        fn state(
+            &self,
+            _replication_id: &ReplicationId,
+            state: ReplicationState,
+        ) -> AgentDaemonResult<()> {
+            self.0.lock().unwrap().push(state);
+            Ok(())
+        }
+
+        fn object(
+            &self,
+            _replication_id: &ReplicationId,
+            _object_id: &ObjectId,
+            _offset: u64,
+            _state: neoengram_domain::protocol::ReplicationObjectState,
+        ) -> AgentDaemonResult<()> {
+            Ok(())
+        }
+
+        fn publish(
+            &self,
+            _replication_id: &ReplicationId,
+            _tenant_id: &TenantId,
+            _commit_id: &neoengram_domain::CommitId,
+            _object_set_digest: &ContentDigest,
+        ) -> AgentDaemonResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn replication_task_failure_does_not_close_the_agent_session() {
+        let replication_id = ReplicationId::new("replication-task-failure").unwrap();
+        let progress = RecordingReplicationProgress::default();
+
+        settle_replication_execution(
+            &replication_id,
+            &progress,
+            Err(AgentDaemonError::Session("transfer failed".to_owned())),
+        )
+        .unwrap();
+
+        assert_eq!(*progress.0.lock().unwrap(), vec![ReplicationState::Failed]);
     }
 
     #[test]

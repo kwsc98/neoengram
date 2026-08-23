@@ -36,9 +36,10 @@ use crate::{
     AgentConfig, AgentDaemonError, AgentDaemonResult, AgentMessageProcessor, AgentRequestSigner,
     AgentSessionBinding, AgentSessionClient, AgentSessionClientError, AgentSessionFence,
     AgentSigningKey, CentralCommandTrustBundle, CoreAgentMessageProcessor, ExecutionBridge,
-    FilesystemExecution, MountProbe, RuntimeHealthPhase, S3ReadExecutor, S3SnapshotSource,
-    SessionExecutionBridge, SharedResourceVersion, SharedSessionFence, SnapshotCasReaderFactory,
-    SnapshotDeliveryMountManager, WorkspaceMaterializer,
+    FilesystemExecution, MountProbe, MountedVolumeReplicationExecutor, RuntimeHealthPhase,
+    S3ReadExecutor, S3SnapshotSource, SessionExecutionBridge, SharedResourceVersion,
+    SharedSessionFence, SnapshotCasReaderFactory, SnapshotDeliveryMountManager,
+    WorkspaceMaterializer,
 };
 
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
@@ -83,6 +84,13 @@ impl DeferredProcessor {
 impl AgentMessageProcessor for DeferredProcessor {
     async fn handle_assignment(&self, assignment: JobAssignment) -> AgentDaemonResult<()> {
         self.current()?.handle_assignment(assignment).await
+    }
+
+    async fn handle_replication(
+        &self,
+        assignment: neoengram_domain::protocol::ReplicationAssignment,
+    ) -> AgentDaemonResult<()> {
+        self.current()?.handle_replication(assignment).await
     }
 
     async fn handle_lifecycle_assignment(
@@ -224,6 +232,92 @@ where
     let execution = FilesystemExecution::new(&config.storage.mount_path, Arc::clone(&bridge));
     execution.initialize()?;
     let execution = Arc::new(execution);
+
+    // Direct Agent QUIC is optional and disabled unless the complete endpoint/TLS block is
+    // configured.  The same network object is shared by the source listener and target executor;
+    // only the signed Central ticket selects an artifact-scoped backend.
+    let replication_network = match (
+        config.replication_listen_socket_addr()?,
+        config.replication_gateway_socket_addr()?,
+    ) {
+        (None, None) => None,
+        (listen, gateway_endpoint) => {
+            let certificate_file =
+                config
+                    .replication
+                    .tls_certificate_file
+                    .clone()
+                    .ok_or_else(|| {
+                        AgentDaemonError::Configuration(
+                            "replication TLS certificate is not configured".to_owned(),
+                        )
+                    })?;
+            let private_key_file =
+                config
+                    .replication
+                    .tls_private_key_file
+                    .clone()
+                    .ok_or_else(|| {
+                        AgentDaemonError::Configuration(
+                            "replication TLS private key is not configured".to_owned(),
+                        )
+                    })?;
+            let client_ca_file = config.replication.tls_ca_file.clone().ok_or_else(|| {
+                AgentDaemonError::Configuration("replication TLS CA is not configured".to_owned())
+            })?;
+            let server_name = config
+                .replication
+                .gateway_endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.host_str())
+                .or_else(|| {
+                    config
+                        .replication
+                        .listen_endpoint
+                        .as_ref()
+                        .and_then(|endpoint| endpoint.host_str())
+                })
+                .unwrap_or("localhost")
+                .to_owned();
+            let network = crate::QuicTransferNetwork::bind(&crate::QuicTransferNetworkConfig {
+                listen,
+                gateway_endpoint,
+                certificate_file,
+                private_key_file,
+                client_ca_file,
+                server_name,
+            })
+            .map_err(|error| {
+                AgentDaemonError::Configuration(format!(
+                    "replication QUIC network could not start: {error}"
+                ))
+            })?;
+            Some(Arc::new(network))
+        }
+    };
+    let (_replication_shutdown, replication_shutdown_receiver) = tokio::sync::watch::channel(false);
+    if let (Some(network), Some(trust_bundle)) =
+        (replication_network.clone(), command_trust_bundle.clone())
+    {
+        let source_network = Arc::clone(&network);
+        let source_execution = Arc::clone(&execution);
+        let source_tenant = config.tenant_id.clone();
+        let source_agent = volume.agent_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = source_network
+                .serve_source(
+                    trust_bundle,
+                    source_tenant,
+                    source_agent,
+                    source_execution,
+                    replication_shutdown_receiver,
+                )
+                .await
+            {
+                tracing::error!(%error, "Agent QUIC source listener stopped");
+            }
+        });
+    }
     let validator = Arc::new(SingleVolumeAssignmentValidator::new(
         volume.clone(),
         initial_observation.health,
@@ -232,7 +326,7 @@ where
         ledger,
         validator,
         execution.clone(),
-        execution,
+        execution.clone(),
         report_sink,
         Arc::clone(&clock),
     ));
@@ -331,7 +425,18 @@ where
         .with_snapshot_delivery_mounts(Arc::clone(&snapshot_delivery_mounts))
         .with_lifecycle_journal(lifecycle_journal)
         .with_lifecycle_binding(volume.clone(), binding.fence.session_generation)
-        .with_lifecycle_executor(lifecycle_executor),
+        .with_lifecycle_executor(lifecycle_executor)
+        .with_replication_executor(Arc::new(
+            MountedVolumeReplicationExecutor::new_with_network(
+                Arc::clone(&execution),
+                volume.tenant_id.clone(),
+                volume.agent_id.clone(),
+                volume.storage_volume_id.clone(),
+                command_trust_bundle.clone(),
+                Arc::clone(&clock),
+                replication_network,
+            ),
+        )),
     ))?;
     let mut dispatcher = spawn_work_dispatcher(config.tenant_id.clone(), deferred, fence.clone());
 
@@ -949,6 +1054,21 @@ async fn handle_downstream(
                 .await
                 .map_err(|_| AgentDaemonError::Session("Agent Job dispatcher is closed".to_owned()))
         }
+        AgentChannelDownstreamMessage::ReplicationAssignment(assignment) => {
+            if !seen_commands.insert(frame.message_id) {
+                return Ok(());
+            }
+            dispatcher
+                .sender
+                .send(FencedAgentWork {
+                    generation,
+                    work: AgentWork::Replication(*assignment),
+                })
+                .await
+                .map_err(|_| {
+                    AgentDaemonError::Session("Agent replication dispatcher is closed".to_owned())
+                })
+        }
         AgentChannelDownstreamMessage::LifecycleAssignment(assignment) => {
             if !seen_commands.insert(frame.message_id) {
                 return Ok(());
@@ -1161,6 +1281,9 @@ fn heartbeat_payload(
                 AgentDaemonError::MountProbe("mount access mode disappeared".to_owned())
             })?,
             health: observation.health,
+            available_bytes: observation.available_bytes.ok_or_else(|| {
+                AgentDaemonError::MountProbe("mount available space disappeared".to_owned())
+            })?,
             observed_at_unix_ms: observed_at,
         })?
         .report;
@@ -1301,6 +1424,13 @@ mod tests {
             Ok(())
         }
 
+        async fn handle_replication(
+            &self,
+            _assignment: neoengram_domain::protocol::ReplicationAssignment,
+        ) -> AgentDaemonResult<()> {
+            Ok(())
+        }
+
         async fn handle_lifecycle_assignment(
             &self,
             _assignment: neoengram_domain::protocol::AgentResourceLifecycleAssignment,
@@ -1327,6 +1457,14 @@ mod tests {
     #[async_trait]
     impl AgentMessageProcessor for CountingProcessor {
         async fn handle_assignment(&self, _assignment: JobAssignment) -> AgentDaemonResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn handle_replication(
+            &self,
+            _assignment: neoengram_domain::protocol::ReplicationAssignment,
+        ) -> AgentDaemonResult<()> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }

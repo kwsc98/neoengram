@@ -360,6 +360,11 @@ fn report_job_id(report: &AgentReport) -> AgentResult<neoengram_domain::protocol
             neoengram_domain::protocol::JobId::new(value.assignment_id.to_string())
                 .map_err(AgentError::from)
         }
+        AgentReport::Replication(value) => neoengram_domain::protocol::JobId::new(format!(
+            "replication-{}",
+            value.replication_id()
+        ))
+        .map_err(AgentError::from),
     }
 }
 
@@ -367,6 +372,7 @@ fn report_tenant_id(report: &AgentReport) -> Option<&TenantId> {
     match report {
         AgentReport::Failed(value) => Some(&value.tenant_id),
         AgentReport::Lifecycle(value) => Some(&value.tenant_id),
+        AgentReport::Replication(value) => Some(value.tenant_id()),
         _ => None,
     }
 }

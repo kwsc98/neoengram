@@ -7,7 +7,6 @@ import {
   DocumentCopy,
   Folder,
   RefreshRight,
-  TakeawayBox,
 } from '@element-plus/icons-vue';
 import { useQuery } from '@tanstack/vue-query';
 import { computed } from 'vue';
@@ -39,7 +38,9 @@ const readyQuery = useQuery({
 });
 const tenant = computed(() => tenantQuery.data.value?.data.tenant);
 const version = computed(() => versionQuery.data.value?.data);
-const canCreateProject = computed(() => tenant.value?.permissions.includes('project.create') ?? false);
+const canCreateProject = computed(
+  () => tenant.value?.permissions.includes('project.create') ?? false,
+);
 const firstError = computed(
   () =>
     tenantQuery.error.value ??
@@ -90,9 +91,9 @@ const resourceLinks = computed(() => [
     : []),
   {
     name: 'storage-volume-list',
-    label: '存储卷',
-    detail: '查看已登记的 StorageVolume 与放置状态',
-    icon: TakeawayBox,
+    label: '集群与存储',
+    detail: '查看 Gateway 集群及其磁盘状态',
+    icon: Connection,
   },
 ]);
 
@@ -129,12 +130,7 @@ async function openProjectCreate(): Promise<void> {
           <span class="status-dot" :class="readyQuery.data.value ? 'status-dot--ok' : ''" />
           {{ readyQuery.data.value ? '控制面正常' : '状态检查中' }}
         </span>
-        <el-button
-          v-if="canCreateProject"
-          type="primary"
-          :icon="Folder"
-          @click="openProjectCreate"
-        >
+        <el-button v-if="canCreateProject" type="primary" :icon="Folder" @click="openProjectCreate">
           创建 Project
         </el-button>
         <el-button :icon="RefreshRight" :loading="refreshing" @click="refresh">刷新</el-button>

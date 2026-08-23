@@ -8,7 +8,7 @@
 ## 报告漏洞
 
 请不要为未修复漏洞创建公开 issue。请直接使用
-[GitHub 私密漏洞报告](https://github.com/kwsc98/synapse/security/advisories/new) 提交：
+[GitHub 私密漏洞报告](https://github.com/kwsc98/neoengram/security/advisories/new) 提交：
 
 - 受影响版本或提交；
 - 可复现步骤或最小示例；

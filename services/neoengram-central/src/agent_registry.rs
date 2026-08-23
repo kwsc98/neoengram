@@ -371,6 +371,8 @@ pub struct AgentMountRecord {
     pub observed_volume_marker: Option<VolumeMarkerId>,
     pub observed_access_mode: Option<MountAccessMode>,
     pub reported_health: Option<ResourceHealth>,
+    #[serde(default)]
+    pub available_bytes: Option<u64>,
     pub health: ResourceHealth,
     pub observed_at_unix_ms: Option<UnixMillis>,
 }
@@ -1314,6 +1316,7 @@ impl AgentRegistryService {
         instance.last_heartbeat_at_unix_ms = None;
         instance.last_sequence = None;
         record.mount.health = ResourceHealth::Unknown;
+        record.mount.available_bytes = None;
         record.mount.observed_at_unix_ms = None;
         let previous = record.resource_version.get();
         advance_resource_version(&mut record)?;
@@ -1424,7 +1427,8 @@ impl AgentRegistryService {
                         == Some(report.observed_volume_marker.clone())
                     && record.mount.mount_identity_digest == Some(report.mount_identity_digest)
                     && record.mount.observed_access_mode == Some(report.access_mode)
-                    && record.mount.reported_health == Some(report.health);
+                    && record.mount.reported_health == Some(report.health)
+                    && record.mount.available_bytes == Some(report.available_bytes.get());
                 if replayed {
                     return Ok(ReportAgentMountResult {
                         record,
@@ -1442,6 +1446,7 @@ impl AgentRegistryService {
         record.mount.observed_volume_marker = Some(report.observed_volume_marker.clone());
         record.mount.observed_access_mode = Some(report.access_mode);
         record.mount.reported_health = Some(report.health);
+        record.mount.available_bytes = Some(report.available_bytes.get());
         record.mount.observed_at_unix_ms = Some(report.observed_at_unix_ms);
         record.mount.health =
             if report.observed_volume_marker != record.mount.expected_volume_marker {
@@ -2168,6 +2173,7 @@ fn token_intent_record(
             observed_volume_marker: None,
             observed_access_mode: None,
             reported_health: None,
+            available_bytes: None,
             health: ResourceHealth::Unknown,
             observed_at_unix_ms: None,
         },
@@ -2400,6 +2406,7 @@ fn revoke_for_replacement(
     record.mount.observed_volume_marker = None;
     record.mount.observed_access_mode = None;
     record.mount.reported_health = None;
+    record.mount.available_bytes = None;
     record.mount.observed_at_unix_ms = None;
     record.owner.owner_generation = OwnerGeneration::new(owner_generation);
     record.owner.active_agent_id = None;
@@ -2493,6 +2500,7 @@ pub(crate) fn revoke_for_volume_lifecycle(
     record.mount.observed_volume_marker = None;
     record.mount.observed_access_mode = None;
     record.mount.reported_health = None;
+    record.mount.available_bytes = None;
     record.mount.observed_at_unix_ms = None;
     record.owner.owner_generation = OwnerGeneration::new(next_owner_generation);
     record.owner.active_agent_id = None;
@@ -2697,6 +2705,7 @@ pub(crate) fn open_agent_session_against(
         record.mount.observed_volume_marker = None;
         record.mount.observed_access_mode = None;
         record.mount.reported_health = None;
+        record.mount.available_bytes = None;
         record.mount.health = ResourceHealth::Unknown;
         record.mount.observed_at_unix_ms = None;
     }

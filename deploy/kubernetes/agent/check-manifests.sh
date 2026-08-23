@@ -57,7 +57,7 @@ for expected in \
 done
 
 for expected in \
-  'gateway_endpoint: https://synapse-gateway.' \
+  'gateway_endpoint: https://neoengram-gateway.' \
   'trust_bundle_file: /etc/neoengram/gateway-ca.pem' \
   'gateway_workload_trust_domain: mesh.example.test' \
   'central_command_trust_bundle_file: /etc/neoengram/central-command-trust.json' \
@@ -86,8 +86,8 @@ rg -q '"state": "active"' "$config" || \
   fail "Central command trust keys must declare a lifecycle state"
 rg -q '^kind: NetworkPolicy$' "$network_policy" || fail "Agent egress NetworkPolicy is required"
 rg -q '^    - Egress$' "$network_policy" || fail "Agent NetworkPolicy must restrict egress"
-rg -q 'app.kubernetes.io/name: synapse-gateway' "$network_policy" || \
-  fail "Agent egress must be scoped to Synapse Gateway"
+rg -q 'app.kubernetes.io/name: neoengram-gateway' "$network_policy" || \
+  fail "Agent egress must be scoped to NeoEngram Gateway"
 if rg -n 'neoengram-(server|central)|central' "$network_policy"; then
   fail "Agent egress policy must not allow Central"
 fi

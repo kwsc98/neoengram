@@ -51,19 +51,21 @@ use zeroize::Zeroizing;
 use crate::{
     dto::{
         ArtifactInitialization as ArtifactInitializationBody, ArtifactView, CancelPreCommitRequest,
-        CancelPreCommitResponse, CommitGraphView, CommitNodeView, CommitPlaygroundRequest,
-        CommitPlaygroundResponse, CreateArtifactRequest, CreateArtifactResponse,
-        CreateDeletionRequest, CreatePlaygroundRequest, CreatePlaygroundResponse,
-        CreateProjectRequest, CreateProjectResponse, CreateRetentionHoldRequest,
-        CreateRetentionHoldResponse, CreateS3AccessPointRequest, CreateS3AccessPointResponse,
-        CreateS3CredentialRequest, CreateS3CredentialResponse, CreateS3DownloadUrlRequest,
-        CreateS3DownloadUrlResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-        CreateStorageVolumeRequest, CreateStorageVolumeResponse, CreateTenantRequest,
-        CreateTenantResponse, DatasetProfileSummary, DatasetProfileView, DeletionBlockerView,
-        DeletionImpactView, DeletionMutationResponse, DeletionOperationView, DeletionTargetView,
-        FileMetadataView, IndexVersionBody, LogicalFileEntry, PlaygroundChangeEntry,
-        PlaygroundChangeSummary, PlaygroundView, PreCommitCheckView, PreCommitDiffSummaryView,
-        PreCommitNoticeView, PreCommitProgressView, PreCommitView, ProjectView, PvcReference,
+        CancelPreCommitResponse, CommitDiffEntry, CommitDiffSummary, CommitDiffView,
+        CommitGraphView, CommitNodeView, CommitPlaygroundRequest, CommitPlaygroundResponse,
+        CreateArtifactRequest, CreateArtifactResponse, CreateDeletionRequest,
+        CreatePlaygroundRequest, CreatePlaygroundResponse, CreateProjectRequest,
+        CreateProjectResponse, CreateRetentionHoldRequest, CreateRetentionHoldResponse,
+        CreateS3AccessPointRequest, CreateS3AccessPointResponse, CreateS3CredentialRequest,
+        CreateS3CredentialResponse, CreateS3DownloadUrlRequest, CreateS3DownloadUrlResponse,
+        CreateSnapshotRequest, CreateSnapshotResponse, CreateStorageVolumeRequest,
+        CreateStorageVolumeResponse, CreateTenantRequest, CreateTenantResponse,
+        DatasetProfileSummary, DatasetProfileView, DeletionBlockerView, DeletionImpactView,
+        DeletionMutationResponse, DeletionOperationView, DeletionTargetView, FileMetadataView,
+        IndexVersionBody, LogicalFileEntry, PlaygroundChangeEntry, PlaygroundChangeSummary,
+        PlaygroundView, PreCommitCheckView, PreCommitDiffSummaryView, PreCommitNoticeView,
+        PreCommitProgressView, PreCommitView, ProjectView, PvcReference,
+        QueryArtifactCommitDiffRequest, QueryArtifactCommitDiffResponse,
         QueryArtifactCommitGraphRequest, QueryArtifactCommitGraphResponse,
         QueryArtifactListRequest, QueryArtifactListResponse, QueryArtifactRequest,
         QueryArtifactResponse, QueryDeletionImpactRequest, QueryDeletionImpactResponse,
@@ -113,6 +115,15 @@ pub trait StorageAvailabilityProvider: Send + Sync {
         tenant_id: &TenantId,
         storage_volume_id: &StorageVolumeId,
     ) -> crate::CentralResult<crate::DerivedVolumeState>;
+
+    /// Returns heartbeat-backed free space for the current ready mount.
+    async fn current_available_bytes(
+        &self,
+        _tenant_id: &TenantId,
+        _storage_volume_id: &StorageVolumeId,
+    ) -> crate::CentralResult<Option<u64>> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -123,6 +134,99 @@ impl StorageAvailabilityProvider for AgentRegistryService {
         storage_volume_id: &StorageVolumeId,
     ) -> crate::CentralResult<crate::DerivedVolumeState> {
         AgentRegistryService::current_volume_state(self, tenant_id, storage_volume_id).await
+    }
+
+    async fn current_available_bytes(
+        &self,
+        tenant_id: &TenantId,
+        storage_volume_id: &StorageVolumeId,
+    ) -> crate::CentralResult<Option<u64>> {
+        Ok(self
+            .current_ready_volume_record(tenant_id, storage_volume_id)
+            .await?
+            .and_then(|record| record.mount.available_bytes))
+    }
+}
+
+#[cfg(test)]
+mod commit_diff_tests {
+    use super::*;
+
+    fn file(path: &str, manifest: u8, size: u64) -> FileRecord {
+        FileRecord::new(
+            LogicalPath::parse(path).unwrap(),
+            neoengram_domain::core::ManifestId::from_bytes([manifest; 32]),
+            size,
+            u64::from(size > 0),
+        )
+        .unwrap()
+    }
+
+    fn commit(
+        id: u8,
+        parent_commit_id: Option<CommitId>,
+        records: Vec<FileRecord>,
+    ) -> CommitRecord {
+        CommitRecord {
+            tenant_id: TenantId::new("tenant-a").unwrap(),
+            project_id: ProjectId::new("project-a").unwrap(),
+            artifact_id: ArtifactId::new("artifact-a").unwrap(),
+            source_playground_id: PlaygroundId::new("playground-a").unwrap(),
+            source_precommit_id: PreCommitId::new(format!("precommit-{id}")).unwrap(),
+            commit_request_id: RequestId::new(format!("request-{id}")).unwrap(),
+            commit_id: CommitId::from_bytes([id; 32]),
+            object_set_digest: ContentDigest::from_bytes([id; 32]),
+            root_directory_id: neoengram_domain::core::DirectoryId::from_bytes([id; 32]),
+            parent_commit_id,
+            index_version: WireIndexVersion {
+                revision: IndexRevision::new(u64::from(id)),
+                digest: ContentDigest::from_bytes([id; 32]),
+                extensions: neoengram_domain::protocol::Extensions::new(),
+            },
+            data_layout: CommitDataLayout::FastCdc,
+            records,
+            message: format!("Commit {id}"),
+            description: None,
+            tag_names: Vec::new(),
+            created_at_unix_ms: UnixMillis::new(u64::from(id)),
+        }
+    }
+
+    #[test]
+    fn commit_diff_projects_root_and_explicit_base_without_private_metadata() {
+        let root = commit(1, None, vec![file("root.txt", 1, 5)]);
+        let root_diff = build_commit_diff_view(None, &root).unwrap();
+        assert!(root_diff.base_commit.is_none());
+        assert_eq!(root_diff.summary.files_added, "1");
+        assert_eq!(root_diff.summary.bytes_added, "5");
+        assert_eq!(root_diff.changes[0].path, "root.txt");
+
+        let parent = commit(
+            2,
+            None,
+            vec![file("data.txt", 2, 10), file("old.txt", 3, 4)],
+        );
+        let target = commit(
+            3,
+            Some(parent.commit_id),
+            vec![file("data.txt", 4, 13), file("new.txt", 3, 4)],
+        );
+        let explicit_diff = build_commit_diff_view(Some(&parent), &target).unwrap();
+        assert_eq!(
+            explicit_diff.base_commit.as_ref().unwrap().commit_id,
+            parent.commit_id.to_string()
+        );
+        assert_eq!(
+            explicit_diff.target_commit.commit_id,
+            target.commit_id.to_string()
+        );
+        assert_eq!(explicit_diff.summary.files_modified, "1");
+        assert_eq!(explicit_diff.summary.files_renamed, "1");
+        assert_eq!(explicit_diff.summary.bytes_added, "3");
+        assert_eq!(
+            explicit_diff.changes[1].previous_path.as_deref(),
+            Some("old.txt")
+        );
     }
 }
 
@@ -195,10 +299,11 @@ pub struct CatalogService {
     pub(crate) coordinator: Option<Arc<super::JobCoordinator>>,
     pub(crate) precommits: Option<Arc<dyn PreCommitRepository>>,
     workspace_commits: Option<Arc<super::WorkspaceCommitService>>,
-    storage_availability: Option<Arc<dyn StorageAvailabilityProvider>>,
-    s3_placement: Option<Arc<dyn S3PlacementProvider>>,
-    gateway_registry: Option<Arc<dyn crate::GatewayRegistryRepository>>,
+    pub(crate) storage_availability: Option<Arc<dyn StorageAvailabilityProvider>>,
+    pub(crate) s3_placement: Option<Arc<dyn S3PlacementProvider>>,
+    pub(crate) gateway_registry: Option<Arc<dyn crate::GatewayRegistryRepository>>,
     pub(crate) placement: Option<Arc<dyn crate::PlacementRepository>>,
+    pub(crate) replication_ticket_keyring: Option<Arc<CentralCommandKeyring>>,
     lifecycle_objects: Option<Arc<dyn crate::ObjectCatalog>>,
     lifecycle_authority: Option<Arc<dyn AuthorityLifecycleRepository>>,
     s3_read_revocations: Option<Arc<dyn S3ReadRevocationPublisher>>,
@@ -231,6 +336,7 @@ impl CatalogService {
             s3_placement: None,
             gateway_registry: None,
             placement: None,
+            replication_ticket_keyring: None,
             lifecycle_objects: None,
             lifecycle_authority: None,
             s3_read_revocations: None,
@@ -307,6 +413,12 @@ impl CatalogService {
         placement: Arc<dyn crate::PlacementRepository>,
     ) -> Self {
         self.placement = Some(placement);
+        self
+    }
+
+    #[must_use]
+    pub fn with_replication_ticket_keyring(mut self, keyring: Arc<CentralCommandKeyring>) -> Self {
+        self.replication_ticket_keyring = Some(keyring);
         self
     }
 
@@ -543,8 +655,22 @@ impl CatalogService {
         request: QueryStorageVolumeListRequest,
     ) -> Result<QueryStorageVolumeListResponse, Error> {
         let tenant_id = parse_tenant(request.tenant_id)?;
-        self.require_tenant(identity, Permission::StorageRead, &tenant_id)
-            .await?;
+        let can_read_storage =
+            self.policy
+                .is_allowed(identity.principal(), Permission::StorageRead, &tenant_id);
+        let can_replicate = self.policy.is_allowed(
+            identity.principal(),
+            Permission::ArtifactCommitReplicate,
+            &tenant_id,
+        );
+        if !can_read_storage && !can_replicate {
+            return Err(resource_not_found("tenant"));
+        }
+        self.repository
+            .get_tenant(&tenant_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("tenant"))?;
         let region = request.region.map(validate_region).transpose()?;
         let backend_type = request
             .backend_type
@@ -585,7 +711,13 @@ impl CatalogService {
             .records
             .iter()
             .filter(|record| record.lifecycle.is_active())
-            .map(storage_volume_view)
+            .map(|record| {
+                let mut view = storage_volume_view(record);
+                if !can_read_storage {
+                    view.pvc_reference = None;
+                }
+                view
+            })
             .collect();
         Ok(QueryStorageVolumeListResponse { items, next_cursor })
     }
@@ -911,6 +1043,54 @@ impl CatalogService {
                 nodes: records.iter().map(commit_node_view).collect(),
                 next_cursor,
             },
+        })
+    }
+
+    pub async fn query_artifact_commit_diff(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: QueryArtifactCommitDiffRequest,
+    ) -> Result<QueryArtifactCommitDiffResponse, Error> {
+        let tenant_id = parse_tenant(request.tenant_id)?;
+        if !self
+            .policy
+            .is_allowed(identity.principal(), Permission::ArtifactRead, &tenant_id)
+        {
+            return Err(resource_not_found("artifact"));
+        }
+        let project_id = parse_project_id(request.project_id)?;
+        let artifact_id = parse_artifact_id(request.artifact_id)?;
+        let artifact = self
+            .repository
+            .get_artifact(&tenant_id, &project_id, &artifact_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("artifact"))?;
+        require_active_for_read(&artifact.lifecycle, "artifact")?;
+
+        let target_commit_id = parse_commit_id(request.commit_id)?;
+        let requested_base_commit_id = request.base_commit_id.map(parse_commit_id).transpose()?;
+        if requested_base_commit_id == Some(target_commit_id) {
+            return Err(invalid_request("base_commit_id must differ from commit_id"));
+        }
+        let target = self
+            .load_published_commit(&artifact, target_commit_id)
+            .await?;
+        let base = match requested_base_commit_id {
+            Some(base_commit_id) => Some(
+                self.load_published_commit(&artifact, base_commit_id)
+                    .await?,
+            ),
+            None => match target.parent_commit_id {
+                Some(parent_commit_id) => Some(
+                    self.load_published_commit(&artifact, parent_commit_id)
+                        .await?,
+                ),
+                None => None,
+            },
+        };
+        Ok(QueryArtifactCommitDiffResponse {
+            diff: build_commit_diff_view(base.as_ref(), &target)?,
         })
     }
 
@@ -1550,41 +1730,17 @@ impl CatalogService {
             }
             return Err(lifecycle_request_id_reused());
         }
+        // The impact digest identifies the exact, short-lived snapshot returned by the
+        // confirmation query. Rebuilding an impact here would change its issued/expiry timestamps
+        // on every request and make a valid confirmation fail with IMPACT_CHANGED. The repository
+        // transaction below re-loads that saved snapshot, checks its TTL and target versions, and
+        // fences the current resources atomically before creating the deletion operation.
         let current_blockers = self.lifecycle_authority_blockers(&tenant_id, &root).await?;
         if !current_blockers.is_empty() {
             return Err(lifecycle_conflict(
                 "unique_object_replica",
                 "UNIQUE_OBJECT_REPLICA",
                 "the StorageVolume now contains an object with no valid replica on another Volume",
-            ));
-        }
-        let current_authority_impact = match self.lifecycle_authority.as_ref() {
-            Some(authority) => Some(
-                authority
-                    .impact(&tenant_id, &root)
-                    .await
-                    .map_err(map_central_error)?,
-            ),
-            None => None,
-        };
-        let current_impact = self
-            .repository
-            .query_deletion_impact(DeletionImpactQuery {
-                tenant_id: tenant_id.clone(),
-                root: root.clone(),
-                cascade: request.cascade,
-                confirm_managed_data_erase: request.confirm_managed_data_erase,
-                additional_blockers: current_blockers,
-                authority_impact: current_authority_impact,
-                now_unix_ms: now,
-            })
-            .await
-            .map_err(map_central_error)?;
-        if current_impact.impact_digest != impact_digest {
-            return Err(lifecycle_conflict(
-                "impact_changed",
-                "IMPACT_CHANGED",
-                "the deletion impact changed after the confirmation dialog was opened",
             ));
         }
         let outcome = self
@@ -4517,6 +4673,39 @@ fn commit_node_view(record: &CommitRecord) -> CommitNodeView {
     }
 }
 
+fn build_commit_diff_view(
+    base: Option<&CommitRecord>,
+    target: &CommitRecord,
+) -> Result<CommitDiffView, Error> {
+    let base_records = base.map_or(&[][..], |commit| commit.records.as_slice());
+    let diff = diff_index_snapshots(base_records, &target.records).map_err(map_central_error)?;
+    let summary = diff.summary;
+    let changes = diff
+        .changes
+        .into_iter()
+        .map(|change| CommitDiffEntry {
+            change_type: index_change_kind_name(change.kind).to_owned(),
+            path: change.path.to_string(),
+            previous_path: change.previous_path.map(|path| path.to_string()),
+            old_size_bytes: change.old_size.map(|size| size.to_string()),
+            new_size_bytes: change.new_size.map(|size| size.to_string()),
+        })
+        .collect();
+    Ok(CommitDiffView {
+        base_commit: base.map(commit_node_view),
+        target_commit: commit_node_view(target),
+        summary: CommitDiffSummary {
+            files_added: summary.files_added.to_string(),
+            files_modified: summary.files_modified.to_string(),
+            files_deleted: summary.files_deleted.to_string(),
+            files_renamed: summary.files_renamed.to_string(),
+            bytes_added: summary.bytes_added.to_string(),
+            bytes_removed: summary.bytes_removed.to_string(),
+        },
+        changes,
+    })
+}
+
 fn playground_view(
     record: &PlaygroundRecord,
     index_version: &WireIndexVersion,
@@ -5074,7 +5263,7 @@ fn decode_s3_object_cursor(
 
 fn s3_object_cursor_digest(domain: &[u8], value: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"synapse-s3-object-cursor-v2\0");
+    hasher.update(b"neoengram-s3-object-cursor-v2\0");
     hasher.update(domain);
     hasher.update(b"\0");
     hasher.update(value);
@@ -5106,7 +5295,7 @@ fn s3_cursor_mac(signing_key: &[u8; 32], payload: &[u8]) -> [u8; 32] {
 }
 
 fn s3_cursor_authenticated_bytes(payload: &[u8]) -> Vec<u8> {
-    let mut authenticated = b"synapse-s3-continuation-token-v1\0".to_vec();
+    let mut authenticated = b"neoengram-s3-continuation-token-v1\0".to_vec();
     authenticated.extend_from_slice(payload);
     authenticated
 }
@@ -5479,6 +5668,12 @@ fn parse_project_id(value: String) -> Result<ProjectId, Error> {
 
 fn parse_artifact_id(value: String) -> Result<ArtifactId, Error> {
     ArtifactId::new(value).map_err(|error| invalid_request(format!("artifact_id: {error}")))
+}
+
+fn parse_commit_id(value: String) -> Result<CommitId, Error> {
+    value
+        .parse::<CommitId>()
+        .map_err(|error| invalid_request(format!("commit_id: {error}")))
 }
 
 fn parse_playground_id(value: String) -> Result<PlaygroundId, Error> {
@@ -6391,7 +6586,7 @@ fn s3_secret_context(credential: &S3CredentialRecord) -> Vec<u8> {
 }
 
 pub(crate) fn development_s3_envelope_key() -> [u8; 32] {
-    *blake3::hash(b"synapse-development-s3-envelope-key-v1").as_bytes()
+    *blake3::hash(b"neoengram-development-s3-envelope-key-v1").as_bytes()
 }
 
 fn s3_access_point_state_name(value: S3AccessPointState) -> &'static str {

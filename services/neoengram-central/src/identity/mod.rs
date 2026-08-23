@@ -819,6 +819,8 @@ pub enum Permission {
     ArtifactRead,
     #[serde(rename = "artifact.create")]
     ArtifactCreate,
+    #[serde(rename = "artifact.commit.replicate")]
+    ArtifactCommitReplicate,
     #[serde(rename = "project.read")]
     ProjectRead,
     #[serde(rename = "project.create")]
@@ -864,6 +866,7 @@ impl Permission {
             Self::StorageEnrollmentReview => "storage.enrollment.review",
             Self::ArtifactRead => "artifact.read",
             Self::ArtifactCreate => "artifact.create",
+            Self::ArtifactCommitReplicate => "artifact.commit.replicate",
             Self::ProjectRead => "project.read",
             Self::ProjectCreate => "project.create",
             Self::PlaygroundRead => "playground.read",
@@ -1248,6 +1251,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Permission>("\"job.create\"").unwrap(),
             Permission::CreateAddJob
+        );
+        assert_eq!(
+            serde_json::from_str::<Permission>("\"artifact.commit.replicate\"").unwrap(),
+            Permission::ArtifactCommitReplicate
         );
     }
 

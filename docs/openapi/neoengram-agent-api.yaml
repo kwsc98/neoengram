@@ -5,7 +5,7 @@ info:
   version: 0.0.1
   summary: Agent-initiated action API for enrollment, sessions, Jobs, Index and Manifest pages, and metadata
   description: |
-    Contract for the internal Agent action boundary carried through the Synapse Gateway. Every
+    Contract for the internal Agent action boundary carried through the NeoEngram Gateway. Every
     operation is an action-style POST and all resource identities are carried in the JSON body.
     This API is not exposed by the public Web listener. It is carried only by the mTLS Gateway
     control tunnel and is not a standalone public endpoint.

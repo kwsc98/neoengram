@@ -19,6 +19,8 @@ pub const AGENT_JOB_ASSIGNMENT_ACTION: &str = "agent.job.assignment";
 pub const AGENT_JOB_DECISION_ACTION: &str = "agent.job.decision";
 pub const AGENT_LIFECYCLE_ASSIGNMENT_ACTION: &str = "agent.lifecycle.assignment";
 pub const AGENT_JOB_REPORT_ACTION: &str = "agent.job.report.create";
+pub const AGENT_REPLICATION_ASSIGNMENT_ACTION: &str = "agent.replication.assignment";
+pub const AGENT_REPLICATION_REPORT_ACTION: &str = "agent.replication.report";
 pub const AGENT_PROTOCOL_ERROR_ACTION: &str = "agent.protocol.error";
 
 const CONTROL_ACTIONS: &[&str] = &[
@@ -26,6 +28,8 @@ const CONTROL_ACTIONS: &[&str] = &[
     AGENT_JOB_DECISION_ACTION,
     AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
     AGENT_JOB_REPORT_ACTION,
+    AGENT_REPLICATION_ASSIGNMENT_ACTION,
+    AGENT_REPLICATION_REPORT_ACTION,
     AGENT_PROTOCOL_ERROR_ACTION,
     "agent.hello",
     "agent.heartbeat",
@@ -322,6 +326,31 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
     ),
     public_action(
         "POST",
+        "/api/commit/replication/ticket/query",
+        "queryCommitReplicationTicket",
+    ),
+    public_action(
+        "POST",
+        "/api/commit/replication/list/query",
+        "queryCommitReplicationList",
+    ),
+    public_action(
+        "POST",
+        "/api/commit/replication/retry",
+        "retryCommitReplication",
+    ),
+    public_action(
+        "POST",
+        "/api/commit/replication/cancel",
+        "cancelCommitReplication",
+    ),
+    public_action(
+        "POST",
+        "/api/commit/placements/query",
+        "queryCommitPlacementList",
+    ),
+    public_action(
+        "POST",
         "/api/commit/availability/query",
         "queryCommitAvailability",
     ),
@@ -330,7 +359,7 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
         "/api/artifact/commit/graph/query",
         "queryArtifactCommitGraph",
     ),
-    documented_action(
+    public_action(
         "POST",
         "/api/artifact/commit/diff/query",
         "queryArtifactCommitDiff",
@@ -752,7 +781,6 @@ mod tests {
         assert_eq!(
             paths,
             BTreeSet::from([
-                "/api/artifact/commit/diff/query",
                 "/api/snapshot/activity/list/query",
                 "/api/snapshot/dataset/profile/query",
                 "/api/snapshot/file/list/query",

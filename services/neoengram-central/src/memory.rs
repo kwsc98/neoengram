@@ -13,8 +13,8 @@ use neoengram_domain::core::{
 use neoengram_domain::protocol::{
     AgentId, ArtifactId, DecimalU64, JobAssignment, JobState, MetadataBatchDescriptor,
     MetadataBatchId, MetadataBatchPage, ObjectReceiptId, PlacementGeneration, ReplicationId,
-    RequestId, ResourceRef, ResourceVersion, StorageVolumeId, TenantId, UnixMillis,
-    WireIndexVersion, WorkspaceId,
+    ReplicationState, RequestId, ResourceRef, ResourceVersion, StorageVolumeId, TenantId,
+    UnixMillis, WireIndexVersion, WorkspaceId,
 };
 
 use crate::{
@@ -37,7 +37,13 @@ use crate::{
     PreCommitState, PublishedIndex, StagedMetadataBatch,
 };
 
-use crate::{CommitAvailabilityRecord, PlacementRepository, ReplicationRecord, WorkspaceRecord};
+use crate::{
+    valid_replication_transition, validate_replication_checkpoints,
+    validate_replication_publication, validate_replication_record, CancelReplicationRequest,
+    CommitAvailabilityRecord, FinalizeReplicationRequest, FinalizeReplicationResult,
+    PlacementRepository, ReplicationRecord, ReplicationStateTransitionRequest,
+    RetryReplicationRequest, WorkspaceRecord,
+};
 
 #[derive(Debug, Default)]
 pub struct AllowAllAuthorizer;
@@ -232,6 +238,18 @@ impl PlacementRepository for InMemoryPlacementRepository {
                     && digest == commit_id
                     && set.state == neoengram_domain::protocol::CommitPlacementSetState::Published
             })
+            .map(|(_, set)| set.clone())
+            .collect())
+    }
+
+    async fn commit_placement_sets(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Vec<neoengram_domain::protocol::CommitPlacementSet>> {
+        Ok(lock(&self.placement_sets)?
+            .iter()
+            .filter(|((tenant, digest, _), _)| tenant == tenant_id && digest == commit_id)
             .map(|(_, set)| set.clone())
             .collect())
     }
@@ -497,10 +515,37 @@ impl PlacementRepository for InMemoryPlacementRepository {
         self.get_replication(tenant_id, &replication_id).await
     }
 
+    async fn list_replications_for_commit(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Vec<ReplicationRecord>> {
+        Ok(lock(&self.replications)?
+            .values()
+            .filter(|record| &record.tenant_id == tenant_id && &record.commit_id == commit_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_replications_for_agent(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &neoengram_domain::protocol::AgentId,
+    ) -> CentralResult<Vec<ReplicationRecord>> {
+        Ok(lock(&self.replications)?
+            .values()
+            .filter(|record| {
+                &record.tenant_id == tenant_id && record.target_agent_id.as_ref() == Some(agent_id)
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn insert_replication(
         &self,
         record: ReplicationRecord,
     ) -> CentralResult<ReplicationRecord> {
+        validate_replication_record(&record)?;
         let key = (record.tenant_id.clone(), record.replication_id.clone());
         let request_key = (record.tenant_id.clone(), record.request_id.clone());
         let mut records = lock(&self.replications)?;
@@ -535,23 +580,378 @@ impl PlacementRepository for InMemoryPlacementRepository {
                 ))
             };
         }
+        if records.values().any(|existing| {
+            existing.tenant_id == record.tenant_id
+                && existing.commit_id == record.commit_id
+                && existing.target_backend_id == record.target_backend_id
+                && matches!(
+                    existing.state,
+                    ReplicationState::Queued
+                        | ReplicationState::Planning
+                        | ReplicationState::Transferring
+                        | ReplicationState::Verifying
+                )
+        }) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "an active replication already targets this Commit and backend",
+            ));
+        }
         records.insert(key, record.clone());
         lock(&self.replication_requests)?.insert(request_key, record.replication_id.clone());
         Ok(record)
+    }
+
+    async fn transition_replication(
+        &self,
+        request: ReplicationStateTransitionRequest,
+    ) -> CentralResult<ReplicationRecord> {
+        if !valid_replication_transition(request.expected_state, request.next_state) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "invalid Replication state transition",
+            ));
+        }
+        let key = (request.tenant_id.clone(), request.replication_id.clone());
+        let mut records = lock(&self.replications)?;
+        let record = records.get_mut(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "replication does not exist",
+            )
+        })?;
+        if record.attempt != request.expected_attempt || record.state != request.expected_state {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication state or attempt changed concurrently",
+            ));
+        }
+        if request.completed_objects < record.completed_objects
+            || request.completed_bytes < record.completed_bytes
+            || request.completed_objects > record.total_objects
+            || request.completed_bytes > record.total_bytes
+            || request.updated_at_unix_ms < record.updated_at_unix_ms
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication progress cannot move backwards or exceed its frozen total",
+            ));
+        }
+        record.state = request.next_state;
+        record.completed_objects = request.completed_objects;
+        record.completed_bytes = request.completed_bytes;
+        record.issue_code = request.issue_code;
+        record.issue_message = request.issue_message;
+        record.updated_at_unix_ms = request.updated_at_unix_ms;
+        Ok(record.clone())
+    }
+
+    async fn retry_replication(
+        &self,
+        request: RetryReplicationRequest,
+    ) -> CentralResult<ReplicationRecord> {
+        let key = (request.tenant_id.clone(), request.replication_id.clone());
+        let mut records = lock(&self.replications)?;
+        let current = records.get(&key).cloned().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "replication does not exist",
+            )
+        })?;
+        if matches!(current.state, ReplicationState::Queued)
+            && current.attempt == request.expected_attempt.saturating_add(1)
+        {
+            return Ok(current);
+        }
+        if current.attempt != request.expected_attempt {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication attempt changed concurrently",
+            ));
+        }
+        if !matches!(
+            current.state,
+            ReplicationState::Failed | ReplicationState::Cancelled
+        ) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "only failed or cancelled Replications can be retried",
+            ));
+        }
+        if request.updated_at_unix_ms < current.updated_at_unix_ms {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication timestamp cannot move backwards",
+            ));
+        }
+        if records.values().any(|existing| {
+            existing.replication_id != current.replication_id
+                && existing.tenant_id == current.tenant_id
+                && existing.commit_id == current.commit_id
+                && existing.target_backend_id == current.target_backend_id
+                && matches!(
+                    existing.state,
+                    ReplicationState::Queued
+                        | ReplicationState::Planning
+                        | ReplicationState::Transferring
+                        | ReplicationState::Verifying
+                )
+        }) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "an active replication already targets this Commit and backend",
+            ));
+        }
+        let next_attempt = current.attempt.checked_add(1).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication attempt exhausted",
+            )
+        })?;
+        let record = records
+            .get_mut(&key)
+            .expect("replication was read while holding the same lock");
+        record.attempt = next_attempt;
+        record.state = ReplicationState::Queued;
+        record.issue_code = None;
+        record.issue_message = None;
+        record.updated_at_unix_ms = request.updated_at_unix_ms;
+        Ok(record.clone())
+    }
+
+    async fn cancel_replication(
+        &self,
+        request: CancelReplicationRequest,
+    ) -> CentralResult<ReplicationRecord> {
+        let key = (request.tenant_id.clone(), request.replication_id.clone());
+        let mut records = lock(&self.replications)?;
+        let record = records.get_mut(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "replication does not exist",
+            )
+        })?;
+        if record.attempt != request.expected_attempt {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication attempt changed concurrently",
+            ));
+        }
+        if matches!(record.state, ReplicationState::Cancelled) {
+            return Ok(record.clone());
+        }
+        if matches!(
+            record.state,
+            ReplicationState::Published | ReplicationState::Failed
+        ) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "terminal Replication cannot be cancelled",
+            ));
+        }
+        if request.updated_at_unix_ms < record.updated_at_unix_ms {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication timestamp cannot move backwards",
+            ));
+        }
+        record.state = ReplicationState::Cancelled;
+        record.issue_code = Some("REPLICATION_CANCELLED".to_owned());
+        record.issue_message = Some("replication was cancelled by the caller".to_owned());
+        record.updated_at_unix_ms = request.updated_at_unix_ms;
+        Ok(record.clone())
+    }
+
+    async fn finalize_replication(
+        &self,
+        request: FinalizeReplicationRequest,
+    ) -> CentralResult<FinalizeReplicationResult> {
+        let replication_key = (request.tenant_id.clone(), request.replication_id.clone());
+        let record = lock(&self.replications)?
+            .get(&replication_key)
+            .cloned()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "replication does not exist",
+                )
+            })?;
+        if record.attempt != request.expected_attempt {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication attempt changed concurrently",
+            ));
+        }
+        if matches!(record.state, ReplicationState::Published) {
+            let stored = lock(&self.placement_sets)?
+                .get(&(
+                    request.tenant_id.clone(),
+                    record.commit_id,
+                    request.placement_set.backend_id.clone(),
+                ))
+                .cloned();
+            if record.target_placement_set_id.as_ref()
+                == Some(&request.placement_set.placement_set_id)
+                && stored.as_ref() == Some(&request.placement_set)
+            {
+                return Ok(FinalizeReplicationResult {
+                    replication: record,
+                    placement_set: request.placement_set,
+                    replayed: true,
+                });
+            }
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "published Replication is bound to another PlacementSet",
+            ));
+        }
+        if !matches!(record.state, ReplicationState::Verifying) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "only verifying Replications can be finalized",
+            ));
+        }
+        if record.completed_objects != record.total_objects
+            || record.completed_bytes != record.total_bytes
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "all replication objects must be verified before finalize",
+            ));
+        }
+        if request.finalized_at_unix_ms < record.updated_at_unix_ms {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication timestamp cannot move backwards",
+            ));
+        }
+        let object_set = lock(&self.commit_object_sets)?
+            .get(&(request.tenant_id.clone(), record.commit_id))
+            .cloned()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "Commit ObjectSet is missing",
+                )
+            })?;
+        let replication_objects = lock(&self.replication_objects)?;
+        let checkpoints = replication_objects
+            .iter()
+            .filter(|((tenant, replication, _), _)| {
+                tenant == &request.tenant_id && replication == &request.replication_id
+            })
+            .map(|(_, checkpoint)| checkpoint.clone())
+            .collect::<Vec<_>>();
+        validate_replication_checkpoints(&record, &object_set, &checkpoints)?;
+        validate_replication_publication(
+            &record,
+            &object_set,
+            &request.placements,
+            &request.placement_set,
+        )?;
+        let placement_key = (
+            request.placement_set.tenant_id.clone(),
+            request.placement_set.commit_id.digest(),
+            request.placement_set.backend_id.clone(),
+        );
+        let mut records = lock(&self.replications)?;
+        let mut placement_sets = lock(&self.placement_sets)?;
+        let mut object_placements = lock(&self.object_placements)?;
+        if let Some(existing) = placement_sets.get(&placement_key) {
+            if existing != &request.placement_set {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "target PlacementSet is already bound to different metadata",
+                ));
+            }
+        }
+        for placement in &request.placements {
+            if let Some(existing) = object_placements
+                .get(&(placement.tenant_id.clone(), placement.object_id))
+                .and_then(|entries| {
+                    entries.iter().find(|existing| {
+                        existing.backend_id == placement.backend_id
+                            && existing.placement_generation == placement.placement_generation
+                    })
+                })
+            {
+                if existing != placement {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        "target ObjectPlacement is already bound to different metadata",
+                    ));
+                }
+            }
+        }
+        let current = records.get_mut(&replication_key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "replication does not exist",
+            )
+        })?;
+        if current.attempt != request.expected_attempt
+            || current.state != ReplicationState::Verifying
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication state or attempt changed concurrently",
+            ));
+        }
+        for placement in request.placements {
+            let entries = object_placements
+                .entry((placement.tenant_id.clone(), placement.object_id))
+                .or_default();
+            if !entries.iter().any(|existing| {
+                existing.backend_id == placement.backend_id
+                    && existing.placement_generation == placement.placement_generation
+            }) {
+                entries.push(placement);
+            }
+        }
+        placement_sets.insert(placement_key, request.placement_set.clone());
+        current.state = ReplicationState::Published;
+        current.target_placement_set_id = Some(request.placement_set.placement_set_id.clone());
+        current.completed_objects = current.total_objects;
+        current.completed_bytes = current.total_bytes;
+        current.issue_code = None;
+        current.issue_message = None;
+        current.updated_at_unix_ms = request.finalized_at_unix_ms;
+        Ok(FinalizeReplicationResult {
+            replication: current.clone(),
+            placement_set: request.placement_set,
+            replayed: false,
+        })
     }
 
     async fn upsert_replication_object(
         &self,
         record: crate::ReplicationObjectRecord,
     ) -> CentralResult<crate::ReplicationObjectRecord> {
-        if self
-            .get_replication(&record.tenant_id, &record.replication_id)
-            .await?
-            .is_none()
-        {
+        // Keep the checkpoint and Replication state locks together. Finalization takes them in
+        // this same order, so a terminal-state transition cannot race a checkpoint write.
+        let mut checkpoints = lock(&self.replication_objects)?;
+        let replications = lock(&self.replications)?;
+        let replication = replications
+            .get(&(record.tenant_id.clone(), record.replication_id.clone()))
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "replication object references a missing Replication",
+                )
+            })?;
+        if matches!(
+            replication.state,
+            ReplicationState::Published | ReplicationState::Failed | ReplicationState::Cancelled
+        ) {
             return Err(invalid(
                 CentralErrorCode::InvalidState,
-                "replication object references a missing Replication",
+                "terminal Replication cannot accept object checkpoints",
+            ));
+        }
+        if record.retry_count != replication.attempt {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication object checkpoint attempt is stale",
             ));
         }
         let key = (
@@ -559,8 +959,7 @@ impl PlacementRepository for InMemoryPlacementRepository {
             record.replication_id.clone(),
             record.object_id,
         );
-        let mut records = lock(&self.replication_objects)?;
-        if let Some(existing) = records.get(&key) {
+        if let Some(existing) = checkpoints.get(&key) {
             if existing == &record {
                 return Ok(existing.clone());
             }
@@ -574,7 +973,7 @@ impl PlacementRepository for InMemoryPlacementRepository {
                 ));
             }
         }
-        records.insert(key, record.clone());
+        checkpoints.insert(key, record.clone());
         Ok(record)
     }
 

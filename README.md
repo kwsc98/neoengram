@@ -32,11 +32,11 @@ RouteLease 和最多一跳 peer forwarding，Replica activation 的显式管理 
 
 ## 快速开始
 
-项目使用 Rust Edition 2021，需要 Rust 1.97.0 或更高版本。从源码以 release profile 安装二进制：
+项目使用 Rust Edition 2021，需要 Rust 1.97.1 或更高版本。从源码以 release profile 安装二进制：
 
 ```bash
-git clone https://github.com/kwsc98/synapse.git
-cd synapse
+git clone https://github.com/kwsc98/neoengram.git
+cd neoengram
 cargo install --locked --path apps/neoengram-cli --features fuse-mount
 cd ..
 ```
@@ -405,7 +405,7 @@ neoengram gc
 ├── services/
 │   ├── neoengram-central/           # Central authority + HTTP composition
 │   ├── neoengram-agent/             # Agent state machine + Gateway transport adapter
-│   └── synapse-gateway/             # 三 listener H2 tunnel + activation + mTLS + 一跳 peer forwarding
+│   └── neoengram-gateway/             # 三 listener H2 tunnel + activation + mTLS + 一跳 peer forwarding
 ├── apps/
 │   ├── neoengram-cli/               # Clap、cwd 输入和唯一终端渲染入口
 │   └── neoengram-web/               # Vue 3 用户控制台；首版由 OpenAPI/MSW 驱动
@@ -419,13 +419,13 @@ CLI 对 domain/runtime 的直接类型导入；
 Agent 的本地组合测试只通过 Central 的公开测试适配器验证控制面，不引入 Central 运行时依赖。CLI 之外不渲染终端输出；完整约束见
 [`docs/code-architecture.md`](docs/code-architecture.md)。
 
-2026-08-09 已确认 Synapse Gateway 目标拓扑：Central 主动连接每个 EdgeCluster 的多副本
+2026-08-09 已确认 NeoEngram Gateway 目标拓扑：Central 主动连接每个 EdgeCluster 的多副本
 GatewayPool，Agent 只注册并连接本集群 Gateway；Gateway 不挂载 StorageVolume，也不保存 metadata 或
 对象权威。G1 已落地 Registry、管理 API、Gateway/部署清单、有界 H2 tunnel、运行时 mTLS、下行命令签名
 和一跳 peer forwarding；双 Replica listener/H2/peer 协议 harness 及真实 InMemory/SQLite RouteLease
 接管契约已分别通过，但完整 Central/Registry/outbox/签名业务 E2E、外部生产 issuer/KMS-HSM、真实集群
 故障/就绪与切换验收尚未完成；旧 Agent 直连 Server 已删除，不再作为运行或回退路径。专项设计和切换边界见
-[`docs/synapse-gateway-architecture.md`](docs/synapse-gateway-architecture.md)。
+[`docs/neoengram-gateway-architecture.md`](docs/neoengram-gateway-architecture.md)。
 
 `neoengram-web` 是独立 npm 应用，不进入 Cargo workspace，也不导入 Rust crate、Agent Schema 或
 数据库类型。它只从公开 OpenAPI 生成客户端类型；当前界面覆盖租户、StorageVolume、Enrollment、
@@ -472,10 +472,10 @@ evidence，不接收 Chunk payload。业务接口使用外部 OIDC/JWKS 与默�
 单副本，用户 API 的生产 TLS 由 Ingress/反向代理终止。Ready Snapshot 的只读 S3 Access Point、
 凭证轮换、对象浏览、Agent 二进制读取和 Gateway Web/S3 公网 listener 已接入；生产环境仍需完成
 公网 DNS/TLS、Central mTLS 前置终止、生产密钥 provisioner 和真实双 Replica 故障验收。生产 Central
-开发环境可通过 `SYNAPSE_S3_ENVELOPE_KEY_FILE` 注入恰好 32 字节且权限不宽于 `0600` 的本地 KEK；
+开发环境可通过 `NEOENGRAM_S3_ENVELOPE_KEY_FILE` 注入恰好 32 字节且权限不宽于 `0600` 的本地 KEK；
 生产环境拒绝该文件适配器，必须通过 `RuntimeDependencies::with_s3_secret_envelope` 注入 KMS/HSM provider。
 每条凭证使用独立 DEK，持久化 wrapped DEK 与 wrapping key ID，并支持保留旧 unwrap key 完成轮换。仓库仍不包含
-其余 OpenAPI、已验收的 Synapse Gateway 生产切换、跨 Volume Gateway-to-Gateway 传输、merge/rebase、
+其余 OpenAPI、已验收的 NeoEngram Gateway 生产切换、跨 Volume Gateway-to-Gateway 传输、merge/rebase、
 `push/fetch/pull/clone` 或 Volume GC 编排。分页、事务、
 CAS、分层 Merkle Directory 和流式 Commit
 已经落地；CLI 通过结构化 Request/typed Result facade 调用 Standalone，并拥有全部成功文本与

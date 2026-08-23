@@ -1,18 +1,23 @@
 use async_trait::async_trait;
 use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
 use neoengram_domain::protocol::{
-    ArchiveId, BackendId, CommitObject, CommitObjectSet, CommitPlacementSet,
-    CommitPlacementSetState, DataHealth, DecimalU64, EdgeClusterId, GatewayPoolId, ObjectEncoding,
-    ObjectPlacement, ObjectSet, PlacementGeneration, PlacementId, PlacementSetId, PlacementState,
-    RegionId, ReplicationId, ReplicationObjectState, ReplicationState, RequestId, StorageVolumeId,
-    TenantId, UnixMillis, WorkspaceId, WorkspaceLifecycle,
+    AgentId, ArchiveId, ArtifactId, BackendId, CommitObject, CommitObjectSet, CommitPlacementSet,
+    CommitPlacementSetState, DataHealth, DecimalU64, EdgeClusterId, GatewayPoolId, MountGeneration,
+    ObjectEncoding, ObjectPlacement, ObjectSet, PlacementGeneration, PlacementId, PlacementSetId,
+    PlacementState, RegionId, ReplicationId, ReplicationObjectState, ReplicationState, RequestId,
+    RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, TransferId, TransferRouteId,
+    UnixMillis, WorkspaceId, WorkspaceLifecycle,
 };
 use sqlx::{sqlite::SqliteRow, Row};
 
 use super::authority::{digest_from_blob, storage_corruption, storage_error, SqliteAuthorityStore};
 use crate::{
-    CentralError, CentralErrorCode, CentralResult, CommitAvailabilityRecord, PlacementRepository,
-    ReplicationObjectRecord, ReplicationRecord, WorkspaceRecord,
+    valid_replication_transition, validate_replication_checkpoints,
+    validate_replication_publication, validate_replication_record, CancelReplicationRequest,
+    CentralError, CentralErrorCode, CentralResult, CommitAvailabilityRecord,
+    FinalizeReplicationRequest, FinalizeReplicationResult, PlacementRepository,
+    ReplicationObjectRecord, ReplicationRecord, ReplicationStateTransitionRequest,
+    RetryReplicationRequest, WorkspaceRecord,
 };
 
 fn as_i64(value: UnixMillis) -> CentralResult<i64> {
@@ -103,6 +108,18 @@ fn parse_workspace_lifecycle(value: &str) -> CentralResult<WorkspaceLifecycle> {
 
 fn protocol_invalid(error: impl std::fmt::Display) -> CentralError {
     CentralError::new(CentralErrorCode::ProtocolInvalid, error.to_string()).with_retryable(false)
+}
+
+fn decode_optional_id<T, E: std::fmt::Display>(
+    row: &SqliteRow,
+    column: &str,
+    parser: fn(String) -> Result<T, E>,
+) -> CentralResult<Option<T>> {
+    row.try_get::<Option<String>, _>(column)
+        .map_err(storage_error)?
+        .map(parser)
+        .transpose()
+        .map_err(|error| storage_corruption(format!("stored replication {column}: {error}")))
 }
 
 fn object_encoding_name(encoding: ObjectEncoding) -> &'static str {
@@ -433,6 +450,7 @@ fn decode_replication(row: &SqliteRow) -> CentralResult<ReplicationRecord> {
                 .map_err(storage_error)?,
         )
         .map_err(|error| storage_corruption(format!("stored replication ID: {error}")))?,
+        artifact_id: decode_optional_id(row, "artifact_id", ArtifactId::new)?,
         commit_id: digest_from_blob(
             row.try_get::<Vec<u8>, _>("commit_id")
                 .map_err(storage_error)?,
@@ -448,6 +466,97 @@ fn decode_replication(row: &SqliteRow) -> CentralResult<ReplicationRecord> {
         .map_err(|error| {
             storage_corruption(format!("stored replication target Volume ID: {error}"))
         })?,
+        source_placement_set_id: decode_optional_id(
+            row,
+            "source_placement_set_id",
+            PlacementSetId::new,
+        )?,
+        source_backend_id: decode_optional_id(row, "source_backend_id", BackendId::new)?,
+        source_storage_volume_id: decode_optional_id(
+            row,
+            "source_storage_volume_id",
+            StorageVolumeId::new,
+        )?,
+        source_edge_cluster_id: decode_optional_id(
+            row,
+            "source_edge_cluster_id",
+            EdgeClusterId::new,
+        )?,
+        source_gateway_pool_id: decode_optional_id(
+            row,
+            "source_gateway_pool_id",
+            GatewayPoolId::new,
+        )?,
+        source_placement_generation: row
+            .try_get::<Option<i64>, _>("source_placement_generation")
+            .map_err(storage_error)?
+            .map(|value| u64_from_i64(value, "source placement_generation"))
+            .transpose()?
+            .map(PlacementGeneration::new),
+        source_agent_id: decode_optional_id(row, "source_agent_id", AgentId::new)?,
+        source_session_generation: row
+            .try_get::<Option<i64>, _>("source_session_generation")
+            .map_err(storage_error)?
+            .map(|value| u64_from_i64(value, "source session_generation"))
+            .transpose()?
+            .map(SessionGeneration::new),
+        source_mount_generation: row
+            .try_get::<Option<i64>, _>("source_mount_generation")
+            .map_err(storage_error)?
+            .map(|value| u64_from_i64(value, "source mount_generation"))
+            .transpose()?
+            .map(MountGeneration::new),
+        source_route_generation: row
+            .try_get::<Option<i64>, _>("source_route_generation")
+            .map_err(storage_error)?
+            .map(|value| u64_from_i64(value, "source route_generation"))
+            .transpose()?
+            .map(RouteGeneration::new),
+        target_edge_cluster_id: decode_optional_id(
+            row,
+            "target_edge_cluster_id",
+            EdgeClusterId::new,
+        )?,
+        target_gateway_pool_id: decode_optional_id(
+            row,
+            "target_gateway_pool_id",
+            GatewayPoolId::new,
+        )?,
+        target_placement_generation: row
+            .try_get::<Option<i64>, _>("target_placement_generation")
+            .map_err(storage_error)?
+            .map(|value| u64_from_i64(value, "target placement_generation"))
+            .transpose()?
+            .map(PlacementGeneration::new),
+        target_agent_id: decode_optional_id(row, "target_agent_id", AgentId::new)?,
+        target_session_generation: row
+            .try_get::<Option<i64>, _>("target_session_generation")
+            .map_err(storage_error)?
+            .map(|value| u64_from_i64(value, "target session_generation"))
+            .transpose()?
+            .map(SessionGeneration::new),
+        target_mount_generation: row
+            .try_get::<Option<i64>, _>("target_mount_generation")
+            .map_err(storage_error)?
+            .map(|value| u64_from_i64(value, "target mount_generation"))
+            .transpose()?
+            .map(MountGeneration::new),
+        target_route_generation: row
+            .try_get::<Option<i64>, _>("target_route_generation")
+            .map_err(storage_error)?
+            .map(|value| u64_from_i64(value, "target route_generation"))
+            .transpose()?
+            .map(RouteGeneration::new),
+        transfer_route_id: decode_optional_id(row, "transfer_route_id", TransferRouteId::new)?,
+        transfer_id: decode_optional_id(row, "transfer_id", TransferId::new)?,
+        target_placement_set_id: decode_optional_id(
+            row,
+            "target_placement_set_id",
+            PlacementSetId::new,
+        )?,
+        staging_id: row
+            .try_get::<Option<String>, _>("staging_id")
+            .map_err(storage_error)?,
         object_set_digest: digest_from_blob(
             row.try_get::<Vec<u8>, _>("object_set_digest")
                 .map_err(storage_error)?,
@@ -475,6 +584,25 @@ fn decode_replication(row: &SqliteRow) -> CentralResult<ReplicationRecord> {
             .map_err(storage_error)
             .and_then(|value| {
                 u64::try_from(value).map_err(|_| storage_corruption("total_objects is negative"))
+            })?,
+        completed_bytes: row
+            .try_get::<i64, _>("completed_bytes")
+            .map_err(storage_error)
+            .and_then(|value| {
+                u64::try_from(value).map_err(|_| storage_corruption("completed_bytes is negative"))
+            })?,
+        total_bytes: row
+            .try_get::<i64, _>("total_bytes")
+            .map_err(storage_error)
+            .and_then(|value| {
+                u64::try_from(value).map_err(|_| storage_corruption("total_bytes is negative"))
+            })?,
+        attempt: row
+            .try_get::<i64, _>("attempt")
+            .map_err(storage_error)
+            .and_then(|value| {
+                u64::try_from(value)
+                    .map_err(|_| storage_corruption("replication attempt is invalid"))
             })?,
         issue_code: row
             .try_get::<Option<String>, _>("error_code")
@@ -554,8 +682,16 @@ fn decode_workspace(row: &SqliteRow) -> CentralResult<WorkspaceRecord> {
 }
 
 const REPLICATION_COLUMNS: &str = "tenant_id, replication_id, commit_id, target_backend_id, \
-    target_storage_volume_id, object_set_digest, state, request_id, completed_objects, \
-    total_objects, error_code, error_message, created_at_unix_ms, updated_at_unix_ms";
+    target_storage_volume_id, source_placement_set_id, source_backend_id, source_storage_volume_id, \
+    source_edge_cluster_id, source_gateway_pool_id, source_placement_generation, source_agent_id, \
+    source_session_generation, source_mount_generation, source_route_generation, target_edge_cluster_id, \
+    target_gateway_pool_id, target_placement_generation, target_agent_id, target_session_generation, \
+    target_mount_generation, target_route_generation, transfer_route_id, \
+    transfer_id, target_placement_set_id, staging_id, object_set_digest, state, request_id, \
+    attempt, completed_objects, total_objects, completed_bytes, total_bytes, error_code, \
+    error_message, created_at_unix_ms, updated_at_unix_ms, \
+    (SELECT artifact_id FROM replication_artifacts AS a WHERE a.tenant_id = replications.tenant_id \
+      AND a.replication_id = replications.replication_id) AS artifact_id";
 const WORKSPACE_COLUMNS: &str = "tenant_id, workspace_id, request_id, project_id, artifact_id, \
     base_commit_id, target_storage_volume_id, lifecycle, created_at_unix_ms, updated_at_unix_ms";
 
@@ -815,6 +951,24 @@ impl PlacementRepository for SqliteAuthorityStore {
             "SELECT {PLACEMENT_SET_COLUMNS} FROM commit_placement_sets \
              WHERE tenant_id = ? AND commit_id = ? AND state = 'published' \
              ORDER BY backend_id",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant_id.as_str())
+            .bind(commit_id.as_bytes().as_slice())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        rows.iter().map(decode_placement_set).collect()
+    }
+
+    async fn commit_placement_sets(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &ContentDigest,
+    ) -> CentralResult<Vec<CommitPlacementSet>> {
+        let sql = format!(
+            "SELECT {PLACEMENT_SET_COLUMNS} FROM commit_placement_sets \
+             WHERE tenant_id = ? AND commit_id = ? ORDER BY backend_id, placement_generation",
         );
         let rows = sqlx::query(&sql)
             .bind(tenant_id.as_str())
@@ -1509,31 +1663,100 @@ impl PlacementRepository for SqliteAuthorityStore {
             .transpose()
     }
 
+    async fn list_replications_for_commit(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &ContentDigest,
+    ) -> CentralResult<Vec<ReplicationRecord>> {
+        let sql = format!(
+            "SELECT {REPLICATION_COLUMNS} FROM replications \
+             WHERE tenant_id = ? AND commit_id = ? ORDER BY created_at_unix_ms, replication_id",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant_id.as_str())
+            .bind(commit_id.as_bytes().as_slice())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        rows.iter().map(decode_replication).collect()
+    }
+
+    async fn list_replications_for_agent(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+    ) -> CentralResult<Vec<ReplicationRecord>> {
+        let sql = format!(
+            "SELECT {REPLICATION_COLUMNS} FROM replications \
+             WHERE tenant_id = ? AND target_agent_id = ? ORDER BY created_at_unix_ms, replication_id",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(tenant_id.as_str())
+            .bind(agent_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        rows.iter().map(decode_replication).collect()
+    }
+
     async fn insert_replication(
         &self,
         record: ReplicationRecord,
     ) -> CentralResult<ReplicationRecord> {
+        validate_replication_record(&record)?;
         if record.created_at_unix_ms > record.updated_at_unix_ms {
             return Err(CentralError::new(
                 CentralErrorCode::ProtocolInvalid,
                 "replication timestamps are out of order",
             ));
         }
+        // The replication row and its artifact namespace are one identity.  Keep both writes in
+        // the same transaction so a crash cannot leave an assignment-visible row without the
+        // scope required to open its artifact CAS.
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         let result = sqlx::query(
             "INSERT INTO replications \
              (tenant_id, replication_id, commit_id, target_backend_id, target_storage_volume_id, \
-              target_archive_id, object_set_digest, state, request_id, completed_objects, \
-              total_objects, error_code, error_message, created_at_unix_ms, updated_at_unix_ms) \
-             VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              target_archive_id, source_placement_set_id, source_backend_id, source_storage_volume_id, \
+              source_edge_cluster_id, source_gateway_pool_id, source_placement_generation, \
+              source_agent_id, source_session_generation, source_mount_generation, source_route_generation, \
+              target_edge_cluster_id, target_gateway_pool_id, target_placement_generation, \
+              target_agent_id, target_session_generation, target_mount_generation, target_route_generation, \
+              transfer_route_id, transfer_id, target_placement_set_id, staging_id, object_set_digest, \
+              state, request_id, attempt, completed_objects, total_objects, completed_bytes, total_bytes, \
+              error_code, error_message, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.tenant_id.as_str())
         .bind(record.replication_id.as_str())
         .bind(record.commit_id.as_bytes().as_slice())
         .bind(&record.target_backend_id)
         .bind(record.target_storage_volume_id.as_str())
+        .bind(record.source_placement_set_id.as_ref().map(PlacementSetId::as_str))
+        .bind(record.source_backend_id.as_ref().map(BackendId::as_str))
+        .bind(record.source_storage_volume_id.as_ref().map(StorageVolumeId::as_str))
+        .bind(record.source_edge_cluster_id.as_ref().map(EdgeClusterId::as_str))
+        .bind(record.source_gateway_pool_id.as_ref().map(GatewayPoolId::as_str))
+        .bind(record.source_placement_generation.map(|value| i64::try_from(value.get()).unwrap_or(i64::MAX)))
+        .bind(record.source_agent_id.as_ref().map(AgentId::as_str))
+        .bind(record.source_session_generation.map(|value| i64::try_from(value.get()).unwrap_or(i64::MAX)))
+        .bind(record.source_mount_generation.map(|value| i64::try_from(value.get()).unwrap_or(i64::MAX)))
+        .bind(record.source_route_generation.map(|value| i64::try_from(value.get()).unwrap_or(i64::MAX)))
+        .bind(record.target_edge_cluster_id.as_ref().map(EdgeClusterId::as_str))
+        .bind(record.target_gateway_pool_id.as_ref().map(GatewayPoolId::as_str))
+        .bind(record.target_placement_generation.map(|value| i64::try_from(value.get()).unwrap_or(i64::MAX)))
+        .bind(record.target_agent_id.as_ref().map(AgentId::as_str))
+        .bind(record.target_session_generation.map(|value| i64::try_from(value.get()).unwrap_or(i64::MAX)))
+        .bind(record.target_mount_generation.map(|value| i64::try_from(value.get()).unwrap_or(i64::MAX)))
+        .bind(record.target_route_generation.map(|value| i64::try_from(value.get()).unwrap_or(i64::MAX)))
+        .bind(record.transfer_route_id.as_ref().map(TransferRouteId::as_str))
+        .bind(record.transfer_id.as_ref().map(TransferId::as_str))
+        .bind(record.target_placement_set_id.as_ref().map(PlacementSetId::as_str))
+        .bind(record.staging_id.as_deref())
         .bind(record.object_set_digest.as_bytes().as_slice())
         .bind(replication_state_name(record.state))
         .bind(record.request_id.as_str())
+        .bind(i64::try_from(record.attempt).map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?)
         .bind(i64::try_from(record.completed_objects).map_err(|_| {
             CentralError::new(
                 CentralErrorCode::ProtocolInvalid,
@@ -1546,53 +1769,670 @@ impl PlacementRepository for SqliteAuthorityStore {
                 "total_objects exceeds SQLite range",
             )
         })?)
+        .bind(i64::try_from(record.completed_bytes).map_err(|_| protocol_invalid("completed_bytes exceeds SQLite range"))?)
+        .bind(i64::try_from(record.total_bytes).map_err(|_| protocol_invalid("total_bytes exceeds SQLite range"))?)
         .bind(&record.issue_code)
         .bind(&record.issue_message)
         .bind(as_i64(record.created_at_unix_ms)?)
         .bind(as_i64(record.updated_at_unix_ms)?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await;
         match result {
-            Ok(_) => Ok(record),
+            Ok(_) => {
+                if let Some(artifact_id) = &record.artifact_id {
+                    sqlx::query(
+                        "INSERT INTO replication_artifacts (tenant_id, replication_id, artifact_id) \
+                         VALUES (?, ?, ?)",
+                    )
+                    .bind(record.tenant_id.as_str())
+                    .bind(record.replication_id.as_str())
+                    .bind(artifact_id.as_str())
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+                }
+                transaction.commit().await.map_err(storage_error)?;
+                Ok(record)
+            }
             Err(error) if is_unique(&error) => {
-                let existing = self
+                transaction.rollback().await.map_err(storage_error)?;
+                if let Some(existing) = self
                     .get_replication_by_request_id(&record.tenant_id, &record.request_id)
                     .await?
-                    .ok_or_else(|| {
-                        storage_corruption("replication uniqueness conflict has no row")
-                    })?;
-                if existing.replication_id == record.replication_id
-                    && existing.commit_id == record.commit_id
-                    && existing.target_storage_volume_id == record.target_storage_volume_id
-                    && existing.object_set_digest == record.object_set_digest
                 {
-                    Ok(existing)
-                } else {
-                    Err(CentralError::new(
+                    return if existing.replication_id == record.replication_id
+                        && existing.artifact_id == record.artifact_id
+                        && existing.commit_id == record.commit_id
+                        && existing.target_storage_volume_id == record.target_storage_volume_id
+                        && existing.object_set_digest == record.object_set_digest
+                    {
+                        Ok(existing)
+                    } else {
+                        Err(CentralError::new(
+                            CentralErrorCode::InvalidState,
+                            "replication request ID is already bound to another payload",
+                        )
+                        .with_retryable(false))
+                    };
+                }
+                if self
+                    .list_replications_for_commit(&record.tenant_id, &record.commit_id)
+                    .await?
+                    .iter()
+                    .any(|existing| {
+                        existing.target_backend_id == record.target_backend_id
+                            && matches!(
+                                existing.state,
+                                ReplicationState::Queued
+                                    | ReplicationState::Planning
+                                    | ReplicationState::Transferring
+                                    | ReplicationState::Verifying
+                            )
+                    })
+                {
+                    return Err(CentralError::new(
                         CentralErrorCode::InvalidState,
-                        "replication request ID is already bound to another payload",
+                        "an active replication already targets this Commit and backend",
                     )
-                    .with_retryable(false))
+                    .with_retryable(false));
+                }
+                Err(storage_error(error))
+            }
+            Err(error) => {
+                transaction.rollback().await.map_err(storage_error)?;
+                Err(storage_error(error))
+            }
+        }
+    }
+
+    async fn transition_replication(
+        &self,
+        request: ReplicationStateTransitionRequest,
+    ) -> CentralResult<ReplicationRecord> {
+        if !valid_replication_transition(request.expected_state, request.next_state) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "invalid Replication state transition",
+            )
+            .with_retryable(false));
+        }
+        let current = self
+            .get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "replication does not exist",
+                )
+                .with_retryable(false)
+            })?;
+        if current.state != request.expected_state || current.attempt != request.expected_attempt {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication state or attempt changed concurrently",
+            )
+            .with_retryable(false));
+        }
+        if request.completed_objects < current.completed_objects
+            || request.completed_bytes < current.completed_bytes
+            || request.completed_objects > current.total_objects
+            || request.completed_bytes > current.total_bytes
+            || request.updated_at_unix_ms < current.updated_at_unix_ms
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication progress cannot move backwards or exceed its frozen total",
+            )
+            .with_retryable(false));
+        }
+        let result = sqlx::query(
+            "UPDATE replications SET state = ?, completed_objects = ?, completed_bytes = ?, \
+             error_code = ?, error_message = ?, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND replication_id = ? AND state = ? AND attempt = ? \
+               AND completed_objects = ? AND completed_bytes = ? AND updated_at_unix_ms = ?",
+        )
+        .bind(replication_state_name(request.next_state))
+        .bind(
+            i64::try_from(request.completed_objects)
+                .map_err(|_| protocol_invalid("completed_objects exceeds SQLite range"))?,
+        )
+        .bind(
+            i64::try_from(request.completed_bytes)
+                .map_err(|_| protocol_invalid("completed_bytes exceeds SQLite range"))?,
+        )
+        .bind(request.issue_code)
+        .bind(request.issue_message)
+        .bind(as_i64(request.updated_at_unix_ms)?)
+        .bind(request.tenant_id.as_str())
+        .bind(request.replication_id.as_str())
+        .bind(replication_state_name(request.expected_state))
+        .bind(
+            i64::try_from(request.expected_attempt)
+                .map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?,
+        )
+        .bind(
+            i64::try_from(current.completed_objects)
+                .map_err(|_| protocol_invalid("completed_objects exceeds SQLite range"))?,
+        )
+        .bind(
+            i64::try_from(current.completed_bytes)
+                .map_err(|_| protocol_invalid("completed_bytes exceeds SQLite range"))?,
+        )
+        .bind(as_i64(current.updated_at_unix_ms)?)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if result.rows_affected() != 1 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication state changed before it could be persisted",
+            )
+            .with_retryable(false));
+        }
+        self.get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| storage_corruption("updated replication disappeared"))
+    }
+
+    async fn retry_replication(
+        &self,
+        request: RetryReplicationRequest,
+    ) -> CentralResult<ReplicationRecord> {
+        let current = self
+            .get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "replication does not exist",
+                )
+                .with_retryable(false)
+            })?;
+        if current.state == ReplicationState::Queued
+            && current.attempt == request.expected_attempt.saturating_add(1)
+        {
+            return Ok(current);
+        }
+        if current.attempt != request.expected_attempt {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication attempt changed concurrently",
+            )
+            .with_retryable(false));
+        }
+        if !matches!(
+            current.state,
+            ReplicationState::Failed | ReplicationState::Cancelled
+        ) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "only failed or cancelled Replications can be retried",
+            )
+            .with_retryable(false));
+        }
+        if request.updated_at_unix_ms < current.updated_at_unix_ms {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication timestamp cannot move backwards",
+            )
+            .with_retryable(false));
+        }
+        let next_attempt = current.attempt.checked_add(1).ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::InvalidState,
+                "replication attempt exhausted",
+            )
+            .with_retryable(false)
+        })?;
+        if self
+            .list_replications_for_commit(&current.tenant_id, &current.commit_id)
+            .await?
+            .iter()
+            .any(|existing| {
+                existing.replication_id != current.replication_id
+                    && existing.target_backend_id == current.target_backend_id
+                    && matches!(
+                        existing.state,
+                        ReplicationState::Queued
+                            | ReplicationState::Planning
+                            | ReplicationState::Transferring
+                            | ReplicationState::Verifying
+                    )
+            })
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "an active replication already targets this Commit and backend",
+            )
+            .with_retryable(false));
+        }
+        let result = sqlx::query(
+            "UPDATE replications SET state = 'queued', attempt = ?, error_code = NULL, \
+             error_message = NULL, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND replication_id = ? AND state = ? AND attempt = ?",
+        )
+        .bind(
+            i64::try_from(next_attempt)
+                .map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?,
+        )
+        .bind(as_i64(request.updated_at_unix_ms)?)
+        .bind(request.tenant_id.as_str())
+        .bind(request.replication_id.as_str())
+        .bind(replication_state_name(current.state))
+        .bind(
+            i64::try_from(request.expected_attempt)
+                .map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?,
+        )
+        .execute(&self.pool)
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if is_unique(&error) => {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "an active replication already targets this Commit and backend",
+                )
+                .with_retryable(false));
+            }
+            Err(error) => return Err(storage_error(error)),
+        };
+        if result.rows_affected() != 1 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication changed before retry could be persisted",
+            )
+            .with_retryable(false));
+        }
+        self.get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| storage_corruption("retried replication disappeared"))
+    }
+
+    async fn cancel_replication(
+        &self,
+        request: CancelReplicationRequest,
+    ) -> CentralResult<ReplicationRecord> {
+        let current = self
+            .get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "replication does not exist",
+                )
+                .with_retryable(false)
+            })?;
+        if current.attempt != request.expected_attempt {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication attempt changed concurrently",
+            )
+            .with_retryable(false));
+        }
+        if current.state == ReplicationState::Cancelled {
+            return Ok(current);
+        }
+        if matches!(
+            current.state,
+            ReplicationState::Published | ReplicationState::Failed
+        ) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "terminal Replication cannot be cancelled",
+            )
+            .with_retryable(false));
+        }
+        if request.updated_at_unix_ms < current.updated_at_unix_ms {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication timestamp cannot move backwards",
+            )
+            .with_retryable(false));
+        }
+        let result = sqlx::query(
+            "UPDATE replications SET state = 'cancelled', error_code = ?, error_message = ?, \
+             updated_at_unix_ms = ? WHERE tenant_id = ? AND replication_id = ? AND attempt = ? \
+             AND state NOT IN ('published', 'failed', 'cancelled')",
+        )
+        .bind("REPLICATION_CANCELLED")
+        .bind("replication was cancelled by the caller")
+        .bind(as_i64(request.updated_at_unix_ms)?)
+        .bind(request.tenant_id.as_str())
+        .bind(request.replication_id.as_str())
+        .bind(
+            i64::try_from(request.expected_attempt)
+                .map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if result.rows_affected() != 1 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication changed before cancellation could be persisted",
+            )
+            .with_retryable(false));
+        }
+        self.get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| storage_corruption("cancelled replication disappeared"))
+    }
+
+    async fn finalize_replication(
+        &self,
+        request: FinalizeReplicationRequest,
+    ) -> CentralResult<FinalizeReplicationResult> {
+        let current = self
+            .get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "replication does not exist",
+                )
+                .with_retryable(false)
+            })?;
+        if current.attempt != request.expected_attempt {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication attempt changed concurrently",
+            )
+            .with_retryable(false));
+        }
+        if current.state == ReplicationState::Published {
+            if current.target_placement_set_id.as_ref()
+                == Some(&request.placement_set.placement_set_id)
+            {
+                let stored = self
+                    .get_placement_set(
+                        &request.tenant_id,
+                        &current.commit_id,
+                        &request.placement_set.backend_id,
+                    )
+                    .await?;
+                if stored.as_ref() == Some(&request.placement_set) {
+                    return Ok(FinalizeReplicationResult {
+                        replication: current,
+                        placement_set: request.placement_set,
+                        replayed: true,
+                    });
                 }
             }
-            Err(error) => Err(storage_error(error)),
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "published Replication is bound to another PlacementSet",
+            )
+            .with_retryable(false));
         }
+        if current.state != ReplicationState::Verifying {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "only verifying Replications can be finalized",
+            )
+            .with_retryable(false));
+        }
+        if current.completed_objects != current.total_objects
+            || current.completed_bytes != current.total_bytes
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "all replication objects must be verified before finalize",
+            )
+            .with_retryable(false));
+        }
+        if request.finalized_at_unix_ms < current.updated_at_unix_ms {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication timestamp cannot move backwards",
+            )
+            .with_retryable(false));
+        }
+        let object_set = self
+            .get_commit_object_set(&request.tenant_id, &current.commit_id)
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "Commit ObjectSet is missing",
+                )
+                .with_retryable(false)
+            })?;
+        validate_replication_publication(
+            &current,
+            &object_set,
+            &request.placements,
+            &request.placement_set,
+        )?;
+
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        // Acquire SQLite's writer lock before reading checkpoints. This keeps a concurrent Agent
+        // checkpoint update from landing between validation and the publication writes.
+        let fence = sqlx::query(
+            "UPDATE replications SET updated_at_unix_ms = updated_at_unix_ms \
+             WHERE tenant_id = ? AND replication_id = ? AND state = 'verifying' AND attempt = ?",
+        )
+        .bind(request.tenant_id.as_str())
+        .bind(request.replication_id.as_str())
+        .bind(
+            i64::try_from(request.expected_attempt)
+                .map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?,
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if fence.rows_affected() != 1 {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication changed before checkpoint validation",
+            )
+            .with_retryable(false));
+        }
+        let current_row = sqlx::query(
+            "SELECT state, attempt FROM replications WHERE tenant_id = ? AND replication_id = ?",
+        )
+        .bind(request.tenant_id.as_str())
+        .bind(request.replication_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_corruption("replication disappeared during finalize"))?;
+        let current_state = current_row
+            .try_get::<String, _>("state")
+            .map_err(storage_error)?;
+        let current_attempt = current_row
+            .try_get::<i64, _>("attempt")
+            .map_err(storage_error)?;
+        if current_state != "verifying"
+            || u64::try_from(current_attempt)
+                .map_err(|_| storage_corruption("stored replication attempt is negative"))?
+                != request.expected_attempt
+        {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication state or attempt changed during finalize",
+            )
+            .with_retryable(false));
+        }
+        let checkpoint_rows = sqlx::query(
+            "SELECT tenant_id, replication_id, object_id, offset, state, retry_count, updated_at_unix_ms \
+             FROM replication_objects WHERE tenant_id = ? AND replication_id = ? ORDER BY object_id",
+        )
+        .bind(request.tenant_id.as_str())
+        .bind(request.replication_id.as_str())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let checkpoints = checkpoint_rows
+            .iter()
+            .map(decode_replication_object)
+            .collect::<CentralResult<Vec<_>>>()?;
+        validate_replication_checkpoints(&current, &object_set, &checkpoints)?;
+
+        for placement in &request.placements {
+            let placement_id = placement_id_for(placement)?;
+            sqlx::query(
+                "INSERT INTO placement_objects \
+                 (tenant_id, placement_id, object_id, backend_id, storage_volume_id, archive_id, \
+                  edge_cluster_id, gateway_pool_id, region, placement_generation, state, \
+                  verified_size, verified_digest, failure_domain, created_at_unix_ms, updated_at_unix_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0) ON CONFLICT DO NOTHING",
+            )
+            .bind(placement.tenant_id.as_str())
+            .bind(placement_id.as_str())
+            .bind(placement.object_id.as_bytes().as_slice())
+            .bind(placement.backend_id.as_str())
+            .bind(placement.storage_volume_id.as_ref().map(StorageVolumeId::as_str))
+            .bind(placement.archive_id.as_ref().map(ArchiveId::as_str))
+            .bind(placement.edge_cluster_id.as_ref().map(EdgeClusterId::as_str))
+            .bind(placement.gateway_pool_id.as_ref().map(GatewayPoolId::as_str))
+            .bind(placement.region.as_ref().map(RegionId::as_str))
+            .bind(i64::try_from(placement.placement_generation.get()).map_err(|_| protocol_invalid("placement_generation exceeds SQLite range"))?)
+            .bind(placement_state_name(placement.state))
+            .bind(i64::try_from(placement.verified_size.get()).map_err(|_| protocol_invalid("verified_size exceeds SQLite range"))?)
+            .bind(placement.verified_digest.as_bytes().as_slice())
+            .bind(&placement.failure_domain)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            let stored = sqlx::query(&format!(
+                "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM placement_objects \
+                 WHERE tenant_id = ? AND object_id = ? AND backend_id = ? AND placement_generation = ?",
+            ))
+            .bind(placement.tenant_id.as_str())
+            .bind(placement.object_id.as_bytes().as_slice())
+            .bind(placement.backend_id.as_str())
+            .bind(i64::try_from(placement.placement_generation.get()).map_err(|_| protocol_invalid("placement_generation exceeds SQLite range"))?)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| storage_corruption("target object Placement disappeared during finalize"))?;
+            if decode_object_placement(&stored)? != *placement {
+                transaction.rollback().await.map_err(storage_error)?;
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "target ObjectPlacement is already bound to different metadata",
+                )
+                .with_retryable(false));
+            }
+        }
+
+        let placement_set = &request.placement_set;
+        sqlx::query(
+            "INSERT INTO commit_placement_sets \
+             (tenant_id, placement_set_id, commit_id, backend_id, storage_volume_id, archive_id, \
+              object_set_digest, object_count, verified_object_count, placement_generation, state, \
+              created_at_unix_ms, updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0) \
+              ON CONFLICT DO NOTHING",
+        )
+        .bind(placement_set.tenant_id.as_str())
+        .bind(placement_set.placement_set_id.as_str())
+        .bind(placement_set.commit_id.digest().as_bytes().as_slice())
+        .bind(placement_set.backend_id.as_str())
+        .bind(placement_set.storage_volume_id.as_ref().map(StorageVolumeId::as_str))
+        .bind(placement_set.archive_id.as_ref().map(ArchiveId::as_str))
+        .bind(placement_set.object_set_digest.as_bytes().as_slice())
+        .bind(i64::try_from(placement_set.object_count.get()).map_err(|_| protocol_invalid("object_count exceeds SQLite range"))?)
+        .bind(i64::try_from(placement_set.verified_object_count.get()).map_err(|_| protocol_invalid("verified_object_count exceeds SQLite range"))?)
+        .bind(i64::try_from(placement_set.placement_generation.get()).map_err(|_| protocol_invalid("placement_generation exceeds SQLite range"))?)
+        .bind(placement_set_state_name(placement_set.state))
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let stored_set = sqlx::query(&format!(
+            "SELECT {PLACEMENT_SET_COLUMNS} FROM commit_placement_sets \
+             WHERE tenant_id = ? AND commit_id = ? AND backend_id = ?",
+        ))
+        .bind(placement_set.tenant_id.as_str())
+        .bind(placement_set.commit_id.digest().as_bytes().as_slice())
+        .bind(placement_set.backend_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_corruption("target PlacementSet disappeared during finalize"))?;
+        if decode_placement_set(&stored_set)? != *placement_set {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "target PlacementSet is already bound to different metadata",
+            )
+            .with_retryable(false));
+        }
+        let result = sqlx::query(
+            "UPDATE replications SET state = 'published', target_placement_set_id = ?, \
+             completed_objects = total_objects, completed_bytes = total_bytes, error_code = NULL, \
+             error_message = NULL, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND replication_id = ? AND state = 'verifying' AND attempt = ?",
+        )
+        .bind(placement_set.placement_set_id.as_str())
+        .bind(as_i64(request.finalized_at_unix_ms)?)
+        .bind(request.tenant_id.as_str())
+        .bind(request.replication_id.as_str())
+        .bind(
+            i64::try_from(request.expected_attempt)
+                .map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?,
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if result.rows_affected() != 1 {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication changed before publication could be persisted",
+            )
+            .with_retryable(false));
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        let replication = self
+            .get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| storage_corruption("published replication disappeared"))?;
+        Ok(FinalizeReplicationResult {
+            replication,
+            placement_set: placement_set.clone(),
+            replayed: false,
+        })
     }
 
     async fn upsert_replication_object(
         &self,
         record: ReplicationObjectRecord,
     ) -> CentralResult<ReplicationObjectRecord> {
-        if self
-            .get_replication(&record.tenant_id, &record.replication_id)
-            .await?
-            .is_none()
-        {
-            return Err(CentralError::new(
-                CentralErrorCode::InvalidState,
-                "replication object references a missing Replication",
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        // Acquire the writer lock while fencing terminal Replications. This makes the state check
+        // and checkpoint write one atomic operation relative to finalize/cancel.
+        let fence =
+            sqlx::query(
+                "UPDATE replications SET updated_at_unix_ms = updated_at_unix_ms \
+             WHERE tenant_id = ? AND replication_id = ? AND attempt = ? \
+               AND state NOT IN ('published', 'failed', 'cancelled')",
             )
-            .with_retryable(false));
+            .bind(record.tenant_id.as_str())
+            .bind(record.replication_id.as_str())
+            .bind(i64::try_from(record.retry_count).map_err(|_| {
+                protocol_invalid("replication object retry_count exceeds SQLite range")
+            })?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        if fence.rows_affected() != 1 {
+            transaction.rollback().await.map_err(storage_error)?;
+            let current = self
+                .get_replication(&record.tenant_id, &record.replication_id)
+                .await?;
+            let (code, message) = match current {
+                Some(replication) if replication.attempt != record.retry_count => (
+                    CentralErrorCode::ConcurrentUpdate,
+                    "replication object checkpoint attempt is stale",
+                ),
+                _ => (
+                    CentralErrorCode::InvalidState,
+                    "Replication is missing or terminal; object checkpoints are no longer accepted",
+                ),
+            };
+            return Err(CentralError::new(code, message).with_retryable(false));
         }
         let object_id = record.object_id;
         let existing = sqlx::query(
@@ -1602,7 +2442,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(record.tenant_id.as_str())
         .bind(record.replication_id.as_str())
         .bind(object_id.as_bytes().as_slice())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?
         .map(|row| decode_replication_object(&row))
@@ -1637,9 +2477,10 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(replication_object_state_name(record.state))
         .bind(i64::try_from(record.retry_count).map_err(|_| protocol_invalid("replication object retry_count exceeds SQLite range"))?)
         .bind(as_i64(record.updated_at_unix_ms)?)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
         Ok(record)
     }
 
@@ -1772,8 +2613,24 @@ impl PlacementRepository for SqliteAuthorityStore {
         // generation. Objects from different generations must never be combined into
         // a synthetic replica.  The candidate count includes archive-backed sets; the
         // response's volume list remains a convenience projection for local callers.
+        let object_count = u64::try_from(object_set.object_set.objects.len())
+            .map_err(|_| storage_corruption("object count exceeds u64"))?;
         let mut verified_candidates =
             std::collections::BTreeMap::<(String, Option<String>, Option<String>, u64), u64>::new();
+        for placement in self.published_placement_sets(tenant_id, commit_id).await? {
+            if placement.object_set_digest == object_set.object_set.object_set_digest
+                && placement.object_count.get() == object_count
+            {
+                verified_candidates
+                    .entry((
+                        placement.backend_id.to_string(),
+                        placement.storage_volume_id.map(|value| value.to_string()),
+                        placement.archive_id.map(|value| value.to_string()),
+                        placement.placement_generation.get(),
+                    ))
+                    .or_default();
+            }
+        }
         let mut missing_objects = 0_u64;
         let mut degraded = false;
         for object in &object_set.object_set.objects {
@@ -1841,8 +2698,6 @@ impl PlacementRepository for SqliteAuthorityStore {
                     .ok_or_else(|| storage_corruption("missing object count exceeds u64"))?;
             }
         }
-        let object_count = u64::try_from(object_set.object_set.objects.len())
-            .map_err(|_| storage_corruption("object count exceeds u64"))?;
         let complete_candidates = verified_candidates
             .into_iter()
             .filter(|(_, count)| *count == object_count)
@@ -1902,14 +2757,39 @@ mod tests {
         let record = ReplicationRecord {
             tenant_id: tenant_id.clone(),
             replication_id: ReplicationId::new("replication-test-1").unwrap(),
+            artifact_id: Some(ArtifactId::new("artifact-a").unwrap()),
             commit_id,
             target_backend_id: "volume-backend-a".to_owned(),
             target_storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
+            source_placement_set_id: None,
+            source_backend_id: None,
+            source_storage_volume_id: None,
+            source_edge_cluster_id: None,
+            source_gateway_pool_id: None,
+            source_placement_generation: None,
+            source_agent_id: None,
+            source_session_generation: None,
+            source_mount_generation: None,
+            source_route_generation: None,
+            target_edge_cluster_id: None,
+            target_gateway_pool_id: None,
+            target_placement_generation: None,
+            target_agent_id: None,
+            target_session_generation: None,
+            target_mount_generation: None,
+            target_route_generation: None,
+            transfer_route_id: None,
+            transfer_id: None,
+            target_placement_set_id: None,
+            staging_id: None,
             object_set_digest: ContentDigest::from_bytes([8; 32]),
             state: ReplicationState::Queued,
             request_id: request_id.clone(),
+            attempt: 1,
             completed_objects: 0,
             total_objects: 3,
+            completed_bytes: 0,
+            total_bytes: 17,
             issue_code: None,
             issue_message: None,
             created_at_unix_ms: now,

@@ -14,7 +14,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use neoengram_domain::protocol::CommitObject;
+use neoengram_domain::protocol::{ArtifactId, CommitObject};
 use neoengram_domain::{ObjectId, TenantId, TransferId, TransferTicket};
 
 use crate::{
@@ -442,12 +442,17 @@ where
 #[derive(Debug, Clone)]
 pub struct VolumeCasBackend {
     root: VerifiedRoot,
+    /// When set, the backend addresses the Agent's existing artifact-scoped layout instead of
+    /// the generic `objects/<tenant>/<object>` layout.  Keeping the scope in the backend makes
+    /// it impossible for a caller to accidentally use a ticket for another artifact.
+    artifact_scope: Option<(TenantId, ArtifactId)>,
 }
 
 impl VolumeCasBackend {
     pub fn open_or_create(path: impl AsRef<Path>) -> EngineResult<Self> {
         let backend = Self {
             root: VerifiedRoot::create(path)?,
+            artifact_scope: None,
         };
         backend.initialize()?;
         Ok(backend)
@@ -456,6 +461,40 @@ impl VolumeCasBackend {
     pub fn open(path: impl AsRef<Path>) -> EngineResult<Self> {
         let backend = Self {
             root: VerifiedRoot::open(path)?,
+            artifact_scope: None,
+        };
+        backend.validate_layout()?;
+        Ok(backend)
+    }
+
+    /// Opens the layout used by a live Agent volume:
+    /// `tenants/<tenant>/artifacts/<artifact>/objects/<object>`.
+    ///
+    /// `path` is the volume's `.neoengram/objects` directory.  Staging remains outside the
+    /// artifact namespace (`staging/<tenant>/<transfer>/<object>.partial`) so a retry can resume
+    /// the same transfer without exposing a partially copied object through the artifact CAS.
+    pub fn open_or_create_artifact_scoped(
+        path: impl AsRef<Path>,
+        tenant_id: TenantId,
+        artifact_id: ArtifactId,
+    ) -> EngineResult<Self> {
+        let backend = Self {
+            root: VerifiedRoot::create(path)?,
+            artifact_scope: Some((tenant_id, artifact_id)),
+        };
+        backend.initialize()?;
+        Ok(backend)
+    }
+
+    /// Opens an existing Agent artifact-scoped CAS without creating any directory.
+    pub fn open_artifact_scoped(
+        path: impl AsRef<Path>,
+        tenant_id: TenantId,
+        artifact_id: ArtifactId,
+    ) -> EngineResult<Self> {
+        let backend = Self {
+            root: VerifiedRoot::open(path)?,
+            artifact_scope: Some((tenant_id, artifact_id)),
         };
         backend.validate_layout()?;
         Ok(backend)
@@ -466,8 +505,30 @@ impl VolumeCasBackend {
         self.root.as_path()
     }
 
+    fn validate_scope(&self, tenant_id: &TenantId) -> EngineResult<()> {
+        if let Some((expected_tenant, _)) = &self.artifact_scope {
+            if expected_tenant != tenant_id {
+                return Err(EngineError::new(
+                    ErrorCode::InvalidArgument,
+                    "artifact-scoped object backend received another tenant",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn objects_root(&self) -> PathBuf {
-        self.root.as_path().join(OBJECTS_DIRECTORY)
+        match &self.artifact_scope {
+            Some((tenant_id, artifact_id)) => self
+                .root
+                .as_path()
+                .join("tenants")
+                .join(tenant_id.as_str())
+                .join("artifacts")
+                .join(artifact_id.as_str())
+                .join(OBJECTS_DIRECTORY),
+            None => self.root.as_path().join(OBJECTS_DIRECTORY),
+        }
     }
 
     fn staging_root(&self) -> PathBuf {
@@ -475,7 +536,11 @@ impl VolumeCasBackend {
     }
 
     fn tenant_objects_path(&self, tenant_id: &TenantId) -> PathBuf {
-        self.objects_root().join(tenant_id.as_str())
+        if self.artifact_scope.is_some() {
+            self.objects_root()
+        } else {
+            self.objects_root().join(tenant_id.as_str())
+        }
     }
 
     fn object_path(&self, tenant_id: &TenantId, object_id: &ObjectId) -> PathBuf {
@@ -499,6 +564,7 @@ impl VolumeCasBackend {
     }
 
     fn ensure_object_store(&self, tenant_id: &TenantId) -> EngineResult<LooseObjectStore> {
+        self.validate_scope(tenant_id)?;
         self.initialize()?;
         let path = self.tenant_objects_path(tenant_id);
         ensure_directory(&path)?;
@@ -511,6 +577,7 @@ impl VolumeCasBackend {
         &self,
         tenant_id: &TenantId,
     ) -> EngineResult<Option<LooseObjectStore>> {
+        self.validate_scope(tenant_id)?;
         self.validate_layout()?;
         let path = self.tenant_objects_path(tenant_id);
         match ordinary_file_metadata(&path, "tenant object directory")? {
@@ -532,6 +599,7 @@ impl VolumeCasBackend {
         transfer_id: &TransferId,
         tenant_id: &TenantId,
     ) -> EngineResult<PathBuf> {
+        self.validate_scope(tenant_id)?;
         self.initialize()?;
         let tenant_staging = self.staging_root().join(tenant_id.as_str());
         ensure_directory(&tenant_staging)?;
@@ -544,7 +612,7 @@ impl VolumeCasBackend {
 impl ObjectBackend for VolumeCasBackend {
     fn initialize(&self) -> EngineResult<()> {
         self.root.verify_identity()?;
-        let objects_created = ensure_directory(&self.objects_root())?;
+        let objects_created = ensure_directory_tree(&self.objects_root())?;
         let staging_created = ensure_directory(&self.staging_root())?;
         if objects_created || staging_created {
             sync_directory(self.root.as_path())?;
@@ -563,6 +631,7 @@ impl ObjectBackend for VolumeCasBackend {
         tenant_id: &TenantId,
         object_id: &ObjectId,
     ) -> EngineResult<Option<ObjectMetadata>> {
+        self.validate_scope(tenant_id)?;
         self.validate_layout()?;
         let path = self.object_path(tenant_id, object_id);
         match ordinary_file_metadata(&path, "published object")? {
@@ -585,6 +654,7 @@ impl ObjectBackend for VolumeCasBackend {
         range: ObjectRange,
         target: &mut dyn Write,
     ) -> EngineResult<u64> {
+        self.validate_scope(tenant_id)?;
         range.validate_for(expected)?;
         let Some(metadata) = self.inspect(tenant_id, &expected.id)? else {
             return Err(EngineError::new(
@@ -624,6 +694,7 @@ impl ObjectBackend for VolumeCasBackend {
         tenant_id: &TenantId,
         object_id: &ObjectId,
     ) -> EngineResult<Option<u64>> {
+        self.validate_scope(tenant_id)?;
         self.validate_layout()?;
         let path = self.staged_object_path(transfer_id, tenant_id, object_id);
         match ordinary_file_metadata(&path, "staged object")? {
@@ -644,6 +715,7 @@ impl ObjectBackend for VolumeCasBackend {
         offset: u64,
         bytes: &[u8],
     ) -> EngineResult<StageWriteOutcome> {
+        self.validate_scope(tenant_id)?;
         if bytes.is_empty() {
             return Err(EngineError::new(
                 ErrorCode::InvalidArgument,
@@ -741,6 +813,7 @@ impl ObjectBackend for VolumeCasBackend {
         tenant_id: &TenantId,
         expected: &ObjectSpec,
     ) -> EngineResult<ObjectPutOutcome> {
+        self.validate_scope(tenant_id)?;
         let store = self.ensure_object_store(tenant_id)?;
         if store.stat(&expected.id)?.is_some() {
             store.verify(expected)?;
@@ -782,6 +855,7 @@ impl ObjectBackend for VolumeCasBackend {
         tenant_id: &TenantId,
         object_id: &ObjectId,
     ) -> EngineResult<bool> {
+        self.validate_scope(tenant_id)?;
         self.validate_layout()?;
         let path = self.staged_object_path(transfer_id, tenant_id, object_id);
         let Some(metadata) = ordinary_file_metadata(&path, "staged object")? else {
@@ -802,6 +876,7 @@ impl ObjectBackend for VolumeCasBackend {
     }
 
     fn delete(&self, tenant_id: &TenantId, object_id: &ObjectId) -> EngineResult<bool> {
+        self.validate_scope(tenant_id)?;
         let Some(store) = self.existing_object_store(tenant_id)? else {
             return Ok(false);
         };
@@ -832,6 +907,22 @@ fn ensure_directory(path: &Path) -> EngineResult<bool> {
             "failed to inspect object backend directory",
         )),
     }
+}
+
+/// Creates a bounded directory chain while checking every existing component for symlink
+/// traversal.  Artifact-scoped CAS paths are nested more deeply than the generic backend, so a
+/// plain `create_dir` on the leaf would otherwise fail on a fresh Agent volume.
+fn ensure_directory_tree(path: &Path) -> EngineResult<bool> {
+    let mut created = false;
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+        created |= ensure_directory(&current)?;
+    }
+    Ok(created)
 }
 
 fn ensure_existing_directory(path: &Path, description: &str) -> EngineResult<()> {
@@ -935,6 +1026,10 @@ mod tests {
         TenantId::new(value).unwrap()
     }
 
+    fn artifact(value: &str) -> ArtifactId {
+        ArtifactId::new(value).unwrap()
+    }
+
     fn transfer(value: &str) -> TransferId {
         TransferId::new(value).unwrap()
     }
@@ -991,6 +1086,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(selected, &payload[10..15]);
+    }
+
+    #[test]
+    fn artifact_scoped_backend_uses_live_agent_layout_and_fences_tenant() {
+        let temporary = tempfile::tempdir().unwrap();
+        let tenant_id = tenant("tenant-a");
+        let backend = VolumeCasBackend::open_or_create_artifact_scoped(
+            temporary.path(),
+            tenant_id.clone(),
+            artifact("artifact-a"),
+        )
+        .unwrap();
+        let payload = b"artifact-layout";
+        let expected = ObjectSpec::for_bytes(payload);
+        let transfer_id = transfer("transfer-artifact");
+        backend
+            .stage_write(&transfer_id, &tenant_id, &expected, 0, payload)
+            .unwrap();
+        backend
+            .verify_and_publish(&transfer_id, &tenant_id, &expected)
+            .unwrap();
+
+        let published = temporary
+            .path()
+            .join("tenants/tenant-a/artifacts/artifact-a/objects")
+            .join(expected.id.to_hex());
+        assert!(published.is_file());
+        assert!(!temporary
+            .path()
+            .join("objects")
+            .join("tenant-a")
+            .join(expected.id.to_hex())
+            .exists());
+        assert!(backend.inspect(&tenant("tenant-b"), &expected.id).is_err());
     }
 
     #[test]

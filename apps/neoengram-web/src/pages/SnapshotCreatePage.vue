@@ -11,12 +11,7 @@ import { ElMessage } from 'element-plus';
 import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import {
-  createSnapshot,
-  queryApiVersion,
-  queryArtifact,
-  querySnapshot,
-} from '@/api/operations';
+import { createSnapshot, queryApiVersion, queryArtifact, querySnapshot } from '@/api/operations';
 import type { CreateSnapshotResponse } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
@@ -81,7 +76,9 @@ const snapshotQuery = useQuery({
   },
   enabled: computed(() => Boolean(createdSnapshotId.value)),
   refetchInterval: (query) =>
-    snapshotPollInterval(query.state.data?.data.snapshot.state ?? createOutcome.value?.snapshot.state),
+    snapshotPollInterval(
+      query.state.data?.data.snapshot.state ?? createOutcome.value?.snapshot.state,
+    ),
 });
 
 watch([tenantId, projectId, artifactId], () => {
@@ -134,7 +131,6 @@ async function openSnapshot(): Promise<void> {
     },
   });
 }
-
 </script>
 
 <template>
@@ -211,13 +207,24 @@ async function openSnapshot(): Promise<void> {
     <template v-else>
       <section class="content-section delivery-panel">
         <div class="delivery-heading">
-          <span :class="['delivery-icon', `delivery-icon--${snapshotQuery.data.value?.data.snapshot.state}`]">
+          <span
+            :class="[
+              'delivery-icon',
+              `delivery-icon--${snapshotQuery.data.value?.data.snapshot.state}`,
+            ]"
+          >
             <CircleCheck v-if="snapshotQuery.data.value?.data.snapshot.state === 'ready'" />
-            <WarningFilled v-else-if="snapshotQuery.data.value?.data.snapshot.state === 'abnormal'" />
+            <WarningFilled
+              v-else-if="snapshotQuery.data.value?.data.snapshot.state === 'abnormal'"
+            />
             <RefreshRight v-else />
           </span>
           <div>
-            <small>{{ snapshotStateLabel(snapshotQuery.data.value?.data.snapshot.state ?? createOutcome.snapshot.state) }}</small>
+            <small>{{
+              snapshotStateLabel(
+                snapshotQuery.data.value?.data.snapshot.state ?? createOutcome.snapshot.state,
+              )
+            }}</small>
             <h2>Snapshot 已创建</h2>
             <p>Snapshot 只保存逻辑 Commit 引用。请在详情页先复制到目标 Volume，再创建只读交付。</p>
           </div>
@@ -239,9 +246,19 @@ async function openSnapshot(): Promise<void> {
           <div>
             <dt>状态</dt>
             <dd>
-              <el-tag :type="snapshotStateTagType(snapshotQuery.data.value?.data.snapshot.state ?? createOutcome.snapshot.state)" effect="plain">{{
-                snapshotStateLabel(snapshotQuery.data.value?.data.snapshot.state ?? createOutcome.snapshot.state)
-              }}</el-tag>
+              <el-tag
+                :type="
+                  snapshotStateTagType(
+                    snapshotQuery.data.value?.data.snapshot.state ?? createOutcome.snapshot.state,
+                  )
+                "
+                effect="plain"
+                >{{
+                  snapshotStateLabel(
+                    snapshotQuery.data.value?.data.snapshot.state ?? createOutcome.snapshot.state,
+                  )
+                }}</el-tag
+              >
             </dd>
           </div>
           <div>
@@ -254,7 +271,12 @@ async function openSnapshot(): Promise<void> {
               >
             </dd>
           </div>
-          <div><dt>Commit</dt><dd><code>{{ createOutcome.snapshot.commit_id }}</code></dd></div>
+          <div>
+            <dt>Commit</dt>
+            <dd>
+              <code>{{ createOutcome.snapshot.commit_id }}</code>
+            </dd>
+          </div>
           <div>
             <dt>文件</dt>
             <dd>{{ formatCount(createOutcome.snapshot.logical_file_count) }}</dd>
@@ -270,7 +292,9 @@ async function openSnapshot(): Promise<void> {
         </div>
       </section>
       <footer class="snapshot-actions">
-        <span v-if="snapshotQuery.data.value?.data.snapshot.state === 'creating'">页面会持续刷新 Snapshot 状态</span>
+        <span v-if="snapshotQuery.data.value?.data.snapshot.state === 'creating'"
+          >页面会持续刷新 Snapshot 状态</span
+        >
         <span v-else>下一步在详情页处理 Replicate 和 Delivery</span>
         <el-button type="primary" @click="openSnapshot">查看 Snapshot</el-button>
       </footer>

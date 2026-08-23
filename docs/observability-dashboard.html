@@ -878,9 +878,9 @@
 <body>
 <div style="padding:10px 16px;border-bottom:1px solid hsl(36 90% 75%);background:hsl(38 95% 94%);color:hsl(30 80% 28%);line-height:1.45;z-index:100">
   <strong>历史原型：</strong>本页的 Agent 自带公网 S3 endpoint、Volume Gateway、可变 Playground
-  gateway 和 Agent 直连中心不是 Synapse 目标架构。2026-08-09 目标为 Central -> 每集群多副本
+  gateway 和 Agent 直连中心不是 NeoEngram 目标架构。2026-08-09 目标为 Central -> 每集群多副本
   GatewayPool <- Agent；Gateway 不挂载 Volume。详见
-  <a href="synapse-gateway-architecture.md">Synapse Gateway 架构</a>。
+  <a href="neoengram-gateway-architecture.md">NeoEngram Gateway 架构</a>。
 </div>
 <div class="console">
 
@@ -1398,7 +1398,7 @@ const STORE_LABEL = {
   "center-s3": "Center S3 (self-contained)",
   "oss-archive": "OSS Archive (S2)"
 };
-// 历史 mock 数据：旧原型的 S3 端点字段不代表当前 Synapse Gateway 能力。
+// 历史 mock 数据：旧原型的 S3 端点字段不代表当前 NeoEngram Gateway 能力。
 // 当前目标是每个 EdgeCluster 的多副本 GatewayPool；该页面不执行真实注册或传输。
 const STORE_S3GW = {
   "edge-a-nas": true,
@@ -1588,7 +1588,7 @@ let topoModalState = { scale: 1, tx: 0, ty: 0 }; // modal
 let topoDragCtx = null;
 
 function buildTopoSVG() {
-  // 历史 mock 拓扑：不代表当前部署或数据路径；当前目标由 Synapse Gateway 架构文档定义。
+  // 历史 mock 拓扑：不代表当前部署或数据路径；当前目标由 NeoEngram Gateway 架构文档定义。
   const nodes = {
     edgeA:       { x: 20,  y: 250, w: 210, h: 116, label: "Edge A NAS",  sub: "edge-a-nas · 6.8/12 TB",  color: "var(--accent)",   kind: "managed", s3gw: true,  role: "采集/STAA · 数据主住所" },
     centerNas:   { x: 290, y: 250, w: 210, h: 116, label: "Center NAS",  sub: "center-nas · 5.2/10 TB", color: "var(--accent)",   kind: "managed", s3gw: true,  role: "训练实验 · 全功能版本仓库" },
@@ -2887,7 +2887,7 @@ function renderSpaceForm() {
     <div class="sc-banner" style="background:var(--panel-2);border-color:var(--border)">
       <span class="b-ico" style="background:var(--accent);color:#fff">i</span>
       <div>
-        <div style="margin-bottom:6px"><b>历史 mock（当前已停用）</b>：以下 gj-agent/gjctl 注册流程只属于旧原型，不能用于当前 Synapse 部署。当前 Agent 应注册到所属 EdgeCluster 的 GatewayPool。</div>
+        <div style="margin-bottom:6px"><b>历史 mock（当前已停用）</b>：以下 gj-agent/gjctl 注册流程只属于旧原型，不能用于当前 NeoEngram 部署。当前 Agent 应注册到所属 EdgeCluster 的 GatewayPool。</div>
         <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">该空间专属接入 Token（泄露后可在空间配置中重置）：<span class="cfg-token">${scState.spaceToken}</span></div>
         <div class="cfg-cmd" aria-disabled="true">历史 mock 命令（不可执行）：gjctl register …</div>
         <div style="font-size:11px;color:var(--text-dim);margin-top:6px">旧原型中的 Volume Gateway、Agent 直拉和自带公网 S3 endpoint 均已废弃。Gateway 不挂载 Volume；跨集群传输和 S3 访问属于后续里程碑。</div>
@@ -3196,7 +3196,7 @@ function renderSpaceConfig() {
             <li><b>历史 mock</b>：旧原型曾用 gj-agent/gjctl 直接登记 NAS；该流程当前不可执行。</li>
             <li><b>当前目标</b>：Agent 通过 GatewayPool 建立控制连接，Central 仍是 metadata authority，Volume Owner Agent 执行 Volume I/O。</li>
             <li><b>当前未开放</b>：Gateway 不挂载 Volume；跨集群对象传输和只读 S3 访问分别属于 G2/G3，不能通过本页配置。</li>
-            <li><b>验收入口</b>：请以 <code>docs/synapse-gateway-architecture.md</code> 和部署清单为准，本页数据仅用于历史 UI 演示。</li>
+            <li><b>验收入口</b>：请以 <code>docs/neoengram-gateway-architecture.md</code> 和部署清单为准，本页数据仅用于历史 UI 演示。</li>
           </ol>
           <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">接入 Token（该空间专属，泄露后请重置）：<span class="cfg-token">${spaceToken}</span></div>
           <div class="cfg-cmd" aria-disabled="true">历史 mock 命令（不可执行）：gjctl register …</div>
@@ -3237,7 +3237,7 @@ function renderSpaceConfig() {
         <button class="cfg-mini-btn primary" onclick="toggleSelfNasGuide()">接入引导</button>
       </div>
       <div id="selfnas-guide" style="display:none;padding:12px 16px;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;margin:0 16px 12px">
-        <div style="margin-bottom:6px"><b>历史 mock（当前已停用）</b>：旧 gj-agent/gjctl 注册流程不能用于当前 Synapse 部署。当前 Agent 应注册到所属 EdgeCluster 的 GatewayPool。</div>
+        <div style="margin-bottom:6px"><b>历史 mock（当前已停用）</b>：旧 gj-agent/gjctl 注册流程不能用于当前 NeoEngram 部署。当前 Agent 应注册到所属 EdgeCluster 的 GatewayPool。</div>
         <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">该空间专属接入 Token（泄露后可在此重置）：<span class="cfg-token">${spaceToken}</span></div>
         <div class="cfg-cmd" aria-disabled="true">历史 mock 命令（不可执行）：gjctl register …</div>
         <div style="font-size:11px;color:var(--text-dim);margin-top:6px">旧原型中的 Volume Gateway、Agent 直拉和自带公网 S3 endpoint 均已废弃。Gateway 不挂载 Volume；跨集群传输和 S3 访问属于后续里程碑。</div>
@@ -3434,7 +3434,7 @@ function openOpModal(opName, ctx) {
   const op = OPERATIONS[opName];
   if (!op) return;
   if (op.legacy) {
-    renderModalShell(`${op.title}（已停用）`, "历史 mock 操作不可执行；请使用 Synapse Gateway 架构和当前管理 API。",
+    renderModalShell(`${op.title}（已停用）`, "历史 mock 操作不可执行；请使用 NeoEngram Gateway 架构和当前管理 API。",
       `<div class="danger-block"><div class="b-title">当前能力边界</div><div class="danger-msg">Gateway 不挂载 Volume，也不提供旧原型的 WebDAV/SFTP/Agent 直拉入口。跨集群传输和只读 S3 属于后续里程碑。</div></div>`,
       `<button class="btn" onclick="closeOpModal()">关闭</button>`, false);
     document.getElementById("op-modal").classList.add("open");

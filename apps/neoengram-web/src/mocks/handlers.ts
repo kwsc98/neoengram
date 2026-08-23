@@ -18,6 +18,8 @@ import type {
   CreateArtifactResponse,
   CreateCommitReplicationRequest,
   CreateCommitReplicationResponse,
+  CancelCommitReplicationRequest,
+  CancelCommitReplicationResponse,
   CreatePlaygroundRequest,
   CreatePlaygroundResponse,
   CreateProjectRequest,
@@ -38,12 +40,18 @@ import type {
   DeleteSnapshotDeliveryResponse,
   PreCommitView,
   ProblemDetails,
+  QueryGatewayPoolListRequest,
+  QueryGatewayPoolListResponse,
   QueryArtifactListRequest,
   QueryArtifactListResponse,
   QueryArtifactCommitDiffResponse,
   QueryArtifactResponse,
   QueryCommitReplicationRequest,
   QueryCommitReplicationResponse,
+  QueryCommitReplicationListRequest,
+  QueryCommitReplicationListResponse,
+  QueryCommitPlacementListRequest,
+  QueryCommitPlacementListResponse,
   QueryCommitAvailabilityRequest,
   QueryCommitAvailabilityResponse,
   QueryPlaygroundListRequest,
@@ -83,6 +91,8 @@ import type {
   RejectStorageEnrollmentResponse,
   RetrySnapshotDeliveryRequest,
   RetrySnapshotDeliveryResponse,
+  RetryCommitReplicationRequest,
+  RetryCommitReplicationResponse,
   SnapshotDeliveryView,
   CreateS3AccessPointRequest,
   CreateS3AccessPointResponse,
@@ -140,6 +150,7 @@ import type {
 import {
   artifacts,
   commitGraphs,
+  gatewayPools,
   playgrounds,
   projects,
   resourceKey,
@@ -247,7 +258,11 @@ const snapshotDeliveryDeleteRequests = new Map<
 >();
 const snapshotQueryCounts = new Map<string, number>();
 const commitReplications = new Map<string, CreateCommitReplicationResponse['replication']>();
-const commitReplicationRequests = new Map<string, { requestJson: string; response: CreateCommitReplicationResponse }>();
+const commitReplicationQueryCounts = new Map<string, number>();
+const commitReplicationRequests = new Map<
+  string,
+  { requestJson: string; response: CreateCommitReplicationResponse }
+>();
 const s3AccessPointCreateRequests = new Map<
   string,
   { requestJson: string; response: CreateS3AccessPointResponse }
@@ -262,6 +277,35 @@ const deletionMutationRequests = new Map<string, { requestJson: string; response
 const retentionHolds: RetentionHoldView[] = [];
 
 const READY_AFTER_QUERY_COUNT = 2;
+
+const commitReplicationProgression = [
+  'planning',
+  'transferring',
+  'verifying',
+  'published',
+] as const;
+
+function advanceCommitReplication(
+  key: string,
+  replication: CreateCommitReplicationResponse['replication'],
+): CreateCommitReplicationResponse['replication'] {
+  if (!['queued', 'planning', 'transferring', 'verifying'].includes(replication.state)) {
+    return replication;
+  }
+  const queryCount = commitReplicationQueryCounts.get(key) ?? 0;
+  const state = commitReplicationProgression[Math.min(queryCount, 3)]!;
+  const objectsComplete = state === 'verifying' || state === 'published';
+  const next = {
+    ...replication,
+    state,
+    completed_objects: objectsComplete ? replication.total_objects : replication.completed_objects,
+    completed_bytes: objectsComplete ? replication.total_bytes : replication.completed_bytes,
+  };
+  commitReplications.set(key, next);
+  if (state === 'published') commitReplicationQueryCounts.delete(key);
+  else commitReplicationQueryCounts.set(key, queryCount + 1);
+  return next;
+}
 
 function completesOnThisQuery(queryCounts: Map<string, number>, key: string): boolean {
   const currentCount = queryCounts.get(key);
@@ -1320,6 +1364,8 @@ export const handlers = [
           'managed_add',
           'artifact_catalog',
           'artifact_commit_graph',
+          'artifact_commit_diff',
+          'artifact_commit_replication',
           'playground_browser',
           'playground_materialize',
           'playground_precommit',
@@ -1436,6 +1482,7 @@ export const handlers = [
         'storage.enrollment.review',
         'artifact.read',
         'artifact.create',
+        'artifact.commit.replicate',
         'project.read',
         'project.create',
         'playground.create',
@@ -1449,6 +1496,32 @@ export const handlers = [
     tenants.push(tenant);
     tenantCreatePayloads.set(body.tenant_id, requestJson);
     const response: CreateTenantResponse = { tenant, replayed: false };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/gateway/pool/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryGatewayPoolListRequest;
+    const filtered = gatewayPools
+      .filter(
+        (gatewayPool) =>
+          (!body.edge_cluster_id || gatewayPool.edge_cluster_id === body.edge_cluster_id) &&
+          (!body.state || gatewayPool.state === body.state),
+      )
+      .sort((left, right) => left.gateway_pool_id.localeCompare(right.gateway_pool_id));
+    const afterIndex = body.after
+      ? filtered.findIndex((gatewayPool) => gatewayPool.gateway_pool_id === body.after)
+      : -1;
+    const start = afterIndex + 1;
+    const pageSize = body.page_size ?? 50;
+    const items = filtered.slice(start, start + pageSize);
+    const hasNext = start + items.length < filtered.length;
+    const response: QueryGatewayPoolListResponse = {
+      items,
+      ...(hasNext && items.length > 0
+        ? { next_after: items[items.length - 1]!.gateway_pool_id }
+        : {}),
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/storage/volume/list/query', async ({ request }) => {
@@ -3278,32 +3351,97 @@ export const handlers = [
     const prior = commitReplicationRequests.get(requestKey);
     if (prior) {
       if (prior.requestJson !== requestJson) {
-        return mutationConflict(request, 'REPLICATION_REQUEST_ID_REUSED', 'The replication request ID is already bound to another request');
+        return mutationConflict(
+          request,
+          'REPLICATION_REQUEST_ID_REUSED',
+          'The replication request ID is already bound to another request',
+        );
       }
       const response = structuredClone(prior.response);
       response.replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
+    const artifact = artifacts.find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.project_id === body.project_id &&
+        item.artifact_id === body.artifact_id &&
+        isLifecycleActive(item),
+    );
+    if (!artifact) return notFound(request, 'Artifact');
+    const commit = commitGraphs
+      .get(resourceKey(body.tenant_id, body.project_id, body.artifact_id))
+      ?.nodes.find((item) => item.commit_id === body.commit_id);
+    if (!commit) {
+      return problem(
+        request,
+        404,
+        'COMMIT_NOT_FOUND',
+        'Commit not found',
+        'The requested Commit was not found in this Artifact',
+      );
+    }
     const volume = storageVolumes.find(
-      (item) => item.tenant_id === body.tenant_id && item.storage_volume_id === body.target_storage_volume_id,
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.storage_volume_id === body.target_storage_volume_id,
     );
     if (!volume) return notFound(request, 'StorageVolume');
     if (volume.state !== 'ready') {
-      return mutationConflict(request, 'STORAGE_VOLUME_NOT_READY', 'Replication targets require a Ready StorageVolume');
+      return mutationConflict(
+        request,
+        'STORAGE_VOLUME_NOT_READY',
+        'Replication targets require a Ready StorageVolume',
+      );
     }
+    const gatewayPool = gatewayPools.find(
+      (item) => item.edge_cluster_id === volume.edge_cluster_id,
+    );
+    if (!gatewayPool || gatewayPool.state !== 'ready') {
+      return mutationConflict(
+        request,
+        'TRANSFER_ROUTE_UNAVAILABLE',
+        'Replication targets require a Ready GatewayPool route',
+      );
+    }
+    const existingPlacement = [...commitReplications.values()].find(
+      (item) =>
+        item.tenant_id === body.tenant_id &&
+        item.commit_id === body.commit_id &&
+        item.target_storage_volume_id === body.target_storage_volume_id &&
+        item.state === 'published',
+    );
+    if (existingPlacement) {
+      return mutationConflict(
+        request,
+        'TARGET_COMMIT_PLACEMENT_EXISTS',
+        'The target StorageVolume already contains a published Commit PlacementSet',
+      );
+    }
+    const snapshot = snapshots.find(
+      (item) => item.tenant_id === body.tenant_id && item.commit_id === body.commit_id,
+    );
     const replicationId = `replication-${fingerprint(body).slice(0, 24)}`;
     const replication = {
       replication_id: replicationId,
       tenant_id: body.tenant_id,
+      artifact_id: body.artifact_id,
       commit_id: body.commit_id,
       target_storage_volume_id: body.target_storage_volume_id,
-      state: 'published' as const,
+      attempt: '1',
+      state: 'queued' as const,
       object_set_digest: body.commit_id,
-      completed_objects: '1',
-      total_objects: '1',
+      completed_objects: '0',
+      total_objects: snapshot?.logical_file_count ?? '1',
+      target_edge_cluster_id: volume.edge_cluster_id,
+      target_gateway_pool_id: gatewayPool.gateway_pool_id,
+      completed_bytes: '0',
+      total_bytes: snapshot?.logical_size_bytes ?? '0',
     };
     const response: CreateCommitReplicationResponse = { replication, replayed: false };
-    commitReplications.set(resourceKey(body.tenant_id, replicationId), replication);
+    const replicationKey = resourceKey(body.tenant_id, replicationId);
+    commitReplications.set(replicationKey, replication);
+    commitReplicationQueryCounts.set(replicationKey, 0);
     commitReplicationRequests.set(requestKey, { requestJson, response: structuredClone(response) });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
@@ -3313,9 +3451,114 @@ export const handlers = [
     const body = (await request.json()) as QueryCommitReplicationRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const replication = commitReplications.get(resourceKey(body.tenant_id, body.replication_id));
+    const key = resourceKey(body.tenant_id, body.replication_id);
+    const replication = commitReplications.get(key);
     if (!replication) return notFound(request, 'Replication');
-    const response: QueryCommitReplicationResponse = { replication };
+    const response: QueryCommitReplicationResponse = {
+      replication: advanceCommitReplication(key, replication),
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/commit/replication/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryCommitReplicationListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const response: QueryCommitReplicationListResponse = {
+      replications: [...commitReplications.entries()]
+        .filter(
+          ([, item]) => item.tenant_id === body.tenant_id && item.commit_id === body.commit_id,
+        )
+        .map(([key, item]) => advanceCommitReplication(key, item)),
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/commit/placements/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryCommitPlacementListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const placements: QueryCommitPlacementListResponse['placements'] = [
+      ...commitReplications.values(),
+    ]
+      .filter(
+        (item) =>
+          item.tenant_id === body.tenant_id &&
+          item.commit_id === body.commit_id &&
+          item.state === 'published',
+      )
+      .map((item) => ({
+        placement_set_id: `placement-set-${item.replication_id}`,
+        commit_id: item.commit_id,
+        backend_id: item.target_storage_volume_id,
+        storage_volume_id: item.target_storage_volume_id,
+        object_set_digest: item.object_set_digest,
+        object_count: item.total_objects,
+        verified_object_count: item.completed_objects,
+        placement_generation: '1',
+        state: 'published',
+      }));
+    return HttpResponse.json({ placements }, { headers: headers(request) });
+  }),
+  http.post('*/api/commit/replication/retry', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as RetryCommitReplicationRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const key = resourceKey(body.tenant_id, body.replication_id);
+    const replication = commitReplications.get(key);
+    if (!replication) return notFound(request, 'Replication');
+    if (replication.attempt !== body.expected_attempt) {
+      return mutationConflict(
+        request,
+        'REPLICATION_ATTEMPT_CHANGED',
+        'Replication attempt changed',
+      );
+    }
+    if (!['failed', 'cancelled'].includes(replication.state)) {
+      return mutationConflict(request, 'REPLICATION_NOT_RETRYABLE', 'Replication is not retryable');
+    }
+    const next = {
+      ...replication,
+      attempt: String(Number(replication.attempt) + 1),
+      state: 'queued' as const,
+    };
+    delete next.issue;
+    commitReplications.set(key, next);
+    commitReplicationQueryCounts.set(key, 0);
+    const response: RetryCommitReplicationResponse = { replication: next };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/commit/replication/cancel', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CancelCommitReplicationRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const key = resourceKey(body.tenant_id, body.replication_id);
+    const replication = commitReplications.get(key);
+    if (!replication) return notFound(request, 'Replication');
+    if (replication.attempt !== body.expected_attempt) {
+      return mutationConflict(
+        request,
+        'REPLICATION_ATTEMPT_CHANGED',
+        'Replication attempt changed',
+      );
+    }
+    if (!['queued', 'planning', 'transferring', 'verifying'].includes(replication.state)) {
+      return mutationConflict(
+        request,
+        'REPLICATION_NOT_CANCELLABLE',
+        'Replication is not cancellable',
+      );
+    }
+    const next = { ...replication, state: 'cancelled' as const };
+    commitReplications.set(key, next);
+    commitReplicationQueryCounts.delete(key);
+    const response: CancelCommitReplicationResponse = { replication: next };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/commit/availability/query', async ({ request }) => {
@@ -3335,9 +3578,9 @@ export const handlers = [
     const response: QueryCommitAvailabilityResponse = {
       availability: {
         commit_id: body.commit_id,
-        data_health: 'available',
+        data_health: verified_storage_volume_ids.length > 0 ? 'available' : 'unavailable',
         verified_placements: String(verified_storage_volume_ids.length),
-        missing_objects: '0',
+        missing_objects: verified_storage_volume_ids.length > 0 ? '0' : '1',
         verified_storage_volume_ids,
       },
     };
@@ -4531,6 +4774,7 @@ export function resetMockState(): void {
   precommitMutationRequests.clear();
   snapshotCreateRequests.clear();
   commitReplications.clear();
+  commitReplicationQueryCounts.clear();
   commitReplicationRequests.clear();
   snapshotDeliveries.splice(0, snapshotDeliveries.length);
   snapshotDeliveryCreateRequests.clear();

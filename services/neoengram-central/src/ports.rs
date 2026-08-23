@@ -739,6 +739,13 @@ pub trait PlacementRepository: Send + Sync {
         tenant_id: &TenantId,
         commit_id: &neoengram_domain::core::ContentDigest,
     ) -> CentralResult<Vec<neoengram_domain::protocol::CommitPlacementSet>>;
+    /// Returns all PlacementSets for a Commit, including staged, retiring, and deleted records, in
+    /// stable backend order. This is the authority source for version-management placement views.
+    async fn commit_placement_sets(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Vec<neoengram_domain::protocol::CommitPlacementSet>>;
     /// Returns the first published placement for callers that only need a deterministic default.
     async fn published_placement_set(
         &self,
@@ -806,10 +813,44 @@ pub trait PlacementRepository: Send + Sync {
         tenant_id: &TenantId,
         request_id: &neoengram_domain::protocol::RequestId,
     ) -> CentralResult<Option<crate::ReplicationRecord>>;
+    async fn list_replications_for_commit(
+        &self,
+        tenant_id: &TenantId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Vec<crate::ReplicationRecord>>;
+    /// Lists replication attempts currently bound to one target Agent.  The result is used by
+    /// the reverse Agent channel to derive a durable command delivery set without introducing a
+    /// second, non-authoritative replication outbox.
+    async fn list_replications_for_agent(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+    ) -> CentralResult<Vec<crate::ReplicationRecord>>;
     async fn insert_replication(
         &self,
         record: crate::ReplicationRecord,
     ) -> CentralResult<crate::ReplicationRecord>;
+    /// Advances an active Replication through its non-publication states with attempt fencing.
+    async fn transition_replication(
+        &self,
+        request: crate::ReplicationStateTransitionRequest,
+    ) -> CentralResult<crate::ReplicationRecord>;
+    /// Starts the next attempt for a failed Replication while retaining durable object offsets.
+    async fn retry_replication(
+        &self,
+        request: crate::RetryReplicationRequest,
+    ) -> CentralResult<crate::ReplicationRecord>;
+    /// Cancels an active Replication attempt. Published data cannot be cancelled through this API.
+    async fn cancel_replication(
+        &self,
+        request: crate::CancelReplicationRequest,
+    ) -> CentralResult<crate::ReplicationRecord>;
+    /// Atomically publishes verified ObjectPlacements and their complete PlacementSet, then marks
+    /// the matching fenced Replication attempt Published.
+    async fn finalize_replication(
+        &self,
+        request: crate::FinalizeReplicationRequest,
+    ) -> CentralResult<crate::FinalizeReplicationResult>;
     /// Inserts or advances one object checkpoint. Replays with the same payload are idempotent;
     /// an offset may only move forward for the same replication/object identity.
     async fn upsert_replication_object(

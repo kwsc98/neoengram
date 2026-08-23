@@ -1984,6 +1984,7 @@ mod tests {
                 heartbeat_interval_seconds: 10,
                 reconnect_max_delay_seconds: 30,
             },
+            replication: crate::ReplicationConfig::default(),
             logging: LoggingConfig {
                 format: LoggingFormat::Json,
                 level: "info".into(),

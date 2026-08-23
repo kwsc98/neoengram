@@ -248,7 +248,7 @@ test('creates a PVC token and independently approves a pending enrollment', asyn
   await approvalDialog.getByRole('button', { name: '批准', exact: true }).click();
   await expect.poll(() => approvalRequestCount).toBe(1);
 
-  await page.getByRole('tab', { name: '已登记' }).click();
+  await page.getByRole('tab', { name: '集群与磁盘' }).click();
   const volumeRow = page
     .locator('.desktop-table .el-table__row')
     .filter({ hasText: pendingVolumeId });
@@ -428,19 +428,20 @@ test('creates an Artifact, Playground, Commit and Snapshot from resource pages',
       .getByText(/建立自动驾驶评测基线/)
       .first(),
   ).toBeVisible();
-  await page.getByRole('button', { name: '选择 StorageVolume' }).click();
-  await page.getByRole('button', { name: /广州训练集交付 PVC/ }).click();
-  await expect(page.getByText('cn-guangzhou', { exact: true }).first()).toBeVisible();
   await page.getByRole('button', { name: '创建 Snapshot', exact: true }).click();
   await expect(page.locator('.delivery-heading small')).toHaveText('可用');
   await expect(page.getByText('新请求', { exact: true })).toBeVisible();
-  await expect(page.getByText('新建交付位置', { exact: true })).toBeVisible();
   await expectNoOperatorDetails(page);
   await page.getByRole('button', { name: '查看 Snapshot' }).click();
   await expect(page).toHaveURL(/\/snapshots\/snap-/);
   await expect(page.getByRole('heading', { name: '建立自动驾驶评测基线' })).toBeVisible();
   await expect(page.locator('.snapshot-state-band > .el-tag')).toHaveText('可用');
-  await expect(page.getByText('cn-guangzhou', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(/cn-shanghai/).first()).toBeVisible();
+  await expect(
+    page
+      .getByRole('paragraph')
+      .filter({ hasText: '请先将 Commit 复制到当前目标 Volume，并等待 PlacementSet published' }),
+  ).toBeVisible();
   await expectNoOperatorDetails(page);
   await expectHealthyLayout(page);
 });
@@ -681,7 +682,7 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   await expect(page.getByText('12 GiB', { exact: true }).first()).toBeVisible();
   await expect(page.getByRole('heading', { name: '只读交付' })).toBeVisible();
   await expect(page.getByRole('radio', { name: 'FUSE' })).toBeChecked();
-  await expect(page.getByText('cn-shanghai', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(/cn-shanghai/).first()).toBeVisible();
   await expect(page.getByText('cn-guangzhou', { exact: true })).toHaveCount(0);
   await page.screenshot({
     path: testInfo.outputPath('snapshot-detail.png'),
@@ -704,12 +705,7 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   testInfo.setTimeout(45_000);
   await page.addInitScript(() => {
     const nativeFetch = window.fetch.bind(window);
-    const trackedWindow = window as typeof window & {
-      __snapshotCreateBodies?: string[];
-    };
-    trackedWindow.__snapshotCreateBodies = [];
     let rejectFirstCommit = true;
-    let failFirstSnapshotCreate = true;
 
     window.fetch = async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
@@ -735,58 +731,6 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
             },
           },
         );
-      }
-      if (url.pathname.endsWith('/api/storage/volume/list/query')) {
-        const response = await nativeFetch(request);
-        const payload = (await response.clone().json()) as { items?: unknown[] };
-        return new Response(
-          JSON.stringify({
-            ...payload,
-            items: [
-              ...(payload.items ?? []),
-              {
-                tenant_id: 'tenant-a',
-                storage_volume_id: 'volume-e2e-unavailable',
-                display_name: '离线交付 Volume',
-                edge_cluster_id: 'cluster-e2e-offline',
-                region: 'cn-hangzhou',
-                backend_type: 'nfs',
-                access_mode: 'read_only_many',
-                state: 'unavailable',
-                resource_version: '1',
-                created_at_unix_ms: '1785167000000',
-                updated_at_unix_ms: '1785167600000',
-              },
-            ],
-          }),
-          { status: response.status, headers: response.headers },
-        );
-      }
-      if (url.pathname.endsWith('/api/snapshot/create')) {
-        trackedWindow.__snapshotCreateBodies?.push(await request.clone().text());
-        if (failFirstSnapshotCreate) {
-          failFirstSnapshotCreate = false;
-          return new Response(
-            JSON.stringify({
-              type: 'urn:neoengram:problem:authority-unavailable',
-              title: 'Authority unavailable',
-              status: 503,
-              detail: 'The authority is temporarily unavailable',
-              instance: url.pathname,
-              code: 'AUTHORITY_UNAVAILABLE',
-              request_id: 'req-e2e-snapshot-unavailable',
-              retryable: true,
-              retry_after_ms: '100',
-            }),
-            {
-              status: 503,
-              headers: {
-                'Content-Type': 'application/problem+json',
-                'X-Request-ID': 'req-e2e-snapshot-unavailable',
-              },
-            },
-          );
-        }
       }
       return nativeFetch(request);
     };
@@ -865,44 +809,31 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
       .getByText(/发布自动驾驶夜间场景 v4/)
       .first(),
   ).toBeVisible();
-  await page.getByRole('button', { name: '选择 StorageVolume' }).click();
-
-  await expect(page.getByRole('heading', { name: '选择 Volume 与交付模式' })).toBeVisible();
-  const degradedVolume = page.getByRole('button', { name: /上海共享归档/ });
-  await expect(degradedVolume).toBeVisible();
-  await expect(degradedVolume).toBeDisabled();
-  const unavailableVolume = page.getByRole('button', { name: /离线交付 Volume/ });
-  await expect(unavailableVolume).toBeVisible();
-  await expect(unavailableVolume).toBeDisabled();
-  await page.getByRole('button', { name: /广州训练集交付 PVC/ }).click();
-  await expect(
-    page.getByLabel('Snapshot 创建摘要').getByText('volume-guangzhou-delivery', { exact: true }),
-  ).toBeVisible();
-  await expect(page.locator('.el-message')).toHaveCount(0);
-  await page.evaluate(() => window.scrollTo(0, 0));
-  await page.screenshot({
-    path: testInfo.outputPath('release-placement.png'),
-    animations: 'disabled',
-    fullPage: true,
-  });
   await page.getByRole('button', { name: '创建 Snapshot', exact: true }).click();
 
-  await expect(page.getByText('服务暂时不可用')).toBeVisible();
-  await expect(page.getByText('AUTHORITY_UNAVAILABLE', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '重试', exact: true }).click();
   await expect(page.locator('.delivery-heading small')).toHaveText('可用');
   await expect(page.getByText('新请求', { exact: true })).toBeVisible();
-  await expect(page.getByText('新建交付位置', { exact: true })).toBeVisible();
-  await expect(page.getByText('cn-guangzhou', { exact: true })).toBeVisible();
-  const snapshotCreateBodies = await page.evaluate(
-    () =>
-      (window as typeof window & { __snapshotCreateBodies?: string[] }).__snapshotCreateBodies ??
-      [],
-  );
-  expect(snapshotCreateBodies).toHaveLength(2);
-  expect(JSON.parse(snapshotCreateBodies[1] ?? '{}')).toEqual(
-    JSON.parse(snapshotCreateBodies[0] ?? '{}'),
-  );
+  await expect(page.getByText('下一步在详情页处理 Replicate 和 Delivery')).toBeVisible();
+  await page.getByRole('button', { name: '查看 Snapshot' }).click();
+  await expect(page).toHaveURL(/\/snapshots\/snap-/);
+  await expect(page.getByRole('heading', { name: '先复制 Commit，再创建交付' })).toBeVisible();
+  await expect(
+    page
+      .getByRole('paragraph')
+      .filter({ hasText: '请先将 Commit 复制到当前目标 Volume，并等待 PlacementSet published' }),
+  ).toBeVisible();
+  await expect(page.getByRole('button', { name: '创建交付', exact: true })).toBeDisabled();
+  await expect(page.getByText(/Gateway 集群：华东 Gateway/)).toBeVisible();
+  await page.getByRole('button', { name: '复制 Commit', exact: true }).click();
+  await expect(page.locator('.replication-status')).toContainText('published', {
+    timeout: 15_000,
+  });
+  await expect(page.getByRole('button', { name: '副本已发布', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '创建交付', exact: true })).toBeEnabled({
+    timeout: 15_000,
+  });
+  await page.getByRole('button', { name: '创建交付', exact: true }).click();
+  await expect(page.getByText('等待调度', { exact: true })).toBeVisible();
   await expectNoOperatorDetails(page);
   await expectHealthyLayout(page);
   await expect(page.locator('.el-message')).toHaveCount(0);

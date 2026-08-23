@@ -18,10 +18,10 @@ spec:
     - to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: synapse-gateway-example
+              kubernetes.io/metadata.name: neoengram-gateway-example
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: synapse-gateway
+              app.kubernetes.io/name: neoengram-gateway
               neoengram.io/gateway-pool: gateway-pool-example
       ports:
         - protocol: TCP

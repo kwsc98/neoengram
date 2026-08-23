@@ -2,7 +2,7 @@
 
 These manifests implement the Gateway-only Agent network topology. Each Agent connects to its EdgeCluster's
 multi-replica GatewayPool and has no Central endpoint or fallback. See
-[`docs/synapse-gateway-architecture.md`](../../../docs/synapse-gateway-architecture.md). The checked-in
+[`docs/neoengram-gateway-architecture.md`](../../../docs/neoengram-gateway-architecture.md). The checked-in
 Gateway and Agent runtimes implement H2/mTLS identity validation and fail closed until an authenticated
 Central control session and a generation-current Agent route are established. Production certificate
 provisioning, two-replica E2E, and cutover validation remain deployment gates.

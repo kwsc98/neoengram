@@ -26,26 +26,113 @@ const MAX_CLIENT_CA_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct GatewayTransportConfig {
     /// PEM certificate chain presented by all Gateway listeners.
-    #[arg(long, env = "SYNAPSE_GATEWAY_TLS_CERTIFICATE_FILE")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TLS_CERTIFICATE_FILE")]
     pub(crate) tls_certificate_file: Option<PathBuf>,
 
     /// PEM private key matching the Gateway listener certificate.
     #[arg(
         long,
-        env = "SYNAPSE_GATEWAY_TLS_PRIVATE_KEY_FILE",
+        env = "NEOENGRAM_GATEWAY_TLS_PRIVATE_KEY_FILE",
         hide_env_values = true
     )]
     pub(crate) tls_private_key_file: Option<PathBuf>,
 
     /// PEM CA bundle used to authenticate Central, Agent, and peer workload certificates.
-    #[arg(long, env = "SYNAPSE_GATEWAY_TLS_CLIENT_CA_FILE")]
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TLS_CLIENT_CA_FILE")]
     pub(crate) tls_client_ca_file: Option<PathBuf>,
+}
+
+/// TLS material dedicated to the QUIC transfer plane. Keeping this separate from the HTTP/H2
+/// workload listeners lets a loopback development stack enable authenticated transfer relays
+/// without changing its existing Agent, Central-control, or peer endpoint schemes.
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct GatewayTransferTlsConfig {
+    /// PEM certificate chain presented by the transfer listener and outbound relay client.
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_TLS_CERTIFICATE_FILE")]
+    pub(crate) transfer_tls_certificate_file: Option<PathBuf>,
+
+    /// PEM private key matching `transfer_tls_certificate_file`.
+    #[arg(
+        long,
+        env = "NEOENGRAM_GATEWAY_TRANSFER_TLS_PRIVATE_KEY_FILE",
+        hide_env_values = true
+    )]
+    pub(crate) transfer_tls_private_key_file: Option<PathBuf>,
+
+    /// Shared transfer-plane CA used to authenticate Agents and both Gateway relay hops.
+    #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_TLS_CLIENT_CA_FILE")]
+    pub(crate) transfer_tls_client_ca_file: Option<PathBuf>,
+}
+
+impl GatewayTransferTlsConfig {
+    pub(crate) fn is_configured(&self) -> bool {
+        self.transfer_tls_certificate_file.is_some()
+            || self.transfer_tls_private_key_file.is_some()
+            || self.transfer_tls_client_ca_file.is_some()
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), GatewayTransportConfigError> {
+        match (
+            &self.transfer_tls_certificate_file,
+            &self.transfer_tls_private_key_file,
+            &self.transfer_tls_client_ca_file,
+        ) {
+            (Some(_), Some(_), Some(_)) | (None, None, None) => Ok(()),
+            _ => Err(GatewayTransportConfigError::IncompleteTransferTlsIdentity),
+        }
+    }
+
+    fn as_workload_transport(&self) -> GatewayTransportConfig {
+        GatewayTransportConfig {
+            tls_certificate_file: self.transfer_tls_certificate_file.clone(),
+            tls_private_key_file: self.transfer_tls_private_key_file.clone(),
+            tls_client_ca_file: self.transfer_tls_client_ca_file.clone(),
+        }
+    }
+
+    pub(crate) fn validate_local_identity(
+        &self,
+        edge_cluster_id: &str,
+        gateway_pool_id: &str,
+        gateway_replica_id: &str,
+        workload_trust_domain: Option<&str>,
+    ) -> Result<(), GatewayTransportConfigError> {
+        self.as_workload_transport().validate_local_server_identity(
+            edge_cluster_id,
+            gateway_pool_id,
+            gateway_replica_id,
+            workload_trust_domain,
+        )
+    }
+
+    pub(crate) fn validate_local_bootstrap_server_identity(
+        &self,
+    ) -> Result<(), GatewayTransportConfigError> {
+        self.as_workload_transport()
+            .validate_local_bootstrap_server_identity()
+    }
+
+    pub(crate) fn load_server_config(
+        &self,
+    ) -> Result<Arc<ServerConfig>, GatewayTransportConfigError> {
+        self.as_workload_transport().load_quic_server_config()
+    }
+
+    pub(crate) fn load_client_config(
+        &self,
+    ) -> Result<Arc<ClientConfig>, GatewayTransportConfigError> {
+        self.as_workload_transport().load_quic_client_config()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GatewayTransportConfigError {
     #[error("Gateway TLS certificate and private key files must be configured together")]
     IncompleteTlsIdentity,
+    #[error(
+        "Gateway transfer TLS certificate, private key, and client CA files must be configured together"
+    )]
+    IncompleteTransferTlsIdentity,
     #[error("plaintext Gateway listeners are permitted only when every listener is loopback")]
     PlaintextExposed,
     #[error("exposed Gateway listeners require a workload client CA for mTLS")]
@@ -703,6 +790,55 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
             client.alpn_protocols,
             vec![TRANSFER_ALPN.as_bytes().to_vec()]
         );
+        assert!(format!("{:?}", client.resumption).contains("Disabled"));
+    }
+
+    #[test]
+    fn transfer_tls_is_complete_and_independent_from_workload_listener_tls() {
+        let incomplete = GatewayTransferTlsConfig {
+            transfer_tls_certificate_file: Some(PathBuf::from("/transfer-certificate.pem")),
+            transfer_tls_private_key_file: None,
+            transfer_tls_client_ca_file: None,
+        };
+        assert!(matches!(
+            incomplete.validate(),
+            Err(GatewayTransportConfigError::IncompleteTransferTlsIdentity)
+        ));
+
+        let workload = GatewayTransportConfig::default();
+        assert!(workload
+            .load_server_config(loopback_listeners())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn dedicated_transfer_tls_builds_mtls_quic_policies() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("transfer-certificate.pem");
+        let private_key = directory.path().join("transfer-private-key.pem");
+        let client_ca = directory.path().join("transfer-client-ca.pem");
+        fs::write(&certificate, TEST_CERTIFICATE).unwrap();
+        fs::write(&private_key, TEST_PRIVATE_KEY).unwrap();
+        fs::write(&client_ca, TEST_CERTIFICATE).unwrap();
+        let transfer = GatewayTransferTlsConfig {
+            transfer_tls_certificate_file: Some(certificate),
+            transfer_tls_private_key_file: Some(private_key),
+            transfer_tls_client_ca_file: Some(client_ca),
+        };
+
+        transfer.validate().unwrap();
+        let server = transfer.load_server_config().unwrap();
+        let client = transfer.load_client_config().unwrap();
+        assert_eq!(
+            server.alpn_protocols,
+            vec![TRANSFER_ALPN.as_bytes().to_vec()]
+        );
+        assert_eq!(
+            client.alpn_protocols,
+            vec![TRANSFER_ALPN.as_bytes().to_vec()]
+        );
+        assert!(!server.session_storage.can_cache());
         assert!(format!("{:?}", client.resumption).contains("Disabled"));
     }
 

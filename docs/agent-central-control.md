@@ -12,16 +12,16 @@
 >
 > 最后更新：2026-08-10。
 >
-> 目标架构决策：Central 主动连接每个 EdgeCluster 的多副本 Synapse GatewayPool，Agent 只连接本集群
+> 目标架构决策：Central 主动连接每个 EdgeCluster 的多副本 NeoEngram GatewayPool，Agent 只连接本集群
 > Gateway；Agent 控制链固定经 Gateway，当前 Agent 已改为 Gateway-only 配置。Gateway
 > 专项权威边界见
-> [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。本文其余任何旧 Gateway 探索与该
+> [`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md)。本文其余任何旧 Gateway 探索与该
 > 文档冲突时均视为 obsolete。
 >
 > 本文统一描述 `neoengram-central`、`neoengram-agent`、多租户/多 EdgeCluster 边界、CPU 计算节点、NFS
 > 存储、Volume-bound Agent 和 Volume-local CAS。当前 `0.2.0`/仓库格式 9 只实现 transport- and
 > storage-independent library、协议、内存适配器、中心 SQLite authority、已注册的用户 API，以及
-> Agent enrollment/session/Job transport 开发 adapter。Synapse Gateway 的协议、Gateway Registry、管理面和
+> Agent enrollment/session/Job transport 开发 adapter。NeoEngram Gateway 的协议、Gateway Registry、管理面和
 > fail-closed 服务/部署骨架和 Replica activation challenge/proof/证书投递已部分实现；生产
 > 外部生产 issuer/KMS-HSM adapter、真实集群 readiness/failover 和切换仍是后续工作。PostgreSQL、跨 Volume 数据通道、NFS fencing、
 > HA 与生产部署也不是当前开发运行能力。
@@ -335,7 +335,7 @@ path、祖先、设备、inode、symlink 和 mount identity 校验拒绝路径�
 
 下图表达目标运行时边界；标注为 PostgreSQL、Gateway 和生产 mTLS 的节点需要后续 adapter。交互式
 HTML 已标记为迁移前参考；Gateway 的专项细节以
-[`synapse-gateway-architecture.md`](synapse-gateway-architecture.md) 为准。
+[`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md) 为准。
 
 ```mermaid
 flowchart TB
@@ -1844,11 +1844,11 @@ source: active -> frozen
 必须属于同一 Tenant/EdgeCluster、具有唯一且不重叠的 Artifact root，并由其活动 RW Owner 完成落盘和
 验证；CAS 失败时保持源 placement 权威，目标仅作为未激活的已验证候选清理或续传。
 
-## 13. Synapse Gateway 与 Volume CAS
+## 13. NeoEngram Gateway 与 Volume CAS
 
 2026-08-09 的架构决策取代此前“可选 source Volume Gateway”“Gateway 挂载只读对象根”和“两个 Agent
 自行建立临时通道”的探索。Gateway 的完整专项定义见
-[`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)；本节只记录与 Agent/Volume 的交界。
+[`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md)；本节只记录与 Agent/Volume 的交界。
 
 ### 13.1 控制入口与资源
 
@@ -2136,7 +2136,7 @@ crates/neoengram-domain/src/     # typed content IDs、logical paths、canonical
 crates/neoengram-runtime/        # Chunk、ObjectStore、Worktree、Mutation、Recovery 与读取内核
 services/neoengram-agent/       # Agent state machine + Gateway endpoint/trust/session transport
 services/neoengram-central/     # authority、identity、catalog、jobs、gateway、storage、snapshot、S3、lifecycle、API
-services/synapse-gateway/       # three-listener H2/mTLS router + activation + one-hop forwarding
+services/neoengram-gateway/       # three-listener H2/mTLS router + activation + one-hop forwarding
 ```
 
 `neoengram-domain::protocol` 只依赖 Serde/JSON Schema/JCS 支撑库，不依赖 runtime、CLI、SQLite、
@@ -2158,7 +2158,7 @@ services/synapse-gateway/       # three-listener H2/mTLS router + activation + o
   `extensions` round-trip 和未知消息稳定错误；metadata committed Schema 根是实际 wire DTO 的
   `anyOf` 联合，不是要求所有 DTO 同时出现的 catalog wrapper。
 
-目标 `synapse-gateway` 只允许依赖 domain 与网络、TLS、签名、观测组件，不得依赖
+目标 `neoengram-gateway` 只允许依赖 domain 与网络、TLS、签名、观测组件，不得依赖
 `neoengram-central` authority datasource/mapper、engine、fs、standalone 或 Volume adapter。它不包含业务
 数据库，不挂载 StorageVolume，也不成为 Chunk 或 metadata store。
 
@@ -2261,7 +2261,7 @@ generation 变化后无法继续领取或发布，无法证明旧 PVC writer 已
 hardlink 被拒绝；每个故障点要么恢复到完整状态，要么明确停在 `RECOVERY_REQUIRED`。强隔离上线前
 还必须证明 storage-side fence 能阻止失陷旧进程继续写。
 
-### A4：Synapse Gateway 控制与对象传输
+### A4：NeoEngram Gateway 控制与对象传输
 
 - 第一里程碑先实现 GatewayPool/Replica/AgentRouteLease、Registry 持久化、Central 主动连接、Agent
   经本集群 Gateway enrollment/session、H2+mTLS、端到端签名和双 Replica forwarding；
@@ -2387,7 +2387,7 @@ SQLite 模式只允许单 server 副本，生产 TLS 由 Ingress/反向代理终
 - 自动 Agent failover、跨 Agent 并行调度与强 storage-side fencing；
 - 中心 Playground Index 的 PostgreSQL publisher、Agent cache/candidate adapter、持久 Job Ledger 的
   session 接线和经 transport 的真实 MetadataBatch 上传；
-- GatewayPool/Replica/AgentRouteLease 和可运行 `synapse-gateway` 已进入 G1；G1 仍缺完整业务 E2E、
+- GatewayPool/Replica/AgentRouteLease 和可运行 `neoengram-gateway` 已进入 G1；G1 仍缺完整业务 E2E、
   外部 KMS/HSM issuer/provisioner、真实 readiness/failover、证书自动切换和维护窗口切换。TransferRoute/
   Ticket/Session、只读 S3 Access Point 和跨 EdgeCluster/StorageVolume Transfer 属于后续 G2/G3；
 - 分布式 lease、ObjectLocation、远端 GC 和自动故障接管。

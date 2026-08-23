@@ -34,12 +34,14 @@ impl SystemService {
         let mut capabilities = vec![
             "artifact_catalog".to_owned(),
             "artifact_commit_graph".to_owned(),
+            "artifact_commit_diff".to_owned(),
             "managed_add".to_owned(),
             "playground_browser".to_owned(),
             "sqlite_authority".to_owned(),
         ];
         if self.storage_execution_enabled {
             capabilities.extend([
+                "artifact_commit_replication".to_owned(),
                 "playground_materialize".to_owned(),
                 "playground_precommit".to_owned(),
                 "snapshot_materialize".to_owned(),

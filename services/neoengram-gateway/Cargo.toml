@@ -1,16 +1,17 @@
 [package]
-name = "synapse-gateway"
+name = "neoengram-gateway"
 description = "Fail-closed edge Gateway process for NeoEngram control-plane routing"
 publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [[bin]]
-name = "synapse-gateway"
+name = "neoengram-gateway"
 path = "src/main.rs"
 
 [dependencies]

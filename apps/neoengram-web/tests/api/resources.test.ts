@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  cancelCommitReplication,
   cancelPlaygroundPreCommit,
   commitPlayground,
   createArtifact,
@@ -12,6 +13,10 @@ import {
   queryArtifactCommitDiff,
   queryArtifactCommitGraph,
   queryArtifactList,
+  queryCommitAvailability,
+  queryCommitPlacementList,
+  queryCommitReplicationList,
+  queryGatewayPoolList,
   queryPlayground,
   queryPlaygroundChangeList,
   queryPlaygroundDatasetProfile,
@@ -30,7 +35,9 @@ import {
   queryStorageVolumeList,
   queryTenant,
   queryTenantList,
+  replicateCommit,
   restartPlaygroundPreCommit,
+  retryCommitReplication,
   retrySnapshotDelivery,
   startPlaygroundPreCommit,
 } from '@/api/operations';
@@ -38,6 +45,7 @@ import type { PreCommitView } from '@/api/types';
 import {
   artifacts,
   commitGraphs,
+  gatewayPools,
   mockCommitIds,
   playgrounds,
   snapshots,
@@ -139,6 +147,92 @@ describe('tenant-scoped public resource operations', () => {
     });
   });
 
+  it('queries the GatewayPool inventory used by the storage hierarchy', async () => {
+    const pools = await queryGatewayPoolList({ page_size: 255 });
+    expect(pools.data.items).toEqual(gatewayPools);
+  });
+
+  it('replicates a Commit through the mock cluster route and publishes its PlacementSet', async () => {
+    const request = {
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      commit_id: mockCommitIds.roadMain3,
+      target_storage_volume_id: 'volume-beijing-language',
+      request_id: 'replicate-road-main-to-beijing',
+    };
+    const created = await replicateCommit(request);
+    expect(created.data).toMatchObject({
+      replayed: false,
+      replication: {
+        state: 'queued',
+        target_edge_cluster_id: 'cluster-cn-north-1',
+        target_gateway_pool_id: 'pool-cn-north-1',
+      },
+    });
+    expect((await replicateCommit(request)).data.replayed).toBe(true);
+
+    let state = created.data.replication.state;
+    for (let query = 0; query < 4 && state !== 'published'; query += 1) {
+      const replications = await queryCommitReplicationList({
+        tenant_id: request.tenant_id,
+        commit_id: request.commit_id,
+      });
+      state = replications.data.replications[0]!.state;
+    }
+    expect(state).toBe('published');
+
+    const placements = await queryCommitPlacementList({
+      tenant_id: request.tenant_id,
+      commit_id: request.commit_id,
+    });
+    expect(placements.data.placements).toContainEqual(
+      expect.objectContaining({
+        storage_volume_id: request.target_storage_volume_id,
+        state: 'published',
+      }),
+    );
+    const availability = await queryCommitAvailability({
+      tenant_id: request.tenant_id,
+      commit_id: request.commit_id,
+    });
+    expect(availability.data.availability.verified_storage_volume_ids).toContain(
+      request.target_storage_volume_id,
+    );
+
+    await expect(
+      replicateCommit({
+        ...request,
+        project_id: 'project-language',
+        request_id: 'replicate-commit-from-wrong-artifact',
+      }),
+    ).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('cancels and retries one immutable Commit replication task', async () => {
+    const created = await replicateCommit({
+      tenant_id: 'tenant-a',
+      project_id: 'project-vision',
+      artifact_id: 'road-scenes',
+      commit_id: mockCommitIds.roadMain2,
+      target_storage_volume_id: 'volume-guangzhou-delivery',
+      request_id: 'replicate-road-main-to-guangzhou',
+    });
+    const cancelled = await cancelCommitReplication({
+      tenant_id: 'tenant-a',
+      replication_id: created.data.replication.replication_id,
+      expected_attempt: created.data.replication.attempt,
+    });
+    expect(cancelled.data.replication.state).toBe('cancelled');
+
+    const retried = await retryCommitReplication({
+      tenant_id: 'tenant-a',
+      replication_id: created.data.replication.replication_id,
+      expected_attempt: cancelled.data.replication.attempt,
+    });
+    expect(retried.data.replication).toMatchObject({ attempt: '2', state: 'queued' });
+  });
+
   it('keeps Project, Artifact, Playground and Snapshot queries tenant-scoped', async () => {
     const projects = await queryProjectList({ tenant_id: 'tenant-a', page_size: 100 });
     expect(projects.data.items).toHaveLength(2);
@@ -220,7 +314,6 @@ describe('tenant-scoped public resource operations', () => {
         base_commit_id: mockCommitIds.roadMain3,
       }),
     ).rejects.toMatchObject({ status: 409, code: 'STORAGE_VOLUME_UNAVAILABLE' });
-
   });
 
   it('derives a Playground from a selected historical Commit or the current Head', async () => {

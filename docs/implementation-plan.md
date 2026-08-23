@@ -5,13 +5,13 @@
 > 中心化 Agent 的用户角色、公开资源语义、页面和交互口径见
 > [`centralized-agent-product.md`](centralized-agent-product.md)。
 > Gateway 的连接、安全、HA、数据传输和 S3 专项边界见
-> [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md)。
+> [`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md)。
 
 最后更新：2026-08-10
 当前阶段：`0.2.0` P0、中心 `AuthorityStore`/SQLite 默认后端，以及 Volume-bound Agent enrollment、
 本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；独立 `neoengram-central` 提供用户 API 和
 迁移前 Agent action listener，`neoengram-agent` 已通过 Gateway H2 双向 channel 完成
-enrollment/session/Job，并将 Chunk 直接写入用户 Volume CAS。Synapse Gateway G1 已实现协议、
+enrollment/session/Job，并将 Chunk 直接写入用户 Volume CAS。NeoEngram Gateway G1 已实现协议、
 Gateway Registry、管理 API、Central session、
 Registry-driven outbound tunnel、Replica activation、运行时 H2/mTLS、RouteLease、Central command
 signing/trust bundle 和最多一跳 peer forwarding；双 Replica listener/H2/peer harness 与真实
@@ -314,7 +314,7 @@ Agent 访问 Playground 和获批 Volume CAS，将结构化 metadata/placement e
 多 EdgeCluster、CPU/NFS 调度和跨卷 checkout 仍处设计或后续阶段。Gateway 不再是待定目标：G1
 控制面已经落地 Registry/管理面、三类 listener、H2/mTLS tunnel、RouteLease、命令签名和最多一跳
 forwarding，但完整业务 E2E、外部生产 issuer/KMS-HSM、真实集群 readiness/failover、维护窗口切换
-仍未完成。Gateway 的边界以 [`synapse-gateway-architecture.md`](synapse-gateway-architecture.md) 为准，
+仍未完成。Gateway 的边界以 [`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md) 为准，
 其他控制面细节见 [`agent-central-control.md`](agent-central-control.md)。这些文档不代表已经存在中心
 PostgreSQL、生产级 lease/fencing、跨 Volume 数据通道或 G2/G3 能力。
 
@@ -370,7 +370,7 @@ unavailable，禁止自动接管。
 `neoengram-agent` 纵切；PostgreSQL、Agent 生产 mTLS、跨 Volume 复制、NFS fencing、其余公开 API 与 HA
 仍不包含在当前实现中。
 
-### G0：Synapse Gateway 架构冻结
+### G0：NeoEngram Gateway 架构冻结
 
 状态：**已完成（仅文档，不代表运行能力）**
 
@@ -395,7 +395,7 @@ unavailable，禁止自动接管。
   action fail-closed 返回 `503`。
 - `HttpGatewayBootstrapTransport` 只能由 `reqwest::ClientBuilder` 构造，内部强制关闭 HTTP
   redirect；bootstrap proof/证书 payload 不得被 3xx 转发到 Registry 之外的 origin。
-- 已新增 `services/synapse-gateway`、Agent edge/Central control/Replica peer listener、限额/health 和
+- 已新增 `services/neoengram-gateway`、Agent edge/Central control/Replica peer listener、限额/health 和
   Kubernetes Deployment/Service/PDB/NetworkPolicy；Gateway Pod 无业务 Volume mount；
 - 已将 Agent 配置收敛为 GatewayPool endpoint + trust bundle 且无 Central fallback；Central 根据
   Registry endpoint 建立 outbound 连接，Agent 请求转发、session 与 RouteLease 由 Central 原子判定；
@@ -881,5 +881,5 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-30 | 冻结派生 Artifact 与多区域 Snapshot 产品身份 | Artifact 只能为空或从同 Tenant 明确 Commit 派生；Snapshot 使用独立 ID，同一 Commit 可有多个单 Region/Volume Snapshot；Playground/Snapshot 主状态统一为 Creating/Ready/Abnormal |
 | 2026-07-31 | 冻结 0.0.1 Kubernetes Agent 部署和接管边界 | 一个业务 PVC/StorageVolume 对应一个常驻 AgentInstance；固定 `/volume`、独立状态 PVC、主动注册和首次审批；无 Operator/Kubernetes API，故障接管仅承诺 generation + 人工流程的 cooperative fencing |
 | 2026-08-06 | 以用户 StorageVolume 内的 Volume-local CAS 取代 2026-07-26 的中心 S3 durability authority | Chunk payload 由 Volume Owner Agent 持久化；Server 只保存 Manifest、Index 和 `ObjectPlacementEvidence`；跨 Volume 由获批 Agent/Gateway 数据端点直传，payload 不经过 Server |
-| 2026-08-09 | 确认每个 EdgeCluster 一个多副本 Synapse GatewayPool，Central 和 Agent 均经 Gateway 建立控制链路 | Gateway 成为固定区域入口和后续跨集群/S3 边界；Central 仍是 metadata authority，Volume Owner Agent 仍是唯一 Volume I/O 执行者；当前 Agent 直连 Server 和可选 Volume-bound Gateway 仅作为历史基线 |
+| 2026-08-09 | 确认每个 EdgeCluster 一个多副本 NeoEngram GatewayPool，Central 和 Agent 均经 Gateway 建立控制链路 | Gateway 成为固定区域入口和后续跨集群/S3 边界；Central 仍是 metadata authority，Volume Owner Agent 仍是唯一 Volume I/O 执行者；当前 Agent 直连 Server 和可选 Volume-bound Gateway 仅作为历史基线 |
 | 2026-08-10 | 校正 G2/G3、Web 配置与 GatewayPool readiness 的未完成边界 | G2/G3 目标流程明确标注当前未实现；静态 Web 构建必须绑定一个 GatewayPool EdgeCluster，Pool `Ready` 仍需外部 observed readiness/failover 证据；架构检查守护 Web binding，不改变 Central 授权或后端协议 |

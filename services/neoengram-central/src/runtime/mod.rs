@@ -64,7 +64,7 @@ const GATEWAY_CREDENTIAL_EXPIRY_RECONCILE_INTERVAL: Duration = Duration::from_se
 const JOB_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const RESOURCE_LIFECYCLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const GATEWAY_REPLICA_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_DEVELOPMENT_PERMISSIONS: [Permission; 26] = [
+const DEFAULT_DEVELOPMENT_PERMISSIONS: [Permission; 27] = [
     Permission::CreateAddJob,
     Permission::QueryJob,
     Permission::FinalizeAdd,
@@ -78,6 +78,7 @@ const DEFAULT_DEVELOPMENT_PERMISSIONS: [Permission; 26] = [
     Permission::StorageEnrollmentReview,
     Permission::ArtifactRead,
     Permission::ArtifactCreate,
+    Permission::ArtifactCommitReplicate,
     Permission::ProjectRead,
     Permission::ProjectCreate,
     Permission::PlaygroundRead,
@@ -142,7 +143,7 @@ pub struct Config {
     pub rbac_file: Option<PathBuf>,
 
     /// Development-only raw 32-byte KEK used by the local S3 envelope adapter.
-    #[arg(long, env = "SYNAPSE_S3_ENVELOPE_KEY_FILE", hide_env_values = true)]
+    #[arg(long, env = "NEOENGRAM_S3_ENVELOPE_KEY_FILE", hide_env_values = true)]
     pub s3_envelope_key_file: Option<PathBuf>,
 
     /// OIDC issuer used in production mode.
@@ -454,11 +455,15 @@ impl AppState {
         };
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let authority_store = authority.authority_store();
-        let control = Arc::new(ControlPlane::new(
-            policy.clone(),
-            authority_store.clone(),
-            clock.clone(),
-        ));
+        let mut control_builder =
+            ControlPlane::new(policy.clone(), authority_store.clone(), clock.clone());
+        if let Some(placement) = authority_store.placement() {
+            control_builder = control_builder.with_placement_repository(placement);
+        }
+        if let Some(keyring) = command_keyring_dependency.as_ref() {
+            control_builder = control_builder.with_replication_ticket_keyring(keyring.clone());
+        }
+        let control = Arc::new(control_builder);
         let catalog_repository = authority_store.control_catalog().ok_or_else(|| {
             RuntimeError::Authority("SQLite authority has no control catalog".to_owned())
         })?;
@@ -641,7 +646,9 @@ impl AppState {
             None => catalog,
         };
         let catalog = match command_keyring_dependency.as_ref() {
-            Some(keyring) => catalog.with_s3_ticket_keyring(keyring.clone()),
+            Some(keyring) => catalog
+                .with_s3_ticket_keyring(keyring.clone())
+                .with_replication_ticket_keyring(keyring.clone()),
             None => catalog,
         };
         let catalog = catalog.with_gateway_registry(gateway_repository.clone());
