@@ -11,7 +11,7 @@ exposed through `WorkloadCertificateIssuer`; neither is supplied by this directo
 requires the complete two-replica business E2E and real-cluster failover evidence. The public
 listener in this example exposes the console and read-only S3 access protocol; it does not make
 Gateway or Central a durability backend. See
-[`docs/neoengram-gateway-architecture.md`](../../../docs/neoengram-gateway-architecture.md).
+[`docs/architecture/gateway.md`](../../../docs/architecture/gateway.md).
 
 This directory models one EdgeCluster GatewayPool with two independently managed replicas. It
 uses two explicit `Deployment` documents (`gateway-pool-example-r0` and `gateway-pool-example-r1`)
@@ -132,12 +132,15 @@ Volume.
 
 Relay routing is deliberately overlay-specific. A target Gateway accepts the target Agent hop and
 forwards to the source Gateway; a source Gateway accepts that hop and forwards to the source Agent.
-When a relay is enabled, all of the following values are required together:
+When a relay is enabled, the role and fixed next hop are required together. Generation values are
+optional startup hints; the Gateway refreshes the tuple from the Central-authorized Agent
+`channel.opened` response and keeps the transfer listener fail-closed until that route is active:
 
 ```text
 NEOENGRAM_GATEWAY_TRANSFER_RELAY_ROLE=target|source
 NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM=<fixed-next-hop-address>
 NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM_SERVER_NAME=<upstream-TLS-server-name>
+# Optional static startup fence; omit all three to learn it at runtime.
 NEOENGRAM_GATEWAY_TRANSFER_SESSION_GENERATION=<current-session-generation>
 NEOENGRAM_GATEWAY_TRANSFER_MOUNT_GENERATION=<current-mount-generation>
 NEOENGRAM_GATEWAY_TRANSFER_ROUTE_GENERATION=<current-route-generation>
@@ -147,10 +150,11 @@ The checked-in base leaves the role, upstream, and generation values unset, so i
 authenticated listener while remaining fail-closed until the provisioner renders a route lease.
 During the bootstrap phase the listener may use the server-auth bootstrap certificate, but Gateway
 rejects any relay route; remove the bootstrap path settings and roll the Pod with the promoted
-workload certificate before enabling a source/target relay.
-Do not put a source Agent address in a ticket or derive an upstream from request data. If any route
-generation changes, drain and roll the affected Gateway with the new complete tuple; a stale tuple
-must reject the ticket before the first object frame.
+workload certificate before enabling a source/target relay. If a Gateway or Agent reconnects, the
+active route and its session generation update the transfer fence automatically; no manual roll is
+needed for generation changes.
+Do not put a source Agent address in a ticket or derive an upstream from request data. A stale or
+missing runtime route must reject the ticket before the first object frame.
 
 ## Applying a rendered example
 

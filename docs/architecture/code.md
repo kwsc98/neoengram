@@ -5,23 +5,24 @@ wire contract，`neoengram-runtime` 统一执行内核与本地适配器 facade�
 Central 进程入口，Gateway 与 Web 保持独立部署边界。
 当前仍以本地仓库格式 9 工作流为主要产品；`neoengram-central` 同时承载 authority、HTTP API 和 Gateway
 composition，已提供后端无关
-`AuthorityStore` 和默认 SQLite 单节点权威后端。它通过 Fusen 0.9.0 暴露已实现的
-system、Tenant、StorageVolume、Enrollment、Artifact、Playground、Snapshot 基础、Job 和 Gateway Registry action API，并保留
-Central 不再提供独立 Agent listener。Agent 控制链只通过 Gateway 建立 HTTP/2 全双工 control
+`AuthorityStore` 和默认 SQLite 单节点权威后端。它通过 Fusen 0.9.0 暴露当前 Central descriptor 中的
+system、Tenant、Project、StorageVolume、Enrollment、Artifact/Commit graph/diff/replication、Playground、
+Snapshot/SnapshotDelivery、S3、lifecycle、Job 和 Gateway Registry action API；仅 Snapshot file/activity/
+dataset-profile 三条公开路径保留为 contract-only。Central 不再提供独立 Agent listener。Agent 控制链只通过 Gateway 建立 HTTP/2 全双工 control
 channel；当前 `neoengram-agent` 已改为 Gateway-only 配置，Gateway 控制面、运行时 mTLS、下行命令签名
 和一跳 peer forwarding 已接入。Vue 3 Web
 控制台可通过 MSW 运行多租户资源浏览、
-StorageVolume 登记与放置选择、Artifact/Playground/Snapshot 创建、Playground Commit 与 Managed
+StorageVolume 登记与放置选择、Artifact/Playground/Snapshot 创建、SnapshotDelivery、Playground Commit 与 Managed
 Add Job 流程，并可查看 Commit 描述、Tags、父 Commit 信息和文件 Diff，但尚未
-连接完整真实中心。这不代表其余 OpenAPI、PostgreSQL、生产凭据签发/轮换、跨 Volume 数据路由或 HA 已经实现。能力状态和后续路线统一见
-[`implementation-plan.md`](implementation-plan.md)。
+覆盖完整真实中心数据面。这不代表 derived Artifact 执行、Snapshot contract-only 查询、PostgreSQL、生产凭据签发/轮换、跨 Volume 数据路由或 HA 已经完成。能力状态和后续路线统一见
+[`../roadmap.md`](../roadmap.md)。
 
 2026-08-09 已确认 `services/neoengram-gateway` 的目标架构。G1 已加入协议、Registry/管理 API、
 三 listener、Central outbound tunnel、工作负载证书校验、端到端命令签名和一跳 peer forwarding，
 Agent 配置也已切到 Gateway-only；双 Replica listener/H2/peer harness 和真实 Registry RouteLease 接管
 契约已分别通过，但完整业务 E2E、外部生产凭据适配、真实集群故障/就绪和切换验收仍未完成。目标状态由
 Central 主动连接每个 EdgeCluster 的 GatewayPool，Agent 只连接本集群 Gateway。Gateway 的完整边界见
-[`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md)，在端到端契约测试和部署切换完成前
+[`gateway.md`](gateway.md)，在端到端契约测试和部署切换完成前
 不得把部分骨架标记为可用 Gateway 能力。
 
 ## Workspace 与职责
@@ -167,5 +168,5 @@ payload。Gateway 不挂载 Volume。HTTP/3、外部生产凭据 provisioner、P
 属于后续 adapter/部署阶段。开发 profile 不能被描述为
 具备生产传输安全或 HA 的完整业务 Agent。
 
-本地磁盘布局及事务语义见 [`storage-architecture.md`](storage-architecture.md)；中心与 Agent 的详细
-边界见 [`agent-central-control.md`](agent-central-control.md)。
+本地磁盘布局及事务语义见 [`storage.md`](storage.md)；中心与 Agent 的详细
+边界见 [`control-plane.md`](control-plane.md)。

@@ -10,14 +10,16 @@ use neoengram_domain::protocol::{
 };
 use sqlx::{sqlite::SqliteRow, Row};
 
-use super::authority::{digest_from_blob, storage_corruption, storage_error, SqliteAuthorityStore};
+use super::authority::{
+    decode, digest_from_blob, encode, storage_corruption, storage_error, SqliteAuthorityStore,
+};
 use crate::{
-    valid_replication_transition, validate_replication_checkpoints,
+    same_retry_request, valid_replication_transition, validate_replication_checkpoints,
     validate_replication_publication, validate_replication_record, CancelReplicationRequest,
     CentralError, CentralErrorCode, CentralResult, CommitAvailabilityRecord,
     FinalizeReplicationRequest, FinalizeReplicationResult, PlacementRepository,
     ReplicationObjectRecord, ReplicationRecord, ReplicationStateTransitionRequest,
-    RetryReplicationRequest, WorkspaceRecord,
+    RetryReplicationRequest, RetryReplicationResult, WorkspaceRecord,
 };
 
 fn as_i64(value: UnixMillis) -> CentralResult<i64> {
@@ -1713,7 +1715,48 @@ impl PlacementRepository for SqliteAuthorityStore {
         // The replication row and its artifact namespace are one identity.  Keep both writes in
         // the same transaction so a crash cannot leave an assignment-visible row without the
         // scope required to open its artifact CAS.
-        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let mut transaction = if matches!(
+            record.state,
+            ReplicationState::Queued
+                | ReplicationState::Planning
+                | ReplicationState::Transferring
+                | ReplicationState::Verifying
+        ) {
+            // Claim checks must start as a writer transaction.  A deferred transaction can read
+            // an unclaimed target, then lose the race to finalize before its INSERT commits.
+            self.pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(storage_error)?
+        } else {
+            self.pool.begin().await.map_err(storage_error)?
+        };
+        if matches!(
+            record.state,
+            ReplicationState::Queued
+                | ReplicationState::Planning
+                | ReplicationState::Transferring
+                | ReplicationState::Verifying
+        ) {
+            let target_placement_exists: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM commit_placement_sets \
+                 WHERE tenant_id = ? AND commit_id = ? AND backend_id = ? LIMIT 1",
+            )
+            .bind(record.tenant_id.as_str())
+            .bind(record.commit_id.as_bytes().as_slice())
+            .bind(&record.target_backend_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if target_placement_exists.is_some() {
+                transaction.rollback().await.map_err(storage_error)?;
+                return Err(CentralError::new(
+                    CentralErrorCode::ReplicationAlreadyActive,
+                    "a Commit PlacementSet already targets this backend",
+                )
+                .with_retryable(false));
+            }
+        }
         let result = sqlx::query(
             "INSERT INTO replications \
              (tenant_id, replication_id, commit_id, target_backend_id, target_storage_volume_id, \
@@ -1831,7 +1874,7 @@ impl PlacementRepository for SqliteAuthorityStore {
                     })
                 {
                     return Err(CentralError::new(
-                        CentralErrorCode::InvalidState,
+                        CentralErrorCode::ReplicationAlreadyActive,
                         "an active replication already targets this Commit and backend",
                     )
                     .with_retryable(false));
@@ -1937,22 +1980,66 @@ impl PlacementRepository for SqliteAuthorityStore {
     async fn retry_replication(
         &self,
         request: RetryReplicationRequest,
-    ) -> CentralResult<ReplicationRecord> {
-        let current = self
-            .get_replication(&request.tenant_id, &request.replication_id)
-            .await?
-            .ok_or_else(|| {
-                CentralError::new(
-                    CentralErrorCode::ResourceNotFound,
-                    "replication does not exist",
-                )
-                .with_retryable(false)
-            })?;
-        if current.state == ReplicationState::Queued
-            && current.attempt == request.expected_attempt.saturating_add(1)
+    ) -> CentralResult<RetryReplicationResult> {
+        // Retry receipts and the attempt CAS share one writer transaction.  This makes the
+        // request ID the linearization point: a duplicate can return its original snapshot even
+        // after another retry has advanced the live Replication row.
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(storage_error)?;
+        if let Some(row) = sqlx::query(
+            "SELECT request_payload, result_payload FROM replication_retry_mutations \
+             WHERE tenant_id = ? AND request_id = ?",
+        )
+        .bind(request.tenant_id.as_str())
+        .bind(request.request_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
         {
-            return Ok(current);
+            let stored_request: RetryReplicationRequest = decode(
+                &row.try_get::<Vec<u8>, _>("request_payload")
+                    .map_err(storage_error)?,
+            )?;
+            let stored_result: ReplicationRecord = decode(
+                &row.try_get::<Vec<u8>, _>("result_payload")
+                    .map_err(storage_error)?,
+            )?;
+            transaction.rollback().await.map_err(storage_error)?;
+            return if same_retry_request(&stored_request, &request) {
+                Ok(RetryReplicationResult {
+                    replication: stored_result,
+                    replayed: true,
+                })
+            } else {
+                Err(CentralError::new(
+                    CentralErrorCode::ReplicationRetryRequestReused,
+                    "replication retry request ID is already bound to another payload",
+                )
+                .with_retryable(false))
+            };
         }
+
+        let current = sqlx::query(&format!(
+            "SELECT {REPLICATION_COLUMNS} FROM replications \
+             WHERE tenant_id = ? AND replication_id = ?",
+        ))
+        .bind(request.tenant_id.as_str())
+        .bind(request.replication_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .map(|row| decode_replication(&row))
+        .transpose()?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "replication does not exist",
+            )
+            .with_retryable(false)
+        })?;
         if current.attempt != request.expected_attempt {
             return Err(CentralError::new(
                 CentralErrorCode::ConcurrentUpdate,
@@ -1984,29 +2071,44 @@ impl PlacementRepository for SqliteAuthorityStore {
             )
             .with_retryable(false)
         })?;
-        if self
-            .list_replications_for_commit(&current.tenant_id, &current.commit_id)
-            .await?
-            .iter()
-            .any(|existing| {
-                existing.replication_id != current.replication_id
-                    && existing.target_backend_id == current.target_backend_id
-                    && matches!(
-                        existing.state,
-                        ReplicationState::Queued
-                            | ReplicationState::Planning
-                            | ReplicationState::Transferring
-                            | ReplicationState::Verifying
-                    )
-            })
-        {
+        let active_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM replications \
+             WHERE tenant_id = ? AND commit_id = ? AND target_backend_id = ? \
+               AND replication_id <> ? \
+               AND state IN ('queued', 'planning', 'transferring', 'verifying') LIMIT 1",
+        )
+        .bind(current.tenant_id.as_str())
+        .bind(current.commit_id.as_bytes().as_slice())
+        .bind(&current.target_backend_id)
+        .bind(current.replication_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if active_exists.is_some() {
             return Err(CentralError::new(
-                CentralErrorCode::InvalidState,
+                CentralErrorCode::ReplicationAlreadyActive,
                 "an active replication already targets this Commit and backend",
             )
             .with_retryable(false));
         }
-        let result = sqlx::query(
+        let target_placement_exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM commit_placement_sets \
+             WHERE tenant_id = ? AND commit_id = ? AND backend_id = ? LIMIT 1",
+        )
+        .bind(current.tenant_id.as_str())
+        .bind(current.commit_id.as_bytes().as_slice())
+        .bind(&current.target_backend_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if target_placement_exists.is_some() {
+            return Err(CentralError::new(
+                CentralErrorCode::ReplicationAlreadyActive,
+                "a Commit PlacementSet already targets this backend",
+            )
+            .with_retryable(false));
+        }
+        let update = sqlx::query(
             "UPDATE replications SET state = 'queued', attempt = ?, error_code = NULL, \
              error_message = NULL, updated_at_unix_ms = ? \
              WHERE tenant_id = ? AND replication_id = ? AND state = ? AND attempt = ?",
@@ -2023,29 +2125,56 @@ impl PlacementRepository for SqliteAuthorityStore {
             i64::try_from(request.expected_attempt)
                 .map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?,
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await;
-        let result = match result {
+        let update = match update {
             Ok(result) => result,
             Err(error) if is_unique(&error) => {
                 return Err(CentralError::new(
-                    CentralErrorCode::InvalidState,
+                    CentralErrorCode::ReplicationAlreadyActive,
                     "an active replication already targets this Commit and backend",
                 )
                 .with_retryable(false));
             }
             Err(error) => return Err(storage_error(error)),
         };
-        if result.rows_affected() != 1 {
+        if update.rows_affected() != 1 {
             return Err(CentralError::new(
                 CentralErrorCode::ConcurrentUpdate,
                 "replication changed before retry could be persisted",
             )
             .with_retryable(false));
         }
-        self.get_replication(&request.tenant_id, &request.replication_id)
-            .await?
-            .ok_or_else(|| storage_corruption("retried replication disappeared"))
+        let result = sqlx::query(&format!(
+            "SELECT {REPLICATION_COLUMNS} FROM replications \
+             WHERE tenant_id = ? AND replication_id = ?",
+        ))
+        .bind(request.tenant_id.as_str())
+        .bind(request.replication_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .map(|row| decode_replication(&row))
+        .transpose()?
+        .ok_or_else(|| storage_corruption("retried replication disappeared"))?;
+        sqlx::query(
+            "INSERT INTO replication_retry_mutations \
+             (tenant_id, request_id, replication_id, request_payload, result_payload) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(request.tenant_id.as_str())
+        .bind(request.request_id.as_str())
+        .bind(request.replication_id.as_str())
+        .bind(encode(&request)?)
+        .bind(encode(&result)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(RetryReplicationResult {
+            replication: result,
+            replayed: false,
+        })
     }
 
     async fn cancel_replication(
@@ -2252,6 +2381,27 @@ impl PlacementRepository for SqliteAuthorityStore {
             return Err(CentralError::new(
                 CentralErrorCode::ConcurrentUpdate,
                 "replication state or attempt changed during finalize",
+            )
+            .with_retryable(false));
+        }
+        let conflicting_active_target: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM replications \
+             WHERE tenant_id = ? AND commit_id = ? AND target_backend_id = ? \
+               AND replication_id <> ? \
+               AND state IN ('queued', 'planning', 'transferring', 'verifying') LIMIT 1",
+        )
+        .bind(request.tenant_id.as_str())
+        .bind(current.commit_id.as_bytes().as_slice())
+        .bind(request.placement_set.backend_id.as_str())
+        .bind(request.replication_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if conflicting_active_target.is_some() {
+            transaction.rollback().await.map_err(storage_error)?;
+            return Err(CentralError::new(
+                CentralErrorCode::ReplicationAlreadyActive,
+                "an active replication already targets this Commit and backend",
             )
             .with_retryable(false));
         }

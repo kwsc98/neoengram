@@ -29,6 +29,7 @@ import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
 import {
   commitReplicationRequestId,
+  commitReplicationRetryRequestId,
   findCommitReplicationForTarget,
   isCommitReplicationActive,
 } from '@/features/commit-replication';
@@ -189,6 +190,10 @@ const storageVolumeQuery = useQuery({
   queryFn: () => queryStorageVolumeList({ tenant_id: tenantId.value, page_size: 100 }),
   enabled: computed(() => artifactCommitReplicationEnabled.value && commitDetailOpen.value),
   staleTime: 15_000,
+  // StorageVolume.state is Agent-heartbeat derived; keep replication choices fresh after an
+  // Agent or mount disappears instead of retaining a stale ready option in this long-lived view.
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
 });
 const gatewayPoolQuery = useQuery({
   queryKey: computed(() => ['gateway-pools', tenantId.value, 'artifact-commit-replication']),
@@ -200,6 +205,8 @@ const gatewayPoolQuery = useQuery({
       gatewayInventoryEnabled.value,
   ),
   staleTime: 15_000,
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
 });
 const replicationListQuery = useQuery({
   queryKey: computed(() => [
@@ -468,6 +475,7 @@ async function retrySelectedReplication(
     tenant_id: tenantId.value,
     replication_id: replication.replication_id,
     expected_attempt: replication.attempt,
+    request_id: commitReplicationRetryRequestId(replication.replication_id, replication.attempt),
   });
   ElMessage.success('复制任务已重新提交');
   await replicationListQuery.refetch();

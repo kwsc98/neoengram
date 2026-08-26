@@ -219,6 +219,18 @@ fn replication_route_unavailable(role: &str) -> Error {
     )
 }
 
+fn replication_prerequisites_unmet(role: &str) -> Error {
+    application_error(
+        ErrorCategory::Conflict,
+        "replication_prerequisites_unmet",
+        "REPLICATION_PREREQUISITES_UNMET",
+        format!(
+            "{role} StorageVolume Agent is ready for control traffic but has not passed the Commit replication QUIC preflight"
+        ),
+        false,
+    )
+}
+
 fn ensure_replication_capacity(
     total_bytes: u64,
     reserve_bytes: u64,
@@ -507,6 +519,17 @@ impl CatalogService {
                     && route.edge_cluster_id == volume.edge_cluster_id
             })
             .ok_or_else(|| replication_route_unavailable(role))?;
+        if let Some(agent_registry) = &self.agent_registry {
+            if !agent_registry
+                .current_ready_volume_supports_replication(tenant_id, &volume.storage_volume_id)
+                .await
+                .map_err(map_central_error)?
+            {
+                return Err(replication_prerequisites_unmet(role));
+            }
+        } else {
+            return Err(replication_prerequisites_unmet(role));
+        }
         let pool = registry
             .get_pool(&route.gateway_pool_id)
             .await
@@ -1084,6 +1107,8 @@ impl CatalogService {
         let replication_id = ReplicationId::new(request.replication_id)
             .map_err(|error| invalid_request(format!("replication_id: {error}")))?;
         let expected_attempt = parse_attempt(request.expected_attempt)?;
+        let request_id = RequestId::new(request.request_id)
+            .map_err(|error| invalid_request(format!("request_id: {error}")))?;
         let repository = self.placement.as_ref().ok_or_else(|| {
             application_error(
                 ErrorCategory::Unavailable,
@@ -1098,12 +1123,14 @@ impl CatalogService {
                 tenant_id,
                 replication_id,
                 expected_attempt,
+                request_id,
                 updated_at_unix_ms: self.clock.now(),
             })
             .await
             .map_err(map_central_error)?;
         Ok(RetryCommitReplicationResponse {
-            replication: replication_view(&record),
+            replication: replication_view(&record.replication),
+            replayed: record.replayed,
         })
     }
 

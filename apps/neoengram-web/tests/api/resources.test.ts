@@ -229,6 +229,7 @@ describe('tenant-scoped public resource operations', () => {
       tenant_id: 'tenant-a',
       replication_id: created.data.replication.replication_id,
       expected_attempt: cancelled.data.replication.attempt,
+      request_id: 'retry-replicate-road-main-to-guangzhou',
     });
     expect(retried.data.replication).toMatchObject({ attempt: '2', state: 'queued' });
   });

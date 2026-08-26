@@ -3,6 +3,7 @@ use std::sync::Arc;
 use neoengram_central::{
     CancelReplicationRequest, CentralErrorCode, InMemoryComponents, PlacementRepository,
     ReplicationObjectRecord, ReplicationRecord, ReplicationStateTransitionRequest,
+    RetryReplicationRequest,
 };
 use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
 use neoengram_domain::protocol::{
@@ -99,6 +100,51 @@ async fn sqlite_same_state_progress_cas_never_overwrites_a_successful_newer_repo
     authority.close().await;
 }
 
+#[cfg(feature = "authority-sqlite")]
+#[tokio::test]
+async fn sqlite_replication_retry_receipt_survives_reopen() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let repository = authority.authority_store().placement().unwrap();
+    let tenant_id = TenantId::new("tenant-retry-reopen").unwrap();
+    let record = replication_record(
+        &tenant_id,
+        "retry-reopen",
+        ContentDigest::from_bytes([39; 32]),
+        "backend-retry-reopen",
+        "volume-retry-reopen",
+        ReplicationState::Failed,
+        1,
+    );
+    repository.insert_replication(record.clone()).await.unwrap();
+    let request = RetryReplicationRequest {
+        tenant_id: tenant_id.clone(),
+        replication_id: record.replication_id.clone(),
+        expected_attempt: 1,
+        request_id: RequestId::new("retry-reopen-request").unwrap(),
+        updated_at_unix_ms: UnixMillis::new(20),
+    };
+    let first = repository.retry_replication(request.clone()).await.unwrap();
+    assert!(!first.replayed);
+    authority.close().await;
+
+    let reopened = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let replay = reopened
+        .authority_store()
+        .placement()
+        .unwrap()
+        .retry_replication(request)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.replication, first.replication);
+    reopened.close().await;
+}
+
 async fn run_replication_edge_contract(repository: Arc<dyn PlacementRepository>) {
     let tenant_id = TenantId::new("tenant-replication-contract").unwrap();
     let commit_id = ContentDigest::from_bytes([31; 32]);
@@ -125,7 +171,7 @@ async fn run_replication_edge_contract(repository: Arc<dyn PlacementRepository>)
         .insert_replication(second.clone())
         .await
         .unwrap_err();
-    assert_eq!(duplicate.code(), CentralErrorCode::InvalidState);
+    assert_eq!(duplicate.code(), CentralErrorCode::ReplicationAlreadyActive);
 
     repository
         .transition_replication(ReplicationStateTransitionRequest {
@@ -142,7 +188,145 @@ async fn run_replication_edge_contract(repository: Arc<dyn PlacementRepository>)
         })
         .await
         .unwrap();
+
+    let retryable = replication_record(
+        &tenant_id,
+        "retryable",
+        ContentDigest::from_bytes([37; 32]),
+        "backend-retry",
+        "volume-retry",
+        ReplicationState::Failed,
+        1,
+    );
+    repository
+        .insert_replication(retryable.clone())
+        .await
+        .unwrap();
+    let retry_request = RetryReplicationRequest {
+        tenant_id: tenant_id.clone(),
+        replication_id: retryable.replication_id.clone(),
+        expected_attempt: 1,
+        request_id: RequestId::new("retry-request-1").unwrap(),
+        updated_at_unix_ms: UnixMillis::new(20),
+    };
+    let first_retry = repository
+        .retry_replication(retry_request.clone())
+        .await
+        .unwrap();
+    assert!(!first_retry.replayed);
+    assert_eq!(first_retry.replication.attempt, 2);
+    assert_eq!(first_retry.replication.state, ReplicationState::Queued);
+    repository
+        .transition_replication(ReplicationStateTransitionRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: retryable.replication_id.clone(),
+            expected_state: ReplicationState::Queued,
+            expected_attempt: 2,
+            next_state: ReplicationState::Planning,
+            completed_objects: 0,
+            completed_bytes: 0,
+            issue_code: None,
+            issue_message: None,
+            updated_at_unix_ms: UnixMillis::new(21),
+        })
+        .await
+        .unwrap();
+    let replay = repository
+        .retry_replication(RetryReplicationRequest {
+            updated_at_unix_ms: UnixMillis::new(22),
+            ..retry_request
+        })
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.replication.attempt, 2);
+    assert_eq!(replay.replication.state, ReplicationState::Queued);
+
+    let conflicting_retry = repository
+        .retry_replication(RetryReplicationRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: first.replication_id.clone(),
+            expected_attempt: 1,
+            request_id: RequestId::new("retry-request-1").unwrap(),
+            updated_at_unix_ms: UnixMillis::new(20),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflicting_retry.code(),
+        CentralErrorCode::ReplicationRetryRequestReused
+    );
+
     repository.insert_replication(second).await.unwrap();
+
+    // A target PlacementSet is a durable claim even when it is not currently Published.  The
+    // repository must reject a new active replication at this boundary; checking only in the
+    // service leaves a race between create and finalize on SQLite and with concurrent in-memory users.
+    let claimed_commit = ContentDigest::from_bytes([36; 32]);
+    let claimed_object_set = ObjectSet::new(Vec::new()).unwrap();
+    repository
+        .insert_placement_set(CommitPlacementSet {
+            placement_set_id: PlacementSetId::new("placement-set-claimed").unwrap(),
+            tenant_id: tenant_id.clone(),
+            commit_id: CommitId::from_digest(claimed_commit),
+            backend_id: BackendId::new("backend-claimed").unwrap(),
+            storage_volume_id: Some(StorageVolumeId::new("volume-claimed").unwrap()),
+            archive_id: None,
+            object_set_digest: claimed_object_set.object_set_digest,
+            object_count: DecimalU64::new(0),
+            verified_object_count: DecimalU64::new(0),
+            placement_generation: PlacementGeneration::new(1),
+            state: CommitPlacementSetState::Staged,
+        })
+        .await
+        .unwrap();
+    let claimed_replication = replication_record(
+        &tenant_id,
+        "claimed-target",
+        claimed_commit,
+        "backend-claimed",
+        "volume-claimed",
+        ReplicationState::Queued,
+        1,
+    );
+    let claimed_error = repository
+        .insert_replication(claimed_replication)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        claimed_error.code(),
+        CentralErrorCode::ReplicationAlreadyActive
+    );
+
+    // A failed replication can be retried only while its target remains unclaimed. The durable
+    // PlacementSet check must run inside the retry mutation, not only during initial scheduling.
+    let retry_claimed = replication_record(
+        &tenant_id,
+        "retry-claimed-target",
+        claimed_commit,
+        "backend-claimed",
+        "volume-claimed",
+        ReplicationState::Failed,
+        1,
+    );
+    repository
+        .insert_replication(retry_claimed.clone())
+        .await
+        .unwrap();
+    let retry_claimed_error = repository
+        .retry_replication(RetryReplicationRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: retry_claimed.replication_id,
+            expected_attempt: 1,
+            request_id: RequestId::new("retry-claimed-request").unwrap(),
+            updated_at_unix_ms: UnixMillis::new(30),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        retry_claimed_error.code(),
+        CentralErrorCode::ReplicationAlreadyActive
+    );
 
     let attempt_fenced = replication_record(
         &tenant_id,

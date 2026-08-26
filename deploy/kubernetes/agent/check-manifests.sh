@@ -61,6 +61,8 @@ for expected in \
   'trust_bundle_file: /etc/neoengram/gateway-ca.pem' \
   'gateway_workload_trust_domain: mesh.example.test' \
   'central_command_trust_bundle_file: /etc/neoengram/central-command-trust.json' \
+  'replication:' \
+  'enabled: false' \
   'storage_volume_id: volume-example' \
   'volume_descriptor_digest: replace-with-64-lowercase-hex-descriptor-digest' \
   'region: cn-example-1' \

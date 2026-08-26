@@ -4,7 +4,7 @@
 > Gateway Registry、管理面、H2/mTLS 控制 tunnel 和一跳 Replica forwarding 已进入 G1；固定 Ready Snapshot 的
 > 一期只读 S3 Access Point、Gateway Web/S3 listener 和 Agent 流式读取已经实现，公网 DNS/TLS、生产凭据
 > provisioner 与真实双 Replica 故障演练仍属于部署验收项。Gateway 也没有任何 Volume/CAS I/O 能力；其专项设计见
-> [`neoengram-gateway-architecture.md`](neoengram-gateway-architecture.md)。
+> [`gateway.md`](gateway.md)。
 
 NeoEngram `0.2.0` 的本地仓库格式为 9。升级允许破坏兼容性：实现明确拒绝所有旧
 格式，不读取、不迁移，也不提供自动回退。仓库格式 9 将可移植内容模型和规范 digest 收敛到
@@ -89,9 +89,12 @@ Managed 模式使用不同的权威边界：
   Assignment 的 Tenant、Artifact、StorageVolume、ArtifactPlacement 和 `placement_generation`；
 - Agent 的 identity、Ledger、outbound 和 candidate 位于独立 `state_dir`，不得在业务 Volume 上创建
   SQLite/WAL；状态盘丢失不会删除 Volume 中的业务对象；
-- 当前 P0 不实现跨 Volume 对象复制、强 storage-side fencing、NeoEngram Gateway payload 数据链或生产数据库。目标
-  复制链路固定为源 Agent -> 源 GatewayPool -> 目标 GatewayPool -> 目标 Agent；Server 仍只下发计划
-  和记录凭证，不进入 payload 路径。
+- 当前 P0 不承诺跨 Volume 对象复制的生产执行、强 storage-side fencing、NeoEngram Gateway payload 数据链
+  或生产数据库；replication 的 Central route/ticket 控制链和 Agent/Gateway 协议边界已有代码。Agent
+  复制配置现在必须显式启用并通过 command trust + QUIC/TLS 启动预检，Central 只向具备
+  `commit_replication_quic_v1` capability 的 ready Agent 路由。目标复制链路
+  固定为源 Agent -> 源 GatewayPool -> 目标 GatewayPool -> 目标 Agent；Server 仍只下发计划和记录凭证，
+  不进入 payload 路径。
 
 Managed Add 的固定发布闭环为：
 
@@ -134,9 +137,10 @@ Index 仍可解析；Conflict/Rejected 不发布候选 Manifest。
   Volume durability 证明；
 - GatewayPool 整体不可用时，控制/传输/S3 失败关闭，本地 Volume 数据和已完成 durability 的对象不受损。
 
-后续只读 S3 是 Gateway 暴露固定 Commit/Snapshot 的访问协议，不是 `ObjectStoreKind`、中心归档后端或
+当前只读 S3 是 Gateway 暴露固定 Commit/Snapshot 的访问协议，不是 `ObjectStoreKind`、中心归档后端或
 新的 durability authority。S3 `LIST` 查询 Central metadata，`GET`/Range 由 owning Agent 根据 Manifest
-读取 Volume CAS；内部对象目录不映射为公开 Bucket 或 Key。
+读取 Volume CAS；内部对象目录不映射为公开 Bucket 或 Key。实际调用仍依赖 Ready PlacementSet、GatewayPool、
+Agent route、signed ticket 和生产凭据。
 
 ## 一致性、锁与 mutation
 

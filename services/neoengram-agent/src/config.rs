@@ -138,6 +138,10 @@ impl AgentConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
+    /// Cross-Volume Commit replication is opt-in.  An enabled Agent must complete the
+    /// Central-ticket and QUIC preflight before it advertises replication capability.
+    #[serde(default)]
+    pub enabled: bool,
     /// QUIC listener URL, for example `quic://127.0.0.1:9191`.
     #[serde(default)]
     pub listen_endpoint: Option<Url>,
@@ -165,14 +169,24 @@ impl ReplicationConfig {
             self.tls_ca_file.as_ref(),
         ];
         let tls_count = tls_values.iter().filter(|value| value.is_some()).count();
-        if has_endpoint && tls_count != tls_values.len() {
+        if !self.enabled && (has_endpoint || tls_count != 0) {
+            return Err(configuration(
+                "replication.enabled must be true when replication endpoints or TLS material are configured",
+            ));
+        }
+        if self.enabled && (self.listen_endpoint.is_none() || self.gateway_endpoint.is_none()) {
+            return Err(configuration(
+                "replication listener and Gateway endpoints are required when replication is enabled",
+            ));
+        }
+        if self.enabled && tls_count != tls_values.len() {
             return Err(configuration(
                 "replication TLS certificate, private key, and CA are required when an endpoint is configured",
             ));
         }
-        if !has_endpoint && tls_count != 0 {
+        if self.enabled && !has_endpoint {
             return Err(configuration(
-                "replication TLS material cannot be configured without a QUIC endpoint",
+                "replication endpoints are required when replication is enabled",
             ));
         }
         for (name, path) in [
@@ -604,6 +618,7 @@ logging:
     fn optional_replication_transport_requires_complete_tls_scope() {
         let mut config: AgentConfig = serde_yaml::from_str(VALID_CONFIG).unwrap();
         assert!(config.replication_listen_socket_addr().unwrap().is_none());
+        config.replication.enabled = true;
         config.replication.listen_endpoint = Some(Url::parse("quic://127.0.0.1:9191").unwrap());
         config.replication.gateway_endpoint = Some(Url::parse("quic://127.0.0.1:9292").unwrap());
         assert!(config.validate().is_err());
@@ -615,6 +630,13 @@ logging:
             config.replication_listen_socket_addr().unwrap(),
             Some("127.0.0.1:9191".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn replication_transport_must_be_explicitly_enabled() {
+        let mut config: AgentConfig = serde_yaml::from_str(VALID_CONFIG).unwrap();
+        config.replication.listen_endpoint = Some(Url::parse("quic://127.0.0.1:9191").unwrap());
+        assert!(config.validate().is_err());
     }
 
     #[test]

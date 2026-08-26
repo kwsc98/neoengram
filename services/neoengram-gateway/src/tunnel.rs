@@ -39,6 +39,8 @@ use tokio::{
     time::{interval, timeout, MissedTickBehavior},
 };
 
+use crate::transfer_quic::QuicTransferFence;
+
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json";
 pub(crate) const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
 pub(crate) const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
@@ -154,6 +156,9 @@ struct TunnelState {
     stream_cancellations: Mutex<BTreeMap<GatewayConnectionId, watch::Sender<bool>>>,
     stream_requests: Mutex<BTreeMap<RequestId, GatewayConnectionId>>,
     routes: Mutex<BTreeMap<GatewayConnectionId, ActiveRoute>>,
+    /// Shared with the QUIC transfer listener. It is updated only from Central-granted Agent
+    /// routes, so a reconnect cannot leave the data plane fenced to an old session generation.
+    transfer_fence: Option<QuicTransferFence>,
     peer_forward_seen: Mutex<BTreeMap<RequestId, PeerForwardReplay>>,
     /// Central's current allow-list for peer TLS credentials. This is scoped to the active control
     /// connection and is cleared atomically when that connection is fenced or disconnected.
@@ -326,9 +331,18 @@ impl GatewayTunnel {
         Self::with_peer_forwarder(identity, Arc::new(UnavailablePeerForwarder))
     }
 
+    #[cfg(test)]
     pub(crate) fn with_peer_forwarder(
         identity: GatewayIdentity,
         peer_forwarder: Arc<dyn PeerForwarder>,
+    ) -> Self {
+        Self::with_peer_forwarder_and_transfer_fence(identity, peer_forwarder, None)
+    }
+
+    pub(crate) fn with_peer_forwarder_and_transfer_fence(
+        identity: GatewayIdentity,
+        peer_forwarder: Arc<dyn PeerForwarder>,
+        transfer_fence: Option<QuicTransferFence>,
     ) -> Self {
         let (s3_read_revocations, _) = broadcast::channel(S3_READ_REVOCATION_BUFFER);
         Self {
@@ -347,6 +361,7 @@ impl GatewayTunnel {
                 stream_cancellations: Mutex::new(BTreeMap::new()),
                 stream_requests: Mutex::new(BTreeMap::new()),
                 routes: Mutex::new(BTreeMap::new()),
+                transfer_fence,
                 peer_forward_seen: Mutex::new(BTreeMap::new()),
                 peer_directory: Mutex::new(None),
                 s3_read_revocations,
@@ -1440,6 +1455,32 @@ impl GatewayTunnel {
                                 tracing::warn!(%stream_id, "Central Agent Opened generation differs from its atomic route");
                                 break;
                             }
+                            // RouteFence/teardown may have won while this Opened frame was
+                            // queued. Never let a late worker resurrect a transfer fence after
+                            // its stream and route have been removed.
+                            let route_still_active = {
+                                let closed = self.state.closed_streams.lock().await;
+                                !closed.contains(&stream_id)
+                                    && self
+                                        .state
+                                        .routes
+                                        .lock()
+                                        .await
+                                        .get(&stream_id)
+                                        .is_some_and(|current| current == &route)
+                            };
+                            if !route_still_active {
+                                tracing::warn!(%stream_id, "Central Agent Opened arrived after its route was fenced");
+                                break;
+                            }
+                            if let Some(fence) = &self.state.transfer_fence {
+                                fence.set_agent_generations(
+                                    &opened_payload.agent_id,
+                                    opened_payload.session_generation.get(),
+                                    opened_payload.mount_generation.get(),
+                                    route.route_generation.get(),
+                                );
+                            }
                             opened_verified = true;
                             for bytes in pending.drain(..) {
                                 if output.send(bytes).await.is_err() {
@@ -2409,6 +2450,9 @@ impl GatewayTunnel {
         drop(closed_streams);
         drop(_streams);
         self.state.routes.lock().await.clear();
+        if let Some(fence) = &self.state.transfer_fence {
+            fence.clear_generations();
+        }
         // The directory is a lease of Central authority, not durable local configuration. Any
         // disconnect therefore revokes every cached peer credential immediately.
         self.state.peer_directory.lock().await.take();
@@ -2532,15 +2576,52 @@ impl GatewayTunnel {
 
         self.state.streams.lock().await.remove(stream_id);
         let mut routes = self.state.routes.lock().await;
-        if let Some(expected_route) = expected_route {
+        let removed_route = if let Some(expected_route) = expected_route {
             if routes
                 .get(stream_id)
                 .is_some_and(|current| current == expected_route)
             {
-                routes.remove(stream_id);
+                routes.remove(stream_id)
+            } else {
+                None
             }
         } else {
-            routes.remove(stream_id);
+            routes.remove(stream_id)
+        };
+        // A Gateway can carry several Agent streams. The transfer fence must follow only the
+        // route being removed; selecting an arbitrary remaining route would mix another Agent's
+        // session/mount/route generations into this Agent's ticket checks.
+        let removed_fence = removed_route.as_ref().map(|route| {
+            (
+                route.agent_id.clone(),
+                route.session_generation.get(),
+                route.route_generation.get(),
+            )
+        });
+        let replacement_route = removed_fence.as_ref().and_then(|(agent_id, _, _)| {
+            routes
+                .values()
+                .filter(|route| &route.agent_id == agent_id)
+                .max_by_key(|route| route.route_generation.get())
+                .cloned()
+        });
+        drop(routes);
+        if let Some(fence) = &self.state.transfer_fence {
+            if let Some(route) = replacement_route {
+                // The fence update is monotonic and preserves the mount for a same-session
+                // renewal; a newer session intentionally clears mount until its Opened frame.
+                fence.set_agent_route_generations(
+                    &route.agent_id,
+                    route.session_generation.get(),
+                    route.route_generation.get(),
+                );
+            } else if let Some((agent_id, session_generation, route_generation)) = removed_fence {
+                fence.clear_agent_generations_if_current(
+                    &agent_id,
+                    session_generation,
+                    route_generation,
+                );
+            }
         }
     }
 
@@ -2561,8 +2642,11 @@ impl GatewayTunnel {
         if closed_streams.contains(stream_id) {
             return false;
         }
+        let agent_id = route.agent_id.clone();
+        let session_generation = route.session_generation.get();
+        let route_generation = route.route_generation.get();
         let mut routes = self.state.routes.lock().await;
-        match routes.get(stream_id) {
+        let inserted = match routes.get(stream_id) {
             None => {
                 routes.insert(stream_id.clone(), route);
                 true
@@ -2578,7 +2662,14 @@ impl GatewayTunnel {
                 true
             }
             Some(_) => false,
+        };
+        drop(routes);
+        if inserted {
+            if let Some(fence) = &self.state.transfer_fence {
+                fence.set_agent_route_generations(&agent_id, session_generation, route_generation);
+            }
         }
+        inserted
     }
 
     /// Removes a waiter and records its identity while holding the pending-map lock. The lock
@@ -4787,6 +4878,68 @@ mod tests {
         assert!(closed.contains(&GatewayConnectionId::new("agent-a-old-2").unwrap()));
         assert!(!closed.contains(&GatewayConnectionId::new("agent-a-current").unwrap()));
         assert!(!closed.contains(&GatewayConnectionId::new("agent-b-other").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn transfer_route_removal_does_not_mix_agent_generations() {
+        let identity = identity("replica-transfer-fence");
+        let fence = QuicTransferFence::new(
+            identity.gateway_pool_id.clone(),
+            identity.edge_cluster_id.clone(),
+        );
+        let tunnel = Arc::new(GatewayTunnel::with_peer_forwarder_and_transfer_fence(
+            identity,
+            Arc::new(UnavailablePeerForwarder),
+            Some(fence.clone()),
+        ));
+        let agent_a = AgentId::new("transfer-agent-a").unwrap();
+        let agent_b = AgentId::new("transfer-agent-b").unwrap();
+        let old_stream = GatewayConnectionId::new("transfer-agent-a-old").unwrap();
+        let current_stream = GatewayConnectionId::new("transfer-agent-a-current").unwrap();
+        let other_stream = GatewayConnectionId::new("transfer-agent-b-current").unwrap();
+        let old_route = ActiveRoute {
+            agent_id: agent_a.clone(),
+            session_generation: SessionGeneration::new(4),
+            route_generation: RouteGeneration::new(7),
+            lease_expires_at_unix_ms: lease_expiry(),
+        };
+        let current_route = ActiveRoute {
+            agent_id: agent_a.clone(),
+            session_generation: SessionGeneration::new(5),
+            route_generation: RouteGeneration::new(8),
+            lease_expires_at_unix_ms: lease_expiry(),
+        };
+        let other_route = ActiveRoute {
+            agent_id: agent_b.clone(),
+            session_generation: SessionGeneration::new(9),
+            route_generation: RouteGeneration::new(3),
+            lease_expires_at_unix_ms: lease_expiry(),
+        };
+        tunnel.state.routes.lock().await.extend([
+            (old_stream.clone(), old_route.clone()),
+            (current_stream.clone(), current_route.clone()),
+            (other_stream, other_route.clone()),
+        ]);
+        fence.set_agent_generations(&agent_a, 5, 11, 8);
+        fence.set_agent_generations(&agent_b, 9, 12, 3);
+
+        tunnel
+            .close_stream_state_if_route(&old_stream, None, &old_route)
+            .await;
+        assert_eq!(fence.agent_generations(&agent_a), Some((5, 11, 8)));
+        assert_eq!(fence.agent_generations(&agent_b), Some((9, 12, 3)));
+
+        tunnel
+            .close_stream_state_if_route(&old_stream, None, &old_route)
+            .await;
+        assert_eq!(fence.agent_generations(&agent_a), Some((5, 11, 8)));
+        assert_eq!(fence.agent_generations(&agent_b), Some((9, 12, 3)));
+
+        tunnel
+            .close_stream_state_if_route(&current_stream, None, &current_route)
+            .await;
+        assert_eq!(fence.agent_generations(&agent_a), None);
+        assert_eq!(fence.agent_generations(&agent_b), Some((9, 12, 3)));
     }
 
     #[tokio::test]

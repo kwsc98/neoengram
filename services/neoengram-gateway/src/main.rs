@@ -295,11 +295,9 @@ impl GatewayConfig {
         if configured_generations != 0 && self.transfer_relay_role.is_none() {
             return Err("transfer generations require a configured relay role".into());
         }
-        if self.transfer_relay_role.is_some() && configured_generations == 0 {
-            return Err(
-                "transfer relay requires session, mount, and route generations for fencing".into(),
-            );
-        }
+        // Generation fences are learned from the Central-authorized Agent channel at runtime.
+        // Static values remain supported for deployments that want a startup fence, but an
+        // omitted tuple starts fail-closed and is populated after channel.opened.
         if generation_fields
             .iter()
             .flatten()
@@ -712,9 +710,13 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
     ) {
         transfer_fence = transfer_fence.with_generations(session, mount, route);
     }
-    let tunnel = Arc::new(GatewayTunnel::with_peer_forwarder(
+    let tunnel = Arc::new(GatewayTunnel::with_peer_forwarder_and_transfer_fence(
         identity,
         peer_forwarder.clone(),
+        config
+            .transfer_listen
+            .is_some()
+            .then(|| transfer_fence.clone()),
     ));
     let s3_read_channels = Arc::new(s3_read_channel::S3ReadChannelRegistry::with_peer_reader(
         tunnel.clone(),
@@ -2087,7 +2089,9 @@ mod tests {
 
         config.transfer_upstream = Some("127.0.0.1:8184".parse().unwrap());
         config.transfer_upstream_server_name = Some("localhost".to_owned());
-        assert!(config.validate().is_err());
+        // The route tuple is learned from the Central-authorized Agent channel. A relay may
+        // therefore start without static generations and remains fail-closed until channel.opened.
+        config.validate().unwrap();
         config.transfer_session_generation = Some(3);
         config.transfer_mount_generation = Some(4);
         assert!(config.validate().is_err());

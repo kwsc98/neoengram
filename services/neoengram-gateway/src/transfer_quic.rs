@@ -7,15 +7,16 @@
 //! Gateway connection without changing the domain protocol.
 
 use std::{
+    collections::BTreeMap,
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
 use neoengram_domain::protocol::{
-    EdgeClusterId, GatewayPoolId, SignedTransferTicket, TransferFrame, TransferFrameError,
+    AgentId, EdgeClusterId, GatewayPoolId, SignedTransferTicket, TransferFrame, TransferFrameError,
     TransferTicket, MAX_TRANSFER_FRAME_BYTES, TRANSFER_ALPN,
 };
 use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream};
@@ -72,14 +73,27 @@ pub(crate) enum TransferRelayRole {
 
 /// Generation and identity fences applied before any object frame is accepted.  A listener has
 /// no storage handle; the caller can update this value when Central replaces a route/session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default)]
+struct TransferGenerations {
+    session: Option<u64>,
+    mount: Option<u64>,
+    route: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TransferFenceState {
+    /// Static deployments may configure one tuple before the Gateway has a Central route. It is a
+    /// fallback only; a Central-granted Agent route always gets an exact per-Agent entry.
+    default: Option<TransferGenerations>,
+    agents: BTreeMap<AgentId, TransferGenerations>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct QuicTransferFence {
     role: TransferRelayRole,
     gateway_pool_id: GatewayPoolId,
     edge_cluster_id: EdgeClusterId,
-    session_generation: Option<u64>,
-    mount_generation: Option<u64>,
-    route_generation: Option<u64>,
+    state: Arc<RwLock<TransferFenceState>>,
 }
 
 impl QuicTransferFence {
@@ -98,25 +112,177 @@ impl QuicTransferFence {
             role,
             gateway_pool_id,
             edge_cluster_id,
-            session_generation: None,
-            mount_generation: None,
-            route_generation: None,
+            state: Arc::new(RwLock::new(TransferFenceState::default())),
         }
     }
 
-    /// Installs the current generations for a route.  `None` means that the listener only checks
-    /// the endpoint identity; callers that have an Agent route should always provide all three.
+    /// Installs the current generations for a route.  Until all three values are installed, the
+    /// listener rejects transfers because no authenticated Agent route is active.
     #[must_use]
     pub(crate) fn with_generations(
-        mut self,
+        self,
         session_generation: u64,
         mount_generation: u64,
         route_generation: u64,
     ) -> Self {
-        self.session_generation = Some(session_generation);
-        self.mount_generation = Some(mount_generation);
-        self.route_generation = Some(route_generation);
+        self.set_generations(session_generation, mount_generation, route_generation);
         self
+    }
+
+    /// Updates the route fence after the Gateway acquires or renews its Central route lease.
+    /// The shared state is intentionally independent from the listener lifetime, so every
+    /// accepted transfer observes the latest session/mount/route tuple after an Agent reconnect.
+    pub(crate) fn set_generations(
+        &self,
+        session_generation: u64,
+        mount_generation: u64,
+        route_generation: u64,
+    ) {
+        if let Ok(mut state) = self.state.write() {
+            state.agents.clear();
+            state.default = Some(TransferGenerations {
+                session: Some(session_generation),
+                mount: Some(mount_generation),
+                route: Some(route_generation),
+            });
+        }
+    }
+
+    /// Installs a complete route fence for one Agent. Routes for other Agents remain untouched.
+    pub(crate) fn set_agent_generations(
+        &self,
+        agent_id: &AgentId,
+        session_generation: u64,
+        mount_generation: u64,
+        route_generation: u64,
+    ) {
+        if let Ok(mut state) = self.state.write() {
+            // A static fallback has no Agent identity and is only safe before Central has
+            // published any dynamic route. Once one Agent is learned, unknown Agent IDs must
+            // fail closed instead of borrowing that fallback tuple.
+            state.default = None;
+            let next = TransferGenerations {
+                session: Some(session_generation),
+                mount: Some(mount_generation),
+                route: Some(route_generation),
+            };
+            match state.agents.get_mut(agent_id) {
+                Some(current)
+                    if current.route.is_some_and(|current_route| {
+                        current_route > route_generation
+                            || (current_route == route_generation
+                                && current.session != Some(session_generation))
+                    }) =>
+                {
+                    // A delayed Opened frame from a replaced stream cannot move the fence back
+                    // to an older route, nor complete a conflicting session for one generation.
+                }
+                Some(current) => *current = next,
+                None => {
+                    state.agents.insert(agent_id.clone(), next);
+                }
+            }
+        }
+    }
+
+    /// Updates the session and route part of the fence while retaining the mount generation
+    /// supplied by the Agent's channel.opened response or a static deployment configuration.
+    pub(crate) fn set_route_generations(&self, session_generation: u64, route_generation: u64) {
+        if let Ok(mut state) = self.state.write() {
+            if let Some(generations) = state.default.as_mut() {
+                generations.session = Some(session_generation);
+                generations.route = Some(route_generation);
+            }
+        }
+    }
+
+    /// Publishes one Agent route before its Opened frame is accepted. A same-session renewal keeps
+    /// the authenticated mount; a replacement session clears it and therefore stays fail-closed
+    /// until `set_agent_generations` installs the complete tuple.
+    pub(crate) fn set_agent_route_generations(
+        &self,
+        agent_id: &AgentId,
+        session_generation: u64,
+        route_generation: u64,
+    ) {
+        if let Ok(mut state) = self.state.write() {
+            // A dynamic route is authoritative even before its Opened frame arrives. Remove the
+            // identity-free static fallback immediately so startup cannot expose that tuple to an
+            // unrelated Agent while the new route is still being authenticated.
+            state.default = None;
+            let generations = state.agents.entry(agent_id.clone()).or_default();
+            if generations
+                .route
+                .is_none_or(|current_route| route_generation >= current_route)
+            {
+                if generations.session != Some(session_generation) {
+                    // A new session has a new mount identity until its authenticated Opened frame
+                    // supplies the complete tuple. Retaining the previous mount would authorize
+                    // a generation combination that Central never issued.
+                    generations.mount = None;
+                }
+                generations.session = Some(session_generation);
+                generations.route = Some(route_generation);
+            }
+        }
+    }
+
+    /// Revokes the transfer route while no authenticated Agent route is active.
+    pub(crate) fn clear_generations(&self) {
+        if let Ok(mut state) = self.state.write() {
+            state.default = None;
+            state.agents.clear();
+        }
+    }
+
+    /// Revokes one Agent route without affecting other Agents sharing this Gateway listener.
+    pub(crate) fn clear_agent_generations(&self, agent_id: &AgentId) {
+        if let Ok(mut state) = self.state.write() {
+            state.agents.remove(agent_id);
+            // There is no Agent identity in the legacy static tuple. Clearing any named route
+            // therefore revokes that compatibility fallback as well instead of leaving an
+            // apparently removed route usable by an arbitrary ticket.
+            state.default = None;
+        }
+    }
+
+    /// Conditionally revokes one Agent route. The generation comparison is the linearization
+    /// point for stream teardown, so a stale worker cannot clear a newer route for the same Agent.
+    pub(crate) fn clear_agent_generations_if_current(
+        &self,
+        agent_id: &AgentId,
+        session_generation: u64,
+        route_generation: u64,
+    ) -> bool {
+        let Ok(mut state) = self.state.write() else {
+            return false;
+        };
+        let current = state.agents.get(agent_id).copied();
+        let matches = current.is_some_and(|generations| {
+            generations.session == Some(session_generation)
+                && generations.route == Some(route_generation)
+        });
+        let mut revoked = matches;
+        if matches {
+            state.agents.remove(agent_id);
+        } else if state.agents.is_empty()
+            && state.default.is_some_and(|generations| {
+                generations.session == Some(session_generation)
+                    && generations.route == Some(route_generation)
+            })
+        {
+            // Compatibility-mode cleanup is still conditional on the exact tuple.
+            state.default = None;
+            revoked = true;
+        }
+        revoked
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_generations(&self, agent_id: &AgentId) -> Option<(u64, u64, u64)> {
+        let state = self.state.read().ok()?;
+        let generations = state.agents.get(agent_id)?;
+        Some((generations.session?, generations.mount?, generations.route?))
     }
 
     fn validate(&self, ticket: &TransferTicket) -> Result<(), QuicTransferError> {
@@ -148,28 +314,38 @@ impl QuicTransferFence {
                 TransferRelayRole::Source => "source_edge_cluster_id",
             }));
         }
-        if self
-            .session_generation
-            .is_some_and(|generation| generation != session)
-        {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| QuicTransferError::Fenced("transfer_route_unavailable"))?;
+        let generations = state
+            .agents
+            .get(&endpoint.agent_id)
+            .copied()
+            .or_else(|| state.agents.is_empty().then_some(state.default).flatten())
+            .ok_or(QuicTransferError::Fenced("transfer_route_unavailable"))?;
+        let Some(expected_session) = generations.session else {
+            return Err(QuicTransferError::Fenced("transfer_route_unavailable"));
+        };
+        if expected_session != session {
             return Err(QuicTransferError::Fenced(match prefix {
                 "target" => "target_session_generation",
                 _ => "source_session_generation",
             }));
         }
-        if self
-            .mount_generation
-            .is_some_and(|generation| generation != mount)
-        {
+        let Some(expected_mount) = generations.mount else {
+            return Err(QuicTransferError::Fenced("transfer_route_unavailable"));
+        };
+        if expected_mount != mount {
             return Err(QuicTransferError::Fenced(match prefix {
                 "target" => "target_mount_generation",
                 _ => "source_mount_generation",
             }));
         }
-        if self
-            .route_generation
-            .is_some_and(|generation| generation != route)
-        {
+        let Some(expected_route) = generations.route else {
+            return Err(QuicTransferError::Fenced("transfer_route_unavailable"));
+        };
+        if expected_route != route {
             return Err(QuicTransferError::Fenced(match prefix {
                 "target" => "target_route_generation",
                 _ => "source_route_generation",
@@ -787,6 +963,70 @@ mod tests {
             wrong_pool.validate(&ticket),
             Err(QuicTransferError::Fenced("target_gateway_pool_id"))
         ));
+    }
+
+    #[test]
+    fn fence_tracks_route_reconnects_and_revokes_without_restarting_listener() {
+        let ticket = ticket();
+        let fence = QuicTransferFence::new(
+            ticket.target.gateway_pool_id.clone(),
+            ticket.target.edge_cluster_id.clone(),
+        );
+        assert!(matches!(
+            fence.validate(&ticket),
+            Err(QuicTransferError::Fenced("transfer_route_unavailable"))
+        ));
+
+        fence.set_generations(7, 8, 9);
+        assert!(fence.validate(&ticket).is_ok());
+        fence.set_route_generations(11, 13);
+        assert!(matches!(
+            fence.validate(&ticket),
+            Err(QuicTransferError::Fenced("target_session_generation"))
+        ));
+        fence.clear_generations();
+        assert!(matches!(
+            fence.validate(&ticket),
+            Err(QuicTransferError::Fenced("transfer_route_unavailable"))
+        ));
+    }
+
+    #[test]
+    fn fence_keeps_multiple_agent_routes_isolated() {
+        let first = ticket();
+        let mut second = ticket();
+        second.target.agent_id = AgentId::new("agent-target-2").unwrap();
+        second.session_generation = SessionGeneration::new(17);
+        second.mount_generation = MountGeneration::new(18);
+        second.route_generation = RouteGeneration::new(19);
+        let fence = QuicTransferFence::new(
+            first.target.gateway_pool_id.clone(),
+            first.target.edge_cluster_id.clone(),
+        );
+
+        fence.set_agent_generations(&first.target.agent_id, 7, 8, 9);
+        fence.set_agent_generations(&second.target.agent_id, 17, 18, 19);
+        assert!(fence.validate(&first).is_ok());
+        assert!(fence.validate(&second).is_ok());
+
+        fence.set_agent_route_generations(&first.target.agent_id, 11, 13);
+        assert!(matches!(
+            fence.validate(&first),
+            Err(QuicTransferError::Fenced("target_session_generation"))
+        ));
+        assert!(fence.validate(&second).is_ok());
+        // A late teardown for the old generation must not revoke the replacement route.
+        assert!(!fence.clear_agent_generations_if_current(&first.target.agent_id, 7, 9,));
+        assert!(matches!(
+            fence.validate(&first),
+            Err(QuicTransferError::Fenced("target_session_generation"))
+        ));
+        assert!(fence.clear_agent_generations_if_current(&first.target.agent_id, 11, 13,));
+        assert!(matches!(
+            fence.validate(&first),
+            Err(QuicTransferError::Fenced("transfer_route_unavailable"))
+        ));
+        assert!(fence.validate(&second).is_ok());
     }
 
     #[test]

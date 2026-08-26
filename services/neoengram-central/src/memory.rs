@@ -38,11 +38,11 @@ use crate::{
 };
 
 use crate::{
-    valid_replication_transition, validate_replication_checkpoints,
+    same_retry_request, valid_replication_transition, validate_replication_checkpoints,
     validate_replication_publication, validate_replication_record, CancelReplicationRequest,
     CommitAvailabilityRecord, FinalizeReplicationRequest, FinalizeReplicationResult,
     PlacementRepository, ReplicationRecord, ReplicationStateTransitionRequest,
-    RetryReplicationRequest, WorkspaceRecord,
+    RetryReplicationRequest, RetryReplicationResult, WorkspaceRecord,
 };
 
 #[derive(Debug, Default)]
@@ -178,6 +178,8 @@ pub struct InMemoryPlacementRepository {
     replication_objects:
         Mutex<BTreeMap<(TenantId, ReplicationId, ObjectId), crate::ReplicationObjectRecord>>,
     replication_requests: Mutex<BTreeMap<(TenantId, RequestId), ReplicationId>>,
+    replication_retry_mutations:
+        Mutex<BTreeMap<(TenantId, RequestId), (RetryReplicationRequest, ReplicationRecord)>>,
     workspaces: Mutex<BTreeMap<(TenantId, WorkspaceId), WorkspaceRecord>>,
     workspace_requests: Mutex<BTreeMap<(TenantId, RequestId), WorkspaceId>>,
 }
@@ -580,6 +582,26 @@ impl PlacementRepository for InMemoryPlacementRepository {
                 ))
             };
         }
+        // The service performs this check as an early validation, but the authority must repeat
+        // it while holding the replication/placement locks.  Otherwise a concurrent finalize can
+        // publish the target PlacementSet between the service pre-check and this insert.
+        let placement_sets = lock(&self.placement_sets)?;
+        if matches!(
+            record.state,
+            ReplicationState::Queued
+                | ReplicationState::Planning
+                | ReplicationState::Transferring
+                | ReplicationState::Verifying
+        ) && placement_sets.keys().any(|(tenant, commit, backend)| {
+            tenant == &record.tenant_id
+                && *commit == record.commit_id
+                && backend.as_str() == record.target_backend_id
+        }) {
+            return Err(invalid(
+                CentralErrorCode::ReplicationAlreadyActive,
+                "a Commit PlacementSet already targets this backend",
+            ));
+        }
         if records.values().any(|existing| {
             existing.tenant_id == record.tenant_id
                 && existing.commit_id == record.commit_id
@@ -593,7 +615,7 @@ impl PlacementRepository for InMemoryPlacementRepository {
                 )
         }) {
             return Err(invalid(
-                CentralErrorCode::InvalidState,
+                CentralErrorCode::ReplicationAlreadyActive,
                 "an active replication already targets this Commit and backend",
             ));
         }
@@ -649,7 +671,22 @@ impl PlacementRepository for InMemoryPlacementRepository {
     async fn retry_replication(
         &self,
         request: RetryReplicationRequest,
-    ) -> CentralResult<ReplicationRecord> {
+    ) -> CentralResult<RetryReplicationResult> {
+        let request_key = (request.tenant_id.clone(), request.request_id.clone());
+        let mut retry_mutations = lock(&self.replication_retry_mutations)?;
+        if let Some((stored_request, stored_result)) = retry_mutations.get(&request_key) {
+            return if same_retry_request(stored_request, &request) {
+                Ok(RetryReplicationResult {
+                    replication: stored_result.clone(),
+                    replayed: true,
+                })
+            } else {
+                Err(invalid(
+                    CentralErrorCode::ReplicationRetryRequestReused,
+                    "replication retry request ID is already bound to another payload",
+                ))
+            };
+        }
         let key = (request.tenant_id.clone(), request.replication_id.clone());
         let mut records = lock(&self.replications)?;
         let current = records.get(&key).cloned().ok_or_else(|| {
@@ -661,7 +698,13 @@ impl PlacementRepository for InMemoryPlacementRepository {
         if matches!(current.state, ReplicationState::Queued)
             && current.attempt == request.expected_attempt.saturating_add(1)
         {
-            return Ok(current);
+            // A queued row at the next attempt can only be an unrecorded legacy retry.  The
+            // request receipt is still required for new calls; treat this as a fenced conflict
+            // instead of guessing which earlier request caused the transition.
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication attempt changed concurrently",
+            ));
         }
         if current.attempt != request.expected_attempt {
             return Err(invalid(
@@ -698,8 +741,19 @@ impl PlacementRepository for InMemoryPlacementRepository {
                 )
         }) {
             return Err(invalid(
-                CentralErrorCode::InvalidState,
+                CentralErrorCode::ReplicationAlreadyActive,
                 "an active replication already targets this Commit and backend",
+            ));
+        }
+        let placement_sets = lock(&self.placement_sets)?;
+        if placement_sets.keys().any(|(tenant, commit, backend)| {
+            tenant == &current.tenant_id
+                && *commit == current.commit_id
+                && backend.as_str() == current.target_backend_id
+        }) {
+            return Err(invalid(
+                CentralErrorCode::ReplicationAlreadyActive,
+                "a Commit PlacementSet already targets this backend",
             ));
         }
         let next_attempt = current.attempt.checked_add(1).ok_or_else(|| {
@@ -716,7 +770,12 @@ impl PlacementRepository for InMemoryPlacementRepository {
         record.issue_code = None;
         record.issue_message = None;
         record.updated_at_unix_ms = request.updated_at_unix_ms;
-        Ok(record.clone())
+        let result = record.clone();
+        retry_mutations.insert(request_key, (request, result.clone()));
+        Ok(RetryReplicationResult {
+            replication: result,
+            replayed: false,
+        })
     }
 
     async fn cancel_replication(
@@ -857,6 +916,24 @@ impl PlacementRepository for InMemoryPlacementRepository {
         let mut records = lock(&self.replications)?;
         let mut placement_sets = lock(&self.placement_sets)?;
         let mut object_placements = lock(&self.object_placements)?;
+        if records.values().any(|existing| {
+            existing.replication_id != request.replication_id
+                && existing.tenant_id == request.tenant_id
+                && existing.commit_id == record.commit_id
+                && existing.target_backend_id == request.placement_set.backend_id.as_str()
+                && matches!(
+                    existing.state,
+                    ReplicationState::Queued
+                        | ReplicationState::Planning
+                        | ReplicationState::Transferring
+                        | ReplicationState::Verifying
+                )
+        }) {
+            return Err(invalid(
+                CentralErrorCode::ReplicationAlreadyActive,
+                "an active replication already targets this Commit and backend",
+            ));
+        }
         if let Some(existing) = placement_sets.get(&placement_key) {
             if existing != &request.placement_set {
                 return Err(invalid(

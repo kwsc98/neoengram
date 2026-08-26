@@ -6,6 +6,7 @@ import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import SnapshotDetailPage from '@/pages/SnapshotDetailPage.vue';
+import { commitReplicationRetryRequestId } from '@/features/commit-replication';
 import { useTenantsStore } from '@/stores/tenants';
 import type {
   CreateCommitReplicationRequest,
@@ -293,6 +294,81 @@ describe('Snapshot detail page', () => {
     queryClient.clear();
   });
 
+  it('refreshes live StorageVolume availability while delivery controls are open', async () => {
+    vi.useFakeTimers();
+    const mounted = await mountPage();
+    try {
+      const { wrapper } = mounted;
+      expect(api.queryStorageVolumeList).toHaveBeenCalledTimes(1);
+      expect(api.queryStorageVolume).toHaveBeenCalledTimes(1);
+
+      api.queryStorageVolumeList.mockResolvedValueOnce({
+        data: {
+          items: [
+            {
+              tenant_id: 'tenant-a',
+              storage_volume_id: 'volume-a',
+              display_name: 'Volume A',
+              edge_cluster_id: 'edge-a',
+              region: 'cn-shanghai',
+              backend_type: 'nfs',
+              access_mode: 'read_write_many',
+              allowed_delivery_modes: ['fuse', 'copy', 'hardlink'],
+              hardlink_policy: 'sealed_acl',
+              max_whole_file_bytes: '1073741824',
+              copy_reserve_bytes: '1024',
+              state: 'unavailable',
+              resource_version: '2',
+              lifecycle: { state: 'active', generation: '1', resource_version: '2' },
+              created_at_unix_ms: '1',
+              updated_at_unix_ms: '3',
+            },
+          ],
+        },
+        requestId: 'request-volume-list-unavailable',
+      });
+      api.queryStorageVolume.mockResolvedValueOnce({
+        data: {
+          storage_volume: {
+            tenant_id: 'tenant-a',
+            storage_volume_id: 'volume-a',
+            display_name: 'Volume A',
+            edge_cluster_id: 'edge-a',
+            region: 'cn-shanghai',
+            backend_type: 'nfs',
+            access_mode: 'read_write_many',
+            allowed_delivery_modes: ['fuse', 'copy', 'hardlink'],
+            hardlink_policy: 'sealed_acl',
+            max_whole_file_bytes: '1073741824',
+            copy_reserve_bytes: '1024',
+            state: 'unavailable',
+            resource_version: '2',
+            lifecycle: { state: 'active', generation: '1', resource_version: '2' },
+            created_at_unix_ms: '1',
+            updated_at_unix_ms: '3',
+          },
+        },
+        requestId: 'request-volume-unavailable',
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushPromises();
+
+      expect(api.queryStorageVolumeList).toHaveBeenCalledTimes(2);
+      expect(api.queryStorageVolume).toHaveBeenCalledTimes(2);
+      expect(wrapper.text()).toContain('不可用');
+      expect(
+        wrapper
+          .findAllComponents(ElButton)
+          .find((button) => button.text().trim() === '创建交付')
+          ?.attributes('disabled'),
+      ).toBeDefined();
+    } finally {
+      mounted.wrapper.unmount();
+      mounted.queryClient.clear();
+      vi.useRealTimers();
+    }
+  });
+
   it('shows the Snapshot creation state without inventing delivery progress', async () => {
     const { wrapper, queryClient } = await mountPage('creating');
 
@@ -528,6 +604,7 @@ describe('Snapshot detail page', () => {
       tenant_id: 'tenant-a',
       replication_id: 'replication-failed',
       expected_attempt: '3',
+      request_id: commitReplicationRetryRequestId('replication-failed', '3'),
     });
     expect(api.replicateCommit).not.toHaveBeenCalled();
 

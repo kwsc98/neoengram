@@ -68,3 +68,17 @@ export function commitReplicationRequestId(scope: CommitReplicationRequestScope)
   ].join('');
   return `commit-replicate-${digest}`;
 }
+
+export function commitReplicationRetryRequestId(
+  replicationId: string,
+  expectedAttempt: string,
+): string {
+  const canonicalScope = `${replicationId.length}:${replicationId}|${expectedAttempt.length}:${expectedAttempt}`;
+  const digest = [
+    hash32(canonicalScope, 2_166_136_261),
+    hash32(canonicalScope, 2_166_136_261 ^ 0x9e3779b9),
+    hash32(canonicalScope, 2_166_136_261 ^ 0x85ebca6b),
+    hash32(canonicalScope, 2_166_136_261 ^ 0xc2b2ae35),
+  ].join('');
+  return `commit-retry-${digest}`;
+}

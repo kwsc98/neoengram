@@ -178,6 +178,8 @@ run_real_agent_flow() {
 
 if [[ -n "${PROJECT_TEST_REAL_FLOW_COMMAND:-}" ]]; then
   project_test_run_step real-agent-flow run_real_agent_flow
+elif [[ "${PROJECT_TEST_REQUIRE_REAL_FLOW:-0}" == "1" ]]; then
+  project_test_die 'PROJECT_TEST_REQUIRE_REAL_FLOW=1 but PROJECT_TEST_REAL_FLOW_COMMAND is not configured; refusing to claim replication coverage'
 else
   project_test_skip_step real-agent-flow 'PROJECT_TEST_REAL_FLOW_COMMAND is not configured; isolated contract flow completed'
   printf '%s\n' '{"status":"skipped","reason":"PROJECT_TEST_REAL_FLOW_COMMAND is not configured","source_volume":"isolated temporary volume","target_volume":"isolated temporary volume"}' >"${PROJECT_TEST_REPORT_ROOT}/real-agent-flow.json"

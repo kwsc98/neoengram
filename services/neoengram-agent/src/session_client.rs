@@ -1311,6 +1311,7 @@ mod tests {
                             ContentDigest::from_bytes([7; 32]),
                         ),
                         expected_resource_version: ResourceVersion::new(1),
+                        capabilities: None,
                         extensions: Extensions::new(),
                     }),
                     extensions: Extensions::new(),

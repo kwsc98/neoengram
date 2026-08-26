@@ -241,6 +241,10 @@ impl RegistryAgentApiHandler {
 
     async fn session_open(&self, body: &[u8]) -> Result<Vec<u8>, AgentHttpError> {
         let request: AgentAuthenticatedRequest<AgentSessionOpenPayload> = decode(body)?;
+        request
+            .payload
+            .validate()
+            .map_err(|_| AgentHttpError::protocol_invalid())?;
         let authenticated = self.authenticate(&request, AGENT_SESSION_OPEN_PATH).await?;
         let result = self
             .registry
@@ -250,6 +254,11 @@ impl RegistryAgentApiHandler {
                 boot_id: request.boot_id.clone(),
                 mount_identity_digest: request.payload.mount_identity_digest,
                 expected_resource_version: request.payload.expected_resource_version,
+                capabilities: request
+                    .payload
+                    .capabilities
+                    .clone()
+                    .map(|capabilities| capabilities.into_iter().collect()),
             })
             .await
             .map_err(map_registry_error)?;
@@ -557,6 +566,10 @@ impl RegistryAgentApiHandler {
             boot_id: frame.request.boot_id.clone(),
             mount_identity_digest: open.mount_identity_digest,
             expected_resource_version: open.expected_resource_version,
+            capabilities: open
+                .capabilities
+                .clone()
+                .map(|capabilities| capabilities.into_iter().collect()),
         };
         let (opened, routed) = match route {
             Some(route) => {

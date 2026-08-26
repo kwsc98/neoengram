@@ -301,6 +301,7 @@ pub struct CatalogService {
     workspace_commits: Option<Arc<super::WorkspaceCommitService>>,
     pub(crate) storage_availability: Option<Arc<dyn StorageAvailabilityProvider>>,
     pub(crate) s3_placement: Option<Arc<dyn S3PlacementProvider>>,
+    pub(crate) agent_registry: Option<Arc<AgentRegistryService>>,
     pub(crate) gateway_registry: Option<Arc<dyn crate::GatewayRegistryRepository>>,
     pub(crate) placement: Option<Arc<dyn crate::PlacementRepository>>,
     pub(crate) replication_ticket_keyring: Option<Arc<CentralCommandKeyring>>,
@@ -334,6 +335,7 @@ impl CatalogService {
             workspace_commits: None,
             storage_availability: None,
             s3_placement: None,
+            agent_registry: None,
             gateway_registry: None,
             placement: None,
             replication_ticket_keyring: None,
@@ -384,6 +386,7 @@ impl CatalogService {
 
     #[must_use]
     pub fn with_agent_registry(mut self, agent_registry: Arc<AgentRegistryService>) -> Self {
+        self.agent_registry = Some(agent_registry.clone());
         self.storage_availability = Some(agent_registry.clone());
         self.s3_placement = Some(agent_registry);
         self
@@ -707,18 +710,18 @@ impl CatalogService {
             .as_ref()
             .map(|cursor| encode_volume_cursor(&scope, cursor))
             .transpose()?;
-        let items = page
+        let mut items = Vec::with_capacity(page.records.len());
+        for record in page
             .records
             .iter()
             .filter(|record| record.lifecycle.is_active())
-            .map(|record| {
-                let mut view = storage_volume_view(record);
-                if !can_read_storage {
-                    view.pvc_reference = None;
-                }
-                view
-            })
-            .collect();
+        {
+            let mut view = self.storage_volume_view_with_live_state(record).await?;
+            if !can_read_storage {
+                view.pvc_reference = None;
+            }
+            items.push(view);
+        }
         Ok(QueryStorageVolumeListResponse { items, next_cursor })
     }
 
@@ -743,7 +746,7 @@ impl CatalogService {
             .ok_or_else(|| resource_not_found("storage volume"))?;
         require_active_for_read(&record.lifecycle, "storage volume")?;
         Ok(QueryStorageVolumeResponse {
-            storage_volume: storage_volume_view(&record),
+            storage_volume: self.storage_volume_view_with_live_state(&record).await?,
         })
     }
 
@@ -4425,6 +4428,29 @@ impl CatalogService {
                 true,
             )
         })
+    }
+
+    /// Projects the same live Agent-derived state used by Playground views onto the public
+    /// StorageVolume view. The catalog row is retained as the fallback for compositions that do
+    /// not have an Agent registry (for example, metadata-only tests and bootstrap tooling).
+    async fn storage_volume_view_with_live_state(
+        &self,
+        record: &StorageVolumeRecord,
+    ) -> Result<StorageVolumeView, Error> {
+        let mut view = storage_volume_view(record);
+        if let Some(provider) = &self.storage_availability {
+            view.state = match provider
+                .current_volume_state(&record.tenant_id, &record.storage_volume_id)
+                .await
+                .map_err(map_central_error)?
+            {
+                crate::DerivedVolumeState::Ready => "ready",
+                crate::DerivedVolumeState::Degraded => "degraded",
+                crate::DerivedVolumeState::Unavailable => "unavailable",
+            }
+            .to_owned();
+        }
+        Ok(view)
     }
 
     fn tenant_view(&self, identity: &AuthenticatedIdentity, record: &TenantRecord) -> TenantView {

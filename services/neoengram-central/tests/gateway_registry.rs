@@ -1606,6 +1606,7 @@ fn session_route_request(
             boot_id: AgentBootId::new(boot).unwrap(),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version,
+            capabilities: None,
         },
         gateway_pool_id: pool_id(),
         gateway_replica_id: replica_id(),

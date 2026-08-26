@@ -7,7 +7,8 @@ use neoengram_central::{
         ArtifactInitialization as ArtifactInitializationBody, CreateArtifactRequest,
         CreateDeletionRequest, CreatePlaygroundRequest, QueryArtifactCommitGraphRequest,
         QueryArtifactListRequest, QueryArtifactRequest, QueryDeletionImpactRequest,
-        QueryPlaygroundRequest, ResourceRefBody,
+        QueryPlaygroundRequest, QueryStorageVolumeListRequest, QueryStorageVolumeRequest,
+        ResourceRefBody,
     },
     AuthenticatedIdentity, CatalogService, Permission, StaticRbacPolicy,
     StorageAvailabilityProvider, SystemService,
@@ -644,6 +645,90 @@ async fn playground_lifecycle_and_live_storage_availability_are_independent() {
     .unwrap();
     assert_eq!(unknown.playground.state, "ready");
     assert_eq!(unknown.playground.storage_availability, "unknown");
+}
+
+#[tokio::test]
+async fn storage_volume_views_use_live_availability_when_configured() {
+    let components = InMemoryComponents::new(1_000);
+    let tenant_id = TenantId::new("tenant-a").unwrap();
+    let storage_volume_id = StorageVolumeId::new("volume-a").unwrap();
+    insert_tenant(&components, tenant_id.clone()).await;
+    components
+        .control_catalog
+        .insert_storage_volume(StorageVolumeRecord {
+            tenant_id: tenant_id.clone(),
+            storage_volume_id: storage_volume_id.clone(),
+            display_name: "Volume A".to_owned(),
+            edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
+            region: "cn-shanghai".to_owned(),
+            backend_type: StorageBackendType::Pvc,
+            access_mode: StorageAccessMode::ReadWriteMany,
+            allowed_delivery_modes: vec![
+                neoengram_domain::protocol::SnapshotDeliveryMode::Fuse,
+                neoengram_domain::protocol::SnapshotDeliveryMode::Copy,
+            ],
+            hardlink_policy: neoengram_domain::protocol::HardlinkPolicy::Disabled,
+            max_whole_file_bytes: neoengram_domain::protocol::DecimalU64::new(u64::MAX),
+            copy_reserve_bytes: neoengram_domain::protocol::DecimalU64::new(0),
+            pvc_reference: Some(CatalogPvcReference {
+                namespace: "neoengram".to_owned(),
+                claim_name: "data-a".to_owned(),
+            }),
+            nfs_reference: None,
+            state: StorageVolumeState::Ready,
+            resource_version: 1,
+            lifecycle: neoengram_domain::protocol::ResourceLifecycle::active(),
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+        })
+        .await
+        .unwrap();
+    let policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-a",
+            [tenant_id.to_string()],
+            [Permission::StorageRead],
+        )
+        .unwrap(),
+    );
+    let service = CatalogService::new(
+        components.control_catalog.clone(),
+        components.publisher.clone(),
+        policy,
+        components.clock.clone(),
+    )
+    .with_storage_availability_provider(Arc::new(FixedStorageAvailability(
+        DerivedVolumeState::Unavailable,
+    )));
+
+    let list = service
+        .list_storage_volumes(
+            &identity(),
+            QueryStorageVolumeListRequest {
+                tenant_id: tenant_id.to_string(),
+                region: None,
+                backend_type: None,
+                cursor: None,
+                page_size: None,
+                query: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.items.len(), 1);
+    assert_eq!(list.items[0].state, "unavailable");
+
+    let queried = service
+        .query_storage_volume(
+            &identity(),
+            QueryStorageVolumeRequest {
+                tenant_id: tenant_id.to_string(),
+                storage_volume_id: storage_volume_id.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queried.storage_volume.state, "unavailable");
 }
 
 #[tokio::test]

@@ -60,6 +60,7 @@ async fn stale_terminal_report_is_rejected_after_session_and_owner_generations_a
             boot_id: boot_id("boot-restarted"),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version: closed.resource_version,
+            capabilities: None,
         })
         .await
         .unwrap();
@@ -267,6 +268,7 @@ async fn lifecycle_fixture() -> LifecycleFixture {
             boot_id: boot_id("boot-initial"),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version: approved.resource_version,
+            capabilities: None,
         })
         .await
         .unwrap();

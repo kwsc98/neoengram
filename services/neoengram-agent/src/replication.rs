@@ -12,9 +12,9 @@ use std::{
 
 use neoengram_domain::core::{ContentDigest, ObjectId};
 use neoengram_domain::protocol::{
-    AgentId, CommitObject, ReplicationAssignment, ReplicationId, ReplicationObjectState,
-    ReplicationProgressReport, ReplicationState, SignedTransferTicket, TenantId, TransferId,
-    TransferTicket, UnixMillis,
+    AgentId, CommitObject, MountGeneration, ReplicationAssignment, ReplicationId,
+    ReplicationObjectState, ReplicationProgressReport, ReplicationState, SignedTransferTicket,
+    TenantId, TransferId, TransferTicket, UnixMillis,
 };
 use neoengram_runtime::{
     ObjectBackend, ObjectSetTransferExecutor, ObjectTransferOutcome, TransferSink, TransferSource,
@@ -23,7 +23,7 @@ use neoengram_runtime::{
 use crate::{AgentDaemonError, AgentDaemonResult, AgentReport, Clock, OutboundReportQueue};
 use crate::{
     CentralCommandTrustBundle, FilesystemExecution, QuicTransferClientConfig, QuicTransferIdentity,
-    QuicTransferNetwork,
+    QuicTransferNetwork, SharedSessionFence,
 };
 
 fn block_on<F>(future: F) -> F::Output
@@ -70,6 +70,9 @@ pub struct MountedVolumeReplicationExecutor {
     trust_bundle: Option<Arc<CentralCommandTrustBundle>>,
     /// Optional Gateway-routed QUIC network. When absent, remote source assignments fail closed.
     network: Option<Arc<QuicTransferNetwork>>,
+    /// The live control-session fence used to reject tickets issued for a replaced target session.
+    session_fence: Option<SharedSessionFence>,
+    local_mount_generation: Option<MountGeneration>,
     clock: Arc<dyn Clock>,
     worker: ReplicationWorker,
 }
@@ -105,6 +108,32 @@ impl MountedVolumeReplicationExecutor {
         clock: Arc<dyn Clock>,
         network: Option<Arc<QuicTransferNetwork>>,
     ) -> Self {
+        Self::new_with_network_and_session_fence(
+            execution,
+            local_tenant_id,
+            local_agent_id,
+            local_volume_id,
+            trust_bundle,
+            clock,
+            network,
+            None,
+            None,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_network_and_session_fence(
+        execution: Arc<FilesystemExecution>,
+        local_tenant_id: TenantId,
+        local_agent_id: AgentId,
+        local_volume_id: neoengram_domain::protocol::StorageVolumeId,
+        trust_bundle: Option<Arc<CentralCommandTrustBundle>>,
+        clock: Arc<dyn Clock>,
+        network: Option<Arc<QuicTransferNetwork>>,
+        session_fence: Option<SharedSessionFence>,
+        local_mount_generation: Option<MountGeneration>,
+    ) -> Self {
         Self {
             execution,
             local_tenant_id,
@@ -112,6 +141,8 @@ impl MountedVolumeReplicationExecutor {
             local_volume_id,
             trust_bundle,
             network,
+            session_fence,
+            local_mount_generation,
             clock,
             worker: ReplicationWorker::default(),
         }
@@ -179,11 +210,34 @@ impl ReplicationAssignmentExecutor for MountedVolumeReplicationExecutor {
                     "target Gateway replication connection failed: {error}"
                 ))
             })?;
-            let identity = QuicTransferIdentity::new(self.local_agent_id.clone()).with_generations(
-                ticket.session_generation.get(),
-                ticket.mount_generation.get(),
-                ticket.route_generation.get(),
-            );
+            let identity = match (&self.session_fence, self.local_mount_generation) {
+                (Some(session_fence), Some(local_mount_generation)) => {
+                    let current = session_fence.get().inspect_err(|_| {
+                        let _ =
+                            progress.state(&assignment.replication_id, ReplicationState::Failed);
+                    })?;
+                    if ticket.session_generation != current.session_generation
+                        || ticket.mount_generation != local_mount_generation
+                    {
+                        return Self::fail(
+                            assignment,
+                            progress,
+                            "replication ticket target session or mount generation is stale",
+                        );
+                    }
+                    QuicTransferIdentity::new(self.local_agent_id.clone()).with_session_mount(
+                        current.session_generation.get(),
+                        local_mount_generation.get(),
+                    )
+                }
+                // Test/embedded callers that do not own a live Agent session retain the strict
+                // static identity API. Production startup always supplies the shared fence.
+                _ => QuicTransferIdentity::new(self.local_agent_id.clone()).with_generations(
+                    ticket.session_generation.get(),
+                    ticket.mount_generation.get(),
+                    ticket.route_generation.get(),
+                ),
+            };
             block_on(crate::run_quic_sink_stream(
                 connection,
                 &assignment.signed_ticket,

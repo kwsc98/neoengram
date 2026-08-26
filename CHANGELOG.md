@@ -43,7 +43,7 @@
 - `export TARGET DIR` 可将 Commit 原子导出到仓库外的 Unix 只读快照目录；新增
   `.neoengramignore` 并让 `add`/`status` 共享忽略规则。
 - `fsck` 使用有界外部 Chunk 标记归并，避免为对象完整性检查长期保留完整 Chunk Hash 集合。
-- 新增 [`docs/implementation-plan.md`](docs/implementation-plan.md)，集中维护当前能力、分布式
+- 新增 [`docs/roadmap.md`](docs/roadmap.md)，集中维护当前能力、分布式
   控制面路线、研究事项、验收标准和后续路线变更。
 - `repository.json` 格式 4 显式记录 `metadata_store` 和 `object_store`，并支持 attached/direct
   HEAD；开发期不兼容旧格式。

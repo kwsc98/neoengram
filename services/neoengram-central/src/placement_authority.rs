@@ -106,12 +106,33 @@ pub struct ReplicationStateTransitionRequest {
 }
 
 /// Compare-and-swap request that starts a fresh attempt without discarding durable checkpoints.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryReplicationRequest {
     pub tenant_id: TenantId,
     pub replication_id: ReplicationId,
     pub expected_attempt: u64,
+    pub request_id: RequestId,
     pub updated_at_unix_ms: UnixMillis,
+}
+
+/// Result of a retry mutation.  The receipt is the linearization point: an exact replay returns
+/// the original Replication snapshot even if a later retry has already advanced the live row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryReplicationResult {
+    pub replication: ReplicationRecord,
+    pub replayed: bool,
+}
+
+pub(crate) fn same_retry_request(
+    left: &RetryReplicationRequest,
+    right: &RetryReplicationRequest,
+) -> bool {
+    // `updated_at_unix_ms` is assigned by Central for the state mutation. It is deliberately not
+    // part of the request identity because an HTTP replay receives a fresh server timestamp.
+    left.tenant_id == right.tenant_id
+        && left.replication_id == right.replication_id
+        && left.expected_attempt == right.expected_attempt
+        && left.request_id == right.request_id
 }
 
 /// Idempotent cancellation request for one active Replication attempt.

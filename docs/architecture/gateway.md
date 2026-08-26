@@ -4,7 +4,7 @@
 >
 > 生效日期：2026-08-09。
 >
-> 最后更新：2026-08-10。
+> 最后更新：2026-08-24。
 >
 > 本文是 Gateway 拓扑、资源、连接方向、安全、可用性、跨集群传输和 S3 暴露方式的专项权威文档。
 > 当前代码已包含 Gateway 协议、Gateway Registry、管理 API、三 listener、有界 H2 tunnel、Central outbound
@@ -17,8 +17,8 @@
 > 但尚未组成包含真实 Central Registry 原子租约、durable outbox、命令签名和完整业务回路的 E2E。外部生产
 > `WorkloadCertificateIssuer`/KMS-HSM 适配、完整双 Replica E2E、真实集群 readiness/failover 和维护窗口
 > 切换验收仍未完成。
-> 任何文档或原型与本文冲突时，目标架构以本文为准。当前能力和实施顺序分别见
-> [`implementation-plan.md`](implementation-plan.md) 和 [`ROADMAP.md`](ROADMAP.md)。
+> 任何文档或原型与本文冲突时，目标架构以本文为准。当前能力和实施顺序见
+> [`../roadmap.md`](../roadmap.md)；本文是 Gateway 专项唯一事实来源。
 
 ## 1. 决策摘要
 
@@ -50,7 +50,8 @@ GatewayPool”。一个 EdgeCluster 对应一个逻辑 `GatewayPool`，Pool 由�
 - Gateway 只路由控制帧和后续的数据流，不保存对象 payload 或权威 metadata；
 - Gateway 多副本只提升网络入口可用性，不表示 Chunk、Volume 或 metadata 多副本；
 - Central 下行命令和 Agent 上行报告保留端到端签名，Gateway 不能修改已签名 payload；
-- Gateway 控制面与固定 Ready Snapshot 的一期只读 S3 数据面已实现；跨集群对象传输仍是后续独立里程碑；
+- Gateway 控制面与固定 Ready Snapshot 的一期只读 S3 数据面已实现；跨集群 replication 的控制记录、ticket
+  和协议边界已有代码，payload 执行与生产验收仍是独立里程碑；
 - 迁移采用维护窗口一次性切换，不保留 Agent 直连 Central 的双栈或回退协议；
 - Fusen 不属于 Gateway 架构依赖或传输决策。
 
@@ -64,7 +65,7 @@ GatewayPool”。一个 EdgeCluster 对应一个逻辑 `GatewayPool`，Pool 由�
 | Agent 路由     | Gateway Registry 已持久化 RouteLease，Central 原子 session+lease grant 和 Agent stream/unary 转发代码已接入；InMemory/SQLite 共用的双 Replica 契约已覆盖活跃租约拒绝抢占、过期接管和旧 owner fencing，但尚无把真实 Registry、双 Replica transport、outbox 和签名串起来的故障恢复 E2E                                                                                                        | Central 权威 `AgentRouteLease` + Replica forwarding |
 | 传输安全       | Agent trust bundle、Central command signing、activation 防重放、Gateway/Agent mTLS/SAN/EKU、过期 credential CAS fencing、RouteLease owner 复核、Gateway 入站对端证书 notAfter deadline、Agent 半程续签安装和重连，以及 Gateway server leaf 到期驱动 Agent/Central 既有 H2 断开已实现；外部生产 issuer/KMS-HSM adapter、Gateway 证书交付切换和真实轮换演练待完成                        | H2 + mTLS，另保留端到端 Ed25519 签名                |
 | Volume 访问    | Agent 挂载并读写所属 Volume                                                                                                                                                                                                                                                                                                                                                            | 仍只有 Volume Owner Agent 挂载和访问 Volume         |
-| 跨集群 payload | 未实现                                                                                                                                                                                                                                                                                                                                                                                 | Agent A -> Gateway A -> Gateway B -> Agent B        |
+| 跨集群 payload | Central replication/route/ticket 与 Agent/Gateway 协议边界已接入；Agent 复制配置必须显式启用并在启动时完成 command trust、QUIC/TLS 预检，Central 只向声明 `commit_replication_quic_v1` 的 ready Agent 路由；真实 payload 执行和跨节点 E2E 待验收                                                                                                                                                                                                                                                                                                                                                                                 | Agent A -> Gateway A -> Gateway B -> Agent B        |
 | S3             | Ready Snapshot Access Point、SigV4/预签名、ListObjectsV2、HEAD/GET/Range、Agent 二进制流和 Web 对象浏览已实现；公网 DNS/TLS、生产 CA、真实双 Replica 故障演练仍由部署验收完成                                                                                                                                                                                                              | 固定 Ready Snapshot 的只读 S3 Access Point          |
 
 “目标架构”不能在对应代码、契约测试和部署验收完成前标记为当前能力。当前仓库处于不提供旧 endpoint
@@ -81,8 +82,8 @@ Central 继续权威管理：
 - EdgeCluster、StorageVolume、ArtifactPlacement、AgentInstance 和 Volume Owner generation；
 - GatewayPool、GatewayReplica、AgentRouteLease 和工作负载证书状态；
 - Job、Assignment、PlaygroundLease、fencing token、Decision 和审计事件；
-- 后续的 TransferRoute、TransferTicket 和 TransferSession，以及当前只读数据面的 S3AccessPoint、
-  S3Credential 和策略 generation。
+- TransferRoute、TransferTicket 和 TransferSession 控制记录，以及当前只读数据面的 S3AccessPoint、
+  S3Credential 和策略 generation；payload 是否可执行由 route/keyring/capability 决定。
 
 Central 持久化 metadata 和 placement evidence，但不接收、不代理、不保存 Chunk payload。当前 SQLite
 仍只支持单进程 Central；Central 多副本和生产 HA 以 PostgreSQL adapter 为前置条件。
@@ -96,7 +97,7 @@ Gateway 是区域网络与协议边界，负责：
 - 把 Agent enrollment、heartbeat、report、metadata 和 Index 请求转发给 Central；
 - 把 Central Assignment、Decision、drain 和控制命令投递到 Agent owner Replica；
 - 维护可丢弃的连接目录、限流计数和短期转发状态；
-- 后续按 TransferTicket 流式转发跨集群对象；
+- 按 TransferTicket 流式转发跨集群对象（当前需 route/keyring/Agent execution）；
 - 为固定 Ready Snapshot 提供只读 S3 协议入口和 Web 静态资源；
 
 Gateway 不得：
@@ -126,7 +127,7 @@ Volume Owner Agent -> durability barrier -> Volume-local CAS
 Central ObjectCatalog
 ```
 
-业务 Pod 继续通过本集群 NFS/CSI 直接访问精确 Playground/Snapshot 目录，不经过 Gateway 或 Central。
+业务 Pod 继续通过本集群 NFS/CSI 直接访问精确 Playground/SnapshotDelivery 目录，不经过 Gateway 或 Central。
 
 ## 4. Central 资源模型
 
@@ -201,8 +202,9 @@ bootstrap endpoint 在 Registry 层固化；在证书轮换交付/切换协议�
 
 Central 增加 `GatewayRegistryRepository`，InMemory 和 SQLite 必须运行同一行为契约。GatewayPool、
 GatewayReplica、activation/certificate 记录和 AgentRouteLease 写入现有 Agent Registry 数据库；该库从
-authority 使用单一 clean-slate schema identity `application_id = 0x4e454155`、`user_version = 12`；
-未知或旧数据库直接拒绝，不能留下半初始化 schema。
+  authority 使用单一 clean-slate schema identity `application_id = 0x4e454155`、`user_version = 17`；
+  已知的合并 authority v13-v16 显式迁移到 v17，未知 schema 与旧的拆分数据库布局直接拒绝，不能留下
+  半初始化 schema。
 
 管理面至少提供 GatewayPool create/get/list/update/drain，以及 GatewayReplica create/list/drain/revoke。
 所有 mutation 使用稳定 request identity、expected resource version 和审计主体；重复 create 返回同一

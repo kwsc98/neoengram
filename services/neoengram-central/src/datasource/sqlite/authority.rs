@@ -19,8 +19,9 @@ const LOCK_FILE_NAME: &str = "authority.lock";
 // `NEAU` identifies the consolidated authority database. Older consolidated schema versions are
 // migrated in place; legacy split-database layouts remain rejected below.
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4155;
-const SQLITE_SCHEMA_VERSION: i64 = 16;
+const SQLITE_SCHEMA_VERSION: i64 = 17;
 const PREVIOUS_SQLITE_SCHEMA_VERSION: i64 = 15;
+const RETRY_RECEIPT_SQLITE_SCHEMA_VERSION: i64 = 16;
 const ARTIFACT_SCOPE_SQLITE_SCHEMA_VERSION: i64 = 14;
 const LEGACY_SQLITE_SCHEMA_VERSION: i64 = 13;
 const LEGACY_DATABASE_FILES: &[&str] = &[
@@ -383,6 +384,17 @@ CREATE TABLE replication_artifacts (
         REFERENCES replications (tenant_id, replication_id) ON DELETE CASCADE
 ) STRICT;
 
+CREATE TABLE replication_retry_mutations (
+    tenant_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    replication_id TEXT NOT NULL,
+    request_payload BLOB NOT NULL,
+    result_payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, request_id),
+    FOREIGN KEY (tenant_id, replication_id)
+        REFERENCES replications (tenant_id, replication_id) ON DELETE CASCADE
+) STRICT;
+
 CREATE TABLE replication_objects (
     tenant_id TEXT NOT NULL,
     replication_id TEXT NOT NULL,
@@ -611,7 +623,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 16")
+        sqlx::query("PRAGMA user_version = 17")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -627,15 +639,22 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
         migrate_schema_v13_to_v14(pool).await?;
         migrate_schema_v14_to_v15(pool).await?;
         migrate_schema_v15_to_v16(pool).await?;
+        migrate_schema_v16_to_v17(pool).await?;
         return validate_current_schema(pool).await;
     }
     if user_version == ARTIFACT_SCOPE_SQLITE_SCHEMA_VERSION {
         migrate_schema_v14_to_v15(pool).await?;
         migrate_schema_v15_to_v16(pool).await?;
+        migrate_schema_v16_to_v17(pool).await?;
         return validate_current_schema(pool).await;
     }
     if user_version == PREVIOUS_SQLITE_SCHEMA_VERSION {
         migrate_schema_v15_to_v16(pool).await?;
+        migrate_schema_v16_to_v17(pool).await?;
+        return validate_current_schema(pool).await;
+    }
+    if user_version == RETRY_RECEIPT_SQLITE_SCHEMA_VERSION {
+        migrate_schema_v16_to_v17(pool).await?;
         return validate_current_schema(pool).await;
     }
     if user_version != SQLITE_SCHEMA_VERSION {
@@ -866,6 +885,50 @@ async fn migrate_schema_v15_to_v16(pool: &SqlitePool) -> CentralResult<()> {
     .await
     .map_err(storage_error)?;
     sqlx::query("PRAGMA user_version = 16")
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    transaction.commit().await.map_err(storage_error)
+}
+
+/// Adds durable request receipts for Commit replication retries.  The receipt table is separate
+/// from `replications` because one replication may be retried more than once over its lifetime.
+async fn migrate_schema_v16_to_v17(pool: &SqlitePool) -> CentralResult<()> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    let existing_sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'replication_retry_mutations'",
+    )
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(storage_error)?;
+    let canonical_sql = embedded_table_schema("replication_retry_mutations")?;
+    let mut create_table = existing_sql.is_none();
+    if let Some(existing_sql) = existing_sql {
+        if normalize_schema_sql(&existing_sql) != normalize_schema_sql(&canonical_sql) {
+            let row_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM replication_retry_mutations")
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?;
+            if row_count != 0 {
+                return Err(storage_corruption(
+                    "cannot migrate non-empty replication retry receipts with an invalid schema",
+                ));
+            }
+            sqlx::query("DROP TABLE replication_retry_mutations")
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            create_table = true;
+        }
+    }
+    if create_table {
+        sqlx::raw_sql(&canonical_sql)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+    }
+    sqlx::query("PRAGMA user_version = 17")
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;

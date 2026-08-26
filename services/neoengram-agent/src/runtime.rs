@@ -282,16 +282,41 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     config.validate()?;
+    validate_replication_prerequisites(&config, command_trust_bundle.as_ref())?;
+    let replication_ready = if config.replication.enabled {
+        // Preserve the startup invariant that a failed mount probe performs no network I/O.
+        let observation = probe.probe();
+        validate_bootstrap_probe(&observation)?;
+        // Bootstrap capability evidence must include a real Gateway QUIC/TLS handshake, not only
+        // local config parsing or a socket bind. A temporarily unavailable Gateway leaves the
+        // Agent usable for non-replication work and simply withholds the dynamic capability.
+        let network = crate::approved_runtime::build_replication_network(&config)?;
+        match network
+            .as_ref()
+            .expect("enabled replication always builds a network")
+            .preflight_gateway()
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "replication Gateway QUIC preflight failed; capability will not be advertised");
+                false
+            }
+        }
+    } else {
+        false
+    };
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         shutdown.await;
         let _ = shutdown_sender.send(true);
     });
-    run_with(
+    run_with_capabilities(
         config.clone(),
         enrollment_client.clone(),
         probe.clone(),
         wait_for_shutdown(shutdown_receiver.clone()),
+        replication_ready,
     )
     .await?;
     if *shutdown_receiver.borrow() {
@@ -651,6 +676,21 @@ where
     P: MountProbe,
     F: Future<Output = ()> + Send,
 {
+    run_with_capabilities(config, client, probe, shutdown, false).await
+}
+
+async fn run_with_capabilities<C, P, F>(
+    config: AgentConfig,
+    client: C,
+    probe: P,
+    shutdown: F,
+    replication_ready: bool,
+) -> AgentDaemonResult<()>
+where
+    C: EnrollmentClient,
+    P: MountProbe,
+    F: Future<Output = ()> + Send,
+{
     config.validate()?;
     let mut reporter = HealthReporter::acquire(config.storage.state_dir.clone())?;
     let mut shutdown = Box::pin(shutdown);
@@ -723,6 +763,7 @@ where
                 &public_key_spki,
                 token,
                 bootstrap_probe,
+                replication_ready,
             )?);
             let accepted = match bootstrap_until_accepted(
                 &client,
@@ -1039,6 +1080,7 @@ fn build_bootstrap_request(
     public_key_spki: &Ed25519PublicKeySpki,
     token: Zeroizing<String>,
     probe: neoengram_domain::protocol::AgentBootstrapProbe,
+    replication_ready: bool,
 ) -> AgentDaemonResult<AgentBootstrapRequest> {
     let mut request = AgentBootstrapRequest {
         bootstrap_request_id: RequestId::new(identity.bootstrap_request_id.clone())
@@ -1052,7 +1094,7 @@ fn build_bootstrap_request(
         volume_descriptor_digest: config.volume_descriptor_digest,
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         wire_version: CURRENT_WIRE_VERSION,
-        capabilities: agent_capabilities(),
+        capabilities: agent_capabilities(config, replication_ready),
         public_key_fingerprint: public_key_spki.fingerprint(),
         proof: placeholder_proof(public_key_spki.clone()),
         probe,
@@ -1062,7 +1104,7 @@ fn build_bootstrap_request(
     Ok(request)
 }
 
-fn agent_capabilities() -> Vec<String> {
+pub(crate) fn agent_capabilities(config: &AgentConfig, replication_ready: bool) -> Vec<String> {
     let mut capabilities = vec![
         "h2_control_channel_v1".to_owned(),
         "managed_add_v1".to_owned(),
@@ -1071,6 +1113,9 @@ fn agent_capabilities() -> Vec<String> {
         "workspace_materialize_v1".to_owned(),
     ];
     capabilities.push("snapshot_delivery_copy_v2".to_owned());
+    if config.replication.enabled && replication_ready {
+        capabilities.push("commit_replication_quic_v1".to_owned());
+    }
     // The v2 FUSE backend and the device/inode proof required by Hardlink Delivery are only
     // implemented on these Unix targets. Do not advertise a mode that would fail after Central
     // has already accepted and persisted a Delivery.
@@ -1080,6 +1125,29 @@ fn agent_capabilities() -> Vec<String> {
         "snapshot_delivery_hardlink_v2".to_owned(),
     ]);
     capabilities
+}
+
+fn validate_replication_prerequisites(
+    config: &AgentConfig,
+    command_trust_bundle: Option<&crate::CentralCommandTrustBundle>,
+) -> AgentDaemonResult<()> {
+    if !config.replication.enabled {
+        return Ok(());
+    }
+    if command_trust_bundle.is_none() {
+        return Err(AgentDaemonError::Configuration(
+            "central_command_trust_bundle_file is required when replication is enabled".to_owned(),
+        ));
+    }
+    if config.replication_listen_socket_addr()?.is_none()
+        || config.replication_gateway_socket_addr()?.is_none()
+    {
+        return Err(AgentDaemonError::Configuration(
+            "replication listener and Gateway endpoints are required when replication is enabled"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 struct StatusRequestSigner<'a> {

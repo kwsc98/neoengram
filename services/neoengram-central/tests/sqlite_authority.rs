@@ -232,7 +232,7 @@ async fn sqlite_migrates_schema_13_replication_records_and_checkpoints() {
         .fetch_one(&mut connection)
         .await
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     connection.close().await.unwrap();
     authority.integrity_check().await.unwrap();
     authority.close().await;

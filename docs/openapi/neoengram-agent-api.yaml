@@ -777,6 +777,14 @@ components:
           $ref: '#/components/schemas/Digest'
         expected_resource_version:
           $ref: '#/components/schemas/DecimalU64'
+        capabilities:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
     AgentSessionOpenResponse:
       type: object
       additionalProperties: false

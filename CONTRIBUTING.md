@@ -6,8 +6,10 @@
 ## 本地开发
 
 1. Fork 仓库并从最新默认分支创建短生命周期分支。
-2. 进行范围清晰的改动，并为行为变化增加测试和文档。
-3. 在提交 pull request 前运行：
+2. 开始任务前阅读 [`AGENTS.md`](AGENTS.md)；涉及产品或公共 API 时先核对
+   [`docs/current-state.md`](docs/current-state.md) 与 [`docs/iteration-guide.md`](docs/iteration-guide.md)。
+3. 进行范围清晰的改动，并为行为变化增加测试和文档。
+4. 在提交 pull request 前运行：
 
 ```bash
 cargo fmt --all -- --check
@@ -21,8 +23,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 - 说明改动解决的问题、实现方式和验证方法。
 - 保持每个 pull request 聚焦，避免混入无关重构。
 - 如果公共行为发生变化，请同步更新 README 或相关文档。
+- 如果代码、契约或测试反推出的实际行为与产品描述不一致，先更新
+  [`docs/current-state.md`](docs/current-state.md)，再把未实现目标保留在产品/路线文档中。
 - 如果涉及路线、架构、研究结论或阶段状态，请同步更新
-  [`docs/implementation-plan.md`](docs/implementation-plan.md)；该文件是能力和计划的唯一事实来源。
+  [`docs/roadmap.md`](docs/roadmap.md)；该文件是能力和计划的唯一事实来源。
 - 不要求每个 pull request 修改 CHANGELOG；维护者会在发布前统一整理。
 
 ## 贡献许可

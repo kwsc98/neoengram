@@ -105,6 +105,11 @@ a separately provisioned fixture; provide its command as
 `PROJECT_TEST_REAL_FLOW_COMMAND` to run that explicit step. Without it, the
 runner records a clear skip rather than claiming that a real Agent transfer was
 verified.
+Set `PROJECT_TEST_REQUIRE_REAL_FLOW=1` in CI acceptance jobs so a missing real-flow
+fixture is a configuration failure instead of a skip. Generated local Agent fixtures
+explicitly set `replication.enabled: false`; a real-flow fixture must provision the
+Central command trust bundle, both QUIC endpoints, and mutual-TLS material before
+enabling replication.
 
 The default full-flow does not start production Agents because enrollment needs
 deployment-specific Gateway trust, bootstrap tokens, and Central command-key

@@ -228,6 +228,7 @@ async fn workload_certificate_install_advances_generation_once() {
             boot_id: boot_id("certificate-replacement-old-boot"),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version: renewed.resource_version,
+            capabilities: None,
         })
         .await
         .unwrap();
@@ -2373,6 +2374,94 @@ fn scoped_bootstrap_token(suffix: &str) -> String {
 }
 
 #[tokio::test]
+async fn new_boot_without_capabilities_clears_previous_session_capabilities() {
+    assert_capabilities_are_scoped_to_boot(Arc::new(InMemoryAgentRegistry::new())).await;
+
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    assert_capabilities_are_scoped_to_boot(sqlite.repository()).await;
+}
+
+async fn assert_capabilities_are_scoped_to_boot(repository: Arc<dyn AgentRegistryRepository>) {
+    let approved = approve_initial_repository(repository.clone()).await;
+    let service = AgentRegistryService::new(repository, Arc::new(InMemoryClock::new(200)), 100);
+    let first = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot_id("capability-boot-a"),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: approved.resource_version,
+            capabilities: Some(
+                ["commit_replication_quic_v1".to_owned()]
+                    .into_iter()
+                    .collect(),
+            ),
+        })
+        .await
+        .unwrap();
+    assert!(first
+        .record
+        .instance
+        .as_ref()
+        .unwrap()
+        .capabilities
+        .contains("commit_replication_quic_v1"));
+
+    let replay = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot_id("capability-boot-a"),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: approved.resource_version,
+            capabilities: None,
+        })
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert!(replay
+        .record
+        .instance
+        .as_ref()
+        .unwrap()
+        .capabilities
+        .contains("commit_replication_quic_v1"));
+
+    let closed = service
+        .close_session(CloseAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            boot_id: boot_id("capability-boot-a"),
+            session_generation: first.session_generation,
+            expected_resource_version: first.record.resource_version,
+        })
+        .await
+        .unwrap();
+    let second = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot_id("capability-boot-b"),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: closed.resource_version,
+            capabilities: None,
+        })
+        .await
+        .unwrap();
+    assert!(!second.replayed);
+    assert_eq!(second.session_generation, SessionGeneration::new(2));
+    assert!(second
+        .record
+        .instance
+        .as_ref()
+        .unwrap()
+        .capabilities
+        .is_empty());
+}
+
+#[tokio::test]
 async fn stale_session_recovers_after_crash_without_owner_takeover() {
     run_crash_recovery(Arc::new(InMemoryAgentRegistry::new())).await;
 
@@ -2412,6 +2501,7 @@ async fn run_crash_recovery(repository: Arc<dyn AgentRegistryRepository>) {
             boot_id: boot_id("boot-before-crash"),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version: approved.record.resource_version,
+            capabilities: None,
         })
         .await
         .unwrap();
@@ -2445,6 +2535,7 @@ async fn run_crash_recovery(repository: Arc<dyn AgentRegistryRepository>) {
             boot_id: boot_id("boot-after-crash"),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version: ready.record.resource_version,
+            capabilities: None,
         })
         .await
         .unwrap();
@@ -2873,6 +2964,7 @@ async fn run_lifecycle(
                 boot_id: boot_id("boot-wrong-mount"),
                 mount_identity_digest: different_mount_identity_digest(),
                 expected_resource_version: approved.record.resource_version,
+                capabilities: None,
             })
             .await
             .unwrap_err()
@@ -2887,10 +2979,22 @@ async fn run_lifecycle(
             boot_id: boot_id("boot-a"),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version: approved.record.resource_version,
+            capabilities: Some(
+                ["commit_replication_quic_v1".to_owned()]
+                    .into_iter()
+                    .collect(),
+            ),
         })
         .await
         .unwrap();
     assert_eq!(opened.session_generation.get(), 1);
+    assert!(opened
+        .record
+        .instance
+        .as_ref()
+        .expect("approved Agent instance")
+        .capabilities
+        .contains("commit_replication_quic_v1"));
     let replayed_open = service
         .open_session(OpenAgentSessionRequest {
             agent_id: initial_agent_id(),
@@ -2898,6 +3002,11 @@ async fn run_lifecycle(
             boot_id: boot_id("boot-a"),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version: approved.record.resource_version,
+            capabilities: Some(
+                ["commit_replication_quic_v1".to_owned()]
+                    .into_iter()
+                    .collect(),
+            ),
         })
         .await
         .unwrap();
@@ -2915,6 +3024,7 @@ async fn run_lifecycle(
                 boot_id: boot_id("boot-a"),
                 mount_identity_digest: mount_identity_digest(),
                 expected_resource_version: opened.record.resource_version,
+                capabilities: None,
             })
             .await
             .unwrap_err()
@@ -2929,6 +3039,7 @@ async fn run_lifecycle(
                 boot_id: boot_id("boot-cloned-state"),
                 mount_identity_digest: mount_identity_digest(),
                 expected_resource_version: opened.record.resource_version,
+                capabilities: None,
             })
             .await
             .unwrap_err()
@@ -3079,6 +3190,17 @@ async fn run_lifecycle(
         })
         .await
         .unwrap();
+    assert_eq!(closed.mount.health, ResourceHealth::Unknown);
+    assert!(closed.mount.observed_volume_marker.is_none());
+    assert!(closed.mount.observed_access_mode.is_none());
+    assert!(closed.mount.reported_health.is_none());
+    assert_eq!(
+        service
+            .volume_state(&initial_enrollment_id())
+            .await
+            .unwrap(),
+        DerivedVolumeState::Unavailable
+    );
     assert_eq!(
         service
             .report_mount(mount_report(
@@ -3103,6 +3225,7 @@ async fn run_lifecycle(
             boot_id: boot_id("boot-a-restarted"),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version: closed.resource_version,
+            capabilities: None,
         })
         .await
         .unwrap();
@@ -3231,6 +3354,7 @@ async fn run_lifecycle(
                 boot_id: boot_id("boot-old-retry"),
                 mount_identity_digest: mount_identity_digest(),
                 expected_resource_version: revoked.resource_version,
+                capabilities: None,
             })
             .await
             .unwrap_err()
@@ -3262,6 +3386,7 @@ async fn run_lifecycle(
             boot_id: boot_id("boot-b"),
             mount_identity_digest: mount_identity_digest(),
             expected_resource_version: replacement_approved.record.resource_version,
+            capabilities: None,
         })
         .await
         .unwrap();

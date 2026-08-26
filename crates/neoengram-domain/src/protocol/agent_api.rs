@@ -1,8 +1,11 @@
+use std::collections::HashSet;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::validation::{
-    parse_unique_json, validate_extension_keys, validate_positive, CONTENT_DIGEST_PATTERN,
+    parse_unique_json, validate_extension_keys, validate_nonempty_limited, validate_positive,
+    CONTENT_DIGEST_PATTERN,
 };
 use crate::core::ManifestId;
 use crate::{
@@ -205,8 +208,49 @@ struct AgentRequestSignatureInput<'a> {
 pub struct AgentSessionOpenPayload {
     pub mount_identity_digest: AgentMountIdentityDigest,
     pub expected_resource_version: ResourceVersion,
+    /// Capabilities that were validated by this Agent before opening the session.  This is
+    /// optional for compatibility with older Agents; when present Central refreshes the dynamic
+    /// Agent capability set atomically with the session fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256), extend("uniqueItems" = true))]
+    pub capabilities: Option<Vec<String>>,
     #[serde(default, flatten)]
     pub extensions: Extensions,
+}
+
+impl AgentSessionOpenPayload {
+    pub fn validate(&self) -> ProtocolResult<()> {
+        if let Some(capabilities) = &self.capabilities {
+            if capabilities.len() > 256 {
+                return Err(ProtocolError::LimitExceeded {
+                    limit_name: "Agent session capabilities",
+                    limit: 256,
+                    actual: capabilities.len(),
+                });
+            }
+            let mut unique = HashSet::with_capacity(capabilities.len());
+            if let Some(duplicate) = capabilities
+                .iter()
+                .find(|capability| !unique.insert(capability.as_str()))
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "capabilities",
+                    reason: format!("duplicate capability {duplicate:?}"),
+                });
+            }
+            for capability in capabilities {
+                validate_nonempty_limited("capability", capability, 128)?;
+            }
+        }
+        validate_extension_keys(
+            &self.extensions,
+            &[
+                "mount_identity_digest",
+                "expected_resource_version",
+                "capabilities",
+            ],
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -709,6 +753,7 @@ impl AgentChannelUpstreamFrame {
         match &payload.message {
             AgentChannelUpstreamMessage::Open(open) => {
                 self.request.validate_open()?;
+                open.validate()?;
                 if payload.sequence.get() != 1 {
                     return Err(invalid_channel_field(
                         "sequence",
@@ -721,10 +766,6 @@ impl AgentChannelUpstreamFrame {
                         "the signed Open frame cannot correlate a prior message",
                     ));
                 }
-                validate_extension_keys(
-                    &open.extensions,
-                    &["mount_identity_digest", "expected_resource_version"],
-                )?;
             }
             AgentChannelUpstreamMessage::Heartbeat(heartbeat) => {
                 self.request.validate_session()?;
@@ -1289,6 +1330,7 @@ mod tests {
             payload: AgentSessionOpenPayload {
                 mount_identity_digest: AgentMountIdentityDigest::new(digest()),
                 expected_resource_version: ResourceVersion::new(7),
+                capabilities: None,
                 extensions: Extensions::new(),
             },
             proof: AgentRequestProof {
@@ -1322,6 +1364,7 @@ mod tests {
                     message: AgentChannelUpstreamMessage::Open(AgentSessionOpenPayload {
                         mount_identity_digest: AgentMountIdentityDigest::new(digest()),
                         expected_resource_version: ResourceVersion::new(7),
+                        capabilities: None,
                         extensions: Extensions::new(),
                     }),
                     extensions: Extensions::new(),

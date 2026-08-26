@@ -259,6 +259,15 @@ const snapshotDeliveryDeleteRequests = new Map<
 const snapshotQueryCounts = new Map<string, number>();
 const commitReplications = new Map<string, CreateCommitReplicationResponse['replication']>();
 const commitReplicationQueryCounts = new Map<string, number>();
+const commitReplicationRetryMutations = new Map<
+  string,
+  {
+    tenant_id: string;
+    replication_id: string;
+    expected_attempt: string;
+    response: RetryCommitReplicationResponse;
+  }
+>();
 const commitReplicationRequests = new Map<
   string,
   { requestJson: string; response: CreateCommitReplicationResponse }
@@ -3508,6 +3517,25 @@ export const handlers = [
     const body = (await request.json()) as RetryCommitReplicationRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
+    const receiptKey = resourceKey(body.tenant_id, body.request_id);
+    const receipt = commitReplicationRetryMutations.get(receiptKey);
+    if (receipt) {
+      if (
+        receipt.tenant_id !== body.tenant_id ||
+        receipt.replication_id !== body.replication_id ||
+        receipt.expected_attempt !== body.expected_attempt
+      ) {
+        return mutationConflict(
+          request,
+          'REQUEST_ID_REUSED',
+          'Replication retry request ID is already bound to another payload',
+        );
+      }
+      return HttpResponse.json(
+        { ...receipt.response, replayed: true },
+        { headers: headers(request) },
+      );
+    }
     const key = resourceKey(body.tenant_id, body.replication_id);
     const replication = commitReplications.get(key);
     if (!replication) return notFound(request, 'Replication');
@@ -3529,7 +3557,13 @@ export const handlers = [
     delete next.issue;
     commitReplications.set(key, next);
     commitReplicationQueryCounts.set(key, 0);
-    const response: RetryCommitReplicationResponse = { replication: next };
+    const response: RetryCommitReplicationResponse = { replication: next, replayed: false };
+    commitReplicationRetryMutations.set(receiptKey, {
+      tenant_id: body.tenant_id,
+      replication_id: body.replication_id,
+      expected_attempt: body.expected_attempt,
+      response,
+    });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/commit/replication/cancel', async ({ request }) => {
@@ -4775,6 +4809,7 @@ export function resetMockState(): void {
   snapshotCreateRequests.clear();
   commitReplications.clear();
   commitReplicationQueryCounts.clear();
+  commitReplicationRetryMutations.clear();
   commitReplicationRequests.clear();
   snapshotDeliveries.splice(0, snapshotDeliveries.length);
   snapshotDeliveryCreateRequests.clear();

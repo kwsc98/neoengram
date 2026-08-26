@@ -143,6 +143,7 @@ pub struct RetryCommitReplicationRequest {
     pub tenant_id: String,
     pub replication_id: String,
     pub expected_attempt: String,
+    pub request_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -150,6 +151,7 @@ pub struct RetryCommitReplicationRequest {
 #[sensitive(opaque)]
 pub struct RetryCommitReplicationResponse {
     pub replication: ReplicationView,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]

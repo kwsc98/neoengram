@@ -501,7 +501,7 @@ export interface paths {
         put?: never;
         /**
          * 重试失败的 Commit 复制
-         * @description 使用当前 attempt fence 重新排队失败或取消的 Commit 复制任务。
+         * @description 使用当前 attempt fence 重新排队失败或取消的 Commit 复制任务。相同 request_id 与完整 payload 幂等返回首次重试结果；request_id 复用到不同 payload 时返回 409。
          */
         post: operations["retryCommitReplication"];
         delete?: never;
@@ -912,8 +912,8 @@ export interface paths {
         put?: never;
         /**
          * 查询租户内 Snapshot
-         * @description 按 Project、Artifact、Commit 或状态分页查询独立逻辑 Snapshot；物理副本由 Placement
-         *     动态解析，不作为 Snapshot 筛选条件。
+         * @description 按 Project、Artifact、Commit 或状态分页查询独立逻辑 Snapshot；物理可读性由已发布 PlacementSet
+         *     和相关 SnapshotDelivery 动态解析，不作为 Snapshot 筛选条件。
          *     opaque cursor 与全部筛选条件绑定。
          */
         post: operations["querySnapshotList"];
@@ -2792,6 +2792,7 @@ export interface components {
             tenant_id: components["schemas"]["TenantId"];
             replication_id: components["schemas"]["ResourceId"];
             expected_attempt: components["schemas"]["CanonicalU64"];
+            request_id: components["schemas"]["RequestId"];
         };
         CancelCommitReplicationRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -2900,6 +2901,7 @@ export interface components {
         };
         RetryCommitReplicationResponse: {
             replication: components["schemas"]["ReplicationView"];
+            replayed: boolean;
         };
         CancelCommitReplicationResponse: {
             replication: components["schemas"]["ReplicationView"];

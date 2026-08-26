@@ -556,6 +556,7 @@ fn agent_open_frame(request_id: &str, message_id: &str) -> AgentChannelUpstreamF
                         b"network-e2e-mount",
                     )),
                     expected_resource_version: ResourceVersion::new(1),
+                    capabilities: None,
                     extensions: Extensions::new(),
                 }),
                 extensions: Extensions::new(),

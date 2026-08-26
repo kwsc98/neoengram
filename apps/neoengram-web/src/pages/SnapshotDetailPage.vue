@@ -34,6 +34,7 @@ import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import {
   commitReplicationRequestId,
+  commitReplicationRetryRequestId,
   findActiveCommitReplication,
   findCommitReplicationForTarget,
   isCommitReplicationActive,
@@ -115,6 +116,9 @@ const volumeQuery = useQuery({
   queryFn: () => queryStorageVolume(tenantId.value, targetVolumeId.value),
   enabled: computed(() => Boolean(targetVolumeId.value && deliveryCapabilityEnabled.value)),
   staleTime: 30_000,
+  // This state is live Agent availability, not a durable lifecycle field.
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
 });
 const volumeListQuery = useQuery({
   queryKey: computed(() => ['storage-volumes', tenantId.value, 'snapshot-detail']),
@@ -124,6 +128,8 @@ const volumeListQuery = useQuery({
       snapshot.value && (deliveryCapabilityEnabled.value || replicationCapabilityEnabled.value),
     ),
   ),
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
 });
 const targetVolumes = computed(() => volumeListQuery.data.value?.data.items ?? []);
 const gatewayPoolQuery = useQuery({
@@ -135,6 +141,8 @@ const gatewayPoolQuery = useQuery({
       gatewayInventoryEnabled.value,
   ),
   staleTime: 15_000,
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
 });
 const storageClusters = computed(() =>
   groupStorageVolumesByCluster(targetVolumes.value, gatewayPoolQuery.data.value?.data.items ?? [], {
@@ -433,6 +441,7 @@ async function retryReplication(): Promise<void> {
     tenant_id: tenantId.value,
     replication_id: current.replication_id,
     expected_attempt: current.attempt,
+    request_id: commitReplicationRetryRequestId(current.replication_id, current.attempt),
   });
   ElMessage.success('复制任务已重新提交');
   await replicationListQuery.refetch();

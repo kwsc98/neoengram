@@ -25,6 +25,9 @@ pub const AGENT_ENROLLMENT_REVIEW_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const AGENT_BOOTSTRAP_STATUS_MAX_CLOCK_SKEW_MS: u64 = 60 * 1_000;
 pub const AGENT_ENROLLMENT_MAX_PAGE_SIZE: usize = 100;
 pub const AGENT_ENROLLMENT_MAX_QUERY_CHARS: usize = 256;
+/// Capability emitted only after an Agent has validated its Central ticket trust and QUIC data
+/// plane before opening a session.
+pub const AGENT_CAPABILITY_COMMIT_REPLICATION_QUIC_V1: &str = "commit_replication_quic_v1";
 
 /// Persisted format identity for the current authority record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +430,7 @@ impl AgentRegistryRecord {
         };
         if instance.state != AgentInstanceState::Active
             || instance.active_boot_id.is_none()
+            || instance.active_session_id.is_none()
             || instance.session_generation.is_none()
             || self.owner.active_agent_id.as_ref() != Some(&instance.agent_id)
         {
@@ -497,6 +501,10 @@ pub struct OpenAgentSessionRequest {
     pub boot_id: AgentBootId,
     pub mount_identity_digest: AgentMountIdentityDigest,
     pub expected_resource_version: ResourceVersion,
+    /// Capabilities validated by the Agent before this session was opened. `None` means that a
+    /// new session advertises no dynamic capabilities; an accepted same-boot replay does not
+    /// mutate the persisted set.
+    pub capabilities: Option<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1316,6 +1324,9 @@ impl AgentRegistryService {
         instance.last_heartbeat_at_unix_ms = None;
         instance.last_sequence = None;
         record.mount.health = ResourceHealth::Unknown;
+        record.mount.observed_volume_marker = None;
+        record.mount.observed_access_mode = None;
+        record.mount.reported_health = None;
         record.mount.available_bytes = None;
         record.mount.observed_at_unix_ms = None;
         let previous = record.resource_version.get();
@@ -1762,6 +1773,26 @@ impl AgentRegistryService {
             return Ok(None);
         }
         Ok(Some(record))
+    }
+
+    /// Returns true only for a heartbeat-backed ready Volume whose active Agent advertised the
+    /// replication data-plane capability at bootstrap.
+    pub async fn current_ready_volume_supports_replication(
+        &self,
+        tenant_id: &TenantId,
+        storage_volume_id: &StorageVolumeId,
+    ) -> CentralResult<bool> {
+        let Some(record) = self
+            .current_ready_volume_record(tenant_id, storage_volume_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(record.instance.is_some_and(|instance| {
+            instance
+                .capabilities
+                .contains(AGENT_CAPABILITY_COMMIT_REPLICATION_QUIC_V1)
+        }))
     }
 
     async fn load(&self, enrollment_id: &AgentEnrollmentId) -> CentralResult<AgentRegistryRecord> {
@@ -2647,6 +2678,16 @@ pub(crate) fn open_agent_session_against(
                 "session open replay payload differs from the persisted request",
             ));
         }
+        if request
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| instance.capabilities != *capabilities)
+        {
+            return Err(error(
+                CentralErrorCode::ConcurrentUpdate,
+                "session open replay capabilities differ from the persisted request",
+            ));
+        }
         let session_generation = instance.session_generation.ok_or_else(|| {
             error(
                 CentralErrorCode::Internal,
@@ -2689,6 +2730,8 @@ pub(crate) fn open_agent_session_against(
     instance.session_opened_at_unix_ms = Some(now);
     instance.last_heartbeat_at_unix_ms = None;
     instance.last_sequence = None;
+    // Dynamic capability evidence belongs to this boot and must not survive into a new session.
+    instance.capabilities = request.capabilities.clone().unwrap_or_default();
     let generation = instance
         .session_generation
         .expect("generation was assigned");
@@ -3067,7 +3110,6 @@ pub(crate) fn validate_registry_replace_transition(
                         && stored.public_key_fingerprint == updated.public_key_fingerprint
                         && stored.agent_version == updated.agent_version
                         && stored.wire_version == updated.wire_version
-                        && stored.capabilities == updated.capabilities
                         && stored.state == updated.state
                 });
         if !owner_state_valid || !runtime_scope_frozen {
@@ -3368,7 +3410,6 @@ pub(crate) fn validate_registry_record(record: &AgentRegistryRecord) -> CentralR
                 && instance.public_key_fingerprint == candidate.public_key_fingerprint
                 && instance.agent_version == candidate.agent_version
                 && instance.wire_version == candidate.wire_version
-                && instance.capabilities == candidate.capabilities
         });
         let session_metadata_complete = match &instance.active_boot_id {
             Some(_) => {

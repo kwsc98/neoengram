@@ -19,6 +19,9 @@ data:
     trust_bundle_file: /etc/neoengram/gateway-ca.pem
     gateway_workload_trust_domain: mesh.example.test
     central_command_trust_bundle_file: /etc/neoengram/central-command-trust.json
+    replication:
+      # Enable only after provisioning QUIC endpoints and mutual-TLS files.
+      enabled: false
     tenant_id: tenant-example
     edge_cluster_id: edge-example
     storage_volume_id: volume-example

@@ -4,9 +4,9 @@
 一致性保证和已知边界。它以当前 `0.2.0`/仓库格式 9 代码为准，面向需要操作仓库、集成命令行或排查
 故障的使用者。
 
-源码模块职责见 [`code-architecture.md`](code-architecture.md)，磁盘布局、内容图和锁协议见
-[`storage-architecture.md`](storage-architecture.md)，尚未实现的远端能力与路线见
-[`implementation-plan.md`](implementation-plan.md)。
+源码模块职责见 [`../architecture/code.md`](../architecture/code.md)，磁盘布局、内容图和锁协议见
+[`../architecture/storage.md`](../architecture/storage.md)，尚未实现的远端能力与路线见
+[`../roadmap.md`](../roadmap.md)。
 
 ## 1. 当前能力边界
 

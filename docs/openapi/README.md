@@ -1,39 +1,23 @@
 # NeoEngram Public OpenAPI
 
-[`neoengram-api.yaml`](neoengram-api.yaml) 是面向用户、CLI 和 UI 的公开 API 设计契约。
-`neoengram-central` 是唯一 Central 进程，使用 Fusen 0.9.0 提供可监听 HTTP API。
-默认配置注册当前已实现的 system、Tenant、StorageVolume、Artifact、Playground、Snapshot 和 Job
-action API：
+[`neoengram-api.yaml`](neoengram-api.yaml) 是面向用户、CLI 和 UI 的公开 API 契约。
+`neoengram-central` 是唯一 Central 进程，使用 Fusen 0.9.0 提供 HTTP API。路由的唯一清单是
+`crates/neoengram-domain/src/protocol/action_registry.rs` 中的 `PUBLIC_ACTION_REGISTRY`；不要从本文件
+手写的摘要推断后端能力。
+
+截至 2026-08-24，registry 有 85 条公开契约路由：其中 82 条（含健康探针）由当前 Central controller
+descriptor 安装，以下 3 条明确是 contract-only Web surface：
 
 ```text
-POST /api/system/version/query
-GET  /health/live
-GET  /health/ready
-POST /api/tenant/list/query
-POST /api/tenant/query
-POST /api/tenant/create
-POST /api/storage/volume/list/query
-POST /api/storage/volume/query
-POST /api/storage/volume/create
-POST /api/artifact/list/query
-POST /api/artifact/query
-POST /api/artifact/create
-POST /api/playground/list/query
-POST /api/playground/query
-POST /api/playground/create
-POST /api/playground/precommit/start
-POST /api/playground/precommit/query
-POST /api/playground/precommit/restart
-POST /api/playground/precommit/cancel
-POST /api/playground/file/list/query
-POST /api/playground/change/list/query
-POST /api/playground/file/metadata/query
-POST /api/playground/dataset/profile/query
-POST /api/playground/commit/create
-POST /api/job/add/create
-POST /api/job/query
-POST /api/job/add/finalize
+POST /api/snapshot/file/list/query
+POST /api/snapshot/activity/list/query
+POST /api/snapshot/dataset/profile/query
 ```
+
+这 3 条路径由 OpenAPI 和 Web Mock 冻结请求/响应形状，但当前没有 Central handler。其余公开路径（包括
+Project、Commit graph/diff/replication、SnapshotDelivery、资源生命周期、Gateway 管理和 S3 管理/对象
+查询 action）都已进入 Central 路由 descriptor；具体是否可执行仍由 `/api/system/version/query` 的
+capability 和运行时依赖决定。
 
 Gateway 控制面管理接口已加入同一 Fusen listener。它们是 operator/管理 API，不是数据面或 Agent
 业务帧入口；调用需要 `gateway.manage` 权限。Replica activation 响应中的 activation token 只展示
@@ -53,8 +37,10 @@ POST /api/gateway/replica/revoke
 ```
 
 这些接口只管理 Central 权威的 GatewayPool/Replica 状态、证书激活和排空；它们不让 Gateway 挂载
-Volume，也不把 Gateway 变成 metadata 或 Chunk authority。跨集群 Transfer 和只读 S3 API 尚未注册，
-分别属于后续 G2/G3 里程碑。
+Volume，也不把 Gateway 变成 metadata 或 Chunk authority。跨 Volume 的控制 action 通过 Commit
+replication 路径提供，字节仍由 Agent/Gateway 数据面传输；只读 S3 另有 Central 管理 action、内部授权
+路由和 Gateway public listener。生产凭据、GatewayPool readiness、Agent route 与真实跨节点 E2E 仍受
+能力开关和部署验收约束。
 
 启用 Agent enrollment 时，同一 Fusen 用户 listener 还注册 token create、enrollment list/query、approve
 和 reject 五个公开管理接口。另一份 OpenAPI 3.1 契约
@@ -78,9 +64,10 @@ POST /agent/session/close
 对象字节不会进入 Gateway/Central 控制链路。Agent 将不可变 Chunk 直接持久化到获批 StorageVolume
 的 Volume-local CAS，只通过 MetadataBatch 上报 Manifest、IndexDelta 和带 Placement 的 ObjectReceipt。
 
-公开契约中的 Project、Artifact commit diff，以及 Snapshot delivery/file/activity/profile 等 operation
-仍是目标契约，不表示当前 Server 已经注册；Artifact commit graph 与 Snapshot list/query/create
-基础 action 已注册。Web 必须按 `/api/system/version/query` 返回的 capability 隐藏未注册入口。
+公开契约中的 Project、Artifact commit diff、Snapshot delivery、Commit replication 和 S3 管理 action
+已经注册到当前 Central descriptor；只有上面列出的 Snapshot file/activity/profile 三条仍是 contract-only。
+OpenAPI 路由已注册不等于数据面已经可用：Web 必须按 `/api/system/version/query` 返回的 capability 隐藏
+依赖 enrollment、coordinator、GatewayPool、placement 或 command keyring 的入口。
 
 业务接口使用外部 OIDC/JWKS Bearer JWT 和服务端 RBAC，无法确认身份或授权时默认拒绝。SQLite
 运行模式只支持单副本；生产 TLS 由 Ingress/反向代理终止。
@@ -134,8 +121,10 @@ Agent 消费 token 后通过内部 API 提交脱敏 enrollment，公开状态为
 probe 才能推进到 `enrolled` 和 `ready`；拒绝进入终态 `rejected`。
 
 资源 mutation 同样只接受公开 DTO：StorageVolume 登记已有 PVC/NFS，不负责创建底层存储资源。
-Artifact 创建必须通过 discriminator 明确选择空初始化，或从同 Tenant 另一 Artifact 的明确 Commit
-派生；派生来源显式携带来源 Project。Playground/Workspace 和 SnapshotDelivery 创建各自选择一个同 Tenant Volume。
+Artifact 创建通过 discriminator 表达空初始化或从同 Tenant 另一 Artifact 的明确 Commit 派生，派生来源显式
+携带来源 Project；当前 Central 只执行空初始化，`derived` 请求返回
+`409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED`。Playground/Workspace 和 SnapshotDelivery 创建各自
+选择一个同 Tenant Volume。
 
 Playground 继续使用完整资源 identity 幂等创建。Snapshot create 使用稳定 request identity，只创建
 `snapshot_id + commit_id` 的逻辑引用，不选择或绑定 Volume/Region；同一 Tenant/Artifact/Commit
@@ -153,11 +142,13 @@ Pre-commit start 创建新的 `precommit_id`，并在服务端内部冻结当前
 父 Commit 和 Tags，不要求调用方理解 Ref。Commit Diff 默认比较目标 Commit 与其单一 parent，根
 Commit 与空基线比较；公开结果只包含 Commit 视图、逻辑路径、变更类型和大小统计。
 
-Playground 文件、变更、文件元数据和 Dataset Profile 使用拆分分页方法；Snapshot 提供独立详情、
-交付重试、Ready 文件清单、活动记录和 Dataset Profile。上述 DTO 仅包含逻辑路径、Schema、统计、
+Playground 文件、变更、文件元数据和 Dataset Profile 使用拆分分页方法；Snapshot 提供独立详情和
+SnapshotDelivery 交付重试。Snapshot 文件清单、活动记录和 Dataset Profile 的三条路径目前只冻结了
+OpenAPI/Web Mock 形状，尚无 Central handler（contract-only）。上述 DTO 仅包含逻辑路径、Schema、统计、
 质量和 freshness，不公开 Manifest ID、对象位置、凭据或物理路径。
 
-Dataset Profile 是 Playground/Snapshot 派生的只读元数据，不是 Snapshot 创建参数。用途、保留策略、
+Dataset Profile 的目标语义是 Playground/Snapshot 派生的只读元数据，不是 Snapshot 创建参数；当前 Snapshot
+Profile 路径仍为 contract-only。用途、保留策略、
 Lease/Mount、容量与底层诊断、Agent/assignment、fencing、Manifest/Chunk、文件内容 digest、对象分布
 和物理路径均不属于 P0 普通用户契约；后续能力必须通过独立 P1 或 operator API 与相应 RBAC 暴露。
 
@@ -169,7 +160,7 @@ fence、sequence、message ID、correlation、type 和 payload。MetadataBatch �
 由以下契约定义：
 
 - [`neoengram-agent-api.yaml`](neoengram-agent-api.yaml)
-- [`../agent-central-control.md`](../agent-central-control.md)
+- [`../architecture/control-plane.md`](../architecture/control-plane.md)
 - [`../../crates/neoengram-domain/schemas/current/control-envelope.schema.json`](../../crates/neoengram-domain/schemas/current/control-envelope.schema.json)
 - [`../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json`](../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json)
 

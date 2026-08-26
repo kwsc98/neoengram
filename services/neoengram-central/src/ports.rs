@@ -839,7 +839,7 @@ pub trait PlacementRepository: Send + Sync {
     async fn retry_replication(
         &self,
         request: crate::RetryReplicationRequest,
-    ) -> CentralResult<crate::ReplicationRecord>;
+    ) -> CentralResult<crate::RetryReplicationResult>;
     /// Cancels an active Replication attempt. Published data cannot be cancelled through this API.
     async fn cancel_replication(
         &self,

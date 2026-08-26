@@ -43,6 +43,9 @@ use crate::{
 };
 
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
+// Keep a report burst below the Gateway's bounded Agent input queue. Heartbeats and
+// acknowledgements must still fit while Central is processing durable reports.
+const MAX_REPORTS_PER_FLUSH: usize = 1;
 const CHANNEL_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 
@@ -124,6 +127,68 @@ impl Clock for RuntimeClock {
     }
 }
 
+pub(crate) fn build_replication_network(
+    config: &AgentConfig,
+) -> AgentDaemonResult<Option<Arc<crate::QuicTransferNetwork>>> {
+    if !config.replication.enabled {
+        return Ok(None);
+    }
+    let listen = config.replication_listen_socket_addr()?.ok_or_else(|| {
+        AgentDaemonError::Configuration(
+            "replication listener endpoint is not configured".to_owned(),
+        )
+    })?;
+    let gateway_endpoint = config.replication_gateway_socket_addr()?.ok_or_else(|| {
+        AgentDaemonError::Configuration("replication Gateway endpoint is not configured".to_owned())
+    })?;
+    let certificate_file = config
+        .replication
+        .tls_certificate_file
+        .clone()
+        .ok_or_else(|| {
+            AgentDaemonError::Configuration(
+                "replication TLS certificate is not configured".to_owned(),
+            )
+        })?;
+    let private_key_file = config
+        .replication
+        .tls_private_key_file
+        .clone()
+        .ok_or_else(|| {
+            AgentDaemonError::Configuration(
+                "replication TLS private key is not configured".to_owned(),
+            )
+        })?;
+    let client_ca_file = config.replication.tls_ca_file.clone().ok_or_else(|| {
+        AgentDaemonError::Configuration("replication TLS CA is not configured".to_owned())
+    })?;
+    let server_name = config
+        .replication
+        .gateway_endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.host_str())
+        .ok_or_else(|| {
+            AgentDaemonError::Configuration(
+                "replication Gateway endpoint host is not configured".to_owned(),
+            )
+        })?
+        .to_owned();
+    let network = crate::QuicTransferNetwork::bind(&crate::QuicTransferNetworkConfig {
+        listen: Some(listen),
+        gateway_endpoint: Some(gateway_endpoint),
+        certificate_file,
+        private_key_file,
+        client_ca_file,
+        server_name,
+    })
+    .map_err(|error| {
+        AgentDaemonError::Configuration(format!(
+            "replication QUIC network could not start: {error}"
+        ))
+    })?;
+    Ok(Some(Arc::new(network)))
+}
+
 /// Runs one already-approved Agent identity until shutdown.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_approved_session<C, P, F>(
@@ -168,9 +233,27 @@ where
     )?);
     reports.integrity_check()?;
     let deferred = Arc::new(DeferredProcessor::default());
+    // Bind and preflight the replication data plane before opening the Central session. A
+    // replication-enabled Agent may stay online when the Gateway is temporarily unavailable, but
+    // Central must not persist the dynamic capability until the endpoint handshake succeeds.
+    let replication_network = build_replication_network(&config)?;
+    let replication_ready = match replication_network.as_ref() {
+        Some(network) => match network.preflight_gateway().await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "replication Gateway QUIC preflight failed; capability will not be advertised");
+                false
+            }
+        },
+        None => false,
+    };
     let open_payload = AgentSessionOpenPayload {
         mount_identity_digest,
         expected_resource_version: initial_resource_version,
+        capabilities: Some(super::runtime::agent_capabilities(
+            &config,
+            replication_ready,
+        )),
         extensions: Extensions::new(),
     };
     let reconnect_max_delay = Duration::from_secs(config.session.reconnect_max_delay_seconds);
@@ -233,68 +316,6 @@ where
     execution.initialize()?;
     let execution = Arc::new(execution);
 
-    // Direct Agent QUIC is optional and disabled unless the complete endpoint/TLS block is
-    // configured.  The same network object is shared by the source listener and target executor;
-    // only the signed Central ticket selects an artifact-scoped backend.
-    let replication_network = match (
-        config.replication_listen_socket_addr()?,
-        config.replication_gateway_socket_addr()?,
-    ) {
-        (None, None) => None,
-        (listen, gateway_endpoint) => {
-            let certificate_file =
-                config
-                    .replication
-                    .tls_certificate_file
-                    .clone()
-                    .ok_or_else(|| {
-                        AgentDaemonError::Configuration(
-                            "replication TLS certificate is not configured".to_owned(),
-                        )
-                    })?;
-            let private_key_file =
-                config
-                    .replication
-                    .tls_private_key_file
-                    .clone()
-                    .ok_or_else(|| {
-                        AgentDaemonError::Configuration(
-                            "replication TLS private key is not configured".to_owned(),
-                        )
-                    })?;
-            let client_ca_file = config.replication.tls_ca_file.clone().ok_or_else(|| {
-                AgentDaemonError::Configuration("replication TLS CA is not configured".to_owned())
-            })?;
-            let server_name = config
-                .replication
-                .gateway_endpoint
-                .as_ref()
-                .and_then(|endpoint| endpoint.host_str())
-                .or_else(|| {
-                    config
-                        .replication
-                        .listen_endpoint
-                        .as_ref()
-                        .and_then(|endpoint| endpoint.host_str())
-                })
-                .unwrap_or("localhost")
-                .to_owned();
-            let network = crate::QuicTransferNetwork::bind(&crate::QuicTransferNetworkConfig {
-                listen,
-                gateway_endpoint,
-                certificate_file,
-                private_key_file,
-                client_ca_file,
-                server_name,
-            })
-            .map_err(|error| {
-                AgentDaemonError::Configuration(format!(
-                    "replication QUIC network could not start: {error}"
-                ))
-            })?;
-            Some(Arc::new(network))
-        }
-    };
     let (_replication_shutdown, replication_shutdown_receiver) = tokio::sync::watch::channel(false);
     if let (Some(network), Some(trust_bundle)) =
         (replication_network.clone(), command_trust_bundle.clone())
@@ -427,7 +448,7 @@ where
         .with_lifecycle_binding(volume.clone(), binding.fence.session_generation)
         .with_lifecycle_executor(lifecycle_executor)
         .with_replication_executor(Arc::new(
-            MountedVolumeReplicationExecutor::new_with_network(
+            MountedVolumeReplicationExecutor::new_with_network_and_session_fence(
                 Arc::clone(&execution),
                 volume.tenant_id.clone(),
                 volume.agent_id.clone(),
@@ -435,6 +456,8 @@ where
                 command_trust_bundle.clone(),
                 Arc::clone(&clock),
                 replication_network,
+                Some(fence.clone()),
+                Some(volume.mount_generation),
             ),
         )),
     ))?;
@@ -972,7 +995,7 @@ async fn send_queued_reports(
     pending: &mut BTreeMap<MessageId, PendingAck>,
     tenant_id: TenantId,
 ) -> AgentDaemonResult<()> {
-    for queued in reports.list(32)? {
+    for queued in reports.list(MAX_REPORTS_PER_FLUSH)? {
         if pending.contains_key(&queued.message_id) {
             continue;
         }
@@ -1117,6 +1140,34 @@ async fn handle_downstream(
             .map(|_| ())
         }
         AgentChannelDownstreamMessage::Error(error) => {
+            // A non-retryable report rejection is a terminal outcome for that durable
+            // observation (for example, a report for a replication that Central cancelled).
+            // Drop only the correlated report so one obsolete item cannot prevent the Agent
+            // from reconnecting and accepting newer assignments.
+            if error.code.as_str() == "AGENT_ACTION_REJECTED" && !error.retryable {
+                let Some(correlation) = frame.correlation_id.as_ref() else {
+                    return Err(AgentDaemonError::Session(
+                        "Agent report rejection omitted correlation".to_owned(),
+                    ));
+                };
+                let is_report = matches!(pending.get(correlation), Some(PendingAck::Report { .. }));
+                if is_report {
+                    let Some(PendingAck::Report {
+                        durable_message_id, ..
+                    }) = pending.remove(correlation)
+                    else {
+                        return Err(AgentDaemonError::Session(
+                            "Agent report rejection correlation disappeared".to_owned(),
+                        ));
+                    };
+                    if !reports.acknowledge(&durable_message_id)? {
+                        return Err(AgentDaemonError::Session(
+                            "rejected outbound report disappeared from the local queue".to_owned(),
+                        ));
+                    }
+                    return Ok(());
+                }
+            }
             let stale = matches!(
                 error.code.as_str(),
                 "STALE_SESSION_GENERATION" | "SESSION_FENCE_MISMATCH"

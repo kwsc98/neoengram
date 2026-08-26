@@ -115,6 +115,8 @@ pub fn map_central_error(error: CentralError) -> Error {
         ),
         CentralErrorCode::JobAlreadyExists
         | CentralErrorCode::JobIdReused
+        | CentralErrorCode::ReplicationAlreadyActive
+        | CentralErrorCode::ReplicationRetryRequestReused
         | CentralErrorCode::InvalidState
         | CentralErrorCode::AssignmentMismatch
         | CentralErrorCode::GenerationMismatch
@@ -230,6 +232,12 @@ fn conflict_message(code: CentralErrorCode) -> &'static str {
     match code {
         CentralErrorCode::JobAlreadyExists | CentralErrorCode::JobIdReused => {
             "the Job ID already belongs to a different request"
+        }
+        CentralErrorCode::ReplicationRetryRequestReused => {
+            "the replication retry request ID already belongs to a different payload"
+        }
+        CentralErrorCode::ReplicationAlreadyActive => {
+            "an active replication already targets this Commit and StorageVolume"
         }
         CentralErrorCode::InvalidState => "the Job is not in a valid state for this operation",
         CentralErrorCode::AssignmentMismatch | CentralErrorCode::GenerationMismatch => {
@@ -496,6 +504,20 @@ mod tests {
             Some(&Value::String("CONCURRENT_UPDATE".into()))
         );
         assert_eq!(details.get("retryable"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn active_replication_uses_stable_conflict_code() {
+        let error = map_central_error(CentralError::new(
+            CentralErrorCode::ReplicationAlreadyActive,
+            "private storage race detail",
+        ));
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(error.code().as_str(), "replication_already_active");
+        assert_eq!(
+            error.details().unwrap().get("neo_code"),
+            Some(&Value::String("REPLICATION_ALREADY_ACTIVE".into()))
+        );
     }
 
     #[test]

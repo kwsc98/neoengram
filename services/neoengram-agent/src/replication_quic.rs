@@ -11,7 +11,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use neoengram_domain::protocol::{
@@ -50,6 +50,8 @@ pub enum QuicTransferError {
     Io(#[from] io::Error),
     #[error("QUIC TLS configuration failed: {0}")]
     Tls(String),
+    #[error("Gateway QUIC preflight timed out")]
+    PreflightTimeout,
 }
 
 /// Optional Agent QUIC network. Central still signs the immutable scope; this config supplies a
@@ -167,6 +169,18 @@ impl QuicTransferNetwork {
         Ok(self.endpoint.connect(address, &self.server_name)?.await?)
     }
 
+    /// Performs the bounded network half of replication preflight. A successful result means the
+    /// configured Gateway endpoint completed QUIC TLS/ALPN negotiation with this Agent identity;
+    /// it does not authorize a transfer or consume object bytes. The control stream is closed
+    /// immediately because only a Central-signed ticket can open a transfer.
+    pub async fn preflight_gateway(&self) -> Result<(), QuicTransferError> {
+        let connection = tokio::time::timeout(Duration::from_secs(5), self.connect_gateway())
+            .await
+            .map_err(|_| QuicTransferError::PreflightTimeout)??;
+        connection.close(0u32.into(), b"replication preflight");
+        Ok(())
+    }
+
     /// Serves source streams until the session is fenced or shutdown is requested.  The backend
     /// is selected only after the signed ticket has been validated, so a peer cannot choose an
     /// arbitrary artifact path by manipulating the QUIC handshake.
@@ -239,6 +253,7 @@ impl QuicTransferNetwork {
 pub struct QuicTransferIdentity {
     pub agent_id: neoengram_domain::AgentId,
     generations: Option<(u64, u64, u64)>,
+    session_mount: Option<(u64, u64)>,
 }
 
 impl QuicTransferIdentity {
@@ -247,12 +262,24 @@ impl QuicTransferIdentity {
         Self {
             agent_id,
             generations: None,
+            session_mount: None,
         }
     }
 
     #[must_use]
     pub fn with_generations(mut self, session: u64, mount: u64, route: u64) -> Self {
         self.generations = Some((session, mount, route));
+        self.session_mount = None;
+        self
+    }
+
+    /// Fences the Agent session and mounted Volume while leaving the Gateway route generation to
+    /// the signed ticket/Gateway fence. Agents do not own the Gateway's route lease, so comparing
+    /// that field against the ticket itself would provide no protection.
+    #[must_use]
+    pub fn with_session_mount(mut self, session: u64, mount: u64) -> Self {
+        self.generations = None;
+        self.session_mount = Some((session, mount));
         self
     }
 
@@ -288,6 +315,14 @@ impl QuicTransferIdentity {
             {
                 return Err(QuicTransferError::Protocol(
                     "ticket target route generation is stale".into(),
+                ));
+            }
+        }
+        if let Some((session, mount)) = self.session_mount {
+            if ticket.session_generation.get() != session || ticket.mount_generation.get() != mount
+            {
+                return Err(QuicTransferError::Protocol(
+                    "ticket target session or mount generation is stale".into(),
                 ));
             }
         }
@@ -901,6 +936,15 @@ mod tests {
         identity.check_target(&transfer).unwrap();
         let stale = identity.clone().with_generations(6, 7, 9);
         assert!(stale.check_target(&transfer).is_err());
+        let session_mount = QuicTransferIdentity::new(AgentId::new("agent-target").unwrap())
+            .with_session_mount(6, 7);
+        session_mount.check_target(&transfer).unwrap();
+        let mut replaced_session = transfer.clone();
+        replaced_session.session_generation = SessionGeneration::new(9);
+        assert!(session_mount.check_target(&replaced_session).is_err());
+        let mut replaced_mount = transfer.clone();
+        replaced_mount.mount_generation = MountGeneration::new(10);
+        assert!(session_mount.check_target(&replaced_mount).is_err());
         let mut unauthorized = transfer;
         unauthorized.allowed_objects.clear();
         assert!(validate_ticket_set(&unauthorized, &set).is_err());

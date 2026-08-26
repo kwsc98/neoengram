@@ -53,6 +53,8 @@ schema_version: 1
 wire_version: 1
 gateway_endpoint: ${gateway_endpoint}
 trust_bundle_file: ${trust_bundle}
+replication:
+  enabled: false
 tenant_id: ${tenant_id}
 edge_cluster_id: ${edge_cluster_id}
 storage_volume_id: ${storage_volume_id}

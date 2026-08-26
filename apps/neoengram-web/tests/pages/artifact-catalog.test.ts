@@ -582,6 +582,64 @@ describe('Artifact catalog detail', () => {
     queryClient.clear();
   });
 
+  it('refreshes live StorageVolume availability while the replication drawer is open', async () => {
+    vi.useFakeTimers();
+    const mounted = await mountPage(
+      '/tenants/tenant-a/projects/project-a/artifacts/artifact-a?tab=commits',
+      artifact,
+      ['artifact_catalog', 'artifact_commit_graph', 'artifact_commit_replication'],
+      undefined,
+      ['artifact.read', 'artifact.commit.replicate'],
+    );
+    try {
+      const { wrapper } = mounted;
+
+      await wrapper.find(`[data-commit-id="${headCommitId}"]`).find('button').trigger('click');
+      await flushPromises();
+      expect(api.queryStorageVolumeList).toHaveBeenCalledTimes(1);
+
+      api.queryStorageVolumeList.mockResolvedValueOnce({
+        data: {
+          items: [
+            {
+              tenant_id: 'tenant-a',
+              storage_volume_id: 'volume-a',
+              display_name: 'Volume A',
+              edge_cluster_id: 'edge-a',
+              backend_type: 'pvc',
+              access_mode: 'read_write_once',
+              region: 'cn-shanghai',
+              allowed_delivery_modes: ['copy'],
+              hardlink_policy: 'disabled',
+              max_whole_file_bytes: '1024',
+              copy_reserve_bytes: '0',
+              state: 'unavailable',
+              resource_version: '2',
+              lifecycle: { state: 'active', generation: '1', resource_version: '2' },
+              created_at_unix_ms: '1',
+              updated_at_unix_ms: '2',
+            },
+          ],
+        },
+        requestId: 'request-volumes-unavailable',
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushPromises();
+
+      expect(api.queryStorageVolumeList).toHaveBeenCalledTimes(2);
+      expect(
+        wrapper
+          .findAll('button')
+          .find((button) => button.text().trim() === '复制 Commit')
+          ?.attributes('disabled'),
+      ).toBeDefined();
+    } finally {
+      mounted.wrapper.unmount();
+      mounted.queryClient.clear();
+      vi.useRealTimers();
+    }
+  });
+
   it('restores an active task for the target and does not create a duplicate', async () => {
     api.queryCommitReplicationList.mockResolvedValueOnce({
       data: {
