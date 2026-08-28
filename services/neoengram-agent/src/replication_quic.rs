@@ -223,6 +223,7 @@ impl QuicTransferNetwork {
     /// Serves source streams until the session is fenced or shutdown is requested.  The backend
     /// is selected only after the signed ticket has been validated, so a peer cannot choose an
     /// arbitrary artifact path by manipulating the QUIC handshake.
+    #[allow(clippy::too_many_arguments)]
     pub async fn serve_source(
         &self,
         trust_bundle: Arc<CentralCommandTrustBundle>,
