@@ -41,8 +41,9 @@ use crate::{
     same_retry_request, valid_replication_transition, validate_replication_checkpoints,
     validate_replication_publication, validate_replication_record, CancelReplicationRequest,
     CommitAvailabilityRecord, FinalizeReplicationRequest, FinalizeReplicationResult,
-    PlacementRepository, ReplicationRecord, ReplicationStateTransitionRequest,
-    RetryReplicationRequest, RetryReplicationResult, WorkspaceRecord,
+    PlacementRepository, RefreshReplicationRoutesRequest, ReplicationRecord,
+    ReplicationRouteBinding, ReplicationStateTransitionRequest, RetryReplicationRequest,
+    RetryReplicationResult, WorkspaceRecord,
 };
 
 #[derive(Debug, Default)]
@@ -541,6 +542,94 @@ impl PlacementRepository for InMemoryPlacementRepository {
             })
             .cloned()
             .collect())
+    }
+
+    async fn refresh_replication_routes(
+        &self,
+        request: RefreshReplicationRoutesRequest,
+    ) -> CentralResult<ReplicationRecord> {
+        let key = (request.tenant_id.clone(), request.replication_id.clone());
+        let mut records = lock(&self.replications)?;
+        let record = records.get_mut(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "replication does not exist",
+            )
+        })?;
+        if record.attempt != request.expected_attempt {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication attempt changed concurrently",
+            ));
+        }
+        if !matches!(
+            record.state,
+            ReplicationState::Queued
+                | ReplicationState::Planning
+                | ReplicationState::Transferring
+                | ReplicationState::Verifying
+        ) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "terminal replication cannot refresh its route",
+            ));
+        }
+        let current_source = route_binding_from_record(record, true)?;
+        let current_target = route_binding_from_record(record, false)?;
+        if request.source.session_generation.get() == 0
+            || request.source.mount_generation.get() == 0
+            || request.source.route_generation.get() == 0
+            || request.target.session_generation.get() == 0
+            || request.target.mount_generation.get() == 0
+            || request.target.route_generation.get() == 0
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "replication route generations must be positive",
+            ));
+        }
+        if current_source != request.expected_source || current_target != request.expected_target {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication route changed concurrently",
+            ));
+        }
+        if request.source.agent_id != current_source.agent_id
+            || request.target.agent_id != current_target.agent_id
+            || request.source.edge_cluster_id != current_source.edge_cluster_id
+            || request.target.edge_cluster_id != current_target.edge_cluster_id
+            || request.source.gateway_pool_id != current_source.gateway_pool_id
+            || request.target.gateway_pool_id != current_target.gateway_pool_id
+            || request.source.mount_generation != current_source.mount_generation
+            || request.target.mount_generation != current_target.mount_generation
+            || request.source.session_generation.get() < current_source.session_generation.get()
+            || request.target.session_generation.get() < current_target.session_generation.get()
+            || request.source.route_generation.get() < current_source.route_generation.get()
+            || request.target.route_generation.get() < current_target.route_generation.get()
+        {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "replication route refresh cannot change Agent or mount identity",
+            ));
+        }
+        if request.updated_at_unix_ms < record.updated_at_unix_ms {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication timestamp cannot move backwards",
+            ));
+        }
+        record.source_edge_cluster_id = Some(request.source.edge_cluster_id);
+        record.source_gateway_pool_id = Some(request.source.gateway_pool_id);
+        record.source_session_generation = Some(request.source.session_generation);
+        record.source_mount_generation = Some(request.source.mount_generation);
+        record.source_route_generation = Some(request.source.route_generation);
+        record.target_edge_cluster_id = Some(request.target.edge_cluster_id);
+        record.target_gateway_pool_id = Some(request.target.gateway_pool_id);
+        record.target_session_generation = Some(request.target.session_generation);
+        record.target_mount_generation = Some(request.target.mount_generation);
+        record.target_route_generation = Some(request.target.route_generation);
+        record.updated_at_unix_ms = request.updated_at_unix_ms;
+        Ok(record.clone())
     }
 
     async fn insert_replication(
@@ -3191,5 +3280,75 @@ fn lock<T>(mutex: &Mutex<T>) -> CentralResult<MutexGuard<'_, T>> {
             CentralErrorCode::Internal,
             "in-memory adapter lock poisoned",
         )
+    })
+}
+
+fn route_binding_from_record(
+    record: &ReplicationRecord,
+    source: bool,
+) -> CentralResult<ReplicationRouteBinding> {
+    let (
+        edge_cluster_id,
+        gateway_pool_id,
+        agent_id,
+        session_generation,
+        mount_generation,
+        route_generation,
+    ) = if source {
+        (
+            record.source_edge_cluster_id.clone(),
+            record.source_gateway_pool_id.clone(),
+            record.source_agent_id.clone(),
+            record.source_session_generation,
+            record.source_mount_generation,
+            record.source_route_generation,
+        )
+    } else {
+        (
+            record.target_edge_cluster_id.clone(),
+            record.target_gateway_pool_id.clone(),
+            record.target_agent_id.clone(),
+            record.target_session_generation,
+            record.target_mount_generation,
+            record.target_route_generation,
+        )
+    };
+    Ok(ReplicationRouteBinding {
+        edge_cluster_id: edge_cluster_id.ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            )
+        })?,
+        gateway_pool_id: gateway_pool_id.ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            )
+        })?,
+        agent_id: agent_id.ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            )
+        })?,
+        session_generation: session_generation.ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            )
+        })?,
+        mount_generation: mount_generation.ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            )
+        })?,
+        route_generation: route_generation.ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            )
+        })?,
     })
 }

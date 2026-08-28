@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     future::Future,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
@@ -32,6 +35,8 @@ use neoengram_domain::protocol::{
     AGENT_SESSION_OPEN_PATH, CURRENT_WIRE_VERSION, MAX_RECORDS_PER_PAGE,
 };
 use tokio::runtime::Handle;
+
+const SESSION_DATA_PLANE_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 use crate::{
     resource_lifecycle::{LifecycleJobGate, ResourceLifecycleExecutor},
@@ -1463,6 +1468,7 @@ pub struct SessionExecutionBridge<C> {
     signer: Arc<AgentRequestSigner>,
     fence: SharedSessionFence,
     reports: Arc<dyn OutboundReportQueue>,
+    shutdown_signal: Arc<AtomicBool>,
     runtime: Handle,
     index_cache: RwLock<BTreeMap<AssignmentKey, AuthoritativeIndexSnapshot>>,
 }
@@ -1491,9 +1497,18 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
             signer,
             fence,
             reports,
+            shutdown_signal: Arc::new(AtomicBool::new(false)),
             runtime,
             index_cache: RwLock::new(BTreeMap::new()),
         }
+    }
+
+    /// Shares the daemon shutdown signal with blocking execution workers. The default keeps the
+    /// bridge usable for embedded callers that do not have a lifecycle signal.
+    #[must_use]
+    pub fn with_shutdown_signal(mut self, shutdown_signal: Arc<AtomicBool>) -> Self {
+        self.shutdown_signal = shutdown_signal;
+        self
     }
 
     fn signed<T: serde::Serialize>(
@@ -1507,26 +1522,86 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
             .map_err(data_plane_error)
     }
 
-    fn call<T, F>(&self, mut action: F) -> AgentResult<T>
+    fn signed_with_request_id<T: serde::Serialize>(
+        &self,
+        path: &'static str,
+        request_id: RequestId,
+        payload: T,
+    ) -> AgentResult<neoengram_domain::protocol::AgentAuthenticatedRequest<T>> {
+        let fence = self.fence.get().map_err(data_plane_error)?;
+        self.signer
+            .sign_with_request_id(
+                path,
+                request_id,
+                Some(&fence),
+                UnixMillis::new(system_now()?),
+                payload,
+            )
+            .map_err(data_plane_error)
+    }
+
+    fn call_signed<P, T, F>(
+        &self,
+        path: &'static str,
+        payload: P,
+        mut action: F,
+    ) -> AgentResult<(neoengram_domain::protocol::AgentAuthenticatedRequest<P>, T)>
     where
+        P: serde::Serialize + Clone + Send + 'static,
+        T: Send + 'static,
         F: FnMut(
             Arc<C>,
+            neoengram_domain::protocol::AgentAuthenticatedRequest<P>,
         )
             -> Pin<Box<dyn Future<Output = Result<T, crate::AgentSessionClientError>> + Send>>,
     {
         self.runtime.block_on(async {
             let mut delay = Duration::from_millis(100);
-            for attempt in 0..3 {
-                match action(Arc::clone(&self.client)).await {
-                    Ok(value) => return Ok(value),
-                    Err(error) if error.retryable() && attempt < 2 => {
-                        tokio::time::sleep(delay).await;
-                        delay = delay.saturating_mul(2);
+            let mut attempt = 0_u64;
+            let mut request_id: Option<RequestId> = None;
+            loop {
+                if self.shutdown_signal.load(Ordering::Acquire) {
+                    return Err(data_plane_error(
+                        "Agent shutdown requested while waiting for the data plane",
+                    ));
+                }
+                attempt = attempt.saturating_add(1);
+                // The control channel can replace the session fence while this blocking worker is
+                // asleep. Re-signing here prevents a recovered Gateway from rejecting a request
+                // that was created with the old generation. Keep one request identity across all
+                // attempts so a mutating action remains idempotent if its first response was
+                // lost after the server applied it.
+                let request = match &request_id {
+                    Some(request_id) => {
+                        self.signed_with_request_id(path, request_id.clone(), payload.clone())?
+                    }
+                    None => {
+                        let request = self.signed(path, payload.clone())?;
+                        request_id = Some(request.request_id.clone());
+                        request
+                    }
+                };
+                match action(Arc::clone(&self.client), request.clone()).await {
+                    Ok(value) => return Ok((request, value)),
+                    Err(error) if error.transient() => {
+                        tracing::debug!(
+                            path,
+                            attempt,
+                            error = %error,
+                            "Agent data-plane request is temporarily unavailable; retrying"
+                        );
+                        if wait_for_data_plane_retry(delay, &self.shutdown_signal).await {
+                            return Err(data_plane_error(
+                                "Agent shutdown requested while waiting for the data plane",
+                            ));
+                        }
+                        delay = delay
+                            .saturating_mul(2)
+                            .min(SESSION_DATA_PLANE_MAX_RETRY_DELAY);
                     }
                     Err(error) => return Err(data_plane_error(error)),
                 }
             }
-            Err(data_plane_error("Agent action retry loop exhausted"))
         })
     }
 
@@ -1558,7 +1633,7 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
         let mut records = Vec::new();
         let mut observed_index_version;
         loop {
-            let request = self.signed(
+            let (request, response) = self.call_signed(
                 AGENT_JOB_INDEX_PAGE_QUERY_PATH,
                 AgentIndexPageQueryPayload {
                     tenant_id: tenant_id.clone(),
@@ -1573,11 +1648,8 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
                     s3_ticket: None,
                     extensions: Extensions::new(),
                 },
+                |client, request| Box::pin(async move { client.query_index_page(&request).await }),
             )?;
-            let response = self.call(|client| {
-                let request = request.clone();
-                Box::pin(async move { client.query_index_page(&request).await })
-            })?;
             if response.wire_version != CURRENT_WIRE_VERSION
                 || response.request_id != request.request_id
                 || response.index_version.digest != index_version.digest
@@ -1642,7 +1714,7 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
         let mut accumulator = ManifestPageAccumulator::new(manifest_id);
         loop {
             let page_number = accumulator.next_page_number();
-            let request = self.signed(
+            let (request, response) = self.call_signed(
                 AGENT_JOB_MANIFEST_PAGE_QUERY_PATH,
                 AgentManifestPageQueryPayload {
                     tenant_id: tenant_id.clone(),
@@ -1656,11 +1728,10 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
                     s3_ticket: None,
                     extensions: Extensions::new(),
                 },
+                |client, request| {
+                    Box::pin(async move { client.query_manifest_page(&request).await })
+                },
             )?;
-            let response = self.call(|client| {
-                let request = request.clone();
-                Box::pin(async move { client.query_manifest_page(&request).await })
-            })?;
             if accumulator.push(&request.request_id, response)? {
                 return accumulator.finish();
             }
@@ -1668,19 +1739,34 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
     }
 
     fn await_report_acknowledgement(&self) -> AgentResult<()> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
+            if self.shutdown_signal.load(Ordering::Acquire) {
+                return Err(data_plane_error(
+                    "Agent shutdown requested while waiting for a report acknowledgement",
+                ));
+            }
             if self.reports.list(1)?.is_empty() {
                 return Ok(());
             }
-            if std::time::Instant::now() >= deadline {
-                return Err(data_plane_error(
-                    "timed out waiting for the control channel to acknowledge durable reports",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(20));
+            // Reports are durable and the control channel reconnects independently. Keep the
+            // prepared execution at its ordering barrier until the reconnecting channel has
+            // acknowledged the report instead of converting a temporary outage into a terminal
+            // ObjectTransferFailed result.
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+async fn wait_for_data_plane_retry(delay: Duration, shutdown_signal: &AtomicBool) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    while !shutdown_signal.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1929,7 +2015,7 @@ impl<C: AgentSessionClient + 'static> ExecutionBridge for SessionExecutionBridge
         let mut records = Vec::new();
         let mut observed;
         loop {
-            let request = self.signed(
+            let (request, response) = self.call_signed(
                 AGENT_JOB_INDEX_PAGE_QUERY_PATH,
                 AgentIndexPageQueryPayload {
                     tenant_id: tenant_id.clone(),
@@ -1944,11 +2030,8 @@ impl<C: AgentSessionClient + 'static> ExecutionBridge for SessionExecutionBridge
                     s3_ticket: Some(ticket.clone()),
                     extensions: Extensions::new(),
                 },
+                |client, request| Box::pin(async move { client.query_index_page(&request).await }),
             )?;
-            let response = self.call(|client| {
-                let request = request.clone();
-                Box::pin(async move { client.query_index_page(&request).await })
-            })?;
             if response.request_id != request.request_id
                 || response.index_version.digest != ticket.index_digest
                 || response.page_number != page_number
@@ -2025,7 +2108,7 @@ impl<C: AgentSessionClient + 'static> ExecutionBridge for SessionExecutionBridge
         // Prepared is enqueued before ObjectTransfer::stage_metadata. The center rejects metadata
         // until Accepted/Running/Prepared have been observed in durable order.
         self.await_report_acknowledgement()?;
-        let request = self.signed(
+        let (_, response) = self.call_signed(
             AGENT_JOB_METADATA_BATCH_STAGE_PATH,
             AgentMetadataBatchStagePayload {
                 tenant_id: assignment.tenant_id.clone(),
@@ -2033,11 +2116,8 @@ impl<C: AgentSessionClient + 'static> ExecutionBridge for SessionExecutionBridge
                 descriptor: descriptor.clone(),
                 extensions: Extensions::new(),
             },
+            |client, request| Box::pin(async move { client.stage_metadata_batch(&request).await }),
         )?;
-        let response = self.call(|client| {
-            let request = request.clone();
-            Box::pin(async move { client.stage_metadata_batch(&request).await })
-        })?;
         if response.batch_id != descriptor.batch_id {
             return Err(data_plane_error(
                 "metadata descriptor acknowledgement changed batch ID",
@@ -2051,7 +2131,7 @@ impl<C: AgentSessionClient + 'static> ExecutionBridge for SessionExecutionBridge
         assignment: &neoengram_domain::protocol::AddAssignment,
         page: &MetadataBatchPage,
     ) -> AgentResult<()> {
-        let request = self.signed(
+        let (_, response) = self.call_signed(
             AGENT_JOB_METADATA_PAGE_STAGE_PATH,
             AgentMetadataPageStagePayload {
                 tenant_id: assignment.tenant_id.clone(),
@@ -2059,11 +2139,8 @@ impl<C: AgentSessionClient + 'static> ExecutionBridge for SessionExecutionBridge
                 page: page.clone(),
                 extensions: Extensions::new(),
             },
+            |client, request| Box::pin(async move { client.stage_metadata_page(&request).await }),
         )?;
-        let response = self.call(|client| {
-            let request = request.clone();
-            Box::pin(async move { client.stage_metadata_page(&request).await })
-        })?;
         if response.batch_id != page.batch_id {
             return Err(data_plane_error(
                 "metadata page acknowledgement changed batch ID",
@@ -2089,7 +2166,7 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
         let mut accumulator = ManifestPageAccumulator::new(manifest_id);
         loop {
             let page_number = accumulator.next_page_number();
-            let request = self.signed(
+            let (request, response) = self.call_signed(
                 AGENT_JOB_MANIFEST_PAGE_QUERY_PATH,
                 AgentManifestPageQueryPayload {
                     tenant_id: tenant_id.clone(),
@@ -2103,11 +2180,10 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
                     s3_ticket: Some(ticket.clone()),
                     extensions: Extensions::new(),
                 },
+                |client, request| {
+                    Box::pin(async move { client.query_manifest_page(&request).await })
+                },
             )?;
-            let response = self.call(|client| {
-                let request = request.clone();
-                Box::pin(async move { client.query_manifest_page(&request).await })
-            })?;
             if accumulator.push(&request.request_id, response)? {
                 return accumulator.finish();
             }
@@ -2170,6 +2246,20 @@ fn settle_replication_execution(
     let Err(error) = result else {
         return Ok(());
     };
+    if let AgentDaemonError::SessionTransport(message) = &error {
+        // A QUIC disconnect is not a replication failure.  Keep the attempt active so Central's
+        // redelivery loop can issue the same immutable assignment and let the target CAS resume
+        // from its durable staging offset. The dispatcher recognizes this variant for
+        // redeliverable work and keeps the control channel alive without marking the attempt
+        // complete.
+        progress.state(replication_id, ReplicationState::Transferring)?;
+        tracing::warn!(
+            %replication_id,
+            error = %message,
+            "Replication data-plane transport is unavailable; retaining active attempt for retry"
+        );
+        return Err(error);
+    }
     progress.state(replication_id, ReplicationState::Failed)?;
     tracing::warn!(%replication_id, %error, "Replication task failed");
     Ok(())
@@ -2177,14 +2267,18 @@ fn settle_replication_execution(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Mutex};
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+    };
 
     use crate::QueuedAgentReport;
     use neoengram_domain::core::{ContentDigest, LogicalPath, ObjectId};
     use neoengram_domain::protocol::{
         AgentId, AgentMountId, ArtifactId, AssignmentGeneration, AssignmentId, MessageId,
         MountGeneration, OwnerGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef,
-        ProjectId, StorageVolumeId, WireChunkRef, WireChunkingStrategy,
+        ProjectId, RequestId, SessionGeneration, SessionId, StorageVolumeId, WireChunkRef,
+        WireChunkingStrategy, AGENT_JOB_METADATA_PAGE_STAGE_PATH,
     };
     use tempfile::TempDir;
 
@@ -2207,6 +2301,155 @@ mod tests {
         assert!(!snapshot_delivery_error_is_permanent(
             "DELIVERY_STORAGE_UNAVAILABLE"
         ));
+    }
+
+    #[tokio::test]
+    async fn data_plane_retry_resigns_after_session_fence_replacement() {
+        let key_document =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let signer = Arc::new(
+            AgentRequestSigner::new(
+                AgentId::new("agent-a").unwrap(),
+                neoengram_domain::protocol::AgentInstallationId::new("installation-a").unwrap(),
+                neoengram_domain::protocol::AgentBootId::new("boot-a").unwrap(),
+                Arc::new(
+                    ring::signature::Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap(),
+                ),
+            )
+            .unwrap(),
+        );
+        let fence = SharedSessionFence::default();
+        fence
+            .replace(Some(AgentSessionFence {
+                session_id: SessionId::new("session-before").unwrap(),
+                session_generation: SessionGeneration::new(1),
+            }))
+            .unwrap();
+        let client = Arc::new(
+            crate::ReqwestAgentSessionClient::new(url::Url::parse("http://127.0.0.1:1/").unwrap())
+                .unwrap(),
+        );
+        let bridge = Arc::new(SessionExecutionBridge::new(
+            TenantId::new("tenant-a").unwrap(),
+            client,
+            signer,
+            fence.clone(),
+            Arc::new(RecordingQueue::default()),
+            tokio::runtime::Handle::current(),
+        ));
+        let observed = Arc::new(Mutex::new(Vec::<(SessionGeneration, RequestId)>::new()));
+        let observed_for_call = Arc::clone(&observed);
+        let fence_for_call = fence.clone();
+        let (request, ()) = tokio::task::spawn_blocking(move || {
+            bridge.call_signed(
+                AGENT_JOB_METADATA_PAGE_STAGE_PATH,
+                serde_json::json!({"test": true}),
+                move |_client, request| {
+                    let observed = Arc::clone(&observed_for_call);
+                    let fence = fence_for_call.clone();
+                    Box::pin(async move {
+                        let attempt = {
+                            let mut observed = observed.lock().unwrap();
+                            let attempt = observed.len();
+                            observed.push((
+                                request.session_generation.expect("signed request fence"),
+                                request.request_id.clone(),
+                            ));
+                            attempt
+                        };
+                        if attempt == 0 {
+                            fence
+                                .replace(Some(AgentSessionFence {
+                                    session_id: SessionId::new("session-after").unwrap(),
+                                    session_generation: SessionGeneration::new(2),
+                                }))
+                                .unwrap();
+                            Err(crate::AgentSessionClientError::transport(
+                                "Gateway disconnected",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, SessionGeneration::new(1));
+        assert_eq!(observed[1].0, SessionGeneration::new(2));
+        assert_eq!(
+            observed[0].1, observed[1].1,
+            "a retry must preserve the logical request identity"
+        );
+        assert_eq!(
+            request.session_id,
+            Some(SessionId::new("session-after").unwrap())
+        );
+        assert_eq!(request.session_generation, Some(SessionGeneration::new(2)));
+        request
+            .verify(AGENT_JOB_METADATA_PAGE_STAGE_PATH)
+            .expect("successful retry must be signed with the current fence");
+    }
+
+    #[tokio::test]
+    async fn data_plane_retry_stops_when_agent_shutdown_is_requested() {
+        let key_document =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let signer = Arc::new(
+            AgentRequestSigner::new(
+                AgentId::new("agent-a").unwrap(),
+                neoengram_domain::protocol::AgentInstallationId::new("installation-a").unwrap(),
+                neoengram_domain::protocol::AgentBootId::new("boot-a").unwrap(),
+                Arc::new(
+                    ring::signature::Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap(),
+                ),
+            )
+            .unwrap(),
+        );
+        let fence = SharedSessionFence::default();
+        fence
+            .replace(Some(AgentSessionFence {
+                session_id: SessionId::new("session-a").unwrap(),
+                session_generation: SessionGeneration::new(1),
+            }))
+            .unwrap();
+        let bridge = SessionExecutionBridge::new(
+            TenantId::new("tenant-a").unwrap(),
+            Arc::new(
+                crate::ReqwestAgentSessionClient::new(
+                    url::Url::parse("http://127.0.0.1:1/").unwrap(),
+                )
+                .unwrap(),
+            ),
+            signer,
+            fence,
+            Arc::new(RecordingQueue::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .with_shutdown_signal(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+
+        let error = tokio::task::spawn_blocking(move || {
+            bridge
+                .call_signed(
+                    AGENT_JOB_METADATA_PAGE_STAGE_PATH,
+                    serde_json::json!({"test": true}),
+                    |_client, _request| {
+                        Box::pin(async { Ok::<_, crate::AgentSessionClientError>(()) })
+                    },
+                )
+                .expect_err("shutdown must stop a retrying data-plane call")
+        })
+        .await
+        .unwrap();
+        assert_eq!(error.code(), AgentErrorCode::ObjectTransferFailed);
+        assert!(error.message().contains("shutdown"));
     }
 
     #[derive(Debug, Default)]
@@ -2314,6 +2557,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(*progress.0.lock().unwrap(), vec![ReplicationState::Failed]);
+    }
+
+    #[test]
+    fn transient_replication_transport_failure_keeps_attempt_active() {
+        let replication_id = ReplicationId::new("replication-transport-retry").unwrap();
+        let progress = RecordingReplicationProgress::default();
+
+        let error = settle_replication_execution(
+            &replication_id,
+            &progress,
+            Err(AgentDaemonError::SessionTransport(
+                "Gateway connection closed".to_owned(),
+            )),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            *progress.0.lock().unwrap(),
+            vec![ReplicationState::Transferring]
+        );
+        assert!(matches!(error, AgentDaemonError::SessionTransport(_)));
     }
 
     #[test]

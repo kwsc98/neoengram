@@ -48,6 +48,15 @@ const REPORT_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_REPORTS_PER_FLUSH: usize = 1;
 const CHANNEL_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
+const HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+struct ShutdownSignalGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ShutdownSignalGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
 
 #[derive(Default)]
 struct DeferredProcessor(RwLock<Option<Arc<dyn AgentMessageProcessor>>>);
@@ -207,6 +216,13 @@ where
     P: MountProbe,
     F: Future<Output = ()> + Send,
 {
+    let shutdown_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _shutdown_signal_guard = ShutdownSignalGuard(Arc::clone(&shutdown_signal));
+    let shutdown_signal_for_future = Arc::clone(&shutdown_signal);
+    let mut shutdown = Box::pin(async move {
+        shutdown.await;
+        shutdown_signal_for_future.store(true, std::sync::atomic::Ordering::Release);
+    });
     let mut reporter = HealthReporter::acquire(config.storage.state_dir.clone())?;
     reporter.set_phase(RuntimeHealthPhase::ApprovedWaitingCertificate)?;
     let initial_observation = probe.probe();
@@ -237,17 +253,8 @@ where
     // replication-enabled Agent may stay online when the Gateway is temporarily unavailable, but
     // Central must not persist the dynamic capability until the endpoint handshake succeeds.
     let replication_network = build_replication_network(&config)?;
-    let replication_ready = match replication_network.as_ref() {
-        Some(network) => match network.preflight_gateway().await {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(%error, "replication Gateway QUIC preflight failed; capability will not be advertised");
-                false
-            }
-        },
-        None => false,
-    };
-    let open_payload = AgentSessionOpenPayload {
+    let replication_ready = replication_preflight(replication_network.as_deref()).await;
+    let mut open_payload = AgentSessionOpenPayload {
         mount_identity_digest,
         expected_resource_version: initial_resource_version,
         capabilities: Some(super::runtime::agent_capabilities(
@@ -257,7 +264,6 @@ where
         extensions: Extensions::new(),
     };
     let reconnect_max_delay = Duration::from_secs(config.session.reconnect_max_delay_seconds);
-    let mut shutdown = Box::pin(shutdown);
     let Some((mut channel, binding)) = connect_with_backoff(
         Arc::clone(&client),
         Arc::clone(&signer),
@@ -266,6 +272,7 @@ where
         &resource_version,
         None,
         reconnect_max_delay,
+        Some(&mut reporter),
         &mut shutdown,
     )
     .await?
@@ -304,14 +311,17 @@ where
     lifecycle_journal.integrity_check()?;
     let clock: Arc<dyn Clock> = Arc::new(RuntimeClock);
     let report_sink = Arc::new(DurableReportSink::new(reports.clone(), Arc::clone(&clock)));
-    let bridge: Arc<dyn ExecutionBridge> = Arc::new(SessionExecutionBridge::new(
-        config.tenant_id.clone(),
-        Arc::clone(&client),
-        Arc::clone(&signer),
-        fence.clone(),
-        reports.clone(),
-        tokio::runtime::Handle::current(),
-    ));
+    let bridge: Arc<dyn ExecutionBridge> = Arc::new(
+        SessionExecutionBridge::new(
+            config.tenant_id.clone(),
+            Arc::clone(&client),
+            Arc::clone(&signer),
+            fence.clone(),
+            reports.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .with_shutdown_signal(Arc::clone(&shutdown_signal)),
+    );
     let execution = FilesystemExecution::new(&config.storage.mount_path, Arc::clone(&bridge));
     execution.initialize()?;
     let execution = Arc::new(execution);
@@ -324,12 +334,16 @@ where
         let source_execution = Arc::clone(&execution);
         let source_tenant = config.tenant_id.clone();
         let source_agent = volume.agent_id.clone();
+        let source_fence = fence.clone();
+        let source_mount_generation = volume.mount_generation;
         tokio::spawn(async move {
             if let Err(error) = source_network
                 .serve_source(
                     trust_bundle,
                     source_tenant,
                     source_agent,
+                    source_fence,
+                    source_mount_generation,
                     source_execution,
                     replication_shutdown_receiver,
                 )
@@ -455,7 +469,7 @@ where
                 volume.storage_volume_id.clone(),
                 command_trust_bundle.clone(),
                 Arc::clone(&clock),
-                replication_network,
+                replication_network.clone(),
                 Some(fence.clone()),
                 Some(volume.mount_generation),
             ),
@@ -504,7 +518,7 @@ where
 
     let mut heartbeat_sequence = 0_u64;
     loop {
-        match run_channel(
+        let channel_exit = run_channel(
             &mut channel,
             &mut shutdown,
             &probe,
@@ -521,15 +535,23 @@ where
             command_trust_bundle.as_deref(),
             &mut reporter,
         )
-        .await?
-        {
-            ChannelExit::Shutdown => return Ok(()),
-            ChannelExit::Reconnect => {}
+        .await?;
+        if channel_exit == ChannelExit::Shutdown {
+            return Ok(());
         }
+        reporter.set_phase(RuntimeHealthPhase::SessionReconnecting)?;
         tokio::select! {
             _ = shutdown.as_mut() => return Ok(()),
             _ = time::sleep(INITIAL_RECONNECT_DELAY) => {}
         }
+        // The replication data plane can recover independently of the control channel. Re-run
+        // the bounded QUIC preflight before every session reopen so Central does not retain a
+        // stale capability after a Gateway outage, and can advertise it again after recovery.
+        open_payload.capabilities = Some(super::runtime::agent_capabilities(
+            &config,
+            replication_preflight(replication_network.as_deref()).await,
+        ));
+        open_payload.expected_resource_version = resource_version.get()?;
         let Some(connected) = connect_with_backoff(
             Arc::clone(&client),
             Arc::clone(&signer),
@@ -538,6 +560,7 @@ where
             &resource_version,
             Some(&binding),
             reconnect_max_delay,
+            Some(&mut reporter),
             &mut shutdown,
         )
         .await?
@@ -545,6 +568,7 @@ where
             return Ok(());
         };
         channel = connected.0;
+        reporter.set_phase(RuntimeHealthPhase::SessionReady)?;
         // Fence and recreate the binary channel with every control reconnect.  Even when Central
         // keeps the same session generation, this prevents an H2 stream that raced disconnect
         // from surviving into the newly authenticated control session.
@@ -566,6 +590,29 @@ where
 enum ChannelExit {
     Shutdown,
     Reconnect,
+}
+
+fn is_stale_session_error(code: &str) -> bool {
+    matches!(
+        code,
+        "AGENT_SESSION_FENCED"
+            | "GATEWAY_ROUTE_FENCED"
+            | "STALE_SESSION_GENERATION"
+            | "SESSION_FENCE_MISMATCH"
+    )
+}
+
+fn is_transient_session_error(code: &str) -> bool {
+    matches!(
+        code,
+        "SERVICE_UNAVAILABLE"
+            | "GATEWAY_ROUTE_UNAVAILABLE"
+            | "GATEWAY_RESOURCE_EXHAUSTED"
+            | "GATEWAY_INTERNAL"
+            | "ROUTE_UNAVAILABLE"
+            | "RESOURCE_EXHAUSTED"
+            | "INTERNAL"
+    )
 }
 
 #[derive(Debug)]
@@ -612,6 +659,7 @@ async fn connect_with_backoff<C, F>(
     resource_version: &SharedResourceVersion,
     expected_binding: Option<&AgentSessionBinding>,
     max_delay: Duration,
+    mut reporter: Option<&mut HealthReporter>,
     shutdown: &mut std::pin::Pin<Box<F>>,
 ) -> AgentDaemonResult<Option<(AgentChannelConnection, AgentSessionBinding)>>
 where
@@ -620,27 +668,94 @@ where
 {
     let mut delay = INITIAL_RECONNECT_DELAY;
     loop {
-        let attempt = tokio::select! {
-            _ = shutdown.as_mut() => return Ok(None),
-            result = connect_once(
+        if let Some(reporter) = reporter.as_mut() {
+            reporter.refresh()?;
+        }
+        // A TLS/HTTP connection attempt is bounded, but the bound is long enough that a
+        // black-holed path could otherwise make runtime-health.json stale. Refresh liveness while
+        // the attempt is in flight as well as during exponential backoff.
+        let attempt = {
+            let connect = connect_once(
                 client.as_ref(),
                 signer.as_ref(),
                 open_payload.clone(),
                 fence,
                 resource_version,
                 expected_binding,
-            ) => result,
+            );
+            tokio::pin!(connect);
+            let mut health_tick = time::interval(HEALTH_REFRESH_INTERVAL);
+            health_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            health_tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = shutdown.as_mut() => return Ok(None),
+                    result = &mut connect => break result,
+                    _ = health_tick.tick() => {
+                        if let Some(reporter) = reporter.as_deref_mut() {
+                            reporter.refresh()?;
+                        }
+                    }
+                }
+            }
         };
         match attempt {
             Ok(value) => return Ok(Some(value)),
-            Err(error) if error.retryable() => {
-                tokio::select! {
-                    _ = shutdown.as_mut() => return Ok(None),
-                    _ = time::sleep(delay) => {}
+            // A reconnect may race a heartbeat or an old Gateway route lease. Those business
+            // conflicts are retryable only after a session was already established; on the
+            // initial open, a retryable business response still represents a rejected bootstrap
+            // and must be surfaced instead of looping forever.
+            Err(error)
+                if error.transient() || (expected_binding.is_some() && error.retryable()) =>
+            {
+                if let Some(reporter) = reporter.as_deref_mut() {
+                    if wait_with_health(delay, reporter, shutdown).await? {
+                        return Ok(None);
+                    }
+                } else {
+                    tokio::select! {
+                        _ = shutdown.as_mut() => return Ok(None),
+                        _ = time::sleep(delay) => {}
+                    }
                 }
                 delay = delay.saturating_mul(2).min(max_delay);
             }
             Err(error) => return Err(AgentDaemonError::Session(error.to_string())),
+        }
+    }
+}
+
+async fn replication_preflight(network: Option<&crate::QuicTransferNetwork>) -> bool {
+    match network {
+        Some(network) => match network.preflight_gateway().await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "replication Gateway QUIC preflight failed; capability will not be advertised");
+                false
+            }
+        },
+        None => false,
+    }
+}
+
+async fn wait_with_health<F>(
+    duration: Duration,
+    reporter: &mut HealthReporter,
+    shutdown: &mut std::pin::Pin<Box<F>>,
+) -> AgentDaemonResult<bool>
+where
+    F: Future<Output = ()> + Send,
+{
+    let deadline = time::sleep(duration);
+    tokio::pin!(deadline);
+    let mut refresh = time::interval(HEALTH_REFRESH_INTERVAL);
+    refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    refresh.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.as_mut() => return Ok(true),
+            _ = &mut deadline => return Ok(false),
+            _ = refresh.tick() => reporter.refresh()?,
         }
     }
 }
@@ -677,6 +792,29 @@ async fn connect_once<C: AgentSessionClient>(
     opened
         .validate_sequence_after(None)
         .map_err(AgentSessionClientError::protocol)?;
+    if let AgentChannelDownstreamMessage::Error(error) = &opened.message {
+        if opened
+            .correlation_id
+            .as_ref()
+            .is_some_and(|correlation| correlation != &message_id)
+        {
+            return Err(AgentSessionClientError::protocol(
+                "Agent channel Open error correlation does not match Open",
+            ));
+        }
+        let message = format!(
+            "Agent channel Open rejected with {}: {}",
+            error.code.as_str(),
+            error.message
+        );
+        if error.retryable && !is_stale_session_error(error.code.as_str()) {
+            if is_transient_session_error(error.code.as_str()) {
+                return Err(AgentSessionClientError::transport(message));
+            }
+            return Err(AgentSessionClientError::business_retryable(message));
+        }
+        return Err(AgentSessionClientError::protocol(message));
+    }
     if opened.correlation_id.as_ref() != Some(&message_id) {
         return Err(AgentSessionClientError::protocol(
             "Agent channel Opened correlation does not match Open",
@@ -761,12 +899,14 @@ where
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut report_tick = time::interval(REPORT_INTERVAL);
     report_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut health_tick = time::interval(HEALTH_REFRESH_INTERVAL);
+    health_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut ack_watchdog = time::interval(Duration::from_secs(1));
     ack_watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = shutdown.as_mut() => {
-                flush_outbound_reports(
+                if let Err(error) = flush_outbound_reports(
                     channel,
                     signer.as_ref(),
                     &established,
@@ -779,14 +919,40 @@ where
                     dispatcher,
                     volume.tenant_id.clone(),
                     command_trust_bundle,
-                ).await?;
-                send_close(channel, signer.as_ref(), &established, resource_version,
-                    &mut upstream_sequence, &mut pending).await?;
+                )
+                .await
+                {
+                    if let AgentDaemonError::SessionTransport(error) = error {
+                        tracing::debug!(%error, "Agent channel closed during shutdown report flush");
+                        return Ok(ChannelExit::Shutdown);
+                    }
+                    return Err(error);
+                }
+                if let Err(error) = send_close(
+                    channel,
+                    signer.as_ref(),
+                    &established,
+                    resource_version,
+                    &mut upstream_sequence,
+                    &mut pending,
+                )
+                .await
+                {
+                    if let AgentDaemonError::SessionTransport(error) = error {
+                        tracing::debug!(%error, "Agent channel closed while sending shutdown");
+                        return Ok(ChannelExit::Shutdown);
+                    }
+                    return Err(error);
+                }
                 let closed = wait_for_close_ack(channel, &mut downstream_sequence,
                     established.session_generation, reports, resource_version, &mut pending,
                     &mut seen_commands, dispatcher, command_trust_bundle).await;
                 if matches!(closed, Ok(ChannelExit::Shutdown)) {
                     fence.replace(None)?;
+                }
+                if let Err(AgentDaemonError::SessionTransport(error)) = &closed {
+                    tracing::debug!(%error, "Agent channel closed while waiting for shutdown acknowledgement");
+                    return Ok(ChannelExit::Shutdown);
                 }
                 return closed;
             }
@@ -803,11 +969,12 @@ where
                     Err(error) => return Err(AgentDaemonError::Session(error.to_string())),
                 };
                 if let AgentChannelDownstreamMessage::Error(error) = &frame.message {
-                    let stale = matches!(
-                        error.code.as_str(),
-                        "STALE_SESSION_GENERATION" | "SESSION_FENCE_MISMATCH"
-                    );
-                    if error.retryable && !stale {
+                    let stale = is_stale_session_error(error.code.as_str());
+                    // A route/session fence is terminal for this concrete channel, but not for
+                    // the Agent process. Central may have installed a replacement route while
+                    // this stream was still in flight; after validating the authenticated
+                    // channel ordering, reopen so the Agent can bind to the current owner.
+                    if stale || error.retryable {
                         frame.validate_sequence_after(Some(downstream_sequence))
                             .and_then(|()| frame.validate_session_generation(
                                 established.session_generation
@@ -827,9 +994,24 @@ where
                     })?;
                     let payload = heartbeat_payload(resource_version, agent, volume, boot_id,
                         established.session_generation, *heartbeat_sequence, probe.probe())?;
-                    let (message_id, sequence) = send_signed(channel, signer.as_ref(), &established,
-                        &mut upstream_sequence, None,
-                        AgentChannelUpstreamMessage::Heartbeat(payload), None).await?;
+                    let (message_id, sequence) = match send_signed(
+                        channel,
+                        signer.as_ref(),
+                        &established,
+                        &mut upstream_sequence,
+                        None,
+                        AgentChannelUpstreamMessage::Heartbeat(payload),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(AgentDaemonError::SessionTransport(error)) => {
+                            tracing::debug!(%error, "Agent heartbeat could not be sent; reconnecting");
+                            return Ok(ChannelExit::Reconnect);
+                        }
+                        Err(error) => return Err(error),
+                    };
                     pending.insert(
                         message_id,
                         PendingAck::Heartbeat {
@@ -841,8 +1023,28 @@ where
                 reporter.refresh()?;
             }
             _ = report_tick.tick() => {
-                send_queued_reports(channel, signer.as_ref(), &established, reports,
-                    &mut upstream_sequence, &mut pending, volume.tenant_id.clone()).await?;
+                if let Err(error) = send_queued_reports(
+                    channel,
+                    signer.as_ref(),
+                    &established,
+                    reports,
+                    &mut upstream_sequence,
+                    &mut pending,
+                    volume.tenant_id.clone(),
+                )
+                .await
+                {
+                    match error {
+                        AgentDaemonError::SessionTransport(error) => {
+                            tracing::debug!(%error, "Agent report could not be sent; reconnecting");
+                            return Ok(ChannelExit::Reconnect);
+                        }
+                        error => return Err(error),
+                    }
+                }
+            }
+            _ = health_tick.tick() => {
+                reporter.refresh()?;
             }
             _ = ack_watchdog.tick() => {
                 let now = time::Instant::now();
@@ -917,9 +1119,15 @@ async fn drain_pending_acks(
             let frame = channel
                 .receive()
                 .await
-                .map_err(|error| AgentDaemonError::Session(error.to_string()))?
+                .map_err(|error| {
+                    if error.retryable() {
+                        AgentDaemonError::SessionTransport(error.to_string())
+                    } else {
+                        AgentDaemonError::Session(error.to_string())
+                    }
+                })?
                 .ok_or_else(|| {
-                    AgentDaemonError::Session(
+                    AgentDaemonError::SessionTransport(
                         "Agent channel ended while draining pending acknowledgements".to_owned(),
                     )
                 })?;
@@ -977,11 +1185,20 @@ async fn send_signed(
             },
         )
         .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
-    channel
-        .writer
-        .send(&frame)
+    let write = time::timeout(CHANNEL_ACTION_TIMEOUT, channel.writer.send(&frame))
         .await
-        .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+        .map_err(|_| {
+            AgentDaemonError::SessionTransport(
+                "Agent control channel write timed out; reconnecting".to_owned(),
+            )
+        })?;
+    write.map_err(|error| {
+        if error.retryable() {
+            AgentDaemonError::SessionTransport(error.to_string())
+        } else {
+            AgentDaemonError::Session(error.to_string())
+        }
+    })?;
     Ok((message_id, sequence))
 }
 
@@ -1078,9 +1295,11 @@ async fn handle_downstream(
                 .map_err(|_| AgentDaemonError::Session("Agent Job dispatcher is closed".to_owned()))
         }
         AgentChannelDownstreamMessage::ReplicationAssignment(assignment) => {
-            if !seen_commands.insert(frame.message_id) {
-                return Ok(());
-            }
+            // Unlike one-shot Job assignments, active replication commands are deliberately
+            // redelivered by Central until the Published report is observed.  Do not fence them
+            // by message ID for the lifetime of this connection: the dispatcher coalesces a
+            // duplicate while it is still running, then admits the next redelivery after a
+            // transient QUIC failure so the target CAS can resume its staging offset.
             dispatcher
                 .sender
                 .send(FencedAgentWork {
@@ -1168,10 +1387,7 @@ async fn handle_downstream(
                     return Ok(());
                 }
             }
-            let stale = matches!(
-                error.code.as_str(),
-                "STALE_SESSION_GENERATION" | "SESSION_FENCE_MISMATCH"
-            );
+            let stale = is_stale_session_error(error.code.as_str());
             Err(AgentDaemonError::Session(format!(
                 "Agent channel protocol error {} (retryable={}, stale_fence={}): {}",
                 error.code.as_str(),
@@ -1266,9 +1482,15 @@ async fn wait_for_close_ack(
             let frame = channel
                 .receive()
                 .await
-                .map_err(|error| AgentDaemonError::Session(error.to_string()))?
+                .map_err(|error| {
+                    if error.retryable() {
+                        AgentDaemonError::SessionTransport(error.to_string())
+                    } else {
+                        AgentDaemonError::Session(error.to_string())
+                    }
+                })?
                 .ok_or_else(|| {
-                    AgentDaemonError::Session(
+                    AgentDaemonError::SessionTransport(
                         "Agent channel ended before Close acknowledgement".to_owned(),
                     )
                 })?;
@@ -1392,7 +1614,7 @@ mod tests {
     use std::{
         collections::BTreeSet,
         sync::{
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
             Mutex,
         },
     };
@@ -1401,10 +1623,15 @@ mod tests {
     use async_trait::async_trait;
     use neoengram_domain::core::ContentDigest;
     use neoengram_domain::protocol::{
-        AgentChannelAck, AgentChannelUpstreamFrame, AgentInstallationId, AgentMountId, ArtifactId,
+        AgentActionAcceptedResponse, AgentAuthenticatedRequest, AgentChannelAck,
+        AgentChannelUpstreamFrame, AgentHeartbeatReportPayload, AgentHeartbeatReportResponse,
+        AgentIndexPageQueryPayload, AgentIndexPageQueryResponse, AgentInstallationId,
+        AgentJobReportCreatePayload, AgentManifestPageQueryPayload, AgentManifestPageQueryResponse,
+        AgentMetadataBatchStagePayload, AgentMetadataPageStagePayload, AgentMetadataStageResponse,
+        AgentMountId, AgentSessionCloseResponse, AgentSessionOpenResponse, ArtifactId,
         AssignmentGeneration, AssignmentId, AssignmentOperation, CentralSignedPayload,
-        CertificateGeneration, DecimalU64, DeliveryGeneration, Ed25519PublicKeySpki,
-        Ed25519Signature, GatewayOpaqueBytes, HardlinkPolicy, JobAssignment, JobId,
+        CertificateGeneration, ControlError, DecimalU64, DeliveryGeneration, Ed25519PublicKeySpki,
+        Ed25519Signature, ErrorCode, GatewayOpaqueBytes, HardlinkPolicy, JobAssignment, JobId,
         MountGeneration, OwnerGeneration, PlacementGeneration, PrincipalId, PrincipalKind,
         PrincipalRef, ProjectId, SessionId, SnapshotDeliveryAction, SnapshotDeliveryAssignment,
         SnapshotDeliveryMode, SnapshotId, StorageVolumeId, CURRENT_WIRE_VERSION,
@@ -1468,6 +1695,32 @@ mod tests {
 
     #[derive(Debug)]
     struct NoopProcessor;
+
+    #[derive(Debug)]
+    struct ReadyMountProbe;
+
+    impl MountProbe for ReadyMountProbe {
+        fn probe(&self) -> crate::FilesystemMountObservation {
+            crate::FilesystemMountObservation {
+                observed_volume_marker: Some(
+                    neoengram_domain::protocol::VolumeMarkerId::new("volume-a").unwrap(),
+                ),
+                marker_matches: true,
+                mount_boundary_detected: true,
+                access_mode: Some(MountAccessMode::ReadWrite),
+                rename_supported: true,
+                fsync_supported: true,
+                health: neoengram_domain::protocol::ResourceHealth::Ready,
+                available_bytes: Some(1_000_000),
+                mount_identity_digest: Some(
+                    neoengram_domain::protocol::AgentMountIdentityDigest::new(ContentDigest::hash(
+                        b"mount-a",
+                    )),
+                ),
+                condition: crate::MountProbeCondition::Ready,
+            }
+        }
+    }
 
     #[async_trait]
     impl AgentMessageProcessor for NoopProcessor {
@@ -1540,6 +1793,434 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct ReconnectingSessionClient {
+        connect_attempts: AtomicUsize,
+        first_error: Option<AgentSessionClientError>,
+        first_frame_error: Option<ControlError>,
+    }
+
+    #[async_trait]
+    impl AgentSessionClient for ReconnectingSessionClient {
+        async fn connect_channel(
+            &self,
+            open: &AgentChannelUpstreamFrame,
+        ) -> Result<AgentChannelConnection, AgentSessionClientError> {
+            let attempt = self.connect_attempts.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = &self.first_error {
+                return Err(error.clone());
+            }
+            if attempt == 0 {
+                let (outgoing, _outgoing_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+                let (incoming_tx, incoming) = tokio::sync::mpsc::channel(1);
+                if let Some(error) = &self.first_frame_error {
+                    incoming_tx
+                        .send(Ok(AgentChannelDownstreamFrame {
+                            wire_version: CURRENT_WIRE_VERSION,
+                            sequence: SequenceNumber::new(1),
+                            message_id: MessageId::new("open-error").unwrap(),
+                            correlation_id: Some(open.request.payload.message_id.clone()),
+                            session_generation: SessionGeneration::new(1),
+                            sent_at_unix_ms: UnixMillis::new(20),
+                            central_signature: None,
+                            message: AgentChannelDownstreamMessage::Error(error.clone()),
+                            extensions: Extensions::new(),
+                        }))
+                        .await
+                        .expect("test channel receiver remains open");
+                } else {
+                    drop(incoming_tx);
+                }
+                let reader = tokio::spawn(async {});
+                return Ok(AgentChannelConnection::new(
+                    outgoing,
+                    incoming,
+                    vec![reader],
+                ));
+            }
+
+            let (outgoing, _outgoing_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+            let (incoming_tx, incoming) = tokio::sync::mpsc::channel(1);
+            let reader = tokio::spawn(async {});
+            incoming_tx
+                .send(Ok(AgentChannelDownstreamFrame {
+                    wire_version: CURRENT_WIRE_VERSION,
+                    sequence: SequenceNumber::new(1),
+                    message_id: MessageId::new("opened-after-reconnect").unwrap(),
+                    correlation_id: Some(open.request.payload.message_id.clone()),
+                    session_generation: SessionGeneration::new(2),
+                    sent_at_unix_ms: UnixMillis::new(20),
+                    central_signature: None,
+                    message: AgentChannelDownstreamMessage::Opened(AgentSessionOpenResponse {
+                        wire_version: CURRENT_WIRE_VERSION,
+                        request_id: open.request.request_id.clone(),
+                        agent_id: open.request.agent_id.clone(),
+                        session_id: SessionId::new("session-after-reconnect").unwrap(),
+                        session_generation: SessionGeneration::new(2),
+                        agent_mount_id: AgentMountId::new("mount-a").unwrap(),
+                        mount_generation: MountGeneration::new(7),
+                        owner_generation: OwnerGeneration::new(9),
+                        resource_version: ResourceVersion::new(42),
+                        opened_at_unix_ms: UnixMillis::new(20),
+                        replayed: false,
+                        extensions: Extensions::new(),
+                    }),
+                    extensions: Extensions::new(),
+                }))
+                .await
+                .expect("test channel receiver remains open");
+            Ok(AgentChannelConnection::new(
+                outgoing,
+                incoming,
+                vec![reader],
+            ))
+        }
+
+        async fn open(
+            &self,
+            _request: &AgentAuthenticatedRequest<AgentSessionOpenPayload>,
+        ) -> Result<AgentSessionOpenResponse, AgentSessionClientError> {
+            Err(AgentSessionClientError::transport("unused test operation"))
+        }
+
+        async fn heartbeat(
+            &self,
+            _request: &AgentAuthenticatedRequest<AgentHeartbeatReportPayload>,
+        ) -> Result<AgentHeartbeatReportResponse, AgentSessionClientError> {
+            Err(AgentSessionClientError::transport("unused test operation"))
+        }
+
+        async fn create_report(
+            &self,
+            _request: &AgentAuthenticatedRequest<AgentJobReportCreatePayload>,
+        ) -> Result<AgentActionAcceptedResponse, AgentSessionClientError> {
+            Err(AgentSessionClientError::transport("unused test operation"))
+        }
+
+        async fn stage_metadata_batch(
+            &self,
+            _request: &AgentAuthenticatedRequest<AgentMetadataBatchStagePayload>,
+        ) -> Result<AgentMetadataStageResponse, AgentSessionClientError> {
+            Err(AgentSessionClientError::transport("unused test operation"))
+        }
+
+        async fn stage_metadata_page(
+            &self,
+            _request: &AgentAuthenticatedRequest<AgentMetadataPageStagePayload>,
+        ) -> Result<AgentMetadataStageResponse, AgentSessionClientError> {
+            Err(AgentSessionClientError::transport("unused test operation"))
+        }
+
+        async fn query_index_page(
+            &self,
+            _request: &AgentAuthenticatedRequest<AgentIndexPageQueryPayload>,
+        ) -> Result<AgentIndexPageQueryResponse, AgentSessionClientError> {
+            Err(AgentSessionClientError::transport("unused test operation"))
+        }
+
+        async fn query_manifest_page(
+            &self,
+            _request: &AgentAuthenticatedRequest<AgentManifestPageQueryPayload>,
+        ) -> Result<AgentManifestPageQueryResponse, AgentSessionClientError> {
+            Err(AgentSessionClientError::transport("unused test operation"))
+        }
+
+        async fn close(
+            &self,
+            _request: &AgentAuthenticatedRequest<AgentSessionClosePayload>,
+        ) -> Result<AgentSessionCloseResponse, AgentSessionClientError> {
+            Err(AgentSessionClientError::transport("unused test operation"))
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_with_backoff_retries_eof_and_updates_session_fence() {
+        let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Arc::new(
+            AgentRequestSigner::new(
+                AgentId::new("agent-a").unwrap(),
+                AgentInstallationId::new("installation-a").unwrap(),
+                AgentBootId::new("boot-a").unwrap(),
+                Arc::new(Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap()),
+            )
+            .unwrap(),
+        );
+        let open_payload = AgentSessionOpenPayload {
+            mount_identity_digest: neoengram_domain::protocol::AgentMountIdentityDigest::new(
+                ContentDigest::from_bytes([1; 32]),
+            ),
+            expected_resource_version: ResourceVersion::new(3),
+            capabilities: None,
+            extensions: Extensions::new(),
+        };
+        let fence = SharedSessionFence::default();
+        let resource_version = SharedResourceVersion::new(ResourceVersion::new(3));
+        let client = Arc::new(ReconnectingSessionClient::default());
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+
+        let connected = connect_with_backoff(
+            client.clone(),
+            signer,
+            &open_payload,
+            &fence,
+            &resource_version,
+            None,
+            Duration::from_millis(1),
+            None,
+            &mut shutdown,
+        )
+        .await
+        .expect("transport EOF should be retried")
+        .expect("test should connect before shutdown");
+
+        assert_eq!(client.connect_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            connected.1.fence.session_id,
+            SessionId::new("session-after-reconnect").unwrap()
+        );
+        assert_eq!(
+            connected.1.fence.session_generation,
+            SessionGeneration::new(2)
+        );
+        assert_eq!(fence.get().unwrap(), connected.1.fence);
+        assert_eq!(resource_version.get().unwrap(), ResourceVersion::new(42));
+        assert_eq!(connected.1.mount_generation, MountGeneration::new(7));
+        assert_eq!(connected.1.owner_generation, OwnerGeneration::new(9));
+    }
+
+    #[tokio::test]
+    async fn connect_with_backoff_does_not_retry_business_retryable_errors() {
+        let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Arc::new(
+            AgentRequestSigner::new(
+                AgentId::new("agent-a").unwrap(),
+                AgentInstallationId::new("installation-a").unwrap(),
+                AgentBootId::new("boot-a").unwrap(),
+                Arc::new(Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap()),
+            )
+            .unwrap(),
+        );
+        let open_payload = AgentSessionOpenPayload {
+            mount_identity_digest: neoengram_domain::protocol::AgentMountIdentityDigest::new(
+                ContentDigest::from_bytes([1; 32]),
+            ),
+            expected_resource_version: ResourceVersion::new(3),
+            capabilities: None,
+            extensions: Extensions::new(),
+        };
+        let fence = SharedSessionFence::default();
+        let resource_version = SharedResourceVersion::new(ResourceVersion::new(3));
+        let client = Arc::new(ReconnectingSessionClient {
+            first_error: Some(AgentSessionClientError::business_retryable(
+                "Agent API returned AGENT_BUSY",
+            )),
+            ..Default::default()
+        });
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+
+        let error = connect_with_backoff(
+            client.clone(),
+            signer,
+            &open_payload,
+            &fence,
+            &resource_version,
+            None,
+            Duration::from_secs(1),
+            None,
+            &mut shutdown,
+        )
+        .await
+        .expect_err("business retryable errors must not enter reconnect backoff");
+
+        assert!(matches!(
+            error,
+            AgentDaemonError::Session(message) if message.contains("AGENT_BUSY")
+        ));
+        assert_eq!(client.connect_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn connect_with_backoff_retries_a_retryable_open_error_frame() {
+        let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Arc::new(
+            AgentRequestSigner::new(
+                AgentId::new("agent-a").unwrap(),
+                AgentInstallationId::new("installation-a").unwrap(),
+                AgentBootId::new("boot-a").unwrap(),
+                Arc::new(Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap()),
+            )
+            .unwrap(),
+        );
+        let open_payload = AgentSessionOpenPayload {
+            mount_identity_digest: neoengram_domain::protocol::AgentMountIdentityDigest::new(
+                ContentDigest::from_bytes([1; 32]),
+            ),
+            expected_resource_version: ResourceVersion::new(3),
+            capabilities: None,
+            extensions: Extensions::new(),
+        };
+        let fence = SharedSessionFence::default();
+        let resource_version = SharedResourceVersion::new(ResourceVersion::new(3));
+        let client = Arc::new(ReconnectingSessionClient {
+            first_frame_error: Some(ControlError {
+                code: ErrorCode::new("GATEWAY_ROUTE_UNAVAILABLE").unwrap(),
+                message: "Gateway route is temporarily unavailable".to_owned(),
+                retryable: true,
+                retry_after_ms: Some(DecimalU64::new(1_000)),
+                extensions: Extensions::new(),
+            }),
+            ..Default::default()
+        });
+        let expected_binding = AgentSessionBinding {
+            fence: AgentSessionFence {
+                session_id: SessionId::new("session-after-reconnect").unwrap(),
+                session_generation: SessionGeneration::new(2),
+            },
+            agent_mount_id: AgentMountId::new("mount-a").unwrap(),
+            mount_generation: MountGeneration::new(7),
+            owner_generation: OwnerGeneration::new(9),
+        };
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+
+        let connected = connect_with_backoff(
+            client.clone(),
+            signer,
+            &open_payload,
+            &fence,
+            &resource_version,
+            Some(&expected_binding),
+            Duration::from_millis(1),
+            None,
+            &mut shutdown,
+        )
+        .await
+        .expect("retryable Open error should enter reconnect backoff")
+        .expect("test should connect before shutdown");
+
+        assert_eq!(client.connect_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(connected.1, expected_binding);
+    }
+
+    #[tokio::test]
+    async fn connect_with_backoff_keeps_initial_route_fence_fail_closed() {
+        let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Arc::new(
+            AgentRequestSigner::new(
+                AgentId::new("agent-a").unwrap(),
+                AgentInstallationId::new("installation-a").unwrap(),
+                AgentBootId::new("boot-a").unwrap(),
+                Arc::new(Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap()),
+            )
+            .unwrap(),
+        );
+        let open_payload = AgentSessionOpenPayload {
+            mount_identity_digest: neoengram_domain::protocol::AgentMountIdentityDigest::new(
+                ContentDigest::from_bytes([1; 32]),
+            ),
+            expected_resource_version: ResourceVersion::new(3),
+            capabilities: None,
+            extensions: Extensions::new(),
+        };
+        let fence = SharedSessionFence::default();
+        let resource_version = SharedResourceVersion::new(ResourceVersion::new(3));
+        let client = Arc::new(ReconnectingSessionClient {
+            first_frame_error: Some(ControlError {
+                code: ErrorCode::new("GATEWAY_ROUTE_FENCED").unwrap(),
+                message: "the previous owner lease is still active".to_owned(),
+                retryable: false,
+                retry_after_ms: None,
+                extensions: Extensions::new(),
+            }),
+            ..Default::default()
+        });
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+
+        let error = connect_with_backoff(
+            client.clone(),
+            signer,
+            &open_payload,
+            &fence,
+            &resource_version,
+            None,
+            Duration::from_millis(1),
+            None,
+            &mut shutdown,
+        )
+        .await
+        .expect_err("a non-retryable first-frame route fence must fail closed");
+
+        assert_eq!(client.connect_attempts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            error,
+            AgentDaemonError::Session(message) if message.contains("GATEWAY_ROUTE_FENCED")
+        ));
+    }
+
+    #[test]
+    fn stale_session_error_codes_include_the_current_wire_code() {
+        assert!(is_stale_session_error("AGENT_SESSION_FENCED"));
+        assert!(is_stale_session_error("GATEWAY_ROUTE_FENCED"));
+        assert!(is_stale_session_error("STALE_SESSION_GENERATION"));
+        assert!(is_stale_session_error("SESSION_FENCE_MISMATCH"));
+        assert!(!is_stale_session_error("GATEWAY_ROUTE_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn connect_with_backoff_retries_transient_gateway_error_during_initial_open() {
+        let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Arc::new(
+            AgentRequestSigner::new(
+                AgentId::new("agent-a").unwrap(),
+                AgentInstallationId::new("installation-a").unwrap(),
+                AgentBootId::new("boot-a").unwrap(),
+                Arc::new(Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap()),
+            )
+            .unwrap(),
+        );
+        let open_payload = AgentSessionOpenPayload {
+            mount_identity_digest: neoengram_domain::protocol::AgentMountIdentityDigest::new(
+                ContentDigest::from_bytes([1; 32]),
+            ),
+            expected_resource_version: ResourceVersion::new(3),
+            capabilities: None,
+            extensions: Extensions::new(),
+        };
+        let fence = SharedSessionFence::default();
+        let resource_version = SharedResourceVersion::new(ResourceVersion::new(3));
+        let client = Arc::new(ReconnectingSessionClient {
+            first_frame_error: Some(ControlError {
+                code: ErrorCode::new("GATEWAY_ROUTE_UNAVAILABLE").unwrap(),
+                message: "Gateway route is temporarily unavailable".to_owned(),
+                retryable: true,
+                retry_after_ms: Some(DecimalU64::new(1_000)),
+                extensions: Extensions::new(),
+            }),
+            ..Default::default()
+        });
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+
+        let connected = connect_with_backoff(
+            client.clone(),
+            signer,
+            &open_payload,
+            &fence,
+            &resource_version,
+            None,
+            Duration::from_millis(1),
+            None,
+            &mut shutdown,
+        )
+        .await
+        .expect("transient Gateway errors should be retried during initial open")
+        .expect("test should connect before shutdown");
+
+        assert_eq!(client.connect_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            connected.1.fence.session_generation,
+            SessionGeneration::new(2)
+        );
     }
 
     fn signed_assignment_frame(
@@ -1742,6 +2423,280 @@ mod tests {
         )
         .unwrap();
         assert!(!queue.0.lock().unwrap().contains(&durable_id));
+    }
+
+    #[tokio::test]
+    async fn closed_channel_writer_is_classified_as_reconnectable_transport() {
+        let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = AgentRequestSigner::new(
+            AgentId::new("agent-a").unwrap(),
+            AgentInstallationId::new("installation-a").unwrap(),
+            AgentBootId::new("boot-a").unwrap(),
+            Arc::new(Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap()),
+        )
+        .unwrap();
+        let fence = AgentSessionFence {
+            session_id: SessionId::new("session-a").unwrap(),
+            session_generation: SessionGeneration::new(3),
+        };
+        let (outgoing, outgoing_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        drop(outgoing_rx);
+        let (_incoming_tx, incoming) = tokio::sync::mpsc::channel(1);
+        let reader = tokio::spawn(async {});
+        let channel = AgentChannelConnection::new(outgoing, incoming, vec![reader]);
+        let mut upstream_sequence = 1;
+
+        let error = send_signed(
+            &channel,
+            &signer,
+            &fence,
+            &mut upstream_sequence,
+            None,
+            AgentChannelUpstreamMessage::Close(AgentSessionClosePayload {
+                expected_resource_version: ResourceVersion::new(1),
+                extensions: Extensions::new(),
+            }),
+            None,
+        )
+        .await
+        .expect_err("closed channel writer must fail");
+
+        assert!(matches!(error, AgentDaemonError::SessionTransport(_)));
+    }
+
+    #[tokio::test]
+    async fn report_send_failure_keeps_durable_report_for_reconnect() {
+        let generation = SessionGeneration::new(3);
+        let durable_id = MessageId::new("report-reconnect-send-failure").unwrap();
+        let queue = DurableQueue(Mutex::new(Some(QueuedAgentReport {
+            sequence: 1,
+            message_id: durable_id.clone(),
+            enqueued_at_unix_ms: UnixMillis::new(10),
+            report: AgentReport::Accepted(neoengram_domain::protocol::JobAccepted {
+                job_id: JobId::new("job-reconnect-send-failure").unwrap(),
+                assignment_id: AssignmentId::new("assignment-reconnect-send-failure").unwrap(),
+                assignment_generation: AssignmentGeneration::new(1),
+                accepted_at_unix_ms: UnixMillis::new(10),
+                request_digest: "22".repeat(32).parse().unwrap(),
+                extensions: Extensions::new(),
+            }),
+        })));
+        let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = AgentRequestSigner::new(
+            AgentId::new("agent-a").unwrap(),
+            AgentInstallationId::new("installation-a").unwrap(),
+            AgentBootId::new("boot-a").unwrap(),
+            Arc::new(Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap()),
+        )
+        .unwrap();
+        let fence = AgentSessionFence {
+            session_id: SessionId::new("session-a").unwrap(),
+            session_generation: generation,
+        };
+        let (outgoing, outgoing_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        drop(outgoing_rx);
+        let (_incoming_tx, incoming) = tokio::sync::mpsc::channel(1);
+        let reader = tokio::spawn(async {});
+        let channel = AgentChannelConnection::new(outgoing, incoming, vec![reader]);
+        let mut upstream_sequence = 1;
+        let mut pending = BTreeMap::new();
+
+        let error = send_queued_reports(
+            &channel,
+            &signer,
+            &fence,
+            &queue,
+            &mut upstream_sequence,
+            &mut pending,
+            TenantId::new("tenant-a").unwrap(),
+        )
+        .await
+        .expect_err("closed channel writer must fail report delivery");
+
+        assert!(matches!(error, AgentDaemonError::SessionTransport(_)));
+        assert!(pending.is_empty());
+        assert_eq!(queue.list(1).unwrap().len(), 1);
+        assert_eq!(queue.list(1).unwrap()[0].message_id, durable_id);
+    }
+
+    async fn run_test_channel(
+        temp: &tempfile::TempDir,
+        mut channel: AgentChannelConnection,
+    ) -> AgentDaemonResult<ChannelExit> {
+        let mut reporter = HealthReporter::acquire(temp.path().to_path_buf()).unwrap();
+        reporter
+            .set_phase(RuntimeHealthPhase::SessionReady)
+            .unwrap();
+
+        let shared_fence = SharedSessionFence::default();
+        let fence = AgentSessionFence {
+            session_id: SessionId::new("session-a").unwrap(),
+            session_generation: SessionGeneration::new(3),
+        };
+        shared_fence.replace(Some(fence.clone())).unwrap();
+        let mut dispatcher = spawn_work_dispatcher(
+            TenantId::new("tenant-a").unwrap(),
+            Arc::new(NoopProcessor),
+            shared_fence.clone(),
+        );
+
+        let ledger = Arc::new(crate::InMemoryLedger::new());
+        let agent = Agent::new(
+            ledger,
+            Arc::new(crate::BasicAssignmentValidator),
+            Arc::new(crate::FakeAddExecutor::with_results(Vec::<
+                AgentResult<neoengram_runtime::engine::PreparedAdd>,
+            >::new())),
+            Arc::new(crate::FakeObjectTransfer::with_staging_results(
+                Vec::<AgentResult<crate::TransferReceipt>>::new(),
+                Vec::<AgentResult<()>>::new(),
+                Vec::<AgentResult<()>>::new(),
+            )),
+            Arc::new(crate::FakeReportSink::new()),
+            Arc::new(crate::FakeClock::new(10)),
+        );
+        let volume = SingleVolumeAgentConfig {
+            agent_id: AgentId::new("agent-a").unwrap(),
+            installation_id: AgentInstallationId::new("installation-a").unwrap(),
+            tenant_id: TenantId::new("tenant-a").unwrap(),
+            edge_cluster_id: neoengram_domain::protocol::EdgeClusterId::new("cluster-a").unwrap(),
+            storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
+            agent_mount_id: AgentMountId::new("mount-a").unwrap(),
+            mount_generation: MountGeneration::new(1),
+            owner_generation: OwnerGeneration::new(1),
+            expected_volume_marker: neoengram_domain::protocol::VolumeMarkerId::new("volume-a")
+                .unwrap(),
+            desired_access_mode: MountAccessMode::ReadWrite,
+            data_root: temp.path().join("data"),
+            state_root: temp.path().join("state"),
+        };
+        let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Arc::new(
+            AgentRequestSigner::new(
+                AgentId::new("agent-a").unwrap(),
+                AgentInstallationId::new("installation-a").unwrap(),
+                AgentBootId::new("boot-a").unwrap(),
+                Arc::new(Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap()),
+            )
+            .unwrap(),
+        );
+        let reports = SqliteOutboundReportQueue::open(SqliteOutboundReportQueueConfig::new(
+            temp.path().join("queue-state"),
+            AgentId::new("agent-a").unwrap(),
+            TenantId::new("tenant-a").unwrap(),
+        ))
+        .unwrap();
+        let resource_version = SharedResourceVersion::new(ResourceVersion::new(1));
+        let mut heartbeat_sequence = 0;
+        let mut shutdown = Box::pin(std::future::pending::<()>());
+        let probe = ReadyMountProbe;
+
+        run_channel(
+            &mut channel,
+            &mut shutdown,
+            &probe,
+            &agent,
+            &volume,
+            &AgentBootId::new("boot-a").unwrap(),
+            signer,
+            &reports,
+            &shared_fence,
+            &resource_version,
+            &mut dispatcher,
+            &mut heartbeat_sequence,
+            10,
+            None,
+            &mut reporter,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn run_channel_reconnects_when_heartbeat_writer_is_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (outgoing, outgoing_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        drop(outgoing_rx);
+        let (_incoming_tx, incoming) = tokio::sync::mpsc::channel(1);
+        let reader = tokio::spawn(async {});
+        let channel = AgentChannelConnection::new(outgoing, incoming, vec![reader]);
+
+        let result = run_test_channel(&temp, channel).await.unwrap();
+
+        assert_eq!(result, ChannelExit::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn run_channel_reconnects_after_a_nonretryable_gateway_route_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let generation = SessionGeneration::new(3);
+        let (outgoing, _outgoing_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+        let (incoming_tx, incoming) = tokio::sync::mpsc::channel(1);
+        incoming_tx
+            .send(Ok(AgentChannelDownstreamFrame {
+                wire_version: CURRENT_WIRE_VERSION,
+                sequence: SequenceNumber::new(2),
+                message_id: MessageId::new("gateway-route-fenced").unwrap(),
+                correlation_id: None,
+                session_generation: generation,
+                sent_at_unix_ms: UnixMillis::new(20),
+                central_signature: None,
+                message: AgentChannelDownstreamMessage::Error(ControlError {
+                    code: ErrorCode::new("GATEWAY_ROUTE_FENCED").unwrap(),
+                    message: "Agent route ownership changed".to_owned(),
+                    retryable: false,
+                    retry_after_ms: None,
+                    extensions: Extensions::new(),
+                }),
+                extensions: Extensions::new(),
+            }))
+            .await
+            .unwrap();
+        let reader = tokio::spawn(async {});
+        let channel = AgentChannelConnection::new(outgoing, incoming, vec![reader]);
+
+        let result = run_test_channel(&temp, channel).await.unwrap();
+
+        assert_eq!(result, ChannelExit::Reconnect);
+    }
+
+    #[tokio::test]
+    async fn run_channel_keeps_identity_rejection_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let generation = SessionGeneration::new(3);
+        let (outgoing, _outgoing_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+        let (incoming_tx, incoming) = tokio::sync::mpsc::channel(1);
+        incoming_tx
+            .send(Ok(AgentChannelDownstreamFrame {
+                wire_version: CURRENT_WIRE_VERSION,
+                sequence: SequenceNumber::new(2),
+                message_id: MessageId::new("gateway-identity-rejected").unwrap(),
+                correlation_id: None,
+                session_generation: generation,
+                sent_at_unix_ms: UnixMillis::new(20),
+                central_signature: None,
+                message: AgentChannelDownstreamMessage::Error(ControlError {
+                    code: ErrorCode::new("GATEWAY_IDENTITY_REJECTED").unwrap(),
+                    message: "Agent identity rejected".to_owned(),
+                    retryable: false,
+                    retry_after_ms: None,
+                    extensions: Extensions::new(),
+                }),
+                extensions: Extensions::new(),
+            }))
+            .await
+            .unwrap();
+        let reader = tokio::spawn(async {});
+        let channel = AgentChannelConnection::new(outgoing, incoming, vec![reader]);
+
+        let error = run_test_channel(&temp, channel)
+            .await
+            .expect_err("identity rejection must remain terminal");
+
+        assert!(matches!(
+            error,
+            AgentDaemonError::Session(message)
+                if message.contains("GATEWAY_IDENTITY_REJECTED")
+        ));
     }
 
     #[tokio::test]

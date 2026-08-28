@@ -2,14 +2,15 @@ use std::sync::Arc;
 
 use neoengram_central::{
     CancelReplicationRequest, CentralErrorCode, InMemoryComponents, PlacementRepository,
-    ReplicationObjectRecord, ReplicationRecord, ReplicationStateTransitionRequest,
-    RetryReplicationRequest,
+    RefreshReplicationRoutesRequest, ReplicationObjectRecord, ReplicationRecord,
+    ReplicationRouteBinding, ReplicationStateTransitionRequest, RetryReplicationRequest,
 };
 use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
 use neoengram_domain::protocol::{
-    ArtifactId, BackendId, CommitObjectSet, CommitPlacementSet, CommitPlacementSetState,
-    DataHealth, DecimalU64, ObjectSet, PlacementGeneration, PlacementSetId, ReplicationId,
-    ReplicationObjectState, ReplicationState, RequestId, StorageVolumeId, TenantId, UnixMillis,
+    AgentId, ArtifactId, BackendId, CommitObjectSet, CommitPlacementSet, CommitPlacementSetState,
+    DataHealth, DecimalU64, EdgeClusterId, GatewayPoolId, MountGeneration, ObjectSet,
+    PlacementGeneration, PlacementSetId, ReplicationId, ReplicationObjectState, ReplicationState,
+    RequestId, RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, UnixMillis,
 };
 
 #[cfg(feature = "authority-sqlite")]
@@ -379,6 +380,139 @@ async fn run_replication_edge_contract(repository: Arc<dyn PlacementRepository>)
         .unwrap_err();
     assert_eq!(stale_cancel.code(), CentralErrorCode::ConcurrentUpdate);
 
+    let mut route_refresh = replication_record(
+        &tenant_id,
+        "route-refresh",
+        ContentDigest::from_bytes([38; 32]),
+        "backend-route-refresh",
+        "volume-route-refresh",
+        ReplicationState::Transferring,
+        1,
+    );
+    let old_source = route_binding("source", 1, 2, 3);
+    let old_target = route_binding("target", 1, 2, 4);
+    route_refresh.source_placement_set_id =
+        Some(PlacementSetId::new("source-route-refresh").unwrap());
+    route_refresh.source_backend_id = Some(BackendId::new("backend-source-refresh").unwrap());
+    route_refresh.source_storage_volume_id =
+        Some(StorageVolumeId::new("volume-source-refresh").unwrap());
+    route_refresh.source_edge_cluster_id = Some(old_source.edge_cluster_id.clone());
+    route_refresh.source_gateway_pool_id = Some(old_source.gateway_pool_id.clone());
+    route_refresh.source_placement_generation = Some(PlacementGeneration::new(1));
+    route_refresh.source_agent_id = Some(old_source.agent_id.clone());
+    route_refresh.source_session_generation = Some(old_source.session_generation);
+    route_refresh.source_mount_generation = Some(old_source.mount_generation);
+    route_refresh.source_route_generation = Some(old_source.route_generation);
+    route_refresh.target_edge_cluster_id = Some(old_target.edge_cluster_id.clone());
+    route_refresh.target_gateway_pool_id = Some(old_target.gateway_pool_id.clone());
+    route_refresh.target_placement_generation = Some(PlacementGeneration::new(1));
+    route_refresh.target_agent_id = Some(old_target.agent_id.clone());
+    route_refresh.target_session_generation = Some(old_target.session_generation);
+    route_refresh.target_mount_generation = Some(old_target.mount_generation);
+    route_refresh.target_route_generation = Some(old_target.route_generation);
+    repository
+        .insert_replication(route_refresh.clone())
+        .await
+        .unwrap();
+    let new_source = route_binding("source", 5, 2, 6);
+    let new_target = route_binding("target", 7, 2, 8);
+    let refreshed = repository
+        .refresh_replication_routes(RefreshReplicationRoutesRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: route_refresh.replication_id.clone(),
+            expected_attempt: 1,
+            expected_source: old_source.clone(),
+            expected_target: old_target.clone(),
+            source: new_source.clone(),
+            target: new_target.clone(),
+            updated_at_unix_ms: UnixMillis::new(30),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed.source_session_generation,
+        Some(new_source.session_generation)
+    );
+    assert_eq!(
+        refreshed.source_mount_generation,
+        Some(new_source.mount_generation)
+    );
+    assert_eq!(
+        refreshed.source_route_generation,
+        Some(new_source.route_generation)
+    );
+    assert_eq!(
+        refreshed.target_session_generation,
+        Some(new_target.session_generation)
+    );
+    assert_eq!(
+        refreshed.target_mount_generation,
+        Some(new_target.mount_generation)
+    );
+    assert_eq!(
+        refreshed.target_route_generation,
+        Some(new_target.route_generation)
+    );
+    let stale = repository
+        .refresh_replication_routes(RefreshReplicationRoutesRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: route_refresh.replication_id,
+            expected_attempt: 1,
+            expected_source: old_source,
+            expected_target: old_target,
+            source: new_source.clone(),
+            target: new_target.clone(),
+            updated_at_unix_ms: UnixMillis::new(31),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), CentralErrorCode::ConcurrentUpdate);
+    let mut replacement_source = route_binding("source", 9, 99, 10);
+    replacement_source.edge_cluster_id = new_source.edge_cluster_id.clone();
+    replacement_source.gateway_pool_id = new_source.gateway_pool_id.clone();
+    replacement_source.agent_id = new_source.agent_id.clone();
+    let mount_change = repository
+        .refresh_replication_routes(RefreshReplicationRoutesRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: refreshed.replication_id.clone(),
+            expected_attempt: 1,
+            expected_source: new_source.clone(),
+            expected_target: new_target.clone(),
+            source: replacement_source,
+            target: new_target.clone(),
+            updated_at_unix_ms: UnixMillis::new(32),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(mount_change.code(), CentralErrorCode::AssignmentMismatch);
+
+    // A route refresh racing a terminal transition must never resurrect the attempt or return a
+    // terminal record that a caller could use to issue a new transfer ticket. The SQLite mapper
+    // also enforces this active-state fence in the atomic UPDATE predicate.
+    repository
+        .cancel_replication(CancelReplicationRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: refreshed.replication_id.clone(),
+            expected_attempt: refreshed.attempt,
+            updated_at_unix_ms: UnixMillis::new(33),
+        })
+        .await
+        .unwrap();
+    let terminal_refresh = repository
+        .refresh_replication_routes(RefreshReplicationRoutesRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: refreshed.replication_id,
+            expected_attempt: 1,
+            expected_source: new_source.clone(),
+            expected_target: new_target.clone(),
+            source: new_source,
+            target: new_target,
+            updated_at_unix_ms: UnixMillis::new(34),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(terminal_refresh.code(), CentralErrorCode::InvalidState);
+
     let empty_commit = ContentDigest::from_bytes([35; 32]);
     let empty_set = ObjectSet::new(Vec::new()).unwrap();
     repository
@@ -413,6 +547,17 @@ async fn run_replication_edge_contract(repository: Arc<dyn PlacementRepository>)
     assert_eq!(availability.data_health, DataHealth::Available);
     assert_eq!(availability.verified_placements, 1);
     assert_eq!(availability.verified_storage_volume_ids, vec![empty_volume]);
+}
+
+fn route_binding(prefix: &str, session: u64, mount: u64, route: u64) -> ReplicationRouteBinding {
+    ReplicationRouteBinding {
+        edge_cluster_id: EdgeClusterId::new(format!("edge-{prefix}")).unwrap(),
+        gateway_pool_id: GatewayPoolId::new(format!("pool-{prefix}")).unwrap(),
+        agent_id: AgentId::new(format!("agent-{prefix}")).unwrap(),
+        session_generation: SessionGeneration::new(session),
+        mount_generation: MountGeneration::new(mount),
+        route_generation: RouteGeneration::new(route),
+    }
 }
 
 fn replication_record(

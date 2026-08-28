@@ -801,8 +801,9 @@ enrollment daemon 在独立 agent-state PVC 上创建统一 Agent 状态库与 h
   状态、outbound report 和本地执行证据；所有适配器共享同一连接与锁域；
 - `agent-state.lock` 保证同一状态目录只被一个 Agent 进程打开；第二个进程必须 fail closed；
 - `bootstrap-status-clock.json` 保存签名 status 请求的单调时间水位；
-- `runtime-health.json` 是 startup/liveness/readiness 命令读取的 daemon health record；readiness 只有在
-  session generation、mount recovery 和 heartbeat 全部有效后才能成功。
+- `runtime-health.json` 是 startup/liveness/readiness 命令读取的 daemon health record；Agent 断线重连期间
+  写入 `session_reconnecting` 并保持 liveness，但 readiness 失败；readiness 只有在 session generation、mount
+  recovery 和 heartbeat 全部有效后才能成功。
 
 Job/session 组件使用统一状态库；对象 cache、candidate 和 filesystem journal 仍是可重建的文件系统
 目录，不属于权威状态库：

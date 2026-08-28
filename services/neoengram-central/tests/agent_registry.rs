@@ -1,13 +1,21 @@
 #![cfg(feature = "authority-sqlite")]
 
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    time::Duration,
+};
 
 use neoengram_central::{
     open_sqlite_authority, AgentEnrollmentAuditEvent, AgentEnrollmentAuditKind,
     AgentEnrollmentLifecycleAuditKind, AgentEnrollmentListRequest, AgentInstanceRecord,
     AgentInstanceState, AgentProofOfPossessionStatus, AgentRegistryRecord,
     AgentRegistryRecordFormat, AgentRegistryRepository, AgentRegistryService,
-    BootstrapTokenMetadata, CentralErrorCode, CloseAgentSessionRequest,
+    BootstrapTokenMetadata, CentralErrorCode, Clock, CloseAgentSessionRequest,
     CompleteVolumeRecoveryRequest, CreateStorageEnrollmentIntentRequest, DerivedVolumeState,
     ExpireAgentEnrollmentRequest, FrozenPvcReference, FrozenStorageDescriptor,
     InMemoryAgentRegistry, InMemoryClock, InMemoryComponents, OpenAgentSessionRequest,
@@ -36,6 +44,54 @@ use tempfile::TempDir;
 const INITIAL_TOKEN: &str = "initial-bootstrap-token-with-at-least-32-bytes";
 const REPLACEMENT_TOKEN: &str = "replacement-bootstrap-token-with-32-bytes";
 const INDEPENDENT_TOKEN: &str = "independent-bootstrap-token-with-at-least-32-bytes";
+
+/// Test clock which can pause exactly one service mutation after its aggregate read. This makes
+/// the read/replace CAS race deterministic without adding hooks to the production repository.
+#[derive(Debug)]
+struct GateClock {
+    now_ms: AtomicU64,
+    block_next: AtomicBool,
+    entered: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl GateClock {
+    fn new(now_ms: u64) -> Self {
+        Self {
+            now_ms: AtomicU64::new(now_ms),
+            block_next: AtomicBool::new(false),
+            entered: Mutex::new(None),
+            release: Mutex::new(None),
+        }
+    }
+
+    fn arm(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *self.entered.lock().unwrap() = Some(entered_tx);
+        *self.release.lock().unwrap() = Some(release_rx);
+        self.block_next.store(true, Ordering::SeqCst);
+        (entered_rx, release_tx)
+    }
+}
+
+impl Clock for GateClock {
+    fn now(&self) -> UnixMillis {
+        if self.block_next.swap(false, Ordering::SeqCst) {
+            if let Some(sender) = self.entered.lock().unwrap().take() {
+                sender
+                    .send(())
+                    .expect("the test must receive the clock gate");
+            }
+            if let Some(receiver) = self.release.lock().unwrap().take() {
+                receiver
+                    .recv()
+                    .expect("the test must release the clock gate");
+            }
+        }
+        UnixMillis::new(self.now_ms.load(Ordering::SeqCst))
+    }
+}
 
 #[derive(Debug)]
 struct LifecycleResult {
@@ -2382,6 +2438,263 @@ async fn new_boot_without_capabilities_clears_previous_session_capabilities() {
         .await
         .unwrap();
     assert_capabilities_are_scoped_to_boot(sqlite.repository()).await;
+}
+
+#[tokio::test]
+async fn same_boot_capability_refresh_is_cas_bound_in_memory_and_sqlite() {
+    assert_same_boot_capability_refresh(Arc::new(InMemoryAgentRegistry::new())).await;
+
+    let directory = TempDir::new().unwrap();
+    let sqlite = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    assert_same_boot_capability_refresh(sqlite.repository()).await;
+    sqlite.integrity_check().await.unwrap();
+}
+
+async fn assert_same_boot_capability_refresh(repository: Arc<dyn AgentRegistryRepository>) {
+    let approved = approve_initial_repository(repository.clone()).await;
+    let service = AgentRegistryService::new(repository, Arc::new(InMemoryClock::new(200)), 100);
+    let boot = boot_id("capability-refresh");
+    let initial_capabilities = BTreeSet::from(["single_volume_v1".to_owned()]);
+    let first = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot.clone(),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: approved.resource_version,
+            capabilities: Some(initial_capabilities.clone()),
+        })
+        .await
+        .unwrap();
+    let first_session_id = first
+        .record
+        .instance
+        .as_ref()
+        .and_then(|instance| instance.active_session_id.clone())
+        .unwrap();
+
+    // Simulate a heartbeat that Central persisted after its ACK was lost. A reconnect still
+    // carries the pre-heartbeat ResourceVersion, but the already-advertised capability set is a
+    // read-only replay and must not be rejected as a stale session open.
+    let heartbeat = service
+        .report_mount(mount_report(
+            AgentKind::Initial,
+            "capability-refresh",
+            first.session_generation,
+            1,
+            1,
+            1,
+            "volume-a",
+            200,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        heartbeat.record.resource_version.get(),
+        first.record.resource_version.get() + 1
+    );
+    let replay_after_heartbeat = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot.clone(),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: first.record.resource_version,
+            capabilities: Some(initial_capabilities.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(replay_after_heartbeat.replayed);
+    assert_eq!(
+        replay_after_heartbeat.record.resource_version,
+        heartbeat.record.resource_version
+    );
+
+    let refreshed_capabilities = BTreeSet::from([
+        "single_volume_v1".to_owned(),
+        "commit_replication_quic_v1".to_owned(),
+    ]);
+    let refreshed = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot.clone(),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: first.record.resource_version,
+            capabilities: Some(refreshed_capabilities.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(!refreshed.replayed);
+    assert_eq!(refreshed.session_generation, first.session_generation);
+    assert_eq!(
+        refreshed
+            .record
+            .instance
+            .as_ref()
+            .unwrap()
+            .active_session_id
+            .as_ref(),
+        Some(&first_session_id)
+    );
+    assert_eq!(
+        refreshed.record.resource_version.get(),
+        heartbeat.record.resource_version.get() + 1
+    );
+    assert_eq!(
+        refreshed.record.instance.as_ref().unwrap().capabilities,
+        refreshed_capabilities
+    );
+
+    // Retrying the exact refresh after a lost response replays against the previous CAS version;
+    // it must not advance the aggregate a second time.
+    let replay = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot.clone(),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: first.record.resource_version,
+            capabilities: Some(refreshed_capabilities.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(
+        replay.record.resource_version,
+        refreshed.record.resource_version
+    );
+
+    // A different capability payload cannot reuse the ResourceVersion which already committed
+    // the previous refresh. Otherwise two reconnects racing from the same aggregate version can
+    // overwrite each other's capability decision after the repository CAS retry.
+    let stale_refresh = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot.clone(),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: first.record.resource_version,
+            capabilities: Some(initial_capabilities.clone()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale_refresh.code(), CentralErrorCode::ConcurrentUpdate);
+
+    let future_replay = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot.clone(),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: ResourceVersion::new(
+                refreshed.record.resource_version.get() + 1,
+            ),
+            capabilities: Some(refreshed_capabilities.clone()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(future_replay.code(), CentralErrorCode::ConcurrentUpdate);
+
+    let wrong_installation = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: AgentInstallationId::new("installation-other").unwrap(),
+            boot_id: boot,
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: refreshed.record.resource_version,
+            capabilities: Some(initial_capabilities),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        wrong_installation.code(),
+        CentralErrorCode::AgentIdentityMismatch
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_open_retries_when_heartbeat_wins_the_cas() {
+    assert_session_open_retries_after_heartbeat(Arc::new(InMemoryAgentRegistry::new())).await;
+}
+
+async fn assert_session_open_retries_after_heartbeat(repository: Arc<dyn AgentRegistryRepository>) {
+    let approved = approve_initial_repository(repository.clone()).await;
+    let clock = Arc::new(GateClock::new(200));
+    let service = Arc::new(AgentRegistryService::new(repository, clock.clone(), 100));
+    let boot = boot_id("session-open-cas-race");
+    let initial_capabilities = BTreeSet::from(["single_volume_v1".to_owned()]);
+    let first = service
+        .open_session(OpenAgentSessionRequest {
+            agent_id: initial_agent_id(),
+            installation_id: initial_installation_id(),
+            boot_id: boot.clone(),
+            mount_identity_digest: mount_identity_digest(),
+            expected_resource_version: approved.resource_version,
+            capabilities: Some(initial_capabilities.clone()),
+        })
+        .await
+        .unwrap();
+
+    let (entered, release) = clock.arm();
+    let opening_service = Arc::clone(&service);
+    let opening = tokio::spawn(async move {
+        opening_service
+            .open_session(OpenAgentSessionRequest {
+                agent_id: initial_agent_id(),
+                installation_id: initial_installation_id(),
+                boot_id: boot,
+                mount_identity_digest: mount_identity_digest(),
+                expected_resource_version: first.record.resource_version,
+                capabilities: Some(BTreeSet::from([
+                    "single_volume_v1".to_owned(),
+                    "commit_replication_quic_v1".to_owned(),
+                ])),
+            })
+            .await
+    });
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("session open must reach the CAS gate after loading the record");
+
+    let heartbeat = service
+        .report_mount(mount_report(
+            AgentKind::Initial,
+            "session-open-cas-race",
+            first.session_generation,
+            1,
+            1,
+            1,
+            "volume-a",
+            200,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        heartbeat.record.resource_version.get(),
+        first.record.resource_version.get() + 1
+    );
+    release.send(()).unwrap();
+
+    let refreshed = opening
+        .await
+        .expect("session open task must finish")
+        .expect("a heartbeat CAS race must be retried");
+    assert!(!refreshed.replayed);
+    assert_eq!(refreshed.session_generation, first.session_generation);
+    assert_eq!(
+        refreshed.record.resource_version.get(),
+        heartbeat.record.resource_version.get() + 1
+    );
+    assert_eq!(
+        refreshed.record.instance.as_ref().unwrap().capabilities,
+        BTreeSet::from([
+            "single_volume_v1".to_owned(),
+            "commit_replication_quic_v1".to_owned(),
+        ])
+    );
 }
 
 async fn assert_capabilities_are_scoped_to_boot(repository: Arc<dyn AgentRegistryRepository>) {

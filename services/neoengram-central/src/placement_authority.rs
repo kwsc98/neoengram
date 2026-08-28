@@ -123,6 +123,33 @@ pub struct RetryReplicationResult {
     pub replayed: bool,
 }
 
+/// Route/session binding for one side of an active replication. Agent and mount identity are
+/// retained across a reconnect; only the current session and Gateway route generations may be
+/// refreshed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationRouteBinding {
+    pub edge_cluster_id: EdgeClusterId,
+    pub gateway_pool_id: GatewayPoolId,
+    pub agent_id: AgentId,
+    pub session_generation: SessionGeneration,
+    pub mount_generation: MountGeneration,
+    pub route_generation: RouteGeneration,
+}
+
+/// Compare-and-swap route refresh used when a Gateway/Agent reconnects during an active attempt.
+/// The expected bindings prevent a stale reconnect from overwriting a newer route refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshReplicationRoutesRequest {
+    pub tenant_id: TenantId,
+    pub replication_id: ReplicationId,
+    pub expected_attempt: u64,
+    pub expected_source: ReplicationRouteBinding,
+    pub expected_target: ReplicationRouteBinding,
+    pub source: ReplicationRouteBinding,
+    pub target: ReplicationRouteBinding,
+    pub updated_at_unix_ms: UnixMillis,
+}
+
 pub(crate) fn same_retry_request(
     left: &RetryReplicationRequest,
     right: &RetryReplicationRequest,

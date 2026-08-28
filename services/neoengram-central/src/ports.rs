@@ -826,6 +826,12 @@ pub trait PlacementRepository: Send + Sync {
         tenant_id: &TenantId,
         agent_id: &AgentId,
     ) -> CentralResult<Vec<crate::ReplicationRecord>>;
+    /// Atomically refreshes the source and target session/route bindings for an active attempt.
+    /// Agent and mount identities remain fenced by the expected bindings.
+    async fn refresh_replication_routes(
+        &self,
+        request: crate::RefreshReplicationRoutesRequest,
+    ) -> CentralResult<crate::ReplicationRecord>;
     async fn insert_replication(
         &self,
         record: crate::ReplicationRecord,

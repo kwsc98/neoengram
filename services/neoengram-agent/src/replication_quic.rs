@@ -15,8 +15,9 @@ use std::{
 };
 
 use neoengram_domain::protocol::{
-    CommitObjectSet, ObjectChunk, ObjectProof, ObjectRequest, ObjectSet, SignedTransferTicket,
-    TransferFrame, TransferFrameError, TransferTicket, MAX_TRANSFER_CHUNK_BYTES,
+    CommitObjectSet, MountGeneration, ObjectChunk, ObjectProof, ObjectRequest, ObjectSet,
+    SignedTransferTicket, TransferFrame, TransferFrameError, TransferTicket,
+    MAX_TRANSFER_CHUNK_BYTES,
 };
 use neoengram_domain::ObjectId;
 use neoengram_domain::TenantId;
@@ -24,7 +25,14 @@ use neoengram_runtime::{ObjectBackend, ObjectRange};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls_pki_types::pem::PemObject;
 
-use crate::CentralCommandTrustBundle;
+use crate::{CentralCommandTrustBundle, SharedSessionFence};
+
+/// A transfer frame must make progress within a bounded interval. QUIC's connection idle
+/// timeout eventually closes a dead path, but relying on it alone leaves the worker blocked for
+/// an unbounded amount of time when an intermediary black-holes packets.
+const TRANSFER_FRAME_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const TRANSFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TRANSFER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuicTransferError {
@@ -52,6 +60,24 @@ pub enum QuicTransferError {
     Tls(String),
     #[error("Gateway QUIC preflight timed out")]
     PreflightTimeout,
+}
+
+impl QuicTransferError {
+    /// Returns whether retrying the same immutable transfer scope may succeed after the network
+    /// path recovers. Ticket, frame, protocol and backend failures are intentionally excluded:
+    /// those indicate a bad request or local data and must remain fail-closed.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Connection(_)
+                | Self::Connect(_)
+                | Self::Read(_)
+                | Self::Write(_)
+                | Self::Io(_)
+                | Self::PreflightTimeout
+        )
+    }
 }
 
 /// Optional Agent QUIC network. Central still signs the immutable scope; this config supplies a
@@ -129,9 +155,12 @@ impl QuicTransferNetwork {
         let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server)
             .map_err(|error| QuicTransferError::Tls(error.to_string()))?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
-        Arc::get_mut(&mut server_config.transport)
-            .expect("new QUIC server config has a unique transport")
-            .max_concurrent_bidi_streams(64u32.into());
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .max_concurrent_bidi_streams(64u32.into())
+            .keep_alive_interval(Some(TRANSFER_KEEP_ALIVE_INTERVAL));
+        let transport = Arc::new(transport);
+        server_config.transport = Arc::clone(&transport);
 
         let mut client = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -145,7 +174,8 @@ impl QuicTransferNetwork {
         client.resumption = rustls::client::Resumption::disabled();
         let client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client)
             .map_err(|error| QuicTransferError::Tls(error.to_string()))?;
-        let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+        let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+        client_config.transport_config(transport);
         let mut endpoint = match config.listen {
             Some(address) => quinn::Endpoint::server(server_config, address)?,
             None => quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid client bind"))?,
@@ -166,7 +196,16 @@ impl QuicTransferNetwork {
         let address = self.gateway_endpoint.ok_or_else(|| {
             QuicTransferError::Protocol("target Gateway endpoint is not configured".into())
         })?;
-        Ok(self.endpoint.connect(address, &self.server_name)?.await?)
+        let connecting = self.endpoint.connect(address, &self.server_name)?;
+        tokio::time::timeout(TRANSFER_CONNECT_TIMEOUT, connecting)
+            .await
+            .map_err(|_| {
+                QuicTransferError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "QUIC Gateway connection timed out",
+                ))
+            })?
+            .map_err(QuicTransferError::from)
     }
 
     /// Performs the bounded network half of replication preflight. A successful result means the
@@ -189,6 +228,8 @@ impl QuicTransferNetwork {
         trust_bundle: Arc<CentralCommandTrustBundle>,
         local_tenant_id: TenantId,
         local_agent_id: neoengram_domain::AgentId,
+        session_fence: SharedSessionFence,
+        local_mount_generation: MountGeneration,
         execution: Arc<crate::FilesystemExecution>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), QuicTransferError> {
@@ -207,12 +248,19 @@ impl QuicTransferNetwork {
             let trust_bundle = Arc::clone(&trust_bundle);
             let local_tenant_id = local_tenant_id.clone();
             let local_agent_id = local_agent_id.clone();
+            let session_fence = session_fence.clone();
             let execution = Arc::clone(&execution);
             tokio::spawn(async move {
                 let result = async {
                     let connection = incoming.await?;
                     let (send, recv) = connection.accept_bi().await?;
-                    let identity = QuicTransferIdentity::new(local_agent_id);
+                    let current_session = session_fence
+                        .get()
+                        .map_err(|error| QuicTransferError::Protocol(error.to_string()))?;
+                    let identity = QuicTransferIdentity::new(local_agent_id).with_session_mount(
+                        current_session.session_generation.get(),
+                        local_mount_generation.get(),
+                    );
                     serve_quic_source_connection(
                         send,
                         recv,
@@ -296,6 +344,15 @@ impl QuicTransferIdentity {
             {
                 return Err(QuicTransferError::Protocol(
                     "ticket source route generation is stale".into(),
+                ));
+            }
+        }
+        if let Some((session, mount)) = self.session_mount {
+            if ticket.source_session_generation.get() != session
+                || ticket.source_mount_generation.get() != mount
+            {
+                return Err(QuicTransferError::Protocol(
+                    "ticket source session or mount generation is stale".into(),
                 ));
             }
         }
@@ -406,9 +463,7 @@ impl QuicTransferClient {
         if let Some(identity) = self.identity.as_ref() {
             identity.check_target(&signed_ticket.ticket)?;
         }
-        let (mut send, mut recv) = self.connection.open_bi().await.map_err(|error| {
-            QuicTransferError::Protocol(format!("failed to open transfer stream: {error}"))
-        })?;
+        let (mut send, mut recv) = self.connection.open_bi().await?;
         send_frame(
             &mut send,
             &TransferFrame::OpenTransferSigned(signed_ticket.clone()),
@@ -842,11 +897,29 @@ fn protocol_frame(message: &str) -> QuicTransferError {
 
 async fn send_frame(send: &mut SendStream, frame: &TransferFrame) -> Result<(), QuicTransferError> {
     let encoded = frame.encode()?;
-    send.write_all(&encoded).await?;
+    tokio::time::timeout(TRANSFER_FRAME_IO_TIMEOUT, send.write_all(&encoded))
+        .await
+        .map_err(|_| {
+            QuicTransferError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC transfer frame write timed out",
+            ))
+        })??;
     Ok(())
 }
 
 async fn read_frame(recv: &mut RecvStream) -> Result<TransferFrame, QuicTransferError> {
+    tokio::time::timeout(TRANSFER_FRAME_IO_TIMEOUT, read_frame_inner(recv))
+        .await
+        .map_err(|_| {
+            QuicTransferError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC transfer frame read timed out",
+            ))
+        })?
+}
+
+async fn read_frame_inner(recv: &mut RecvStream) -> Result<TransferFrame, QuicTransferError> {
     let mut prefix = [0_u8; 4];
     recv.read_exact(&mut prefix).await?;
     let payload_len = u32::from_be_bytes(prefix) as usize;
@@ -945,8 +1018,32 @@ mod tests {
         let mut replaced_mount = transfer.clone();
         replaced_mount.mount_generation = MountGeneration::new(10);
         assert!(session_mount.check_target(&replaced_mount).is_err());
+        let source_session_mount = QuicTransferIdentity::new(AgentId::new("agent-source").unwrap())
+            .with_session_mount(3, 4);
+        source_session_mount.check_source(&transfer).unwrap();
+        let mut replaced_source_session = transfer.clone();
+        replaced_source_session.source_session_generation = SessionGeneration::new(9);
+        assert!(source_session_mount
+            .check_source(&replaced_source_session)
+            .is_err());
+        let mut replaced_source_mount = transfer.clone();
+        replaced_source_mount.source_mount_generation = MountGeneration::new(10);
+        assert!(source_session_mount
+            .check_source(&replaced_source_mount)
+            .is_err());
         let mut unauthorized = transfer;
         unauthorized.allowed_objects.clear();
         assert!(validate_ticket_set(&unauthorized, &set).is_err());
+    }
+
+    #[test]
+    fn transport_errors_are_retryable_but_protocol_errors_are_not() {
+        assert!(
+            QuicTransferError::Io(io::Error::new(io::ErrorKind::TimedOut, "test timeout",))
+                .is_transient()
+        );
+        assert!(QuicTransferError::PreflightTimeout.is_transient());
+        assert!(!QuicTransferError::Protocol("bad frame".to_owned()).is_transient());
+        assert!(!QuicTransferError::Expired.is_transient());
     }
 }

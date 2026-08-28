@@ -440,7 +440,7 @@ impl GatewayRegistryRepository for SqliteAgentRegistryStore {
             replace_agent_record_transaction(
                 &mut transaction,
                 &stored_agent,
-                request.session.expected_resource_version.get(),
+                stored_agent.resource_version.get(),
                 &session.record,
             )
             .await?;

@@ -4,13 +4,14 @@ use neoengram_domain::protocol::{
     AgentId, AssignmentOperation, ControlError, ControlMessage, DecisionGeneration,
     DeletionOperationState, DeletionProof, DeletionProofId, DeletionProofResult, Envelope,
     EnvelopeHeader, ErrorCode, Extensions, IndexRevision, JobAssignment, JobDecision, JobFinalized,
-    JobState, LifecycleEvent, LifecycleEventId, LifecycleEventKind, MessageId, PrincipalKind,
-    PublishDecision, ReplicationAssignment, ReplicationObjectState, ReplicationProgressReport,
-    ReplicationState, RequestId, ResourceLifecycleReport, ResourceLifecycleReportState,
-    ResourceVersion, SessionGeneration, SignedTransferTicket, SnapshotDeliveryAssignment,
-    SnapshotDeliveryState, TraceId, TransferEndpoint, TransferTicket, UnixMillis, WireIndexVersion,
-    WorkspaceMaterializeAssignment, AGENT_JOB_ASSIGNMENT_ACTION, AGENT_JOB_DECISION_ACTION,
-    AGENT_LIFECYCLE_ASSIGNMENT_ACTION, AGENT_REPLICATION_ASSIGNMENT_ACTION, CURRENT_WIRE_VERSION,
+    JobState, LifecycleEvent, LifecycleEventId, LifecycleEventKind, MessageId, MountGeneration,
+    PrincipalKind, PublishDecision, ReplicationAssignment, ReplicationObjectState,
+    ReplicationProgressReport, ReplicationState, RequestId, ResourceLifecycleReport,
+    ResourceLifecycleReportState, ResourceVersion, RouteGeneration, SessionGeneration,
+    SignedTransferTicket, SnapshotDeliveryAssignment, SnapshotDeliveryState, TraceId,
+    TransferEndpoint, TransferTicket, UnixMillis, WireIndexVersion, WorkspaceMaterializeAssignment,
+    AGENT_JOB_ASSIGNMENT_ACTION, AGENT_JOB_DECISION_ACTION, AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
+    AGENT_REPLICATION_ASSIGNMENT_ACTION, CURRENT_WIRE_VERSION,
 };
 
 use crate::{
@@ -27,12 +28,14 @@ use crate::{
     CreateAddJobResult, CreateSnapshotDeliveryRequest, CreateSnapshotDeliveryResult,
     CreateWorkspaceMaterializationRequest, CreateWorkspaceMaterializationResult,
     ExpireAddJobRequest, ExpireAddJobResult, FinalizeAddRequest, FinalizeAddResult,
-    FinalizeReplicationRequest, IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest,
-    IndexPublisher, JobInsertOutcome, JobOperation, JobRecord, JobRepository, MetadataBatchStager,
-    MetadataBatchSubmission, ObjectCatalog, PlacementRepository, PublicationCandidate,
-    QueryJobRequest, QueryJobResult, ReceiveReportRequest, ReceiveReportResult,
-    ReplicationObjectRecord, ReplicationRecord, ReplicationStateTransitionRequest,
-    ResumePublicationRequest, StageMetadataBatchRequest, StageMetadataBatchResult,
+    FinalizeReplicationRequest, GatewayRegistryRepository, IndexPublishOutcome,
+    IndexPublishRejection, IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobOperation,
+    JobRecord, JobRepository, MetadataBatchStager, MetadataBatchSubmission, ObjectCatalog,
+    PlacementRepository, PublicationCandidate, QueryJobRequest, QueryJobResult,
+    ReceiveReportRequest, ReceiveReportResult, RefreshReplicationRoutesRequest,
+    ReplicationObjectRecord, ReplicationRecord, ReplicationRouteBinding,
+    ReplicationStateTransitionRequest, ResumePublicationRequest, StageMetadataBatchRequest,
+    StageMetadataBatchResult,
 };
 
 use crate::service::{CentralCommandKeyring, DEFAULT_CENTRAL_COMMAND_TTL_MS};
@@ -114,6 +117,7 @@ pub struct ControlPlane {
     catalog: Option<Arc<dyn ControlCatalogRepository>>,
     agent_registry: Option<Arc<dyn AgentRegistryRepository>>,
     placement: Option<Arc<dyn PlacementRepository>>,
+    gateway_registry: Option<Arc<dyn GatewayRegistryRepository>>,
     replication_ticket_keyring: Option<Arc<CentralCommandKeyring>>,
     clock: Arc<dyn Clock>,
 }
@@ -205,6 +209,111 @@ async fn validate_replication_report_binding(
     Ok(())
 }
 
+fn replication_active_state_rank(state: ReplicationState) -> Option<u8> {
+    match state {
+        ReplicationState::Queued => Some(0),
+        ReplicationState::Planning => Some(1),
+        ReplicationState::Transferring => Some(2),
+        ReplicationState::Verifying => Some(3),
+        ReplicationState::Published | ReplicationState::Failed | ReplicationState::Cancelled => {
+            None
+        }
+    }
+}
+
+fn replication_object_state_rank(state: ReplicationObjectState) -> u8 {
+    match state {
+        ReplicationObjectState::Queued => 0,
+        ReplicationObjectState::Transferring => 1,
+        ReplicationObjectState::Verified => 2,
+        // A failed object is terminal for this attempt and must not be replaced by a stale
+        // progress event from a worker that was still unwinding when the failure was recorded.
+        ReplicationObjectState::Failed => 3,
+    }
+}
+
+fn current_is_terminal_replication(state: ReplicationState) -> bool {
+    matches!(
+        state,
+        ReplicationState::Published | ReplicationState::Failed | ReplicationState::Cancelled
+    )
+}
+
+fn replication_delivery_can_wait_for_next_tick(error: &crate::CentralError) -> bool {
+    match error.code() {
+        CentralErrorCode::GatewayRouteUnavailable => error.retryable(),
+        // Repository CAS adapters may mark the caller's exact stale request as non-retryable.
+        // Delivery still retries by re-reading the authoritative replication on the next tick.
+        CentralErrorCode::ConcurrentUpdate => true,
+        _ => false,
+    }
+}
+
+fn reconnected_replication_report_matches_route(
+    stored_session: SessionGeneration,
+    stored_mount: MountGeneration,
+    stored_route: RouteGeneration,
+    report_session: SessionGeneration,
+    refreshed: ReplicationRouteGenerations,
+) -> bool {
+    refreshed.session == report_session
+        && refreshed.session.get() > stored_session.get()
+        && refreshed.mount == stored_mount
+        && refreshed.route.get() >= stored_route.get()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReplicationRouteGenerations {
+    session: SessionGeneration,
+    mount: MountGeneration,
+    route: RouteGeneration,
+}
+
+fn replication_route_binding(
+    record: &ReplicationRecord,
+    source: bool,
+    session_generation: SessionGeneration,
+    mount_generation: MountGeneration,
+    route_generation: RouteGeneration,
+) -> CentralResult<ReplicationRouteBinding> {
+    let (edge_cluster_id, gateway_pool_id, agent_id) = if source {
+        (
+            record.source_edge_cluster_id.clone(),
+            record.source_gateway_pool_id.clone(),
+            record.source_agent_id.clone(),
+        )
+    } else {
+        (
+            record.target_edge_cluster_id.clone(),
+            record.target_gateway_pool_id.clone(),
+            record.target_agent_id.clone(),
+        )
+    };
+    Ok(ReplicationRouteBinding {
+        edge_cluster_id: edge_cluster_id.ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            )
+        })?,
+        gateway_pool_id: gateway_pool_id.ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            )
+        })?,
+        agent_id: agent_id.ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "replication route binding is incomplete",
+            )
+        })?,
+        session_generation,
+        mount_generation,
+        route_generation,
+    })
+}
+
 impl ControlPlane {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -224,6 +333,7 @@ impl ControlPlane {
             catalog: authority.control_catalog(),
             agent_registry: authority.agent_registry(),
             placement: authority.placement(),
+            gateway_registry: authority.gateway_registry(),
             replication_ticket_keyring: None,
             clock,
         }
@@ -244,6 +354,85 @@ impl ControlPlane {
     pub fn with_replication_ticket_keyring(mut self, keyring: Arc<CentralCommandKeyring>) -> Self {
         self.replication_ticket_keyring = Some(keyring);
         self
+    }
+
+    /// Installs the Gateway route registry used to refresh session/route generations when a
+    /// control channel reconnects. The immutable Agent, Volume, cluster, and pool bindings stay
+    /// on the Replication record; only the live transport generations are refreshed.
+    #[must_use]
+    pub fn with_gateway_registry(mut self, registry: Arc<dyn GatewayRegistryRepository>) -> Self {
+        self.gateway_registry = Some(registry);
+        self
+    }
+
+    async fn current_replication_route_generations(
+        &self,
+        agent_id: &AgentId,
+        expected_edge_cluster_id: &neoengram_domain::protocol::EdgeClusterId,
+        expected_gateway_pool_id: &neoengram_domain::protocol::GatewayPoolId,
+        expected_session_generation: SessionGeneration,
+        expected_mount_generation: MountGeneration,
+        expected_route_generation: RouteGeneration,
+    ) -> CentralResult<ReplicationRouteGenerations> {
+        let Some(registry) = &self.gateway_registry else {
+            // Focused Job-only adapters do not have a Gateway registry. Their replication tests
+            // still use the immutable route snapshot stored on the record.
+            return Ok(ReplicationRouteGenerations {
+                session: expected_session_generation,
+                mount: expected_mount_generation,
+                route: expected_route_generation,
+            });
+        };
+        let route = registry
+            .get_agent_route(agent_id)
+            .await?
+            .filter(|route| route.is_active_at(self.clock.now()))
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::GatewayRouteUnavailable,
+                    "replication Agent route is temporarily unavailable",
+                )
+            })?;
+        // A reconnect may advance session/route generations, but it must not silently move a
+        // transfer to a different Agent, EdgeCluster, or GatewayPool.
+        if route.agent_id != *agent_id
+            || route.edge_cluster_id != *expected_edge_cluster_id
+            || route.gateway_pool_id != *expected_gateway_pool_id
+        {
+            return Err(invalid(
+                CentralErrorCode::GatewayRouteUnavailable,
+                "replication Agent route no longer matches its frozen placement scope",
+            ));
+        }
+        let mount = if let Some(agent_registry) = &self.agent_registry {
+            let record = agent_registry
+                .get_by_agent(agent_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::GatewayRouteUnavailable,
+                        "replication Agent enrollment is temporarily unavailable",
+                    )
+                })?;
+            if record.mount.mount_generation != expected_mount_generation
+                || record.enrollment.edge_cluster_id != *expected_edge_cluster_id
+                || record.owner.active_agent_id.as_ref() != Some(agent_id)
+                || record.owner.active_agent_mount_id.as_ref() != Some(&record.mount.agent_mount_id)
+            {
+                return Err(invalid(
+                    CentralErrorCode::GatewayRouteUnavailable,
+                    "replication Agent owner or mount generation changed",
+                ));
+            }
+            record.mount.mount_generation
+        } else {
+            expected_mount_generation
+        };
+        Ok(ReplicationRouteGenerations {
+            session: route.session_generation,
+            mount,
+            route: route.route_generation,
+        })
     }
 
     /// Derives the current Agent delivery set from the durable assignment outbox and Job CAS.
@@ -457,13 +646,36 @@ impl ControlPlane {
                                 | ReplicationState::Transferring
                                 | ReplicationState::Verifying
                         )
-                        || replication.target_session_generation != Some(session_generation)
                     {
                         continue;
                     }
-                    let Some(assignment) = self.replication_assignment(&replication).await? else {
+                    let assignment = match self.replication_assignment(&replication).await {
+                        Ok(assignment) => assignment,
+                        Err(error) if replication_delivery_can_wait_for_next_tick(&error) => {
+                            // A single replication can race a Gateway lease refresh or a route
+                            // CAS. Keep unrelated Job/decision/lifecycle messages flowing; the
+                            // active replication remains in Placement and will be retried on the
+                            // next delivery tick. Authority/protocol failures still fail closed.
+                            tracing::debug!(
+                                agent_id = %agent_id,
+                                replication_id = %replication.replication_id,
+                                code = error.stable_code(),
+                                "skipping temporarily unavailable replication assignment"
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let Some(assignment) = assignment else {
                         continue;
                     };
+                    // The assignment builder refreshes the live target route. Do not enqueue a
+                    // command for a channel whose session was fenced while the delivery pass was
+                    // reading the registry.
+                    if assignment.signed_ticket.as_ticket().session_generation != session_generation
+                    {
+                        continue;
+                    }
                     let deadline = assignment.signed_ticket.as_ticket().deadline_unix_ms;
                     let envelope = action_envelope(
                         AGENT_REPLICATION_ASSIGNMENT_ACTION,
@@ -576,6 +788,68 @@ impl ControlPlane {
                 "replication route binding is incomplete",
             ));
         };
+        let source_generations = self
+            .current_replication_route_generations(
+                &source_agent_id,
+                &source_edge_cluster_id,
+                &source_gateway_pool_id,
+                source_session_generation,
+                source_mount_generation,
+                source_route_generation,
+            )
+            .await?;
+        let target_generations = self
+            .current_replication_route_generations(
+                &target_agent_id,
+                &target_edge_cluster_id,
+                &target_gateway_pool_id,
+                target_session_generation,
+                target_mount_generation,
+                target_route_generation,
+            )
+            .await?;
+        let expected_source = replication_route_binding(
+            &record,
+            true,
+            source_session_generation,
+            source_mount_generation,
+            source_route_generation,
+        )?;
+        let expected_target = replication_route_binding(
+            &record,
+            false,
+            target_session_generation,
+            target_mount_generation,
+            target_route_generation,
+        )?;
+        let refreshed_source = replication_route_binding(
+            &record,
+            true,
+            source_generations.session,
+            source_generations.mount,
+            source_generations.route,
+        )?;
+        let refreshed_target = replication_route_binding(
+            &record,
+            false,
+            target_generations.session,
+            target_generations.mount,
+            target_generations.route,
+        )?;
+        if refreshed_source != expected_source || refreshed_target != expected_target {
+            record = placement
+                .refresh_replication_routes(RefreshReplicationRoutesRequest {
+                    tenant_id: record.tenant_id.clone(),
+                    replication_id: record.replication_id.clone(),
+                    expected_attempt: record.attempt,
+                    expected_source,
+                    expected_target,
+                    source: refreshed_source,
+                    target: refreshed_target,
+                    updated_at_unix_ms: self.clock.now(),
+                })
+                .await?;
+        }
         let mut allowed_objects = object_set
             .object_set
             .objects
@@ -603,12 +877,12 @@ impl ControlPlane {
                 edge_cluster_id: target_edge_cluster_id,
                 storage_volume_id: Some(record.target_storage_volume_id.clone()),
             },
-            source_session_generation,
-            source_mount_generation,
-            source_route_generation,
-            session_generation: target_session_generation,
-            mount_generation: target_mount_generation,
-            route_generation: target_route_generation,
+            source_session_generation: source_generations.session,
+            source_mount_generation: source_generations.mount,
+            source_route_generation: source_generations.route,
+            session_generation: target_generations.session,
+            mount_generation: target_generations.mount,
+            route_generation: target_generations.route,
             deadline_unix_ms: replication_ticket_deadline(self.clock.now())?,
             max_bytes: neoengram_domain::protocol::DecimalU64::new(record.total_bytes),
             allowed_objects,
@@ -658,7 +932,7 @@ impl ControlPlane {
             )
         })?;
         let replication_id = report.replication_id().clone();
-        let current = placement
+        let mut current = placement
             .get_replication(tenant_id, &replication_id)
             .await?
             .ok_or_else(|| {
@@ -673,10 +947,20 @@ impl ControlPlane {
                 "replication report is not bound to the target Agent",
             ));
         }
-        if current.attempt != report.attempt() {
+        if report.attempt() < current.attempt {
+            // A cancelled/failed attempt can still have durable Agent reports in flight when the
+            // caller starts its successor. They are authenticated as belonging to the same target
+            // Agent, but can no longer mutate authority. Acknowledge them as replays so the Agent
+            // outbox can drain and deliver reports for the current attempt.
+            return Ok(ReplicationReportResult {
+                resource_version: ResourceVersion::new(1),
+                replayed: true,
+            });
+        }
+        if report.attempt() > current.attempt {
             return Err(invalid(
                 CentralErrorCode::ConcurrentUpdate,
-                "replication report belongs to a superseded attempt",
+                "replication report attempt is ahead of authority",
             ));
         }
         validate_replication_report_binding(placement.as_ref(), tenant_id, &current, &report)
@@ -692,10 +976,103 @@ impl ControlPlane {
             });
         }
         if current.target_session_generation != Some(session_generation) {
-            return Err(invalid(
-                CentralErrorCode::AssignmentMismatch,
-                "replication report is not bound to the target Agent session",
-            ));
+            // A process restart legitimately advances the session generation while the
+            // Replication attempt remains active. Accept the report only after re-reading the
+            // current route and mount fence for the same Agent; a replacement Agent or Volume
+            // mount still fails closed.
+            let (
+                Some(target_edge_cluster_id),
+                Some(target_gateway_pool_id),
+                Some(target_agent_id),
+                Some(target_session_generation),
+                Some(target_mount_generation),
+                Some(target_route_generation),
+            ) = (
+                current.target_edge_cluster_id.clone(),
+                current.target_gateway_pool_id.clone(),
+                current.target_agent_id.clone(),
+                current.target_session_generation,
+                current.target_mount_generation,
+                current.target_route_generation,
+            )
+            else {
+                return Err(invalid(
+                    CentralErrorCode::AssignmentMismatch,
+                    "replication report target route binding is incomplete",
+                ));
+            };
+            let refreshed = self
+                .current_replication_route_generations(
+                    &target_agent_id,
+                    &target_edge_cluster_id,
+                    &target_gateway_pool_id,
+                    target_session_generation,
+                    target_mount_generation,
+                    target_route_generation,
+                )
+                .await?;
+            if !reconnected_replication_report_matches_route(
+                target_session_generation,
+                target_mount_generation,
+                target_route_generation,
+                session_generation,
+                refreshed,
+            ) {
+                return Err(invalid(
+                    CentralErrorCode::AssignmentMismatch,
+                    "replication report is not bound to the current target route and mount",
+                ));
+            }
+            // Persist the advanced target fence before applying the report. This keeps the
+            // durable attempt aligned with the session that authenticated the replay and avoids
+            // validating every later outbox item against a permanently stale route snapshot.
+            // The source does not need to be live here: its frozen binding is carried forward
+            // unchanged, so a target can drain durable reports while the source is offline.
+            if !current_is_terminal_replication(current.state) {
+                if let (
+                    Some(source_session_generation),
+                    Some(source_mount_generation),
+                    Some(source_route_generation),
+                ) = (
+                    current.source_session_generation,
+                    current.source_mount_generation,
+                    current.source_route_generation,
+                ) {
+                    let expected_source = replication_route_binding(
+                        &current,
+                        true,
+                        source_session_generation,
+                        source_mount_generation,
+                        source_route_generation,
+                    )?;
+                    let expected_target = replication_route_binding(
+                        &current,
+                        false,
+                        target_session_generation,
+                        target_mount_generation,
+                        target_route_generation,
+                    )?;
+                    let refreshed_target = replication_route_binding(
+                        &current,
+                        false,
+                        refreshed.session,
+                        refreshed.mount,
+                        refreshed.route,
+                    )?;
+                    current = placement
+                        .refresh_replication_routes(RefreshReplicationRoutesRequest {
+                            tenant_id: tenant_id.clone(),
+                            replication_id: replication_id.clone(),
+                            expected_attempt: current.attempt,
+                            source: expected_source.clone(),
+                            target: refreshed_target,
+                            expected_source,
+                            expected_target,
+                            updated_at_unix_ms: self.clock.now(),
+                        })
+                        .await?;
+                }
+            }
         }
         let now = self.clock.now();
         let mut replayed = false;
@@ -708,15 +1085,29 @@ impl ControlPlane {
                 issue_message,
                 ..
             } => {
-                if state == ReplicationState::Published
-                    || (current.state == state
-                        && current.completed_objects == completed_objects
-                        && current.completed_bytes == completed_bytes
-                        && current.issue_code == issue_code
-                        && current.issue_message == issue_message)
+                let state_is_stale = match (
+                    replication_active_state_rank(current.state),
+                    replication_active_state_rank(state),
+                ) {
+                    (Some(current_rank), Some(next_rank)) => {
+                        next_rank < current_rank
+                            || completed_objects < current.completed_objects
+                            || completed_bytes < current.completed_bytes
+                            || (next_rank == current_rank
+                                && completed_objects == current.completed_objects
+                                && completed_bytes == current.completed_bytes)
+                    }
+                    _ => false,
+                };
+                if current_is_terminal_replication(current.state)
+                    || state == ReplicationState::Published
+                    || state_is_stale
                 {
                     replayed = true;
                 } else {
+                    // Failed/Cancelled are explicit terminal transitions. They are accepted even
+                    // when the last progress counters were higher because the counters are only
+                    // informational and a failed transfer must not be resurrected by a replay.
                     placement
                         .transition_replication(ReplicationStateTransitionRequest {
                             tenant_id: tenant_id.clone(),
@@ -739,23 +1130,42 @@ impl ControlPlane {
                 state,
                 ..
             } => {
-                let checkpoint = ReplicationObjectRecord {
-                    tenant_id: tenant_id.clone(),
-                    replication_id,
-                    object_id,
-                    offset,
-                    state,
-                    retry_count: current.attempt,
-                    updated_at_unix_ms: now,
-                };
-                placement.upsert_replication_object(checkpoint).await?;
+                if current_is_terminal_replication(current.state) {
+                    replayed = true;
+                } else {
+                    let existing = placement
+                        .list_replication_objects(tenant_id, &replication_id)
+                        .await?
+                        .into_iter()
+                        .find(|checkpoint| checkpoint.object_id == object_id);
+                    let state_is_stale = existing.as_ref().is_some_and(|checkpoint| {
+                        offset < checkpoint.offset
+                            || replication_object_state_rank(state)
+                                < replication_object_state_rank(checkpoint.state)
+                            || (offset == checkpoint.offset && state == checkpoint.state)
+                    });
+                    if state_is_stale {
+                        replayed = true;
+                    } else {
+                        let checkpoint = ReplicationObjectRecord {
+                            tenant_id: tenant_id.clone(),
+                            replication_id,
+                            object_id,
+                            offset,
+                            state,
+                            retry_count: current.attempt,
+                            updated_at_unix_ms: now,
+                        };
+                        placement.upsert_replication_object(checkpoint).await?;
+                    }
+                }
             }
             ReplicationProgressReport::Published {
                 commit_id,
                 object_set_digest,
                 ..
             } => {
-                if current.state == ReplicationState::Published {
+                if current_is_terminal_replication(current.state) {
                     replayed = true;
                 } else {
                     let object_set = placement
@@ -3104,8 +3514,9 @@ fn validate_frozen_publication(
 #[cfg(test)]
 mod tests {
     use super::{
-        action_envelope, bounded_control_error_message, AGENT_JOB_ASSIGNMENT_ACTION,
-        CONTROL_ERROR_MESSAGE_LIMIT,
+        action_envelope, bounded_control_error_message,
+        reconnected_replication_report_matches_route, replication_delivery_can_wait_for_next_tick,
+        ReplicationRouteGenerations, AGENT_JOB_ASSIGNMENT_ACTION, CONTROL_ERROR_MESSAGE_LIMIT,
     };
     use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
     use neoengram_domain::protocol::{
@@ -3117,9 +3528,75 @@ mod tests {
     };
 
     use crate::{
-        CancelReplicationRequest, InMemoryComponents, PlacementRepository, ReplicationObjectRecord,
-        ReplicationRecord,
+        CancelReplicationRequest, CentralError, CentralErrorCode, InMemoryComponents,
+        PlacementRepository, ReplicationObjectRecord, ReplicationRecord,
     };
+
+    #[test]
+    fn only_temporary_replication_delivery_errors_leave_the_message_batch_usable() {
+        for code in [
+            CentralErrorCode::GatewayRouteUnavailable,
+            CentralErrorCode::ConcurrentUpdate,
+        ] {
+            assert!(replication_delivery_can_wait_for_next_tick(
+                &CentralError::new(code, "temporary delivery race")
+            ));
+        }
+        assert!(replication_delivery_can_wait_for_next_tick(
+            &CentralError::new(CentralErrorCode::ConcurrentUpdate, "SQLite route CAS lost")
+                .with_retryable(false)
+        ));
+        for code in [
+            CentralErrorCode::ProtocolInvalid,
+            CentralErrorCode::InvalidState,
+            CentralErrorCode::StorageFailure,
+            CentralErrorCode::Internal,
+        ] {
+            assert!(!replication_delivery_can_wait_for_next_tick(
+                &CentralError::new(code, "delivery must fail closed")
+            ));
+        }
+    }
+
+    #[test]
+    fn reconnected_replication_report_accepts_only_an_advanced_live_route() {
+        let stored_session = SessionGeneration::new(4);
+        let stored_mount = MountGeneration::new(2);
+        let stored_route = RouteGeneration::new(7);
+        assert!(reconnected_replication_report_matches_route(
+            stored_session,
+            stored_mount,
+            stored_route,
+            SessionGeneration::new(5),
+            ReplicationRouteGenerations {
+                session: SessionGeneration::new(5),
+                mount: stored_mount,
+                route: RouteGeneration::new(8),
+            },
+        ));
+        assert!(!reconnected_replication_report_matches_route(
+            stored_session,
+            stored_mount,
+            stored_route,
+            SessionGeneration::new(5),
+            ReplicationRouteGenerations {
+                session: SessionGeneration::new(5),
+                mount: MountGeneration::new(3),
+                route: RouteGeneration::new(8),
+            },
+        ));
+        assert!(!reconnected_replication_report_matches_route(
+            stored_session,
+            stored_mount,
+            stored_route,
+            SessionGeneration::new(5),
+            ReplicationRouteGenerations {
+                session: SessionGeneration::new(5),
+                mount: stored_mount,
+                route: RouteGeneration::new(6),
+            },
+        ));
+    }
 
     struct ReplicationFixture {
         tenant_id: TenantId,
@@ -3263,6 +3740,91 @@ mod tests {
         assert_eq!(
             envelope.header.session_generation,
             Some(SessionGeneration::new(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_replication_report_is_acked_without_mutating_current_attempt() {
+        let components = InMemoryComponents::new(30);
+        let mut fixture = replication_fixture(ReplicationState::Queued, false);
+        fixture.replication.attempt = 2;
+        components
+            .placement
+            .insert_replication(fixture.replication.clone())
+            .await
+            .unwrap();
+        let control = components.control_plane();
+
+        let result = control
+            .receive_replication_report(
+                &fixture.tenant_id,
+                &fixture.target_agent_id,
+                SessionGeneration::new(8),
+                ReplicationProgressReport::State {
+                    replication_id: fixture.replication.replication_id.clone(),
+                    tenant_id: fixture.tenant_id.clone(),
+                    attempt: 1,
+                    state: ReplicationState::Failed,
+                    completed_objects: 0,
+                    completed_bytes: 0,
+                    issue_code: Some("OLD_ATTEMPT_FAILED".to_owned()),
+                    issue_message: Some("durable report from the previous attempt".to_owned()),
+                    extensions: Extensions::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(result.replayed);
+        assert_eq!(
+            components
+                .placement
+                .get_replication(&fixture.tenant_id, &fixture.replication.replication_id)
+                .await
+                .unwrap(),
+            Some(fixture.replication)
+        );
+    }
+
+    #[tokio::test]
+    async fn future_replication_report_attempt_remains_fail_closed() {
+        let components = InMemoryComponents::new(30);
+        let fixture = replication_fixture(ReplicationState::Queued, false);
+        components
+            .placement
+            .insert_replication(fixture.replication.clone())
+            .await
+            .unwrap();
+        let control = components.control_plane();
+
+        let error = control
+            .receive_replication_report(
+                &fixture.tenant_id,
+                &fixture.target_agent_id,
+                SessionGeneration::new(8),
+                ReplicationProgressReport::State {
+                    replication_id: fixture.replication.replication_id.clone(),
+                    tenant_id: fixture.tenant_id.clone(),
+                    attempt: 2,
+                    state: ReplicationState::Transferring,
+                    completed_objects: 0,
+                    completed_bytes: 0,
+                    issue_code: None,
+                    issue_message: None,
+                    extensions: Extensions::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), CentralErrorCode::ConcurrentUpdate);
+        assert_eq!(
+            components
+                .placement
+                .get_replication(&fixture.tenant_id, &fixture.replication.replication_id)
+                .await
+                .unwrap(),
+            Some(fixture.replication)
         );
     }
 

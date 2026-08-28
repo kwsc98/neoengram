@@ -8,7 +8,7 @@ use neoengram_domain::protocol::{
     RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, TransferId, TransferRouteId,
     UnixMillis, WorkspaceId, WorkspaceLifecycle,
 };
-use sqlx::{sqlite::SqliteRow, Row};
+use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 
 use super::authority::{
     decode, digest_from_blob, encode, storage_corruption, storage_error, SqliteAuthorityStore,
@@ -18,8 +18,9 @@ use crate::{
     validate_replication_publication, validate_replication_record, CancelReplicationRequest,
     CentralError, CentralErrorCode, CentralResult, CommitAvailabilityRecord,
     FinalizeReplicationRequest, FinalizeReplicationResult, PlacementRepository,
-    ReplicationObjectRecord, ReplicationRecord, ReplicationStateTransitionRequest,
-    RetryReplicationRequest, RetryReplicationResult, WorkspaceRecord,
+    RefreshReplicationRoutesRequest, ReplicationObjectRecord, ReplicationRecord,
+    ReplicationRouteBinding, ReplicationStateTransitionRequest, RetryReplicationRequest,
+    RetryReplicationResult, WorkspaceRecord,
 };
 
 fn as_i64(value: UnixMillis) -> CentralResult<i64> {
@@ -696,6 +697,144 @@ const REPLICATION_COLUMNS: &str = "tenant_id, replication_id, commit_id, target_
       AND a.replication_id = replications.replication_id) AS artifact_id";
 const WORKSPACE_COLUMNS: &str = "tenant_id, workspace_id, request_id, project_id, artifact_id, \
     base_commit_id, target_storage_volume_id, lifecycle, created_at_unix_ms, updated_at_unix_ms";
+
+fn route_binding_matches_record(
+    record: &ReplicationRecord,
+    binding: &ReplicationRouteBinding,
+    source: bool,
+) -> bool {
+    if source {
+        record.source_edge_cluster_id.as_ref() == Some(&binding.edge_cluster_id)
+            && record.source_gateway_pool_id.as_ref() == Some(&binding.gateway_pool_id)
+            && record.source_agent_id.as_ref() == Some(&binding.agent_id)
+            && record.source_session_generation == Some(binding.session_generation)
+            && record.source_mount_generation == Some(binding.mount_generation)
+            && record.source_route_generation == Some(binding.route_generation)
+    } else {
+        record.target_edge_cluster_id.as_ref() == Some(&binding.edge_cluster_id)
+            && record.target_gateway_pool_id.as_ref() == Some(&binding.gateway_pool_id)
+            && record.target_agent_id.as_ref() == Some(&binding.agent_id)
+            && record.target_session_generation == Some(binding.session_generation)
+            && record.target_mount_generation == Some(binding.mount_generation)
+            && record.target_route_generation == Some(binding.route_generation)
+    }
+}
+
+async fn refresh_replication_routes_cas(
+    pool: &SqlitePool,
+    request: &RefreshReplicationRoutesRequest,
+    expected_updated_at_unix_ms: UnixMillis,
+) -> CentralResult<u64> {
+    let result = sqlx::query(
+        "UPDATE replications SET source_edge_cluster_id = ?, source_gateway_pool_id = ?, \
+         source_session_generation = ?, source_mount_generation = ?, source_route_generation = ?, \
+         target_edge_cluster_id = ?, target_gateway_pool_id = ?, target_session_generation = ?, \
+         target_mount_generation = ?, target_route_generation = ?, updated_at_unix_ms = ? \
+         WHERE tenant_id = ? AND replication_id = ? AND attempt = ? \
+         AND source_edge_cluster_id = ? AND source_gateway_pool_id = ? AND source_agent_id = ? \
+         AND source_session_generation = ? AND source_mount_generation = ? AND source_route_generation = ? \
+         AND target_edge_cluster_id = ? AND target_gateway_pool_id = ? AND target_agent_id = ? \
+         AND target_session_generation = ? AND target_mount_generation = ? AND target_route_generation = ? \
+         AND updated_at_unix_ms = ? \
+         AND state IN ('queued', 'planning', 'transferring', 'verifying')",
+    )
+    .bind(request.source.edge_cluster_id.as_str())
+    .bind(request.source.gateway_pool_id.as_str())
+    .bind(i64::try_from(request.source.session_generation.get()).map_err(|_| {
+        protocol_invalid("source session generation exceeds SQLite range")
+    })?)
+    .bind(i64::try_from(request.source.mount_generation.get()).map_err(|_| {
+        protocol_invalid("source mount generation exceeds SQLite range")
+    })?)
+    .bind(i64::try_from(request.source.route_generation.get()).map_err(|_| {
+        protocol_invalid("source route generation exceeds SQLite range")
+    })?)
+    .bind(request.target.edge_cluster_id.as_str())
+    .bind(request.target.gateway_pool_id.as_str())
+    .bind(i64::try_from(request.target.session_generation.get()).map_err(|_| {
+        protocol_invalid("target session generation exceeds SQLite range")
+    })?)
+    .bind(i64::try_from(request.target.mount_generation.get()).map_err(|_| {
+        protocol_invalid("target mount generation exceeds SQLite range")
+    })?)
+    .bind(i64::try_from(request.target.route_generation.get()).map_err(|_| {
+        protocol_invalid("target route generation exceeds SQLite range")
+    })?)
+    .bind(as_i64(request.updated_at_unix_ms)?)
+    .bind(request.tenant_id.as_str())
+    .bind(request.replication_id.as_str())
+    .bind(i64::try_from(request.expected_attempt).map_err(|_| {
+        protocol_invalid("replication attempt exceeds SQLite range")
+    })?)
+    .bind(request.expected_source.edge_cluster_id.as_str())
+    .bind(request.expected_source.gateway_pool_id.as_str())
+    .bind(request.expected_source.agent_id.as_str())
+    .bind(
+        i64::try_from(request.expected_source.session_generation.get()).map_err(|_| {
+            protocol_invalid("source session generation exceeds SQLite range")
+        })?,
+    )
+    .bind(
+        i64::try_from(request.expected_source.mount_generation.get()).map_err(|_| {
+            protocol_invalid("source mount generation exceeds SQLite range")
+        })?,
+    )
+    .bind(
+        i64::try_from(request.expected_source.route_generation.get()).map_err(|_| {
+            protocol_invalid("source route generation exceeds SQLite range")
+        })?,
+    )
+    .bind(request.expected_target.edge_cluster_id.as_str())
+    .bind(request.expected_target.gateway_pool_id.as_str())
+    .bind(request.expected_target.agent_id.as_str())
+    .bind(
+        i64::try_from(request.expected_target.session_generation.get()).map_err(|_| {
+            protocol_invalid("target session generation exceeds SQLite range")
+        })?,
+    )
+    .bind(
+        i64::try_from(request.expected_target.mount_generation.get()).map_err(|_| {
+            protocol_invalid("target mount generation exceeds SQLite range")
+        })?,
+    )
+    .bind(
+        i64::try_from(request.expected_target.route_generation.get()).map_err(|_| {
+            protocol_invalid("target route generation exceeds SQLite range")
+        })?,
+    )
+    .bind(as_i64(expected_updated_at_unix_ms)?)
+    .execute(pool)
+    .await
+    .map_err(storage_error)?;
+    Ok(result.rows_affected())
+}
+
+async fn cancel_replication_cas(
+    pool: &SqlitePool,
+    request: &CancelReplicationRequest,
+    expected_updated_at_unix_ms: UnixMillis,
+) -> CentralResult<u64> {
+    let result = sqlx::query(
+        "UPDATE replications SET state = 'cancelled', error_code = ?, error_message = ?, \
+         updated_at_unix_ms = ? WHERE tenant_id = ? AND replication_id = ? AND attempt = ? \
+         AND updated_at_unix_ms = ? \
+         AND state NOT IN ('published', 'failed', 'cancelled')",
+    )
+    .bind("REPLICATION_CANCELLED")
+    .bind("replication was cancelled by the caller")
+    .bind(as_i64(request.updated_at_unix_ms)?)
+    .bind(request.tenant_id.as_str())
+    .bind(request.replication_id.as_str())
+    .bind(
+        i64::try_from(request.expected_attempt)
+            .map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?,
+    )
+    .bind(as_i64(expected_updated_at_unix_ms)?)
+    .execute(pool)
+    .await
+    .map_err(storage_error)?;
+    Ok(result.rows_affected())
+}
 
 fn decode_replication_object(row: &SqliteRow) -> CentralResult<ReplicationObjectRecord> {
     Ok(ReplicationObjectRecord {
@@ -1701,6 +1840,106 @@ impl PlacementRepository for SqliteAuthorityStore {
         rows.iter().map(decode_replication).collect()
     }
 
+    async fn refresh_replication_routes(
+        &self,
+        request: RefreshReplicationRoutesRequest,
+    ) -> CentralResult<ReplicationRecord> {
+        let current = self
+            .get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "replication does not exist",
+                )
+                .with_retryable(false)
+            })?;
+        if current.attempt != request.expected_attempt {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication attempt changed concurrently",
+            )
+            .with_retryable(false));
+        }
+        if !matches!(
+            current.state,
+            ReplicationState::Queued
+                | ReplicationState::Planning
+                | ReplicationState::Transferring
+                | ReplicationState::Verifying
+        ) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "terminal replication cannot refresh its route",
+            )
+            .with_retryable(false));
+        }
+        if !route_binding_matches_record(&current, &request.expected_source, true)
+            || !route_binding_matches_record(&current, &request.expected_target, false)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication route changed concurrently",
+            )
+            .with_retryable(false));
+        }
+        if request.source.session_generation.get() == 0
+            || request.source.mount_generation.get() == 0
+            || request.source.route_generation.get() == 0
+            || request.target.session_generation.get() == 0
+            || request.target.mount_generation.get() == 0
+            || request.target.route_generation.get() == 0
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "replication route generations must be positive",
+            )
+            .with_retryable(false));
+        }
+        if request.source.agent_id != request.expected_source.agent_id
+            || request.target.agent_id != request.expected_target.agent_id
+            || request.source.edge_cluster_id != request.expected_source.edge_cluster_id
+            || request.target.edge_cluster_id != request.expected_target.edge_cluster_id
+            || request.source.gateway_pool_id != request.expected_source.gateway_pool_id
+            || request.target.gateway_pool_id != request.expected_target.gateway_pool_id
+            || request.source.mount_generation != request.expected_source.mount_generation
+            || request.target.mount_generation != request.expected_target.mount_generation
+            || request.source.session_generation.get()
+                < request.expected_source.session_generation.get()
+            || request.target.session_generation.get()
+                < request.expected_target.session_generation.get()
+            || request.source.route_generation.get()
+                < request.expected_source.route_generation.get()
+            || request.target.route_generation.get()
+                < request.expected_target.route_generation.get()
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::AssignmentMismatch,
+                "replication route refresh cannot change Agent or mount identity",
+            )
+            .with_retryable(false));
+        }
+        if request.updated_at_unix_ms < current.updated_at_unix_ms {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication timestamp cannot move backwards",
+            )
+            .with_retryable(false));
+        }
+        if refresh_replication_routes_cas(&self.pool, &request, current.updated_at_unix_ms).await?
+            != 1
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replication route changed before it could be refreshed",
+            )
+            .with_retryable(false));
+        }
+        self.get_replication(&request.tenant_id, &request.replication_id)
+            .await?
+            .ok_or_else(|| storage_corruption("refreshed replication disappeared"))
+    }
+
     async fn insert_replication(
         &self,
         record: ReplicationRecord,
@@ -2218,24 +2457,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             )
             .with_retryable(false));
         }
-        let result = sqlx::query(
-            "UPDATE replications SET state = 'cancelled', error_code = ?, error_message = ?, \
-             updated_at_unix_ms = ? WHERE tenant_id = ? AND replication_id = ? AND attempt = ? \
-             AND state NOT IN ('published', 'failed', 'cancelled')",
-        )
-        .bind("REPLICATION_CANCELLED")
-        .bind("replication was cancelled by the caller")
-        .bind(as_i64(request.updated_at_unix_ms)?)
-        .bind(request.tenant_id.as_str())
-        .bind(request.replication_id.as_str())
-        .bind(
-            i64::try_from(request.expected_attempt)
-                .map_err(|_| protocol_invalid("replication attempt exceeds SQLite range"))?,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
-        if result.rows_affected() != 1 {
+        if cancel_replication_cas(&self.pool, &request, current.updated_at_unix_ms).await? != 1 {
             return Err(CentralError::new(
                 CentralErrorCode::ConcurrentUpdate,
                 "replication changed before cancellation could be persisted",
@@ -2891,6 +3113,7 @@ fn is_unique(error: &sqlx::Error) -> bool {
 mod tests {
     use super::*;
     use crate::{open_sqlite_authority, SqliteAuthorityConfig};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -3021,6 +3244,190 @@ mod tests {
             vec![replication_object]
         );
         reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn route_refresh_and_cancel_cas_reject_stale_reads_in_both_directions() {
+        let directory = TempDir::new().unwrap();
+        let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+            .await
+            .unwrap();
+        let store = authority.authority_store().placement().unwrap();
+        let tenant_id = TenantId::new("tenant-route-cancel-race").unwrap();
+        let now = UnixMillis::new(10);
+        let old_source = ReplicationRouteBinding {
+            edge_cluster_id: EdgeClusterId::new("edge-source-race").unwrap(),
+            gateway_pool_id: GatewayPoolId::new("pool-source-race").unwrap(),
+            agent_id: AgentId::new("agent-source-race").unwrap(),
+            session_generation: SessionGeneration::new(1),
+            mount_generation: MountGeneration::new(2),
+            route_generation: RouteGeneration::new(3),
+        };
+        let old_target = ReplicationRouteBinding {
+            edge_cluster_id: EdgeClusterId::new("edge-target-race").unwrap(),
+            gateway_pool_id: GatewayPoolId::new("pool-target-race").unwrap(),
+            agent_id: AgentId::new("agent-target-race").unwrap(),
+            session_generation: SessionGeneration::new(1),
+            mount_generation: MountGeneration::new(2),
+            route_generation: RouteGeneration::new(4),
+        };
+        let record = ReplicationRecord {
+            tenant_id: tenant_id.clone(),
+            replication_id: ReplicationId::new("replication-route-cancel-race").unwrap(),
+            artifact_id: Some(ArtifactId::new("artifact-route-cancel-race").unwrap()),
+            commit_id: ContentDigest::from_bytes([0x57; 32]),
+            target_backend_id: "backend-target-race".to_owned(),
+            target_storage_volume_id: StorageVolumeId::new("volume-target-race").unwrap(),
+            source_placement_set_id: Some(PlacementSetId::new("placement-source-race").unwrap()),
+            source_backend_id: Some(BackendId::new("backend-source-race").unwrap()),
+            source_storage_volume_id: Some(StorageVolumeId::new("volume-source-race").unwrap()),
+            source_edge_cluster_id: Some(old_source.edge_cluster_id.clone()),
+            source_gateway_pool_id: Some(old_source.gateway_pool_id.clone()),
+            source_placement_generation: Some(PlacementGeneration::new(1)),
+            source_agent_id: Some(old_source.agent_id.clone()),
+            source_session_generation: Some(old_source.session_generation),
+            source_mount_generation: Some(old_source.mount_generation),
+            source_route_generation: Some(old_source.route_generation),
+            target_edge_cluster_id: Some(old_target.edge_cluster_id.clone()),
+            target_gateway_pool_id: Some(old_target.gateway_pool_id.clone()),
+            target_placement_generation: Some(PlacementGeneration::new(1)),
+            target_agent_id: Some(old_target.agent_id.clone()),
+            target_session_generation: Some(old_target.session_generation),
+            target_mount_generation: Some(old_target.mount_generation),
+            target_route_generation: Some(old_target.route_generation),
+            transfer_route_id: None,
+            transfer_id: None,
+            target_placement_set_id: None,
+            staging_id: None,
+            object_set_digest: ContentDigest::from_bytes([0x58; 32]),
+            state: ReplicationState::Transferring,
+            request_id: RequestId::new("request-route-cancel-race").unwrap(),
+            attempt: 1,
+            completed_objects: 0,
+            total_objects: 1,
+            completed_bytes: 0,
+            total_bytes: 1,
+            issue_code: None,
+            issue_message: None,
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+        };
+        store.insert_replication(record.clone()).await.unwrap();
+
+        // Both operations below begin from this same stale record snapshot.
+        let stale_updated_at = store
+            .get_replication(&tenant_id, &record.replication_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at_unix_ms;
+        let new_source = ReplicationRouteBinding {
+            session_generation: SessionGeneration::new(5),
+            route_generation: RouteGeneration::new(6),
+            ..old_source.clone()
+        };
+        let new_target = ReplicationRouteBinding {
+            session_generation: SessionGeneration::new(7),
+            route_generation: RouteGeneration::new(8),
+            ..old_target.clone()
+        };
+        let request = RefreshReplicationRoutesRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: record.replication_id.clone(),
+            expected_attempt: 1,
+            expected_source: old_source.clone(),
+            expected_target: old_target.clone(),
+            source: new_source.clone(),
+            target: new_target.clone(),
+            updated_at_unix_ms: UnixMillis::new(20),
+        };
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new().filename(directory.path().join("authority.sqlite3")),
+            )
+            .await
+            .unwrap();
+        let affected = refresh_replication_routes_cas(&pool, &request, stale_updated_at)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        // A cancellation that read the old timestamp must not overwrite the newer route refresh
+        // with an older timestamp while the attempt and active state still happen to match.
+        let stale_cancel = CancelReplicationRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: record.replication_id.clone(),
+            expected_attempt: 1,
+            updated_at_unix_ms: UnixMillis::new(15),
+        };
+        assert_eq!(
+            cancel_replication_cas(&pool, &stale_cancel, stale_updated_at)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let refreshed = store
+            .get_replication(&tenant_id, &record.replication_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.state, ReplicationState::Transferring);
+        assert_eq!(refreshed.updated_at_unix_ms, UnixMillis::new(20));
+        assert_eq!(
+            refreshed.source_session_generation,
+            Some(new_source.session_generation)
+        );
+        assert_eq!(
+            refreshed.target_session_generation,
+            Some(new_target.session_generation)
+        );
+
+        // Conversely, a route refresh that read the active row cannot write after cancellation,
+        // even when both mutations use the same millisecond timestamp.
+        store
+            .cancel_replication(CancelReplicationRequest {
+                tenant_id: tenant_id.clone(),
+                replication_id: record.replication_id.clone(),
+                expected_attempt: 1,
+                updated_at_unix_ms: UnixMillis::new(20),
+            })
+            .await
+            .unwrap();
+        let post_cancel_refresh = RefreshReplicationRoutesRequest {
+            tenant_id: tenant_id.clone(),
+            replication_id: record.replication_id.clone(),
+            expected_attempt: 1,
+            expected_source: new_source.clone(),
+            expected_target: new_target.clone(),
+            source: ReplicationRouteBinding {
+                session_generation: SessionGeneration::new(9),
+                route_generation: RouteGeneration::new(10),
+                ..new_source
+            },
+            target: ReplicationRouteBinding {
+                session_generation: SessionGeneration::new(11),
+                route_generation: RouteGeneration::new(12),
+                ..new_target
+            },
+            updated_at_unix_ms: UnixMillis::new(20),
+        };
+        assert_eq!(
+            refresh_replication_routes_cas(&pool, &post_cancel_refresh, UnixMillis::new(20))
+                .await
+                .unwrap(),
+            0
+        );
+        let cancelled = store
+            .get_replication(&tenant_id, &record.replication_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, ReplicationState::Cancelled);
+        assert_eq!(cancelled.updated_at_unix_ms, UnixMillis::new(20));
+        pool.close().await;
+        authority.close().await;
     }
 
     #[tokio::test]

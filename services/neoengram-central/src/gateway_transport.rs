@@ -8,9 +8,10 @@ use std::{
 };
 
 use crate::{
-    AgentRouteLease, CentralError, CentralErrorCode, Clock, GatewayCredentialState,
-    GatewayPoolState, GatewayRegistryRepository, GatewayReplicaListRequest, GatewayReplicaState,
-    ReleaseAgentRouteLeaseRequest, RenewAgentRouteLeaseRequest, GATEWAY_REGISTRY_MAX_PAGE_SIZE,
+    AgentRouteLease, AgentRouteLeaseListRequest, CentralError, CentralErrorCode, Clock,
+    GatewayCredentialState, GatewayPoolState, GatewayRegistryRepository, GatewayReplicaListRequest,
+    GatewayReplicaState, ReleaseAgentRouteLeaseRequest, RenewAgentRouteLeaseRequest,
+    GATEWAY_REGISTRY_MAX_PAGE_SIZE,
 };
 use bytes::Bytes;
 use neoengram_domain::protocol::{
@@ -27,7 +28,7 @@ use neoengram_domain::protocol::{
 use serde::Serialize;
 use tokio::{
     sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock as AsyncRwLock},
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 
 use crate::agent_transport::{
@@ -42,6 +43,11 @@ const MAX_ACTIVE_AGENT_REQUESTS: usize = 256;
 const MAX_LATE_PEER_FORWARDS: usize = 1_024;
 const CONTROL_RESPONSE_DEADLINE_MS: u64 = 10_000;
 const LATE_PEER_FORWARD_RETENTION_MS: u64 = CONTROL_RESPONSE_DEADLINE_MS * 2;
+// Disconnect cleanup is best effort. A stalled authority must not prevent a replacement Gateway
+// control session from being admitted; the route lease remains fenced by its exact generation and
+// expires through the normal short lease window if this cleanup cannot complete.
+const ROUTE_CLEANUP_RPC_TIMEOUT: Duration = Duration::from_secs(1);
+const ROUTE_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const JSON_CONTENT_TYPE: &str = "application/json";
 const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
 
@@ -263,8 +269,10 @@ impl CentralGatewayControl {
                 last_sequence: 1,
                 streams: BTreeMap::new(),
             }),
+            owned_routes: StdMutex::new(BTreeMap::new()),
             accept_gate: AsyncMutex::new(()),
             admission: AsyncRwLock::new(()),
+            cleanup_gate: StdMutex::new(()),
             unary_tasks: StdMutex::new(BTreeMap::new()),
             outbound: AsyncMutex::new(OutboundState {
                 next_sequence: 1,
@@ -273,6 +281,8 @@ impl CentralGatewayControl {
             pending_forwards: StdMutex::new(BTreeMap::new()),
             late_forwards: StdMutex::new(BTreeMap::new()),
             fenced: AtomicBool::new(false),
+            route_release: StdMutex::new(RouteReleaseState { tasks: Vec::new() }),
+            aborted_stream_tasks: StdMutex::new(Vec::new()),
             fence_signal: watch::channel(false).0,
             peer_directory_generation: AtomicU64::new(1),
         });
@@ -508,13 +518,30 @@ pub struct CentralGatewaySession {
     // frame dispatch against replacement fencing. Synchronous draining keeps the connector's Drop
     // guard abort-safe during task cancellation.
     inbound: StdMutex<InboundState>,
+    /// Central route leases outlive the H2 stream worker that acquired them. Keep ownership
+    /// independently of `inbound.streams` so a worker that exits after its final outbound frame
+    /// cannot make a later disconnect forget the lease. Entries are reserved when the stream is
+    /// admitted, then filled with the authoritative lease once the atomic session/route open
+    /// commits; the reservation closes the fence-vs-acquire race during task cancellation.
+    owned_routes: StdMutex<BTreeMap<GatewayConnectionId, OwnedAgentRoute>>,
     accept_gate: AsyncMutex<()>,
     admission: AsyncRwLock<()>,
+    /// Linearizes stream-worker exit cleanup with replacement fencing. A worker removes its
+    /// inbound entry before scheduling the durable route release; keeping both operations under
+    /// this gate prevents a replacement from observing the gap between them.
+    cleanup_gate: StdMutex<()>,
     unary_tasks: StdMutex<BTreeMap<GatewayConnectionId, tokio::task::AbortHandle>>,
     outbound: AsyncMutex<OutboundState>,
     pending_forwards: StdMutex<BTreeMap<RequestId, PendingForward>>,
     late_forwards: StdMutex<BTreeMap<RequestId, LatePeerForward>>,
     fenced: AtomicBool,
+    /// Serializes disconnected-route cleanup tasks with replacement fencing. The replacement
+    /// boundary must observe every task scheduled by an exiting stream worker.
+    route_release: StdMutex<RouteReleaseState>,
+    /// Stream workers are spawned independently from the H2 frame reader. Keep their join
+    /// handles after fencing aborts them so replacement admission can wait for each worker's
+    /// `Drop` guard and its exact route-release task to finish.
+    aborted_stream_tasks: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
     fence_signal: watch::Sender<bool>,
     /// Monotonic version for peer-directory snapshots on this control session.
     peer_directory_generation: AtomicU64,
@@ -543,7 +570,11 @@ struct InboundState {
 struct InboundStream {
     request_id: RequestId,
     writer: AgentControlInputWriter,
-    task: tokio::task::AbortHandle,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct OwnedAgentRoute {
+    request_id: RequestId,
 }
 
 /// Removes a stream directory entry when its worker exits for any reason, including a rejected
@@ -557,6 +588,11 @@ struct AgentStreamCleanup {
 
 impl Drop for AgentStreamCleanup {
     fn drop(&mut self) {
+        let _cleanup_gate = self
+            .session
+            .cleanup_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut inbound = self
             .session
             .inbound
@@ -569,12 +605,40 @@ impl Drop for AgentStreamCleanup {
         {
             inbound.streams.remove(&self.stream_id);
         }
+        // The worker can exit after Central has acquired the durable route but before Gateway
+        // receives a grant or can emit its normal RouteRelease.  Schedule an exact, idempotent
+        // authority cleanup from Drop so an individual stream failure does not pin the Agent
+        // route until the lease TTL.  The release helper re-reads the route generation before
+        // mutating it, so a replacement owner is never touched by this stale cleanup.
+        drop(inbound);
+        let owner = RouteOwner {
+            stream_id: self.stream_id.clone(),
+            request_id: self.request_id.clone(),
+        };
+        // Always schedule the exact cleanup, even when a synchronous session fence already
+        // drained the ownership reservation. The worker may have committed the route after that
+        // fence's local scan but before its cancellation was observed; the request/stream binding
+        // below makes this late release harmless when a replacement owner has taken over.
+        self.session.take_owned_route(&owner);
+        self.session.schedule_route_release(vec![owner]);
     }
 }
 
 struct OutboundState {
     next_sequence: u64,
     sender: mpsc::Sender<GatewayControlFrame>,
+}
+
+struct RouteReleaseState {
+    /// Every cleanup request owns a task handle. Individual Agent stream workers can exit
+    /// independently, so a one-shot session-wide marker would lose later route IDs. Duplicate
+    /// releases are harmless because the authority mutation is bound to the exact route fence.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+struct RouteOwner {
+    stream_id: GatewayConnectionId,
+    request_id: RequestId,
 }
 
 impl CentralGatewaySession {
@@ -718,19 +782,111 @@ impl CentralGatewaySession {
 
     pub(crate) fn close(&self) {
         self.fence_local_state();
+        // `close` is also used by the connector's synchronous Drop guard. Start the exact route
+        // cleanup here so a normal H2 EOF does not rely on a later replacement connection to
+        // release its Agent leases. `fence_and_wait` will adopt and await these same handles when
+        // a replacement arrives.
+        self.schedule_all_route_releases();
     }
 
     /// Fences this session and waits for every already-admitted Central frame to finish. This is
     /// used when a replacement connection is installed; the synchronous local marker remains
     /// available for error paths and Drop guards that cannot await.
     async fn fence_and_wait(&self) {
+        // One deadline covers admission, worker joins, and authority cleanup. A worker retained
+        // after a normal AgentStreamEnd is not necessarily finished; waiting on it without this
+        // bound would make a replacement connection depend on an untrusted Agent handler.
+        let cleanup_deadline = tokio::time::Instant::now() + ROUTE_CLEANUP_WAIT_TIMEOUT;
         self.fenced.store(true, Ordering::Release);
         // Abort background stream/unary tasks before waiting for the write lease. An Agent stream
         // opener may be holding an admission read lease while it awaits its first upstream line;
         // draining first lets cancellation release that lease instead of making replacement wait
         // on an unbounded handler.
-        self.fence_local_state();
-        let _admission = self.admission.write().await;
+        self.fence_local_state_inner();
+        let admission = timeout_at(cleanup_deadline, self.admission.write())
+            .await
+            .ok();
+        // Wait for any worker Drop guard that is currently publishing its cleanup marker. The
+        // guard is synchronous and short-lived; taking this lock after admission guarantees a
+        // replacement cannot race the stream-table removal/release scheduling pair.
+        let _cleanup_gate = self
+            .cleanup_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Route acquisition is performed while holding an admission read lease.  Wait until all
+        // such work has drained before taking ownership of the pending cleanup scan; otherwise a
+        // route that commits just after the scan would remain pinned until its TTL.
+        let stream_tasks = self
+            .aborted_stream_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect::<Vec<_>>();
+        // `AgentStreamEnd` removes a stream from `inbound` before its worker necessarily exits,
+        // so those handles are already in the retained list rather than the map just drained by
+        // `fence_local_state_inner`. Abort every retained worker before joining it, including
+        // workers from a previous normal End path.
+        for stream_task in &stream_tasks {
+            stream_task.abort();
+        }
+        drop(_cleanup_gate);
+        drop(admission);
+        // Abort is cooperative at the Tokio task boundary. Await every worker before scanning
+        // the authoritative route table so a late `AgentStreamCleanup::Drop` cannot race a new
+        // connection's route acquisition.
+        for stream_task in stream_tasks {
+            if timeout_at(cleanup_deadline, stream_task).await.is_err() {
+                tracing::warn!(
+                    "disconnected Gateway stream cleanup exceeded its bounded wait; replacement admission will continue"
+                );
+                break;
+            }
+        }
+        self.schedule_all_route_releases();
+        // A worker may run its Drop guard while the aborts above are being observed. Drain all
+        // tasks that were already scheduled, then check once more for a late Drop-triggered task
+        // before returning the replacement admission boundary. Use one shared deadline so a
+        // broken authority cannot make replacement admission wait once per route.
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= cleanup_deadline {
+                self.route_release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .tasks
+                    .drain(..)
+                    .for_each(|task| task.abort());
+                tracing::warn!(
+                    "disconnected Gateway route cleanup exceeded its bounded wait; replacement admission will continue"
+                );
+                break;
+            }
+            let route_releases = self
+                .route_release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tasks
+                .drain(..)
+                .collect::<Vec<_>>();
+            if route_releases.is_empty() {
+                break;
+            }
+            for route_release in route_releases {
+                match timeout_at(cleanup_deadline, route_release).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::debug!(
+                        %error,
+                        "disconnected Gateway route cleanup task failed"
+                    ),
+                    Err(_) => {
+                        tracing::warn!(
+                            "disconnected Gateway route cleanup exceeded its bounded wait; replacement admission will continue"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     async fn check_current_replica(&self) -> Result<(), GatewaySessionError> {
@@ -773,6 +929,14 @@ impl CentralGatewaySession {
     }
 
     fn fence_local_state(&self) {
+        self.fence_local_state_inner();
+    }
+
+    fn fence_local_state_inner(&self) {
+        let _cleanup_gate = self
+            .cleanup_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let streams = {
             let mut inbound = self
                 .inbound
@@ -782,9 +946,21 @@ impl CentralGatewaySession {
             std::mem::take(&mut inbound.streams)
         };
         self.fence_signal.send_replace(true);
+        let mut aborted_stream_tasks = self
+            .aborted_stream_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for stream in streams.into_values() {
             stream.task.abort();
+            aborted_stream_tasks.push(stream.task);
         }
+        // A stream may already have received AgentStreamEnd and therefore be retained only in
+        // this join-handle list. Fence those workers as well before waiting for the admission
+        // writer; otherwise one such worker could keep a read lease until its handler returns.
+        for task in aborted_stream_tasks.iter() {
+            task.abort();
+        }
+        drop(aborted_stream_tasks);
         let unary_tasks = {
             let mut unary_tasks = self
                 .unary_tasks
@@ -807,6 +983,107 @@ impl CentralGatewaySession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+    }
+
+    /// Releases route leases owned by streams on this fenced control session. The route table is
+    /// authoritative and outlives the H2 socket, so merely clearing the in-memory stream map
+    /// would force a reconnect to wait for the full lease TTL. Each release is bound to the old
+    /// stream ID and route generation; if a replacement session won the route first, Central
+    /// rejects this stale release without touching the replacement lease.
+    fn schedule_all_route_releases(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // All production fencing occurs on a Tokio task. Keep the synchronous fence path
+            // usable for embedded callers that construct a session outside a runtime.
+            tracing::debug!("skipping disconnected Gateway route release without a Tokio runtime");
+            return;
+        };
+        let owners = {
+            let mut owned_routes = self
+                .owned_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *owned_routes)
+                .into_iter()
+                .map(|(stream_id, owned)| RouteOwner {
+                    stream_id,
+                    request_id: owned.request_id,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut route_release = self
+            .route_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.spawn_route_release_tasks(&mut route_release, handle, owners);
+    }
+
+    fn register_owned_route(&self, stream_id: GatewayConnectionId, request_id: RequestId) {
+        self.owned_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(stream_id, OwnedAgentRoute { request_id });
+    }
+
+    fn track_stream_task(&self, task: tokio::task::JoinHandle<()>) {
+        let mut tasks = self
+            .aborted_stream_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Completed workers have already run their Drop cleanup. Reaping them before retaining
+        // the next handle keeps a long-lived Gateway session from accumulating one handle per
+        // short-lived Agent stream while still preserving unfinished workers for replacement
+        // fencing.
+        tasks.retain(|task| !task.is_finished());
+        if !task.is_finished() {
+            tasks.push(task);
+        }
+    }
+
+    fn take_owned_route(&self, owner: &RouteOwner) -> bool {
+        let mut routes = self
+            .owned_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        routes
+            .get(&owner.stream_id)
+            .is_some_and(|route| route.request_id == owner.request_id)
+            .then(|| routes.remove(&owner.stream_id))
+            .flatten()
+            .is_some()
+    }
+
+    fn schedule_route_release(&self, owners: Vec<RouteOwner>) {
+        if owners.is_empty() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("skipping disconnected Gateway route release without a Tokio runtime");
+            return;
+        };
+        let mut route_release = self
+            .route_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.spawn_route_release_tasks(&mut route_release, handle, owners);
+    }
+
+    fn spawn_route_release_tasks(
+        &self,
+        route_release: &mut RouteReleaseState,
+        handle: tokio::runtime::Handle,
+        owners: Vec<RouteOwner>,
+    ) {
+        if owners.is_empty() {
+            return;
+        }
+        route_release.tasks.retain(|task| !task.is_finished());
+        let registry = Arc::clone(&self.registry);
+        let pool_id = self.identity.gateway_pool_id.clone();
+        let replica_id = self.identity.gateway_replica_id.clone();
+        let clock = Arc::clone(&self.clock);
+        route_release.tasks.push(handle.spawn(async move {
+            release_disconnected_gateway_routes(registry, clock, pool_id, replica_id, owners).await;
+        }));
     }
 
     async fn send_agent_route_fence(
@@ -1313,7 +1590,6 @@ impl CentralGatewaySession {
             }
         });
         let task_abort = task.abort_handle();
-        drop(task);
         let registration = {
             let mut tasks = self
                 .unary_tasks
@@ -1551,8 +1827,8 @@ impl CentralGatewaySession {
     ) {
         let (code, retryable, detail) = match error {
             GatewaySessionError::RouteUnavailable(_) => (
-                GatewayErrorCode::RouteFenced,
-                false,
+                GatewayErrorCode::RouteUnavailable,
+                true,
                 "Agent route ownership changed before route grant",
             ),
             GatewaySessionError::Registry(_) => (
@@ -1766,7 +2042,8 @@ impl CentralGatewaySession {
             }
         });
         let task_abort = task.abort_handle();
-        drop(task);
+        let mut task = Some(task);
+        let stream_id = open.stream_id.clone();
         let registration = {
             let mut inbound = self
                 .inbound
@@ -1777,12 +2054,14 @@ impl CentralGatewaySession {
             } else if inbound.streams.len() >= MAX_ACTIVE_AGENT_STREAMS {
                 Ok(true)
             } else {
-                match inbound.streams.entry(open.stream_id) {
+                match inbound.streams.entry(stream_id.clone()) {
                     Entry::Vacant(stream) => {
                         stream.insert(InboundStream {
                             request_id: request_id.clone(),
                             writer,
-                            task: task_abort.clone(),
+                            task: task
+                                .take()
+                                .expect("stream worker handle must be installed once"),
                         });
                         Ok(false)
                     }
@@ -1792,10 +2071,16 @@ impl CentralGatewaySession {
                 }
             }
         };
+        if matches!(registration, Ok(false)) {
+            self.register_owned_route(stream_id, request_id.clone());
+        }
         match registration {
             Ok(false) => start.send(()).map_err(|_| GatewaySessionError::Closed),
             Ok(true) => {
                 task_abort.abort();
+                if let Some(task) = task.take() {
+                    self.track_stream_task(task);
+                }
                 self.send(
                     request_id,
                     trace_id,
@@ -1807,6 +2092,9 @@ impl CentralGatewaySession {
             }
             Err(error) => {
                 task_abort.abort();
+                if let Some(task) = task.take() {
+                    self.track_stream_task(task);
+                }
                 Err(error)
             }
         }
@@ -1838,6 +2126,7 @@ impl CentralGatewaySession {
                 if let Some(stream) = stream {
                     stream.task.abort();
                     drop(stream.writer);
+                    self.track_stream_task(stream.task);
                 }
                 return Err(GatewaySessionError::Protocol(
                     "Gateway Agent stream request ID does not match its bound request",
@@ -1869,6 +2158,7 @@ impl CentralGatewaySession {
                     .remove(&data.stream_id);
                 if let Some(stream) = stream {
                     stream.task.abort();
+                    self.track_stream_task(stream.task);
                 }
                 self.send(
                     request_id,
@@ -1909,6 +2199,7 @@ impl CentralGatewaySession {
                 if let Some(stream) = stream {
                     stream.task.abort();
                     drop(stream.writer);
+                    self.track_stream_task(stream.task);
                 }
                 return Err(GatewaySessionError::Protocol(
                     "Gateway Agent stream request ID does not match its bound request",
@@ -1920,6 +2211,7 @@ impl CentralGatewaySession {
                 .expect("stream was present while holding the inbound lock")
         };
         drop(stream.writer);
+        self.track_stream_task(stream.task);
         Ok(())
     }
 
@@ -2107,6 +2399,118 @@ impl CentralGatewaySession {
     }
 }
 
+async fn release_disconnected_gateway_routes(
+    registry: Arc<dyn GatewayRegistryRepository>,
+    clock: Arc<dyn Clock>,
+    pool_id: GatewayPoolId,
+    replica_id: GatewayReplicaId,
+    owners: Vec<RouteOwner>,
+) {
+    let owners = owners
+        .into_iter()
+        .map(|owner| (owner.stream_id, owner.request_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut after = None;
+    loop {
+        let page = match timeout(
+            ROUTE_CLEANUP_RPC_TIMEOUT,
+            registry.list_agent_routes(&AgentRouteLeaseListRequest {
+                gateway_pool_id: pool_id.clone(),
+                gateway_replica_id: Some(replica_id.clone()),
+                active_at_unix_ms: None,
+                after: after.clone(),
+                limit: GATEWAY_REGISTRY_MAX_PAGE_SIZE,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    gateway_replica_id = %replica_id,
+                    %error,
+                    "failed to list Agent routes while fencing a disconnected Gateway"
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    gateway_replica_id = %replica_id,
+                    "timed out listing Agent routes while fencing a disconnected Gateway"
+                );
+                return;
+            }
+        };
+        let page_len = page.len();
+        for route in page.iter().filter(|route| {
+            route.gateway_pool_id == pool_id
+                && route.gateway_replica_id == replica_id
+                && owners
+                    .get(&route.connection_id)
+                    .is_some_and(|request_id| request_id == &route.acquire_request_id)
+        }) {
+            let released_at =
+                UnixMillis::new(clock.now().get().max(route.renewed_at_unix_ms.get()));
+            let Ok(request_id) = fresh_control_request_id("disconnect-route-release") else {
+                tracing::warn!(
+                    agent_id = %route.agent_id,
+                    "failed to allocate a disconnected Gateway route release identity"
+                );
+                continue;
+            };
+            match timeout(
+                ROUTE_CLEANUP_RPC_TIMEOUT,
+                registry.release_agent_route(ReleaseAgentRouteLeaseRequest {
+                    request_id,
+                    agent_id: route.agent_id.clone(),
+                    gateway_replica_id: route.gateway_replica_id.clone(),
+                    connection_id: route.connection_id.clone(),
+                    session_generation: route.session_generation,
+                    route_generation: route.route_generation,
+                    released_at_unix_ms: released_at,
+                }),
+            )
+            .await
+            {
+                Ok(Ok(_)) => tracing::debug!(
+                    agent_id = %route.agent_id,
+                    connection_id = %route.connection_id,
+                    "released Agent route owned by disconnected Gateway"
+                ),
+                Ok(Err(error)) => tracing::debug!(
+                    agent_id = %route.agent_id,
+                    connection_id = %route.connection_id,
+                    %error,
+                    "disconnected Gateway route release was superseded or unavailable"
+                ),
+                Err(_) => tracing::warn!(
+                    agent_id = %route.agent_id,
+                    connection_id = %route.connection_id,
+                    "timed out releasing Agent route owned by disconnected Gateway"
+                ),
+            }
+        }
+        if page_len < GATEWAY_REGISTRY_MAX_PAGE_SIZE {
+            return;
+        }
+        let Some(next_after) = page.last().map(|route| route.agent_id.clone()) else {
+            tracing::warn!(
+                gateway_replica_id = %replica_id,
+                "Gateway route listing returned a full page without a cursor"
+            );
+            return;
+        };
+        if after.as_ref() == Some(&next_after) {
+            tracing::warn!(
+                gateway_replica_id = %replica_id,
+                "Gateway route listing cursor did not advance during disconnect cleanup"
+            );
+            return;
+        }
+        after = Some(next_after);
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GatewaySessionError {
     #[error("Gateway protocol rejected: {0}")]
@@ -2171,17 +2575,22 @@ fn agent_error_response(
 }
 
 fn gateway_error(error: &AgentHttpError) -> GatewayControlError {
+    // HTTP 409 carries both ephemeral CAS contention and authoritative session fencing. Preserve
+    // the retry decision when adapting it to the stricter Gateway error classes so a reconnecting
+    // Agent retries only the former.
+    let code = match (error.status(), error.retryable()) {
+        (http::StatusCode::CONFLICT, true) => GatewayErrorCode::RouteUnavailable,
+        (http::StatusCode::CONFLICT, false) => GatewayErrorCode::RouteFenced,
+        (http::StatusCode::GATEWAY_TIMEOUT, _) => GatewayErrorCode::DeadlineExceeded,
+        (http::StatusCode::TOO_MANY_REQUESTS, _) => GatewayErrorCode::ResourceExhausted,
+        (http::StatusCode::SERVICE_UNAVAILABLE, _) => GatewayErrorCode::RouteUnavailable,
+        (status, _) if status.is_client_error() => GatewayErrorCode::ProtocolInvalid,
+        _ => GatewayErrorCode::Internal,
+    };
     GatewayControlError {
-        code: match error.status() {
-            http::StatusCode::CONFLICT => GatewayErrorCode::RouteFenced,
-            http::StatusCode::GATEWAY_TIMEOUT => GatewayErrorCode::DeadlineExceeded,
-            http::StatusCode::TOO_MANY_REQUESTS => GatewayErrorCode::ResourceExhausted,
-            http::StatusCode::SERVICE_UNAVAILABLE => GatewayErrorCode::RouteUnavailable,
-            _ if error.status().is_client_error() => GatewayErrorCode::ProtocolInvalid,
-            _ => GatewayErrorCode::Internal,
-        },
+        code,
         detail: error.detail().to_owned(),
-        retryable: error.retryable(),
+        retryable: error.retryable() && code.permits_retry(),
     }
 }
 
@@ -2218,6 +2627,7 @@ mod tests {
     struct ForwardAuthorityRegistry {
         state: Mutex<ForwardAuthorityState>,
         standalone_acquire_calls: AtomicUsize,
+        route_release_calls: AtomicUsize,
     }
 
     struct ForwardAuthorityState {
@@ -2256,11 +2666,16 @@ mod tests {
                     route: Some(route),
                 }),
                 standalone_acquire_calls: AtomicUsize::new(0),
+                route_release_calls: AtomicUsize::new(0),
             }
         }
 
         fn standalone_acquire_calls(&self) -> usize {
             self.standalone_acquire_calls.load(Ordering::SeqCst)
+        }
+
+        fn route_release_calls(&self) -> usize {
+            self.route_release_calls.load(Ordering::SeqCst)
         }
 
         fn route(&self) -> AgentRouteLease {
@@ -2425,9 +2840,21 @@ mod tests {
 
         async fn list_agent_routes(
             &self,
-            _request: &AgentRouteLeaseListRequest,
+            request: &AgentRouteLeaseListRequest,
         ) -> CentralResult<Vec<AgentRouteLease>> {
-            unreachable!("forwarding tests only use the authoritative Agent point read")
+            let route = self.route();
+            Ok((route.gateway_pool_id == request.gateway_pool_id
+                && request
+                    .gateway_replica_id
+                    .as_ref()
+                    .is_none_or(|replica| &route.gateway_replica_id == replica)
+                && request
+                    .after
+                    .as_ref()
+                    .is_none_or(|after| route.agent_id > *after))
+            .then_some(route)
+            .into_iter()
+            .collect())
         }
 
         async fn acquire_agent_route(
@@ -2476,6 +2903,7 @@ mod tests {
             &self,
             request: ReleaseAgentRouteLeaseRequest,
         ) -> CentralResult<AgentRouteLeaseMutationOutcome> {
+            self.route_release_calls.fetch_add(1, Ordering::SeqCst);
             let route = self.route();
             if route.agent_id != request.agent_id
                 || route.gateway_replica_id != request.gateway_replica_id
@@ -2511,6 +2939,55 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(body.to_vec())
         }
+    }
+
+    #[test]
+    fn gateway_error_distinguishes_retryable_and_fenced_conflicts() {
+        let route_race = AgentHttpError::new(
+            http::StatusCode::CONFLICT,
+            "AGENT_ACTION_CONFLICT",
+            "Agent action conflicts with authoritative state",
+            true,
+        );
+        let mapped = gateway_error(&route_race);
+        assert_eq!(mapped.code, GatewayErrorCode::RouteUnavailable);
+        assert!(mapped.retryable);
+        mapped.validate().unwrap();
+
+        let active_session = AgentHttpError::new(
+            http::StatusCode::CONFLICT,
+            "AGENT_ACTION_CONFLICT",
+            "Agent action conflicts with authoritative state",
+            false,
+        );
+        let mapped = gateway_error(&active_session);
+        assert_eq!(mapped.code, GatewayErrorCode::RouteFenced);
+        assert!(!mapped.retryable);
+        mapped.validate().unwrap();
+
+        let stale_session = AgentHttpError::new(
+            http::StatusCode::CONFLICT,
+            "AGENT_SESSION_FENCED",
+            "Agent request belongs to a stale or closed session",
+            false,
+        );
+        let mapped = gateway_error(&stale_session);
+        assert_eq!(mapped.code, GatewayErrorCode::RouteFenced);
+        assert!(!mapped.retryable);
+        mapped.validate().unwrap();
+
+        // A route fence emitted by Gateway's route-owner path keeps its dedicated code so an
+        // already-established Agent channel can reconnect after the old lease is replaced.
+        let gateway_route_fence = AgentHttpError::new(
+            http::StatusCode::CONFLICT,
+            "GATEWAY_ROUTE_FENCED",
+            "the previous owner lease is still active",
+            false,
+        );
+        let mapped = gateway_error(&gateway_route_fence);
+        assert_eq!(mapped.code, GatewayErrorCode::RouteFenced);
+        assert!(!mapped.retryable);
+        mapped.validate().unwrap();
     }
 
     #[derive(Default)]
@@ -2925,8 +3402,8 @@ mod tests {
         let GatewayControlMessage::Error(error) = rejected.message else {
             panic!("stale route must not receive RouteGranted")
         };
-        assert_eq!(error.code, GatewayErrorCode::RouteFenced);
-        assert!(!error.retryable);
+        assert_eq!(error.code, GatewayErrorCode::RouteUnavailable);
+        assert!(error.retryable);
         assert!(!session.fenced.load(Ordering::Acquire));
         assert!(output.try_recv().is_err());
     }
@@ -2956,7 +3433,7 @@ mod tests {
                 InboundStream {
                     request_id: request_id.clone(),
                     writer,
-                    task: worker_abort,
+                    task: worker,
                 },
             );
 
@@ -2984,10 +3461,7 @@ mod tests {
             .streams
             .contains_key(&stream_id));
 
-        worker.abort();
-        worker
-            .await
-            .expect_err("the pending worker must be aborted during test cleanup");
+        worker_abort.abort();
     }
 
     #[tokio::test]
@@ -3006,6 +3480,7 @@ mod tests {
         let wrong_request_id = RequestId::new("request-bound-wrong").unwrap();
         let (data_writer, _data_input) = AgentControlInput::channel(1);
         let data_task = tokio::spawn(std::future::pending::<()>());
+        let data_task_abort = data_task.abort_handle();
         session
             .inbound
             .lock()
@@ -3016,7 +3491,7 @@ mod tests {
                 InboundStream {
                     request_id: data_request_id,
                     writer: data_writer,
-                    task: data_task.abort_handle(),
+                    task: data_task,
                 },
             );
 
@@ -3042,14 +3517,14 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .streams
             .contains_key(&data_stream_id));
-        data_task
-            .await
-            .expect_err("request mismatch must abort the data stream worker");
+        tokio::task::yield_now().await;
+        assert!(data_task_abort.is_finished());
 
         let end_stream_id = GatewayConnectionId::new("request-bound-end-stream").unwrap();
         let end_request_id = RequestId::new("request-bound-end").unwrap();
         let (end_writer, _end_input) = AgentControlInput::channel(1);
         let end_task = tokio::spawn(std::future::pending::<()>());
+        let end_task_abort = end_task.abort_handle();
         session
             .inbound
             .lock()
@@ -3060,7 +3535,7 @@ mod tests {
                 InboundStream {
                     request_id: end_request_id,
                     writer: end_writer,
-                    task: end_task.abort_handle(),
+                    task: end_task,
                 },
             );
 
@@ -3084,9 +3559,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .streams
             .contains_key(&end_stream_id));
-        end_task
-            .await
-            .expect_err("request mismatch must abort the end stream worker");
+        tokio::task::yield_now().await;
+        assert!(end_task_abort.is_finished());
     }
 
     #[tokio::test]
@@ -3941,8 +4415,6 @@ mod tests {
 
         let (writer, _input) = AgentControlInput::channel(1);
         let task = tokio::spawn(std::future::pending::<()>());
-        let task_abort = task.abort_handle();
-        drop(task);
         owner
             .inbound
             .lock()
@@ -3953,7 +4425,7 @@ mod tests {
                 InboundStream {
                     request_id: RequestId::new("different-route-acquire").unwrap(),
                     writer,
-                    task: task_abort,
+                    task,
                 },
             );
 
@@ -4830,6 +5302,229 @@ mod tests {
             .expect("replacement fence must complete after admitted work drains")
             .unwrap();
         assert!(session.fenced.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn replacement_fence_waits_for_aborted_stream_cleanup_before_route_release() {
+        let registry = Arc::new(ForwardAuthorityRegistry::new());
+        let control = CentralGatewayControl::new(
+            registry.clone(),
+            Arc::new(EchoHandler),
+            Arc::new(InMemoryClock::new(1_000)),
+        );
+        let (session, _output) = control
+            .open(
+                AuthenticatedGatewayReplica {
+                    edge_cluster_id: cluster_id(),
+                    gateway_pool_id: pool_id(),
+                    gateway_replica_id: replica_id(),
+                    certificate_generation: CertificateGeneration::new(1),
+                },
+                frame(1, GatewayControlMessage::ReplicaHello(hello_message())),
+            )
+            .await
+            .unwrap();
+        let route = registry.route();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let worker = tokio::spawn({
+            let entered = Arc::clone(&entered);
+            let dropped = Arc::clone(&dropped);
+            async move {
+                entered.notify_one();
+                let _cleanup = NotifyOnDrop(&dropped);
+                std::future::pending::<()>().await;
+            }
+        });
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("the stream worker must be running before fencing");
+        let (writer, _input) = AgentControlInput::channel(1);
+        session
+            .inbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .streams
+            .insert(
+                route.connection_id.clone(),
+                InboundStream {
+                    request_id: route.acquire_request_id.clone(),
+                    writer,
+                    task: worker,
+                },
+            );
+        session.register_owned_route(
+            route.connection_id.clone(),
+            route.acquire_request_id.clone(),
+        );
+
+        session.fence_and_wait().await;
+        timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("replacement fencing must await the aborted worker Drop guard");
+        assert_eq!(registry.route_release_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_fence_aborts_a_worker_retained_after_agent_stream_end() {
+        let (control, identity) = control_fixture().await;
+        let (session, _output) = control
+            .open(
+                identity,
+                frame(1, GatewayControlMessage::ReplicaHello(hello_message())),
+            )
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let worker = tokio::spawn({
+            let entered = Arc::clone(&entered);
+            let dropped = Arc::clone(&dropped);
+            async move {
+                entered.notify_one();
+                let _cleanup = NotifyOnDrop(&dropped);
+                std::future::pending::<()>().await;
+            }
+        });
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("the retained stream worker must be running before replacement");
+
+        // AgentStreamEnd removes the worker from `inbound` and retains only its join handle.
+        // Replacement fencing must still abort it rather than awaiting the handler forever.
+        session.track_stream_task(worker);
+        timeout(Duration::from_secs(1), session.fence_and_wait())
+            .await
+            .expect("replacement fencing must abort a retained stream worker");
+        timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("the retained stream worker Drop guard must run");
+    }
+
+    #[tokio::test]
+    async fn completed_stream_and_route_cleanup_handles_are_reaped() {
+        let (control, identity) = control_fixture().await;
+        let (session, _output) = control
+            .open(
+                identity,
+                frame(1, GatewayControlMessage::ReplicaHello(hello_message())),
+            )
+            .await
+            .unwrap();
+
+        let completed_stream = tokio::spawn(async {});
+        timeout(Duration::from_secs(1), async {
+            while !completed_stream.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed stream worker must become observable");
+        session.track_stream_task(completed_stream);
+        assert!(session
+            .aborted_stream_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+
+        let completed_release = tokio::spawn(async {});
+        timeout(Duration::from_secs(1), async {
+            while !completed_release.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed route cleanup must become observable");
+        session
+            .route_release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tasks
+            .push(completed_release);
+        session.schedule_route_release(vec![RouteOwner {
+            stream_id: GatewayConnectionId::new("reap-cleanup-stream").unwrap(),
+            request_id: RequestId::new("reap-cleanup-request").unwrap(),
+        }]);
+        assert_eq!(
+            session
+                .route_release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tasks
+                .len(),
+            1
+        );
+        session.fence_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn synchronous_close_starts_route_cleanup_for_a_disconnected_session() {
+        let registry = Arc::new(ForwardAuthorityRegistry::new());
+        let control = CentralGatewayControl::new(
+            registry.clone(),
+            Arc::new(EchoHandler),
+            Arc::new(InMemoryClock::new(1_000)),
+        );
+        let (session, _output) = control
+            .open(
+                AuthenticatedGatewayReplica {
+                    edge_cluster_id: cluster_id(),
+                    gateway_pool_id: pool_id(),
+                    gateway_replica_id: replica_id(),
+                    certificate_generation: CertificateGeneration::new(1),
+                },
+                frame(1, GatewayControlMessage::ReplicaHello(hello_message())),
+            )
+            .await
+            .unwrap();
+        let route = registry.route();
+        session.register_owned_route(
+            route.connection_id.clone(),
+            route.acquire_request_id.clone(),
+        );
+
+        session.close();
+        timeout(Duration::from_secs(1), async {
+            while registry.route_release_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a disconnected session must release its owned route");
+        assert_eq!(registry.route_release_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnected_gateway_route_release_is_bound_to_the_old_stream() {
+        let registry = Arc::new(ForwardAuthorityRegistry::new());
+        let route = registry.route();
+        let clock: Arc<dyn Clock> = Arc::new(InMemoryClock::new(1_000));
+
+        release_disconnected_gateway_routes(
+            registry.clone(),
+            clock.clone(),
+            route.gateway_pool_id.clone(),
+            route.gateway_replica_id.clone(),
+            vec![RouteOwner {
+                stream_id: route.connection_id.clone(),
+                request_id: route.acquire_request_id.clone(),
+            }],
+        )
+        .await;
+        assert_eq!(registry.route_release_calls(), 1);
+
+        release_disconnected_gateway_routes(
+            registry.clone(),
+            clock,
+            route.gateway_pool_id,
+            route.gateway_replica_id,
+            vec![RouteOwner {
+                stream_id: GatewayConnectionId::new("different-stream").unwrap(),
+                request_id: route.acquire_request_id,
+            }],
+        )
+        .await;
+        assert_eq!(registry.route_release_calls(), 1);
     }
 
     async fn control_fixture() -> (CentralGatewayControl, AuthenticatedGatewayReplica) {

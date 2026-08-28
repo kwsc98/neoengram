@@ -22,16 +22,16 @@ use hyper::body::{Body, Frame, SizeHint};
 use neoengram_domain::protocol::{
     decode_bounded_unique_json, AgentChannelDownstreamFrame, AgentChannelDownstreamMessage,
     AgentChannelNdjsonDecoder, AgentChannelUpstreamFrame, AgentChannelUpstreamMessage,
-    ContentDigest, GatewayAgentAction, GatewayAgentRequest, GatewayAgentResponse,
-    GatewayAgentStreamData, GatewayAgentStreamEnd, GatewayAgentStreamOpen, GatewayBackpressure,
-    GatewayConnectionId, GatewayControlError, GatewayControlFrame, GatewayControlMessage,
-    GatewayControlNdjsonDecoder, GatewayDrain, GatewayErrorCode, GatewayOpaqueBytes,
-    GatewayPeerDirectory, GatewayPeerForwardAccepted, GatewayPeerForwardRequest, GatewayPoolId,
-    GatewayReplicaHeartbeat, GatewayReplicaHello, GatewayReplicaId, GatewayRouteLeaseGranted,
-    GatewayRouteLeaseRequest, GatewayS3ReadRevocation, RequestId, RouteGeneration, SequenceNumber,
-    SessionGeneration, TraceId, UnixMillis, AGENT_ROUTE_LEASE_RENEW_INTERVAL_MS,
-    AGENT_ROUTE_LEASE_TTL_MS, CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES,
-    MAX_GATEWAY_STREAM_CHUNK_BYTES, MAX_METADATA_PAGE_BYTES,
+    ContentDigest, ControlError, ErrorCode, GatewayAgentAction, GatewayAgentRequest,
+    GatewayAgentResponse, GatewayAgentStreamData, GatewayAgentStreamEnd, GatewayAgentStreamOpen,
+    GatewayBackpressure, GatewayConnectionId, GatewayControlError, GatewayControlFrame,
+    GatewayControlMessage, GatewayControlNdjsonDecoder, GatewayDrain, GatewayErrorCode,
+    GatewayOpaqueBytes, GatewayPeerDirectory, GatewayPeerForwardAccepted,
+    GatewayPeerForwardRequest, GatewayPoolId, GatewayReplicaHeartbeat, GatewayReplicaHello,
+    GatewayReplicaId, GatewayRouteLeaseGranted, GatewayRouteLeaseRequest, GatewayS3ReadRevocation,
+    MessageId, RequestId, RouteGeneration, SequenceNumber, SessionGeneration, TraceId, UnixMillis,
+    AGENT_ROUTE_LEASE_RENEW_INTERVAL_MS, AGENT_ROUTE_LEASE_TTL_MS, CURRENT_WIRE_VERSION,
+    MAX_CONTROL_MESSAGE_BYTES, MAX_GATEWAY_STREAM_CHUNK_BYTES, MAX_METADATA_PAGE_BYTES,
 };
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit},
@@ -190,6 +190,13 @@ struct ActiveRoute {
     session_generation: SessionGeneration,
     route_generation: RouteGeneration,
     lease_expires_at_unix_ms: UnixMillis,
+}
+
+struct AgentOutputContext {
+    request_id: RequestId,
+    stream_id: GatewayConnectionId,
+    agent_id: neoengram_domain::protocol::AgentId,
+    open_message_id: MessageId,
 }
 
 /// The immutable identity of a peer-forward request.  The payload digest is part of the
@@ -974,6 +981,7 @@ impl GatewayTunnel {
             .await
             .map_err(|_| TunnelError::Deadline)??;
         let agent_id = open.request.agent_id.clone();
+        let open_message_id = open.request.payload.message_id.clone();
         if peer_agent_id
             .as_ref()
             .is_some_and(|expected_agent_id| expected_agent_id != &agent_id)
@@ -1052,9 +1060,12 @@ impl GatewayTunnel {
         tokio::spawn(async move {
             downstream
                 .forward_agent_output(
-                    downstream_request_id,
-                    downstream_stream_id,
-                    agent_id,
+                    AgentOutputContext {
+                        request_id: downstream_request_id,
+                        stream_id: downstream_stream_id,
+                        agent_id,
+                        open_message_id,
+                    },
                     route_receiver,
                     event_receiver,
                     response_sender,
@@ -1367,13 +1378,17 @@ impl GatewayTunnel {
 
     async fn forward_agent_output(
         &self,
-        request_id: RequestId,
-        stream_id: GatewayConnectionId,
-        agent_id: neoengram_domain::protocol::AgentId,
+        context: AgentOutputContext,
         route_receiver: oneshot::Receiver<Result<GatewayRouteLeaseGranted, GatewayControlError>>,
         mut events: mpsc::Receiver<StreamEvent>,
         output: mpsc::Sender<Bytes>,
     ) {
+        let AgentOutputContext {
+            request_id,
+            stream_id,
+            agent_id,
+            open_message_id,
+        } = context;
         let granted = match timeout(
             Duration::from_millis(CONTROL_FRAME_DEADLINE_MS),
             route_receiver,
@@ -1391,11 +1406,33 @@ impl GatewayTunnel {
             }
             Ok(Ok(Err(error))) => {
                 tracing::warn!(code = ?error.code, detail = %error.detail, %stream_id, "Central rejected the atomic Agent route");
+                send_gateway_error_frame(
+                    &output,
+                    &stream_id,
+                    SequenceNumber::new(1),
+                    SessionGeneration::new(1),
+                    Some(open_message_id.clone()),
+                    error,
+                )
+                .await;
                 self.remove_stream(&request_id, &stream_id).await;
                 return;
             }
             _ => {
                 tracing::warn!(%stream_id, "Central did not grant the atomic Agent route");
+                send_gateway_error_frame(
+                    &output,
+                    &stream_id,
+                    SequenceNumber::new(1),
+                    SessionGeneration::new(1),
+                    Some(open_message_id),
+                    GatewayControlError {
+                        code: GatewayErrorCode::RouteUnavailable,
+                        detail: "Gateway route grant timed out or was cancelled".to_owned(),
+                        retryable: true,
+                    },
+                )
+                .await;
                 self.remove_stream(&request_id, &stream_id).await;
                 return;
             }
@@ -1403,6 +1440,7 @@ impl GatewayTunnel {
         let mut decoder = AgentChannelNdjsonDecoder::new();
         let mut pending = Vec::new();
         let mut opened_verified = false;
+        let mut downstream_sequence = 0_u64;
         let mut route = ActiveRoute {
             agent_id: granted.agent_id,
             session_generation: granted.session_generation,
@@ -1455,6 +1493,12 @@ impl GatewayTunnel {
                                 tracing::warn!(%stream_id, "Central Agent Opened generation differs from its atomic route");
                                 break;
                             }
+                            downstream_sequence = opened.sequence.get();
+                            for line in lines.iter().skip(1) {
+                                if let Ok(frame) = AgentChannelDownstreamFrame::decode_json(line) {
+                                    downstream_sequence = frame.sequence.get();
+                                }
+                            }
                             // RouteFence/teardown may have won while this Opened frame was
                             // queued. Never let a late worker resurrect a transfer fence after
                             // its stream and route have been removed.
@@ -1489,12 +1533,38 @@ impl GatewayTunnel {
                             }
                         }
                         Some(StreamEvent::Data(chunk)) => {
+                            if let Ok(lines) = decoder.push(&chunk) {
+                                for line in lines {
+                                    if let Ok(frame) = AgentChannelDownstreamFrame::decode_json(&line) {
+                                        downstream_sequence = frame.sequence.get();
+                                    }
+                                }
+                            }
                             if output.send(chunk).await.is_err() {
                                 break;
                             }
                         }
                         Some(StreamEvent::Error(error)) => {
                             tracing::warn!(code = ?error.code, detail = %error.detail, %stream_id, "Central closed the Agent stream");
+                            // The output has already been forwarded byte-for-byte. Appending a
+                            // synthetic frame while the decoder retains a partial line would
+                            // concatenate two JSON documents and corrupt the Agent's NDJSON
+                            // stream. A clean LF boundary is the only point at which an error
+                            // frame can be appended safely; otherwise dropping `output` closes
+                            // the transport and lets the Agent retry from a fresh channel.
+                            if decoder.finish().is_ok() {
+                                send_gateway_error_frame(
+                                    &output,
+                                    &stream_id,
+                                    SequenceNumber::new(downstream_sequence.saturating_add(1).max(1)),
+                                    route.session_generation,
+                                    None,
+                                    error,
+                                )
+                                .await;
+                            } else {
+                                tracing::warn!(%stream_id, "Central closed the Agent stream at a partial NDJSON frame; closing transport without a synthetic error");
+                            }
                             break;
                         }
                         Some(StreamEvent::End) | None => break,
@@ -1549,6 +1619,9 @@ impl GatewayTunnel {
             }
         }
 
+        // End the Agent response immediately. Route cleanup may wait for Central, but it must not
+        // keep an already-terminal HTTP response body open behind that control-plane RPC.
+        drop(output);
         if opened_verified {
             let _ = self
                 .mutate_route(GatewayControlMessage::RouteRelease(
@@ -2944,6 +3017,75 @@ fn lease_expiry() -> UnixMillis {
     UnixMillis::new(now_unix_ms().get().saturating_add(AGENT_ROUTE_LEASE_TTL_MS))
 }
 
+fn send_gateway_error_frame_code(code: GatewayErrorCode) -> &'static str {
+    match code {
+        GatewayErrorCode::ProtocolInvalid => "GATEWAY_PROTOCOL_INVALID",
+        GatewayErrorCode::IdentityRejected => "GATEWAY_IDENTITY_REJECTED",
+        GatewayErrorCode::RouteUnavailable => "GATEWAY_ROUTE_UNAVAILABLE",
+        GatewayErrorCode::RouteFenced => "GATEWAY_ROUTE_FENCED",
+        GatewayErrorCode::DeadlineExceeded => "GATEWAY_DEADLINE_EXCEEDED",
+        GatewayErrorCode::ResourceExhausted => "GATEWAY_RESOURCE_EXHAUSTED",
+        GatewayErrorCode::Internal => "GATEWAY_INTERNAL",
+    }
+}
+
+/// Adapts a Gateway control-plane failure into the unsigned Agent channel error format. Errors
+/// are deliberately unsigned: only Central command deliveries require a Central signature, while
+/// transport and route failures are terminal/retry hints carried by the authenticated Gateway
+/// connection itself.
+async fn send_gateway_error_frame(
+    output: &mpsc::Sender<Bytes>,
+    stream_id: &GatewayConnectionId,
+    sequence: SequenceNumber,
+    session_generation: SessionGeneration,
+    correlation_id: Option<MessageId>,
+    error: GatewayControlError,
+) {
+    let Ok(message_id) = MessageId::new(format!("gateway-error-{stream_id}-{sequence}")) else {
+        tracing::warn!(%stream_id, "failed to allocate an Agent Gateway error message ID");
+        return;
+    };
+    let Ok(code) = ErrorCode::new(send_gateway_error_frame_code(error.code)) else {
+        tracing::warn!(%stream_id, "failed to encode an Agent Gateway error code");
+        return;
+    };
+    let frame = AgentChannelDownstreamFrame {
+        wire_version: CURRENT_WIRE_VERSION,
+        sequence,
+        message_id,
+        correlation_id,
+        session_generation,
+        sent_at_unix_ms: now_unix_ms(),
+        central_signature: None,
+        message: AgentChannelDownstreamMessage::Error(ControlError {
+            code,
+            message: error.detail,
+            retryable: error.retryable,
+            retry_after_ms: None,
+            extensions: neoengram_domain::protocol::Extensions::new(),
+        }),
+        extensions: neoengram_domain::protocol::Extensions::new(),
+    };
+    let Ok(bytes) = frame.encode_ndjson().map(Bytes::from) else {
+        tracing::warn!(%stream_id, "failed to encode an Agent Gateway error frame");
+        return;
+    };
+    match timeout(
+        Duration::from_millis(CONTROL_FRAME_DEADLINE_MS),
+        output.send(bytes),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            tracing::debug!(%stream_id, "Agent disconnected before receiving the Gateway error frame");
+        }
+        Err(_) => {
+            tracing::warn!(%stream_id, "Agent response queue remained full while sending the Gateway error frame");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -2952,12 +3094,13 @@ mod tests {
     use http_body_util::Full;
     use neoengram_domain::protocol::{
         AgentId, AgentMountId, AgentResourceLifecycleAssignment, AgentResourceLifecycleScope,
-        ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId, ContentDigest,
-        DecisionGeneration, DeletionId, EdgeClusterId, Extensions, GatewayRouteFence,
-        IndexRevision, JobDecision, JobId, JobState, LifecycleAssignmentId, LifecycleGeneration,
-        MessageId, MountGeneration, OwnerGeneration, PlacementGeneration, ProjectId,
-        PublishDecision, ResourceLifecycleAction, ResourceLifecycleAssignment, ResourceRef,
-        StorageVolumeId, TenantId, VolumeMarkerId, WireIndexVersion,
+        AgentSessionOpenResponse, ArtifactId, ArtifactPlacementId, AssignmentGeneration,
+        AssignmentId, ContentDigest, DecisionGeneration, DeletionId, EdgeClusterId, Extensions,
+        GatewayRouteFence, IndexRevision, JobDecision, JobId, JobState, LifecycleAssignmentId,
+        LifecycleGeneration, MessageId, MountGeneration, OwnerGeneration, PlacementGeneration,
+        ProjectId, PublishDecision, ResourceLifecycleAction, ResourceLifecycleAssignment,
+        ResourceRef, ResourceVersion, SessionId, StorageVolumeId, TenantId, VolumeMarkerId,
+        WireIndexVersion,
     };
 
     struct InProcessPeerForwarder {
@@ -4694,6 +4837,172 @@ mod tests {
                 .await,
             Err(TunnelError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn initial_route_error_is_relayed_to_the_agent_as_a_structured_frame() {
+        let tunnel = tunnel();
+        let request_id = RequestId::new("route-error-frame-request").unwrap();
+        let stream_id = GatewayConnectionId::new("route-error-frame-stream").unwrap();
+        let (route_sender, route_receiver) = oneshot::channel();
+        let (output, mut frames) = mpsc::channel(2);
+        let worker_tunnel = Arc::clone(&tunnel);
+        let worker_stream_id = stream_id.clone();
+        let worker = tokio::spawn(async move {
+            worker_tunnel
+                .forward_agent_output(
+                    AgentOutputContext {
+                        request_id,
+                        stream_id: worker_stream_id,
+                        agent_id: AgentId::new("agent-a").unwrap(),
+                        open_message_id: MessageId::new("open-message-a").unwrap(),
+                    },
+                    route_receiver,
+                    mpsc::channel(STREAM_EVENT_BUFFER).1,
+                    output,
+                )
+                .await;
+        });
+        route_sender
+            .send(Err(GatewayControlError {
+                code: GatewayErrorCode::RouteUnavailable,
+                detail: "route is restarting".to_owned(),
+                retryable: true,
+            }))
+            .unwrap();
+
+        let bytes = timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .expect("Gateway must emit the initial route error")
+            .expect("Gateway error frame must be queued");
+        let frame = AgentChannelDownstreamFrame::decode_json(&bytes[..bytes.len() - 1])
+            .expect("Gateway route error must use the Agent channel wire format");
+        let AgentChannelDownstreamMessage::Error(error) = frame.message else {
+            panic!("Gateway route rejection must be an Agent protocol error");
+        };
+        assert_eq!(error.code.as_str(), "GATEWAY_ROUTE_UNAVAILABLE");
+        assert!(error.retryable);
+        assert_eq!(
+            frame.correlation_id,
+            Some(MessageId::new("open-message-a").unwrap())
+        );
+        assert_eq!(frame.sequence, SequenceNumber::new(1));
+        assert_eq!(frame.session_generation, SessionGeneration::new(1));
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn central_error_after_partial_ndjson_does_not_corrupt_agent_response() {
+        let tunnel = tunnel();
+        let request_id = RequestId::new("partial-frame-request").unwrap();
+        let stream_id = GatewayConnectionId::new("partial-frame-stream").unwrap();
+        let session_generation = SessionGeneration::new(3);
+        let route_generation = RouteGeneration::new(7);
+        let now = now_unix_ms();
+        let (route_sender, route_receiver) = oneshot::channel();
+        let (events_sender, events_receiver) = mpsc::channel(STREAM_EVENT_BUFFER);
+        let (output, mut frames) = mpsc::channel(4);
+        let open_message_id = MessageId::new("partial-open-message").unwrap();
+        let worker = tokio::spawn({
+            let tunnel = Arc::clone(&tunnel);
+            let stream_id = stream_id.clone();
+            let request_id = request_id.clone();
+            async move {
+                tunnel
+                    .forward_agent_output(
+                        AgentOutputContext {
+                            request_id,
+                            stream_id,
+                            agent_id: AgentId::new("agent-a").unwrap(),
+                            open_message_id,
+                        },
+                        route_receiver,
+                        events_receiver,
+                        output,
+                    )
+                    .await;
+            }
+        });
+        route_sender
+            .send(Ok(GatewayRouteLeaseGranted {
+                agent_id: AgentId::new("agent-a").unwrap(),
+                owner_replica_id: GatewayReplicaId::new("replica-a").unwrap(),
+                agent_connection_id: stream_id.clone(),
+                session_generation,
+                route_generation,
+                lease_expires_at_unix_ms: UnixMillis::new(now.get().saturating_add(30_000)),
+                replayed: false,
+            }))
+            .unwrap();
+
+        let opened = AgentChannelDownstreamFrame {
+            wire_version: CURRENT_WIRE_VERSION,
+            sequence: SequenceNumber::new(1),
+            message_id: MessageId::new("partial-opened-frame").unwrap(),
+            correlation_id: Some(MessageId::new("partial-open-message").unwrap()),
+            session_generation,
+            sent_at_unix_ms: now,
+            central_signature: None,
+            message: AgentChannelDownstreamMessage::Opened(AgentSessionOpenResponse {
+                wire_version: CURRENT_WIRE_VERSION,
+                request_id: RequestId::new("partial-open-request").unwrap(),
+                agent_id: AgentId::new("agent-a").unwrap(),
+                session_id: SessionId::new("partial-session").unwrap(),
+                session_generation,
+                agent_mount_id: AgentMountId::new("partial-mount").unwrap(),
+                mount_generation: MountGeneration::new(1),
+                owner_generation: OwnerGeneration::new(1),
+                resource_version: ResourceVersion::new(1),
+                opened_at_unix_ms: now,
+                replayed: false,
+                extensions: Extensions::new(),
+            }),
+            extensions: Extensions::new(),
+        };
+        events_sender
+            .send(StreamEvent::Data(Bytes::from(
+                opened.encode_ndjson().unwrap(),
+            )))
+            .await
+            .unwrap();
+        let opened_bytes = timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .expect("opened frame must be forwarded")
+            .expect("opened frame output must remain open");
+        assert!(
+            AgentChannelDownstreamFrame::decode_json(&opened_bytes[..opened_bytes.len() - 1])
+                .is_ok()
+        );
+
+        // The Gateway has already forwarded this byte prefix. A later synthetic JSON object would
+        // produce `<partial JSON><error JSON>`, which is not a valid Agent channel frame.
+        let partial = Bytes::from_static(b"{\"type\":\"job.assignment\",\"payload\":");
+        events_sender
+            .send(StreamEvent::Data(partial.clone()))
+            .await
+            .unwrap();
+        let forwarded_partial = timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .expect("partial frame must be forwarded byte-for-byte")
+            .expect("partial frame output must remain open");
+        assert_eq!(forwarded_partial, partial);
+
+        events_sender
+            .send(StreamEvent::Error(GatewayControlError {
+                code: GatewayErrorCode::RouteUnavailable,
+                detail: "Central stream failed during a frame".to_owned(),
+                retryable: true,
+            }))
+            .await
+            .unwrap();
+        let end = timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .expect("response output must close after the transport error");
+        assert!(
+            end.is_none(),
+            "no synthetic error may follow a partial NDJSON frame"
+        );
+        worker.await.unwrap();
     }
 
     #[tokio::test]

@@ -26,6 +26,9 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+const TRANSFER_FRAME_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const TRANSFER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum QuicTransferError {
     #[error("QUIC connection could not be started: {0}")]
@@ -58,6 +61,8 @@ pub(crate) enum QuicTransferError {
     Fenced(&'static str),
     #[error("QUIC TLS configuration is invalid: {0}")]
     Tls(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
+    #[error("QUIC transfer I/O timed out: {0}")]
+    Timeout(&'static str),
     #[error("failed to bind QUIC listener: {0}")]
     Bind(#[from] io::Error),
 }
@@ -409,7 +414,11 @@ impl QuinnTransferConnectionFactory {
         );
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from((*tls_config).clone())?;
         let mut endpoint = Endpoint::client(bind_address)?;
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(TRANSFER_KEEP_ALIVE_INTERVAL));
+        client_config.transport_config(Arc::new(transport));
+        endpoint.set_default_client_config(client_config);
         Ok(Self {
             endpoint,
             upstream,
@@ -530,8 +539,10 @@ impl QuicTransferListener {
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         let transport = Arc::get_mut(&mut server_config.transport)
             .expect("new QUIC server config must have one transport owner");
-        transport.max_concurrent_bidi_streams(64u32.into());
-        transport.max_concurrent_uni_streams(0u32.into());
+        transport
+            .max_concurrent_bidi_streams(64u32.into())
+            .max_concurrent_uni_streams(0u32.into())
+            .keep_alive_interval(Some(TRANSFER_KEEP_ALIVE_INTERVAL));
         let endpoint = Endpoint::server(server_config, address)?;
         Ok(Self {
             endpoint: Arc::new(endpoint),
@@ -647,6 +658,12 @@ fn validate_connection_handshake(
 /// stream usable for subsequent ObjectRequest/ObjectAck frames; `read_to_end` would wait forever
 /// on a long-lived transfer stream.
 pub(crate) async fn read_frame(recv: &mut RecvStream) -> Result<TransferFrame, QuicTransferError> {
+    tokio::time::timeout(TRANSFER_FRAME_IO_TIMEOUT, read_frame_inner(recv))
+        .await
+        .map_err(|_| QuicTransferError::Timeout("frame read"))?
+}
+
+async fn read_frame_inner(recv: &mut RecvStream) -> Result<TransferFrame, QuicTransferError> {
     let mut prefix = [0_u8; 4];
     recv.read_exact(&mut prefix).await?;
     let payload_len = u32::from_be_bytes(prefix) as usize;
@@ -778,7 +795,9 @@ pub(crate) async fn send_frame(
     frame: &TransferFrame,
 ) -> Result<(), QuicTransferError> {
     let encoded = frame.encode()?;
-    send.write_all(&encoded).await?;
+    tokio::time::timeout(TRANSFER_FRAME_IO_TIMEOUT, send.write_all(&encoded))
+        .await
+        .map_err(|_| QuicTransferError::Timeout("frame write"))??;
     Ok(())
 }
 

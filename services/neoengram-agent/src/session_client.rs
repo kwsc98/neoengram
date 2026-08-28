@@ -210,6 +210,7 @@ impl Drop for AbortTaskOnDrop {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionClientError {
     retryable: bool,
+    transient: bool,
     message: String,
 }
 
@@ -217,8 +218,21 @@ impl AgentSessionClientError {
     fn new(retryable: bool, message: impl Into<String>) -> Self {
         Self {
             retryable,
+            transient: false,
             message: message.into(),
         }
+    }
+
+    fn transient_error(message: impl Into<String>) -> Self {
+        Self {
+            retryable: true,
+            transient: true,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn business_retryable(message: impl Into<String>) -> Self {
+        Self::new(true, message)
     }
 
     #[must_use]
@@ -226,12 +240,19 @@ impl AgentSessionClientError {
         self.retryable
     }
 
+    /// Returns true when retrying the same operation is appropriate because the transport or
+    /// Gateway is temporarily unavailable. Business-level retryable errors remain distinct so a
+    /// malformed request or missing object is not retried forever by the synchronous data plane.
+    pub(crate) const fn transient(&self) -> bool {
+        self.transient
+    }
+
     pub(crate) fn protocol(error: impl fmt::Display) -> Self {
         Self::new(false, error.to_string())
     }
 
     pub(crate) fn transport(error: impl fmt::Display) -> Self {
-        Self::new(true, error.to_string())
+        Self::transient_error(error.to_string())
     }
 }
 
@@ -295,10 +316,32 @@ impl AgentRequestSigner {
         signed_at_unix_ms: UnixMillis,
         payload: T,
     ) -> Result<AgentAuthenticatedRequest<T>, AgentSessionClientError> {
+        let request_id = RequestId::new(format!("agent-request-{}", Uuid::new_v4().simple()))
+            .map_err(protocol_error)?;
+        self.sign_with_request_id(
+            canonical_path,
+            request_id,
+            fence,
+            signed_at_unix_ms,
+            payload,
+        )
+    }
+
+    /// Re-signs one logical request with a refreshed session fence while preserving its request
+    /// identity. Data-plane callers use this when a Gateway reconnect races an in-flight action;
+    /// keeping the request ID stable preserves at-most-once/idempotent handling for mutating
+    /// actions while the session generation and signature are refreshed.
+    pub(crate) fn sign_with_request_id<T: Serialize>(
+        &self,
+        canonical_path: &'static str,
+        request_id: RequestId,
+        fence: Option<&AgentSessionFence>,
+        signed_at_unix_ms: UnixMillis,
+        payload: T,
+    ) -> Result<AgentAuthenticatedRequest<T>, AgentSessionClientError> {
         let mut request = AgentAuthenticatedRequest {
             wire_version: CURRENT_WIRE_VERSION,
-            request_id: RequestId::new(format!("agent-request-{}", Uuid::new_v4().simple()))
-                .map_err(protocol_error)?,
+            request_id,
             agent_id: self.agent_id.clone(),
             installation_id: self.installation_id.clone(),
             boot_id: self.boot_id.clone(),
@@ -579,7 +622,9 @@ impl ReqwestAgentSessionClient {
             .send()
             .await
             .map_err(|error| {
-                AgentSessionClientError::new(true, format!("Agent API is unavailable: {error}"))
+                AgentSessionClientError::transient_error(format!(
+                    "Agent API is unavailable: {error}"
+                ))
             })?;
         validate_response_request_id(&response, &request.request_id)?;
         let status = response.status();
@@ -768,10 +813,6 @@ impl ReqwestAgentSessionClient {
             certificate_deadline,
         )
         .await?;
-        let sender_keepalive = tokio::spawn(async move {
-            let _sender = sender;
-            std::future::pending::<()>().await;
-        });
         validate_response_request_id_headers(response.headers(), &request_id)?;
         let status = response.status();
         let content_type = response
@@ -792,7 +833,11 @@ impl ReqwestAgentSessionClient {
                     "Agent API response exceeds the transport limit",
                 ));
             }
-            let body = read_h2_bounded(response.into_body()).await?;
+            let body = read_h2_bounded_with_timeout(
+                response.into_body(),
+                "Agent control channel error response timed out",
+            )
+            .await?;
             return Err(remote_error(status, &body));
         }
         if response.version() != Version::HTTP_2 {
@@ -806,6 +851,12 @@ impl ReqwestAgentSessionClient {
             ));
         }
 
+        // Keep the H2 sender alive only after the response has passed validation. Failed
+        // reconnect attempts must drop every task so an outage cannot accumulate pending tasks.
+        let sender_keepalive = tokio::spawn(async move {
+            let _sender = sender;
+            std::future::pending::<()>().await;
+        });
         let mut response_body = response.into_body();
         let (chunks_tx, chunks_rx) = mpsc::channel(64);
         let response_reader = tokio::spawn(async move {
@@ -977,10 +1028,6 @@ impl ReqwestAgentSessionClient {
             certificate_deadline,
         )
         .await?;
-        let sender_keepalive = tokio::spawn(async move {
-            let _sender = sender;
-            std::future::pending::<()>().await;
-        });
         let status = response.status();
         let content_type = response
             .headers()
@@ -1000,7 +1047,11 @@ impl ReqwestAgentSessionClient {
                     "Agent S3 channel error exceeds the transport limit",
                 ));
             }
-            let body = read_h2_bounded(response.into_body()).await?;
+            let body = read_h2_bounded_with_timeout(
+                response.into_body(),
+                "Agent S3 channel error response timed out",
+            )
+            .await?;
             return Err(remote_error(status, &body));
         }
         if response.version() != Version::HTTP_2
@@ -1011,6 +1062,11 @@ impl ReqwestAgentSessionClient {
             ));
         }
 
+        // Do not leave a detached sender task behind when a retry receives a rejected response.
+        let sender_keepalive = tokio::spawn(async move {
+            let _sender = sender;
+            std::future::pending::<()>().await;
+        });
         let mut response_body = response.into_body();
         let (chunks_tx, chunks_rx) = mpsc::channel(64);
         let response_reader = tokio::spawn(async move {
@@ -1152,7 +1208,7 @@ where
 async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, AgentSessionClientError> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        AgentSessionClientError::new(true, format!("Agent API response failed: {error}"))
+        AgentSessionClientError::transient_error(format!("Agent API response failed: {error}"))
     })? {
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
             return Err(AgentSessionClientError::new(
@@ -1182,6 +1238,15 @@ async fn read_h2_bounded(mut body: Incoming) -> Result<Vec<u8>, AgentSessionClie
         bytes.extend_from_slice(&data);
     }
     Ok(bytes)
+}
+
+async fn read_h2_bounded_with_timeout(
+    body: Incoming,
+    timeout_message: &'static str,
+) -> Result<Vec<u8>, AgentSessionClientError> {
+    tokio::time::timeout(REQUEST_TIMEOUT, read_h2_bounded(body))
+        .await
+        .map_err(|_| AgentSessionClientError::transport(timeout_message))?
 }
 
 fn validate_response_request_id(
@@ -1223,10 +1288,14 @@ fn remote_error(status: StatusCode, body: &[u8]) -> AgentSessionClientError {
         .and_then(|value| value.get("retryable"))
         .and_then(Value::as_bool)
         .unwrap_or(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error());
-    AgentSessionClientError::new(
-        retryable,
-        format!("Agent API returned HTTP {} ({code})", status.as_u16()),
-    )
+    let message = format!("Agent API returned HTTP {} ({code})", status.as_u16());
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        AgentSessionClientError::transient_error(message)
+    } else if retryable {
+        AgentSessionClientError::business_retryable(message)
+    } else {
+        AgentSessionClientError::new(false, message)
+    }
 }
 
 fn protocol_error(error: impl std::fmt::Display) -> AgentSessionClientError {

@@ -108,7 +108,7 @@ CreateArtifact(initialization=derived) -> 409 ARTIFACT_DERIVED_INITIALIZATION_UN
 | Commit replication / Placement / availability | `已观察`（复制前置条件和目标占用均已门控） | `/api/commit/*`、`service/placement.rs`、Agent `replication.enabled` | 同一 Commit 到同一 Volume 的 active 任务，或已有目标 PlacementSet 的新任务，均有稳定 `409 REPLICATION_ALREADY_ACTIVE`；仍不等于跨集群生产传输已验收 |
 | S3 read-only Access Point | `已观察`（需 command keyring 与 storage execution） | `/api/s3/*`、Gateway S3 listener | 读取还依赖 Ready PlacementSet、Ready GatewayPool、Agent route 和 signed ticket；不支持写入、不是中心对象存储权威 |
 | Resource deletion / retention hold | `已观察`（需生命周期 coordinator） | `/api/resource/*` | 不等于完整回收站运营和灾备 |
-| Agent enrollment/session/metadata transport | `已观察`（需 `--agent-enrollment-enabled`） | Agent OpenAPI、Central registry handler | 不等于外部 issuer、真实 PVC 和全链路 E2E |
+| Agent enrollment/session/metadata transport | `已观察`（需 `--agent-enrollment-enabled`；已覆盖 channel EOF/写入传输失败、ACK 超时和旧 route/session fencing 进入有界重连，重连期间 readiness 降级、outbox 报告保留及不可用 Gateway route 的 retryable 503 映射） | Agent OpenAPI、Central registry handler、`approved_runtime`/registry handler 单元测试 | 不等于外部 issuer、真实 PVC 或完整双 Replica 断线恢复 E2E |
 | Gateway Registry/activation/mTLS/forwarding | `已观察`（协议和局部契约） | `services/neoengram-gateway`、Gateway controller | 不等于真实多副本 readiness/failover/cutover |
 | Web 真实模式 | `已观察`（页面/API 集成） | `apps/neoengram-web`，由 capabilities 控制 | 不等于所有 OpenAPI action 都有 Central handler |
 | Web MSW Mock | `已观察`（测试/演示） | `apps/neoengram-web/src/mocks` | 不得作为后端交付证据 |

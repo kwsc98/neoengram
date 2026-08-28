@@ -298,6 +298,7 @@ impl GatewayRegistryRepository for InMemoryGatewayRegistry {
             .find(|record| record.enrollment.reserved_agent_id == request.session.agent_id)
             .cloned()
             .ok_or_else(agent_not_found)?;
+        let stored_resource_version = stored.resource_version.get();
         let session = open_agent_session_against(
             stored,
             &request.session,
@@ -324,7 +325,7 @@ impl GatewayRegistryRepository for InMemoryGatewayRegistry {
         if !session.replayed {
             crate::registry_memory::replace_record_locked(
                 &mut agents,
-                request.session.expected_resource_version.get(),
+                stored_resource_version,
                 session.record.clone(),
             )?;
         }

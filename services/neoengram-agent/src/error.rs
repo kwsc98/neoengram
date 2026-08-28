@@ -26,6 +26,13 @@ pub enum AgentDaemonError {
     EnrollmentProtocol(String),
     #[error("Agent session transport failed: {0}")]
     Session(String),
+    /// A transient failure while writing to an established session channel.
+    ///
+    /// The approved runtime converts this variant into `ChannelExit::Reconnect` instead of
+    /// terminating the Agent. It is kept separate from protocol/session failures because those
+    /// remain fail-closed and must not be retried blindly.
+    #[error("Agent session transport is temporarily unavailable: {0}")]
+    SessionTransport(String),
     #[error("Agent status timestamp state is invalid: {0}")]
     StatusClock(String),
     #[error("Agent enrollment was rejected")]

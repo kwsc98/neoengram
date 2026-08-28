@@ -12,7 +12,8 @@
 本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；`neoengram-central` 提供用户 API，Agent
 action/控制 channel 经 Gateway H2 转发（Central 内的 Hyper raw-body adapter 仅用于 loopback/测试，不是
 生产独立 Agent listener），`neoengram-agent` 已通过 Gateway H2 双向 channel 完成 enrollment/session/Job，
-并将 Chunk 直接写入用户 Volume CAS。NeoEngram Gateway G1 已实现协议、
+并将 Chunk 直接写入用户 Volume CAS；Agent 控制 channel 已对 EOF、读写传输失败和 ACK 超时进入有界退避重连，
+durable outbox 报告在收到 ACK 前保留并在新 session 重放。NeoEngram Gateway G1 已实现协议、
 Gateway Registry、管理 API、Central session、
 Registry-driven outbound tunnel、Replica activation、运行时 H2/mTLS、RouteLease、Central command
 signing/trust bundle 和最多一跳 peer forwarding；双 Replica listener/H2/peer harness 与真实
@@ -222,7 +223,7 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 | --- | --- | --- |
 | 客户端数据面 | 工作区、Index、FastCDC/WholeFile Chunk、对象校验、本地恢复 | 远端 push/fetch、断点续传、并发上限和缓存 quota |
 | 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | SQLite adapter 继续收敛到 engine 分页 ports |
-| 中心/Agent | Gateway H2 双向 channel、统一 Agent state SQLite（Ledger/outbound）、mount probe、enrollment/AuthorityStore；Gateway ID/协议、Gateway Registry、管理 API/session/activation、Registry-driven outbound connector、H2/mTLS、RouteLease、命令签名、一跳 forwarding 和 Gateway-only Agent 配置；双 Replica 协议 harness 与 Registry 接管契约分别通过 | 完整 Central/Registry/outbox/签名双 Replica E2E、外部生产 issuer/KMS-HSM、真实集群 readiness/failover、切换验收、PostgreSQL HA/RLS、完整授权/调度 |
+| 中心/Agent | Gateway H2 双向 channel、统一 Agent state SQLite（Ledger/outbound）、mount probe、enrollment/AuthorityStore；Agent 有界 session 重连、重连期间 readiness 降级、durable report 重放；Gateway ID/协议、Gateway Registry、管理 API/session/activation、Registry-driven outbound connector、H2/mTLS、RouteLease、命令签名、一跳 forwarding 和 Gateway-only Agent 配置；双 Replica 协议 harness 与 Registry 接管契约分别通过 | 完整 Central/Registry/outbox/签名双 Replica E2E、外部生产 issuer/KMS-HSM、真实集群 readiness/failover、切换验收、PostgreSQL HA/RLS、完整授权/调度 |
 | Managed 数据面 | Agent 扫描并将 Chunk 写入 Volume CAS，ObjectReceipt 绑定 placement generation，Server 无 payload；Commit replication 的 route/ticket 控制链与 Agent/Gateway 协议边界已有代码 | 跨 Volume payload 的真实执行、断点续传 E2E、对象生命周期和 GC 编排 |
 | 读取面 | checkout、权限快照、固定 Commit FUSE、逻辑 Snapshot/SnapshotDelivery API、固定 Ready Snapshot 的 S3 只读 listener（均按 capability/placement 条件执行） | Shard 分页、mount lease、训练读取票据和生产读取 E2E |
 | 安全治理 | 本地路径安全、OIDC/JWKS、已注册接口的默认拒绝 RBAC、租户隐藏和 enrollment proof | RLS、完整资源授权/审计、密钥轮换和生产威胁模型 |
@@ -405,7 +406,12 @@ unavailable，禁止自动接管。
 - 已新增 `services/neoengram-gateway`、Agent edge/Central control/Replica peer listener、限额/health 和
   Kubernetes Deployment/Service/PDB/NetworkPolicy；Gateway Pod 无业务 Volume mount；
 - 已将 Agent 配置收敛为 GatewayPool endpoint + trust bundle 且无 Central fallback；Central 根据
-  Registry endpoint 建立 outbound 连接，Agent 请求转发、session 与 RouteLease 由 Central 原子判定；
+  Registry endpoint 建立 outbound 连接，Agent 请求转发、session 与 RouteLease 由 Central 原子判定；Agent
+  控制 channel 的 EOF、读写关闭/超时和无 ACK 会结束当前 session 并以有界退避重新建立 channel；重连期间
+  readiness 失败但 liveness 保持，未 ACK 的 durable report 按原 message identity 重放。Gateway route 暂时不可用
+  时返回 retryable `503`，身份、协议和 mount/owner generation 错误仍 fail-closed；旧 session/route fencing
+  只关闭当前 channel 并触发 Agent 重连。该行为已有单元回归测试，真实双 Replica
+  故障恢复 E2E 仍待完成；
 - 已实现最多一跳的 Replica forwarding：Central 只从 Registry 读取 owner/peer endpoint，source Gateway
   主动连接 owner peer listener，owner 校验 mTLS identity、Agent/connection/session/route generation 后
   原样投递 LF-terminated Agent frame；不可达返回 `route_unavailable`，不广播或抢占 owner；
@@ -824,8 +830,8 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
   `neoengram-agent -> domain/runtime`，controller/service 不绕过
   service，CLI 之外没有终端输出。新增 Gateway 后还必须验证其只依赖 domain 与网络/安全组件，
   不依赖 authority datasource、runtime/standalone 或 Volume adapter。
-- Gateway 协议与 HA：Schema/golden、帧大小、deadline、重复帧、错误映射、H2 背压、双 Replica 唯一
-  Agent owner、最多一跳 forwarding、租约过期与新 generation fencing。
+- Gateway 协议与 HA：Schema/golden、帧大小、deadline、重复帧、错误映射、H2 背压、Agent/Gateway 断线重连、
+  durable outbox 重放、双 Replica 唯一 Agent owner、最多一跳 forwarding、租约过期与新 generation fencing。
 - Gateway 安全：错误 URI SAN、跨集群证书、过期/撤销证书、peer credential directory 缺失/过期/旧
   fingerprint、activation token 重放、generation 不匹配、
   Central 下行和 Agent 上行 payload 篡改必须失败关闭。

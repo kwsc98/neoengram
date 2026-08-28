@@ -39,6 +39,7 @@ pub enum RuntimeHealthPhase {
     Bootstrapping,
     PendingApproval,
     ApprovedWaitingCertificate,
+    SessionReconnecting,
     SessionReady,
     Rejected,
     Expired,
@@ -428,6 +429,12 @@ mod tests {
             .set_phase(RuntimeHealthPhase::ApprovedWaitingCertificate)
             .unwrap();
         check_health(directory.path(), HealthMode::Startup).unwrap();
+        check_health(directory.path(), HealthMode::Live).unwrap();
+        assert!(check_health(directory.path(), HealthMode::Ready).is_err());
+
+        reporter
+            .set_phase(RuntimeHealthPhase::SessionReconnecting)
+            .unwrap();
         check_health(directory.path(), HealthMode::Live).unwrap();
         assert!(check_health(directory.path(), HealthMode::Ready).is_err());
 

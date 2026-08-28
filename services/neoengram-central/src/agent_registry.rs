@@ -25,6 +25,9 @@ pub const AGENT_ENROLLMENT_REVIEW_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const AGENT_BOOTSTRAP_STATUS_MAX_CLOCK_SKEW_MS: u64 = 60 * 1_000;
 pub const AGENT_ENROLLMENT_MAX_PAGE_SIZE: usize = 100;
 pub const AGENT_ENROLLMENT_MAX_QUERY_CHARS: usize = 256;
+/// Number of times the session-open aggregate may be re-read after a concurrent heartbeat or
+/// capability update wins the CAS between the service read and write.
+const AGENT_SESSION_OPEN_CAS_RETRIES: u8 = 3;
 /// Capability emitted only after an Agent has validated its Central ticket trust and QUIC data
 /// plane before opening a session.
 pub const AGENT_CAPABILITY_COMMIT_REPLICATION_QUIC_V1: &str = "commit_replication_quic_v1";
@@ -1294,20 +1297,44 @@ impl AgentRegistryService {
         &self,
         request: OpenAgentSessionRequest,
     ) -> CentralResult<OpenAgentSessionResult> {
-        let record = self.load_by_agent(&request.agent_id).await?;
-        let mut result = open_agent_session_against(
-            record,
-            &request,
-            self.clock.now(),
-            self.heartbeat_timeout_ms,
-        )?;
-        if !result.replayed {
-            result.record = self
+        let mut cas_retry = 0_u8;
+        loop {
+            // The read and replace are deliberately kept as one retryable unit. A heartbeat can
+            // advance this aggregate after the read but before the session-open CAS; reloading
+            // lets the same-boot replay/refresh rules decide whether the request is still safe.
+            let record = self.load_by_agent(&request.agent_id).await?;
+            let previous_resource_version = record.resource_version.get();
+            let mut result = open_agent_session_against(
+                record,
+                &request,
+                self.clock.now(),
+                self.heartbeat_timeout_ms,
+            )?;
+            if result.replayed {
+                return Ok(result);
+            }
+            match self
                 .repository
-                .replace(request.expected_resource_version.get(), result.record)
-                .await?;
+                .replace(previous_resource_version, result.record)
+                .await
+            {
+                Ok(record) => {
+                    result.record = record;
+                    return Ok(result);
+                }
+                Err(error)
+                    if error.code() == CentralErrorCode::ConcurrentUpdate
+                        && cas_retry < AGENT_SESSION_OPEN_CAS_RETRIES =>
+                {
+                    cas_retry = cas_retry.saturating_add(1);
+                    // Yield before the next read so the writer which won the CAS can commit and
+                    // the retry observes its complete aggregate rather than immediately racing
+                    // it again.
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(result)
     }
 
     pub async fn close_session(
@@ -2670,22 +2697,103 @@ pub(crate) fn open_agent_session_against(
         ));
     }
     if instance.active_boot_id.as_ref() == Some(&request.boot_id) {
-        if instance.session_open_expected_resource_version
-            != Some(request.expected_resource_version)
-        {
-            return Err(error(
-                CentralErrorCode::ConcurrentUpdate,
-                "session open replay payload differs from the persisted request",
-            ));
+        let session_open_expected_resource_version =
+            instance.session_open_expected_resource_version;
+        let capabilities_changed = request
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| instance.capabilities != *capabilities);
+        if capabilities_changed {
+            // A capability refresh is a second, idempotent session-open mutation for the same
+            // boot. The request may have been signed before a heartbeat was persisted (its ACK
+            // can be the packet that was lost), so the expected version is allowed to lag the
+            // current aggregate. The lower bound prevents an old in-flight refresh from
+            // overwriting a newer capability decision; the repository CAS still serializes the
+            // actual aggregate mutation.
+            let expected = request.expected_resource_version.get();
+            let last_open = session_open_expected_resource_version.map_or(0, |value| value.get());
+            if expected <= last_open || expected > record.resource_version.get() {
+                return Err(error(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "session open capability refresh was based on a stale ResourceVersion",
+                ));
+            }
+            let session_generation = instance.session_generation.ok_or_else(|| {
+                error(
+                    CentralErrorCode::Internal,
+                    "active session is missing its generation",
+                )
+            })?;
+            let session_id = instance.active_session_id.clone().ok_or_else(|| {
+                error(
+                    CentralErrorCode::Internal,
+                    "active session is missing its session ID",
+                )
+            })?;
+            {
+                let instance = record
+                    .instance
+                    .as_mut()
+                    .expect("instance was checked above");
+                instance.capabilities = request.capabilities.clone().unwrap_or_default();
+                instance.session_open_expected_resource_version =
+                    Some(request.expected_resource_version);
+            }
+            advance_resource_version(&mut record)?;
+            touch_storage_enrollment(&mut record, now);
+            return Ok(OpenAgentSessionResult {
+                session_id,
+                session_generation,
+                record,
+                replayed: false,
+            });
         }
         if request
             .capabilities
             .as_ref()
-            .is_some_and(|capabilities| instance.capabilities != *capabilities)
+            .is_some_and(|capabilities| instance.capabilities == *capabilities)
+        {
+            // A reconnect with the already-persisted capability set is read-only. Accept it even
+            // when a heartbeat advanced the aggregate after the last open request; this is the
+            // common lost-ACK path and does not need another resource-version mutation.
+            if session_open_expected_resource_version.is_some_and(|last| {
+                request.expected_resource_version.get() < last.get()
+                    || request.expected_resource_version.get() > record.resource_version.get()
+            }) {
+                return Err(error(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "session open replay payload predates the persisted capability decision",
+                ));
+            }
+            let session_generation = instance.session_generation.ok_or_else(|| {
+                error(
+                    CentralErrorCode::Internal,
+                    "active session is missing its generation",
+                )
+            })?;
+            let session_id = instance.active_session_id.clone().ok_or_else(|| {
+                error(
+                    CentralErrorCode::Internal,
+                    "active session is missing its session ID",
+                )
+            })?;
+            return Ok(OpenAgentSessionResult {
+                session_id,
+                session_generation,
+                record,
+                replayed: true,
+            });
+        }
+        if (request.capabilities.is_none()
+            && session_open_expected_resource_version != Some(request.expected_resource_version))
+            || (request.capabilities.is_some()
+                && session_open_expected_resource_version
+                    != Some(request.expected_resource_version)
+                && record.resource_version != request.expected_resource_version)
         {
             return Err(error(
                 CentralErrorCode::ConcurrentUpdate,
-                "session open replay capabilities differ from the persisted request",
+                "session open replay payload differs from the persisted request",
             ));
         }
         let session_generation = instance.session_generation.ok_or_else(|| {

@@ -28,6 +28,7 @@ use crate::{
     },
     error::{application_error, invalid_request, map_central_error},
     identity::{AuthenticatedIdentity, Permission},
+    RefreshReplicationRoutesRequest, ReplicationRouteBinding,
 };
 
 use super::CatalogService;
@@ -209,6 +210,46 @@ struct ReadyReplicationRoute {
     route_generation: RouteGeneration,
 }
 
+fn stored_replication_route_binding(
+    record: &crate::ReplicationRecord,
+    source: bool,
+) -> Option<ReplicationRouteBinding> {
+    let (
+        edge_cluster_id,
+        gateway_pool_id,
+        agent_id,
+        session_generation,
+        mount_generation,
+        route_generation,
+    ) = if source {
+        (
+            record.source_edge_cluster_id.clone(),
+            record.source_gateway_pool_id.clone(),
+            record.source_agent_id.clone(),
+            record.source_session_generation,
+            record.source_mount_generation,
+            record.source_route_generation,
+        )
+    } else {
+        (
+            record.target_edge_cluster_id.clone(),
+            record.target_gateway_pool_id.clone(),
+            record.target_agent_id.clone(),
+            record.target_session_generation,
+            record.target_mount_generation,
+            record.target_route_generation,
+        )
+    };
+    Some(ReplicationRouteBinding {
+        edge_cluster_id: edge_cluster_id?,
+        gateway_pool_id: gateway_pool_id?,
+        agent_id: agent_id?,
+        session_generation: session_generation?,
+        mount_generation: mount_generation?,
+        route_generation: route_generation?,
+    })
+}
+
 fn replication_route_unavailable(role: &str) -> Error {
     application_error(
         ErrorCategory::Unavailable,
@@ -261,6 +302,7 @@ impl CatalogService {
         &self,
         record: &crate::ReplicationRecord,
     ) -> Result<TransferTicket, Error> {
+        let mut record = record.clone();
         let repository = self.placement.as_ref().ok_or_else(|| {
             application_error(
                 ErrorCategory::Unavailable,
@@ -286,7 +328,7 @@ impl CatalogService {
         }
         let source_volume_id = record
             .source_storage_volume_id
-            .as_ref()
+            .clone()
             .ok_or_else(|| replication_route_unavailable("source"))?;
         let target_volume = self
             .repository
@@ -296,7 +338,7 @@ impl CatalogService {
             .ok_or_else(|| not_found("storage volume"))?;
         let source_volume = self
             .repository
-            .get_storage_volume(&record.tenant_id, source_volume_id)
+            .get_storage_volume(&record.tenant_id, &source_volume_id)
             .await
             .map_err(map_central_error)?
             .ok_or_else(|| not_found("source storage volume"))?;
@@ -306,6 +348,44 @@ impl CatalogService {
         let target_route = self
             .ready_replication_route(&record.tenant_id, &target_volume, "target")
             .await?;
+        let expected_source = stored_replication_route_binding(&record, true);
+        let expected_target = stored_replication_route_binding(&record, false);
+        let refreshed_source = ReplicationRouteBinding {
+            edge_cluster_id: source_route.edge_cluster_id.clone(),
+            gateway_pool_id: source_route.gateway_pool_id.clone(),
+            agent_id: source_route.agent_id.clone(),
+            session_generation: source_route.session_generation,
+            mount_generation: source_route.mount_generation,
+            route_generation: source_route.route_generation,
+        };
+        let refreshed_target = ReplicationRouteBinding {
+            edge_cluster_id: target_route.edge_cluster_id.clone(),
+            gateway_pool_id: target_route.gateway_pool_id.clone(),
+            agent_id: target_route.agent_id.clone(),
+            session_generation: target_route.session_generation,
+            mount_generation: target_route.mount_generation,
+            route_generation: target_route.route_generation,
+        };
+        // A live route may advance after a Gateway/Agent reconnect. Persist that rebind with a
+        // two-sided CAS before issuing a ticket so later queries and channel delivery converge on
+        // the same fence. Legacy rows missing route fields retain the existing read-only path.
+        if let (Some(expected_source), Some(expected_target)) = (expected_source, expected_target) {
+            if expected_source != refreshed_source || expected_target != refreshed_target {
+                record = repository
+                    .refresh_replication_routes(RefreshReplicationRoutesRequest {
+                        tenant_id: record.tenant_id.clone(),
+                        replication_id: record.replication_id.clone(),
+                        expected_attempt: record.attempt,
+                        expected_source,
+                        expected_target,
+                        source: refreshed_source,
+                        target: refreshed_target,
+                        updated_at_unix_ms: self.clock.now(),
+                    })
+                    .await
+                    .map_err(map_central_error)?;
+            }
+        }
         if record
             .source_edge_cluster_id
             .as_ref()

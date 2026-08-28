@@ -731,9 +731,20 @@ async fn loopback_h2_peer_forwarding_recovers_after_the_owner_lease_expires() {
             }),
         )
         .await;
+    let fenced_error = timeout(IO_TIMEOUT, fenced_agent.receive_line())
+        .await
+        .expect("fenced Agent response must include a structured error")
+        .expect("fenced Agent response must not close before the error frame");
+    let fenced_error = AgentChannelDownstreamFrame::decode_json(&fenced_error)
+        .expect("Gateway fencing error must be a valid Agent frame");
+    let AgentChannelDownstreamMessage::Error(fenced_error) = fenced_error.message else {
+        panic!("fenced Agent response must be a protocol error");
+    };
+    assert_eq!(fenced_error.code.as_str(), "GATEWAY_ROUTE_FENCED");
+    assert!(!fenced_error.retryable);
     assert!(timeout(IO_TIMEOUT, fenced_agent.receive_line())
         .await
-        .expect("fenced Agent response must close")
+        .expect("fenced Agent stream must close after the error")
         .is_none());
     drop(fenced_agent);
 

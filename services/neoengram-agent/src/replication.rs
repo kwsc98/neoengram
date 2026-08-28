@@ -26,6 +26,11 @@ use crate::{
     QuicTransferNetwork, SharedSessionFence,
 };
 
+const REMOTE_TRANSFER_MAX_RETRIES: u32 = 8;
+const REMOTE_TRANSFER_INITIAL_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(100);
+const REMOTE_TRANSFER_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn block_on<F>(future: F) -> F::Output
 where
     F: Future,
@@ -204,53 +209,99 @@ impl ReplicationAssignmentExecutor for MountedVolumeReplicationExecutor {
             };
             progress.state(&assignment.replication_id, ReplicationState::Planning)?;
             progress.state(&assignment.replication_id, ReplicationState::Transferring)?;
-            let connection = block_on(network.connect_gateway()).map_err(|error| {
-                let _ = progress.state(&assignment.replication_id, ReplicationState::Failed);
-                AgentDaemonError::Session(format!(
-                    "target Gateway replication connection failed: {error}"
-                ))
-            })?;
-            let identity = match (&self.session_fence, self.local_mount_generation) {
-                (Some(session_fence), Some(local_mount_generation)) => {
-                    let current = session_fence.get().inspect_err(|_| {
-                        let _ =
-                            progress.state(&assignment.replication_id, ReplicationState::Failed);
-                    })?;
-                    if ticket.session_generation != current.session_generation
-                        || ticket.mount_generation != local_mount_generation
-                    {
-                        return Self::fail(
-                            assignment,
-                            progress,
-                            "replication ticket target session or mount generation is stale",
-                        );
+            let mut retry_delay = REMOTE_TRANSFER_INITIAL_RETRY_DELAY;
+            let mut transfer_error = None;
+            let transfer_result = 'transfer: {
+                for retry in 0..=REMOTE_TRANSFER_MAX_RETRIES {
+                    let now = self.clock.now_unix_ms()?;
+                    if now >= ticket.deadline_unix_ms.get() {
+                        transfer_error = Some(crate::QuicTransferError::Expired);
+                        break;
                     }
-                    QuicTransferIdentity::new(self.local_agent_id.clone()).with_session_mount(
-                        current.session_generation.get(),
-                        local_mount_generation.get(),
-                    )
+                    let identity = match (&self.session_fence, self.local_mount_generation) {
+                        (Some(session_fence), Some(local_mount_generation)) => {
+                            let current = session_fence.get().inspect_err(|_| {
+                                let _ = progress
+                                    .state(&assignment.replication_id, ReplicationState::Failed);
+                            })?;
+                            if ticket.session_generation != current.session_generation
+                                || ticket.mount_generation != local_mount_generation
+                            {
+                                return Self::fail(
+                                    assignment,
+                                    progress,
+                                    "replication ticket target session or mount generation is stale",
+                                );
+                            }
+                            QuicTransferIdentity::new(self.local_agent_id.clone())
+                                .with_session_mount(
+                                    current.session_generation.get(),
+                                    local_mount_generation.get(),
+                                )
+                        }
+                        // Test/embedded callers that do not own a live Agent session retain the
+                        // strict static identity API. Production startup always supplies the
+                        // shared fence.
+                        _ => QuicTransferIdentity::new(self.local_agent_id.clone())
+                            .with_generations(
+                                ticket.session_generation.get(),
+                                ticket.mount_generation.get(),
+                                ticket.route_generation.get(),
+                            ),
+                    };
+                    let attempt = block_on(network.connect_gateway()).and_then(|connection| {
+                        block_on(crate::run_quic_sink_stream(
+                            connection,
+                            &assignment.signed_ticket,
+                            &assignment.object_set,
+                            &target,
+                            trust_bundle,
+                            now,
+                            QuicTransferClientConfig::default(),
+                            Some(identity),
+                        ))
+                    });
+                    match attempt {
+                        Ok(()) => break 'transfer Ok(()),
+                        Err(error)
+                            if (error.is_transient()
+                                || matches!(error, crate::QuicTransferError::Expired))
+                                && retry < REMOTE_TRANSFER_MAX_RETRIES
+                                && self.clock.now_unix_ms()? < ticket.deadline_unix_ms.get() =>
+                        {
+                            tracing::debug!(
+                                replication_id = %assignment.replication_id,
+                                retry,
+                                error = %error,
+                                "remote replication transport is unavailable; retrying"
+                            );
+                            std::thread::sleep(retry_delay);
+                            retry_delay = retry_delay
+                                .saturating_mul(2)
+                                .min(REMOTE_TRANSFER_MAX_RETRY_DELAY);
+                        }
+                        Err(error) => {
+                            transfer_error = Some(error);
+                            break;
+                        }
+                    }
                 }
-                // Test/embedded callers that do not own a live Agent session retain the strict
-                // static identity API. Production startup always supplies the shared fence.
-                _ => QuicTransferIdentity::new(self.local_agent_id.clone()).with_generations(
-                    ticket.session_generation.get(),
-                    ticket.mount_generation.get(),
-                    ticket.route_generation.get(),
-                ),
+                Err(transfer_error
+                    .take()
+                    .unwrap_or(crate::QuicTransferError::Expired))
             };
-            block_on(crate::run_quic_sink_stream(
-                connection,
-                &assignment.signed_ticket,
-                &assignment.object_set,
-                &target,
-                trust_bundle,
-                self.clock.now_unix_ms()?,
-                QuicTransferClientConfig::default(),
-                Some(identity),
-            ))
-            .map_err(|error| {
-                let _ = progress.state(&assignment.replication_id, ReplicationState::Failed);
-                AgentDaemonError::Session(format!("remote replication transfer failed: {error}"))
+            transfer_result.map_err(|error| {
+                let transient =
+                    error.is_transient() || matches!(error, crate::QuicTransferError::Expired);
+                if !transient {
+                    let _ = progress.state(&assignment.replication_id, ReplicationState::Failed);
+                }
+                let message = format!("remote replication transfer failed: {error}");
+                if transient {
+                    AgentDaemonError::SessionTransport(message)
+                } else {
+                    AgentDaemonError::Session(message)
+                }
             })?;
             progress.state(&assignment.replication_id, ReplicationState::Verifying)?;
             for object in &assignment.object_set.objects {

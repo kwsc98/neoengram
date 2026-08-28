@@ -224,6 +224,15 @@ Replica --按需 H2+mTLS--> same-pool/remote-pool peer endpoint
 Agent 连接 Pool 服务地址，负载均衡到任意 Ready Replica。Agent 只保持一个活动 Gateway 连接；断线后以
 有界退避重新解析 Pool 地址并连接，不同时维持多个可投递 session。
 
+Agent 控制 channel 的 EOF、读取错误、写入关闭或写入超时都只结束当前 channel，并进入上述重连循环；
+已持久化但尚未收到 ACK 的报告继续留在 Agent outbox，重连后按原 message identity 重放。Gateway 控制
+连接断开时立即调度旧 RouteLease 释放；单次 Authority 清理 RPC 最多等待 1 秒，整次替换最多等待 3 秒。
+如果 Authority 或清理任务卡住，仍允许新 session 建立，旧 route 由 generation fencing 和最长 30 秒的 lease
+TTL 兜底回收。Agent 通过 Gateway 建立新 session 时，如果旧 RouteLease 仍在清理窗口内，Central 返回可
+重试的 `503 GATEWAY_ROUTE_UNAVAILABLE`（带 1 秒重试提示），而不是把暂时不可达误报为 bootstrap 拒绝。
+身份、协议、签名和未知错误仍保持失败关闭；明确的旧 session/route fencing 只关闭当前 channel，Agent 随后
+以有界退避重新打开 session 并重新绑定当前 route。
+
 Central 可以与 Pool 内多个 Replica 建立连接。控制命令先按 Central 的 AgentRouteLease 选择 owner
 Replica；如果 Central 当前连接的是非 owner Replica，则该 Replica 最多转发一跳到 owner。禁止广播、
 多跳转发和非 owner 自行抢占。owner 不可达时返回 `GATEWAY_ROUTE_UNAVAILABLE`，并触发 Central 刷新
@@ -249,7 +258,8 @@ Agent stream 的 data/end 帧 envelope `request_id` 必须与对应 open 帧一�
 容量驱逐在有效窗口内重新投递同一 payload。
 
 Gateway 错误分为可重试不可达、已过期/被 fencing、身份或 scope 拒绝、协议错误和资源耗尽。身份、
-签名、generation 或租户 scope 错误必须失败关闭，不能转为重试或降级到明文连接。
+签名、mount/owner generation 或租户 scope 错误必须失败关闭，不能转为重试或降级到明文连接；仅代表
+旧控制 channel 的 session/route fencing 会触发 Agent 重连。
 
 ### 5.3 Replica peer 凭证目录
 

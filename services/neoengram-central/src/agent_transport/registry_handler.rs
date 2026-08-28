@@ -1353,16 +1353,33 @@ fn map_registry_error(error: CentralError) -> AgentHttpError {
         CentralErrorCode::StorageFailure | CentralErrorCode::Internal => {
             AgentHttpError::unavailable()
         }
+        // A route can disappear while a Gateway replica is restarting or while its lease is
+        // being refreshed. Keep this distinct from bootstrap denial so an approved Agent can
+        // retain its boot identity and retry session.open after the route recovers.
+        CentralErrorCode::GatewayRouteUnavailable => AgentHttpError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GATEWAY_ROUTE_UNAVAILABLE",
+            "Gateway route is temporarily unavailable",
+            true,
+        )
+        .with_retry_after_ms(1_000),
         CentralErrorCode::ProtocolInvalid => AgentHttpError::protocol_invalid(),
         CentralErrorCode::GenerationMismatch => AgentHttpError::session_fenced(),
-        CentralErrorCode::ConcurrentUpdate | CentralErrorCode::AgentSessionActive => {
-            AgentHttpError::new(
-                StatusCode::CONFLICT,
-                "AGENT_ACTION_CONFLICT",
-                "Agent action conflicts with authoritative state",
-                true,
-            )
-        }
+        CentralErrorCode::ConcurrentUpdate => AgentHttpError::new(
+            StatusCode::CONFLICT,
+            "AGENT_ACTION_CONFLICT",
+            "Agent action conflicts with authoritative state",
+            true,
+        ),
+        // A different boot currently owns the session. This is an authoritative takeover, not a
+        // transient CAS race; retrying it forever would leave a duplicate Agent looking healthy
+        // while it can never become the owner of the session.
+        CentralErrorCode::AgentSessionActive => AgentHttpError::new(
+            StatusCode::CONFLICT,
+            "AGENT_ACTION_CONFLICT",
+            "Agent action conflicts with authoritative state",
+            false,
+        ),
         CentralErrorCode::JobNotFound | CentralErrorCode::EnrollmentNotFound => {
             AgentHttpError::new(
                 StatusCode::NOT_FOUND,
@@ -1842,5 +1859,28 @@ mod tests {
         assert_eq!(mapped.status, StatusCode::CONFLICT);
         assert_eq!(mapped.code, "AGENT_SESSION_FENCED");
         assert!(!mapped.detail.contains("generation"));
+    }
+
+    #[test]
+    fn unavailable_gateway_routes_are_retryable_for_approved_agents() {
+        let mapped = map_registry_error(CentralError::new(
+            CentralErrorCode::GatewayRouteUnavailable,
+            "owner replica is restarting",
+        ));
+        assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.code, "GATEWAY_ROUTE_UNAVAILABLE");
+        assert!(mapped.retryable);
+        assert_eq!(mapped.retry_after_ms, Some(1_000));
+    }
+
+    #[test]
+    fn active_session_conflict_is_not_retryable_for_a_duplicate_agent() {
+        let mapped = map_registry_error(CentralError::new(
+            CentralErrorCode::AgentSessionActive,
+            "another boot owns the session",
+        ));
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.code, "AGENT_ACTION_CONFLICT");
+        assert!(!mapped.retryable);
     }
 }
