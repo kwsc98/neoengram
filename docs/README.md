@@ -8,6 +8,7 @@
 | --- | --- |
 | 安装并完成第一次本地操作 | [`reference/cli.md`](reference/cli.md) |
 | 了解当前源码、运行时和存储边界 | [`architecture/code.md`](architecture/code.md)、[`architecture/storage.md`](architecture/storage.md) |
+| 评审 Commit 多源物化 v2 方案 | [`architecture/commit-materialization-v2.md`](architecture/commit-materialization-v2.md) |
 | 了解 Central、Agent、协议和安全边界 | [`architecture/control-plane.md`](architecture/control-plane.md) |
 | 了解 Gateway 拓扑、HA 和数据路径 | [`architecture/gateway.md`](architecture/gateway.md) |
 | 了解产品资源、用户流程和 Web 语义 | [`product.md`](product.md) |
@@ -42,6 +43,7 @@ docs/
 ├── roadmap.md
 ├── architecture/
 │   ├── code.md
+│   ├── commit-materialization-v2.md
 │   ├── control-plane.md
 │   ├── gateway.md
 │   └── storage.md

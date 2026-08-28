@@ -6,6 +6,10 @@
 > provisioner 与真实双 Replica 故障演练仍属于部署验收项。Gateway 也没有任何 Volume/CAS I/O 能力；其专项设计见
 > [`gateway.md`](gateway.md)。
 
+关于 Commit 对象分散在多个 Volume、按对象建立覆盖并由多个来源物化到目标 Volume 的 v2 调研与目标设计，见
+[`commit-materialization-v2.md`](commit-materialization-v2.md)。该报告是未实现的设计结论；当前 replication
+能力仍按本文件和 [`roadmap.md`](../roadmap.md) 所述的完整 PlacementSet 前置条件执行。
+
 NeoEngram `0.2.0` 的本地仓库格式为 9。升级允许破坏兼容性：实现明确拒绝所有旧
 格式，不读取、不迁移，也不提供自动回退。仓库格式 9 将可移植内容模型和规范 digest 收敛到
 `neoengram-domain`，本地 SQLite/文件系统实现统一留在 `neoengram-runtime`。

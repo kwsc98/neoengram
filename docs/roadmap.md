@@ -7,7 +7,7 @@
 > Gateway 的连接、安全、HA、数据传输和 S3 专项边界见
 > [`architecture/gateway.md`](architecture/gateway.md)。
 
-最后更新：2026-08-24
+最后更新：2026-08-28
 当前阶段：`0.2.0` P0、中心 `AuthorityStore`/SQLite 默认后端，以及 Volume-bound Agent enrollment、
 本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；`neoengram-central` 提供用户 API，Agent
 action/控制 channel 经 Gateway H2 转发（Central 内的 Hyper raw-body adapter 仅用于 loopback/测试，不是
@@ -454,6 +454,16 @@ endpoint 的切换验收仍待完成。
 验收：跨租户、错误 route/scope、过期 Ticket 和损坏对象全部硬失败；Central/Gateway durable storage
 与备份均无 payload；任一中断点不会发布半成品 placement。
 
+#### G2 v2 目标设计（未实现）
+
+Commit 多源对象物化调研已形成独立目标设计，见
+[`architecture/commit-materialization-v2.md`](architecture/commit-materialization-v2.md)。该设计建议在开发阶段
+进行 clean-slate 破坏性升级：用对象级 `ObjectPlacement`、`VolumeCommitCoverage`、`MaterializationJob`
+和多源 `MaterializationBatch` 取代完整单盘 `CommitPlacementSet` 与单源 `ReplicationRecord`，并引入必填
+`ObjectNamespaceId`、对象级租约、稳定 staging identity 和 plan revision。当前 G2 代码仍按 v1 完整
+PlacementSet 前置条件工作；本报告不改变当前能力状态，v2 只有在 Domain、Authority、Agent/Gateway、
+OpenAPI/Web 和跨节点 E2E 全部验收后才能移动到已实现。
+
 ### G3：固定版本只读 S3
 
 状态：**进行中；Central/Gateway 只读实现和契约已具备，生产凭据、readiness 与跨节点 E2E 待验收**
@@ -892,3 +902,4 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-08-09 | 确认每个 EdgeCluster 一个多副本 NeoEngram GatewayPool，Central 和 Agent 均经 Gateway 建立控制链路 | Gateway 成为固定区域入口和后续跨集群/S3 边界；Central 仍是 metadata authority，Volume Owner Agent 仍是唯一 Volume I/O 执行者；当前 Agent 直连 Server 和可选 Volume-bound Gateway 仅作为历史基线 |
 | 2026-08-10 | 校正 G2/G3、Web 配置与 GatewayPool readiness 的未完成边界 | 当时 G2/G3 数据面仍按后续流程记录；静态 Web 构建必须绑定一个 GatewayPool EdgeCluster，Pool `Ready` 仍需外部 observed readiness/failover 证据；架构检查守护 Web binding，不改变 Central 授权或后端协议 |
 | 2026-08-24 | 以源码、action registry、测试和 Web 路由重新校准当前能力 | 85 条公开契约中 82 条已由 Central descriptor 安装，3 条 Snapshot file/activity/profile 为 contract-only；逻辑 Snapshot、SnapshotDelivery、Commit replication 控制链和只读 S3 已有代码，但 derived Artifact、真实 Agent/Gateway 数据执行、生产凭据和跨节点 E2E 仍按条件或未实现处理 |
+| 2026-08-28 | 完成 Commit 多源对象物化 v2 调研并登记为目标设计 | 当前单源完整 PlacementSet 模型无法表达多 Volume 对象并集；报告固定对象级副本、Coverage、MaterializationJob/Batch、namespace、健康维度、租约和 clean-slate 协议迁移边界；未改变 v1 当前实现状态 |
