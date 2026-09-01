@@ -552,10 +552,12 @@ describe('Artifact catalog detail', () => {
     expect(api.queryCommitReplicationList).toHaveBeenCalledWith({
       tenant_id: 'tenant-a',
       commit_id: headCommitId,
+      object_namespace_id: 'artifact-a',
     });
     expect(api.queryCommitPlacementList).toHaveBeenCalledWith({
       tenant_id: 'tenant-a',
       commit_id: headCommitId,
+      object_namespace_id: 'artifact-a',
     });
     expect(api.queryGatewayPoolList).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain('路由由 Central 校验');

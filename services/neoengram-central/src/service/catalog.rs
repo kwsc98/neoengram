@@ -33,13 +33,17 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use fusen_rs::{Error, ErrorCategory};
 use neoengram_domain::core::{CommitId, ContentDigest, FileRecord, LogicalPath};
+use neoengram_domain::protocol::materialization::{
+    CoverageState, DurabilityPolicy, NamespaceObjectSet, ObjectPlacement, VolumeCommitCoverage,
+};
 use neoengram_domain::protocol::{
-    presign_s3_get, AgentId, ArtifactId, CommitDataLayout, DeletionCompletion, DeletionId,
-    DeletionOperation, DeletionOperationState, EdgeClusterId, GatewayOpaqueBytes, GatewayPoolId,
-    GatewayS3ReadRevocation, HardlinkPolicy, IndexRevision, JobId, LifecycleGeneration,
-    MountGeneration, OwnerGeneration, PlaygroundId, ProjectId, PvcIdentityDigest, RequestId,
-    ResourceLifecycle, ResourceLifecycleState, ResourceRef, ResourceVersion, RetentionHold,
-    RetentionHoldId, RetentionHoldState, S3AccessPointId, S3AuthorizeOperation, S3AuthorizeRequest,
+    presign_s3_get, AgentId, ArtifactId, CommitDataLayout, CommitObject, DataHealth,
+    DeletionCompletion, DeletionId, DeletionOperation, DeletionOperationState, EdgeClusterId,
+    GatewayOpaqueBytes, GatewayPoolId, GatewayS3ReadRevocation, HardlinkPolicy, IndexRevision,
+    JobId, LifecycleGeneration, MountGeneration, ObjectNamespaceId, ObjectSet, OwnerGeneration,
+    PlacementGeneration, PlaygroundId, ProjectId, PvcIdentityDigest, RequestId, ResourceLifecycle,
+    ResourceLifecycleState, ResourceRef, ResourceVersion, RetentionHold, RetentionHoldId,
+    RetentionHoldState, S3AccessPointId, S3AuthorizeOperation, S3AuthorizeRequest,
     S3AuthorizeResponse, S3AuthorizedObject, S3CredentialId, S3PresignRequest, S3ReadTicket,
     SessionGeneration, SnapshotDeliveryMode, SnapshotDeliveryPolicy, SnapshotId, StorageVolumeId,
     TenantId, UnixMillis, WireIndexVersion,
@@ -123,6 +127,50 @@ pub trait StorageAvailabilityProvider: Send + Sync {
         _storage_volume_id: &StorageVolumeId,
     ) -> crate::CentralResult<Option<u64>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod v2_readiness_tests {
+    use super::*;
+
+    fn coverage(state: CoverageState) -> VolumeCommitCoverage {
+        VolumeCommitCoverage {
+            tenant_id: TenantId::new("tenant-v2").unwrap(),
+            object_namespace_id: ObjectNamespaceId::new("artifact-v2").unwrap(),
+            commit_id: CommitId::from_bytes([1; 32]),
+            storage_volume_id: StorageVolumeId::new("volume-v2").unwrap(),
+            placement_generation: PlacementGeneration::new(1),
+            object_set_digest: ContentDigest::from_bytes([2; 32]),
+            object_count: neoengram_domain::protocol::DecimalU64::new(2),
+            verified_object_count: neoengram_domain::protocol::DecimalU64::new(
+                if state == CoverageState::Complete {
+                    2
+                } else {
+                    1
+                },
+            ),
+            total_bytes: neoengram_domain::protocol::DecimalU64::new(10),
+            verified_bytes: neoengram_domain::protocol::DecimalU64::new(
+                if state == CoverageState::Complete {
+                    10
+                } else {
+                    4
+                },
+            ),
+            state,
+        }
+    }
+
+    #[test]
+    fn only_complete_v2_coverage_is_readable() {
+        assert!(!CatalogService::v2_coverage_is_readable(None));
+        assert!(!CatalogService::v2_coverage_is_readable(Some(&coverage(
+            CoverageState::Partial
+        ))));
+        assert!(CatalogService::v2_coverage_is_readable(Some(&coverage(
+            CoverageState::Complete
+        ))));
     }
 }
 
@@ -304,6 +352,11 @@ pub struct CatalogService {
     pub(crate) agent_registry: Option<Arc<AgentRegistryService>>,
     pub(crate) gateway_registry: Option<Arc<dyn crate::GatewayRegistryRepository>>,
     pub(crate) placement: Option<Arc<dyn crate::PlacementRepository>>,
+    /// Namespace-scoped durability policy overrides.  The default policy is one verified copy in
+    /// one failure domain; callers can install a stricter policy at composition time without
+    /// making durability an implicit property of a complete Volume.
+    pub(crate) default_durability_policy: DurabilityPolicy,
+    pub(crate) durability_policies: BTreeMap<(TenantId, ObjectNamespaceId), DurabilityPolicy>,
     pub(crate) replication_ticket_keyring: Option<Arc<CentralCommandKeyring>>,
     lifecycle_objects: Option<Arc<dyn crate::ObjectCatalog>>,
     lifecycle_authority: Option<Arc<dyn AuthorityLifecycleRepository>>,
@@ -314,6 +367,10 @@ pub struct CatalogService {
 }
 
 impl CatalogService {
+    pub(crate) fn v2_coverage_is_readable(coverage: Option<&VolumeCommitCoverage>) -> bool {
+        coverage.is_some_and(|coverage| coverage.state == CoverageState::Complete)
+    }
+
     #[must_use]
     pub fn new(
         repository: Arc<dyn ControlCatalogRepository>,
@@ -338,6 +395,8 @@ impl CatalogService {
             agent_registry: None,
             gateway_registry: None,
             placement: None,
+            default_durability_policy: DurabilityPolicy::default(),
+            durability_policies: BTreeMap::new(),
             replication_ticket_keyring: None,
             lifecycle_objects: None,
             lifecycle_authority: None,
@@ -416,6 +475,36 @@ impl CatalogService {
         placement: Arc<dyn crate::PlacementRepository>,
     ) -> Self {
         self.placement = Some(placement);
+        self
+    }
+
+    /// Installs the policy used when a namespace has no explicit override.
+    ///
+    /// Policy validation is performed while composing the service so an invalid deployment
+    /// cannot silently weaken an availability decision at request time.
+    #[must_use]
+    pub fn with_default_durability_policy(mut self, policy: DurabilityPolicy) -> Self {
+        policy
+            .validate()
+            .expect("default durability policy must satisfy protocol constraints");
+        self.default_durability_policy = policy;
+        self
+    }
+
+    /// Installs a durability policy for one tenant/namespace pair.  Namespace IDs are not
+    /// globally unique, so the tenant remains part of the lookup key.
+    #[must_use]
+    pub fn with_durability_policy(
+        mut self,
+        tenant_id: TenantId,
+        object_namespace_id: ObjectNamespaceId,
+        policy: DurabilityPolicy,
+    ) -> Self {
+        policy
+            .validate()
+            .expect("durability policy must satisfy protocol constraints");
+        self.durability_policies
+            .insert((tenant_id, object_namespace_id), policy);
         self
     }
 
@@ -3055,6 +3144,11 @@ impl CatalogService {
             .await
             .map_err(map_central_error)?
             .ok_or_else(|| resource_not_found("commit"))?;
+        // Listing is part of the S3 read view as well.  Resolve the current complete v2 target
+        // Coverage and live route before exposing logical keys; a frozen Snapshot index alone is
+        // not evidence that any Volume can serve the corresponding bytes.
+        self.resolve_s3_route_for_commit(&tenant_id, &commit, self.clock.now())
+            .await?;
         let scope = S3ObjectCursorScope {
             access_point_id: access_point.access_point_id.to_string(),
             policy_generation: access_point.policy_generation,
@@ -3422,6 +3516,237 @@ impl CatalogService {
     /// Resolves the current data placement and Gateway route for a Commit. Access Point records
     /// intentionally do not cache this information: Volume failures, replica promotion and
     /// Gateway route changes must take effect without rewriting S3 metadata.
+    pub(crate) async fn v2_commit_coverage_for_volume(
+        &self,
+        tenant_id: &TenantId,
+        artifact_id: &ArtifactId,
+        commit: &CommitRecord,
+        volume_id: &StorageVolumeId,
+        expected_generation: Option<PlacementGeneration>,
+    ) -> Result<Option<VolumeCommitCoverage>, Error> {
+        let Some(placement_authority) = self.placement.as_ref() else {
+            return Ok(None);
+        };
+        let stored = placement_authority
+            .get_commit_object_set(tenant_id, &ContentDigest::from(commit.commit_id))
+            .await
+            .map_err(map_central_error)?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored.tenant_id != *tenant_id
+            || stored.commit_id.digest() != ContentDigest::from(commit.commit_id)
+            || stored.object_set.object_set_digest != commit.object_set_digest
+        {
+            return Ok(None);
+        }
+        let namespace = ObjectNamespaceId::new(artifact_id.to_string())
+            .map_err(|error| invalid_request(format!("object namespace: {error}")))?;
+        let object_set =
+            neoengram_domain::protocol::materialization::NamespaceObjectSet::from_object_set(
+                tenant_id.clone(),
+                namespace.clone(),
+                stored.commit_id,
+                &stored.object_set,
+            )
+            .map_err(|error| invalid_request(format!("commit object set: {error}")))?;
+        let mut placements = Vec::<ObjectPlacement>::new();
+        for object in &object_set.objects {
+            placements.extend(
+                placement_authority
+                    .object_placements_v2(tenant_id, &namespace, &object.object_id)
+                    .await
+                    .map_err(map_central_error)?
+                    .into_iter()
+                    .filter(|placement| {
+                        placement.readable()
+                            && placement.tenant_id == *tenant_id
+                            && placement.object_namespace_id == namespace
+                            && placement.matches_ref(object)
+                    }),
+            );
+        }
+        // In a live composition the owner generation is the authoritative physical fence. Do
+        // not select the newest historical Placement row: after a Volume takeover, an old
+        // generation may still describe a complete object set that the current Agent cannot
+        // serve. Metadata-only compositions have no owner provider, so retain the deterministic
+        // historical fallback used by offline/catalog tests.
+        let generation = if let Some(expected) = expected_generation {
+            Some(expected)
+        } else if let Some(provider) = &self.s3_placement {
+            provider
+                .current_placement(tenant_id, volume_id)
+                .await
+                .map_err(map_central_error)?
+                .map(|placement| PlacementGeneration::new(placement.owner_generation.get()))
+        } else {
+            placements
+                .iter()
+                .filter(|placement| placement.storage_volume_id.as_ref() == Some(volume_id))
+                .map(|placement| placement.placement_generation)
+                .max()
+                .or_else(|| {
+                    object_set
+                        .objects
+                        .is_empty()
+                        .then_some(PlacementGeneration::new(1))
+                })
+        };
+        let Some(generation) = generation else {
+            return Ok(None);
+        };
+        let legacy_object_set = ObjectSet::new(
+            object_set
+                .objects
+                .iter()
+                .map(|object| {
+                    CommitObject::new(
+                        object.object_id,
+                        object.size.get(),
+                        object.encoding,
+                        object.ordinal.get(),
+                    )
+                })
+                .collect(),
+        )
+        .map_err(|error| invalid_request(format!("commit object set: {error}")))?;
+        let coverage = VolumeCommitCoverage::from_placements(
+            tenant_id.clone(),
+            namespace,
+            stored.commit_id,
+            volume_id.clone(),
+            generation,
+            &legacy_object_set,
+            &placements,
+        )
+        .map_err(|error| invalid_request(format!("coverage: {error}")))?;
+        Ok(Some(coverage))
+    }
+
+    /// Computes Commit content health from namespace-scoped v2 object evidence.
+    ///
+    /// A Commit is not considered readable merely because a legacy PlacementSet exists.  Every
+    /// object in the immutable ObjectSet must have at least one matching, verified v2 Placement;
+    /// non-readable evidence is retained as a degraded signal when another copy is available.
+    /// `None` means that placement authority is not configured, preserving metadata-only catalog
+    /// compositions without reintroducing a legacy read fallback.
+    pub(crate) async fn v2_commit_data_health(
+        &self,
+        tenant_id: &TenantId,
+        artifact_id: &ArtifactId,
+        commit: &CommitRecord,
+    ) -> Result<Option<DataHealth>, Error> {
+        let Some(placement_authority) = self.placement.as_ref() else {
+            return Ok(None);
+        };
+        let commit_digest = ContentDigest::from(commit.commit_id);
+        let Some(stored) = placement_authority
+            .get_commit_object_set(tenant_id, &commit_digest)
+            .await
+            .map_err(map_central_error)?
+        else {
+            return Ok(Some(DataHealth::Unavailable));
+        };
+        if stored.tenant_id != *tenant_id
+            || stored.commit_id.digest() != commit_digest
+            || stored.object_set.object_set_digest != commit.object_set_digest
+        {
+            return Ok(Some(DataHealth::Unavailable));
+        }
+        let namespace = ObjectNamespaceId::new(artifact_id.to_string())
+            .map_err(|error| invalid_request(format!("object namespace: {error}")))?;
+        let object_set = NamespaceObjectSet::from_object_set(
+            tenant_id.clone(),
+            namespace.clone(),
+            stored.commit_id,
+            &stored.object_set,
+        )
+        .map_err(|error| invalid_request(format!("commit object set: {error}")))?;
+        Ok(Some(
+            self.v2_object_set_data_health(tenant_id, &namespace, &object_set)
+                .await?,
+        ))
+    }
+
+    /// Resolves v2 content health when only the authority Commit ObjectSet digest is available.
+    /// This is used by placement/workspace actions that do not load the richer catalog
+    /// `CommitRecord`; the namespace remains explicit so object evidence cannot cross Artifact
+    /// boundaries.
+    pub(crate) async fn v2_commit_data_health_for_digest(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &ObjectNamespaceId,
+        commit_digest: &ContentDigest,
+    ) -> Result<Option<DataHealth>, Error> {
+        let Some(placement_authority) = self.placement.as_ref() else {
+            return Ok(None);
+        };
+        let Some(stored) = placement_authority
+            .get_commit_object_set(tenant_id, commit_digest)
+            .await
+            .map_err(map_central_error)?
+        else {
+            return Ok(Some(DataHealth::Unavailable));
+        };
+        if stored.tenant_id != *tenant_id || stored.commit_id.digest() != *commit_digest {
+            return Ok(Some(DataHealth::Unavailable));
+        }
+        let object_set = NamespaceObjectSet::from_object_set(
+            tenant_id.clone(),
+            object_namespace_id.clone(),
+            stored.commit_id,
+            &stored.object_set,
+        )
+        .map_err(|error| invalid_request(format!("commit object set: {error}")))?;
+        Ok(Some(
+            self.v2_object_set_data_health(tenant_id, object_namespace_id, &object_set)
+                .await?,
+        ))
+    }
+
+    async fn v2_object_set_data_health(
+        &self,
+        tenant_id: &TenantId,
+        namespace: &ObjectNamespaceId,
+        object_set: &NamespaceObjectSet,
+    ) -> Result<DataHealth, Error> {
+        let placement_authority = self.placement.as_ref().ok_or_else(|| {
+            application_error(
+                ErrorCategory::Unavailable,
+                "placement_authority_unavailable",
+                "PLACEMENT_AUTHORITY_UNAVAILABLE",
+                "placement authority is not configured",
+                true,
+            )
+        })?;
+        let mut degraded = false;
+        for object in &object_set.objects {
+            let placements = placement_authority
+                .object_placements_v2(tenant_id, namespace, &object.object_id)
+                .await
+                .map_err(map_central_error)?;
+            let matching = placements
+                .iter()
+                .filter(|placement| {
+                    placement.tenant_id == *tenant_id
+                        && placement.object_namespace_id == *namespace
+                        && placement.matches_ref(object)
+                })
+                .collect::<Vec<_>>();
+            if !matching.iter().any(|placement| placement.readable()) {
+                return Ok(DataHealth::Unavailable);
+            }
+            if matching.iter().any(|placement| !placement.readable()) {
+                degraded = true;
+            }
+        }
+        Ok(if degraded {
+            DataHealth::Degraded
+        } else {
+            DataHealth::Available
+        })
+    }
+
     async fn resolve_s3_route_for_commit(
         &self,
         tenant_id: &TenantId,
@@ -3448,52 +3773,50 @@ impl CatalogService {
             .placement
             .as_ref()
             .ok_or_else(s3_snapshot_unavailable)?;
-        // S3 is placement-first: only a published complete PlacementSet can make a Commit
-        // readable.  The logical Commit has no physical source Volume fallback, even when its
-        // historical publication metadata happens to contain one.
+        // S3 is placement-first: only a complete v2 Coverage on a single Volume can make a
+        // Commit readable. A global object union or legacy publication is insufficient.
         let commit_digest = ContentDigest::from(commit.commit_id);
-        let object_set = placement_authority
+        let mut volume_ids = Vec::new();
+        let stored = placement_authority
             .get_commit_object_set(tenant_id, &commit_digest)
             .await
             .map_err(map_central_error)?
             .ok_or_else(s3_snapshot_unavailable)?;
-        let published_sets = placement_authority
-            .published_placement_sets(tenant_id, &commit_digest)
-            .await
-            .map_err(map_central_error)?;
-        let mut volume_ids = Vec::new();
-        for placement_set in published_sets {
-            let Some(volume_id) = placement_set.storage_volume_id.clone() else {
-                continue;
-            };
-            if placement_set.object_set_digest != object_set.object_set.object_set_digest
-                || placement_set.object_count.get() != object_set.object_set.object_count() as u64
+        let namespace = ObjectNamespaceId::new(commit.artifact_id.to_string())
+            .map_err(|_| s3_snapshot_unavailable())?;
+        let mut candidate_volumes = BTreeSet::new();
+        for object in &stored.object_set.objects {
+            for placement in placement_authority
+                .object_placements_v2(tenant_id, &namespace, &object.object_id)
+                .await
+                .map_err(map_central_error)?
             {
-                continue;
-            }
-            // Publication is an immutable fence, while individual copies can later be lost or
-            // retired. Re-check every required object against the same backend and generation so
-            // S3 never routes to a partially readable PlacementSet.
-            let mut complete = true;
-            for object in &object_set.object_set.objects {
-                let placements = placement_authority
-                    .object_placements(tenant_id, &object.object_id)
-                    .await
-                    .map_err(map_central_error)?;
-                if !placements.iter().any(|placement| {
-                    placement.backend_id == placement_set.backend_id
-                        && placement.placement_generation == placement_set.placement_generation
-                        && placement.storage_volume_id.as_ref() == Some(&volume_id)
-                        && placement.archive_id == placement_set.archive_id
-                        && placement.readable()
-                        && placement.verified_size.get() == object.size.get()
-                        && placement.verified_digest == object.object_id.digest()
-                }) {
-                    complete = false;
-                    break;
+                if placement.readable()
+                    && placement.tenant_id == *tenant_id
+                    && placement.object_namespace_id == namespace
+                    && placement.object_id == object.object_id
+                    && placement.size == object.size
+                    && placement.encoding == object.encoding
+                    && placement.verified_digest == object.object_id.digest()
+                {
+                    if let Some(volume_id) = placement.storage_volume_id {
+                        candidate_volumes.insert(volume_id);
+                    }
                 }
             }
-            if complete {
+        }
+        for volume_id in candidate_volumes {
+            if self
+                .v2_commit_coverage_for_volume(
+                    tenant_id,
+                    &commit.artifact_id,
+                    commit,
+                    &volume_id,
+                    None,
+                )
+                .await?
+                .is_some_and(|coverage| Self::v2_coverage_is_readable(Some(&coverage)))
+            {
                 volume_ids.push(volume_id);
             }
         }
@@ -4535,18 +4858,17 @@ impl CatalogService {
         };
         let verified = record.state == SnapshotState::Ready;
         // Snapshot lifecycle is logical and immutable; physical data health is resolved from
-        // the current published PlacementSets so a lost Volume never turns into a logical
-        // deletion, and a newly published replica is visible without rewriting the Snapshot.
-        let data_health = if let Some(placement) = &self.placement {
-            placement
-                .commit_availability(&record.tenant_id, &record.commit_id)
-                .await
-                .map_err(map_central_error)?
-                .data_health
+        // current namespace-scoped v2 object evidence so a lost Volume never turns into a logical
+        // deletion, and a newly published object placement is visible without rewriting the
+        // Snapshot. Legacy PlacementSets are intentionally not consulted by this read path.
+        let data_health = if self.placement.is_some() {
+            self.v2_commit_data_health(&record.tenant_id, &record.artifact_id, &commit)
+                .await?
+                .unwrap_or(DataHealth::Unavailable)
         } else if verified {
-            neoengram_domain::protocol::DataHealth::Available
+            DataHealth::Available
         } else {
-            neoengram_domain::protocol::DataHealth::Unavailable
+            DataHealth::Unavailable
         };
         let data_health_name = format!("{data_health:?}").to_ascii_lowercase();
         let issue = if record.state == SnapshotState::Abnormal
@@ -6654,8 +6976,11 @@ mod s3_cursor_tests {
     use std::sync::Mutex as StdMutex;
 
     use super::*;
-    use crate::GatewayRegistryRepository as _;
-    use neoengram_domain::protocol::S3SigV4Request;
+    use crate::{GatewayRegistryRepository as _, PlacementRepository as _};
+    use neoengram_domain::core::ObjectId;
+    use neoengram_domain::protocol::{
+        materialization::ObjectPlacementState, ObjectEncoding, S3SigV4Request,
+    };
 
     const TEST_KEY: [u8; 32] = [0x5a; 32];
 
@@ -7066,6 +7391,113 @@ mod s3_cursor_tests {
         registry.replace_pool(1, draining).await.unwrap();
         let error = service
             .ensure_s3_gateway_pool_ready(&gateway_pool_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Unavailable);
+        assert_eq!(error.code().as_str(), "s3_snapshot_unavailable");
+    }
+
+    #[derive(Default)]
+    struct NoS3Placement;
+
+    #[async_trait]
+    impl S3PlacementProvider for NoS3Placement {
+        async fn current_placement(
+            &self,
+            _tenant_id: &TenantId,
+            _storage_volume_id: &StorageVolumeId,
+        ) -> crate::CentralResult<Option<S3AgentPlacement>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_read_route_rejects_partial_target_coverage() {
+        let components = crate::InMemoryComponents::new(100_000);
+        let tenant_id = TenantId::new("tenant-s3-coverage").unwrap();
+        let project_id = ProjectId::new("project-s3-coverage").unwrap();
+        let artifact_id = ArtifactId::new("artifact-s3-coverage").unwrap();
+        let volume_id = StorageVolumeId::new("volume-s3-coverage").unwrap();
+        let commit_id = CommitId::from_bytes([41; 32]);
+        let first_object = ObjectId::from_bytes([42; 32]);
+        let second_object = ObjectId::from_bytes([43; 32]);
+        let object_set = ObjectSet::new(vec![
+            CommitObject::new(first_object, 4, ObjectEncoding::Raw, 0),
+            CommitObject::new(second_object, 6, ObjectEncoding::Raw, 1),
+        ])
+        .unwrap();
+        components
+            .placement
+            .insert_commit_object_set(neoengram_domain::protocol::CommitObjectSet {
+                tenant_id: tenant_id.clone(),
+                commit_id,
+                object_set: object_set.clone(),
+            })
+            .await
+            .unwrap();
+        components
+            .placement
+            .insert_object_placement_v2(ObjectPlacement {
+                placement_id: neoengram_domain::protocol::PlacementId::new("placement-s3-coverage")
+                    .unwrap(),
+                tenant_id: tenant_id.clone(),
+                object_namespace_id: ObjectNamespaceId::new(artifact_id.to_string()).unwrap(),
+                object_id: first_object,
+                size: neoengram_domain::protocol::DecimalU64::new(4),
+                encoding: ObjectEncoding::Raw,
+                verified_digest: first_object.digest(),
+                storage_volume_id: Some(volume_id.clone()),
+                archive_id: None,
+                placement_generation: PlacementGeneration::new(1),
+                state: ObjectPlacementState::Verified,
+                failure_domain: "host-s3-coverage".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let policy = Arc::new(
+            StaticRbacPolicy::one_principal(
+                "s3-coverage-test",
+                ["*".to_owned()],
+                std::iter::empty::<Permission>(),
+            )
+            .unwrap(),
+        );
+        let service = CatalogService::new(
+            components.control_catalog,
+            components.publisher,
+            policy,
+            components.clock,
+        )
+        .with_placement_repository(components.placement)
+        .with_s3_placement_provider(Arc::new(NoS3Placement))
+        .with_gateway_registry(components.gateway_registry);
+        let commit = CommitRecord {
+            tenant_id: tenant_id.clone(),
+            project_id,
+            artifact_id,
+            source_playground_id: PlaygroundId::new("playground-s3-coverage").unwrap(),
+            source_precommit_id: PreCommitId::new("precommit-s3-coverage").unwrap(),
+            commit_request_id: RequestId::new("request-s3-coverage").unwrap(),
+            commit_id,
+            object_set_digest: object_set.object_set_digest,
+            root_directory_id: neoengram_domain::core::DirectoryId::from_bytes([44; 32]),
+            parent_commit_id: None,
+            index_version: WireIndexVersion {
+                revision: IndexRevision::new(1),
+                digest: ContentDigest::from_bytes([45; 32]),
+                extensions: neoengram_domain::protocol::Extensions::new(),
+            },
+            data_layout: CommitDataLayout::FastCdc,
+            records: Vec::new(),
+            message: "S3 coverage gate".to_owned(),
+            description: None,
+            tag_names: Vec::new(),
+            created_at_unix_ms: UnixMillis::new(100),
+        };
+
+        let error = service
+            .resolve_s3_route_for_commit(&tenant_id, &commit, UnixMillis::new(100))
             .await
             .unwrap_err();
         assert_eq!(error.category(), ErrorCategory::Unavailable);

@@ -39,7 +39,7 @@ use tokio::{
     time::{interval, timeout, MissedTickBehavior},
 };
 
-use crate::transfer_quic::QuicTransferFence;
+use crate::transfer_quic::{QuicTransferFence, TransferUpstreamDirectory};
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json";
 pub(crate) const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
@@ -159,6 +159,9 @@ struct TunnelState {
     /// Shared with the QUIC transfer listener. It is updated only from Central-granted Agent
     /// routes, so a reconnect cannot leave the data plane fenced to an old session generation.
     transfer_fence: Option<QuicTransferFence>,
+    /// Deployment-owned source next hops shared with the QUIC relay. Route lease lifecycle
+    /// toggles whether an address is eligible; the address itself is never supplied by a ticket.
+    transfer_upstreams: Option<TransferUpstreamDirectory>,
     peer_forward_seen: Mutex<BTreeMap<RequestId, PeerForwardReplay>>,
     /// Central's current allow-list for peer TLS credentials. This is scoped to the active control
     /// connection and is cleared atomically when that connection is fenced or disconnected.
@@ -346,10 +349,25 @@ impl GatewayTunnel {
         Self::with_peer_forwarder_and_transfer_fence(identity, peer_forwarder, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_peer_forwarder_and_transfer_fence(
         identity: GatewayIdentity,
         peer_forwarder: Arc<dyn PeerForwarder>,
         transfer_fence: Option<QuicTransferFence>,
+    ) -> Self {
+        Self::with_peer_forwarder_and_transfer_fence_and_upstreams(
+            identity,
+            peer_forwarder,
+            transfer_fence,
+            None,
+        )
+    }
+
+    pub(crate) fn with_peer_forwarder_and_transfer_fence_and_upstreams(
+        identity: GatewayIdentity,
+        peer_forwarder: Arc<dyn PeerForwarder>,
+        transfer_fence: Option<QuicTransferFence>,
+        transfer_upstreams: Option<TransferUpstreamDirectory>,
     ) -> Self {
         let (s3_read_revocations, _) = broadcast::channel(S3_READ_REVOCATION_BUFFER);
         Self {
@@ -369,6 +387,7 @@ impl GatewayTunnel {
                 stream_requests: Mutex::new(BTreeMap::new()),
                 routes: Mutex::new(BTreeMap::new()),
                 transfer_fence,
+                transfer_upstreams,
                 peer_forward_seen: Mutex::new(BTreeMap::new()),
                 peer_directory: Mutex::new(None),
                 s3_read_revocations,
@@ -2015,9 +2034,10 @@ impl GatewayTunnel {
             AgentChannelDownstreamMessage::Assignment(_)
                 | AgentChannelDownstreamMessage::Decision(_)
                 | AgentChannelDownstreamMessage::LifecycleAssignment(_)
+                | AgentChannelDownstreamMessage::MaterializationAssignment(_)
         ) {
             return Err(protocol_invalid(
-                "peer forwarding accepts only Central Job or lifecycle command frames",
+                "peer forwarding accepts only Central Job, lifecycle, or materialization command frames",
             ));
         }
         let request_id = frame.request_id.clone();
@@ -2523,6 +2543,11 @@ impl GatewayTunnel {
         drop(closed_streams);
         drop(_streams);
         self.state.routes.lock().await.clear();
+        if let Some(directory) = &self.state.transfer_upstreams {
+            // Keep configured addresses for a later reconnect, but make every cached source hop
+            // ineligible until its new Central route reaches the authenticated Opened boundary.
+            directory.deactivate_all();
+        }
         if let Some(fence) = &self.state.transfer_fence {
             fence.clear_generations();
         }
@@ -2679,6 +2704,22 @@ impl GatewayTunnel {
                 .cloned()
         });
         drop(routes);
+        if let Some(directory) = &self.state.transfer_upstreams {
+            if let Some((agent_id, session_generation, route_generation)) = &removed_fence {
+                directory.deactivate_if_current(
+                    agent_id,
+                    SessionGeneration::new(*session_generation),
+                    RouteGeneration::new(*route_generation),
+                );
+            }
+            if let Some(route) = &replacement_route {
+                directory.activate(
+                    &route.agent_id,
+                    route.session_generation,
+                    route.route_generation,
+                );
+            }
+        }
         if let Some(fence) = &self.state.transfer_fence {
             if let Some(route) = replacement_route {
                 // The fence update is monotonic and preserves the mount for a same-session
@@ -2738,6 +2779,13 @@ impl GatewayTunnel {
         };
         drop(routes);
         if inserted {
+            if let Some(directory) = &self.state.transfer_upstreams {
+                directory.activate(
+                    &agent_id,
+                    SessionGeneration::new(session_generation),
+                    RouteGeneration::new(route_generation),
+                );
+            }
             if let Some(fence) = &self.state.transfer_fence {
                 fence.set_agent_route_generations(&agent_id, session_generation, route_generation);
             }
@@ -3088,6 +3136,8 @@ async fn send_gateway_error_frame(
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use std::io;
 
     use super::*;
@@ -4205,6 +4255,58 @@ mod tests {
             tunnel.state.routes.lock().await.get(&stream_id),
             Some(&renewed)
         );
+    }
+
+    #[tokio::test]
+    async fn route_lifecycle_toggles_transfer_upstream_without_losing_configured_address() {
+        let directory = TransferUpstreamDirectory::new();
+        let agent_id = AgentId::new("agent-source").unwrap();
+        let upstream: SocketAddr = "127.0.0.1:41013".parse().unwrap();
+        directory.configure(agent_id.clone(), upstream);
+        let tunnel = Arc::new(
+            GatewayTunnel::with_peer_forwarder_and_transfer_fence_and_upstreams(
+                identity("replica-transfer-directory"),
+                Arc::new(UnavailablePeerForwarder),
+                None,
+                Some(directory.clone()),
+            ),
+        );
+        let stream_id = GatewayConnectionId::new("route-directory-stream").unwrap();
+        let first_route = ActiveRoute {
+            agent_id: agent_id.clone(),
+            session_generation: SessionGeneration::new(2),
+            route_generation: RouteGeneration::new(3),
+            lease_expires_at_unix_ms: lease_expiry(),
+        };
+
+        assert_eq!(directory.resolve(&agent_id), None);
+        assert!(
+            tunnel
+                .insert_route_if_open(&stream_id, first_route.clone())
+                .await
+        );
+        assert_eq!(directory.resolve(&agent_id), Some(upstream));
+
+        tunnel
+            .close_stream_state_if_route(&stream_id, None, &first_route)
+            .await;
+        assert_eq!(directory.resolve(&agent_id), None);
+
+        // A reconnect creates a fresh Agent stream identity. The old stream remains tombstoned
+        // so a delayed worker cannot reuse it after its route was fenced.
+        let reconnected_stream_id =
+            GatewayConnectionId::new("route-directory-reconnected").unwrap();
+        let reconnected_route = ActiveRoute {
+            session_generation: SessionGeneration::new(4),
+            route_generation: RouteGeneration::new(5),
+            ..first_route
+        };
+        assert!(
+            tunnel
+                .insert_route_if_open(&reconnected_stream_id, reconnected_route)
+                .await
+        );
+        assert_eq!(directory.resolve(&agent_id), Some(upstream));
     }
 
     #[tokio::test]

@@ -12,15 +12,16 @@ use crate::{
     AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
     CommitDataLayout, CommitId, ComputeNodeId, DecimalU64, DecisionGeneration, DeletionId,
     EdgeClusterId, Envelope, Extensions, FencingToken, JobId, LeaseId, LifecycleAssignmentId,
-    LifecycleGeneration, MetadataBatchDescriptor, MountGeneration, ObjectSet, OwnerGeneration,
-    PlacementGeneration, PrincipalId, ProjectId, ProtocolError, ProtocolResult, ProtocolVersion,
-    ReplicationId, ReplicationObjectState, ReplicationState, RequestId, ResourceLifecycleAction,
-    ResourceLifecycleAssignment, ResourceRef, ResourceVersion, SessionGeneration,
-    SignedTransferTicket, SnapshotDeliveryAssignment, SnapshotId, StorageVolumeId, TenantId,
-    TraceId, UnixMillis, VolumeMarkerId, WireIndexVersion, AGENT_JOB_REPORT_ACTION,
-    AGENT_PROTOCOL_ERROR_ACTION, AGENT_REPLICATION_ASSIGNMENT_ACTION,
-    AGENT_REPLICATION_REPORT_ACTION, CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES,
-    MAX_RECORDS_PER_PAGE,
+    LifecycleGeneration, MaterializationAssignment, MaterializationReport, MetadataBatchDescriptor,
+    MountGeneration, ObjectSet, OwnerGeneration, PlacementGeneration, PrincipalId, ProjectId,
+    ProtocolError, ProtocolResult, ProtocolVersion, ReplicationId, ReplicationObjectState,
+    ReplicationState, RequestId, ResourceLifecycleAction, ResourceLifecycleAssignment, ResourceRef,
+    ResourceVersion, SessionGeneration, SignedTransferTicket, SnapshotDeliveryAssignment,
+    SnapshotId, StorageVolumeId, TenantId, TraceId, UnixMillis, VolumeMarkerId, WireIndexVersion,
+    AGENT_JOB_REPORT_ACTION, AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
+    AGENT_MATERIALIZATION_REPORT_ACTION, AGENT_PROTOCOL_ERROR_ACTION,
+    AGENT_REPLICATION_ASSIGNMENT_ACTION, AGENT_REPLICATION_REPORT_ACTION, CURRENT_WIRE_VERSION,
+    MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
 };
 
 /// Returns the action identity that must accompany a control message body.
@@ -40,6 +41,8 @@ pub fn control_action(message: &ControlMessage) -> &'static str {
         ControlMessage::LifecycleReport(_) => AGENT_JOB_REPORT_ACTION,
         ControlMessage::ReplicationAssignment(_) => AGENT_REPLICATION_ASSIGNMENT_ACTION,
         ControlMessage::ReplicationReport(_) => AGENT_REPLICATION_REPORT_ACTION,
+        ControlMessage::MaterializationAssignment(_) => AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
+        ControlMessage::MaterializationReport(_) => AGENT_MATERIALIZATION_REPORT_ACTION,
         ControlMessage::Error(_) => AGENT_PROTOCOL_ERROR_ACTION,
     }
 }
@@ -134,6 +137,8 @@ pub fn decode_control_envelope(bytes: &[u8]) -> ProtocolResult<Envelope<ControlM
             | AGENT_JOB_REPORT_ACTION
             | AGENT_REPLICATION_ASSIGNMENT_ACTION
             | AGENT_REPLICATION_REPORT_ACTION
+            | AGENT_MATERIALIZATION_ASSIGNMENT_ACTION
+            | AGENT_MATERIALIZATION_REPORT_ACTION
             | AGENT_PROTOCOL_ERROR_ACTION
             | "agent.hello"
             | "agent.heartbeat"
@@ -188,6 +193,10 @@ pub enum ControlMessage {
     ReplicationAssignment(Box<ReplicationAssignment>),
     #[serde(rename = "replication.report")]
     ReplicationReport(Box<ReplicationProgressReport>),
+    #[serde(rename = "materialization.assignment")]
+    MaterializationAssignment(Box<MaterializationAssignment>),
+    #[serde(rename = "materialization.report")]
+    MaterializationReport(Box<MaterializationReport>),
     #[serde(rename = "protocol.error")]
     Error(ControlError),
 }
@@ -210,6 +219,8 @@ impl ControlMessage {
                 | "resource.lifecycle.report"
                 | "replication.assignment"
                 | "replication.report"
+                | "materialization.assignment"
+                | "materialization.report"
                 | "protocol.error"
         )
     }
@@ -227,8 +238,14 @@ impl ControlMessage {
             Self::Finalized(message) => message.validate(),
             Self::LifecycleAssignment(message) => message.validate(),
             Self::LifecycleReport(message) => message.validate(),
-            Self::ReplicationAssignment(message) => message.validate(),
-            Self::ReplicationReport(message) => message.validate(),
+            Self::ReplicationAssignment(_) => Err(ProtocolError::UnsupportedMessageType(
+                "replication.assignment".to_owned(),
+            )),
+            Self::ReplicationReport(_) => Err(ProtocolError::UnsupportedMessageType(
+                "replication.report".to_owned(),
+            )),
+            Self::MaterializationAssignment(message) => message.validate(),
+            Self::MaterializationReport(message) => message.validate(),
             Self::Error(message) => message.validate(),
         }
     }

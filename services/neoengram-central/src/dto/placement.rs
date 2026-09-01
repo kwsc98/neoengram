@@ -3,6 +3,226 @@ use serde::{Deserialize, Serialize};
 
 use super::ResourceIssueSummary;
 
+/// Public v2 request for hydrating a target Volume from object-level placements.
+///
+/// The request deliberately carries the object namespace even though the first namespace mapping
+/// is ArtifactId == ObjectNamespaceId.  Keeping it explicit prevents a future namespace alias
+/// from making a materialization accidentally cross tenant or artifact boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct CreateCommitMaterializationRequest {
+    pub tenant_id: String,
+    pub project_id: String,
+    pub artifact_id: String,
+    pub object_namespace_id: String,
+    pub commit_id: String,
+    pub target_storage_volume_id: String,
+    #[serde(default)]
+    pub coverage_goal: Option<neoengram_domain::protocol::materialization::CoverageGoal>,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryCommitMaterializationRequest {
+    pub tenant_id: String,
+    pub object_namespace_id: String,
+    pub materialization_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryCommitMaterializationListRequest {
+    pub tenant_id: String,
+    pub object_namespace_id: String,
+    pub commit_id: String,
+    #[serde(default)]
+    pub target_storage_volume_id: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub page_size: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct RetryCommitMaterializationRequest {
+    pub tenant_id: String,
+    pub object_namespace_id: String,
+    pub materialization_id: String,
+    pub expected_plan_revision: String,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct CancelCommitMaterializationRequest {
+    pub tenant_id: String,
+    pub object_namespace_id: String,
+    pub materialization_id: String,
+    pub expected_plan_revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryCommitCoverageRequest {
+    pub tenant_id: String,
+    pub object_namespace_id: String,
+    pub commit_id: String,
+    #[serde(default)]
+    pub storage_volume_id: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub page_size: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryCommitAvailabilityV2Request {
+    pub tenant_id: String,
+    pub object_namespace_id: String,
+    pub commit_id: String,
+    #[serde(default)]
+    pub target_storage_volume_id: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub page_size: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct MaterializationView {
+    pub materialization_id: String,
+    pub tenant_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    pub object_namespace_id: String,
+    pub commit_id: String,
+    pub target_storage_volume_id: String,
+    pub plan_revision: String,
+    pub coverage_goal: neoengram_domain::protocol::materialization::CoverageGoal,
+    pub state: String,
+    pub object_set_digest: String,
+    pub verified_objects: String,
+    pub total_objects: String,
+    pub verified_bytes: String,
+    pub total_bytes: String,
+    pub missing_objects: String,
+    pub missing_bytes: String,
+    pub source_count: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<ResourceIssueSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct CreateCommitMaterializationResponse {
+    pub materialization: MaterializationView,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryCommitMaterializationResponse {
+    pub materialization: MaterializationView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct RetryCommitMaterializationResponse {
+    pub materialization: MaterializationView,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct CancelCommitMaterializationResponse {
+    pub materialization: MaterializationView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryCommitMaterializationListResponse {
+    pub materializations: Vec<MaterializationView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct VolumeCommitCoverageView {
+    pub object_namespace_id: String,
+    pub commit_id: String,
+    pub storage_volume_id: String,
+    pub placement_generation: String,
+    pub object_set_digest: String,
+    pub total_objects: String,
+    pub verified_objects: String,
+    pub total_bytes: String,
+    pub verified_bytes: String,
+    pub missing_objects: String,
+    pub missing_bytes: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryCommitCoverageResponse {
+    pub coverage: Vec<VolumeCommitCoverageView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct MissingObjectView {
+    pub object_id: String,
+    pub size: String,
+    pub encoding: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct CommitAvailabilityV2View {
+    pub object_namespace_id: String,
+    pub commit_id: String,
+    pub object_count: String,
+    pub content_presence: String,
+    pub source_serving: String,
+    pub durability: String,
+    pub target_coverage: String,
+    pub view_readiness: String,
+    pub complete_volume_count: String,
+    pub missing_objects: Vec<MissingObjectView>,
+    pub verified_storage_volume_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct QueryCommitAvailabilityV2Response {
+    pub availability: CommitAvailabilityV2View,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]

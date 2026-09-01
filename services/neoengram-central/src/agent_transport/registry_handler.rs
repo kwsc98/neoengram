@@ -46,6 +46,15 @@ const AGENT_CHANNEL_DELIVERY_INTERVAL: Duration = Duration::from_millis(500);
 const AGENT_CHANNEL_REDELIVERY_INTERVAL: Duration = Duration::from_secs(5);
 const AGENT_CHANNEL_RESPONSE_BUFFER: usize = MAX_AGENT_CHANNEL_MESSAGES * 2;
 
+/// The old replication report enum remains decodable so peers receive a stable protocol error,
+/// but it is no longer a valid Agent transport message in materialization v2.
+fn reject_legacy_replication_report(body: &ControlMessage) -> Result<(), AgentHttpError> {
+    if matches!(body, ControlMessage::ReplicationReport(_)) {
+        return Err(AgentHttpError::protocol_invalid());
+    }
+    Ok(())
+}
+
 /// Extension point for the filesystem-backed Index and object data plane.
 ///
 /// The registry handler authenticates and fences every request before invoking this port.
@@ -343,25 +352,9 @@ impl RegistryAgentApiHandler {
         if request.payload.report.header.session_generation != Some(generation) {
             return Err(AgentHttpError::session_fenced());
         }
-        if let ControlMessage::ReplicationReport(report) = &request.payload.report.body {
-            let result = self
-                .require_control()?
-                .receive_replication_report(
-                    &request.payload.tenant_id,
-                    &request.agent_id,
-                    generation,
-                    report.as_ref().clone(),
-                )
-                .await
-                .map_err(map_registry_error)?;
-            return encode(&AgentActionAcceptedResponse {
-                wire_version: CURRENT_WIRE_VERSION,
-                request_id: request.request_id,
-                resource_version: result.resource_version,
-                replayed: result.replayed,
-                extensions: Extensions::new(),
-            });
-        }
+        // v1 replication reports are deliberately decoded so the boundary can return a
+        // deterministic protocol error. They must not reach the legacy ControlPlane path.
+        reject_legacy_replication_report(&request.payload.report.body)?;
         let report = match request.payload.report.body {
             ControlMessage::Accepted(value) => crate::AgentReport::Accepted(value),
             ControlMessage::Progress(value) => crate::AgentReport::Progress(value),
@@ -384,6 +377,25 @@ impl RegistryAgentApiHandler {
                     request_id: request.request_id,
                     resource_version,
                     replayed,
+                    extensions: Extensions::new(),
+                });
+            }
+            ControlMessage::MaterializationReport(value) => {
+                let result = self
+                    .require_control()?
+                    .receive_materialization_report(
+                        &request.payload.tenant_id,
+                        &request.agent_id,
+                        generation,
+                        *value,
+                    )
+                    .await
+                    .map_err(map_registry_error)?;
+                return encode(&AgentActionAcceptedResponse {
+                    wire_version: CURRENT_WIRE_VERSION,
+                    request_id: request.request_id,
+                    resource_version: result.resource_version,
+                    replayed: result.replayed,
                     extensions: Extensions::new(),
                 });
             }
@@ -893,24 +905,9 @@ impl RegistryAgentApiHandler {
                         extensions: Extensions::new(),
                     }));
                 }
-                if let ControlMessage::ReplicationReport(report) = &payload.report.body {
-                    let result = self
-                        .require_control()?
-                        .receive_replication_report(
-                            &payload.tenant_id,
-                            &context.agent_id,
-                            context.session_generation,
-                            report.as_ref().clone(),
-                        )
-                        .await
-                        .map_err(map_registry_error)?;
-                    return Ok(AppliedChannelFrame::Continue(AgentChannelAck {
-                        acknowledged_sequence: sequence,
-                        resource_version: result.resource_version,
-                        replayed: result.replayed,
-                        extensions: Extensions::new(),
-                    }));
-                }
+                // The channel still understands the old enum for strict decoding, but v1
+                // replication reports are not an accepted Central transport route.
+                reject_legacy_replication_report(&payload.report.body)?;
                 let report = match &payload.report.body {
                     ControlMessage::Accepted(value) => crate::AgentReport::Accepted(value.clone()),
                     ControlMessage::Progress(value) => crate::AgentReport::Progress(value.clone()),
@@ -936,6 +933,24 @@ impl RegistryAgentApiHandler {
                 AppliedChannelFrame::Continue(AgentChannelAck {
                     acknowledged_sequence: sequence,
                     resource_version: result.job.resource_version,
+                    replayed: result.replayed,
+                    extensions: Extensions::new(),
+                })
+            }
+            AgentChannelUpstreamMessage::MaterializationReport(report) => {
+                let result = self
+                    .require_control()?
+                    .receive_materialization_report(
+                        report.tenant_id(),
+                        &context.agent_id,
+                        context.session_generation,
+                        report.as_ref().clone(),
+                    )
+                    .await
+                    .map_err(map_registry_error)?;
+                AppliedChannelFrame::Continue(AgentChannelAck {
+                    acknowledged_sequence: sequence,
+                    resource_version: result.resource_version,
                     replayed: result.replayed,
                     extensions: Extensions::new(),
                 })
@@ -1030,10 +1045,14 @@ impl RegistryAgentApiHandler {
                     AgentChannelDownstreamMessage::LifecycleAssignment(value),
                     ChannelDeliveryPolicy::OncePerConnection,
                 ),
-                ControlMessage::ReplicationAssignment(value) => (
-                    AgentChannelDownstreamMessage::ReplicationAssignment(value),
+                ControlMessage::MaterializationAssignment(value) => (
+                    AgentChannelDownstreamMessage::MaterializationAssignment(value),
                     ChannelDeliveryPolicy::RedeliverAfter(AGENT_CHANNEL_REDELIVERY_INTERVAL),
                 ),
+                // Legacy whole-Commit replication is no longer delivered over the Agent channel.
+                // Leave the authority envelope pending for the v2 materialization dispatcher;
+                // this loop must never serialize a v1 assignment to an Agent.
+                ControlMessage::ReplicationAssignment(_) => continue,
                 ControlMessage::Decision(value) => (
                     AgentChannelDownstreamMessage::Decision(value),
                     ChannelDeliveryPolicy::RedeliverAfter(AGENT_CHANNEL_REDELIVERY_INTERVAL),
@@ -1189,7 +1208,7 @@ impl RegistryAgentApiHandler {
             AgentChannelDownstreamMessage::Assignment(_)
                 | AgentChannelDownstreamMessage::Decision(_)
                 | AgentChannelDownstreamMessage::LifecycleAssignment(_)
-                | AgentChannelDownstreamMessage::ReplicationAssignment(_)
+                | AgentChannelDownstreamMessage::MaterializationAssignment(_)
         ) {
             return Ok(());
         }
@@ -1882,5 +1901,27 @@ mod tests {
         assert_eq!(mapped.status, StatusCode::CONFLICT);
         assert_eq!(mapped.code, "AGENT_ACTION_CONFLICT");
         assert!(!mapped.retryable);
+    }
+
+    #[test]
+    fn legacy_replication_report_is_rejected_before_control_plane_dispatch() {
+        let report = ControlMessage::ReplicationReport(Box::new(
+            neoengram_domain::protocol::ReplicationProgressReport::State {
+                replication_id: neoengram_domain::protocol::ReplicationId::new(
+                    "replication-legacy-test",
+                )
+                .unwrap(),
+                tenant_id: TenantId::new("tenant-legacy-test").unwrap(),
+                attempt: 1,
+                state: neoengram_domain::protocol::ReplicationState::Queued,
+                completed_objects: 0,
+                completed_bytes: 0,
+                issue_code: None,
+                issue_message: None,
+                extensions: Extensions::new(),
+            },
+        ));
+        let error = reject_legacy_replication_report(&report).unwrap_err();
+        assert_eq!(error.code, "PROTOCOL_INVALID");
     }
 }

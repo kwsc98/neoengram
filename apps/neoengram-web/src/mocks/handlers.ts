@@ -16,10 +16,7 @@ import type {
   CreateAddJobResponse,
   CreateArtifactRequest,
   CreateArtifactResponse,
-  CreateCommitReplicationRequest,
   CreateCommitReplicationResponse,
-  CancelCommitReplicationRequest,
-  CancelCommitReplicationResponse,
   CreatePlaygroundRequest,
   CreatePlaygroundResponse,
   CreateProjectRequest,
@@ -34,6 +31,21 @@ import type {
   CreateStorageVolumeResponse,
   CreateTenantRequest,
   CreateTenantResponse,
+  CreateCommitMaterializationRequest,
+  CreateCommitMaterializationResponse,
+  QueryCommitMaterializationRequest,
+  QueryCommitMaterializationResponse,
+  QueryCommitMaterializationListRequest,
+  QueryCommitMaterializationListResponse,
+  RetryCommitMaterializationRequest,
+  RetryCommitMaterializationResponse,
+  CancelCommitMaterializationRequest,
+  CancelCommitMaterializationResponse,
+  QueryCommitCoverageRequest,
+  MaterializationView,
+  VolumeCommitCoverageView,
+  QueryCommitAvailabilityV2Request,
+  QueryCommitAvailabilityV2Response,
   FinalizeAddJobResponse,
   JobView,
   DeleteSnapshotDeliveryRequest,
@@ -46,14 +58,6 @@ import type {
   QueryArtifactListResponse,
   QueryArtifactCommitDiffResponse,
   QueryArtifactResponse,
-  QueryCommitReplicationRequest,
-  QueryCommitReplicationResponse,
-  QueryCommitReplicationListRequest,
-  QueryCommitReplicationListResponse,
-  QueryCommitPlacementListRequest,
-  QueryCommitPlacementListResponse,
-  QueryCommitAvailabilityRequest,
-  QueryCommitAvailabilityResponse,
   QueryPlaygroundListRequest,
   QueryPlaygroundListResponse,
   QueryPlaygroundChangeListRequest,
@@ -91,8 +95,6 @@ import type {
   RejectStorageEnrollmentResponse,
   RetrySnapshotDeliveryRequest,
   RetrySnapshotDeliveryResponse,
-  RetryCommitReplicationRequest,
-  RetryCommitReplicationResponse,
   SnapshotDeliveryView,
   CreateS3AccessPointRequest,
   CreateS3AccessPointResponse,
@@ -263,14 +265,15 @@ const commitReplicationRetryMutations = new Map<
   string,
   {
     tenant_id: string;
+    object_namespace_id: string;
     replication_id: string;
     expected_attempt: string;
-    response: RetryCommitReplicationResponse;
+    response: RetryCommitMaterializationResponse;
   }
 >();
 const commitReplicationRequests = new Map<
   string,
-  { requestJson: string; response: CreateCommitReplicationResponse }
+  { requestJson: string; response: CreateCommitMaterializationResponse }
 >();
 const s3AccessPointCreateRequests = new Map<
   string,
@@ -314,6 +317,53 @@ function advanceCommitReplication(
   if (state === 'published') commitReplicationQueryCounts.delete(key);
   else commitReplicationQueryCounts.set(key, queryCount + 1);
   return next;
+}
+
+function toMaterializationView(
+  value: CreateCommitReplicationResponse['replication'],
+): MaterializationView {
+  const objectNamespaceId = value.artifact_id;
+  if (!objectNamespaceId) {
+    throw new Error('v2 materialization state is missing object_namespace_id/artifact_id');
+  }
+  const state: MaterializationView['state'] =
+    value.state === 'transferring'
+      ? 'materializing'
+      : value.state === 'published'
+        ? 'complete'
+        : value.state === 'planning'
+          ? 'planning'
+          : value.state;
+  const result: MaterializationView = {
+    materialization_id: value.replication_id,
+    tenant_id: value.tenant_id,
+    ...(value.artifact_id ? { artifact_id: value.artifact_id } : {}),
+    object_namespace_id: objectNamespaceId,
+    commit_id: value.commit_id,
+    target_storage_volume_id: value.target_storage_volume_id,
+    plan_revision: value.attempt,
+    coverage_goal: 'complete',
+    state,
+    object_set_digest: value.object_set_digest,
+    verified_objects: value.completed_objects,
+    total_objects: value.total_objects,
+    verified_bytes: value.completed_bytes,
+    total_bytes: value.total_bytes,
+    missing_objects: String(
+      Math.max(0, Number(value.total_objects) - Number(value.completed_objects)),
+    ),
+    missing_bytes: String(Math.max(0, Number(value.total_bytes) - Number(value.completed_bytes))),
+    source_count: value.source_storage_volume_id ? '1' : '0',
+  };
+  if (value.issue) result.issue = value.issue;
+  // Keep route hints for the local compatibility adapter used by existing Web pages. These are
+  // deliberately not part of the public v2 response contract and are stripped by the API client
+  // adapter before exposing the legacy page model.
+  Object.assign(result, {
+    target_edge_cluster_id: value.target_edge_cluster_id,
+    target_gateway_pool_id: value.target_gateway_pool_id,
+  });
+  return result;
 }
 
 function completesOnThisQuery(queryCounts: Map<string, number>, key: string): boolean {
@@ -3349,10 +3399,10 @@ export const handlers = [
     snapshotCreateRequests.set(requestKey, { requestJson, response: structuredClone(response) });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/commit/replicate', async ({ request }) => {
+  http.post('*/api/commit/materialize', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as CreateCommitReplicationRequest;
+    const body = (await request.json()) as CreateCommitMaterializationRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
     const requestKey = resourceKey(body.tenant_id, body.request_id);
@@ -3378,6 +3428,15 @@ export const handlers = [
         isLifecycleActive(item),
     );
     if (!artifact) return notFound(request, 'Artifact');
+    if (body.object_namespace_id !== body.artifact_id) {
+      return problem(
+        request,
+        422,
+        'OBJECT_NAMESPACE_MISMATCH',
+        'Object namespace does not match the Artifact',
+        'The initial v2 namespace mapping is ArtifactId.',
+      );
+    }
     const commit = commitGraphs
       .get(resourceKey(body.tenant_id, body.project_id, body.artifact_id))
       ?.nodes.find((item) => item.commit_id === body.commit_id);
@@ -3416,6 +3475,7 @@ export const handlers = [
     const existingPlacement = [...commitReplications.values()].find(
       (item) =>
         item.tenant_id === body.tenant_id &&
+        item.artifact_id === body.object_namespace_id &&
         item.commit_id === body.commit_id &&
         item.target_storage_volume_id === body.target_storage_volume_id &&
         item.state === 'published',
@@ -3447,74 +3507,87 @@ export const handlers = [
       completed_bytes: '0',
       total_bytes: snapshot?.logical_size_bytes ?? '0',
     };
-    const response: CreateCommitReplicationResponse = { replication, replayed: false };
+    const response: CreateCommitMaterializationResponse = {
+      materialization: toMaterializationView(replication),
+      replayed: false,
+    };
     const replicationKey = resourceKey(body.tenant_id, replicationId);
     commitReplications.set(replicationKey, replication);
     commitReplicationQueryCounts.set(replicationKey, 0);
     commitReplicationRequests.set(requestKey, { requestJson, response: structuredClone(response) });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/commit/replication/query', async ({ request }) => {
+  http.post('*/api/commit/materialization/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as QueryCommitReplicationRequest;
+    const body = (await request.json()) as QueryCommitMaterializationRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const key = resourceKey(body.tenant_id, body.replication_id);
+    const key = resourceKey(body.tenant_id, body.materialization_id);
     const replication = commitReplications.get(key);
-    if (!replication) return notFound(request, 'Replication');
-    const response: QueryCommitReplicationResponse = {
-      replication: advanceCommitReplication(key, replication),
+    if (!replication) return notFound(request, 'Materialization');
+    if (replication.artifact_id !== body.object_namespace_id) {
+      return notFound(request, 'Materialization');
+    }
+    const response: QueryCommitMaterializationResponse = {
+      materialization: toMaterializationView(advanceCommitReplication(key, replication)),
     };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/commit/replication/list/query', async ({ request }) => {
+  http.post('*/api/commit/materialization/list/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as QueryCommitReplicationListRequest;
+    const body = (await request.json()) as QueryCommitMaterializationListRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const response: QueryCommitReplicationListResponse = {
-      replications: [...commitReplications.entries()]
+    const response: QueryCommitMaterializationListResponse = {
+      materializations: [...commitReplications.entries()]
         .filter(
-          ([, item]) => item.tenant_id === body.tenant_id && item.commit_id === body.commit_id,
+          ([, item]) =>
+            item.tenant_id === body.tenant_id &&
+            item.commit_id === body.commit_id &&
+            item.artifact_id === body.object_namespace_id,
         )
-        .map(([key, item]) => advanceCommitReplication(key, item)),
+        .map(([key, item]) => toMaterializationView(advanceCommitReplication(key, item))),
     };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/commit/placements/query', async ({ request }) => {
+  http.post('*/api/commit/coverage/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as QueryCommitPlacementListRequest;
+    const body = (await request.json()) as QueryCommitCoverageRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const placements: QueryCommitPlacementListResponse['placements'] = [
-      ...commitReplications.values(),
-    ]
+    const coverage: VolumeCommitCoverageView[] = [...commitReplications.values()]
       .filter(
         (item) =>
           item.tenant_id === body.tenant_id &&
           item.commit_id === body.commit_id &&
+          item.artifact_id === body.object_namespace_id &&
           item.state === 'published',
       )
       .map((item) => ({
-        placement_set_id: `placement-set-${item.replication_id}`,
+        object_namespace_id: body.object_namespace_id,
         commit_id: item.commit_id,
-        backend_id: item.target_storage_volume_id,
         storage_volume_id: item.target_storage_volume_id,
-        object_set_digest: item.object_set_digest,
-        object_count: item.total_objects,
-        verified_object_count: item.completed_objects,
         placement_generation: '1',
-        state: 'published',
+        object_set_digest: item.object_set_digest,
+        total_objects: item.total_objects,
+        verified_objects: item.completed_objects,
+        total_bytes: item.total_bytes,
+        verified_bytes: item.completed_bytes,
+        missing_objects: String(
+          Math.max(0, Number(item.total_objects) - Number(item.completed_objects)),
+        ),
+        missing_bytes: String(Math.max(0, Number(item.total_bytes) - Number(item.completed_bytes))),
+        state: item.state === 'published' ? 'complete' : 'partial',
       }));
-    return HttpResponse.json({ placements }, { headers: headers(request) });
+    return HttpResponse.json({ coverage }, { headers: headers(request) });
   }),
-  http.post('*/api/commit/replication/retry', async ({ request }) => {
+  http.post('*/api/commit/materialization/retry', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as RetryCommitReplicationRequest;
+    const body = (await request.json()) as RetryCommitMaterializationRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
     const receiptKey = resourceKey(body.tenant_id, body.request_id);
@@ -3522,13 +3595,14 @@ export const handlers = [
     if (receipt) {
       if (
         receipt.tenant_id !== body.tenant_id ||
-        receipt.replication_id !== body.replication_id ||
-        receipt.expected_attempt !== body.expected_attempt
+        receipt.object_namespace_id !== body.object_namespace_id ||
+        receipt.replication_id !== body.materialization_id ||
+        receipt.expected_attempt !== body.expected_plan_revision
       ) {
         return mutationConflict(
           request,
           'REQUEST_ID_REUSED',
-          'Replication retry request ID is already bound to another payload',
+          'Materialization retry request ID is already bound to another payload',
         );
       }
       return HttpResponse.json(
@@ -3536,18 +3610,25 @@ export const handlers = [
         { headers: headers(request) },
       );
     }
-    const key = resourceKey(body.tenant_id, body.replication_id);
+    const key = resourceKey(body.tenant_id, body.materialization_id);
     const replication = commitReplications.get(key);
-    if (!replication) return notFound(request, 'Replication');
-    if (replication.attempt !== body.expected_attempt) {
+    if (!replication) return notFound(request, 'Materialization');
+    if (replication.artifact_id !== body.object_namespace_id) {
+      return notFound(request, 'Materialization');
+    }
+    if (replication.attempt !== body.expected_plan_revision) {
       return mutationConflict(
         request,
-        'REPLICATION_ATTEMPT_CHANGED',
-        'Replication attempt changed',
+        'MATERIALIZATION_PLAN_CHANGED',
+        'Materialization plan revision changed',
       );
     }
     if (!['failed', 'cancelled'].includes(replication.state)) {
-      return mutationConflict(request, 'REPLICATION_NOT_RETRYABLE', 'Replication is not retryable');
+      return mutationConflict(
+        request,
+        'MATERIALIZATION_NOT_RETRYABLE',
+        'Materialization is not retryable',
+      );
     }
     const next = {
       ...replication,
@@ -3557,48 +3638,57 @@ export const handlers = [
     delete next.issue;
     commitReplications.set(key, next);
     commitReplicationQueryCounts.set(key, 0);
-    const response: RetryCommitReplicationResponse = { replication: next, replayed: false };
+    const response: RetryCommitMaterializationResponse = {
+      materialization: toMaterializationView(next),
+      replayed: false,
+    };
     commitReplicationRetryMutations.set(receiptKey, {
       tenant_id: body.tenant_id,
-      replication_id: body.replication_id,
-      expected_attempt: body.expected_attempt,
+      object_namespace_id: body.object_namespace_id,
+      replication_id: body.materialization_id,
+      expected_attempt: body.expected_plan_revision,
       response,
     });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/commit/replication/cancel', async ({ request }) => {
+  http.post('*/api/commit/materialization/cancel', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as CancelCommitReplicationRequest;
+    const body = (await request.json()) as CancelCommitMaterializationRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
-    const key = resourceKey(body.tenant_id, body.replication_id);
+    const key = resourceKey(body.tenant_id, body.materialization_id);
     const replication = commitReplications.get(key);
-    if (!replication) return notFound(request, 'Replication');
-    if (replication.attempt !== body.expected_attempt) {
+    if (!replication) return notFound(request, 'Materialization');
+    if (replication.artifact_id !== body.object_namespace_id) {
+      return notFound(request, 'Materialization');
+    }
+    if (replication.attempt !== body.expected_plan_revision) {
       return mutationConflict(
         request,
-        'REPLICATION_ATTEMPT_CHANGED',
-        'Replication attempt changed',
+        'MATERIALIZATION_PLAN_CHANGED',
+        'Materialization plan revision changed',
       );
     }
     if (!['queued', 'planning', 'transferring', 'verifying'].includes(replication.state)) {
       return mutationConflict(
         request,
-        'REPLICATION_NOT_CANCELLABLE',
-        'Replication is not cancellable',
+        'MATERIALIZATION_NOT_CANCELLABLE',
+        'Materialization is not cancellable',
       );
     }
     const next = { ...replication, state: 'cancelled' as const };
     commitReplications.set(key, next);
     commitReplicationQueryCounts.delete(key);
-    const response: CancelCommitReplicationResponse = { replication: next };
+    const response: CancelCommitMaterializationResponse = {
+      materialization: toMaterializationView(next),
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/commit/availability/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as QueryCommitAvailabilityRequest;
+    const body = (await request.json()) as QueryCommitAvailabilityV2Request;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
     const verified_storage_volume_ids = [...commitReplications.values()]
@@ -3606,15 +3696,57 @@ export const handlers = [
         (item) =>
           item.tenant_id === body.tenant_id &&
           item.commit_id === body.commit_id &&
+          item.artifact_id === body.object_namespace_id &&
           item.state === 'published',
       )
       .map((item) => item.target_storage_volume_id);
-    const response: QueryCommitAvailabilityResponse = {
+    const verified_objects = [...commitReplications.values()]
+      .filter(
+        (item) =>
+          item.tenant_id === body.tenant_id &&
+          item.commit_id === body.commit_id &&
+          item.artifact_id === body.object_namespace_id &&
+          item.state === 'published',
+      )
+      .reduce((sum, item) => sum + Number(item.completed_objects), 0);
+    const total_objects = [...commitReplications.values()]
+      .filter(
+        (item) =>
+          item.tenant_id === body.tenant_id &&
+          item.commit_id === body.commit_id &&
+          item.artifact_id === body.object_namespace_id,
+      )
+      .reduce((max, item) => Math.max(max, Number(item.total_objects)), 0);
+    const response: QueryCommitAvailabilityV2Response = {
       availability: {
+        object_namespace_id: body.object_namespace_id,
         commit_id: body.commit_id,
-        data_health: verified_storage_volume_ids.length > 0 ? 'available' : 'unavailable',
-        verified_placements: String(verified_storage_volume_ids.length),
-        missing_objects: verified_storage_volume_ids.length > 0 ? '0' : '1',
+        object_count: String(total_objects),
+        content_presence: verified_storage_volume_ids.length > 0 ? 'available' : 'unavailable',
+        source_serving: verified_storage_volume_ids.length > 0 ? 'available' : 'unavailable',
+        durability: verified_storage_volume_ids.length > 0 ? 'satisfied' : 'unavailable',
+        target_coverage: body.target_storage_volume_id
+          ? verified_storage_volume_ids.includes(body.target_storage_volume_id)
+            ? 'complete'
+            : 'partial'
+          : 'not_requested',
+        view_readiness: body.target_storage_volume_id
+          ? verified_storage_volume_ids.includes(body.target_storage_volume_id)
+            ? 'ready'
+            : 'not_ready'
+          : 'not_ready',
+        complete_volume_count: String(verified_storage_volume_ids.length),
+        missing_objects: [
+          ...(verified_objects < total_objects
+            ? [
+                {
+                  object_id: body.commit_id,
+                  size: '0',
+                  encoding: 'raw' as const,
+                },
+              ]
+            : []),
+        ],
         verified_storage_volume_ids,
       },
     };

@@ -61,10 +61,11 @@ async fn authority_contract_runs_against_in_memory_and_sqlite() {
 
     let options = SqliteConnectOptions::new().filename(directory.path().join("authority.sqlite3"));
     let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
-    let placement_count: i64 = sqlx::query_scalar("SELECT count(*) FROM object_placements")
-        .fetch_one(&mut connection)
-        .await
-        .unwrap();
+    let placement_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM managed_object_placement_evidence")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
     let unexpected_durability_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM durable_objects")
             .fetch_one(&mut connection)
@@ -77,6 +78,12 @@ async fn authority_contract_runs_against_in_memory_and_sqlite() {
     .await
     .unwrap();
     assert_eq!(placement_count, 1);
+    let canonical_placement_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM object_placements")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+    assert_eq!(canonical_placement_count, 0);
     assert_eq!(unexpected_durability_count, 0);
     assert_eq!(agent_registry_tables, 1);
     assert!(!directory.path().join("agent-registry.sqlite3").exists());
@@ -131,7 +138,7 @@ async fn sqlite_reopen_recovers_every_authority_port() {
 }
 
 #[tokio::test]
-async fn sqlite_migrates_schema_13_replication_records_and_checkpoints() {
+async fn sqlite_rejects_v1_schema_without_implicit_migration() {
     let directory = TempDir::new().unwrap();
     {
         let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
@@ -140,102 +147,16 @@ async fn sqlite_migrates_schema_13_replication_records_and_checkpoints() {
         authority.close().await;
     }
 
-    // Downgrade only the replication tables to the exact v13 shape. This mirrors the real
-    // authority created before route-aware replication while retaining all other v14 tables.
     execute_raw(
         directory.path(),
-        r#"INSERT INTO objects (tenant_id, object_id, size, encoding, created_at_unix_ms) VALUES
-         ('tenant-migrate', X'0101010101010101010101010101010101010101010101010101010101010101', 17, 'raw', 1);
-         INSERT INTO commit_objects (tenant_id, commit_id, ordinal, object_id, size, encoding) VALUES
-         ('tenant-migrate', X'0404040404040404040404040404040404040404040404040404040404040404', 0,
-          X'0101010101010101010101010101010101010101010101010101010101010101', 17, 'raw');
-         ALTER TABLE replications RENAME TO replications_v13;
-         DROP TABLE replication_objects;
-         CREATE TABLE replications (
-             tenant_id TEXT NOT NULL,
-             replication_id TEXT NOT NULL,
-             commit_id BLOB NOT NULL CHECK (length(commit_id) = 32),
-             target_backend_id TEXT NOT NULL,
-             target_storage_volume_id TEXT,
-             target_archive_id TEXT,
-             object_set_digest BLOB NOT NULL CHECK (length(object_set_digest) = 32),
-             completed_objects INTEGER NOT NULL CHECK (completed_objects >= 0),
-             total_objects INTEGER NOT NULL CHECK (total_objects >= 0),
-             state TEXT NOT NULL CHECK (state IN ('queued', 'planning', 'transferring', 'verifying', 'published', 'failed', 'cancelled')),
-             request_id TEXT NOT NULL,
-             error_code TEXT,
-             error_message TEXT,
-             created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
-             updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
-             PRIMARY KEY (tenant_id, replication_id),
-             UNIQUE (tenant_id, request_id),
-             CHECK ((target_storage_volume_id IS NULL) <> (target_archive_id IS NULL))
-         ) STRICT;
-         INSERT INTO replications (tenant_id, replication_id, commit_id, target_backend_id,
-             target_storage_volume_id, target_archive_id, object_set_digest, completed_objects,
-             total_objects, state, request_id, error_code, error_message, created_at_unix_ms,
-             updated_at_unix_ms) VALUES (
-             'tenant-migrate', 'replication-migrate-1',
-             X'0404040404040404040404040404040404040404040404040404040404040404',
-             'backend-target', 'volume-target', NULL,
-             X'0505050505050505050505050505050505050505050505050505050505050505',
-             0, 1, 'transferring', 'request-migrate-1', NULL, NULL, 10, 10);
-         CREATE TABLE replication_objects (
-             tenant_id TEXT NOT NULL,
-             replication_id TEXT NOT NULL,
-             object_id BLOB NOT NULL CHECK (length(object_id) = 32),
-             offset INTEGER NOT NULL CHECK (offset >= 0),
-             state TEXT NOT NULL CHECK (state IN ('queued', 'transferring', 'verified', 'failed')),
-             retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
-             updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0),
-             PRIMARY KEY (tenant_id, replication_id, object_id),
-             FOREIGN KEY (tenant_id, replication_id)
-                 REFERENCES replications (tenant_id, replication_id) ON DELETE CASCADE
-         ) STRICT;
-         INSERT INTO replication_objects (tenant_id, replication_id, object_id, offset, state, retry_count, updated_at_unix_ms) VALUES (
-             'tenant-migrate', 'replication-migrate-1',
-             X'0101010101010101010101010101010101010101010101010101010101010101',
-             17, 'transferring', 1, 11);
-         DROP TABLE replications_v13;
-         PRAGMA user_version = 13;"#,
+        "PRAGMA application_id = 1313161557; PRAGMA user_version = 17;",
     )
     .await;
 
-    let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+    let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .unwrap();
-    let store = authority.authority_store().placement().unwrap();
-    let tenant_id = TenantId::new("tenant-migrate").unwrap();
-    let replication_id =
-        neoengram_domain::protocol::ReplicationId::new("replication-migrate-1").unwrap();
-    let record = store
-        .get_replication(&tenant_id, &replication_id)
-        .await
-        .unwrap()
-        .expect("v13 replication must survive migration");
-    assert_eq!(record.attempt, 1);
-    assert_eq!(record.total_bytes, 17);
-    assert_eq!(record.completed_bytes, 17);
-    assert!(record.source_placement_set_id.is_none());
-    assert!(record.target_placement_set_id.is_none());
-    assert_eq!(
-        store
-            .list_replication_objects(&tenant_id, &replication_id)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-    let options = SqliteConnectOptions::new().filename(directory.path().join("authority.sqlite3"));
-    let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
-    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(&mut connection)
-        .await
-        .unwrap();
-    assert_eq!(version, 17);
-    connection.close().await.unwrap();
-    authority.integrity_check().await.unwrap();
-    authority.close().await;
+        .expect_err("v1 authority must require an explicit reset/inventory rebuild");
+    assert!(error.to_string().contains("explicit reset"));
 }
 
 #[tokio::test]
@@ -339,8 +260,7 @@ async fn sqlite_allows_only_one_authority_instance() {
         .unwrap();
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("second authority must fail while the first lock is alive");
+        .expect_err("second authority must fail while the first lock is alive");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
     drop(first);
     open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
@@ -1494,8 +1414,7 @@ async fn initialize_and_close(path: &Path) {
 async fn assert_open_storage_failure(path: &Path) {
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(path))
         .await
-        .err()
-        .expect("invalid authority database must be rejected");
+        .expect_err("invalid authority database must be rejected");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 

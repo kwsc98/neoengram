@@ -365,6 +365,11 @@ fn report_job_id(report: &AgentReport) -> AgentResult<neoengram_domain::protocol
             value.replication_id()
         ))
         .map_err(AgentError::from),
+        AgentReport::Materialization(value) => neoengram_domain::protocol::JobId::new(format!(
+            "materialization-{}",
+            value.materialization_id()
+        ))
+        .map_err(AgentError::from),
     }
 }
 
@@ -373,6 +378,7 @@ fn report_tenant_id(report: &AgentReport) -> Option<&TenantId> {
         AgentReport::Failed(value) => Some(&value.tenant_id),
         AgentReport::Lifecycle(value) => Some(&value.tenant_id),
         AgentReport::Replication(value) => Some(value.tenant_id()),
+        AgentReport::Materialization(value) => Some(value.tenant_id()),
         _ => None,
     }
 }

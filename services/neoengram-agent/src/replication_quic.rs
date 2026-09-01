@@ -6,7 +6,7 @@
 //! immutable ObjectSet so a signed ticket cannot be widened by a peer.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     net::SocketAddr,
     path::PathBuf,
@@ -15,17 +15,24 @@ use std::{
 };
 
 use neoengram_domain::protocol::{
-    CommitObjectSet, MountGeneration, ObjectChunk, ObjectProof, ObjectRequest, ObjectSet,
-    SignedTransferTicket, TransferFrame, TransferFrameError, TransferTicket,
+    BatchManifest, BatchManifestPage, CommitObjectSet, MaterializationBatch,
+    MaterializationBatchId, MaterializationBatchTicket, MaterializationId,
+    MaterializationManifestSource, MaterializationObjectPlacement, MaterializationObjectReceipt,
+    MountGeneration, ObjectChunk, ObjectPlacementState, ObjectProof, ObjectReceiptId, ObjectRef,
+    ObjectRequest, ObjectSet, PlacementId, SignedMaterializationBatchTicket, SignedTransferTicket,
+    StorageVolumeId, TransferFrame, TransferFrameError, TransferTicket, UnixMillis,
     MAX_TRANSFER_CHUNK_BYTES,
 };
-use neoengram_domain::ObjectId;
 use neoengram_domain::TenantId;
+use neoengram_domain::{Generation, ObjectId};
 use neoengram_runtime::{ObjectBackend, ObjectRange};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls_pki_types::pem::PemObject;
 
-use crate::{CentralCommandTrustBundle, SharedSessionFence};
+use crate::{
+    CentralCommandTrustBundle, InMemoryPlacementInventory, LocalPlacementInventory,
+    SharedSessionFence,
+};
 
 /// A transfer frame must make progress within a bounded interval. QUIC's connection idle
 /// timeout eventually closes a dead path, but relying on it alone leaves the worker blocked for
@@ -33,6 +40,160 @@ use crate::{CentralCommandTrustBundle, SharedSessionFence};
 const TRANSFER_FRAME_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TRANSFER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Read-only Agent-local inventory used to prove that a Central-selected source Placement is
+/// actually the object copy served by this process.  The resolver must not consult Central or
+/// accept network-supplied paths: it is deliberately an Agent-local metadata boundary.
+pub trait SourcePlacementResolver: std::fmt::Debug + Send + Sync {
+    /// Resolve the exact Placement selected by Central for one manifest object.
+    ///
+    /// `None` is treated as a hard authorization failure.  A resolver may return an error for an
+    /// unavailable/corrupt local inventory, which is also fail-closed by the source listener.
+    fn resolve(
+        &self,
+        ticket: &MaterializationBatchTicket,
+        object: &ObjectRef,
+    ) -> Result<Option<MaterializationObjectPlacement>, QuicTransferError>;
+
+    /// Resolves the object against an explicit per-object Placement binding.  The default keeps
+    /// existing in-process resolvers source-compatible while allowing a route-grouped Batch to
+    /// carry different Placement IDs for different objects in its signed manifest.
+    fn resolve_selected(
+        &self,
+        ticket: &MaterializationBatchTicket,
+        object: &ObjectRef,
+        placement: &MaterializationManifestSource,
+    ) -> Result<Option<MaterializationObjectPlacement>, QuicTransferError> {
+        let mut scoped_ticket = ticket.clone();
+        scoped_ticket.source.placement_id = placement.placement_id.clone();
+        scoped_ticket.source.placement_generation = placement.placement_generation;
+        self.resolve(&scoped_ticket, object)
+    }
+
+    /// Verifies that the selected Placement is backed by the local CAS before a source stream is
+    /// opened.  The default is intentionally a no-op for explicit in-process test resolvers;
+    /// mounted-volume production resolvers override it with a content-addressed inventory check.
+    fn verify_backend(
+        &self,
+        _ticket: &MaterializationBatchTicket,
+        _object: &ObjectRef,
+        _backend: &dyn ObjectBackend,
+    ) -> Result<(), QuicTransferError> {
+        Ok(())
+    }
+}
+
+/// Explicit test/development resolver for in-process streams that do not have an Agent inventory.
+/// Production listeners must inject a real [`SourcePlacementResolver`] instead.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PermissiveSourcePlacementResolver;
+
+impl SourcePlacementResolver for PermissiveSourcePlacementResolver {
+    fn resolve(
+        &self,
+        ticket: &MaterializationBatchTicket,
+        object: &ObjectRef,
+    ) -> Result<Option<MaterializationObjectPlacement>, QuicTransferError> {
+        Ok(Some(MaterializationObjectPlacement {
+            placement_id: ticket.source.placement_id.clone(),
+            tenant_id: ticket.tenant_id.clone(),
+            object_namespace_id: ticket.object_namespace_id.clone(),
+            object_id: object.object_id,
+            size: object.size,
+            encoding: object.encoding,
+            verified_digest: object.object_id.digest(),
+            storage_volume_id: ticket.source.storage_volume_id.clone(),
+            archive_id: ticket.source.archive_id.clone(),
+            placement_generation: ticket.source.placement_generation,
+            state: ObjectPlacementState::Verified,
+            failure_domain: "test-permissive".to_owned(),
+        }))
+    }
+}
+
+/// Fail-closed resolver used when a caller has not configured a local placement inventory.
+/// Keeping this separate from the explicit permissive test resolver prevents a production
+/// listener from accidentally treating a signed ticket as local placement evidence.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RejectingSourcePlacementResolver;
+
+impl SourcePlacementResolver for RejectingSourcePlacementResolver {
+    fn resolve(
+        &self,
+        _ticket: &MaterializationBatchTicket,
+        _object: &ObjectRef,
+    ) -> Result<Option<MaterializationObjectPlacement>, QuicTransferError> {
+        Ok(None)
+    }
+}
+
+/// Source resolver used by the mounted-volume runtime.  Agents do not own the Placement
+/// authority, but they do own the physical Volume fence.  Binding the resolver to that Volume
+/// prevents a valid ticket for another source Volume from being served by this process.  Central
+/// supplies an exact Placement binding for each manifest object; the selected ID and generation
+/// are checked against local inventory before the backend is opened.
+#[derive(Debug, Clone)]
+pub struct MountedVolumeSourcePlacementResolver {
+    storage_volume_id: StorageVolumeId,
+    inventory: Arc<dyn LocalPlacementInventory>,
+}
+
+impl MountedVolumeSourcePlacementResolver {
+    #[must_use]
+    pub fn new(storage_volume_id: StorageVolumeId) -> Self {
+        // Keep the one-argument constructor strict for embedded callers: an empty inventory is
+        // preferable to deriving a Placement from ticket bytes. Production runtimes should use
+        // `with_inventory` with the durable Agent-local inventory.
+        Self::with_inventory(
+            storage_volume_id,
+            Arc::new(InMemoryPlacementInventory::default()),
+        )
+    }
+
+    #[must_use]
+    pub fn with_inventory(
+        storage_volume_id: StorageVolumeId,
+        inventory: Arc<dyn LocalPlacementInventory>,
+    ) -> Self {
+        Self {
+            storage_volume_id,
+            inventory,
+        }
+    }
+}
+
+impl SourcePlacementResolver for MountedVolumeSourcePlacementResolver {
+    fn resolve(
+        &self,
+        ticket: &MaterializationBatchTicket,
+        object: &ObjectRef,
+    ) -> Result<Option<MaterializationObjectPlacement>, QuicTransferError> {
+        if ticket.source.storage_volume_id.as_ref() != Some(&self.storage_volume_id) {
+            return Ok(None);
+        }
+        self.inventory
+            .lookup(
+                &ticket.tenant_id,
+                &ticket.source.placement_id,
+                &ticket.object_namespace_id,
+                object.object_id,
+            )
+            .map_err(|error| {
+                QuicTransferError::Backend(format!(
+                    "local source placement inventory is unavailable: {error}"
+                ))
+            })
+    }
+
+    fn verify_backend(
+        &self,
+        ticket: &MaterializationBatchTicket,
+        object: &ObjectRef,
+        backend: &dyn ObjectBackend,
+    ) -> Result<(), QuicTransferError> {
+        verify_local_source_object(backend, &ticket.tenant_id, object)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuicTransferError {
@@ -147,7 +308,7 @@ impl QuicTransferNetwork {
             .with_client_cert_verifier(verifier)
             .with_single_cert(certificates.clone(), private_key.clone_key())
             .map_err(|error| QuicTransferError::Tls(error.to_string()))?;
-        server.alpn_protocols = vec![neoengram_domain::protocol::TRANSFER_ALPN
+        server.alpn_protocols = vec![neoengram_domain::protocol::MATERIALIZATION_TRANSFER_ALPN_V2
             .as_bytes()
             .to_vec()];
         server.send_tls13_tickets = 0;
@@ -168,7 +329,7 @@ impl QuicTransferNetwork {
             .with_root_certificates(roots)
             .with_client_auth_cert(certificates, private_key)
             .map_err(|error| QuicTransferError::Tls(error.to_string()))?;
-        client.alpn_protocols = vec![neoengram_domain::protocol::TRANSFER_ALPN
+        client.alpn_protocols = vec![neoengram_domain::protocol::MATERIALIZATION_TRANSFER_ALPN_V2
             .as_bytes()
             .to_vec()];
         client.resumption = rustls::client::Resumption::disabled();
@@ -232,6 +393,68 @@ impl QuicTransferNetwork {
         session_fence: SharedSessionFence,
         local_mount_generation: MountGeneration,
         execution: Arc<crate::FilesystemExecution>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), QuicTransferError> {
+        self.serve_source_with_volume(
+            trust_bundle,
+            local_tenant_id,
+            local_agent_id,
+            None,
+            session_fence,
+            local_mount_generation,
+            execution,
+            shutdown,
+        )
+        .await
+    }
+
+    /// Source listener entry point with an explicit local Volume identity. Production runtimes
+    /// should use this variant so a valid ticket for another Volume cannot be mapped to this
+    /// Agent's artifact-scoped CAS.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_source_with_volume(
+        &self,
+        trust_bundle: Arc<CentralCommandTrustBundle>,
+        local_tenant_id: TenantId,
+        local_agent_id: neoengram_domain::AgentId,
+        local_storage_volume_id: Option<StorageVolumeId>,
+        session_fence: SharedSessionFence,
+        local_mount_generation: MountGeneration,
+        execution: Arc<crate::FilesystemExecution>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), QuicTransferError> {
+        let resolver: Arc<dyn SourcePlacementResolver> = match local_storage_volume_id.clone() {
+            Some(volume) => Arc::new(MountedVolumeSourcePlacementResolver::new(volume)),
+            None => Arc::new(RejectingSourcePlacementResolver),
+        };
+        self.serve_source_with_volume_and_resolver(
+            trust_bundle,
+            local_tenant_id,
+            local_agent_id,
+            local_storage_volume_id,
+            session_fence,
+            local_mount_generation,
+            execution,
+            resolver,
+            shutdown,
+        )
+        .await
+    }
+
+    /// Source listener entry point with an explicit local Placement resolver. Production callers
+    /// should provide a resolver backed by the Agent's durable Volume inventory; the resolver is
+    /// consulted for every manifest object before the source backend is opened.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_source_with_volume_and_resolver(
+        &self,
+        trust_bundle: Arc<CentralCommandTrustBundle>,
+        local_tenant_id: TenantId,
+        local_agent_id: neoengram_domain::AgentId,
+        local_storage_volume_id: Option<StorageVolumeId>,
+        session_fence: SharedSessionFence,
+        local_mount_generation: MountGeneration,
+        execution: Arc<crate::FilesystemExecution>,
+        source_resolver: Arc<dyn SourcePlacementResolver>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), QuicTransferError> {
         let Some(_) = self.endpoint.local_addr().ok() else {
@@ -249,8 +472,10 @@ impl QuicTransferNetwork {
             let trust_bundle = Arc::clone(&trust_bundle);
             let local_tenant_id = local_tenant_id.clone();
             let local_agent_id = local_agent_id.clone();
+            let local_storage_volume_id = local_storage_volume_id.clone();
             let session_fence = session_fence.clone();
             let execution = Arc::clone(&execution);
+            let source_resolver = Arc::clone(&source_resolver);
             tokio::spawn(async move {
                 let result = async {
                     let connection = incoming.await?;
@@ -258,20 +483,44 @@ impl QuicTransferNetwork {
                     let current_session = session_fence
                         .get()
                         .map_err(|error| QuicTransferError::Protocol(error.to_string()))?;
-                    let identity = QuicTransferIdentity::new(local_agent_id).with_session_mount(
+                    let identity = QuicTransferIdentity::new(local_agent_id);
+                    let identity = match local_storage_volume_id {
+                        Some(storage_volume_id) => identity.with_storage_volume(storage_volume_id),
+                        None => identity,
+                    }
+                    .with_session_mount(
                         current_session.session_generation.get(),
                         local_mount_generation.get(),
                     );
-                    serve_quic_source_connection(
+                    let transfer_execution = Arc::clone(&execution);
+                    let materialization_execution = Arc::clone(&execution);
+                    let transfer_tenant = local_tenant_id.clone();
+                    let materialization_tenant = local_tenant_id.clone();
+                    serve_quic_unified_source_connection(
                         send,
                         recv,
                         move |ticket| {
-                            if ticket.ticket.tenant_id != local_tenant_id {
+                            if ticket.ticket.tenant_id != transfer_tenant {
                                 return Err(QuicTransferError::Ticket(
                                     "source Agent tenant does not match transfer ticket".into(),
                                 ));
                             }
-                            execution
+                            transfer_execution
+                                .replication_backend(
+                                    ticket.ticket.tenant_id.clone(),
+                                    ticket.ticket.artifact_id.clone(),
+                                )
+                                .map(|backend| Arc::new(backend) as Arc<dyn ObjectBackend>)
+                                .map_err(|error| QuicTransferError::Backend(error.to_string()))
+                        },
+                        move |ticket| {
+                            if ticket.ticket.tenant_id != materialization_tenant {
+                                return Err(QuicTransferError::Ticket(
+                                    "source Agent tenant does not match materialization ticket"
+                                        .into(),
+                                ));
+                            }
+                            materialization_execution
                                 .replication_backend(
                                     ticket.ticket.tenant_id.clone(),
                                     ticket.ticket.artifact_id.clone(),
@@ -282,6 +531,7 @@ impl QuicTransferNetwork {
                         &trust_bundle,
                         current_unix_millis(),
                         Some(identity),
+                        source_resolver,
                     )
                     .await
                 }
@@ -301,6 +551,7 @@ impl QuicTransferNetwork {
 #[derive(Debug, Clone)]
 pub struct QuicTransferIdentity {
     pub agent_id: neoengram_domain::AgentId,
+    storage_volume_id: Option<StorageVolumeId>,
     generations: Option<(u64, u64, u64)>,
     session_mount: Option<(u64, u64)>,
 }
@@ -310,9 +561,16 @@ impl QuicTransferIdentity {
     pub fn new(agent_id: neoengram_domain::AgentId) -> Self {
         Self {
             agent_id,
+            storage_volume_id: None,
             generations: None,
             session_mount: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_storage_volume(mut self, storage_volume_id: StorageVolumeId) -> Self {
+        self.storage_volume_id = Some(storage_volume_id);
+        self
     }
 
     #[must_use]
@@ -336,6 +594,13 @@ impl QuicTransferIdentity {
         if ticket.source.agent_id != self.agent_id {
             return Err(QuicTransferError::Protocol(
                 "ticket source Agent does not match local Agent".into(),
+            ));
+        }
+        if self.storage_volume_id.as_ref() != ticket.source.storage_volume_id.as_ref()
+            && self.storage_volume_id.is_some()
+        {
+            return Err(QuicTransferError::Protocol(
+                "ticket source Volume does not match local Volume".into(),
             ));
         }
         if let Some((session, mount, route)) = self.generations {
@@ -366,6 +631,13 @@ impl QuicTransferIdentity {
                 "ticket target Agent does not match local Agent".into(),
             ));
         }
+        if self.storage_volume_id.as_ref() != ticket.target.storage_volume_id.as_ref()
+            && self.storage_volume_id.is_some()
+        {
+            return Err(QuicTransferError::Protocol(
+                "ticket target Volume does not match local Volume".into(),
+            ));
+        }
         if let Some((session, mount, route)) = self.generations {
             if ticket.session_generation.get() != session
                 || ticket.mount_generation.get() != mount
@@ -381,6 +653,82 @@ impl QuicTransferIdentity {
             {
                 return Err(QuicTransferError::Protocol(
                     "ticket target session or mount generation is stale".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_materialization_source(
+        &self,
+        ticket: &MaterializationBatchTicket,
+    ) -> Result<(), QuicTransferError> {
+        if ticket.source.agent_id != self.agent_id {
+            return Err(QuicTransferError::Protocol(
+                "materialization source Agent does not match local Agent".into(),
+            ));
+        }
+        if self.storage_volume_id.as_ref() != ticket.source.storage_volume_id.as_ref()
+            && self.storage_volume_id.is_some()
+        {
+            return Err(QuicTransferError::Protocol(
+                "materialization source Volume does not match local Volume".into(),
+            ));
+        }
+        if let Some((session, mount, route)) = self.generations {
+            if ticket.source.session_generation.get() != session
+                || ticket.source.mount_generation.get() != mount
+                || ticket.source.route_generation.get() != route
+            {
+                return Err(QuicTransferError::Protocol(
+                    "materialization source route generation is stale".into(),
+                ));
+            }
+        }
+        if let Some((session, mount)) = self.session_mount {
+            if ticket.source.session_generation.get() != session
+                || ticket.source.mount_generation.get() != mount
+            {
+                return Err(QuicTransferError::Protocol(
+                    "materialization source session or mount generation is stale".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_materialization_target(
+        &self,
+        ticket: &MaterializationBatchTicket,
+    ) -> Result<(), QuicTransferError> {
+        if ticket.target.agent_id != self.agent_id {
+            return Err(QuicTransferError::Protocol(
+                "materialization target Agent does not match local Agent".into(),
+            ));
+        }
+        if self.storage_volume_id.as_ref() != Some(&ticket.target.storage_volume_id)
+            && self.storage_volume_id.is_some()
+        {
+            return Err(QuicTransferError::Protocol(
+                "materialization target Volume does not match local Volume".into(),
+            ));
+        }
+        if let Some((session, mount, route)) = self.generations {
+            if ticket.target.session_generation.get() != session
+                || ticket.target.mount_generation.get() != mount
+                || ticket.target.route_generation.get() != route
+            {
+                return Err(QuicTransferError::Protocol(
+                    "materialization target route generation is stale".into(),
+                ));
+            }
+        }
+        if let Some((session, mount)) = self.session_mount {
+            if ticket.target.session_generation.get() != session
+                || ticket.target.mount_generation.get() != mount
+            {
+                return Err(QuicTransferError::Protocol(
+                    "materialization target session or mount generation is stale".into(),
                 ));
             }
         }
@@ -614,6 +962,275 @@ impl QuicTransferClient {
         .await?;
         Ok(())
     }
+
+    /// Materializes one Central-planned v2 batch. The target sends the signed capability and the
+    /// complete paged manifest before requesting any bytes; the source can therefore serve only
+    /// the exact object descriptors selected by Central. The returned receipts are ready for the
+    /// normal Agent control/report path and contain no payload bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn materialize_batch(
+        &self,
+        signed_ticket: &SignedMaterializationBatchTicket,
+        batch: &MaterializationBatch,
+        manifest: &BatchManifest,
+        pages: &[BatchManifestPage],
+        target: &dyn ObjectBackend,
+        trust_bundle: &CentralCommandTrustBundle,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaterializationObjectReceipt>, QuicTransferError> {
+        crate::validate_signed_materialization_batch_with_trust(
+            trust_bundle,
+            signed_ticket,
+            batch,
+            manifest,
+            pages,
+            UnixMillis::new(now_unix_ms),
+        )
+        .map_err(|error| QuicTransferError::Ticket(error.to_string()))?;
+        if let Some(identity) = self.identity.as_ref() {
+            identity.check_materialization_target(&signed_ticket.ticket)?;
+        }
+        let transfer_id = crate::materialization_transfer_id(
+            &signed_ticket.ticket.materialization_id,
+            &signed_ticket.ticket.object_namespace_id,
+        )
+        .map_err(|error| QuicTransferError::Ticket(error.to_string()))?;
+        let (mut send, mut recv) = self.connection.open_bi().await?;
+        send_frame(
+            &mut send,
+            &TransferFrame::OpenMaterializationSigned(signed_ticket.clone()),
+        )
+        .await?;
+        send_frame(
+            &mut send,
+            &TransferFrame::MaterializationManifest(manifest.clone()),
+        )
+        .await?;
+        for page in pages {
+            send_frame(
+                &mut send,
+                &TransferFrame::MaterializationManifestPage(page.clone()),
+            )
+            .await?;
+        }
+
+        let mut receipts = Vec::with_capacity(manifest.object_count.get() as usize);
+        let mut transferred = 0_u64;
+        let mut ordered_pages = pages.to_vec();
+        ordered_pages.sort_by_key(|page| page.page_number);
+        for object in ordered_pages.iter().flat_map(|page| page.objects.iter()) {
+            let expected = object.object_spec();
+            let already_published = match target
+                .inspect(&signed_ticket.ticket.tenant_id, &expected.id)
+                .map_err(backend_error)?
+            {
+                None => false,
+                Some(metadata) if metadata.id == expected.id && metadata.size == expected.size => {
+                    true
+                }
+                Some(_) => {
+                    return Err(QuicTransferError::Protocol(
+                        "target contains an object with an unexpected size or digest".into(),
+                    ));
+                }
+            };
+            let mut offset = if already_published {
+                expected.size
+            } else {
+                target
+                    .staged_size(
+                        &transfer_id,
+                        &signed_ticket.ticket.tenant_id,
+                        &object.object_id,
+                    )
+                    .map_err(backend_error)?
+                    .unwrap_or(0)
+            };
+            if offset > expected.size {
+                return Err(QuicTransferError::Protocol(
+                    "materialization staged offset exceeds object size".into(),
+                ));
+            }
+            if already_published {
+                // A replayed target object is already durable.  The zero-length acknowledgement
+                // lets the source mark this manifest member complete without requesting bytes.
+                target
+                    .verify_and_publish(&transfer_id, &signed_ticket.ticket.tenant_id, &expected)
+                    .map_err(backend_error)?;
+                send_frame(
+                    &mut send,
+                    &TransferFrame::ObjectAck(neoengram_domain::protocol::ObjectAck {
+                        object_id: object.object_id,
+                        offset,
+                        length: 0,
+                        accepted: true,
+                    }),
+                )
+                .await?;
+            } else if expected.size == 0 {
+                send_frame(
+                    &mut send,
+                    &TransferFrame::ObjectRequest(ObjectRequest {
+                        object_id: object.object_id,
+                        offset: 0,
+                        length: 0,
+                    }),
+                )
+                .await?;
+                let frame = read_frame(&mut recv).await?;
+                let TransferFrame::ObjectProof(proof) = frame else {
+                    return Err(protocol_frame("expected empty-object ObjectProof"));
+                };
+                if proof.object_id != object.object_id
+                    || proof.size != 0
+                    || proof.digest != object.object_id.digest()
+                {
+                    return Err(protocol_frame(
+                        "empty-object ObjectProof does not match object",
+                    ));
+                }
+                target
+                    .verify_and_publish(&transfer_id, &signed_ticket.ticket.tenant_id, &expected)
+                    .map_err(backend_error)?;
+                send_frame(
+                    &mut send,
+                    &TransferFrame::ObjectAck(neoengram_domain::protocol::ObjectAck {
+                        object_id: object.object_id,
+                        offset: 0,
+                        length: 0,
+                        accepted: true,
+                    }),
+                )
+                .await?;
+            } else if offset == expected.size {
+                target
+                    .verify_and_publish(&transfer_id, &signed_ticket.ticket.tenant_id, &expected)
+                    .map_err(backend_error)?;
+                send_frame(
+                    &mut send,
+                    &TransferFrame::ObjectAck(neoengram_domain::protocol::ObjectAck {
+                        object_id: object.object_id,
+                        offset,
+                        length: 0,
+                        accepted: true,
+                    }),
+                )
+                .await?;
+            }
+            while offset < expected.size {
+                let length = (expected.size - offset).min(self.config.chunk_bytes as u64);
+                transferred = transferred
+                    .checked_add(length)
+                    .ok_or_else(|| QuicTransferError::Protocol("byte count overflow".into()))?;
+                if transferred > signed_ticket.ticket.max_bytes.get() {
+                    return Err(QuicTransferError::Protocol(
+                        "materialization exceeds ticket byte limit".into(),
+                    ));
+                }
+                send_frame(
+                    &mut send,
+                    &TransferFrame::ObjectRequest(ObjectRequest {
+                        object_id: object.object_id,
+                        offset,
+                        length,
+                    }),
+                )
+                .await?;
+                let frame = read_frame(&mut recv).await?;
+                let TransferFrame::ObjectChunk(chunk) = frame else {
+                    return Err(protocol_frame("expected ObjectChunk"));
+                };
+                if chunk.object_id != object.object_id
+                    || chunk.offset != offset
+                    || chunk.bytes.len() as u64 != length
+                {
+                    return Err(protocol_frame(
+                        "materialization ObjectChunk range does not match request",
+                    ));
+                }
+                let staged = target
+                    .stage_write(
+                        &transfer_id,
+                        &signed_ticket.ticket.tenant_id,
+                        &expected,
+                        offset,
+                        &chunk.bytes,
+                    )
+                    .map_err(backend_error)?;
+                if staged.staged_size != offset + length {
+                    return Err(protocol_frame(
+                        "materialization target acknowledged an unexpected offset",
+                    ));
+                }
+                send_frame(
+                    &mut send,
+                    &TransferFrame::ObjectAck(neoengram_domain::protocol::ObjectAck {
+                        object_id: object.object_id,
+                        offset,
+                        length,
+                        accepted: true,
+                    }),
+                )
+                .await?;
+                offset += length;
+                if offset == expected.size {
+                    let frame = read_frame(&mut recv).await?;
+                    let TransferFrame::ObjectProof(proof) = frame else {
+                        return Err(protocol_frame("expected ObjectProof"));
+                    };
+                    if proof.object_id != object.object_id
+                        || proof.size != expected.size
+                        || proof.digest != object.object_id.digest()
+                    {
+                        return Err(protocol_frame(
+                            "materialization ObjectProof does not match object",
+                        ));
+                    }
+                    target
+                        .verify_and_publish(
+                            &transfer_id,
+                            &signed_ticket.ticket.tenant_id,
+                            &expected,
+                        )
+                        .map_err(backend_error)?;
+                }
+            }
+            let receipt_id = materialization_receipt_id(
+                &signed_ticket.ticket.materialization_id,
+                &signed_ticket.ticket.batch_id,
+                signed_ticket.ticket.plan_revision,
+                signed_ticket.ticket.batch_attempt,
+                object.object_id,
+            )?;
+            let checkpoint = crate::MaterializationCheckpoint {
+                materialization_id: signed_ticket.ticket.materialization_id.clone(),
+                batch_id: signed_ticket.ticket.batch_id.clone(),
+                plan_revision: signed_ticket.ticket.plan_revision,
+                batch_attempt: signed_ticket.ticket.batch_attempt,
+                object_id: object.object_id,
+                confirmed_offset: expected.size,
+            };
+            receipts.push(
+                crate::materialization_receipt_from_checkpoint(
+                    &signed_ticket.ticket,
+                    object,
+                    receipt_id,
+                    signed_ticket.ticket.target.placement_generation,
+                    &checkpoint,
+                    UnixMillis::new(now_unix_ms),
+                )
+                .map_err(|error| QuicTransferError::Protocol(error.to_string()))?,
+            );
+        }
+        send_frame(
+            &mut send,
+            &TransferFrame::CloseTransfer(neoengram_domain::protocol::CloseTransfer {
+                committed: true,
+            }),
+        )
+        .await?;
+        Ok(receipts)
+    }
 }
 
 /// Functional sink-session hook for runtimes that do not need to retain a client object.
@@ -685,6 +1302,466 @@ pub async fn serve_quic_source_stream_from_ticket(
     .await
 }
 
+/// Handles a clean-slate v2 materialization source stream. The target must provide a bounded
+/// manifest descriptor followed by every page declared by that descriptor. No source object is
+/// opened until the Central signature, route fence, page digests and batch object IDs all match.
+/// This convenience wrapper has no local inventory and therefore rejects source objects; callers
+/// that own the Agent inventory must use [`serve_quic_materialization_source_stream_with_resolver`].
+pub async fn serve_quic_materialization_source_stream(
+    send: SendStream,
+    recv: RecvStream,
+    backend: Arc<dyn ObjectBackend>,
+    trust_bundle: &CentralCommandTrustBundle,
+    now_unix_ms: u64,
+    identity: Option<QuicTransferIdentity>,
+) -> Result<(), QuicTransferError> {
+    serve_quic_materialization_source_stream_with_factory_and_resolver(
+        send,
+        recv,
+        move |_| Ok(backend),
+        trust_bundle,
+        now_unix_ms,
+        identity,
+        Arc::new(RejectingSourcePlacementResolver),
+    )
+    .await
+}
+
+/// Explicit source-stream entry point for a caller that owns an Agent-local placement inventory.
+/// The resolver is mandatory at this boundary; without it a signed ticket is not accepted as
+/// proof that this process holds the selected Placement.
+pub async fn serve_quic_materialization_source_stream_with_resolver(
+    send: SendStream,
+    recv: RecvStream,
+    backend: Arc<dyn ObjectBackend>,
+    trust_bundle: &CentralCommandTrustBundle,
+    now_unix_ms: u64,
+    identity: Option<QuicTransferIdentity>,
+    source_resolver: Arc<dyn SourcePlacementResolver>,
+) -> Result<(), QuicTransferError> {
+    serve_quic_materialization_source_stream_with_factory_and_resolver(
+        send,
+        recv,
+        move |_| Ok(backend),
+        trust_bundle,
+        now_unix_ms,
+        identity,
+        source_resolver,
+    )
+    .await
+}
+
+/// Source listener entry point for runtimes that select an artifact-scoped backend only after
+/// validating the v2 ticket. The callback receives no network address or arbitrary path. A local
+/// placement resolver is required for a source listener; callers should use the `_with_resolver`
+/// variant below.
+pub async fn serve_quic_materialization_source_connection<F>(
+    send: SendStream,
+    recv: RecvStream,
+    backend_factory: F,
+    trust_bundle: &CentralCommandTrustBundle,
+    now_unix_ms: u64,
+    identity: Option<QuicTransferIdentity>,
+) -> Result<(), QuicTransferError>
+where
+    F: FnOnce(
+        &SignedMaterializationBatchTicket,
+    ) -> Result<Arc<dyn ObjectBackend>, QuicTransferError>,
+{
+    serve_quic_materialization_source_stream_with_factory_and_resolver(
+        send,
+        recv,
+        backend_factory,
+        trust_bundle,
+        now_unix_ms,
+        identity,
+        Arc::new(RejectingSourcePlacementResolver),
+    )
+    .await
+}
+
+/// Factory variant with an explicit Agent-local source placement resolver.
+pub async fn serve_quic_materialization_source_connection_with_resolver<F>(
+    send: SendStream,
+    recv: RecvStream,
+    backend_factory: F,
+    trust_bundle: &CentralCommandTrustBundle,
+    now_unix_ms: u64,
+    identity: Option<QuicTransferIdentity>,
+    source_resolver: Arc<dyn SourcePlacementResolver>,
+) -> Result<(), QuicTransferError>
+where
+    F: FnOnce(
+        &SignedMaterializationBatchTicket,
+    ) -> Result<Arc<dyn ObjectBackend>, QuicTransferError>,
+{
+    serve_quic_materialization_source_stream_with_factory_and_resolver(
+        send,
+        recv,
+        backend_factory,
+        trust_bundle,
+        now_unix_ms,
+        identity,
+        source_resolver,
+    )
+    .await
+}
+
+async fn serve_quic_materialization_source_stream_with_factory_and_resolver(
+    send: SendStream,
+    mut recv: RecvStream,
+    backend_factory: impl FnOnce(
+        &SignedMaterializationBatchTicket,
+    ) -> Result<Arc<dyn ObjectBackend>, QuicTransferError>,
+    trust_bundle: &CentralCommandTrustBundle,
+    now_unix_ms: u64,
+    identity: Option<QuicTransferIdentity>,
+    source_resolver: Arc<dyn SourcePlacementResolver>,
+) -> Result<(), QuicTransferError> {
+    let frame = read_frame(&mut recv).await?;
+    serve_quic_materialization_source_stream_with_factory_from_first(
+        send,
+        recv,
+        frame,
+        backend_factory,
+        trust_bundle,
+        now_unix_ms,
+        identity,
+        source_resolver,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_quic_materialization_source_stream_with_factory_from_first(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    frame: TransferFrame,
+    backend_factory: impl FnOnce(
+        &SignedMaterializationBatchTicket,
+    ) -> Result<Arc<dyn ObjectBackend>, QuicTransferError>,
+    trust_bundle: &CentralCommandTrustBundle,
+    now_unix_ms: u64,
+    identity: Option<QuicTransferIdentity>,
+    source_resolver: Arc<dyn SourcePlacementResolver>,
+) -> Result<(), QuicTransferError> {
+    let TransferFrame::OpenMaterializationSigned(signed) = frame else {
+        return Err(protocol_frame(
+            "first frame must be a signed materialization ticket",
+        ));
+    };
+    signed
+        .validate()
+        .map_err(|error| QuicTransferError::Ticket(error.to_string()))?;
+    trust_bundle
+        .verify_materialization_ticket(&signed, UnixMillis::new(now_unix_ms))
+        .map_err(|error| QuicTransferError::Ticket(error.to_string()))?;
+    if let Some(identity) = identity {
+        identity.check_materialization_source(&signed.ticket)?;
+    }
+    let TransferFrame::MaterializationManifest(manifest) = read_frame(&mut recv).await? else {
+        return Err(protocol_frame(
+            "second frame must be a materialization manifest",
+        ));
+    };
+    let page_count = usize::try_from(manifest.page_count.get())
+        .map_err(|_| protocol_frame("materialization manifest page count overflows usize"))?;
+    if page_count == 0 || page_count > 65_535 {
+        return Err(protocol_frame(
+            "materialization manifest page count is out of bounds",
+        ));
+    }
+    let mut pages = Vec::with_capacity(page_count);
+    for _ in 0..page_count {
+        let TransferFrame::MaterializationManifestPage(page) = read_frame(&mut recv).await? else {
+            return Err(protocol_frame("materialization manifest is missing a page"));
+        };
+        pages.push(page);
+    }
+    let mut object_ids = pages
+        .iter()
+        .flat_map(|page| page.objects.iter().map(|object| object.object_id))
+        .collect::<Vec<_>>();
+    object_ids.sort_unstable();
+    let batch = MaterializationBatch {
+        batch_id: signed.ticket.batch_id.clone(),
+        materialization_id: signed.ticket.materialization_id.clone(),
+        plan_revision: signed.ticket.plan_revision,
+        batch_attempt: signed.ticket.batch_attempt,
+        source: signed.ticket.source.clone(),
+        target: signed.ticket.target.clone(),
+        manifest_digest: manifest.manifest_digest,
+        object_ids,
+        object_count: manifest.object_count,
+        total_bytes: manifest.total_bytes,
+        state: neoengram_domain::protocol::MaterializationBatchState::Transferring,
+        max_bytes: signed.ticket.max_bytes,
+        deadline_unix_ms: signed.ticket.deadline_unix_ms,
+    };
+    neoengram_domain::protocol::materialization::validate_materialization_assignment(
+        &signed.ticket,
+        &batch,
+        &manifest,
+        &pages,
+    )
+    .map_err(|error| QuicTransferError::Ticket(error.to_string()))?;
+    let backend = backend_factory(&signed)?;
+    let ordered_pages = {
+        let mut pages = pages;
+        pages.sort_by_key(|page| page.page_number);
+        pages
+    };
+    let objects = ordered_pages
+        .iter()
+        .flat_map(|page| page.objects.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let backend = Arc::clone(&backend);
+    for object in &objects {
+        let selected_source = ordered_pages
+            .iter()
+            .flat_map(|page| page.source_placements.iter())
+            .find(|source| source.object_id == object.object_id)
+            .cloned()
+            .ok_or_else(|| {
+                QuicTransferError::Ticket(
+                    "non-empty materialization object is missing its selected source Placement"
+                        .into(),
+                )
+            })?;
+        if selected_source.placement_generation != signed.ticket.source.placement_generation {
+            return Err(QuicTransferError::Ticket(
+                "manifest source Placement generation differs from the signed route fence".into(),
+            ));
+        }
+        let placement = source_resolver
+            .resolve_selected(&signed.ticket, object, &selected_source)?
+            .ok_or_else(|| {
+                QuicTransferError::Ticket(
+                    "source Agent does not hold the ticket's selected Placement".into(),
+                )
+            })?;
+        validate_materialization_source_placement_selected(
+            &signed.ticket,
+            object,
+            &placement,
+            &selected_source.placement_id,
+            selected_source.placement_generation,
+        )?;
+        source_resolver.verify_backend(&signed.ticket, object, backend.as_ref())?;
+    }
+    let mut completed = BTreeSet::new();
+    // A target may resume from a durable staging offset, but each subsequent request must begin
+    // exactly where the previous acknowledged range ended.  Without this fence a peer could
+    // request only the final range and make an incomplete object pass the close check.
+    let mut next_offsets = BTreeMap::<ObjectId, u64>::new();
+    let mut served_bytes = 0_u64;
+    let mut pending: Option<(ObjectId, u64, u64)> = None;
+    loop {
+        match read_frame(&mut recv).await? {
+            TransferFrame::ObjectAck(ack) => {
+                let Some((id, offset, length)) = pending.take() else {
+                    if ack.accepted
+                        && ack.length == 0
+                        && objects.iter().any(|object| {
+                            object.object_id == ack.object_id && object.size.get() == ack.offset
+                        })
+                    {
+                        completed.insert(ack.object_id);
+                        next_offsets.insert(ack.object_id, ack.offset);
+                        continue;
+                    }
+                    return Err(protocol_frame("unexpected materialization ObjectAck"));
+                };
+                if !ack.accepted
+                    || ack.object_id != id
+                    || ack.offset != offset
+                    || ack.length != length
+                {
+                    return Err(protocol_frame(
+                        "materialization ObjectAck does not match chunk",
+                    ));
+                }
+                if objects.iter().any(|object| {
+                    object.object_id == id && offset.saturating_add(length) == object.size.get()
+                }) {
+                    completed.insert(id);
+                }
+                next_offsets.insert(id, offset.saturating_add(length));
+            }
+            TransferFrame::ObjectRequest(request) => {
+                if pending.is_some() {
+                    return Err(protocol_frame(
+                        "materialization ObjectRequest arrived before ObjectAck",
+                    ));
+                }
+                let object = objects
+                    .iter()
+                    .find(|object| object.object_id == request.object_id)
+                    .ok_or_else(|| {
+                        QuicTransferError::Protocol(
+                            "object is outside the materialization manifest".into(),
+                        )
+                    })?;
+                if completed.contains(&request.object_id) {
+                    return Err(protocol_frame(
+                        "materialization ObjectRequest arrived after completion",
+                    ));
+                }
+                if object.size.get() == 0 {
+                    if request.offset != 0 || request.length != 0 {
+                        return Err(protocol_frame(
+                            "empty-object request must be zero-length at offset zero",
+                        ));
+                    }
+                    send_frame(
+                        &mut send,
+                        &TransferFrame::ObjectProof(ObjectProof {
+                            object_id: object.object_id,
+                            digest: object.object_id.digest(),
+                            size: 0,
+                        }),
+                    )
+                    .await?;
+                    let frame = read_frame(&mut recv).await?;
+                    let TransferFrame::ObjectAck(ack) = frame else {
+                        return Err(protocol_frame("expected empty-object ObjectAck"));
+                    };
+                    if !ack.accepted
+                        || ack.object_id != object.object_id
+                        || ack.offset != 0
+                        || ack.length != 0
+                    {
+                        return Err(protocol_frame(
+                            "empty-object ObjectAck does not match proof",
+                        ));
+                    }
+                    completed.insert(object.object_id);
+                    continue;
+                }
+                if let Some(expected_offset) = next_offsets.get(&request.object_id) {
+                    if request.offset != *expected_offset {
+                        return Err(protocol_frame(
+                            "materialization ObjectRequest range is not contiguous",
+                        ));
+                    }
+                }
+                if request.length == 0
+                    || request.length > MAX_TRANSFER_CHUNK_BYTES as u64
+                    || request
+                        .offset
+                        .checked_add(request.length)
+                        .filter(|end| *end <= object.size.get())
+                        .is_none()
+                {
+                    return Err(protocol_frame(
+                        "materialization ObjectRequest range is invalid",
+                    ));
+                }
+                let next_served_bytes = served_bytes
+                    .checked_add(request.length)
+                    .ok_or_else(|| protocol_frame("materialization byte count overflows u64"))?;
+                if next_served_bytes > signed.ticket.max_bytes.get() {
+                    return Err(protocol_frame(
+                        "materialization source would exceed the signed byte limit",
+                    ));
+                }
+                let mut bytes = Vec::with_capacity(request.length as usize);
+                let copied = backend
+                    .read_range(
+                        &signed.ticket.tenant_id,
+                        &object.object_spec(),
+                        ObjectRange::new(request.offset, request.length).map_err(backend_error)?,
+                        &mut bytes,
+                    )
+                    .map_err(backend_error)?;
+                if copied != request.length {
+                    return Err(protocol_frame(
+                        "materialization source returned an unexpected range",
+                    ));
+                }
+                send_frame(
+                    &mut send,
+                    &TransferFrame::ObjectChunk(ObjectChunk::new(
+                        request.object_id,
+                        request.offset,
+                        bytes,
+                    )?),
+                )
+                .await?;
+                pending = Some((request.object_id, request.offset, request.length));
+                if request.offset + request.length == object.size.get() {
+                    send_frame(
+                        &mut send,
+                        &TransferFrame::ObjectProof(ObjectProof {
+                            object_id: object.object_id,
+                            digest: object.object_id.digest(),
+                            size: object.size.get(),
+                        }),
+                    )
+                    .await?;
+                }
+                served_bytes = next_served_bytes;
+            }
+            TransferFrame::CloseTransfer(close) => {
+                if pending.is_some() || !close.committed || completed.len() != objects.len() {
+                    return Err(protocol_frame(
+                        "materialization closed before all acknowledgements",
+                    ));
+                }
+                return Ok(());
+            }
+            _ => return Err(protocol_frame("unexpected materialization transfer frame")),
+        }
+    }
+}
+
+/// Dispatches one accepted source stream after inspecting its first bounded frame.  The production
+/// Agent listener is v2-only: legacy whole-Commit frames are rejected even if a peer manages to
+/// negotiate the v2 ALPN, so an old client cannot bypass the protocol boundary by changing only
+/// its TLS metadata.  The legacy handler remains available to explicit in-process migration
+/// callers and tests through its dedicated entry point below.
+#[allow(clippy::too_many_arguments)]
+async fn serve_quic_unified_source_connection<F1, F2>(
+    send: SendStream,
+    mut recv: RecvStream,
+    _transfer_backend_factory: F1,
+    materialization_backend_factory: F2,
+    trust_bundle: &CentralCommandTrustBundle,
+    now_unix_ms: u64,
+    identity: Option<QuicTransferIdentity>,
+    source_resolver: Arc<dyn SourcePlacementResolver>,
+) -> Result<(), QuicTransferError>
+where
+    F1: FnOnce(&SignedTransferTicket) -> Result<Arc<dyn ObjectBackend>, QuicTransferError>,
+    F2: FnOnce(
+        &SignedMaterializationBatchTicket,
+    ) -> Result<Arc<dyn ObjectBackend>, QuicTransferError>,
+{
+    let first = read_frame(&mut recv).await?;
+    match first {
+        frame @ TransferFrame::OpenMaterializationSigned(_) => {
+            serve_quic_materialization_source_stream_with_factory_from_first(
+                send,
+                recv,
+                frame,
+                materialization_backend_factory,
+                trust_bundle,
+                now_unix_ms,
+                identity,
+                source_resolver,
+            )
+            .await
+        }
+        TransferFrame::OpenTransfer(_) | TransferFrame::OpenTransferSigned(_) => Err(
+            protocol_frame("legacy whole-Commit transfer is disabled on the v2 Agent listener"),
+        ),
+        _ => Err(protocol_frame(
+            "first frame must be a signed transfer or materialization ticket",
+        )),
+    }
+}
+
 /// Source entry point used by the runtime listener. The ticket is verified before the factory is
 /// called, and the factory can therefore safely open the artifact-scoped CAS named by the ticket.
 pub async fn serve_quic_source_connection<F>(
@@ -711,7 +1788,7 @@ where
 }
 
 async fn serve_quic_source_stream_with_object_set(
-    mut send: SendStream,
+    send: SendStream,
     mut recv: RecvStream,
     backend_factory: impl FnOnce(
         &SignedTransferTicket,
@@ -722,6 +1799,32 @@ async fn serve_quic_source_stream_with_object_set(
     identity: Option<QuicTransferIdentity>,
 ) -> Result<(), QuicTransferError> {
     let frame = read_frame(&mut recv).await?;
+    serve_quic_source_stream_with_object_set_from_first(
+        send,
+        recv,
+        frame,
+        backend_factory,
+        expected_object_set,
+        trust_bundle,
+        now_unix_ms,
+        identity,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_quic_source_stream_with_object_set_from_first(
+    mut send: SendStream,
+    mut recv: RecvStream,
+    frame: TransferFrame,
+    backend_factory: impl FnOnce(
+        &SignedTransferTicket,
+    ) -> Result<Arc<dyn ObjectBackend>, QuicTransferError>,
+    expected_object_set: Option<ObjectSet>,
+    trust_bundle: &CentralCommandTrustBundle,
+    now_unix_ms: u64,
+    identity: Option<QuicTransferIdentity>,
+) -> Result<(), QuicTransferError> {
     let TransferFrame::OpenTransferSigned(signed) = frame else {
         return Err(protocol_frame("first frame must be signed ticket"));
     };
@@ -889,9 +1992,134 @@ fn validate_ticket_set(ticket: &TransferTicket, set: &ObjectSet) -> Result<(), Q
     Ok(())
 }
 
+#[cfg(test)]
+fn validate_materialization_source_placement(
+    ticket: &MaterializationBatchTicket,
+    object: &ObjectRef,
+    placement: &MaterializationObjectPlacement,
+) -> Result<(), QuicTransferError> {
+    validate_materialization_source_placement_selected(
+        ticket,
+        object,
+        placement,
+        &ticket.source.placement_id,
+        ticket.source.placement_generation,
+    )
+}
+
+fn validate_materialization_source_placement_selected(
+    ticket: &MaterializationBatchTicket,
+    object: &ObjectRef,
+    placement: &MaterializationObjectPlacement,
+    selected_placement_id: &PlacementId,
+    selected_placement_generation: neoengram_domain::PlacementGeneration,
+) -> Result<(), QuicTransferError> {
+    placement
+        .validate_against(object)
+        .map_err(|error| QuicTransferError::Ticket(error.to_string()))?;
+    if placement.tenant_id != ticket.tenant_id
+        || placement.object_namespace_id != ticket.object_namespace_id
+        || placement.placement_id != *selected_placement_id
+        || placement.placement_generation != selected_placement_generation
+        || selected_placement_generation != ticket.source.placement_generation
+        || placement.storage_volume_id != ticket.source.storage_volume_id
+        || placement.archive_id != ticket.source.archive_id
+        || !placement.readable()
+    {
+        return Err(QuicTransferError::Ticket(
+            "source Placement does not match the signed materialization scope".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Derives a stable receipt identity for one object in one batch attempt.  The attempt is part of
+/// the identity because Central rejects a receipt replay whose evidence carries a newer attempt;
+/// omitting it would make a retry collide with the receipt from the previous source session.
+fn materialization_receipt_id(
+    materialization_id: &MaterializationId,
+    batch_id: &MaterializationBatchId,
+    plan_revision: Generation,
+    batch_attempt: Generation,
+    object_id: ObjectId,
+) -> Result<ObjectReceiptId, QuicTransferError> {
+    let receipt_digest = blake3::hash(
+        format!(
+            "{}:{}:{}:{}:{}",
+            materialization_id, batch_id, plan_revision, batch_attempt, object_id
+        )
+        .as_bytes(),
+    );
+    ObjectReceiptId::new(format!("receipt-{}", &receipt_digest.to_hex()[..32]))
+        .map_err(|error| QuicTransferError::Protocol(error.to_string()))
+}
+
 fn backend_error(error: impl std::fmt::Display) -> QuicTransferError {
     QuicTransferError::Backend(error.to_string())
 }
+
+/// Re-checks the source Volume's content-addressed object immediately before serving a batch.
+/// Placement metadata is necessary authorization, but it is not proof that a local file has not
+/// been truncated or corrupted since the authority recorded it.  Hashing bounded ranges keeps
+/// this check independent of object size and avoids loading a whole object into memory.
+fn verify_local_source_object(
+    backend: &dyn ObjectBackend,
+    tenant_id: &TenantId,
+    object: &ObjectRef,
+) -> Result<(), QuicTransferError> {
+    let expected = object.object_spec();
+    let metadata = backend
+        .inspect(tenant_id, &expected.id)
+        .map_err(backend_error)?
+        .ok_or_else(|| {
+            QuicTransferError::Backend("selected source object is missing".to_owned())
+        })?;
+    if metadata.size != expected.size {
+        return Err(QuicTransferError::Backend(
+            "selected source object size differs from the manifest".to_owned(),
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0_u64;
+    let mut copied_total = 0_u64;
+    let chunk_size = u64::try_from(MAX_TRANSFER_CHUNK_BYTES)
+        .map_err(|_| QuicTransferError::Protocol("transfer chunk limit overflows u64".into()))?;
+    while offset < expected.size {
+        let length = (expected.size - offset).min(chunk_size);
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(length)
+                .map_err(|_| QuicTransferError::Protocol("source range exceeds usize".into()))?,
+        );
+        let copied = backend
+            .read_range(
+                tenant_id,
+                &expected,
+                ObjectRange::new(offset, length).map_err(backend_error)?,
+                &mut bytes,
+            )
+            .map_err(backend_error)?;
+        if copied != length || bytes.len() as u64 != length {
+            return Err(QuicTransferError::Backend(
+                "selected source object ended before its declared size".to_owned(),
+            ));
+        }
+        hasher.update(&bytes);
+        offset = offset
+            .checked_add(length)
+            .ok_or_else(|| QuicTransferError::Protocol("source offset overflows u64".into()))?;
+        copied_total = copied_total
+            .checked_add(copied)
+            .ok_or_else(|| QuicTransferError::Protocol("source byte count overflows u64".into()))?;
+    }
+    let digest = ObjectId::from_bytes(*hasher.finalize().as_bytes());
+    if copied_total != expected.size || digest != expected.id {
+        return Err(QuicTransferError::Backend(
+            "selected source object failed size or BLAKE3 verification".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn protocol_frame(message: &str) -> QuicTransferError {
     QuicTransferError::Protocol(message.into())
 }
@@ -950,10 +2178,12 @@ mod tests {
     use super::*;
     use neoengram_domain::protocol::{
         AgentId, ArtifactId, CommitObject, DecimalU64, EdgeClusterId, GatewayPoolId,
-        MountGeneration, ObjectEncoding, PlacementId, RouteGeneration, SessionGeneration,
-        StorageVolumeId, TenantId, TransferEndpoint, TransferId, UnixMillis,
+        MaterializationBatchId, MaterializationId, MaterializationSource, MaterializationTarget,
+        MountGeneration, ObjectEncoding, ObjectNamespaceId, ObjectRef, ObjectTicketId,
+        PlacementGeneration, PlacementId, RouteGeneration, SessionGeneration, StorageVolumeId,
+        TenantId, TransferEndpoint, TransferId, UnixMillis,
     };
-    use neoengram_domain::CommitId;
+    use neoengram_domain::{CommitId, ContentDigest, Generation};
 
     fn endpoint(name: &str) -> TransferEndpoint {
         TransferEndpoint {
@@ -986,6 +2216,70 @@ mod tests {
         }
     }
 
+    fn materialization_ticket(object: &ObjectRef) -> MaterializationBatchTicket {
+        MaterializationBatchTicket {
+            ticket_id: ObjectTicketId::new("ticket-source-placement").unwrap(),
+            materialization_id: MaterializationId::new("materialization-source-placement").unwrap(),
+            batch_id: MaterializationBatchId::new("batch-source-placement").unwrap(),
+            plan_revision: Generation::new(1),
+            batch_attempt: Generation::new(1),
+            tenant_id: TenantId::new("tenant-source-placement").unwrap(),
+            artifact_id: ArtifactId::new(object.object_namespace_id.as_str()).unwrap(),
+            object_namespace_id: object.object_namespace_id.clone(),
+            commit_id: CommitId::from_bytes([8; 32]),
+            manifest_digest: ContentDigest::from_bytes([9; 32]),
+            source: MaterializationSource {
+                placement_id: PlacementId::new("placement-source-v2").unwrap(),
+                tenant_id: TenantId::new("tenant-source-placement").unwrap(),
+                object_namespace_id: object.object_namespace_id.clone(),
+                storage_volume_id: Some(StorageVolumeId::new("volume-source-v2").unwrap()),
+                archive_id: None,
+                agent_id: AgentId::new("agent-source-v2").unwrap(),
+                edge_cluster_id: EdgeClusterId::new("cluster-source-v2").unwrap(),
+                gateway_pool_id: GatewayPoolId::new("pool-source-v2").unwrap(),
+                placement_generation: PlacementGeneration::new(3),
+                session_generation: SessionGeneration::new(4),
+                mount_generation: MountGeneration::new(5),
+                route_generation: RouteGeneration::new(6),
+            },
+            target: MaterializationTarget {
+                tenant_id: TenantId::new("tenant-source-placement").unwrap(),
+                object_namespace_id: object.object_namespace_id.clone(),
+                storage_volume_id: StorageVolumeId::new("volume-target-v2").unwrap(),
+                agent_id: AgentId::new("agent-target-v2").unwrap(),
+                edge_cluster_id: EdgeClusterId::new("cluster-target-v2").unwrap(),
+                gateway_pool_id: GatewayPoolId::new("pool-target-v2").unwrap(),
+                placement_generation: PlacementGeneration::new(7),
+                session_generation: SessionGeneration::new(8),
+                mount_generation: MountGeneration::new(9),
+                route_generation: RouteGeneration::new(10),
+            },
+            max_bytes: DecimalU64::new(object.size.get().max(1)),
+            deadline_unix_ms: UnixMillis::new(u64::MAX),
+            capability: neoengram_domain::protocol::COMMIT_MATERIALIZATION_CAPABILITY_V2.to_owned(),
+        }
+    }
+
+    fn source_placement(
+        ticket: &MaterializationBatchTicket,
+        object: &ObjectRef,
+    ) -> MaterializationObjectPlacement {
+        MaterializationObjectPlacement {
+            placement_id: ticket.source.placement_id.clone(),
+            tenant_id: ticket.tenant_id.clone(),
+            object_namespace_id: ticket.object_namespace_id.clone(),
+            object_id: object.object_id,
+            size: object.size,
+            encoding: object.encoding,
+            verified_digest: object.object_id.digest(),
+            storage_volume_id: ticket.source.storage_volume_id.clone(),
+            archive_id: ticket.source.archive_id.clone(),
+            placement_generation: ticket.source.placement_generation,
+            state: ObjectPlacementState::Verified,
+            failure_domain: "volume:volume-source-v2".to_owned(),
+        }
+    }
+
     #[test]
     fn client_config_is_bounded_by_wire_chunk_limit() {
         assert!(QuicTransferClientConfig { chunk_bytes: 0 }
@@ -997,6 +2291,88 @@ mod tests {
         .validate()
         .is_err());
         assert!(QuicTransferClientConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn materialization_receipt_identity_changes_for_each_batch_attempt() {
+        let materialization_id = MaterializationId::new("materialization-receipt-test").unwrap();
+        let batch_id = MaterializationBatchId::new("batch-receipt-test").unwrap();
+        let object_id = ObjectId::from_bytes([9; 32]);
+        let first = materialization_receipt_id(
+            &materialization_id,
+            &batch_id,
+            Generation::new(4),
+            Generation::new(1),
+            object_id,
+        )
+        .unwrap();
+        let retry = materialization_receipt_id(
+            &materialization_id,
+            &batch_id,
+            Generation::new(4),
+            Generation::new(2),
+            object_id,
+        )
+        .unwrap();
+        assert_ne!(first, retry);
+        assert_eq!(
+            first,
+            materialization_receipt_id(
+                &materialization_id,
+                &batch_id,
+                Generation::new(4),
+                Generation::new(1),
+                object_id,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn mounted_resolver_requires_exact_local_placement_metadata() {
+        let object = ObjectRef::new(
+            ObjectNamespaceId::new("artifact-source-v2").unwrap(),
+            ObjectId::from_bytes([3; 32]),
+            4,
+            ObjectEncoding::Raw,
+            0,
+        );
+        let ticket = materialization_ticket(&object);
+        let volume = ticket.source.storage_volume_id.clone().unwrap();
+        assert!(MountedVolumeSourcePlacementResolver::new(volume.clone())
+            .resolve(&ticket, &object)
+            .unwrap()
+            .is_none());
+
+        let inventory = Arc::new(InMemoryPlacementInventory::default());
+        inventory
+            .record(source_placement(&ticket, &object))
+            .unwrap();
+        let resolver = MountedVolumeSourcePlacementResolver::with_inventory(volume, inventory);
+        let resolved = resolver.resolve(&ticket, &object).unwrap().unwrap();
+        validate_materialization_source_placement(&ticket, &object, &resolved).unwrap();
+
+        let mut mismatch = resolved.clone();
+        mismatch.placement_id = PlacementId::new("placement-other").unwrap();
+        assert!(validate_materialization_source_placement(&ticket, &object, &mismatch).is_err());
+        let mut mismatch = resolved.clone();
+        mismatch.object_namespace_id = ObjectNamespaceId::new("artifact-other").unwrap();
+        assert!(validate_materialization_source_placement(&ticket, &object, &mismatch).is_err());
+        let mut mismatch = resolved.clone();
+        mismatch.size = DecimalU64::new(5);
+        assert!(validate_materialization_source_placement(&ticket, &object, &mismatch).is_err());
+        let mut mismatch = resolved.clone();
+        mismatch.encoding = ObjectEncoding::Zstd;
+        assert!(validate_materialization_source_placement(&ticket, &object, &mismatch).is_err());
+        let mut mismatch = resolved.clone();
+        mismatch.placement_generation = PlacementGeneration::new(4);
+        assert!(validate_materialization_source_placement(&ticket, &object, &mismatch).is_err());
+        let mut mismatch = resolved.clone();
+        mismatch.storage_volume_id = Some(StorageVolumeId::new("volume-other").unwrap());
+        assert!(validate_materialization_source_placement(&ticket, &object, &mismatch).is_err());
+        let mut mismatch = resolved;
+        mismatch.state = ObjectPlacementState::Retiring;
+        assert!(validate_materialization_source_placement(&ticket, &object, &mismatch).is_err());
     }
 
     #[test]
@@ -1022,6 +2398,14 @@ mod tests {
         let source_session_mount = QuicTransferIdentity::new(AgentId::new("agent-source").unwrap())
             .with_session_mount(3, 4);
         source_session_mount.check_source(&transfer).unwrap();
+        let source_volume = QuicTransferIdentity::new(AgentId::new("agent-source").unwrap())
+            .with_storage_volume(StorageVolumeId::new("volume-source").unwrap())
+            .with_session_mount(3, 4);
+        source_volume.check_source(&transfer).unwrap();
+        let wrong_source_volume = source_volume
+            .clone()
+            .with_storage_volume(StorageVolumeId::new("volume-other").unwrap());
+        assert!(wrong_source_volume.check_source(&transfer).is_err());
         let mut replaced_source_session = transfer.clone();
         replaced_source_session.source_session_generation = SessionGeneration::new(9);
         assert!(source_session_mount
@@ -1032,6 +2416,14 @@ mod tests {
         assert!(source_session_mount
             .check_source(&replaced_source_mount)
             .is_err());
+        let target_volume = QuicTransferIdentity::new(AgentId::new("agent-target").unwrap())
+            .with_storage_volume(StorageVolumeId::new("volume-target").unwrap())
+            .with_session_mount(6, 7);
+        target_volume.check_target(&transfer).unwrap();
+        let wrong_target_volume = target_volume
+            .clone()
+            .with_storage_volume(StorageVolumeId::new("volume-other").unwrap());
+        assert!(wrong_target_volume.check_target(&transfer).is_err());
         let mut unauthorized = transfer;
         unauthorized.allowed_objects.clear();
         assert!(validate_ticket_set(&unauthorized, &set).is_err());
@@ -1046,5 +2438,54 @@ mod tests {
         assert!(QuicTransferError::PreflightTimeout.is_transient());
         assert!(!QuicTransferError::Protocol("bad frame".to_owned()).is_transient());
         assert!(!QuicTransferError::Expired.is_transient());
+    }
+
+    #[test]
+    fn mounted_source_verification_rejects_missing_and_corrupt_objects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let tenant = TenantId::new("tenant-source-inventory").unwrap();
+        let artifact = ArtifactId::new("artifact-source-inventory").unwrap();
+        let backend = neoengram_runtime::VolumeCasBackend::open_or_create_artifact_scoped(
+            temporary.path(),
+            tenant.clone(),
+            artifact.clone(),
+        )
+        .unwrap();
+        let expected = neoengram_runtime::ObjectSpec::for_bytes(b"source inventory payload");
+        let transfer_id = TransferId::new("source-inventory-transfer").unwrap();
+        backend
+            .stage_write(
+                &transfer_id,
+                &tenant,
+                &expected,
+                0,
+                b"source inventory payload",
+            )
+            .unwrap();
+        backend
+            .verify_and_publish(&transfer_id, &tenant, &expected)
+            .unwrap();
+        let object = ObjectRef::new(
+            ObjectNamespaceId::new("artifact-source-inventory").unwrap(),
+            expected.id,
+            expected.size,
+            ObjectEncoding::Raw,
+            0,
+        );
+        verify_local_source_object(&backend, &tenant, &object).unwrap();
+
+        let object_path = temporary
+            .path()
+            .join("tenants")
+            .join(tenant.as_str())
+            .join("artifacts")
+            .join(artifact.as_str())
+            .join("objects")
+            .join(expected.id.to_hex());
+        fs::write(&object_path, b"source inventory corrupte").unwrap();
+        assert!(verify_local_source_object(&backend, &tenant, &object).is_err());
+
+        fs::remove_file(object_path).unwrap();
+        assert!(verify_local_source_object(&backend, &tenant, &object).is_err());
     }
 }

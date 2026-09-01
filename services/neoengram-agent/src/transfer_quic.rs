@@ -576,6 +576,9 @@ fn frame_name(frame: &TransferFrame) -> &'static str {
     match frame {
         TransferFrame::OpenTransfer(_) => "OpenTransfer",
         TransferFrame::OpenTransferSigned(_) => "OpenTransferSigned",
+        TransferFrame::OpenMaterializationSigned(_) => "OpenMaterializationSigned",
+        TransferFrame::MaterializationManifest(_) => "MaterializationManifest",
+        TransferFrame::MaterializationManifestPage(_) => "MaterializationManifestPage",
         TransferFrame::ObjectRequest(_) => "ObjectRequest",
         TransferFrame::ObjectChunk(_) => "ObjectChunk",
         TransferFrame::ObjectProof(_) => "ObjectProof",

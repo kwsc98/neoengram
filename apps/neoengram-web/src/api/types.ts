@@ -138,36 +138,147 @@ export type CreateSnapshotResponse = Omit<
   components['schemas']['CreateSnapshotResponse'],
   'snapshot'
 > & { snapshot: SnapshotView };
-export type CreateCommitReplicationRequest =
-  components['schemas']['CreateCommitReplicationRequest'];
-export type CreateCommitReplicationResponse =
-  components['schemas']['CreateCommitReplicationResponse'];
-export type QueryCommitReplicationRequest = components['schemas']['QueryCommitReplicationRequest'];
-export type QueryCommitReplicationResponse =
-  components['schemas']['QueryCommitReplicationResponse'];
-export type QueryCommitReplicationTicketRequest =
-  components['schemas']['QueryCommitReplicationTicketRequest'];
-export type QueryCommitReplicationTicketResponse =
-  components['schemas']['QueryCommitReplicationTicketResponse'];
-export type QueryCommitReplicationListRequest =
-  components['schemas']['QueryCommitReplicationListRequest'];
-export type QueryCommitReplicationListResponse =
-  components['schemas']['QueryCommitReplicationListResponse'];
-export type QueryCommitPlacementListRequest =
-  components['schemas']['QueryCommitPlacementListRequest'];
-export type QueryCommitPlacementListResponse =
-  components['schemas']['QueryCommitPlacementListResponse'];
-export type RetryCommitReplicationRequest = components['schemas']['RetryCommitReplicationRequest'];
-export type RetryCommitReplicationResponse =
-  components['schemas']['RetryCommitReplicationResponse'];
-export type CancelCommitReplicationRequest =
-  components['schemas']['CancelCommitReplicationRequest'];
-export type CancelCommitReplicationResponse =
-  components['schemas']['CancelCommitReplicationResponse'];
-export type QueryCommitAvailabilityRequest =
+/** Canonical v2 Materialization API contracts. */
+export type CreateCommitMaterializationRequest =
+  components['schemas']['CreateCommitMaterializationRequest'];
+export type CreateCommitMaterializationResponse =
+  components['schemas']['CreateCommitMaterializationResponse'];
+export type QueryCommitMaterializationRequest =
+  components['schemas']['QueryCommitMaterializationRequest'];
+export type QueryCommitMaterializationResponse =
+  components['schemas']['QueryCommitMaterializationResponse'];
+export type QueryCommitMaterializationListRequest =
+  components['schemas']['QueryCommitMaterializationListRequest'];
+export type QueryCommitMaterializationListResponse =
+  components['schemas']['QueryCommitMaterializationListResponse'];
+export type RetryCommitMaterializationRequest =
+  components['schemas']['RetryCommitMaterializationRequest'];
+export type RetryCommitMaterializationResponse =
+  components['schemas']['RetryCommitMaterializationResponse'];
+export type CancelCommitMaterializationRequest =
+  components['schemas']['CancelCommitMaterializationRequest'];
+export type CancelCommitMaterializationResponse =
+  components['schemas']['CancelCommitMaterializationResponse'];
+export type QueryCommitCoverageRequest = components['schemas']['QueryCommitCoverageRequest'];
+export type QueryCommitCoverageResponse = components['schemas']['QueryCommitCoverageResponse'];
+export type QueryCommitAvailabilityV2Request =
   components['schemas']['QueryCommitAvailabilityRequest'];
-export type QueryCommitAvailabilityResponse =
+export type QueryCommitAvailabilityV2Response =
   components['schemas']['QueryCommitAvailabilityResponse'];
+export type MaterializationView = components['schemas']['MaterializationView'];
+export type VolumeCommitCoverageView = components['schemas']['VolumeCommitCoverageView'];
+
+/**
+ * Transitional names used by the existing Web feature modules.  These are local view models,
+ * never wire contracts: operations.ts maps them to/from the v2 materialization responses.
+ */
+export type CreateCommitReplicationRequest = Omit<
+  CreateCommitMaterializationRequest,
+  'object_namespace_id'
+> & { object_namespace_id?: string };
+export type LegacyReplicationView = {
+  replication_id: string;
+  tenant_id: string;
+  artifact_id?: string;
+  commit_id: string;
+  target_storage_volume_id: string;
+  attempt: string;
+  state:
+    'queued' | 'planning' | 'transferring' | 'verifying' | 'published' | 'failed' | 'cancelled';
+  object_set_digest: string;
+  completed_objects: string;
+  total_objects: string;
+  completed_bytes: string;
+  total_bytes: string;
+  source_storage_volume_id?: string;
+  target_edge_cluster_id?: string;
+  target_gateway_pool_id?: string;
+  issue?: components['schemas']['ResourceIssueSummary'];
+};
+export type CreateCommitReplicationResponse = {
+  replication: LegacyReplicationView;
+  replayed: boolean;
+};
+export type QueryCommitReplicationRequest = {
+  tenant_id: string;
+  object_namespace_id: string;
+  replication_id: string;
+};
+export type QueryCommitReplicationResponse = { replication: LegacyReplicationView };
+export type QueryCommitReplicationListRequest = {
+  tenant_id: string;
+  commit_id: string;
+  object_namespace_id?: string;
+  /** Local page context used to derive the initial v2 namespace mapping. */
+  artifact_id?: string;
+  target_storage_volume_id?: string;
+  cursor?: string;
+  page_size?: number;
+};
+export type QueryCommitReplicationListResponse = {
+  replications: LegacyReplicationView[];
+  next_cursor?: string;
+};
+export type QueryCommitPlacementListRequest = {
+  tenant_id: string;
+  commit_id: string;
+  object_namespace_id?: string;
+  /** Local page context used to derive the initial v2 namespace mapping. */
+  artifact_id?: string;
+  storage_volume_id?: string;
+  cursor?: string;
+  page_size?: number;
+};
+export type LegacyCommitPlacementView = {
+  placement_set_id: string;
+  commit_id: string;
+  backend_id: string;
+  storage_volume_id?: string;
+  object_set_digest: string;
+  object_count: string;
+  verified_object_count: string;
+  placement_generation: string;
+  state: 'staged' | 'published' | 'retiring' | 'deleted';
+};
+export type QueryCommitPlacementListResponse = {
+  placements: LegacyCommitPlacementView[];
+  next_cursor?: string;
+};
+export type RetryCommitReplicationRequest = {
+  tenant_id: string;
+  object_namespace_id: string;
+  replication_id: string;
+  expected_attempt: string;
+  request_id: string;
+};
+export type RetryCommitReplicationResponse = {
+  replication: LegacyReplicationView;
+  replayed: boolean;
+};
+export type CancelCommitReplicationRequest = {
+  tenant_id: string;
+  object_namespace_id: string;
+  replication_id: string;
+  expected_attempt: string;
+};
+export type CancelCommitReplicationResponse = { replication: LegacyReplicationView };
+export type QueryCommitAvailabilityRequest = Omit<
+  components['schemas']['QueryCommitAvailabilityRequest'],
+  'object_namespace_id'
+> & {
+  object_namespace_id?: string;
+  /** Local page context used to derive the initial v2 namespace mapping. */
+  artifact_id?: string;
+};
+export type QueryCommitAvailabilityResponse = {
+  availability: {
+    commit_id: string;
+    data_health: 'available' | 'degraded' | 'unavailable';
+    verified_placements: string;
+    missing_objects: string;
+    verified_storage_volume_ids: string[];
+  };
+};
 export type CreateWorkspaceRequest = components['schemas']['CreateWorkspaceRequest'];
 export type CreateWorkspaceResponse = components['schemas']['CreateWorkspaceResponse'];
 export type RetrySnapshotDeliveryRequest = components['schemas']['RetrySnapshotDeliveryRequest'];

@@ -3,28 +3,43 @@
 //! The authority owns the logical request and its fencing identity.  Byte movement is delegated
 //! to Agent/Gateway data-plane workers; this service never reads or stores object payloads.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use fusen_rs::{Error, ErrorCategory};
-use neoengram_domain::core::ContentDigest;
+use neoengram_domain::core::{ContentDigest, ObjectId};
+use neoengram_domain::protocol::materialization::{
+    AvailabilityStatus, CoverageState, MaterializationJob, MaterializationJobState,
+    NamespaceObjectSet, ObjectPlacement as ObjectPlacementV2, ObjectPlacementState, ViewReadiness,
+    VolumeCommitCoverage,
+};
 use neoengram_domain::protocol::{
     ArtifactId, BackendId, CommitPlacementSet, DecimalU64, EdgeClusterId, GatewayPoolId,
-    MountGeneration, PlacementGeneration, PlacementId, PlacementSetId, PlacementState, ProjectId,
-    ReplicationId, ReplicationState, RequestId, RouteGeneration, SessionGeneration,
-    StorageVolumeId, TenantId, TransferEndpoint, TransferId, TransferRouteId, TransferTicket,
-    UnixMillis, WorkspaceId, WorkspaceLifecycle,
+    Generation, MaterializationId, MountGeneration, ObjectNamespaceId, PlacementGeneration,
+    PlacementId, PlacementSetId, PlacementState, ProjectId, ReplicationId, ReplicationState,
+    RequestId, RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, TransferEndpoint,
+    TransferId, TransferRouteId, TransferTicket, UnixMillis, WorkspaceId, WorkspaceLifecycle,
 };
 use neoengram_domain::CommitId;
 
 use crate::{
     dto::{
-        CancelCommitReplicationRequest, CancelCommitReplicationResponse, CommitAvailabilityView,
-        CommitPlacementView, CreateCommitReplicationRequest, CreateCommitReplicationResponse,
-        CreateWorkspaceRequest, CreateWorkspaceResponse, QueryCommitAvailabilityRequest,
-        QueryCommitAvailabilityResponse, QueryCommitPlacementListRequest,
-        QueryCommitPlacementListResponse, QueryCommitReplicationListRequest,
-        QueryCommitReplicationListResponse, QueryCommitReplicationRequest,
-        QueryCommitReplicationResponse, QueryCommitReplicationTicketRequest,
-        QueryCommitReplicationTicketResponse, ReplicationView, RetryCommitReplicationRequest,
-        RetryCommitReplicationResponse, WorkspaceView,
+        CancelCommitMaterializationRequest, CancelCommitMaterializationResponse,
+        CancelCommitReplicationRequest, CancelCommitReplicationResponse, CommitAvailabilityV2View,
+        CommitAvailabilityView, CommitPlacementView, CreateCommitMaterializationRequest,
+        CreateCommitMaterializationResponse, CreateCommitReplicationRequest,
+        CreateCommitReplicationResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+        MaterializationView, MissingObjectView, QueryCommitAvailabilityRequest,
+        QueryCommitAvailabilityResponse, QueryCommitAvailabilityV2Request,
+        QueryCommitAvailabilityV2Response, QueryCommitCoverageRequest, QueryCommitCoverageResponse,
+        QueryCommitMaterializationListRequest, QueryCommitMaterializationListResponse,
+        QueryCommitMaterializationRequest, QueryCommitMaterializationResponse,
+        QueryCommitPlacementListRequest, QueryCommitPlacementListResponse,
+        QueryCommitReplicationListRequest, QueryCommitReplicationListResponse,
+        QueryCommitReplicationRequest, QueryCommitReplicationResponse,
+        QueryCommitReplicationTicketRequest, QueryCommitReplicationTicketResponse, ReplicationView,
+        RetryCommitMaterializationRequest, RetryCommitMaterializationResponse,
+        RetryCommitReplicationRequest, RetryCommitReplicationResponse, VolumeCommitCoverageView,
+        WorkspaceView,
     },
     error::{application_error, invalid_request, map_central_error},
     identity::{AuthenticatedIdentity, Permission},
@@ -66,6 +81,182 @@ fn parse_attempt(value: String) -> Result<u64, Error> {
     value
         .parse::<u64>()
         .map_err(|_| invalid_request("expected_attempt must be a canonical unsigned integer"))
+}
+
+fn parse_namespace(value: String) -> Result<ObjectNamespaceId, Error> {
+    ObjectNamespaceId::new(value)
+        .map_err(|error| invalid_request(format!("object_namespace_id: {error}")))
+}
+
+fn parse_materialization_id(value: String) -> Result<MaterializationId, Error> {
+    MaterializationId::new(value)
+        .map_err(|error| invalid_request(format!("materialization_id: {error}")))
+}
+
+fn parse_generation(value: String, field: &'static str) -> Result<Generation, Error> {
+    value
+        .parse::<u64>()
+        .map(Generation::new)
+        .map_err(|_| invalid_request(format!("{field} must be a canonical unsigned integer")))
+}
+
+fn materialization_state_name(state: MaterializationJobState) -> &'static str {
+    match state {
+        MaterializationJobState::Queued => "queued",
+        MaterializationJobState::Planning => "planning",
+        MaterializationJobState::WaitingForSources => "waiting_for_sources",
+        MaterializationJobState::Materializing => "materializing",
+        MaterializationJobState::Verifying => "verifying",
+        MaterializationJobState::Complete => "complete",
+        MaterializationJobState::Stalled => "stalled",
+        MaterializationJobState::Failed => "failed",
+        MaterializationJobState::Cancelled => "cancelled",
+    }
+}
+
+fn coverage_state_name(state: CoverageState) -> &'static str {
+    match state {
+        CoverageState::Partial => "partial",
+        CoverageState::Complete => "complete",
+        CoverageState::Retiring => "retiring",
+        CoverageState::Deleted => "deleted",
+    }
+}
+
+fn availability_status_name(status: AvailabilityStatus) -> &'static str {
+    match status {
+        AvailabilityStatus::Available => "available",
+        AvailabilityStatus::Degraded => "degraded",
+        AvailabilityStatus::Unavailable => "unavailable",
+        AvailabilityStatus::Unknown => "unknown",
+    }
+}
+
+fn view_readiness_name(readiness: ViewReadiness) -> &'static str {
+    match readiness {
+        ViewReadiness::Ready => "ready",
+        ViewReadiness::NotReady => "not_ready",
+    }
+}
+
+fn availability_status_for_counts(total: usize, present: usize) -> AvailabilityStatus {
+    if present == 0 {
+        AvailabilityStatus::Unavailable
+    } else if present == total {
+        AvailabilityStatus::Available
+    } else {
+        AvailabilityStatus::Degraded
+    }
+}
+
+fn object_encoding_name(encoding: neoengram_domain::protocol::ObjectEncoding) -> &'static str {
+    match encoding {
+        neoengram_domain::protocol::ObjectEncoding::Raw => "raw",
+        neoengram_domain::protocol::ObjectEncoding::Zstd => "zstd",
+    }
+}
+
+fn coverage_view(coverage: &VolumeCommitCoverage) -> VolumeCommitCoverageView {
+    VolumeCommitCoverageView {
+        object_namespace_id: coverage.object_namespace_id.to_string(),
+        commit_id: coverage.commit_id.to_string(),
+        storage_volume_id: coverage.storage_volume_id.to_string(),
+        placement_generation: coverage.placement_generation.to_string(),
+        object_set_digest: coverage.object_set_digest.to_string(),
+        total_objects: coverage.object_count.to_string(),
+        verified_objects: coverage.verified_object_count.to_string(),
+        total_bytes: coverage.total_bytes.to_string(),
+        verified_bytes: coverage.verified_bytes.to_string(),
+        missing_objects: coverage
+            .object_count
+            .get()
+            .saturating_sub(coverage.verified_object_count.get())
+            .to_string(),
+        missing_bytes: coverage
+            .total_bytes
+            .get()
+            .saturating_sub(coverage.verified_bytes.get())
+            .to_string(),
+        state: coverage_state_name(coverage.state).to_owned(),
+    }
+}
+
+fn materialization_issue(job: &MaterializationJob) -> Option<crate::dto::ResourceIssueSummary> {
+    job.issue
+        .as_ref()
+        .map(|message| crate::dto::ResourceIssueSummary {
+            code: "MATERIALIZATION_ISSUE".to_owned(),
+            message: message.clone(),
+            retryable: matches!(
+                job.state,
+                MaterializationJobState::Stalled | MaterializationJobState::WaitingForSources
+            ),
+            occurred_at_unix_ms: Some(job.updated_at_unix_ms.to_string()),
+        })
+}
+
+fn materialization_view(
+    job: &MaterializationJob,
+    object_set_digest: ContentDigest,
+) -> MaterializationView {
+    MaterializationView {
+        materialization_id: job.materialization_id.to_string(),
+        tenant_id: job.key.tenant_id.to_string(),
+        artifact_id: Some(job.artifact_id.to_string()),
+        object_namespace_id: job.key.object_namespace_id.to_string(),
+        commit_id: job.key.commit_id.to_string(),
+        target_storage_volume_id: job.key.target_storage_volume_id.to_string(),
+        plan_revision: job.plan_revision.to_string(),
+        coverage_goal: job.key.coverage_goal,
+        state: materialization_state_name(job.state).to_owned(),
+        object_set_digest: object_set_digest.to_string(),
+        verified_objects: job.verified_object_count.to_string(),
+        total_objects: job.object_count.to_string(),
+        verified_bytes: job.verified_bytes.to_string(),
+        total_bytes: job.total_bytes.to_string(),
+        missing_objects: job.missing_object_count.to_string(),
+        missing_bytes: job.missing_bytes.to_string(),
+        source_count: job.source_count.to_string(),
+        issue: materialization_issue(job),
+    }
+}
+
+/// Convert the legacy authority ObjectSet envelope into the namespace-scoped v2 contract.
+/// Namespace binding is checked here at every service boundary; no v1 row is trusted implicitly.
+pub(crate) fn namespace_object_set(
+    tenant_id: &TenantId,
+    namespace_id: &ObjectNamespaceId,
+    commit_digest: ContentDigest,
+    stored: &neoengram_domain::protocol::CommitObjectSet,
+) -> Result<NamespaceObjectSet, Error> {
+    if stored.tenant_id != *tenant_id || stored.commit_id.digest() != commit_digest {
+        return Err(application_error(
+            ErrorCategory::Conflict,
+            "commit_object_set_mismatch",
+            "COMMIT_OBJECT_SET_MISMATCH",
+            "Commit authority and Placement authority disagree on the namespace ObjectSet",
+            false,
+        ));
+    }
+    NamespaceObjectSet::from_object_set(
+        tenant_id.clone(),
+        namespace_id.clone(),
+        stored.commit_id,
+        &stored.object_set,
+    )
+    .map_err(|error| invalid_request(format!("commit object set: {error}")))
+}
+
+fn parse_offset(value: Option<&str>) -> Result<usize, Error> {
+    let Some(value) = value else { return Ok(0) };
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return Err(invalid_request(
+            "cursor must be a canonical unsigned integer",
+        ));
+    }
+    value
+        .parse::<usize>()
+        .map_err(|_| invalid_request("cursor must be a canonical unsigned integer"))
 }
 
 fn replication_id(request_id: &str) -> Result<ReplicationId, Error> {
@@ -201,13 +392,17 @@ fn placement_state_name(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ReadyReplicationRoute {
-    edge_cluster_id: EdgeClusterId,
-    gateway_pool_id: GatewayPoolId,
-    agent_id: neoengram_domain::protocol::AgentId,
-    mount_generation: MountGeneration,
-    session_generation: SessionGeneration,
-    route_generation: RouteGeneration,
+pub(crate) struct ReadyReplicationRoute {
+    pub(crate) edge_cluster_id: EdgeClusterId,
+    pub(crate) gateway_pool_id: GatewayPoolId,
+    pub(crate) agent_id: neoengram_domain::protocol::AgentId,
+    /// Current owner fence for the Volume. Materialization targets must use this generation even
+    /// when the Volume has no object placements yet; otherwise an old owner can be mistaken for a
+    /// fresh empty target and accept receipts after an ownership change.
+    pub(crate) placement_generation: PlacementGeneration,
+    pub(crate) mount_generation: MountGeneration,
+    pub(crate) session_generation: SessionGeneration,
+    pub(crate) route_generation: RouteGeneration,
 }
 
 fn stored_replication_route_binding(
@@ -570,7 +765,31 @@ impl CatalogService {
         })
     }
 
-    async fn ready_replication_route(
+    pub(crate) async fn ready_replication_route(
+        &self,
+        tenant_id: &TenantId,
+        volume: &crate::StorageVolumeRecord,
+        role: &str,
+    ) -> Result<ReadyReplicationRoute, Error> {
+        let route = self.ready_transfer_route(tenant_id, volume, role).await?;
+        let agent_registry = self
+            .agent_registry
+            .as_ref()
+            .ok_or_else(|| replication_prerequisites_unmet(role))?;
+        if !agent_registry
+            .current_ready_volume_supports_replication(tenant_id, &volume.storage_volume_id)
+            .await
+            .map_err(map_central_error)?
+        {
+            return Err(replication_prerequisites_unmet(role));
+        }
+        Ok(route)
+    }
+
+    /// Resolves the route, current Volume owner, mount/session fences, and Gateway readiness that
+    /// both transfer protocols require. Protocol-specific capability checks belong in the v1/v2
+    /// wrappers so a v2-only Agent is never rejected for not advertising the legacy capability.
+    async fn ready_transfer_route(
         &self,
         tenant_id: &TenantId,
         volume: &crate::StorageVolumeRecord,
@@ -599,17 +818,6 @@ impl CatalogService {
                     && route.edge_cluster_id == volume.edge_cluster_id
             })
             .ok_or_else(|| replication_route_unavailable(role))?;
-        if let Some(agent_registry) = &self.agent_registry {
-            if !agent_registry
-                .current_ready_volume_supports_replication(tenant_id, &volume.storage_volume_id)
-                .await
-                .map_err(map_central_error)?
-            {
-                return Err(replication_prerequisites_unmet(role));
-            }
-        } else {
-            return Err(replication_prerequisites_unmet(role));
-        }
         let pool = registry
             .get_pool(&route.gateway_pool_id)
             .await
@@ -679,6 +887,9 @@ impl CatalogService {
                     edge_cluster_id: volume.edge_cluster_id.clone(),
                     gateway_pool_id: pool.gateway_pool_id,
                     agent_id: placement.agent_id,
+                    placement_generation: PlacementGeneration::new(
+                        placement.owner_generation.get(),
+                    ),
                     mount_generation: placement.mount_generation,
                     session_generation: placement.session_generation,
                     route_generation: route.route_generation,
@@ -691,6 +902,34 @@ impl CatalogService {
                 .last()
                 .map(|replica| replica.gateway_replica_id.clone());
         }
+    }
+
+    /// Returns a route that is eligible for the clean-slate v2 object materialization protocol.
+    ///
+    /// `ready_replication_route` intentionally remains available to the internal v1 recovery
+    /// path while old assignments are being drained. A v2 planner must never treat that legacy
+    /// capability as equivalent: otherwise an Agent that can only execute whole-Commit
+    /// replication could receive a namespace-scoped Batch ticket. Reuse the common route,
+    /// identity and certificate checks, then apply the stricter v2 capability gate here.
+    pub(crate) async fn ready_materialization_route(
+        &self,
+        tenant_id: &TenantId,
+        volume: &crate::StorageVolumeRecord,
+        role: &str,
+    ) -> Result<ReadyReplicationRoute, Error> {
+        let route = self.ready_transfer_route(tenant_id, volume, role).await?;
+        let agent_registry = self
+            .agent_registry
+            .as_ref()
+            .ok_or_else(|| replication_prerequisites_unmet(role))?;
+        if !agent_registry
+            .current_ready_volume_supports_materialization(tenant_id, &volume.storage_volume_id)
+            .await
+            .map_err(map_central_error)?
+        {
+            return Err(replication_prerequisites_unmet(role));
+        }
+        Ok(route)
     }
 
     async fn source_placement_for_replication(
@@ -811,6 +1050,519 @@ impl CatalogService {
             Permission::SnapshotRead
         };
         self.require_tenant(identity, permission, tenant_id).await
+    }
+
+    async fn materialization_view_for_job(
+        &self,
+        repository: &dyn crate::PlacementRepository,
+        job: &MaterializationJob,
+    ) -> Result<MaterializationView, Error> {
+        let stored = repository
+            .get_commit_object_set(&job.key.tenant_id, &job.key.commit_id.digest())
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| not_found("commit object set"))?;
+        Ok(materialization_view(
+            job,
+            stored.object_set.object_set_digest,
+        ))
+    }
+
+    pub async fn materialize_commit_legacy_v2(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: CreateCommitMaterializationRequest,
+    ) -> Result<CreateCommitMaterializationResponse, Error> {
+        // Keep this compatibility symbol pointed at the v2 aggregate publisher.  The old
+        // implementation inserted the parent Job and Object rows in separate calls, which could
+        // expose a partially planned materialization after a process crash.  All creation now
+        // goes through `service::materialization::materialize_commit`, whose repository boundary
+        // publishes Job, Batch, Object, Lease, and Coverage rows atomically.
+        self.materialize_commit(identity, request).await
+    }
+
+    pub async fn query_commit_materialization_legacy_v2(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: QueryCommitMaterializationRequest,
+    ) -> Result<QueryCommitMaterializationResponse, Error> {
+        let tenant_id = parse_tenant(request.tenant_id)?;
+        self.require_replication_read(identity, &tenant_id).await?;
+        let namespace_id = parse_namespace(request.object_namespace_id)?;
+        let materialization_id = parse_materialization_id(request.materialization_id)?;
+        let repository = self.placement.as_ref().ok_or_else(|| {
+            application_error(
+                ErrorCategory::Unavailable,
+                "placement_authority_unavailable",
+                "PLACEMENT_AUTHORITY_UNAVAILABLE",
+                "placement authority is not configured",
+                true,
+            )
+        })?;
+        let job = repository
+            .get_materialization(&tenant_id, &namespace_id, &materialization_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| not_found("materialization"))?;
+        Ok(QueryCommitMaterializationResponse {
+            materialization: self
+                .materialization_view_for_job(repository.as_ref(), &job)
+                .await?,
+        })
+    }
+
+    pub async fn query_commit_materialization_list_legacy_v2(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: QueryCommitMaterializationListRequest,
+    ) -> Result<QueryCommitMaterializationListResponse, Error> {
+        let tenant_id = parse_tenant(request.tenant_id)?;
+        self.require_replication_read(identity, &tenant_id).await?;
+        let namespace_id = parse_namespace(request.object_namespace_id)?;
+        let commit_digest = parse_commit(request.commit_id)?;
+        let target_volume_id = request
+            .target_storage_volume_id
+            .map(parse_volume)
+            .transpose()?;
+        let offset = parse_offset(request.cursor.as_deref())?;
+        let limit = usize::from(request.page_size.unwrap_or(50));
+        if !(1..=100).contains(&limit) {
+            return Err(invalid_request("page_size must be between 1 and 100"));
+        }
+        let repository = self.placement.as_ref().ok_or_else(|| {
+            application_error(
+                ErrorCategory::Unavailable,
+                "placement_authority_unavailable",
+                "PLACEMENT_AUTHORITY_UNAVAILABLE",
+                "placement authority is not configured",
+                true,
+            )
+        })?;
+        let stored = repository
+            .get_commit_object_set(&tenant_id, &commit_digest)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| not_found("commit object set"))?;
+        let jobs = repository
+            .list_materializations(
+                &tenant_id,
+                &namespace_id,
+                &commit_digest,
+                target_volume_id.as_ref(),
+            )
+            .await
+            .map_err(map_central_error)?;
+        let mut jobs = jobs;
+        jobs.sort_by_key(|job| job.materialization_id.clone());
+        let page = jobs
+            .into_iter()
+            .skip(offset)
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_more = page.len() > limit;
+        let items = page
+            .iter()
+            .take(limit)
+            .map(|job| materialization_view(job, stored.object_set.object_set_digest))
+            .collect();
+        let next_cursor = has_more.then(|| offset.saturating_add(limit).to_string());
+        Ok(QueryCommitMaterializationListResponse {
+            materializations: items,
+            next_cursor,
+        })
+    }
+
+    pub async fn retry_commit_materialization_legacy_v2(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: RetryCommitMaterializationRequest,
+    ) -> Result<RetryCommitMaterializationResponse, Error> {
+        let tenant_id = parse_tenant(request.tenant_id)?;
+        self.require_tenant(identity, Permission::ArtifactCommitReplicate, &tenant_id)
+            .await?;
+        let namespace_id = parse_namespace(request.object_namespace_id)?;
+        let materialization_id = parse_materialization_id(request.materialization_id)?;
+        let expected_plan_revision =
+            parse_generation(request.expected_plan_revision, "expected_plan_revision")?;
+        let _request_id = RequestId::new(request.request_id)
+            .map_err(|error| invalid_request(format!("request_id: {error}")))?;
+        let repository = self.placement.as_ref().ok_or_else(|| {
+            application_error(
+                ErrorCategory::Unavailable,
+                "placement_authority_unavailable",
+                "PLACEMENT_AUTHORITY_UNAVAILABLE",
+                "placement authority is not configured",
+                true,
+            )
+        })?;
+        let current = repository
+            .get_materialization(&tenant_id, &namespace_id, &materialization_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| not_found("materialization"))?;
+        if current.plan_revision != expected_plan_revision {
+            return Err(application_error(
+                ErrorCategory::Conflict,
+                "materialization_plan_revision_conflict",
+                "MATERIALIZATION_PLAN_REVISION_CONFLICT",
+                "materialization plan revision changed",
+                false,
+            ));
+        }
+        if current.state == MaterializationJobState::Complete {
+            return Ok(RetryCommitMaterializationResponse {
+                materialization: self
+                    .materialization_view_for_job(repository.as_ref(), &current)
+                    .await?,
+                replayed: true,
+            });
+        }
+        let next_revision = expected_plan_revision
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| invalid_request("materialization plan revision overflow"))?;
+        let mut next = current.clone();
+        next.plan_revision = Generation::new(next_revision);
+        next.state = MaterializationJobState::Queued;
+        next.issue = None;
+        next.updated_at_unix_ms = self.clock.now();
+        let stored = repository
+            .replace_materialization(
+                &tenant_id,
+                &materialization_id,
+                expected_plan_revision,
+                next,
+            )
+            .await
+            .map_err(map_central_error)?;
+        Ok(RetryCommitMaterializationResponse {
+            materialization: self
+                .materialization_view_for_job(repository.as_ref(), &stored)
+                .await?,
+            replayed: false,
+        })
+    }
+
+    pub async fn cancel_commit_materialization_legacy_v2(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: CancelCommitMaterializationRequest,
+    ) -> Result<CancelCommitMaterializationResponse, Error> {
+        let tenant_id = parse_tenant(request.tenant_id)?;
+        self.require_tenant(identity, Permission::ArtifactCommitReplicate, &tenant_id)
+            .await?;
+        let namespace_id = parse_namespace(request.object_namespace_id)?;
+        let materialization_id = parse_materialization_id(request.materialization_id)?;
+        let expected_plan_revision =
+            parse_generation(request.expected_plan_revision, "expected_plan_revision")?;
+        let repository = self.placement.as_ref().ok_or_else(|| {
+            application_error(
+                ErrorCategory::Unavailable,
+                "placement_authority_unavailable",
+                "PLACEMENT_AUTHORITY_UNAVAILABLE",
+                "placement authority is not configured",
+                true,
+            )
+        })?;
+        let current = repository
+            .get_materialization(&tenant_id, &namespace_id, &materialization_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| not_found("materialization"))?;
+        if current.plan_revision != expected_plan_revision {
+            return Err(application_error(
+                ErrorCategory::Conflict,
+                "materialization_plan_revision_conflict",
+                "MATERIALIZATION_PLAN_REVISION_CONFLICT",
+                "materialization plan revision changed",
+                false,
+            ));
+        }
+        if current.state == MaterializationJobState::Cancelled {
+            return Ok(CancelCommitMaterializationResponse {
+                materialization: self
+                    .materialization_view_for_job(repository.as_ref(), &current)
+                    .await?,
+            });
+        }
+        if current.state == MaterializationJobState::Complete {
+            return Err(application_error(
+                ErrorCategory::Conflict,
+                "materialization_already_complete",
+                "MATERIALIZATION_ALREADY_COMPLETE",
+                "a complete materialization cannot be cancelled",
+                false,
+            ));
+        }
+        let next_revision = expected_plan_revision
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| invalid_request("materialization plan revision overflow"))?;
+        let mut next = current;
+        next.plan_revision = Generation::new(next_revision);
+        next.state = MaterializationJobState::Cancelled;
+        next.updated_at_unix_ms = self.clock.now();
+        let stored = repository
+            .replace_materialization(
+                &tenant_id,
+                &materialization_id,
+                expected_plan_revision,
+                next,
+            )
+            .await
+            .map_err(map_central_error)?;
+        Ok(CancelCommitMaterializationResponse {
+            materialization: self
+                .materialization_view_for_job(repository.as_ref(), &stored)
+                .await?,
+        })
+    }
+
+    pub async fn query_commit_coverage_legacy_v2(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: QueryCommitCoverageRequest,
+    ) -> Result<QueryCommitCoverageResponse, Error> {
+        let tenant_id = parse_tenant(request.tenant_id)?;
+        self.require_replication_read(identity, &tenant_id).await?;
+        let namespace_id = parse_namespace(request.object_namespace_id)?;
+        let commit_digest = parse_commit(request.commit_id)?;
+        let target_volume_id = request.storage_volume_id.map(parse_volume).transpose()?;
+        let offset = parse_offset(request.cursor.as_deref())?;
+        let limit = usize::from(request.page_size.unwrap_or(50));
+        if !(1..=100).contains(&limit) {
+            return Err(invalid_request("page_size must be between 1 and 100"));
+        }
+        let repository = self.placement.as_ref().ok_or_else(|| {
+            application_error(
+                ErrorCategory::Unavailable,
+                "placement_authority_unavailable",
+                "PLACEMENT_AUTHORITY_UNAVAILABLE",
+                "placement authority is not configured",
+                true,
+            )
+        })?;
+        let stored = repository
+            .get_commit_object_set(&tenant_id, &commit_digest)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| not_found("commit object set"))?;
+        let namespace_set =
+            namespace_object_set(&tenant_id, &namespace_id, commit_digest, &stored)?;
+        let mut coverages = repository
+            .volume_commit_coverages(&tenant_id, &namespace_id, &commit_digest)
+            .await
+            .map_err(map_central_error)?;
+
+        // Older rows may not have a materialized summary yet.  Derive missing summaries from the
+        // v2 object evidence so this read path never treats an aggregate counter as authoritative.
+        let mut grouped =
+            BTreeMap::<(StorageVolumeId, PlacementGeneration), Vec<ObjectPlacementV2>>::new();
+        for object in &namespace_set.objects {
+            let placements = repository
+                .object_placements_v2(&tenant_id, &namespace_id, &object.object_id)
+                .await
+                .map_err(map_central_error)?;
+            for placement in placements.into_iter().filter(|placement| {
+                placement.state == ObjectPlacementState::Verified
+                    && placement.tenant_id == tenant_id
+                    && placement.object_namespace_id == namespace_id
+                    && placement.matches_ref(object)
+                    && placement.storage_volume_id.is_some()
+            }) {
+                let volume = placement
+                    .storage_volume_id
+                    .clone()
+                    .expect("filtered v2 placement must have a volume");
+                grouped
+                    .entry((volume, placement.placement_generation))
+                    .or_default()
+                    .push(placement);
+            }
+        }
+        let existing_keys = coverages
+            .iter()
+            .map(|coverage| {
+                (
+                    coverage.storage_volume_id.clone(),
+                    coverage.placement_generation,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        for ((volume, generation), placements) in grouped {
+            if existing_keys.contains(&(volume.clone(), generation)) {
+                continue;
+            }
+            let coverage = VolumeCommitCoverage::from_placements(
+                tenant_id.clone(),
+                namespace_id.clone(),
+                namespace_set.commit_id,
+                volume,
+                generation,
+                &stored.object_set,
+                &placements,
+            )
+            .map_err(|error| invalid_request(format!("coverage: {error}")))?;
+            coverages.push(coverage);
+        }
+        coverages.sort_by_key(|coverage| {
+            (
+                coverage.storage_volume_id.clone(),
+                coverage.placement_generation,
+            )
+        });
+        if let Some(target) = &target_volume_id {
+            coverages.retain(|coverage| &coverage.storage_volume_id == target);
+        }
+        let page = coverages
+            .into_iter()
+            .skip(offset)
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_more = page.len() > limit;
+        let coverage = page.iter().take(limit).map(coverage_view).collect();
+        Ok(QueryCommitCoverageResponse {
+            coverage,
+            next_cursor: has_more.then(|| offset.saturating_add(limit).to_string()),
+        })
+    }
+
+    pub async fn query_commit_availability_legacy_v2(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: QueryCommitAvailabilityV2Request,
+    ) -> Result<QueryCommitAvailabilityV2Response, Error> {
+        let tenant_id = parse_tenant(request.tenant_id)?;
+        self.require_replication_read(identity, &tenant_id).await?;
+        let namespace_id = parse_namespace(request.object_namespace_id)?;
+        let commit_digest = parse_commit(request.commit_id)?;
+        let target_volume_id = request
+            .target_storage_volume_id
+            .map(parse_volume)
+            .transpose()?;
+        let repository = self.placement.as_ref().ok_or_else(|| {
+            application_error(
+                ErrorCategory::Unavailable,
+                "placement_authority_unavailable",
+                "PLACEMENT_AUTHORITY_UNAVAILABLE",
+                "placement authority is not configured",
+                true,
+            )
+        })?;
+        let stored = repository
+            .get_commit_object_set(&tenant_id, &commit_digest)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| not_found("commit object set"))?;
+        let namespace_set =
+            namespace_object_set(&tenant_id, &namespace_id, commit_digest, &stored)?;
+        let total = namespace_set.objects.len();
+        let mut content_present = 0_usize;
+        let mut target_present = 0_usize;
+        let mut missing_objects = Vec::new();
+        let mut verified_volume_ids = BTreeSet::new();
+        let mut volume_generation_objects =
+            BTreeMap::<(StorageVolumeId, PlacementGeneration), BTreeSet<ObjectId>>::new();
+
+        for object in &namespace_set.objects {
+            let placements = repository
+                .object_placements_v2(&tenant_id, &namespace_id, &object.object_id)
+                .await
+                .map_err(map_central_error)?;
+            let matching = placements
+                .iter()
+                .filter(|placement| {
+                    placement.state == ObjectPlacementState::Verified
+                        && placement.tenant_id == tenant_id
+                        && placement.object_namespace_id == namespace_id
+                        && placement.matches_ref(object)
+                })
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                if target_volume_id.is_none() {
+                    missing_objects.push(MissingObjectView {
+                        object_id: object.object_id.to_string(),
+                        size: object.size.to_string(),
+                        encoding: object_encoding_name(object.encoding).to_owned(),
+                    });
+                }
+            } else {
+                content_present += 1;
+            }
+            let mut target_match = false;
+            for placement in matching {
+                let Some(volume) = placement.storage_volume_id.clone() else {
+                    continue;
+                };
+                verified_volume_ids.insert(volume.to_string());
+                volume_generation_objects
+                    .entry((volume.clone(), placement.placement_generation))
+                    .or_default()
+                    .insert(placement.object_id);
+                if target_volume_id.as_ref() == Some(&volume) {
+                    target_match = true;
+                }
+            }
+            if target_volume_id.is_some() && !target_match {
+                missing_objects.push(MissingObjectView {
+                    object_id: object.object_id.to_string(),
+                    size: object.size.to_string(),
+                    encoding: object_encoding_name(object.encoding).to_owned(),
+                });
+            }
+            if target_match {
+                target_present += 1;
+            }
+        }
+
+        let required_ids = namespace_set
+            .objects
+            .iter()
+            .map(|object| object.object_id)
+            .collect::<BTreeSet<_>>();
+        let complete_volume_count = volume_generation_objects
+            .iter()
+            .filter(|((volume, _generation), objects)| {
+                target_volume_id
+                    .as_ref()
+                    .is_none_or(|target| *target == *volume)
+                    && objects.len() == required_ids.len()
+                    && objects.is_superset(&required_ids)
+            })
+            .map(|((volume, _), _)| volume)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let target_coverage = if target_volume_id.is_some() {
+            if target_present == total {
+                CoverageState::Complete
+            } else {
+                CoverageState::Partial
+            }
+        } else if complete_volume_count > 0 {
+            CoverageState::Complete
+        } else {
+            CoverageState::Partial
+        };
+        let content_status = availability_status_for_counts(total, content_present);
+        let view_readiness = if target_volume_id.is_some() && target_coverage.complete() {
+            ViewReadiness::Ready
+        } else {
+            ViewReadiness::NotReady
+        };
+        let availability = CommitAvailabilityV2View {
+            object_namespace_id: namespace_id.to_string(),
+            commit_id: commit_digest.to_string(),
+            object_count: total.to_string(),
+            content_presence: availability_status_name(content_status).to_owned(),
+            source_serving: availability_status_name(content_status).to_owned(),
+            durability: availability_status_name(content_status).to_owned(),
+            target_coverage: coverage_state_name(target_coverage).to_owned(),
+            view_readiness: view_readiness_name(view_readiness).to_owned(),
+            complete_volume_count: complete_volume_count.to_string(),
+            missing_objects,
+            verified_storage_volume_ids: verified_volume_ids.into_iter().collect(),
+        };
+        Ok(QueryCommitAvailabilityV2Response { availability })
     }
 
     pub async fn create_commit_replication(
@@ -1364,19 +2116,22 @@ impl CatalogService {
             .map(|value| parse_commit(value.to_owned()))
             .transpose()?;
         if let Some(commit_id) = base_commit_id {
-            let availability = placement_repository
-                .commit_availability(&tenant_id, &commit_id)
-                .await
-                .map_err(map_central_error)?;
-            if matches!(
-                availability.data_health,
-                neoengram_domain::protocol::DataHealth::Unavailable
-            ) {
+            // Workspace hydration is an object-level v2 read.  Legacy complete PlacementSets
+            // are deliberately ignored: a Commit is usable only when every required object has
+            // a matching verified ObjectPlacement in its Artifact namespace.
+            let namespace = ObjectNamespaceId::new(artifact_id.to_string())
+                .map_err(|error| invalid_request(format!("object namespace: {error}")))?;
+            let data_health = self
+                .v2_commit_data_health_for_digest(&tenant_id, &namespace, &commit_id)
+                .await?;
+            if data_health.is_none_or(|health| {
+                matches!(health, neoengram_domain::protocol::DataHealth::Unavailable)
+            }) {
                 return Err(application_error(
                     ErrorCategory::Unavailable,
                     "data_unavailable",
                     "DATA_UNAVAILABLE",
-                    "the requested base Commit has no readable verified PlacementSet",
+                    "the requested base Commit has no readable verified v2 ObjectPlacement",
                     true,
                 ));
             }

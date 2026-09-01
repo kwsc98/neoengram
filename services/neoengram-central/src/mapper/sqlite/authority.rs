@@ -4,6 +4,7 @@ use neoengram_domain::core::{ContentDigest, Manifest, ManifestId};
 use neoengram_domain::protocol::{ArtifactId, JobAssignment, TenantId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::SqlitePool;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     datasource::sqlite::authority::SqliteAuthorityDataSource,
@@ -45,6 +46,14 @@ impl SqliteAuthorityConfig {
 pub struct SqliteAuthority {
     inner: Arc<SqliteAuthorityStore>,
     agent_registry: SqliteAgentRegistry,
+}
+
+impl std::fmt::Debug for SqliteAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SqliteAuthority")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqliteAuthority {
@@ -150,6 +159,10 @@ impl SqliteAuthority {
 pub(super) struct SqliteAuthorityStore {
     pub(super) pool: SqlitePool,
     datasource: Arc<SqliteAuthorityDataSource>,
+    /// Serializes the multi-row materialization receipt publication boundary. The SQLite
+    /// transaction below provides atomic durability; this gate prevents two callers from doing
+    /// read/validate work against the same object before either transaction commits.
+    pub(super) materialization_receipt_gate: Arc<AsyncMutex<()>>,
 }
 
 pub async fn open_sqlite_authority(
@@ -161,7 +174,11 @@ pub async fn open_sqlite_authority(
     let agent_registry = open_sqlite_agent_registry_with_datasource(datasource.clone()).await?;
 
     Ok(SqliteAuthority {
-        inner: Arc::new(SqliteAuthorityStore { pool, datasource }),
+        inner: Arc::new(SqliteAuthorityStore {
+            pool,
+            datasource,
+            materialization_receipt_gate: Arc::new(AsyncMutex::new(())),
+        }),
         agent_registry,
     })
 }

@@ -177,6 +177,7 @@ describe('tenant-scoped public resource operations', () => {
       const replications = await queryCommitReplicationList({
         tenant_id: request.tenant_id,
         commit_id: request.commit_id,
+        object_namespace_id: request.artifact_id,
       });
       state = replications.data.replications[0]!.state;
     }
@@ -185,6 +186,7 @@ describe('tenant-scoped public resource operations', () => {
     const placements = await queryCommitPlacementList({
       tenant_id: request.tenant_id,
       commit_id: request.commit_id,
+      object_namespace_id: request.artifact_id,
     });
     expect(placements.data.placements).toContainEqual(
       expect.objectContaining({
@@ -195,6 +197,7 @@ describe('tenant-scoped public resource operations', () => {
     const availability = await queryCommitAvailability({
       tenant_id: request.tenant_id,
       commit_id: request.commit_id,
+      object_namespace_id: request.artifact_id,
     });
     expect(availability.data.availability.verified_storage_volume_ids).toContain(
       request.target_storage_volume_id,
@@ -220,6 +223,7 @@ describe('tenant-scoped public resource operations', () => {
     });
     const cancelled = await cancelCommitReplication({
       tenant_id: 'tenant-a',
+      object_namespace_id: 'road-scenes',
       replication_id: created.data.replication.replication_id,
       expected_attempt: created.data.replication.attempt,
     });
@@ -227,6 +231,7 @@ describe('tenant-scoped public resource operations', () => {
 
     const retried = await retryCommitReplication({
       tenant_id: 'tenant-a',
+      object_namespace_id: 'road-scenes',
       replication_id: created.data.replication.replication_id,
       expected_attempt: cancelled.data.replication.attempt,
       request_id: 'retry-replicate-road-main-to-guangzhou',

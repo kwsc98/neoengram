@@ -10,11 +10,17 @@ use async_trait::async_trait;
 use neoengram_domain::core::{
     CommitId, FileRecord, IndexVersion, LogicalPath, Manifest, ManifestId, ObjectId,
 };
+use neoengram_domain::protocol::materialization::{
+    MaterializationBatch, MaterializationJob, MaterializationJobKey, MaterializationJobState,
+    MaterializationLeaseState, MaterializationObject, MaterializationObjectReceipt,
+    ObjectPlacement as ObjectPlacementV2, ObjectReadLease, StagingLease, VolumeCommitCoverage,
+};
 use neoengram_domain::protocol::{
-    AgentId, ArtifactId, DecimalU64, JobAssignment, JobState, MetadataBatchDescriptor,
-    MetadataBatchId, MetadataBatchPage, ObjectReceiptId, PlacementGeneration, ReplicationId,
-    ReplicationState, RequestId, ResourceRef, ResourceVersion, StorageVolumeId, TenantId,
-    UnixMillis, WireIndexVersion, WorkspaceId,
+    object_read_lease_id, staging_lease_id, AgentId, ArtifactId, DecimalU64, Generation,
+    JobAssignment, JobState, MaterializationBatchId, MetadataBatchDescriptor, MetadataBatchId,
+    MetadataBatchPage, ObjectReceiptId, PlacementGeneration, ReplicationId, ReplicationState,
+    RequestId, ResourceRef, ResourceVersion, StorageVolumeId, TenantId, UnixMillis,
+    WireIndexVersion, WorkspaceId,
 };
 
 use crate::{
@@ -41,9 +47,11 @@ use crate::{
     same_retry_request, valid_replication_transition, validate_replication_checkpoints,
     validate_replication_publication, validate_replication_record, CancelReplicationRequest,
     CommitAvailabilityRecord, FinalizeReplicationRequest, FinalizeReplicationResult,
-    PlacementRepository, RefreshReplicationRoutesRequest, ReplicationRecord,
-    ReplicationRouteBinding, ReplicationStateTransitionRequest, RetryReplicationRequest,
-    RetryReplicationResult, WorkspaceRecord,
+    MaterializationBatchCasRequest, MaterializationObjectCasRequest, MaterializationPlan,
+    MaterializationPlanInsertOutcome, MaterializationPlanReplacement,
+    MaterializationReceiptRequest, PlacementRepository, RefreshReplicationRoutesRequest,
+    ReplicationRecord, ReplicationRouteBinding, ReplicationStateTransitionRequest,
+    RetryReplicationRequest, RetryReplicationResult, WorkspaceRecord,
 };
 
 #[derive(Debug, Default)]
@@ -68,6 +76,30 @@ impl Authorizer for DenyAllAuthorizer {
         ))
     }
 }
+
+type MaterializationPlacementKey = (
+    TenantId,
+    neoengram_domain::protocol::ObjectNamespaceId,
+    ObjectId,
+    StorageVolumeId,
+    PlacementGeneration,
+);
+type MaterializationPlacementMap = BTreeMap<MaterializationPlacementKey, ObjectPlacementV2>;
+type VolumeCoverageKey = (
+    TenantId,
+    neoengram_domain::protocol::ObjectNamespaceId,
+    CommitId,
+    StorageVolumeId,
+    PlacementGeneration,
+);
+type VolumeCoverageMap = BTreeMap<VolumeCoverageKey, VolumeCommitCoverage>;
+type MaterializationReceiptKey = (
+    TenantId,
+    neoengram_domain::protocol::ObjectNamespaceId,
+    ObjectReceiptId,
+);
+type MaterializationReceiptMap =
+    BTreeMap<MaterializationReceiptKey, (MaterializationObjectReceipt, ObjectPlacementV2)>;
 
 #[derive(Debug, Default)]
 pub struct InMemoryJobRepository {
@@ -183,10 +215,2389 @@ pub struct InMemoryPlacementRepository {
         Mutex<BTreeMap<(TenantId, RequestId), (RetryReplicationRequest, ReplicationRecord)>>,
     workspaces: Mutex<BTreeMap<(TenantId, WorkspaceId), WorkspaceRecord>>,
     workspace_requests: Mutex<BTreeMap<(TenantId, RequestId), WorkspaceId>>,
+    materialization_placements: Mutex<MaterializationPlacementMap>,
+    volume_commit_coverages: Mutex<VolumeCoverageMap>,
+    materializations: Mutex<
+        BTreeMap<
+            (
+                TenantId,
+                neoengram_domain::protocol::ObjectNamespaceId,
+                neoengram_domain::protocol::MaterializationId,
+            ),
+            MaterializationJob,
+        >,
+    >,
+    materialization_keys: Mutex<BTreeMap<MaterializationJobKey, MaterializationJob>>,
+    materialization_batches: Mutex<
+        BTreeMap<
+            (
+                TenantId,
+                neoengram_domain::protocol::ObjectNamespaceId,
+                neoengram_domain::protocol::MaterializationBatchId,
+            ),
+            MaterializationBatch,
+        >,
+    >,
+    materialization_objects: Mutex<
+        BTreeMap<
+            (
+                TenantId,
+                neoengram_domain::protocol::MaterializationId,
+                neoengram_domain::protocol::ObjectNamespaceId,
+                ObjectId,
+            ),
+            MaterializationObject,
+        >,
+    >,
+    object_read_leases: Mutex<
+        BTreeMap<
+            (
+                TenantId,
+                neoengram_domain::protocol::ObjectNamespaceId,
+                neoengram_domain::protocol::LeaseId,
+            ),
+            ObjectReadLease,
+        >,
+    >,
+    staging_leases: Mutex<
+        BTreeMap<
+            (
+                TenantId,
+                neoengram_domain::protocol::ObjectNamespaceId,
+                neoengram_domain::protocol::LeaseId,
+            ),
+            StagingLease,
+        >,
+    >,
+    materialization_receipts: Mutex<MaterializationReceiptMap>,
+    /// Serializes the multi-record receipt publication boundary.  The individual maps remain
+    /// independently queryable, while receipt writers observe one deterministic state transition.
+    materialization_receipt_gate: tokio::sync::Mutex<()>,
+}
+
+impl InMemoryPlacementRepository {
+    fn materialization_for_namespace(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Option<MaterializationJob>> {
+        Ok(lock(&self.materializations)?
+            .get(&(
+                tenant_id.clone(),
+                object_namespace_id.clone(),
+                materialization_id.clone(),
+            ))
+            .cloned())
+    }
+
+    async fn release_receipt_leases(
+        &self,
+        receipt: &MaterializationObjectReceipt,
+        _batch: &MaterializationBatch,
+        task: &MaterializationObject,
+    ) -> CentralResult<()> {
+        let source_ids = task
+            .primary_source
+            .iter()
+            .chain(task.fallback_sources.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for source_id in source_ids {
+            let lease_id = object_read_lease_id(
+                &receipt.materialization_id,
+                &receipt.batch_id,
+                receipt.plan_revision,
+                receipt.batch_attempt,
+                &receipt.object_namespace_id,
+                receipt.object_id,
+                &source_id,
+            )
+            .map_err(CentralError::from)?;
+            self.release_object_read_lease(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &lease_id,
+            )
+            .await?;
+        }
+        let lease_id = staging_lease_id(
+            &receipt.materialization_id,
+            receipt.plan_revision,
+            &receipt.object_namespace_id,
+            receipt.object_id,
+        )
+        .map_err(CentralError::from)?;
+        self.release_staging_lease(&receipt.tenant_id, &receipt.object_namespace_id, &lease_id)
+            .await?;
+        Ok(())
+    }
+
+    // Receipt publication already owns `materialization_receipt_gate`; keep the actual CAS
+    // mutation in a separate helper so the public mutation path can take the same gate without
+    // recursively locking the non-reentrant Tokio mutex.
+    async fn replace_materialization_unlocked(
+        &self,
+        tenant_id: &TenantId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+        expected_plan_revision: neoengram_domain::protocol::Generation,
+        job: MaterializationJob,
+    ) -> CentralResult<MaterializationJob> {
+        job.validate().map_err(CentralError::from)?;
+        if &job.key.tenant_id != tenant_id || &job.materialization_id != materialization_id {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization replacement identity does not match its key",
+            ));
+        }
+        if job.plan_revision < expected_plan_revision {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision moved backwards",
+            ));
+        }
+        let mut jobs = lock(&self.materializations)?;
+        let current = jobs
+            .get(&(
+                tenant_id.clone(),
+                job.key.object_namespace_id.clone(),
+                materialization_id.clone(),
+            ))
+            .cloned()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if current.key != job.key {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization replacement cannot change its immutable target key",
+            ));
+        }
+        if current.plan_revision != expected_plan_revision {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision changed",
+            ));
+        }
+        if !current.state.can_transition_to(job.state) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization state transition is not allowed",
+            ));
+        }
+        if job.plan_revision > Generation::new(expected_plan_revision.get().saturating_add(1)) {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision advanced by more than one",
+            ));
+        }
+        jobs.insert(
+            (
+                tenant_id.clone(),
+                job.key.object_namespace_id.clone(),
+                materialization_id.clone(),
+            ),
+            job.clone(),
+        );
+        lock(&self.materialization_keys)?.insert(job.key.clone(), job.clone());
+        Ok(job)
+    }
 }
 
 #[async_trait]
 impl PlacementRepository for InMemoryPlacementRepository {
+    async fn insert_object_placement_v2(
+        &self,
+        placement: ObjectPlacementV2,
+    ) -> CentralResult<ObjectPlacementV2> {
+        placement.validate().map_err(CentralError::from)?;
+        let volume = placement.storage_volume_id.clone().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ProtocolInvalid,
+                "v2 object placements currently require a StorageVolume",
+            )
+        })?;
+        let key = (
+            placement.tenant_id.clone(),
+            placement.object_namespace_id.clone(),
+            placement.object_id,
+            volume,
+            placement.placement_generation,
+        );
+        let mut values = lock(&self.materialization_placements)?;
+        if let Some((_, existing)) =
+            values
+                .iter()
+                .find(|((tenant, namespace, _, _, _), existing)| {
+                    tenant == &placement.tenant_id
+                        && namespace == &placement.object_namespace_id
+                        && existing.placement_id == placement.placement_id
+                })
+        {
+            return if existing == &placement {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "v2 placement ID is already bound to different metadata",
+                ))
+            };
+        }
+        if let Some(existing) = values.get(&key) {
+            return if existing == &placement {
+                Ok(existing.clone())
+            } else if existing.tenant_id == placement.tenant_id
+                && existing.object_namespace_id == placement.object_namespace_id
+                && existing.object_id == placement.object_id
+                && existing.size == placement.size
+                && existing.encoding == placement.encoding
+                && existing.verified_digest == placement.verified_digest
+                && existing.storage_volume_id == placement.storage_volume_id
+                && existing.archive_id == placement.archive_id
+                && existing.placement_generation == placement.placement_generation
+                && existing.state == placement.state
+                && existing.failure_domain == placement.failure_domain
+            {
+                // Two concurrent Agents may acknowledge the same durable object with different
+                // receipt IDs. The physical identity is the namespace/object/Volume/generation;
+                // retain the first Placement identity and make the loser an exact replay.
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "v2 object placement identity is already bound to different metadata",
+                ))
+            };
+        }
+        values.insert(key, placement.clone());
+        Ok(placement)
+    }
+
+    async fn object_placements_v2(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        object_id: &ObjectId,
+    ) -> CentralResult<Vec<ObjectPlacementV2>> {
+        Ok(lock(&self.materialization_placements)?
+            .iter()
+            .filter(|((tenant, namespace, object, _, _), _)| {
+                tenant == tenant_id && namespace == object_namespace_id && object == object_id
+            })
+            .map(|(_, placement)| placement.clone())
+            .collect())
+    }
+
+    async fn upsert_volume_commit_coverage(
+        &self,
+        coverage: VolumeCommitCoverage,
+    ) -> CentralResult<VolumeCommitCoverage> {
+        coverage.validate().map_err(CentralError::from)?;
+        let object_set = self
+            .get_commit_object_set(&coverage.tenant_id, &coverage.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "coverage references an unknown Commit ObjectSet",
+                )
+            })?;
+        coverage
+            .validate_against(&object_set.object_set)
+            .map_err(CentralError::from)?;
+        let placements = lock(&self.materialization_placements)?
+            .values()
+            .filter(|placement| {
+                placement.tenant_id == coverage.tenant_id
+                    && placement.object_namespace_id == coverage.object_namespace_id
+                    && placement.storage_volume_id.as_ref() == Some(&coverage.storage_volume_id)
+                    && placement.placement_generation == coverage.placement_generation
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let recomputed = VolumeCommitCoverage::from_placements(
+            coverage.tenant_id.clone(),
+            coverage.object_namespace_id.clone(),
+            coverage.commit_id,
+            coverage.storage_volume_id.clone(),
+            coverage.placement_generation,
+            &object_set.object_set,
+            &placements,
+        )
+        .map_err(CentralError::from)?;
+        if coverage.object_set_digest != recomputed.object_set_digest
+            || coverage.object_count != recomputed.object_count
+            || coverage.verified_object_count != recomputed.verified_object_count
+            || coverage.total_bytes != recomputed.total_bytes
+            || coverage.verified_bytes != recomputed.verified_bytes
+            || (matches!(
+                coverage.state,
+                neoengram_domain::protocol::materialization::CoverageState::Partial
+                    | neoengram_domain::protocol::materialization::CoverageState::Complete
+            ) && coverage.state != recomputed.state)
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "coverage does not match verified object placement evidence",
+            ));
+        }
+        let key = (
+            coverage.tenant_id.clone(),
+            coverage.object_namespace_id.clone(),
+            coverage.commit_id,
+            coverage.storage_volume_id.clone(),
+            coverage.placement_generation,
+        );
+        let mut values = lock(&self.volume_commit_coverages)?;
+        if let Some(existing) = values.get(&key) {
+            if existing.state
+                == neoengram_domain::protocol::materialization::CoverageState::Complete
+                && coverage.state
+                    != neoengram_domain::protocol::materialization::CoverageState::Complete
+            {
+                return Ok(existing.clone());
+            }
+            // Coverage is recomputable, so replacing a summary is allowed.  A stale caller may
+            // never move a terminal/deleted summary back to an older generation.
+            if existing.object_set_digest != coverage.object_set_digest
+                || existing.object_count != coverage.object_count
+                || existing.total_bytes != coverage.total_bytes
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "coverage identity is already bound to different Commit metadata",
+                ));
+            }
+        }
+        values.insert(key, coverage.clone());
+        Ok(coverage)
+    }
+
+    async fn volume_commit_coverages(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Vec<VolumeCommitCoverage>> {
+        Ok(lock(&self.volume_commit_coverages)?
+            .iter()
+            .filter(|((tenant, namespace, commit, _, _), _)| {
+                tenant == tenant_id
+                    && namespace == object_namespace_id
+                    && commit.digest() == *commit_id
+            })
+            .map(|(_, coverage)| coverage.clone())
+            .collect())
+    }
+
+    async fn insert_materialization(
+        &self,
+        job: MaterializationJob,
+    ) -> CentralResult<MaterializationJob> {
+        job.validate().map_err(CentralError::from)?;
+        let tenant_id = job.key.tenant_id.clone();
+        let namespace = job.key.object_namespace_id.clone();
+        let id = job.materialization_id.clone();
+        let key = job.key.clone();
+        let mut jobs = lock(&self.materializations)?;
+        // Materialization IDs are scoped by tenant and object namespace. This mirrors the
+        // authority primary key and prevents a caller-reused ID from crossing namespace fences.
+        let id_key = (tenant_id.clone(), namespace, id.clone());
+        if let Some(existing) = jobs.get(&id_key) {
+            return if existing == &job {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization ID is already bound to different metadata",
+                ))
+            };
+        }
+        if let Some(existing) = lock(&self.materialization_keys)?.get(&key) {
+            if existing == &job {
+                return Ok(existing.clone());
+            }
+            return Err(invalid(
+                if existing.state.terminal() {
+                    CentralErrorCode::InvalidState
+                } else {
+                    CentralErrorCode::ReplicationAlreadyActive
+                },
+                "materialization idempotency key is already bound to different metadata",
+            ));
+        }
+        // Coverage thresholds are request policy, not a second target identity.  A target must
+        // have at most one recoverable Job for a Commit regardless of whether the caller asked
+        // for Complete, ObjectCount, or ByteCount coverage.  Keep this check under the same
+        // mutex as insertion so InMemory has the same CAS boundary as SQLite's partial index.
+        if jobs.values().any(|existing| {
+            !existing.state.terminal()
+                && existing.key.tenant_id == job.key.tenant_id
+                && existing.key.object_namespace_id == job.key.object_namespace_id
+                && existing.key.commit_id == job.key.commit_id
+                && existing.key.target_storage_volume_id == job.key.target_storage_volume_id
+        }) {
+            return Err(invalid(
+                CentralErrorCode::ReplicationAlreadyActive,
+                "a materialization for this Commit target is already active",
+            ));
+        }
+        jobs.insert(id_key, job.clone());
+        lock(&self.materialization_keys)?.insert(key, job.clone());
+        Ok(job)
+    }
+
+    async fn insert_materialization_plan(
+        &self,
+        plan: MaterializationPlan,
+    ) -> CentralResult<MaterializationPlanInsertOutcome> {
+        // Keep plan publication and object-receipt publication on one serialization boundary.
+        // Without this fence a planner could replace the parent after a receipt validated it but
+        // before the receipt advanced its Object/Job rows, leaving an orphan Placement behind.
+        let _gate = self.materialization_receipt_gate.lock().await;
+        let MaterializationPlan {
+            job,
+            batches,
+            objects,
+            object_read_leases,
+            staging_leases,
+            coverage,
+        } = plan;
+        job.validate().map_err(CentralError::from)?;
+        coverage.validate().map_err(CentralError::from)?;
+        if coverage.tenant_id != job.key.tenant_id
+            || coverage.object_namespace_id != job.key.object_namespace_id
+            || coverage.commit_id != job.key.commit_id
+            || coverage.storage_volume_id != job.key.target_storage_volume_id
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Coverage identity does not match its Job",
+            ));
+        }
+        let object_set = self
+            .get_commit_object_set(&job.key.tenant_id, &job.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?;
+        coverage
+            .validate_against(&object_set.object_set)
+            .map_err(CentralError::from)?;
+
+        // Validate the complete aggregate before taking any mutable lock. This keeps all
+        // rejection paths side-effect free and mirrors the SQLite transaction below.
+        let expected_objects = object_set
+            .object_set
+            .objects
+            .iter()
+            .map(|object| (object.object_id, object))
+            .collect::<BTreeMap<_, _>>();
+        let relevant_placements = lock(&self.materialization_placements)?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut object_ids = BTreeSet::new();
+        for object in &objects {
+            object.validate().map_err(CentralError::from)?;
+            if object.materialization_id != job.materialization_id
+                || object.plan_revision != job.plan_revision
+                || object.object.object_namespace_id != job.key.object_namespace_id
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization Object does not match its Job fence",
+                ));
+            }
+            let Some(expected) = expected_objects.get(&object.object.object_id) else {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization Object is not part of the Commit ObjectSet",
+                ));
+            };
+            if object.object.object_id != expected.object_id
+                || object.object.size != expected.size
+                || object.object.encoding != expected.encoding
+                || object.object.ordinal != expected.ordinal
+                || !object_ids.insert(object.object.object_id)
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization Object metadata or identity is duplicated",
+                ));
+            }
+        }
+        if object_ids.len() != expected_objects.len() {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization plan must include every Commit Object",
+            ));
+        }
+
+        let mut batch_ids = BTreeSet::new();
+        let mut assigned_objects = BTreeMap::<ObjectId, MaterializationBatchId>::new();
+        for batch in &batches {
+            batch.validate().map_err(CentralError::from)?;
+            if batch.materialization_id != job.materialization_id
+                || batch.plan_revision != job.plan_revision
+                || batch.target.tenant_id != job.key.tenant_id
+                || batch.target.object_namespace_id != job.key.object_namespace_id
+                || batch.target.storage_volume_id != job.key.target_storage_volume_id
+                || !batch_ids.insert(batch.batch_id.clone())
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization Batch does not match its Job fence or is duplicated",
+                ));
+            }
+            for object_id in &batch.object_ids {
+                if !object_ids.contains(object_id)
+                    || assigned_objects
+                        .insert(*object_id, batch.batch_id.clone())
+                        .is_some()
+                {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        "materialization Batch object list is invalid or overlaps another Batch",
+                    ));
+                }
+            }
+        }
+        for object in &objects {
+            if let Some(batch_id) = &object.current_batch_id {
+                if assigned_objects.get(&object.object.object_id) != Some(batch_id) {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        "materialization Object current Batch does not match its plan",
+                    ));
+                }
+            }
+        }
+
+        let mut read_lease_ids = BTreeSet::new();
+        for lease in &object_read_leases {
+            lease
+                .validate_for_acquisition()
+                .map_err(CentralError::from)?;
+            if lease.materialization_id != job.materialization_id
+                || lease.plan_revision != job.plan_revision
+                || lease.tenant_id != job.key.tenant_id
+                || lease.object_namespace_id != job.key.object_namespace_id
+                || !batch_ids.contains(&lease.batch_id)
+                || !object_ids.contains(&lease.object_id)
+                || !read_lease_ids.insert(lease.lease_id.clone())
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "object read lease does not match its materialization plan",
+                ));
+            }
+            let batch = batches
+                .iter()
+                .find(|batch| batch.batch_id == lease.batch_id)
+                .expect("batch ID was checked above");
+            let Some(object) = objects.iter().find(|object| {
+                object.object.object_id == lease.object_id
+                    && object.current_batch_id.as_ref() == Some(&lease.batch_id)
+            }) else {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "object read lease is not assigned to its Batch",
+                ));
+            };
+            let source_selected = object.primary_source.as_ref() == Some(&lease.placement_id)
+                || object.fallback_sources.contains(&lease.placement_id);
+            if !batch.object_ids.contains(&lease.object_id) || !source_selected {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "object read lease placement is not selected for its object task",
+                ));
+            }
+            let placement = relevant_placements.iter().find(|placement| {
+                placement.tenant_id == lease.tenant_id
+                    && placement.object_namespace_id == lease.object_namespace_id
+                    && placement.object_id == lease.object_id
+                    && placement.placement_id == lease.placement_id
+                    && placement.placement_generation == lease.placement_generation
+                    && placement.readable()
+            });
+            if placement.is_none_or(|placement| {
+                placement.size != expected_objects[&lease.object_id].size
+                    || placement.encoding != expected_objects[&lease.object_id].encoding
+                    || placement.storage_volume_id.is_none()
+                    || (object.primary_source.as_ref() == Some(&lease.placement_id)
+                        && (placement.storage_volume_id != batch.source.storage_volume_id
+                            || placement.archive_id != batch.source.archive_id
+                            || placement.placement_generation != batch.source.placement_generation))
+            }) {
+                return Err(invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "object read lease placement is not a readable source Placement",
+                ));
+            }
+        }
+        let mut staging_lease_ids = BTreeSet::new();
+        for lease in &staging_leases {
+            lease
+                .validate_for_acquisition()
+                .map_err(CentralError::from)?;
+            if lease.materialization_id != job.materialization_id
+                || lease.plan_revision != job.plan_revision
+                || lease.tenant_id != job.key.tenant_id
+                || lease.object_namespace_id != job.key.object_namespace_id
+                || lease.target_storage_volume_id != job.key.target_storage_volume_id
+                || !object_ids.contains(&lease.object_id)
+                || !staging_lease_ids.insert(lease.lease_id.clone())
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "staging lease does not match its materialization plan",
+                ));
+            }
+            let object = objects
+                .iter()
+                .find(|object| object.object.object_id == lease.object_id)
+                .expect("object ID was checked above");
+            lease
+                .validate_against_object(object)
+                .map_err(CentralError::from)?;
+        }
+        for object in &objects {
+            if object.complete() {
+                continue;
+            }
+            let Some(batch_id) = &object.current_batch_id else {
+                continue;
+            };
+            if !object_read_leases.iter().any(|lease| {
+                lease.batch_id == *batch_id && lease.object_id == object.object.object_id
+            }) || !staging_leases
+                .iter()
+                .any(|lease| lease.object_id == object.object.object_id)
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "every assigned materialization Object requires source and staging leases",
+                ));
+            }
+        }
+
+        // Lock order matches the coverage/receipt paths: placements first, then materialization
+        // rows, and Coverage last. No lock is held across an await, so publication is atomic to
+        // readers of the in-memory repository as well.
+        let recomputed = VolumeCommitCoverage::from_placements(
+            coverage.tenant_id.clone(),
+            coverage.object_namespace_id.clone(),
+            coverage.commit_id,
+            coverage.storage_volume_id.clone(),
+            coverage.placement_generation,
+            &object_set.object_set,
+            &relevant_placements,
+        )
+        .map_err(CentralError::from)?;
+        if coverage.object_set_digest != recomputed.object_set_digest
+            || coverage.object_count != recomputed.object_count
+            || coverage.verified_object_count != recomputed.verified_object_count
+            || coverage.total_bytes != recomputed.total_bytes
+            || coverage.verified_bytes != recomputed.verified_bytes
+            || (matches!(
+                coverage.state,
+                neoengram_domain::protocol::materialization::CoverageState::Partial
+                    | neoengram_domain::protocol::materialization::CoverageState::Complete
+            ) && coverage.state != recomputed.state)
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Coverage does not match Placement evidence",
+            ));
+        }
+
+        let mut jobs = lock(&self.materializations)?;
+        let mut keys = lock(&self.materialization_keys)?;
+        let mut stored_batches = lock(&self.materialization_batches)?;
+        let mut stored_objects = lock(&self.materialization_objects)?;
+        let mut stored_read_leases = lock(&self.object_read_leases)?;
+        let mut stored_staging_leases = lock(&self.staging_leases)?;
+        let mut stored_coverages = lock(&self.volume_commit_coverages)?;
+        let job_key = (
+            job.key.tenant_id.clone(),
+            job.key.object_namespace_id.clone(),
+            job.materialization_id.clone(),
+        );
+        let existing_job = jobs.get(&job_key).cloned();
+        if let Some(existing) = &existing_job {
+            if existing != &job {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization ID is already bound to different metadata",
+                ));
+            }
+        } else if let Some(existing) = keys.get(&job.key) {
+            return Err(invalid(
+                if existing.state.terminal() {
+                    CentralErrorCode::InvalidState
+                } else {
+                    CentralErrorCode::ReplicationAlreadyActive
+                },
+                "materialization idempotency key is already bound to different metadata",
+            ));
+        } else if jobs.values().any(|existing| {
+            !existing.state.terminal()
+                && existing.key.tenant_id == job.key.tenant_id
+                && existing.key.object_namespace_id == job.key.object_namespace_id
+                && existing.key.commit_id == job.key.commit_id
+                && existing.key.target_storage_volume_id == job.key.target_storage_volume_id
+        }) {
+            return Err(invalid(
+                CentralErrorCode::ReplicationAlreadyActive,
+                "a materialization for this Commit target is already active",
+            ));
+        }
+
+        for batch in &batches {
+            let key = (
+                job.key.tenant_id.clone(),
+                job.key.object_namespace_id.clone(),
+                batch.batch_id.clone(),
+            );
+            if let Some(existing) = stored_batches.get(&key) {
+                if existing != batch {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        "materialization Batch ID is already bound to different metadata",
+                    ));
+                }
+            }
+        }
+        for object in &objects {
+            let key = (
+                job.key.tenant_id.clone(),
+                job.materialization_id.clone(),
+                job.key.object_namespace_id.clone(),
+                object.object.object_id,
+            );
+            if let Some(existing) = stored_objects.get(&key) {
+                if existing != object {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        "materialization Object ID is already bound to different metadata",
+                    ));
+                }
+            }
+        }
+        for lease in &object_read_leases {
+            let key = (
+                job.key.tenant_id.clone(),
+                job.key.object_namespace_id.clone(),
+                lease.lease_id.clone(),
+            );
+            if let Some(existing) = stored_read_leases.get(&key) {
+                if existing != lease {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        "object read lease ID is already in use",
+                    ));
+                }
+            }
+        }
+        for lease in &staging_leases {
+            let key = (
+                job.key.tenant_id.clone(),
+                job.key.object_namespace_id.clone(),
+                lease.lease_id.clone(),
+            );
+            if let Some(existing) = stored_staging_leases.get(&key) {
+                if existing != lease {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        "staging lease ID is already in use",
+                    ));
+                }
+            }
+        }
+        let coverage_key = (
+            coverage.tenant_id.clone(),
+            coverage.object_namespace_id.clone(),
+            coverage.commit_id,
+            coverage.storage_volume_id.clone(),
+            coverage.placement_generation,
+        );
+        if let Some(existing) = stored_coverages.get(&coverage_key) {
+            if existing.object_set_digest != coverage.object_set_digest
+                || existing.object_count != coverage.object_count
+                || existing.total_bytes != coverage.total_bytes
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "coverage identity is already bound to different Commit metadata",
+                ));
+            }
+        }
+
+        let inserted = existing_job.is_none();
+        if inserted {
+            jobs.insert(job_key, job.clone());
+            keys.insert(job.key.clone(), job.clone());
+        }
+        for batch in batches {
+            stored_batches.insert(
+                (
+                    job.key.tenant_id.clone(),
+                    job.key.object_namespace_id.clone(),
+                    batch.batch_id.clone(),
+                ),
+                batch,
+            );
+        }
+        for object in objects {
+            stored_objects.insert(
+                (
+                    job.key.tenant_id.clone(),
+                    job.materialization_id.clone(),
+                    job.key.object_namespace_id.clone(),
+                    object.object.object_id,
+                ),
+                object,
+            );
+        }
+        for lease in object_read_leases {
+            stored_read_leases.insert(
+                (
+                    job.key.tenant_id.clone(),
+                    job.key.object_namespace_id.clone(),
+                    lease.lease_id.clone(),
+                ),
+                lease,
+            );
+        }
+        for lease in staging_leases {
+            stored_staging_leases.insert(
+                (
+                    job.key.tenant_id.clone(),
+                    job.key.object_namespace_id.clone(),
+                    lease.lease_id.clone(),
+                ),
+                lease,
+            );
+        }
+        stored_coverages.insert(coverage_key, coverage);
+        Ok(if inserted {
+            MaterializationPlanInsertOutcome::Inserted(job)
+        } else {
+            MaterializationPlanInsertOutcome::Existing(job)
+        })
+    }
+
+    async fn replace_materialization_plan(
+        &self,
+        request: MaterializationPlanReplacement,
+    ) -> CentralResult<MaterializationPlanInsertOutcome> {
+        // See `insert_materialization_plan`: replacements retire the previous batch/lease rows and
+        // must not interleave with a receipt's Placement + checkpoint publication.
+        let _gate = self.materialization_receipt_gate.lock().await;
+        let expected_revision = request.expected_plan_revision;
+        let plan = request.plan;
+        let next_revision = expected_revision
+            .get()
+            .checked_add(1)
+            .map(Generation::new)
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization plan revision is exhausted",
+                )
+            })?;
+        if plan.job.plan_revision != next_revision {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "replacement materialization plan must advance exactly one revision",
+            ));
+        }
+        let tenant_id = plan.job.key.tenant_id.clone();
+        let materialization_id = plan.job.materialization_id.clone();
+        let namespace = plan.job.key.object_namespace_id.clone();
+        let current = self
+            .materialization_for_namespace(&tenant_id, &namespace, &materialization_id)?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if current.plan_revision != expected_revision {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision changed",
+            ));
+        }
+        if current.key != plan.job.key || current.materialization_id != materialization_id {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "replacement materialization plan changes its immutable identity",
+            ));
+        }
+        if !materialization_state_transition_allowed(current.state, plan.job.state) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization state transition is not allowed",
+            ));
+        }
+
+        // Run the same complete aggregate validation used by initial creation against a detached
+        // validator. This keeps all rejection paths side-effect free before touching live rows.
+        let object_set = lock(&self.commit_object_sets)?
+            .get(&(tenant_id.clone(), current.key.commit_id.digest()))
+            .cloned()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?;
+        let validator = InMemoryPlacementRepository::default();
+        validator.insert_commit_object_set(object_set).await?;
+        let placements = lock(&self.materialization_placements)?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for placement in placements {
+            validator.insert_object_placement_v2(placement).await?;
+        }
+        validator.insert_materialization_plan(plan.clone()).await?;
+
+        // Recheck the CAS fence while holding every mutable map lock, retire old protection
+        // records, and publish the replacement aggregate as one in-memory visibility boundary.
+        let mut jobs = lock(&self.materializations)?;
+        let mut keys = lock(&self.materialization_keys)?;
+        let mut batches = lock(&self.materialization_batches)?;
+        let mut objects = lock(&self.materialization_objects)?;
+        let mut read_leases = lock(&self.object_read_leases)?;
+        let mut staging_leases = lock(&self.staging_leases)?;
+        let mut coverages = lock(&self.volume_commit_coverages)?;
+        let job_key = (
+            tenant_id.clone(),
+            namespace.clone(),
+            materialization_id.clone(),
+        );
+        let persisted = jobs.get(&job_key).cloned().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "materialization disappeared during replacement",
+            )
+        })?;
+        if persisted.plan_revision != expected_revision {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision changed",
+            ));
+        }
+        // Object rows are keyed by stable materialization/object identity. Overwrite them below
+        // so re-planning preserves the staging key and durable checkpoint selected by the plan.
+        for ((tenant, ns, batch_id), batch) in batches.iter_mut() {
+            if tenant == &tenant_id
+                && ns == &namespace
+                && batch.materialization_id == materialization_id
+                && !matches!(
+                    batch.state,
+                    neoengram_domain::protocol::materialization::MaterializationBatchState::Succeeded
+                        | neoengram_domain::protocol::materialization::MaterializationBatchState::Failed
+                )
+            {
+                batch.state =
+                    neoengram_domain::protocol::materialization::MaterializationBatchState::Failed;
+                let _ = batch_id;
+            }
+        }
+        for ((tenant, ns, _), lease) in read_leases.iter_mut() {
+            if tenant == &tenant_id
+                && ns == &namespace
+                && lease.materialization_id == materialization_id
+                && lease.state
+                    == neoengram_domain::protocol::materialization::MaterializationLeaseState::Active
+            {
+                lease.state =
+                    neoengram_domain::protocol::materialization::MaterializationLeaseState::Released;
+            }
+        }
+        for ((tenant, ns, _), lease) in staging_leases.iter_mut() {
+            if tenant == &tenant_id
+                && ns == &namespace
+                && lease.materialization_id == materialization_id
+                && lease.state
+                    == neoengram_domain::protocol::materialization::MaterializationLeaseState::Active
+            {
+                lease.state =
+                    neoengram_domain::protocol::materialization::MaterializationLeaseState::Released;
+            }
+        }
+        jobs.insert(job_key, plan.job.clone());
+        keys.insert(plan.job.key.clone(), plan.job.clone());
+        for batch in plan.batches {
+            batches.insert(
+                (tenant_id.clone(), namespace.clone(), batch.batch_id.clone()),
+                batch,
+            );
+        }
+        for object in plan.objects {
+            objects.insert(
+                (
+                    tenant_id.clone(),
+                    materialization_id.clone(),
+                    namespace.clone(),
+                    object.object.object_id,
+                ),
+                object,
+            );
+        }
+        for lease in plan.object_read_leases {
+            read_leases.insert(
+                (tenant_id.clone(), namespace.clone(), lease.lease_id.clone()),
+                lease,
+            );
+        }
+        for lease in plan.staging_leases {
+            staging_leases.insert(
+                (tenant_id.clone(), namespace.clone(), lease.lease_id.clone()),
+                lease,
+            );
+        }
+        coverages.insert(
+            (
+                tenant_id,
+                namespace,
+                plan.coverage.commit_id,
+                plan.coverage.storage_volume_id.clone(),
+                plan.coverage.placement_generation,
+            ),
+            plan.coverage,
+        );
+        Ok(MaterializationPlanInsertOutcome::Inserted(plan.job))
+    }
+
+    async fn get_materialization(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Option<MaterializationJob>> {
+        let jobs = lock(&self.materializations)?;
+        Ok(jobs
+            .get(&(
+                tenant_id.clone(),
+                object_namespace_id.clone(),
+                materialization_id.clone(),
+            ))
+            .cloned())
+    }
+
+    async fn get_materialization_by_key(
+        &self,
+        key: &MaterializationJobKey,
+    ) -> CentralResult<Option<MaterializationJob>> {
+        Ok(lock(&self.materialization_keys)?.get(key).cloned())
+    }
+
+    async fn list_materializations(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+        target_storage_volume_id: Option<&StorageVolumeId>,
+    ) -> CentralResult<Vec<MaterializationJob>> {
+        Ok(lock(&self.materializations)?
+            .values()
+            .filter(|job| {
+                &job.key.tenant_id == tenant_id
+                    && &job.key.object_namespace_id == object_namespace_id
+                    && job.key.commit_id.digest() == *commit_id
+                    && target_storage_volume_id
+                        .is_none_or(|target| &job.key.target_storage_volume_id == target)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn replace_materialization(
+        &self,
+        tenant_id: &TenantId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+        expected_plan_revision: neoengram_domain::protocol::Generation,
+        job: MaterializationJob,
+    ) -> CentralResult<MaterializationJob> {
+        let _gate = self.materialization_receipt_gate.lock().await;
+        self.replace_materialization_unlocked(
+            tenant_id,
+            materialization_id,
+            expected_plan_revision,
+            job,
+        )
+        .await
+    }
+
+    async fn insert_materialization_batch(
+        &self,
+        batch: MaterializationBatch,
+    ) -> CentralResult<MaterializationBatch> {
+        batch.validate().map_err(CentralError::from)?;
+        let tenant_id = batch.target.tenant_id.clone();
+        let parent = self
+            .materialization_for_namespace(
+                &tenant_id,
+                &batch.target.object_namespace_id,
+                &batch.materialization_id,
+            )?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != batch.target.object_namespace_id
+            || parent.key.target_storage_volume_id != batch.target.storage_volume_id
+            || parent.plan_revision != batch.plan_revision
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "batch target does not match its materialization",
+            ));
+        }
+        let key = (
+            tenant_id,
+            batch.target.object_namespace_id.clone(),
+            batch.batch_id.clone(),
+        );
+        let mut values = lock(&self.materialization_batches)?;
+        if let Some(existing) = values.get(&key) {
+            return if existing == &batch {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization batch ID is already bound to different metadata",
+                ))
+            };
+        }
+        values.insert(key, batch.clone());
+        Ok(batch)
+    }
+
+    async fn replace_materialization_batch(
+        &self,
+        request: MaterializationBatchCasRequest,
+    ) -> CentralResult<MaterializationBatch> {
+        request.batch.validate().map_err(CentralError::from)?;
+        if request.batch.materialization_id != request.materialization_id
+            || request.batch.batch_id != request.batch_id
+            || request.batch.target.tenant_id != request.tenant_id
+            || request.batch.target.object_namespace_id != request.object_namespace_id
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Batch replacement identity does not match its key",
+            ));
+        }
+        let parent = self
+            .materialization_for_namespace(
+                &request.tenant_id,
+                &request.object_namespace_id,
+                &request.materialization_id,
+            )?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != request.object_namespace_id
+            || parent.key.target_storage_volume_id != request.batch.target.storage_volume_id
+            || parent.plan_revision != request.expected_plan_revision
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Batch target does not match its parent",
+            ));
+        }
+        let key = (
+            request.tenant_id.clone(),
+            request.object_namespace_id.clone(),
+            request.batch_id.clone(),
+        );
+        let mut values = lock(&self.materialization_batches)?;
+        let current = values.get(&key).cloned().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "materialization Batch not found",
+            )
+        })?;
+        if current.plan_revision != request.expected_plan_revision
+            || current.batch_attempt != request.expected_batch_attempt
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Batch revision or attempt changed",
+            ));
+        }
+        if request.batch.plan_revision != request.expected_plan_revision
+            || request.batch.batch_attempt < request.expected_batch_attempt
+            || request.batch.batch_attempt
+                > Generation::new(request.expected_batch_attempt.get().saturating_add(1))
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Batch advanced by more than one attempt",
+            ));
+        }
+        if !current.state.can_transition_to(request.batch.state) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Batch state transition is not allowed",
+            ));
+        }
+        values.insert(key, request.batch.clone());
+        Ok(request.batch)
+    }
+
+    async fn list_materialization_batches(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Vec<MaterializationBatch>> {
+        let batches = lock(&self.materialization_batches)?
+            .iter()
+            .filter(|((tenant, namespace, _), batch)| {
+                tenant == tenant_id
+                    && namespace == object_namespace_id
+                    && batch.materialization_id == *materialization_id
+                    && batch.target.object_namespace_id == *object_namespace_id
+            })
+            .map(|(_, batch)| batch.clone())
+            .collect::<Vec<_>>();
+        Ok(batches)
+    }
+
+    async fn list_active_materialization_batches_for_agent(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+    ) -> CentralResult<Vec<MaterializationBatch>> {
+        let mut batches = lock(&self.materialization_batches)?
+            .values()
+            .filter(|batch| {
+                batch.target.tenant_id == *tenant_id
+                    && batch.target.agent_id == *agent_id
+                    && matches!(
+                        batch.state,
+                        neoengram_domain::protocol::materialization::MaterializationBatchState::Queued
+                            | neoengram_domain::protocol::materialization::MaterializationBatchState::Assigned
+                            | neoengram_domain::protocol::materialization::MaterializationBatchState::Transferring
+                            | neoengram_domain::protocol::materialization::MaterializationBatchState::Verifying
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        batches.sort_by_key(|batch| {
+            (
+                batch.materialization_id.clone(),
+                batch.plan_revision,
+                batch.batch_id.clone(),
+            )
+        });
+        Ok(batches)
+    }
+
+    async fn insert_materialization_object(
+        &self,
+        tenant_id: &TenantId,
+        object: MaterializationObject,
+    ) -> CentralResult<MaterializationObject> {
+        object.validate().map_err(CentralError::from)?;
+        let parent = self
+            .materialization_for_namespace(
+                tenant_id,
+                &object.object.object_namespace_id,
+                &object.materialization_id,
+            )?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != object.object.object_namespace_id {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization object namespace does not match its parent",
+            ));
+        }
+        if parent.plan_revision != object.plan_revision {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization object plan revision does not match its parent",
+            ));
+        }
+        let object_set = self
+            .get_commit_object_set(tenant_id, &parent.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?;
+        let expected = object_set
+            .object_set
+            .objects
+            .iter()
+            .find(|candidate| candidate.object_id == object.object.object_id)
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization object is not part of the Commit ObjectSet",
+                )
+            })?;
+        if expected.size != object.object.size
+            || expected.encoding != object.object.encoding
+            || expected.ordinal != object.object.ordinal
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization object metadata disagrees with the Commit ObjectSet",
+            ));
+        }
+        let key = (
+            tenant_id.clone(),
+            object.materialization_id.clone(),
+            object.object.object_namespace_id.clone(),
+            object.object.object_id,
+        );
+        let mut values = lock(&self.materialization_objects)?;
+        if let Some(existing) = values.get(&key) {
+            if existing == &object {
+                return Ok(existing.clone());
+            }
+            // Replanning advances the parent Job revision and rewrites the same durable object
+            // row. The staging key and ObjectRef are immutable, while a checkpoint may only move
+            // forward. This keeps a reconnect/failover from starting the object at offset zero.
+            if object.plan_revision.get()
+                != existing.plan_revision.get().checked_add(1).ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::ConcurrentUpdate,
+                        "materialization object plan revision is exhausted",
+                    )
+                })?
+                || object.object != existing.object
+                || object.staging_key != existing.staging_key
+            {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization object identity or plan revision changed",
+                ));
+            }
+            if object.confirmed_offset < existing.confirmed_offset {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization object confirmed offset cannot move backwards",
+                ));
+            }
+            if existing.complete()
+                && (!object.complete() || object.confirmed_offset != existing.confirmed_offset)
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "a completed materialization object cannot regress during replanning",
+                ));
+            }
+            if object.attempt.get()
+                != existing.attempt.get().checked_add(1).ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::ConcurrentUpdate,
+                        "materialization object attempt is exhausted",
+                    )
+                })?
+            {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization object attempt must advance by one during replanning",
+                ));
+            }
+            values.insert(key, object.clone());
+            return Ok(object);
+        }
+        values.insert(key, object.clone());
+        Ok(object)
+    }
+
+    async fn replace_materialization_object(
+        &self,
+        request: MaterializationObjectCasRequest,
+    ) -> CentralResult<MaterializationObject> {
+        request.object.validate().map_err(CentralError::from)?;
+        if request.object.materialization_id != request.materialization_id
+            || request.object.object.object_namespace_id != request.object_namespace_id
+            || request.object.object.object_id != request.object_id
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Object replacement identity does not match its key",
+            ));
+        }
+        let parent = self
+            .materialization_for_namespace(
+                &request.tenant_id,
+                &request.object_namespace_id,
+                &request.materialization_id,
+            )?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != request.object_namespace_id
+            || parent.plan_revision != request.expected_plan_revision
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Object parent revision does not match",
+            ));
+        }
+        let key = (
+            request.tenant_id.clone(),
+            request.materialization_id.clone(),
+            request.object_namespace_id.clone(),
+            request.object_id,
+        );
+        let mut values = lock(&self.materialization_objects)?;
+        let current = values.get(&key).cloned().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "materialization Object not found",
+            )
+        })?;
+        if current.plan_revision != request.expected_plan_revision
+            || current.attempt != request.expected_attempt
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Object revision or attempt changed",
+            ));
+        }
+        if current.object != request.object.object
+            || current.staging_key != request.object.staging_key
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Object immutable metadata cannot change",
+            ));
+        }
+        if request.object.confirmed_offset < current.confirmed_offset {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Object confirmed offset cannot move backwards",
+            ));
+        }
+        if request.object.plan_revision != request.expected_plan_revision
+            || request.object.attempt < request.expected_attempt
+            || request.object.attempt
+                > Generation::new(request.expected_attempt.get().saturating_add(1))
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Object advanced by more than one attempt",
+            ));
+        }
+        if !current.state.can_transition_to(request.object.state) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Object state transition is not allowed",
+            ));
+        }
+        values.insert(key, request.object.clone());
+        Ok(request.object)
+    }
+
+    async fn list_materialization_objects(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Vec<MaterializationObject>> {
+        let objects = lock(&self.materialization_objects)?
+            .iter()
+            .filter(|((tenant, materialization, namespace, _), _)| {
+                tenant == tenant_id
+                    && materialization == materialization_id
+                    && namespace == object_namespace_id
+            })
+            .map(|(_, object)| object.clone())
+            .collect::<Vec<_>>();
+        Ok(objects)
+    }
+
+    async fn get_materialization_receipt(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        receipt_id: &neoengram_domain::protocol::ObjectReceiptId,
+    ) -> CentralResult<Option<MaterializationObjectReceipt>> {
+        Ok(lock(&self.materialization_receipts)?
+            .get(&(
+                tenant_id.clone(),
+                object_namespace_id.clone(),
+                receipt_id.clone(),
+            ))
+            .map(|(receipt, _)| receipt.clone()))
+    }
+
+    async fn record_materialization_receipt(
+        &self,
+        request: MaterializationReceiptRequest,
+    ) -> CentralResult<ObjectPlacementV2> {
+        let receipt = request.receipt;
+        receipt
+            .validate_against(&request.object)
+            .map_err(CentralError::from)?;
+
+        // A receipt publication updates several authority records.  Serialize that boundary so
+        // two concurrent reports cannot both advance the same object or Job from one checkpoint.
+        let _gate = self.materialization_receipt_gate.lock().await;
+        let receipt_key = (
+            receipt.tenant_id.clone(),
+            receipt.object_namespace_id.clone(),
+            receipt.receipt_id.clone(),
+        );
+        let existing_replay = {
+            let receipts = lock(&self.materialization_receipts)?;
+            receipts.get(&receipt_key).cloned()
+        };
+        if let Some((existing, placement)) = existing_replay {
+            if existing != receipt {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization receipt ID is already in use",
+                ));
+            }
+            // A previous publication may have committed before its lease cleanup completed.
+            // Replays are therefore also a repair point for source and staging leases.
+            let batch = self
+                .list_materialization_batches(
+                    &receipt.tenant_id,
+                    &receipt.object_namespace_id,
+                    &receipt.materialization_id,
+                )
+                .await?
+                .into_iter()
+                .find(|batch| batch.batch_id == receipt.batch_id)
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::ResourceNotFound,
+                        "materialization batch not found during receipt replay",
+                    )
+                })?;
+            let task = self
+                .list_materialization_objects(
+                    &receipt.tenant_id,
+                    &receipt.object_namespace_id,
+                    &receipt.materialization_id,
+                )
+                .await?
+                .into_iter()
+                .find(|task| {
+                    task.object.object_namespace_id == receipt.object_namespace_id
+                        && task.object.object_id == receipt.object_id
+                })
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::ResourceNotFound,
+                        "materialization object not found during receipt replay",
+                    )
+                })?;
+            let job = self
+                .materialization_for_namespace(
+                    &receipt.tenant_id,
+                    &receipt.object_namespace_id,
+                    &receipt.materialization_id,
+                )?
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::ResourceNotFound,
+                        "materialization not found during receipt replay",
+                    )
+                })?;
+            // A prior process may have committed the receipt and Placement but been interrupted
+            // before the derived Coverage write. Replays are a repair point: recompute Coverage
+            // solely from the durable Placement evidence before releasing the remaining leases.
+            let object_set = self
+                .get_commit_object_set(&receipt.tenant_id, &job.key.commit_id.digest())
+                .await?
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::ResourceNotFound,
+                        "materialization Commit ObjectSet not found during receipt replay",
+                    )
+                })?;
+            let mut placements = Vec::new();
+            for object in &object_set.object_set.objects {
+                placements.extend(
+                    self.object_placements_v2(
+                        &receipt.tenant_id,
+                        &receipt.object_namespace_id,
+                        &object.object_id,
+                    )
+                    .await?
+                    .into_iter()
+                    .filter(|candidate| {
+                        candidate.storage_volume_id.as_ref()
+                            == Some(&receipt.target_storage_volume_id)
+                            && candidate.placement_generation == receipt.target_placement_generation
+                    }),
+                );
+            }
+            let coverage = VolumeCommitCoverage::from_placements(
+                receipt.tenant_id.clone(),
+                receipt.object_namespace_id.clone(),
+                job.key.commit_id,
+                receipt.target_storage_volume_id.clone(),
+                receipt.target_placement_generation,
+                &object_set.object_set,
+                &placements,
+            )
+            .map_err(CentralError::from)?;
+            self.upsert_volume_commit_coverage(coverage).await?;
+            self.release_receipt_leases(&receipt, &batch, &task).await?;
+            return Ok(placement.clone());
+        }
+        let conflicting_receipt = {
+            let receipts = lock(&self.materialization_receipts)?;
+            receipts
+                .values()
+                .find(|(existing, _)| {
+                    existing.tenant_id == receipt.tenant_id
+                        && existing.object_namespace_id == receipt.object_namespace_id
+                        && existing.materialization_id == receipt.materialization_id
+                        && existing.batch_id == receipt.batch_id
+                        && existing.object_id == receipt.object_id
+                })
+                .map(|(existing, _)| existing.clone())
+        };
+        if let Some(existing) = conflicting_receipt {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                format!(
+                    "materialization object already has receipt {} for this Batch",
+                    existing.receipt_id
+                ),
+            ));
+        }
+
+        let job = self
+            .materialization_for_namespace(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if job.plan_revision != receipt.plan_revision
+            || job.key.object_namespace_id != receipt.object_namespace_id
+            || job.key.target_storage_volume_id != receipt.target_storage_volume_id
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization receipt is stale or scoped to another target",
+            ));
+        }
+        let batch = self
+            .list_materialization_batches(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?
+            .into_iter()
+            .find(|batch| batch.batch_id == receipt.batch_id)
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization batch not found",
+                )
+            })?;
+        if batch.plan_revision != receipt.plan_revision
+            || batch.batch_attempt != receipt.batch_attempt
+            || batch.target.tenant_id != receipt.tenant_id
+            || batch.target.object_namespace_id != receipt.object_namespace_id
+            || batch.target.storage_volume_id != receipt.target_storage_volume_id
+            || batch.target.placement_generation != receipt.target_placement_generation
+            || !batch.object_ids.contains(&receipt.object_id)
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization receipt does not match the active batch fence",
+            ));
+        }
+        if receipt.verified_at_unix_ms.get() >= batch.deadline_unix_ms.get() {
+            return Err(invalid(
+                CentralErrorCode::ProtocolInvalid,
+                "receipt verification must occur before the materialization batch deadline",
+            ));
+        }
+        let object_set = self
+            .get_commit_object_set(&receipt.tenant_id, &job.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization Commit ObjectSet not found",
+                )
+            })?;
+        let expected = object_set
+            .object_set
+            .objects
+            .iter()
+            .find(|object| object.object_id == receipt.object_id)
+            .copied()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "receipt object is not part of the Commit ObjectSet",
+                )
+            })?;
+        if expected.object_id != request.object.object_id
+            || expected.size != request.object.size
+            || expected.encoding != request.object.encoding
+            || expected.ordinal != request.object.ordinal
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "receipt ObjectRef disagrees with the Commit ObjectSet",
+            ));
+        }
+        let current = self
+            .list_materialization_objects(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?
+            .into_iter()
+            .find(|task| {
+                task.object.object_namespace_id == receipt.object_namespace_id
+                    && task.object.object_id == receipt.object_id
+            })
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization object not found",
+                )
+            })?;
+        if current.plan_revision != receipt.plan_revision {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization object belongs to an obsolete batch or plan",
+            ));
+        }
+        if current.current_batch_id.as_ref() != Some(&receipt.batch_id) {
+            // Two source-grouped Batches may race for one object after a retry or scheduler
+            // replay. Once the target has a complete, matching Placement for this exact plan and
+            // attempt, the losing receipt is safe to converge on that durable copy. Older
+            // attempts still fail closed, even if their bytes happen to match.
+            let target_has_evidence = self
+                .object_placements_v2(
+                    &receipt.tenant_id,
+                    &receipt.object_namespace_id,
+                    &receipt.object_id,
+                )
+                .await?
+                .into_iter()
+                .any(|candidate| {
+                    candidate.readable()
+                        && candidate.storage_volume_id.as_ref()
+                            == Some(&receipt.target_storage_volume_id)
+                        && candidate.placement_generation == receipt.target_placement_generation
+                        && candidate.matches_ref(&request.object)
+                });
+            if !target_has_evidence || receipt.batch_attempt != current.attempt {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization object belongs to an obsolete batch or attempt",
+                ));
+            }
+        }
+        if current.object != request.object {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization object metadata disagrees with the receipt ObjectRef",
+            ));
+        }
+        if !current.complete()
+            && !current.state.can_transition_to(
+                neoengram_domain::protocol::materialization::MaterializationObjectState::Verified,
+            )
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "materialization Object cannot be verified from its current state",
+            ));
+        }
+        if receipt.batch_attempt < current.attempt
+            || receipt.batch_attempt > Generation::new(current.attempt.get().saturating_add(1))
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization receipt attempt is stale or skipped",
+            ));
+        }
+
+        let receipt_placement_id =
+            crate::placement_authority::materialization_target_placement_id(&receipt)?;
+        let placement = ObjectPlacementV2 {
+            placement_id: receipt_placement_id.clone(),
+            tenant_id: receipt.tenant_id.clone(),
+            object_namespace_id: receipt.object_namespace_id.clone(),
+            object_id: receipt.object_id,
+            size: receipt.size,
+            encoding: receipt.encoding,
+            verified_digest: receipt.verified_digest,
+            storage_volume_id: Some(receipt.target_storage_volume_id.clone()),
+            archive_id: None,
+            placement_generation: receipt.target_placement_generation,
+            state: neoengram_domain::protocol::materialization::ObjectPlacementState::Verified,
+            failure_domain: format!("volume:{}", receipt.target_storage_volume_id),
+        };
+
+        // If a process was interrupted after placement insertion, a completed task is a replay and
+        // must not be forced through the one-way Published -> Verified transition.
+        let existing_target = self
+            .object_placements_v2(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.object_id,
+            )
+            .await?
+            .into_iter()
+            .find(|candidate| {
+                candidate.storage_volume_id.as_ref() == Some(&receipt.target_storage_volume_id)
+                    && candidate.placement_generation == receipt.target_placement_generation
+                    && candidate.size == receipt.size
+                    && candidate.encoding == receipt.encoding
+                    && candidate.verified_digest == receipt.verified_digest
+                    && candidate.readable()
+            });
+        if current.complete() {
+            let stored = existing_target.ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "completed materialization object has no matching placement",
+                )
+            })?;
+            // Placement publication may have succeeded immediately before a process crash. A
+            // retry that observes the completed task must repair the derived Coverage just like
+            // the normal publication and replay paths do.
+            let mut placements = Vec::new();
+            for object in &object_set.object_set.objects {
+                placements.extend(
+                    self.object_placements_v2(
+                        &receipt.tenant_id,
+                        &receipt.object_namespace_id,
+                        &object.object_id,
+                    )
+                    .await?
+                    .into_iter()
+                    .filter(|candidate| {
+                        candidate.storage_volume_id.as_ref()
+                            == Some(&receipt.target_storage_volume_id)
+                            && candidate.placement_generation == receipt.target_placement_generation
+                    }),
+                );
+            }
+            let coverage = VolumeCommitCoverage::from_placements(
+                receipt.tenant_id.clone(),
+                receipt.object_namespace_id.clone(),
+                job.key.commit_id,
+                receipt.target_storage_volume_id.clone(),
+                receipt.target_placement_generation,
+                &object_set.object_set,
+                &placements,
+            )
+            .map_err(CentralError::from)?;
+            self.upsert_volume_commit_coverage(coverage).await?;
+            self.release_receipt_leases(&receipt, &batch, &current)
+                .await?;
+            lock(&self.materialization_receipts)?.insert(receipt_key, (receipt, stored.clone()));
+            return Ok(stored);
+        }
+
+        let stored_placement = self.insert_object_placement_v2(placement).await?;
+        let mut next_object = current.clone();
+        next_object.confirmed_offset = DecimalU64::new(
+            current
+                .confirmed_offset
+                .get()
+                .max(receipt.committed_offset.get()),
+        );
+        next_object.state =
+            neoengram_domain::protocol::materialization::MaterializationObjectState::Verified;
+        next_object.attempt = current.attempt.max(receipt.batch_attempt);
+        self.replace_materialization_object(MaterializationObjectCasRequest {
+            tenant_id: receipt.tenant_id.clone(),
+            object_namespace_id: receipt.object_namespace_id.clone(),
+            materialization_id: receipt.materialization_id.clone(),
+            object_id: receipt.object_id,
+            expected_plan_revision: receipt.plan_revision,
+            expected_attempt: current.attempt,
+            object: next_object,
+        })
+        .await?;
+
+        let tasks = self
+            .list_materialization_objects(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?;
+        let verified_objects = tasks.iter().filter(|task| task.complete()).count() as u64;
+        let verified_bytes = tasks
+            .iter()
+            .filter(|task| task.complete())
+            .map(|task| task.object.size.get())
+            .sum::<u64>();
+        let mut next_job = job.clone();
+        next_job.verified_object_count = DecimalU64::new(verified_objects);
+        next_job.verified_bytes = DecimalU64::new(verified_bytes);
+        next_job.missing_object_count =
+            DecimalU64::new(job.object_count.get().saturating_sub(verified_objects));
+        next_job.missing_bytes =
+            DecimalU64::new(job.total_bytes.get().saturating_sub(verified_bytes));
+        next_job.state = if next_job.key.coverage_goal.satisfied_by(
+            next_job.verified_object_count.get(),
+            next_job.verified_bytes.get(),
+            next_job.object_count.get(),
+            next_job.total_bytes.get(),
+        ) {
+            neoengram_domain::protocol::materialization::MaterializationJobState::Complete
+        } else {
+            match job.state {
+                neoengram_domain::protocol::materialization::MaterializationJobState::Queued
+                | neoengram_domain::protocol::materialization::MaterializationJobState::Planning
+                | neoengram_domain::protocol::materialization::MaterializationJobState::WaitingForSources
+                | neoengram_domain::protocol::materialization::MaterializationJobState::Materializing
+                | neoengram_domain::protocol::materialization::MaterializationJobState::Verifying =>
+                    neoengram_domain::protocol::materialization::MaterializationJobState::Verifying,
+                state => state,
+            }
+        };
+        next_job.updated_at_unix_ms = UnixMillis::new(
+            job.updated_at_unix_ms
+                .get()
+                .max(receipt.verified_at_unix_ms.get()),
+        );
+        self.replace_materialization_unlocked(
+            &receipt.tenant_id,
+            &receipt.materialization_id,
+            receipt.plan_revision,
+            next_job,
+        )
+        .await?;
+
+        let mut placements = Vec::new();
+        for object in &object_set.object_set.objects {
+            placements.extend(
+                self.object_placements_v2(
+                    &receipt.tenant_id,
+                    &receipt.object_namespace_id,
+                    &object.object_id,
+                )
+                .await?
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.storage_volume_id.as_ref() == Some(&receipt.target_storage_volume_id)
+                        && candidate.placement_generation == receipt.target_placement_generation
+                }),
+            );
+        }
+        let coverage = VolumeCommitCoverage::from_placements(
+            receipt.tenant_id.clone(),
+            receipt.object_namespace_id.clone(),
+            job.key.commit_id,
+            receipt.target_storage_volume_id.clone(),
+            receipt.target_placement_generation,
+            &object_set.object_set,
+            &placements,
+        )
+        .map_err(CentralError::from)?;
+        self.upsert_volume_commit_coverage(coverage).await?;
+        self.release_receipt_leases(&receipt, &batch, &current)
+            .await?;
+        lock(&self.materialization_receipts)?
+            .insert(receipt_key, (receipt, stored_placement.clone()));
+        Ok(stored_placement)
+    }
+
+    async fn insert_object_read_lease(
+        &self,
+        lease: ObjectReadLease,
+    ) -> CentralResult<ObjectReadLease> {
+        lease
+            .validate_for_acquisition()
+            .map_err(CentralError::from)?;
+        let parent = self
+            .materialization_for_namespace(
+                &lease.tenant_id,
+                &lease.object_namespace_id,
+                &lease.materialization_id,
+            )?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != lease.object_namespace_id {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "read lease namespace mismatch",
+            ));
+        }
+        if parent.plan_revision != lease.plan_revision {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "read lease plan revision does not match its parent",
+            ));
+        }
+        let batches = self
+            .list_materialization_batches(
+                &lease.tenant_id,
+                &lease.object_namespace_id,
+                &lease.materialization_id,
+            )
+            .await?;
+        let batch = batches
+            .iter()
+            .find(|batch| {
+                batch.batch_id == lease.batch_id
+                    && batch.plan_revision == lease.plan_revision
+                    && batch.target.object_namespace_id == lease.object_namespace_id
+                    && batch.target.storage_volume_id == parent.key.target_storage_volume_id
+            })
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "read lease batch is not registered for this materialization",
+                )
+            })?;
+        if !batch.object_ids.contains(&lease.object_id) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "read lease object is not included in its batch manifest",
+            ));
+        }
+        let objects = self
+            .list_materialization_objects(
+                &lease.tenant_id,
+                &lease.object_namespace_id,
+                &lease.materialization_id,
+            )
+            .await?;
+        let Some(object) = objects.iter().find(|object| {
+            object.object.object_id == lease.object_id
+                && object.current_batch_id.as_ref() == Some(&lease.batch_id)
+        }) else {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "object read lease is not assigned to its Batch",
+            ));
+        };
+        let source_selected = batch.source.placement_id == lease.placement_id
+            || object.fallback_sources.contains(&lease.placement_id)
+            || object.primary_source.as_ref() == Some(&lease.placement_id);
+        if !source_selected {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "object read lease placement is not selected for its object task",
+            ));
+        }
+        if object.primary_source.as_ref() == Some(&lease.placement_id)
+            && batch.source.placement_generation != lease.placement_generation
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "read lease source generation differs from its Batch fence",
+            ));
+        }
+        let object_set = self
+            .get_commit_object_set(&parent.key.tenant_id, &parent.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?;
+        let expected = object_set
+            .object_set
+            .objects
+            .iter()
+            .find(|candidate| candidate.object_id == lease.object_id)
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "read lease object is not part of the Commit ObjectSet",
+                )
+            })?;
+        if expected.object_id != lease.object_id {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "read lease object identity mismatch",
+            ));
+        }
+        let placements = lock(&self.materialization_placements)?;
+        let placement = placements.values().find(|placement| {
+            placement.tenant_id == lease.tenant_id
+                && placement.object_namespace_id == lease.object_namespace_id
+                && placement.object_id == lease.object_id
+                && placement.placement_id == lease.placement_id
+                && placement.placement_generation == lease.placement_generation
+                && placement.readable()
+        });
+        if placement.is_none_or(|placement| {
+            placement.size.get() != expected.size.get() || placement.encoding != expected.encoding
+        }) {
+            return Err(invalid(
+                CentralErrorCode::ResourceNotFound,
+                "read lease placement is not a readable v2 placement",
+            ));
+        }
+        if placement.is_none_or(|value| value.storage_volume_id.is_none()) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "read lease placement must reference a StorageVolume",
+            ));
+        }
+        if placement.is_none_or(|value| {
+            object.primary_source.as_ref() == Some(&lease.placement_id)
+                && (value.storage_volume_id != batch.source.storage_volume_id
+                    || value.archive_id != batch.source.archive_id)
+        }) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "read lease placement Volume does not match its Batch source fence",
+            ));
+        }
+        let key = (
+            lease.tenant_id.clone(),
+            lease.object_namespace_id.clone(),
+            lease.lease_id.clone(),
+        );
+        let mut values = lock(&self.object_read_leases)?;
+        if let Some(existing) = values.get(&key) {
+            return if existing == &lease {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "read lease ID is already in use",
+                ))
+            };
+        }
+        values.insert(key, lease.clone());
+        Ok(lease)
+    }
+
+    async fn insert_staging_lease(&self, lease: StagingLease) -> CentralResult<StagingLease> {
+        lease
+            .validate_for_acquisition()
+            .map_err(CentralError::from)?;
+        let parent = self
+            .materialization_for_namespace(
+                &lease.tenant_id,
+                &lease.object_namespace_id,
+                &lease.materialization_id,
+            )?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != lease.object_namespace_id
+            || parent.key.target_storage_volume_id != lease.target_storage_volume_id
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "staging lease target mismatch",
+            ));
+        }
+        let objects = self
+            .list_materialization_objects(
+                &lease.tenant_id,
+                &lease.object_namespace_id,
+                &lease.materialization_id,
+            )
+            .await?;
+        let object = objects
+            .iter()
+            .find(|object| {
+                object.object.object_namespace_id == lease.object_namespace_id
+                    && object.object.object_id == lease.object_id
+            })
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "staging lease object is not registered",
+                )
+            })?;
+        if object.staging_key != lease.staging_key || object.plan_revision != lease.plan_revision {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "staging lease does not match materialization object",
+            ));
+        }
+        let batch_id = object.current_batch_id.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "staging lease object has no current batch",
+            )
+        })?;
+        let batch = self
+            .list_materialization_batches(
+                &lease.tenant_id,
+                &lease.object_namespace_id,
+                &lease.materialization_id,
+            )
+            .await?
+            .into_iter()
+            .find(|batch| {
+                batch.batch_id == *batch_id
+                    && batch.plan_revision == lease.plan_revision
+                    && batch.target.object_namespace_id == lease.object_namespace_id
+                    && batch.target.storage_volume_id == lease.target_storage_volume_id
+            })
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "staging lease object current batch is not registered",
+                )
+            })?;
+        if !batch.object_ids.contains(&lease.object_id) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "staging lease object is not included in its batch manifest",
+            ));
+        }
+        if batch.target.placement_generation != lease.target_placement_generation {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "staging lease target generation does not match its batch target fence",
+            ));
+        }
+        let key = (
+            lease.tenant_id.clone(),
+            lease.object_namespace_id.clone(),
+            lease.lease_id.clone(),
+        );
+        let mut values = lock(&self.staging_leases)?;
+        if let Some(existing) = values.get(&key) {
+            return if existing == &lease {
+                Ok(existing.clone())
+            } else {
+                Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "staging lease ID is already in use",
+                ))
+            };
+        }
+        values.insert(key, lease.clone());
+        Ok(lease)
+    }
+
+    async fn reconcile_materialization_leases(
+        &self,
+        now_unix_ms: UnixMillis,
+    ) -> CentralResult<crate::MaterializationLeaseExpiryReconciliation> {
+        let mut result = crate::MaterializationLeaseExpiryReconciliation::default();
+        {
+            let mut values = lock(&self.object_read_leases)?;
+            for lease in values.values_mut() {
+                if lease.state == MaterializationLeaseState::Active
+                    && lease.expires_at_unix_ms.get() <= now_unix_ms.get()
+                {
+                    lease.state = MaterializationLeaseState::Expired;
+                    result.expired_object_read_leases += 1;
+                }
+            }
+        }
+        {
+            let mut values = lock(&self.staging_leases)?;
+            for lease in values.values_mut() {
+                if lease.state == MaterializationLeaseState::Active
+                    && lease.expires_at_unix_ms.get() <= now_unix_ms.get()
+                {
+                    lease.state = MaterializationLeaseState::Expired;
+                    result.expired_staging_leases += 1;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn release_object_read_lease(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        lease_id: &neoengram_domain::protocol::LeaseId,
+    ) -> CentralResult<Option<ObjectReadLease>> {
+        let mut values = lock(&self.object_read_leases)?;
+        let Some((key, mut lease)) = values
+            .iter()
+            .find(|((tenant, namespace, id), _)| {
+                tenant == tenant_id && namespace == object_namespace_id && id == lease_id
+            })
+            .map(|(key, lease)| (key.clone(), lease.clone()))
+        else {
+            return Ok(None);
+        };
+        if lease.state == MaterializationLeaseState::Active {
+            lease.state = MaterializationLeaseState::Released;
+        }
+        values.insert(key, lease.clone());
+        Ok(Some(lease))
+    }
+
+    async fn release_staging_lease(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        lease_id: &neoengram_domain::protocol::LeaseId,
+    ) -> CentralResult<Option<StagingLease>> {
+        let mut values = lock(&self.staging_leases)?;
+        let Some((key, mut lease)) = values
+            .iter()
+            .find(|((tenant, namespace, id), _)| {
+                tenant == tenant_id && namespace == object_namespace_id && id == lease_id
+            })
+            .map(|(key, lease)| (key.clone(), lease.clone()))
+        else {
+            return Ok(None);
+        };
+        if lease.state == MaterializationLeaseState::Active {
+            lease.state = MaterializationLeaseState::Released;
+        }
+        values.insert(key, lease.clone());
+        Ok(Some(lease))
+    }
+
     async fn get_commit_object_set(
         &self,
         tenant_id: &TenantId,
@@ -1335,6 +3746,18 @@ impl PlacementRepository for InMemoryPlacementRepository {
             verified_storage_volume_ids: verified_storage_volume_ids.into_iter().collect(),
         })
     }
+}
+
+/// A replan publishes the next revision in one operation, but its state is logically reached
+/// through the durable `Planning` phase.  Accept that two-step state path at the aggregate
+/// boundary so a retry can move a recoverable/failed job directly to its planned next state.
+fn materialization_state_transition_allowed(
+    current: MaterializationJobState,
+    next: MaterializationJobState,
+) -> bool {
+    current.can_transition_to(next)
+        || (current.can_transition_to(MaterializationJobState::Planning)
+            && MaterializationJobState::Planning.can_transition_to(next))
 }
 
 #[derive(Debug, Default)]

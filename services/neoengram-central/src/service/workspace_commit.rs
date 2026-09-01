@@ -14,10 +14,9 @@ use neoengram_domain::core::{
     ChunkingStrategy, CommitId, ContentDigest, FileRecord, IndexVersion, LogicalPath, ObjectId,
 };
 use neoengram_domain::protocol::{
-    ArtifactId, BackendId, CommitDataLayout, CommitObject, CommitObjectSet, CommitPlacementSet,
-    CommitPlacementSetState, DecimalU64, IndexRevision, JobState, ObjectEncoding, ObjectPlacement,
-    PlacementGeneration, PlacementSetId, PlacementState, PlaygroundId, ProjectId, RequestId,
-    TenantId, WireIndexVersion,
+    ArtifactId, CommitDataLayout, CommitObject, CommitObjectSet, IndexRevision, JobState,
+    ObjectEncoding, PlacementGeneration, PlaygroundId, ProjectId, RequestId, TenantId,
+    WireIndexVersion,
 };
 use neoengram_runtime::engine::{
     build_commit_graph, BuildCommitGraphRequest, EngineError, EngineResult, IndexSnapshotReader,
@@ -360,9 +359,9 @@ impl WorkspaceCommitService {
                 .map_err(map_central_error)?
         };
 
-        // A Commit is logical metadata only. The first physical copy is represented by a
-        // complete, verified PlacementSet on the Workspace's volume. This publication is
-        // idempotent so a retry after a process interruption converges without changing the
+        // A Commit is logical metadata only. The initial physical evidence is recorded as
+        // namespace-scoped, verified object placements on the Workspace's Volume. This operation
+        // is idempotent so a retry after a process interruption converges without changing the
         // immutable Commit record.
         self.publish_initial_placement(&authority_outcome.commit, &playground)
             .await?;
@@ -414,71 +413,113 @@ impl WorkspaceCommitService {
             return Ok(());
         };
 
-        // A replay must not infer a new physical origin from a potentially moved Workspace. Once
-        // any complete PlacementSet is published, the initial-copy fence is immutable and the
-        // explicit Replicate action is the only way to add another copy.
-        if placement
-            .published_placement_set(&commit.tenant_id, &commit.commit_id.into())
-            .await
-            .map_err(map_central_error)?
-            .is_some()
-        {
-            return Ok(());
-        }
-
         let object_set = self.build_commit_object_set(commit).await?;
         if object_set.object_set.object_set_digest != commit.object_set_digest {
             return Err(commit_integrity_error(
                 "Commit ObjectSet digest differs from its immutable Commit identity",
             ));
         }
-        let backend_id = BackendId::new(playground.storage_volume_id.to_string())
-            .map_err(|_| internal_error("invalid workspace backend identity"))?;
-        let volume = self
+        let storage_volume_id = playground.storage_volume_id.clone();
+        let _volume = self
             .catalog
-            .get_storage_volume(&commit.tenant_id, &playground.storage_volume_id)
+            .get_storage_volume(&commit.tenant_id, &storage_volume_id)
             .await
             .map_err(map_central_error)?
             .ok_or_else(|| resource_not_found("storage volume"))?;
-        let region = neoengram_domain::protocol::RegionId::new(volume.region.clone()).ok();
-        let generation = PlacementGeneration::new(1);
-        let mut placement_records = Vec::with_capacity(object_set.object_set.objects.len());
-        for object in &object_set.object_set.objects {
-            let placement_record = ObjectPlacement {
-                tenant_id: commit.tenant_id.clone(),
-                object_id: object.object_id,
-                backend_id: backend_id.clone(),
-                storage_volume_id: Some(playground.storage_volume_id.clone()),
-                archive_id: None,
-                edge_cluster_id: Some(volume.edge_cluster_id.clone()),
-                gateway_pool_id: None,
-                region: region.clone(),
-                placement_generation: generation,
-                state: PlacementState::Verified,
-                verified_size: object.size,
-                verified_digest: object.object_id.digest(),
-                failure_domain: format!("volume:{}", playground.storage_volume_id),
-            };
-            placement_records.push(placement_record);
-        }
-
-        let placement_set_id =
-            placement_set_id_for(&commit.tenant_id, &commit.commit_id, &backend_id)?;
-        let placement_set = CommitPlacementSet {
-            placement_set_id,
-            tenant_id: commit.tenant_id.clone(),
-            commit_id: commit.commit_id,
-            backend_id,
-            storage_volume_id: Some(playground.storage_volume_id.clone()),
-            archive_id: None,
-            object_set_digest: object_set.object_set.object_set_digest,
-            object_count: DecimalU64::new(object_set.object_set.object_count() as u64),
-            verified_object_count: DecimalU64::new(object_set.object_set.object_count() as u64),
-            placement_generation: generation,
-            state: CommitPlacementSetState::Published,
-        };
+        let namespace =
+            neoengram_domain::protocol::ObjectNamespaceId::from_artifact(&commit.artifact_id);
         placement
-            .publish_initial_placement(object_set, placement_records, placement_set)
+            .insert_commit_object_set(object_set.clone())
+            .await
+            .map_err(map_central_error)?;
+
+        // Preserve the existing target generation on replay. A generation change is an explicit
+        // Volume-owner operation; a Commit retry must never create a second generation merely
+        // because the process was interrupted between two object receipts.
+        let mut generation: Option<PlacementGeneration> = None;
+        for object in &object_set.object_set.objects {
+            let existing = placement
+                .object_placements_v2(&commit.tenant_id, &namespace, &object.object_id)
+                .await
+                .map_err(map_central_error)?;
+            if let Some(existing_generation) = existing.into_iter().find_map(|entry| {
+                (entry.storage_volume_id.as_ref() == Some(&storage_volume_id)
+                    && entry.state
+                        == neoengram_domain::protocol::materialization::ObjectPlacementState::Verified)
+                    .then_some(entry.placement_generation)
+            }) {
+                generation = Some(generation.map_or(existing_generation, |current| {
+                    current.max(existing_generation)
+                }));
+            }
+        }
+        let generation = generation.unwrap_or_else(|| PlacementGeneration::new(1));
+
+        for object in &object_set.object_set.objects {
+            let placement_digest = blake3::hash(
+                format!(
+                    "v2-placement\0{}\0{}\0{}\0{}",
+                    commit.tenant_id, commit.artifact_id, storage_volume_id, object.object_id
+                )
+                .as_bytes(),
+            );
+            let placement_id = neoengram_domain::protocol::PlacementId::new(format!(
+                "placement-v2-{}",
+                &placement_digest.to_hex()[..32]
+            ))
+            .map_err(|_| internal_error("invalid v2 placement identity"))?;
+            placement
+                .insert_object_placement_v2(
+                    neoengram_domain::protocol::materialization::ObjectPlacement {
+                        placement_id,
+                        tenant_id: commit.tenant_id.clone(),
+                        object_namespace_id: namespace.clone(),
+                        object_id: object.object_id,
+                        size: object.size,
+                        encoding: object.encoding,
+                        verified_digest: object.object_id.digest(),
+                        storage_volume_id: Some(storage_volume_id.clone()),
+                        archive_id: None,
+                        placement_generation: generation,
+                        state: neoengram_domain::protocol::materialization::ObjectPlacementState::Verified,
+                        failure_domain: format!("volume:{}", storage_volume_id),
+                    },
+                )
+                .await
+                .map_err(map_central_error)?;
+        }
+        let mut placements = Vec::with_capacity(object_set.object_set.objects.len());
+        for object in &object_set.object_set.objects {
+            let placement = placement
+                .object_placements_v2(&commit.tenant_id, &namespace, &object.object_id)
+                .await
+                .map_err(map_central_error)?
+                .into_iter()
+                .find(|entry| {
+                    entry.storage_volume_id.as_ref() == Some(&storage_volume_id)
+                        && entry.placement_generation == generation
+                })
+                .ok_or_else(|| {
+                    commit_integrity_error(format!(
+                        "initial object placement for {} was not persisted",
+                        object.object_id
+                    ))
+                })?;
+            placements.push(placement);
+        }
+        let coverage =
+            neoengram_domain::protocol::materialization::VolumeCommitCoverage::from_placements(
+                commit.tenant_id.clone(),
+                namespace,
+                commit.commit_id,
+                storage_volume_id,
+                generation,
+                &object_set.object_set,
+                &placements,
+            )
+            .map_err(|error| commit_integrity_error(format!("initial coverage: {error}")))?;
+        placement
+            .upsert_volume_commit_coverage(coverage)
             .await
             .map_err(map_central_error)?;
         Ok(())
@@ -547,23 +588,6 @@ impl WorkspaceCommitService {
             })?;
         Ok(object_set)
     }
-}
-
-fn placement_set_id_for(
-    tenant_id: &TenantId,
-    commit_id: &CommitId,
-    backend_id: &BackendId,
-) -> Result<PlacementSetId, Error> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"neoengram-placement-set-v1\0");
-    hasher.update(tenant_id.as_str().as_bytes());
-    hasher.update(&[0]);
-    hasher.update(commit_id.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(backend_id.as_str().as_bytes());
-    let digest = hasher.finalize().to_hex();
-    PlacementSetId::new(format!("placement-set-{}", &digest[..32]))
-        .map_err(|_| internal_error("invalid PlacementSet identity"))
 }
 
 async fn validate_candidate_layout(

@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::Args;
-use neoengram_domain::protocol::TRANSFER_ALPN;
+use neoengram_domain::protocol::MATERIALIZATION_TRANSFER_ALPN_V2;
 use rustls::{client::ClientConfig, server::WebPkiClientVerifier, RootCertStore, ServerConfig};
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use x509_parser::{
@@ -486,7 +486,7 @@ impl GatewayTransportConfig {
         )?;
         Arc::get_mut(&mut server)
             .expect("new QUIC TLS configuration must have one owner")
-            .alpn_protocols = vec![TRANSFER_ALPN.as_bytes().to_vec()];
+            .alpn_protocols = vec![MATERIALIZATION_TRANSFER_ALPN_V2.as_bytes().to_vec()];
         Ok(server)
     }
 
@@ -528,7 +528,7 @@ impl GatewayTransportConfig {
             .with_client_auth_cert(certificates, private_key)
             .map_err(|error| GatewayTransportConfigError::InvalidTlsIdentity(error.to_string()))?;
         client.resumption = rustls::client::Resumption::disabled();
-        client.alpn_protocols = vec![TRANSFER_ALPN.as_bytes().to_vec()];
+        client.alpn_protocols = vec![MATERIALIZATION_TRANSFER_ALPN_V2.as_bytes().to_vec()];
         Ok(Arc::new(client))
     }
 
@@ -782,13 +782,13 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
         let server = config.load_quic_server_config().unwrap();
         assert_eq!(
             server.alpn_protocols,
-            vec![TRANSFER_ALPN.as_bytes().to_vec()]
+            vec![MATERIALIZATION_TRANSFER_ALPN_V2.as_bytes().to_vec()]
         );
         assert!(!server.session_storage.can_cache());
         let client = config.load_quic_client_config().unwrap();
         assert_eq!(
             client.alpn_protocols,
-            vec![TRANSFER_ALPN.as_bytes().to_vec()]
+            vec![MATERIALIZATION_TRANSFER_ALPN_V2.as_bytes().to_vec()]
         );
         assert!(format!("{:?}", client.resumption).contains("Disabled"));
     }
@@ -832,11 +832,11 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
         let client = transfer.load_client_config().unwrap();
         assert_eq!(
             server.alpn_protocols,
-            vec![TRANSFER_ALPN.as_bytes().to_vec()]
+            vec![MATERIALIZATION_TRANSFER_ALPN_V2.as_bytes().to_vec()]
         );
         assert_eq!(
             client.alpn_protocols,
-            vec![TRANSFER_ALPN.as_bytes().to_vec()]
+            vec![MATERIALIZATION_TRANSFER_ALPN_V2.as_bytes().to_vec()]
         );
         assert!(!server.session_storage.can_cache());
         assert!(format!("{:?}", client.resumption).contains("Disabled"));

@@ -5,7 +5,7 @@
 `crates/neoengram-domain/src/protocol/action_registry.rs` 中的 `PUBLIC_ACTION_REGISTRY`；不要从本文件
 手写的摘要推断后端能力。
 
-截至 2026-08-24，registry 有 85 条公开契约路由：其中 82 条（含健康探针）由当前 Central controller
+截至 2026-09-01，registry 有 84 条公开契约路由：其中 81 条（含健康探针）由当前 Central controller
 descriptor 安装，以下 3 条明确是 contract-only Web surface：
 
 ```text
@@ -15,7 +15,7 @@ POST /api/snapshot/dataset/profile/query
 ```
 
 这 3 条路径由 OpenAPI 和 Web Mock 冻结请求/响应形状，但当前没有 Central handler。其余公开路径（包括
-Project、Commit graph/diff/replication、SnapshotDelivery、资源生命周期、Gateway 管理和 S3 管理/对象
+Project、Commit graph/diff/materialization、SnapshotDelivery、资源生命周期、Gateway 管理和 S3 管理/对象
 查询 action）都已进入 Central 路由 descriptor；具体是否可执行仍由 `/api/system/version/query` 的
 capability 和运行时依赖决定。
 
@@ -38,7 +38,7 @@ POST /api/gateway/replica/revoke
 
 这些接口只管理 Central 权威的 GatewayPool/Replica 状态、证书激活和排空；它们不让 Gateway 挂载
 Volume，也不把 Gateway 变成 metadata 或 Chunk authority。跨 Volume 的控制 action 通过 Commit
-replication 路径提供，字节仍由 Agent/Gateway 数据面传输；只读 S3 另有 Central 管理 action、内部授权
+materialization 路径提供，字节仍由 Agent/Gateway 数据面传输；只读 S3 另有 Central 管理 action、内部授权
 路由和 Gateway public listener。生产凭据、GatewayPool readiness、Agent route 与真实跨节点 E2E 仍受
 能力开关和部署验收约束。
 
@@ -64,7 +64,7 @@ POST /agent/session/close
 对象字节不会进入 Gateway/Central 控制链路。Agent 将不可变 Chunk 直接持久化到获批 StorageVolume
 的 Volume-local CAS，只通过 MetadataBatch 上报 Manifest、IndexDelta 和带 Placement 的 ObjectReceipt。
 
-公开契约中的 Project、Artifact commit diff、Snapshot delivery、Commit replication 和 S3 管理 action
+公开契约中的 Project、Artifact commit diff、Commit materialization/coverage/availability、Snapshot delivery 和 S3 管理 action
 已经注册到当前 Central descriptor；只有上面列出的 Snapshot file/activity/profile 三条仍是 contract-only。
 OpenAPI 路由已注册不等于数据面已经可用：Web 必须按 `/api/system/version/query` 返回的 capability 隐藏
 依赖 enrollment、coordinator、GatewayPool、placement 或 command keyring 的入口。
@@ -98,7 +98,7 @@ StorageVolume 的稳定逻辑 ID、region、EdgeCluster 和公开 PVC reference 
 不得包含 Assignment target、Agent/Mount identity、generation、fencing token、NFS export、凭据、
 PublicationCandidate、Manifest、IndexDelta、物理路径或数据库信息。跨租户查询按
 对应资源的 `*_NOT_FOUND` 返回 404，不能泄漏目标资源是否存在。Artifact 和 Snapshot 不携带物理放置字段；
-Playground 的 Region 由所选 StorageVolume 派生，Snapshot 的数据健康由当前已发布 PlacementSet 动态解析。
+Playground 的 Region 由所选 StorageVolume 派生，Snapshot 的数据健康由对象级 Verified Placement 和 Volume Coverage 动态解析。
 
 只有 `state=ready` 的 StorageVolume 可以承接新的 Playground、Workspace 或 SnapshotDelivery；`degraded` 和
 `unavailable` 均拒绝新的物化或复制目标，但已有资源的公开元数据仍可查询。P0 Dashboard 只展示当前 Tenant、

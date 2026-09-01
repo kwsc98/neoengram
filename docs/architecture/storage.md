@@ -7,8 +7,10 @@
 > [`gateway.md`](gateway.md)。
 
 关于 Commit 对象分散在多个 Volume、按对象建立覆盖并由多个来源物化到目标 Volume 的 v2 调研与目标设计，见
-[`commit-materialization-v2.md`](commit-materialization-v2.md)。该报告是未实现的设计结论；当前 replication
-能力仍按本文件和 [`roadmap.md`](../roadmap.md) 所述的完整 PlacementSet 前置条件执行。
+[`commit-materialization-v2.md`](commit-materialization-v2.md)。当前 v2 已有 Domain、Authority、Central planner/API、
+Agent source/target executor 和 Gateway relay 纵切及契约测试，但仍处迁移中：v1 replication/PlacementSet 路径与
+v2 双路径并存，真实跨 Gateway route、三 Agent 多源失败恢复和生产 payload E2E 尚未验收。下文凡标注 legacy 的
+完整 PlacementSet/单源 Ticket 均不代表 v2 主链路。
 
 NeoEngram `0.2.0` 的本地仓库格式为 9。升级允许破坏兼容性：实现明确拒绝所有旧
 格式，不读取、不迁移，也不提供自动回退。仓库格式 9 将可移植内容模型和规范 digest 收敛到
@@ -69,7 +71,7 @@ Managed 中心的逻辑权威通过异步 `AuthorityStore` 组合 `JobRepository
 `authority.lock`，连接池固定单连接，并启用 WAL、foreign keys、`synchronous=FULL` 和 busy timeout。
 
 该数据库不属于 Standalone 仓库格式 9，也不得与 Standalone 共用文件。它只接受当前
-`application_id`/`user_version` 和当前 JSON record format；旧格式、错误 schema 和未知非空数据库
+`application_id`/`user_version=18` 和当前 JSON record format；旧格式、错误 schema 和未知非空数据库
 直接拒绝，不提供 migration、双读、字段别名或回退。所有租户查询和复合键都包含 tenant ID，但
 SQLite 仍是应用层隔离，不伪装成数据库级 RLS、HA 或多进程后端。
 
@@ -93,12 +95,31 @@ Managed 模式使用不同的权威边界：
   Assignment 的 Tenant、Artifact、StorageVolume、ArtifactPlacement 和 `placement_generation`；
 - Agent 的 identity、Ledger、outbound 和 candidate 位于独立 `state_dir`，不得在业务 Volume 上创建
   SQLite/WAL；状态盘丢失不会删除 Volume 中的业务对象；
-- 当前 P0 不承诺跨 Volume 对象复制的生产执行、强 storage-side fencing、NeoEngram Gateway payload 数据链
-  或生产数据库；replication 的 Central route/ticket 控制链和 Agent/Gateway 协议边界已有代码。Agent
-  复制配置现在必须显式启用并通过 command trust + QUIC/TLS 启动预检，Central 只向具备
-  `commit_replication_quic_v1` capability 的 ready Agent 路由。目标复制链路
-  固定为源 Agent -> 源 GatewayPool -> 目标 GatewayPool -> 目标 Agent；Server 仍只下发计划和记录凭证，
-  不进入 payload 路径。
+- 当前不承诺跨 Volume 对象复制的生产执行、强 storage-side fencing、NeoEngram Gateway payload 数据链
+  或生产数据库。v1 replication 的 Central route/ticket 控制链和 Agent/Gateway 协议边界仍保留为 legacy；v2
+  `MaterializationJob`/多源 planner、ObjectPlacement、Coverage、Ticket/Receipt/Lease 有代码和契约测试。
+  Agent 只有在 replication 配置启用且 Gateway QUIC 预检成功后才声明 `commit_materialization_v2`；当前 Gateway
+  生产 listener 使用 `neoengram-transfer-v2`、拒绝旧 v1 ticket，并可通过有界 relay 转发 v2 frame。目标复制链路
+  固定为源 Agent -> 源 GatewayPool -> 目标 GatewayPool -> 目标 Agent；Server 仍只下发计划和记录凭证，不进入
+  payload 路径。真实 upstream route、凭据和跨节点 E2E 仍待验收。
+
+### v2 对象级事实与 Coverage
+
+v2 将 Commit 与物理 Volume 解耦。Commit 只引用不可变的 namespace-scoped ObjectSet；初期
+`ObjectNamespaceId == ArtifactId`，但所有对象、Placement、Job、Lease、Ticket 和 authority key 都必须显式带
+namespace。一个对象的耐久事实是 `ObjectPlacement`：它绑定 tenant、namespace、object、size、encoding、BLAKE3
+digest、一个 StorageVolume/archive、placement generation、failure domain 和状态。只有 Agent 完成校验、`fsync`/
+durability barrier 并提交幂等 receipt 后，Placement 才能进入 `verified`。
+
+`VolumeCommitCoverage` 是从目标 Volume 上的 verified ObjectPlacement 重新计算的 `partial/complete` 摘要，不是
+可独立信任的对象目录。目标容量按 `missing_bytes + staging_reserve + concurrency_reserve` 估算；切换 source、route
+或 batch attempt 不能改变 `(materialization_id, namespace, object_id)` staging key 或 confirmed offset。Workspace、
+SnapshotDelivery 和 S3 只有在 Coverage 完整且视图校验通过后才能 Ready；全局对象并集完整不等于任一 Volume 可读。
+
+当前 authority schema 为 `user_version=18`，已安装 v2 表（含 `object_placements_v2`、Coverage、Materialization、
+object-read/staging lease），并通过 InMemory/SQLite 的 CAS、幂等 Receipt 和重规划 checkpoint 契约。v1
+`commit_placement_sets`、`replications`、`replication_objects` 和旧 ObjectCatalog/Assignment mapper 尚未删除，
+因此该 schema 仍是迁移中状态；升级不隐式删除，clean-slate reset/inventory rebuild 仍需显式运维动作。
 
 Managed Add 的固定发布闭环为：
 
@@ -117,7 +138,9 @@ PrepareAdd
 对象 payload 不经过 Central/Gateway 控制 listener 或 `neoengram-central` API 进程。只有所有所需对象均有当前 Assignment
 精确 Volume/placement generation 的有效凭证、批次页完整且 digest/资源 scope/base version 全部通过，
 中心才可执行 CAS。`ObjectReceipt` 是已审批 Agent 对 Volume 中指定对象执行完整性与耐久化
-校验的证据，不包含物理路径或 payload。`JobPrepared.publication_digest` 绑定
+校验的证据，不包含物理路径或 payload。v2 `ObjectPlacement` 是同一类对象级 Durable 事实，必须带
+`ObjectNamespaceId`、size、encoding、digest、Volume 和 generation；`VolumeCommitCoverage` 只由这些证据派生，
+不能替代逐对象校验。`JobPrepared.publication_digest` 绑定
 scope/base/IndexDelta/Manifest/ObjectSpec，
 `candidate_digest` 再覆盖 assignment identity、result/publication digest、ordered MetadataBatch
 descriptors 与 extensions；替换一个仍然有效的 publication 或 descriptor 都会使校验失败。
@@ -137,14 +160,15 @@ Index 仍可解析；Conflict/Rejected 不发布候选 Manifest。
   Owner Agent 执行；
 - Gateway 的多副本和跨 Replica forwarding 只提供入口可用性，不构成对象或 metadata 副本；
 - Gateway 可以流式转发后续的跨集群对象和只读 S3 响应，但不得把 payload 缓存为可恢复业务副本；
-- Central `ObjectCatalog` 仍只接受 Agent 的签名 placement evidence，不能用“流量经过 Gateway”替代
-  Volume durability 证明；
+- legacy `ObjectCatalog` 与 v2 placement authority 只接受 Agent 的签名 placement evidence/receipt，不能用“流量
+  经过 Gateway”替代 Volume durability 证明；
 - GatewayPool 整体不可用时，控制/传输/S3 失败关闭，本地 Volume 数据和已完成 durability 的对象不受损。
 
 当前只读 S3 是 Gateway 暴露固定 Commit/Snapshot 的访问协议，不是 `ObjectStoreKind`、中心归档后端或
 新的 durability authority。S3 `LIST` 查询 Central metadata，`GET`/Range 由 owning Agent 根据 Manifest
-读取 Volume CAS；内部对象目录不映射为公开 Bucket 或 Key。实际调用仍依赖 Ready PlacementSet、GatewayPool、
-Agent route、signed ticket 和生产凭据。
+读取 Volume CAS；内部对象目录不映射为公开 Bucket 或 Key。v2 实际调用要求目标 Volume 的完整
+`VolumeCommitCoverage`、视图校验、GatewayPool、Agent route、signed ticket 和生产凭据；legacy 路径仍检查
+Ready PlacementSet，不能把 partial Coverage 当作可读。
 
 ## 一致性、锁与 mutation
 

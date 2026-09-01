@@ -14,7 +14,7 @@ use crate::{
 use fusen_rs::{Error, ErrorCategory};
 use neoengram_domain::core::{ContentDigest, FileRecord, ObjectId};
 use neoengram_domain::protocol::{
-    BackendId, CommitDataLayout, DeliveryGeneration, SnapshotDeliveryId, SnapshotDeliveryMode,
+    CommitDataLayout, DeliveryGeneration, SnapshotDeliveryId, SnapshotDeliveryMode,
     SnapshotDeliveryOperation, SnapshotDeliveryState, SnapshotId, StorageVolumeId, TenantId,
 };
 
@@ -345,28 +345,18 @@ impl CatalogService {
                 true,
             ));
         }
-        // Delivery is visible only after the target Volume has a published complete object set.
-        // Replication and Delivery are separate authority operations: a queued or partial target
-        // must never be treated as readable merely because the Snapshot exists.
-        let placement = self.placement.as_ref().ok_or_else(|| {
-            application_error(
-                ErrorCategory::Unavailable,
-                "placement_authority_unavailable",
-                "PLACEMENT_AUTHORITY_UNAVAILABLE",
-                "Placement authority is unavailable",
-                true,
+        // Delivery is visible only after the target Volume has complete v2 object Coverage.
+        // A legacy published PlacementSet or a global object union is not sufficient.
+        let coverage = self
+            .v2_commit_coverage_for_volume(
+                &tenant_id,
+                &snapshot.artifact_id,
+                &commit,
+                &target_storage_volume_id,
+                None,
             )
-        })?;
-        let backend_id = BackendId::new(target_storage_volume_id.to_string())
-            .map_err(|error| invalid_request(format!("target_storage_volume_id: {error}")))?;
-        let published = placement
-            .get_placement_set(&tenant_id, &snapshot.commit_id, &backend_id)
-            .await
-            .map_err(map_central_error)?
-            .is_some_and(|set| {
-                set.published() && set.storage_volume_id.as_ref() == Some(&target_storage_volume_id)
-            });
-        if !published {
+            .await?;
+        if !Self::v2_coverage_is_readable(coverage.as_ref()) {
             return Err(application_error(
                 ErrorCategory::Conflict,
                 "snapshot_target_volume_has_no_commit_data",

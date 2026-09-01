@@ -27,6 +27,8 @@ const CURRENT_TABLES: &[&str] = &[
     "system_identity",
     "lifecycle_metadata",
     "lifecycle_records",
+    "placement_inventory_metadata",
+    "placement_inventory",
 ];
 const LEGACY_FILES: &[&str] = &[
     "ledger.sqlite3",

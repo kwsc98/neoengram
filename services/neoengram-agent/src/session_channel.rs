@@ -10,7 +10,7 @@ use bytes::Bytes;
 use neoengram_domain::protocol::{
     AgentChannelDownstreamFrame, AgentChannelNdjsonDecoder, AgentChannelUpstreamFrame,
     AgentResourceLifecycleAssignment, AssignmentOperation, JobAssignment, JobDecision,
-    ReplicationAssignment, SessionGeneration, TenantId,
+    MaterializationAssignment, ReplicationAssignment, SessionGeneration, TenantId,
 };
 use tokio::{
     sync::mpsc,
@@ -150,6 +150,7 @@ pub(crate) fn spawn_response_reader(
 pub(crate) enum AgentWork {
     Assignment(JobAssignment),
     Replication(ReplicationAssignment),
+    Materialization(MaterializationAssignment),
     Lifecycle(AgentResourceLifecycleAssignment),
     Recovery(LedgerRecord),
     Decision(JobDecision),
@@ -167,6 +168,10 @@ impl AgentWork {
                 AssignmentOperation::SnapshotDelivery { input, .. } => input.job_id.to_string(),
             },
             Self::Replication(assignment) => format!("replication:{}", assignment.replication_id),
+            Self::Materialization(assignment) => format!(
+                "materialization:{}:{}",
+                assignment.batch.materialization_id, assignment.batch.batch_id
+            ),
             Self::Lifecycle(assignment) => {
                 // Every phase and retry in one deletion batch mutates the same durable
                 // quarantine journal. Keep those commands ordered even when Central redelivers
@@ -186,6 +191,12 @@ impl AgentWork {
                 "replication:{}:{}",
                 assignment.replication_id, assignment.attempt
             ),
+            Self::Materialization(assignment) => format!(
+                "materialization:{}:{}:{}",
+                assignment.batch.materialization_id,
+                assignment.batch.batch_id,
+                assignment.batch.batch_attempt
+            ),
             _ => self.execution_key(),
         }
     }
@@ -194,7 +205,7 @@ impl AgentWork {
     /// terminal publication.  Other command types use their message ID as a per-connection
     /// delivery fence and must not be admitted again on the same channel.
     const fn is_redeliverable(&self) -> bool {
-        matches!(self, Self::Replication(_))
+        matches!(self, Self::Replication(_) | Self::Materialization(_))
     }
 
     fn redelivery_deadline_unix_ms(&self) -> Option<u64> {
@@ -202,6 +213,17 @@ impl AgentWork {
             Self::Replication(assignment) => {
                 Some(assignment.signed_ticket.as_ticket().deadline_unix_ms.get())
             }
+            Self::Materialization(assignment) => {
+                Some(assignment.signed_ticket.ticket.deadline_unix_ms.get())
+            }
+            _ => None,
+        }
+    }
+
+    fn redelivery_attempt(&self) -> Option<u64> {
+        match self {
+            Self::Replication(assignment) => Some(assignment.attempt),
+            Self::Materialization(assignment) => Some(assignment.batch.batch_attempt.get()),
             _ => None,
         }
     }
@@ -359,24 +381,23 @@ pub(crate) fn spawn_work_dispatcher(
                                 .expect("redeliverable work must carry a deadline"),
                         )
                     });
-                    if let AgentWork::Replication(assignment) = &item.work {
+                    if let Some(attempt) = item.work.redelivery_attempt() {
                         let highest_attempt = highest_replication_attempts
                             .get(&execution_key)
                             .map(|history| history.attempt)
                             .unwrap_or(0);
-                        if assignment.attempt < highest_attempt {
+                        if attempt < highest_attempt {
                             continue;
                         }
-                        if assignment.attempt > highest_attempt {
+                        if attempt > highest_attempt {
                             highest_replication_attempts.insert(
                                 execution_key.clone(),
                                 ReplicationAttemptHistory {
-                                    attempt: assignment.attempt,
-                                    retain_until_unix_ms: assignment
-                                        .signed_ticket
-                                        .as_ticket()
-                                        .deadline_unix_ms
-                                        .get(),
+                                    attempt,
+                                    retain_until_unix_ms: item
+                                        .work
+                                        .redelivery_deadline_unix_ms()
+                                        .expect("redeliverable work must carry a deadline"),
                                 },
                             );
                             // A still-queued older attempt has not touched staging yet and can be
@@ -384,11 +405,10 @@ pub(crate) fn spawn_work_dispatcher(
                             // execution key and is allowed to unwind before the new attempt starts.
                             if let Some(items) = queued.get_mut(&execution_key) {
                                 items.retain(|queued_item| {
-                                    let obsolete = matches!(
-                                        &queued_item.work,
-                                        AgentWork::Replication(queued_assignment)
-                                            if queued_assignment.attempt < assignment.attempt
-                                    );
+                                    let obsolete = queued_item
+                                        .work
+                                        .redelivery_attempt()
+                                        .is_some_and(|queued_attempt| queued_attempt < attempt);
                                     if obsolete {
                                         in_flight_redeliveries
                                             .remove(&queued_item.work.redelivery_key());
@@ -398,21 +418,18 @@ pub(crate) fn spawn_work_dispatcher(
                             }
                             pending_redeliveries.retain(|_, pending_item| {
                                 pending_item.work.execution_key() != execution_key
-                                    || !matches!(
-                                        &pending_item.work,
-                                        AgentWork::Replication(pending_assignment)
-                                            if pending_assignment.attempt < assignment.attempt
-                                )
+                                    || !pending_item
+                                        .work
+                                        .redelivery_attempt()
+                                        .is_some_and(|pending_attempt| pending_attempt < attempt)
                             });
                         } else if let Some(history) =
                             highest_replication_attempts.get_mut(&execution_key)
                         {
                             history.retain_until_unix_ms = history.retain_until_unix_ms.max(
-                                assignment
-                                    .signed_ticket
-                                    .as_ticket()
-                                    .deadline_unix_ms
-                                    .get(),
+                            item.work
+                                .redelivery_deadline_unix_ms()
+                                .expect("redeliverable work must carry a deadline"),
                             );
                         }
                     }
@@ -488,14 +505,14 @@ pub(crate) fn spawn_work_dispatcher(
                                             .expect("guarded redelivery must be present");
                                         if let Some(item) = pending_redeliveries.remove(&redelivery_key) {
                                             let execution_key = item.work.execution_key();
-                                            let current = match &item.work {
-                                                AgentWork::Replication(assignment) => {
+                                            let current = item
+                                                .work
+                                                .redelivery_attempt()
+                                                .is_none_or(|attempt| {
                                                     highest_replication_attempts
                                                         .get(&execution_key)
-                                                        .is_none_or(|highest| assignment.attempt == highest.attempt)
-                                                }
-                                                _ => true,
-                                            };
+                                                        .is_none_or(|highest| attempt == highest.attempt)
+                                                });
                                             if current {
                                                 let pending_deadline = item
                                                     .work
@@ -573,6 +590,9 @@ async fn execute_fenced_work(
     match item.work {
         AgentWork::Assignment(assignment) => processor.handle_assignment(assignment).await,
         AgentWork::Replication(assignment) => processor.handle_replication(assignment).await,
+        AgentWork::Materialization(assignment) => {
+            processor.handle_materialization(assignment).await
+        }
         AgentWork::Lifecycle(assignment) => {
             if assignment.session_generation != item.generation {
                 return Err(AgentDaemonError::Session(

@@ -1,14 +1,31 @@
 use neoengram_domain::core::{ContentDigest, ObjectId};
+use neoengram_domain::protocol::materialization::{
+    MaterializationBatch, MaterializationObject, MaterializationObjectReceipt, ObjectRef,
+};
 use neoengram_domain::protocol::{
     AgentId, ArtifactId, BackendId, CommitObjectSet, CommitPlacementSet, CommitPlacementSetState,
     DataHealth, EdgeClusterId, GatewayPoolId, MountGeneration, ObjectPlacement,
-    PlacementGeneration, PlacementSetId, PlacementState, ReplicationId, ReplicationObjectState,
-    ReplicationState, RequestId, RouteGeneration, SessionGeneration, StorageVolumeId, TenantId,
-    TransferId, TransferRouteId, UnixMillis, WorkspaceId, WorkspaceLifecycle,
+    PlacementGeneration, PlacementId, PlacementSetId, PlacementState, ReplicationId,
+    ReplicationObjectState, ReplicationState, RequestId, RouteGeneration, SessionGeneration,
+    StorageVolumeId, TenantId, TransferId, TransferRouteId, UnixMillis, WorkspaceId,
+    WorkspaceLifecycle,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{CentralError, CentralErrorCode, CentralResult};
+
+/// Derives the physical Placement identity for a materialization target.
+///
+/// A receipt identifies one report, while the durable object copy is identified by its target
+/// namespace/object/Volume generation.  Keeping those identities separate lets two batches race
+/// safely: whichever receipt publishes first owns the one physical Placement and later receipts
+/// converge on it instead of creating aliases (or failing merely because their receipt IDs differ).
+pub(crate) fn materialization_target_placement_id(
+    receipt: &MaterializationObjectReceipt,
+) -> CentralResult<PlacementId> {
+    neoengram_domain::protocol::materialization_target_placement_id(receipt)
+        .map_err(CentralError::from)
+}
 
 /// Durable control-plane identity for one explicit Commit replication request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,6 +462,39 @@ pub struct WorkspaceRecord {
     pub lifecycle: WorkspaceLifecycle,
     pub created_at_unix_ms: neoengram_domain::protocol::UnixMillis,
     pub updated_at_unix_ms: neoengram_domain::protocol::UnixMillis,
+}
+
+/// Compare-and-swap request for one namespace-scoped materialization object checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializationObjectCasRequest {
+    pub tenant_id: TenantId,
+    pub object_namespace_id: neoengram_domain::protocol::ObjectNamespaceId,
+    pub materialization_id: neoengram_domain::protocol::MaterializationId,
+    pub object_id: ObjectId,
+    pub expected_plan_revision: neoengram_domain::protocol::Generation,
+    pub expected_attempt: neoengram_domain::protocol::Generation,
+    pub object: MaterializationObject,
+}
+
+/// Compare-and-swap request for one source-grouped materialization Batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializationBatchCasRequest {
+    pub tenant_id: TenantId,
+    pub object_namespace_id: neoengram_domain::protocol::ObjectNamespaceId,
+    pub materialization_id: neoengram_domain::protocol::MaterializationId,
+    pub batch_id: neoengram_domain::protocol::MaterializationBatchId,
+    pub expected_plan_revision: neoengram_domain::protocol::Generation,
+    pub expected_batch_attempt: neoengram_domain::protocol::Generation,
+    pub batch: MaterializationBatch,
+}
+
+/// Authenticated object receipt from a target Agent.  The receipt is accepted only after the
+/// repository validates the parent Job/Batch fence and then inserts the corresponding Verified
+/// ObjectPlacement idempotently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializationReceiptRequest {
+    pub receipt: MaterializationObjectReceipt,
+    pub object: ObjectRef,
 }
 
 /// Placement-derived Commit availability snapshot returned by the authority.

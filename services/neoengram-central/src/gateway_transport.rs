@@ -412,13 +412,7 @@ async fn forward_agent_frame_via_authority(
     let downstream = neoengram_domain::protocol::AgentChannelDownstreamFrame::decode_json(
         &encoded_frame[..encoded_frame.len() - 1],
     )?;
-    if !matches!(
-        downstream.message,
-        neoengram_domain::protocol::AgentChannelDownstreamMessage::Assignment(_)
-            | neoengram_domain::protocol::AgentChannelDownstreamMessage::Decision(_)
-            | neoengram_domain::protocol::AgentChannelDownstreamMessage::LifecycleAssignment(_)
-            | neoengram_domain::protocol::AgentChannelDownstreamMessage::ReplicationAssignment(_)
-    ) {
+    if !is_peer_forwardable_message(&downstream.message) {
         return Err(GatewaySessionError::Protocol(
             "peer forwarding accepts only Agent Job or lifecycle command frames",
         ));
@@ -496,14 +490,28 @@ fn forwarded_command_generation(
         &encoded_frame[..encoded_frame.len() - 1],
     )
     .ok()?;
+    is_peer_forwardable_message(&downstream.message).then_some(downstream.session_generation)
+}
+
+/// Only current Job and resource-lifecycle commands may cross a Gateway peer hop. The former
+/// whole-Commit replication assignment is intentionally excluded from this transport boundary.
+fn is_peer_forwardable_message(
+    message: &neoengram_domain::protocol::AgentChannelDownstreamMessage,
+) -> bool {
     matches!(
-        downstream.message,
+        message,
         neoengram_domain::protocol::AgentChannelDownstreamMessage::Assignment(_)
             | neoengram_domain::protocol::AgentChannelDownstreamMessage::Decision(_)
             | neoengram_domain::protocol::AgentChannelDownstreamMessage::LifecycleAssignment(_)
-            | neoengram_domain::protocol::AgentChannelDownstreamMessage::ReplicationAssignment(_)
     )
-    .then_some(downstream.session_generation)
+}
+
+#[cfg(test)]
+fn is_peer_forwardable_type(message_type: &str) -> bool {
+    matches!(
+        message_type,
+        "job.assignment" | "job.decision" | "resource.lifecycle.assignment"
+    )
 }
 
 /// One authenticated Central-to-Replica H2 session.
@@ -4553,6 +4561,10 @@ mod tests {
     #[test]
     fn peer_fallback_admits_only_complete_assignment_or_decision_frames() {
         let generation = SessionGeneration::new(4);
+        assert!(is_peer_forwardable_type("job.assignment"));
+        assert!(is_peer_forwardable_type("job.decision"));
+        assert!(is_peer_forwardable_type("resource.lifecycle.assignment"));
+        assert!(!is_peer_forwardable_type("replication.assignment"));
         assert_eq!(
             forwarded_command_generation(&forwarding_frame(generation)),
             Some(generation)

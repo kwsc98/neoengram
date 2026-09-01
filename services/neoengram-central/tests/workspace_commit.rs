@@ -6,9 +6,9 @@ use neoengram_central::{
     ArtifactInitialization, ArtifactRecord, CatalogPvcReference, Clock, CommitRecord,
     ControlCatalogRepository, ControlPlane, InMemoryComponents, IndexKey, IndexPublishOutcome,
     IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobKey, JobOperation, JobRecord,
-    JobRepository, PreCommitCommitRequest, PreCommitId, PreCommitRepository, PreCommitStartRequest,
-    PublishedIndex, StorageAccessMode, StorageBackendType, StorageVolumeRecord, StorageVolumeState,
-    TenantRecord,
+    JobRepository, PlacementRepository, PreCommitCommitRequest, PreCommitId, PreCommitRepository,
+    PreCommitStartRequest, PublishedIndex, StorageAccessMode, StorageBackendType,
+    StorageVolumeRecord, StorageVolumeState, TenantRecord,
 };
 use neoengram_central::{
     dto::{
@@ -168,6 +168,35 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     let commit_digest: ContentDigest = committed.commit.commit_id.into();
     assert_eq!(artifact.head_commit_id, Some(commit_digest));
     assert_eq!(playground.head_commit_id, Some(commit_digest));
+    let placement_repository = components.placement.clone();
+    let object_set = placement_repository
+        .get_commit_object_set(&tenant_id, &commit_digest)
+        .await
+        .unwrap()
+        .expect("workspace Commit ObjectSet");
+    let namespace = neoengram_domain::protocol::ObjectNamespaceId::from_artifact(&artifact_id);
+    for object in &object_set.object_set.objects {
+        let placements = placement_repository
+            .object_placements_v2(&tenant_id, &namespace, &object.object_id)
+            .await
+            .unwrap();
+        assert!(placements.iter().any(|placement| {
+            placement.object_namespace_id == namespace
+                && placement.storage_volume_id.as_ref()
+                    == Some(&StorageVolumeId::new("volume-a").unwrap())
+                && placement.state
+                    == neoengram_domain::protocol::materialization::ObjectPlacementState::Verified
+        }));
+    }
+    let coverages = placement_repository
+        .volume_commit_coverages(&tenant_id, &namespace, &commit_digest)
+        .await
+        .unwrap();
+    assert!(coverages.iter().any(|coverage| {
+        coverage.storage_volume_id == StorageVolumeId::new("volume-a").unwrap()
+            && coverage.state
+                == neoengram_domain::protocol::materialization::CoverageState::Complete
+    }));
     assert!(components
         .precommits
         .list_unpublished_commits(None, 10)

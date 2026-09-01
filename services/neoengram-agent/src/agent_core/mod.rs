@@ -11,6 +11,7 @@ mod lifecycle;
 mod memory;
 mod mount_probe;
 mod outbound;
+mod placement_inventory;
 mod ports;
 mod single_volume;
 mod sqlite_ledger;
@@ -33,6 +34,10 @@ pub use mount_probe::{
 pub use outbound::{
     DurableReportSink, QueuedAgentReport, SqliteOutboundReportQueue,
     SqliteOutboundReportQueueConfig,
+};
+pub use placement_inventory::{
+    InMemoryPlacementInventory, LocalPlacementInventory, PlacementInventoryConfig,
+    SqlitePlacementInventory,
 };
 pub use ports::{
     AddExecutor, AssignmentValidator, BasicAssignmentValidator, Clock, Ledger, ObjectTransfer,

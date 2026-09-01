@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::{
-    AddExecutor, AgentError, AgentErrorCode, AgentResult, ObjectTransfer, TransferReceipt,
+    AddExecutor, AgentError, AgentErrorCode, AgentResult, LocalPlacementInventory, ObjectTransfer,
+    TransferReceipt,
 };
 use neoengram_domain::core::{
     canonical, ChunkRef, ContentDigest, FileRecord, IndexMutation, IndexVersion, LogicalPath,
@@ -766,6 +767,7 @@ pub trait ExecutionBridge: std::fmt::Debug + Send + Sync {
 pub struct FilesystemExecution {
     mount_root: PathBuf,
     bridge: Arc<dyn ExecutionBridge>,
+    placement_inventory: Option<Arc<dyn LocalPlacementInventory>>,
 }
 
 impl FilesystemExecution {
@@ -774,7 +776,36 @@ impl FilesystemExecution {
         Self {
             mount_root: mount_root.into(),
             bridge,
+            placement_inventory: None,
         }
+    }
+
+    /// Attaches the Agent-local placement inventory used by source authorization and materialized
+    /// object publication. The inventory is optional for legacy unit-test adapters, but the
+    /// approved runtime always supplies the durable implementation.
+    #[must_use]
+    pub fn with_placement_inventory(
+        mut self,
+        placement_inventory: Arc<dyn LocalPlacementInventory>,
+    ) -> Self {
+        self.placement_inventory = Some(placement_inventory);
+        self
+    }
+
+    /// Records one verified local object placement. Production materialization paths require an
+    /// attached inventory; test-only executions can omit it and retain the existing object-only
+    /// behavior.
+    pub fn record_local_placement(
+        &self,
+        placement: neoengram_domain::protocol::materialization::ObjectPlacement,
+    ) -> AgentResult<()> {
+        let inventory = self.placement_inventory.as_ref().ok_or_else(|| {
+            AgentError::new(
+                AgentErrorCode::InvalidState,
+                "Agent-local placement inventory is not configured",
+            )
+        })?;
+        inventory.record(placement)
     }
 
     /// Creates and validates the Volume-owned CAS root before the Agent becomes ready.
@@ -959,6 +990,44 @@ impl ObjectTransfer for FilesystemExecution {
             .durability_barrier()
             .map_err(|error| transfer_error(error.to_string()))?;
         let checked_at = self.bridge.now_unix_ms()?;
+        if let Some(inventory) = &self.placement_inventory {
+            let namespace = neoengram_domain::protocol::ObjectNamespaceId::from_artifact(
+                &assignment.artifact_id,
+            );
+            for spec in &prepared.object_specs {
+                let placement_digest = blake3::hash(
+                    format!(
+                        "managed-add-v2\0{}\0{}\0{}\0{}",
+                        assignment.tenant_id,
+                        assignment.artifact_id,
+                        assignment.artifact_placement_id,
+                        spec.id
+                    )
+                    .as_bytes(),
+                );
+                let placement_id = neoengram_domain::protocol::PlacementId::new(format!(
+                    "managed-add-v2-{}",
+                    &placement_digest.to_hex()[..32]
+                ))
+                .map_err(|error| transfer_error(error.to_string()))?;
+                inventory
+                    .record(neoengram_domain::protocol::materialization::ObjectPlacement {
+                        placement_id,
+                        tenant_id: assignment.tenant_id.clone(),
+                        object_namespace_id: namespace.clone(),
+                        object_id: spec.id,
+                        size: DecimalU64::new(spec.size),
+                        encoding: neoengram_domain::protocol::ObjectEncoding::Raw,
+                        verified_digest: spec.id.digest(),
+                        storage_volume_id: Some(assignment.storage_volume_id.clone()),
+                        archive_id: None,
+                        placement_generation: assignment.placement_generation,
+                        state: neoengram_domain::protocol::materialization::ObjectPlacementState::Verified,
+                        failure_domain: format!("volume:{}", assignment.storage_volume_id),
+                    })
+                    ?;
+            }
+        }
         let verified_at = prepared
             .object_specs
             .iter()

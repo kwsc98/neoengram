@@ -410,7 +410,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/commit/replicate": {
+    "/api/commit/materialize": {
         parameters: {
             query?: never;
             header?: never;
@@ -420,17 +420,18 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 将 Commit 复制到目标 Volume
-         * @description 创建显式对象级复制任务；目标 PlacementSet 完整校验并发布前不可用于 Delivery。
+         * 将 Commit 物化到目标 Volume
+         * @description 创建面向目标 Volume 的多源对象物化任务。Central 根据对象级 Placement 规划多个
+         *     Agent/Gateway 批次；目标 Coverage 完整并完成视图校验前不可用于 Workspace、Delivery 或 S3。
          */
-        post: operations["replicateCommit"];
+        post: operations["materializeCommit"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/commit/replication/query": {
+    "/api/commit/materialization/query": {
         parameters: {
             query?: never;
             header?: never;
@@ -440,17 +441,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 查询复制任务
-         * @description 查询单个 Commit 复制任务及其当前对象和字节进度。
+         * 查询物化任务
+         * @description 查询单个目标 Volume 物化任务及其对象覆盖、批次和字节进度。
          */
-        post: operations["queryCommitReplication"];
+        post: operations["queryCommitMaterialization"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/commit/replication/ticket/query": {
+    "/api/commit/materialization/list/query": {
         parameters: {
             query?: never;
             header?: never;
@@ -460,17 +461,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 查询复制传输票据
-         * @description 返回绑定 Tenant、Commit、ObjectSet、源/目标 Placement 和路由代次的短期传输票据。
+         * 查询 Commit 的物化任务
+         * @description 查询指定 Commit 的目标 Volume 物化任务及其覆盖状态。
          */
-        post: operations["queryCommitReplicationTicket"];
+        post: operations["queryCommitMaterializationList"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/commit/replication/list/query": {
+    "/api/commit/materialization/retry": {
         parameters: {
             query?: never;
             header?: never;
@@ -480,17 +481,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 查询 Commit 的复制任务
-         * @description 查询指定 Commit 的全部复制任务及其目标副本状态。
+         * 重试失败的物化任务
+         * @description 使用当前计划版本重新规划未完成对象。目标端已校验的对象和 checkpoint 会被复用。
          */
-        post: operations["queryCommitReplicationList"];
+        post: operations["retryCommitMaterialization"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/commit/replication/retry": {
+    "/api/commit/materialization/cancel": {
         parameters: {
             query?: never;
             header?: never;
@@ -500,17 +501,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 重试失败的 Commit 复制
-         * @description 使用当前 attempt fence 重新排队失败或取消的 Commit 复制任务。相同 request_id 与完整 payload 幂等返回首次重试结果；request_id 复用到不同 payload 时返回 409。
+         * 取消物化任务
+         * @description 取消仍在进行中的目标物化任务；已验证对象不受影响，临时 staging 由租约回收。
          */
-        post: operations["retryCommitReplication"];
+        post: operations["cancelCommitMaterialization"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/commit/replication/cancel": {
+    "/api/commit/coverage/query": {
         parameters: {
             query?: never;
             header?: never;
@@ -520,30 +521,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 取消 Commit 复制
-         * @description 取消仍在进行中的 Commit 复制任务并保留临时数据供后续清理。
+         * 查询 Commit 的 Volume 覆盖
+         * @description 查询对象级 Placement 派生的 Volume 覆盖摘要；partial 不代表目标视图可读。
          */
-        post: operations["cancelCommitReplication"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/commit/placements/query": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * 查询 Commit Placement 列表
-         * @description 查询 Commit 已发布、可用于读取的物理 PlacementSet 列表。
-         */
-        post: operations["queryCommitPlacementList"];
+        post: operations["queryCommitCoverage"];
         delete?: never;
         options?: never;
         head?: never;
@@ -561,7 +542,8 @@ export interface paths {
         put?: never;
         /**
          * 查询 Commit 数据健康
-         * @description 根据已发布 PlacementSet 计算 Commit 当前对象可用性。
+         * @description 返回全局对象内容是否可恢复、当前是否有可服务来源、耐久性策略状态、完整 Volume
+         *     数量和指定目标视图是否 Ready。结果按对象级 Verified Placement 计算，不依赖完整单盘副本。
          */
         post: operations["queryCommitAvailability"];
         delete?: never;
@@ -912,8 +894,8 @@ export interface paths {
         put?: never;
         /**
          * 查询租户内 Snapshot
-         * @description 按 Project、Artifact、Commit 或状态分页查询独立逻辑 Snapshot；物理可读性由已发布 PlacementSet
-         *     和相关 SnapshotDelivery 动态解析，不作为 Snapshot 筛选条件。
+         * @description 按 Project、Artifact、Commit 或状态分页查询独立逻辑 Snapshot；物理可读性由目标 Volume
+         *     的 Coverage 和相关 SnapshotDelivery 动态解析，不作为 Snapshot 筛选条件。
          *     opaque cursor 与全部筛选条件绑定。
          */
         post: operations["querySnapshotList"];
@@ -2768,44 +2750,63 @@ export interface components {
         QuerySnapshotResponse: {
             snapshot: components["schemas"]["SnapshotView"];
         };
-        CreateCommitReplicationRequest: {
+        ObjectNamespaceId: string;
+        MaterializationCoverageGoal: "complete" | {
+            object_count: components["schemas"]["CanonicalU64"];
+        } | {
+            byte_count: components["schemas"]["CanonicalU64"];
+        };
+        CreateCommitMaterializationRequest: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
             commit_id: components["schemas"]["CommitId"];
             target_storage_volume_id: components["schemas"]["StorageVolumeId"];
+            coverage_goal?: components["schemas"]["MaterializationCoverageGoal"];
             request_id: components["schemas"]["RequestId"];
         };
-        QueryCommitReplicationRequest: {
+        QueryCommitMaterializationRequest: {
             tenant_id: components["schemas"]["TenantId"];
-            replication_id: components["schemas"]["ResourceId"];
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
+            materialization_id: components["schemas"]["ResourceId"];
         };
-        QueryCommitReplicationTicketRequest: {
+        QueryCommitMaterializationListRequest: {
             tenant_id: components["schemas"]["TenantId"];
-            replication_id: components["schemas"]["ResourceId"];
-        };
-        QueryCommitReplicationListRequest: {
-            tenant_id: components["schemas"]["TenantId"];
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
             commit_id: components["schemas"]["CommitId"];
+            target_storage_volume_id?: components["schemas"]["StorageVolumeId"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
         };
-        RetryCommitReplicationRequest: {
+        RetryCommitMaterializationRequest: {
             tenant_id: components["schemas"]["TenantId"];
-            replication_id: components["schemas"]["ResourceId"];
-            expected_attempt: components["schemas"]["CanonicalU64"];
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
+            materialization_id: components["schemas"]["ResourceId"];
+            expected_plan_revision: components["schemas"]["CanonicalU64"];
             request_id: components["schemas"]["RequestId"];
         };
-        CancelCommitReplicationRequest: {
+        CancelCommitMaterializationRequest: {
             tenant_id: components["schemas"]["TenantId"];
-            replication_id: components["schemas"]["ResourceId"];
-            expected_attempt: components["schemas"]["CanonicalU64"];
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
+            materialization_id: components["schemas"]["ResourceId"];
+            expected_plan_revision: components["schemas"]["CanonicalU64"];
         };
-        QueryCommitPlacementListRequest: {
+        QueryCommitCoverageRequest: {
             tenant_id: components["schemas"]["TenantId"];
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
             commit_id: components["schemas"]["CommitId"];
+            storage_volume_id?: components["schemas"]["StorageVolumeId"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
         };
         QueryCommitAvailabilityRequest: {
             tenant_id: components["schemas"]["TenantId"];
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
             commit_id: components["schemas"]["CommitId"];
+            target_storage_volume_id?: components["schemas"]["StorageVolumeId"];
+            cursor?: components["schemas"]["PageCursor"];
+            page_size?: components["schemas"]["PageSize"];
         };
         CreateWorkspaceRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -2815,122 +2816,87 @@ export interface components {
             target_storage_volume_id: components["schemas"]["StorageVolumeId"];
             request_id: components["schemas"]["RequestId"];
         };
-        ReplicationView: {
-            replication_id: components["schemas"]["ResourceId"];
+        MaterializationView: {
+            materialization_id: components["schemas"]["ResourceId"];
             tenant_id: components["schemas"]["TenantId"];
             artifact_id?: components["schemas"]["ArtifactId"];
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
             commit_id: components["schemas"]["CommitId"];
             target_storage_volume_id: components["schemas"]["StorageVolumeId"];
-            attempt: components["schemas"]["CanonicalU64"];
+            plan_revision: components["schemas"]["CanonicalU64"];
+            coverage_goal: components["schemas"]["MaterializationCoverageGoal"];
             /** @enum {string} */
-            state: "queued" | "planning" | "transferring" | "verifying" | "published" | "failed" | "cancelled";
+            state: "queued" | "planning" | "waiting_for_sources" | "materializing" | "verifying" | "complete" | "stalled" | "failed" | "cancelled";
             object_set_digest: components["schemas"]["ContentDigest"];
-            completed_objects: components["schemas"]["CanonicalU64"];
+            verified_objects: components["schemas"]["CanonicalU64"];
             total_objects: components["schemas"]["CanonicalU64"];
-            source_placement_set_id?: components["schemas"]["ResourceId"];
-            source_storage_volume_id?: components["schemas"]["StorageVolumeId"];
-            source_edge_cluster_id?: components["schemas"]["ResourceId"];
-            source_gateway_pool_id?: components["schemas"]["ResourceId"];
-            source_agent_id?: components["schemas"]["ResourceId"];
-            source_session_generation?: components["schemas"]["CanonicalU64"];
-            source_mount_generation?: components["schemas"]["CanonicalU64"];
-            source_route_generation?: components["schemas"]["CanonicalU64"];
-            target_edge_cluster_id?: components["schemas"]["ResourceId"];
-            target_gateway_pool_id?: components["schemas"]["ResourceId"];
-            target_agent_id?: components["schemas"]["ResourceId"];
-            target_session_generation?: components["schemas"]["CanonicalU64"];
-            target_mount_generation?: components["schemas"]["CanonicalU64"];
-            target_route_generation?: components["schemas"]["CanonicalU64"];
-            transfer_route_id?: components["schemas"]["ResourceId"];
-            transfer_id?: components["schemas"]["ResourceId"];
-            target_placement_set_id?: components["schemas"]["ResourceId"];
-            staging_id?: components["schemas"]["ResourceId"];
-            completed_bytes: components["schemas"]["CanonicalU64"];
+            verified_bytes: components["schemas"]["CanonicalU64"];
             total_bytes: components["schemas"]["CanonicalU64"];
+            missing_objects: components["schemas"]["CanonicalU64"];
+            missing_bytes: components["schemas"]["CanonicalU64"];
+            source_count: components["schemas"]["CanonicalU64"];
             issue?: components["schemas"]["ResourceIssueSummary"];
         };
-        CreateCommitReplicationResponse: {
-            replication: components["schemas"]["ReplicationView"];
+        CreateCommitMaterializationResponse: {
+            materialization: components["schemas"]["MaterializationView"];
             replayed: boolean;
         };
-        QueryCommitReplicationResponse: {
-            replication: components["schemas"]["ReplicationView"];
+        QueryCommitMaterializationResponse: {
+            materialization: components["schemas"]["MaterializationView"];
         };
-        TransferEndpoint: {
-            placement_id: components["schemas"]["ResourceId"];
-            agent_id: components["schemas"]["ResourceId"];
-            gateway_pool_id: components["schemas"]["GatewayPoolId"];
-            edge_cluster_id: components["schemas"]["EdgeClusterId"];
-            storage_volume_id?: components["schemas"]["StorageVolumeId"];
-        };
-        TransferTicket: {
-            transfer_id: components["schemas"]["ResourceId"];
-            tenant_id: components["schemas"]["TenantId"];
-            artifact_id: components["schemas"]["ArtifactId"];
-            commit_id: components["schemas"]["CommitId"];
-            object_set_digest: components["schemas"]["ContentDigest"];
-            source: components["schemas"]["TransferEndpoint"];
-            target: components["schemas"]["TransferEndpoint"];
-            source_session_generation?: components["schemas"]["CanonicalU64"];
-            source_mount_generation?: components["schemas"]["CanonicalU64"];
-            source_route_generation?: components["schemas"]["CanonicalU64"];
-            session_generation: components["schemas"]["CanonicalU64"];
-            mount_generation: components["schemas"]["CanonicalU64"];
-            route_generation: components["schemas"]["CanonicalU64"];
-            deadline_unix_ms: components["schemas"]["UnixMillis"];
-            max_bytes: components["schemas"]["DecimalU64"];
-            allowed_objects: components["schemas"]["ContentDigest"][];
-        };
-        CentralSignedPayload: {
-            key_id: string;
-            certificate_generation: components["schemas"]["CanonicalU64"];
-            signed_at_unix_ms: components["schemas"]["UnixMillis"];
-            expires_at_unix_ms: components["schemas"]["UnixMillis"];
-            payload_digest: components["schemas"]["ContentDigest"];
-            payload: string;
-            signature: string;
-            extensions?: Record<string, never>;
-        };
-        SignedTransferTicket: {
-            ticket: components["schemas"]["TransferTicket"];
-            central_signature: components["schemas"]["CentralSignedPayload"];
-        };
-        QueryCommitReplicationTicketResponse: {
-            ticket: components["schemas"]["TransferTicket"];
-            signed_ticket?: components["schemas"]["SignedTransferTicket"];
-        };
-        RetryCommitReplicationResponse: {
-            replication: components["schemas"]["ReplicationView"];
+        RetryCommitMaterializationResponse: {
+            materialization: components["schemas"]["MaterializationView"];
             replayed: boolean;
         };
-        CancelCommitReplicationResponse: {
-            replication: components["schemas"]["ReplicationView"];
+        CancelCommitMaterializationResponse: {
+            materialization: components["schemas"]["MaterializationView"];
         };
-        QueryCommitReplicationListResponse: {
-            replications: components["schemas"]["ReplicationView"][];
+        QueryCommitMaterializationListResponse: {
+            materializations: components["schemas"]["MaterializationView"][];
+            next_cursor?: components["schemas"]["PageCursor"];
         };
-        CommitPlacementView: {
-            placement_set_id: components["schemas"]["ResourceId"];
+        VolumeCommitCoverageView: {
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
             commit_id: components["schemas"]["CommitId"];
-            backend_id: components["schemas"]["ResourceId"];
-            storage_volume_id?: components["schemas"]["StorageVolumeId"];
-            object_set_digest: components["schemas"]["ContentDigest"];
-            object_count: components["schemas"]["CanonicalU64"];
-            verified_object_count: components["schemas"]["CanonicalU64"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
             placement_generation: components["schemas"]["CanonicalU64"];
+            object_set_digest: components["schemas"]["ContentDigest"];
+            total_objects: components["schemas"]["CanonicalU64"];
+            verified_objects: components["schemas"]["CanonicalU64"];
+            total_bytes: components["schemas"]["CanonicalU64"];
+            verified_bytes: components["schemas"]["CanonicalU64"];
+            missing_objects: components["schemas"]["CanonicalU64"];
+            missing_bytes: components["schemas"]["CanonicalU64"];
             /** @enum {string} */
-            state: "staged" | "published" | "retiring" | "deleted";
+            state: "partial" | "complete" | "retiring" | "deleted";
         };
-        QueryCommitPlacementListResponse: {
-            placements: components["schemas"]["CommitPlacementView"][];
+        QueryCommitCoverageResponse: {
+            coverage: components["schemas"]["VolumeCommitCoverageView"][];
+            next_cursor?: components["schemas"]["PageCursor"];
         };
         CommitAvailabilityView: {
+            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
             commit_id: components["schemas"]["CommitId"];
+            object_count: components["schemas"]["CanonicalU64"];
             /** @enum {string} */
-            data_health: "available" | "degraded" | "unavailable";
-            verified_placements: components["schemas"]["CanonicalU64"];
-            missing_objects: components["schemas"]["CanonicalU64"];
+            content_presence: "available" | "degraded" | "unavailable";
+            /** @enum {string} */
+            source_serving: "available" | "degraded" | "unavailable";
+            /** @enum {string} */
+            durability: "satisfied" | "under_replicated" | "unavailable";
+            /** @enum {string} */
+            target_coverage: "not_requested" | "partial" | "complete" | "unavailable";
+            /** @enum {string} */
+            view_readiness: "ready" | "not_ready" | "unavailable";
+            complete_volume_count: components["schemas"]["CanonicalU64"];
+            missing_objects: components["schemas"]["MissingObjectView"][];
             verified_storage_volume_ids: components["schemas"]["StorageVolumeId"][];
+        };
+        MissingObjectView: {
+            object_id: components["schemas"]["ContentDigest"];
+            size: components["schemas"]["CanonicalU64"];
+            /** @enum {string} */
+            encoding: "raw" | "zstd";
         };
         QueryCommitAvailabilityResponse: {
             availability: components["schemas"]["CommitAvailabilityView"];
@@ -3090,7 +3056,7 @@ export interface components {
             tag_names: components["schemas"]["TagName"][];
             state: components["schemas"]["SnapshotState"];
             /**
-             * @description Commit object availability resolved from the currently published PlacementSets.
+             * @description Commit object availability resolved from object-level Verified Placements and derived Volume Coverage.
              * @enum {string}
              */
             data_health: "available" | "degraded" | "unavailable";
@@ -4029,7 +3995,7 @@ export interface operations {
                      *         "artifact_catalog",
                      *         "artifact_commit_graph",
                      *         "artifact_commit_diff",
-                     *         "artifact_commit_replication",
+                     *         "commit_materialization_v2",
                      *         "managed_add",
                      *         "sqlite_authority",
                      *         "commit_layout_selection_v2",
@@ -5245,7 +5211,7 @@ export interface operations {
             503: components["responses"]["ServiceUnavailableProblem"];
         };
     };
-    replicateCommit: {
+    materializeCommit: {
         parameters: {
             query?: never;
             header: {
@@ -5270,7 +5236,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["CreateCommitReplicationRequest"];
+                "application/json": components["schemas"]["CreateCommitMaterializationRequest"];
             };
         };
         responses: {
@@ -5281,7 +5247,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CreateCommitReplicationResponse"];
+                    "application/json": components["schemas"]["CreateCommitMaterializationResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];
@@ -5293,7 +5259,7 @@ export interface operations {
             503: components["responses"]["ServiceUnavailableProblem"];
         };
     };
-    queryCommitReplication: {
+    queryCommitMaterialization: {
         parameters: {
             query?: never;
             header: {
@@ -5318,7 +5284,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["QueryCommitReplicationRequest"];
+                "application/json": components["schemas"]["QueryCommitMaterializationRequest"];
             };
         };
         responses: {
@@ -5329,7 +5295,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["QueryCommitReplicationResponse"];
+                    "application/json": components["schemas"]["QueryCommitMaterializationResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];
@@ -5339,7 +5305,7 @@ export interface operations {
             500: components["responses"]["InternalProblem"];
         };
     };
-    queryCommitReplicationTicket: {
+    queryCommitMaterializationList: {
         parameters: {
             query?: never;
             header: {
@@ -5364,55 +5330,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["QueryCommitReplicationTicketRequest"];
-            };
-        };
-        responses: {
-            /** @description 短期传输票据 */
-            200: {
-                headers: {
-                    "X-Request-ID": components["headers"]["RequestId"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["QueryCommitReplicationTicketResponse"];
-                };
-            };
-            401: components["responses"]["AuthenticationProblem"];
-            403: components["responses"]["AuthorizationProblem"];
-            404: components["responses"]["ResourceNotFoundProblem"];
-            409: components["responses"]["MutationConflictProblem"];
-            422: components["responses"]["ValidationProblem"];
-            500: components["responses"]["InternalProblem"];
-            503: components["responses"]["ServiceUnavailableProblem"];
-        };
-    };
-    queryCommitReplicationList: {
-        parameters: {
-            query?: never;
-            header: {
-                /**
-                 * @description 公开 API 主版本；不兼容演进不改变 path。
-                 * @example 1
-                 */
-                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
-                /**
-                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
-                 * @example req-20260727-001
-                 */
-                "X-Request-ID"?: components["parameters"]["RequestId"];
-                /**
-                 * @description W3C Trace Context traceparent。
-                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-                 */
-                traceparent?: components["parameters"]["Traceparent"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["QueryCommitReplicationListRequest"];
+                "application/json": components["schemas"]["QueryCommitMaterializationListRequest"];
             };
         };
         responses: {
@@ -5423,7 +5341,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["QueryCommitReplicationListResponse"];
+                    "application/json": components["schemas"]["QueryCommitMaterializationListResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];
@@ -5432,7 +5350,7 @@ export interface operations {
             500: components["responses"]["InternalProblem"];
         };
     };
-    retryCommitReplication: {
+    retryCommitMaterialization: {
         parameters: {
             query?: never;
             header: {
@@ -5457,7 +5375,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["RetryCommitReplicationRequest"];
+                "application/json": components["schemas"]["RetryCommitMaterializationRequest"];
             };
         };
         responses: {
@@ -5468,7 +5386,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RetryCommitReplicationResponse"];
+                    "application/json": components["schemas"]["RetryCommitMaterializationResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];
@@ -5478,7 +5396,7 @@ export interface operations {
             500: components["responses"]["InternalProblem"];
         };
     };
-    cancelCommitReplication: {
+    cancelCommitMaterialization: {
         parameters: {
             query?: never;
             header: {
@@ -5503,7 +5421,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["CancelCommitReplicationRequest"];
+                "application/json": components["schemas"]["CancelCommitMaterializationRequest"];
             };
         };
         responses: {
@@ -5514,7 +5432,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CancelCommitReplicationResponse"];
+                    "application/json": components["schemas"]["CancelCommitMaterializationResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];
@@ -5524,7 +5442,7 @@ export interface operations {
             500: components["responses"]["InternalProblem"];
         };
     };
-    queryCommitPlacementList: {
+    queryCommitCoverage: {
         parameters: {
             query?: never;
             header: {
@@ -5549,7 +5467,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["QueryCommitPlacementListRequest"];
+                "application/json": components["schemas"]["QueryCommitCoverageRequest"];
             };
         };
         responses: {
@@ -5560,7 +5478,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["QueryCommitPlacementListResponse"];
+                    "application/json": components["schemas"]["QueryCommitCoverageResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];

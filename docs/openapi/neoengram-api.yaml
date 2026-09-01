@@ -6,12 +6,14 @@ info:
   version: 1.0.0
   summary: NeoEngram 用户、CLI 和 UI 使用的非 REST JSON API 契约
   description: |
-    这是 NeoEngram 中心服务的首版公开 API 设计契约。`neoengram-central` 已注册 System、Tenant、
-    StorageVolume、StorageEnrollment、Artifact、Playground、Snapshot、S3 Access Point、资源生命周期、
-    Managed Add Job 和 Gateway Registry 的当前 action；其余 operation 仍是目标契约，不表示已经可以访问。Gateway Registry
-    当前管理 Pool/Replica 资源和显式 activation action；运行时 mTLS 与最多一跳 Replica forwarding 已
-    接入。外部生产 issuer/证书自动切换、完整业务 E2E、真实集群切换和跨集群 payload 仍待验收；
-    S3 只读 Access Point 控制面 action 已在本契约中公开。
+    这是 NeoEngram 中心服务的公开 JSON action 契约。Managed 对象副本采用对象级 Placement，
+    Commit 物理复制通过面向目标 Volume 的 MaterializationJob 完成；一个 Job 可以从多个
+    Volume 的 Agent 经 Gateway relay 并行拉取对象。`neoengram-central` 是元数据、调度、租约
+    和签名权威，Gateway 不挂载 Volume、不保存对象字节。
+
+    当前契约以 Materialization v2 为准。旧的单源 `replication`、完整 `PlacementSet` 和公开
+    Transfer Ticket action 不再属于公开 API；传输票据只通过受信 Agent 控制通道下发。跨 Volume
+    payload、外部生产 issuer/证书自动切换、完整业务 E2E 和真实集群切换仍待验收。
 
     业务方法使用“模块 / 子域 / 动作”路径，并通过普通 JSON 请求和响应调用；
     路径不包含版本号。除版本查询和健康检查外，调用方必须发送
@@ -101,7 +103,7 @@ paths:
                   - artifact_catalog
                   - artifact_commit_graph
                   - artifact_commit_diff
-                  - artifact_commit_replication
+                  - commit_materialization_v2
                   - managed_add
                   - sqlite_authority
                   - commit_layout_selection_v2
@@ -1235,12 +1237,14 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/commit/replicate:
+  /api/commit/materialize:
     post:
       tags: [Placement]
-      operationId: replicateCommit
-      summary: 将 Commit 复制到目标 Volume
-      description: 创建显式对象级复制任务；目标 PlacementSet 完整校验并发布前不可用于 Delivery。
+      operationId: materializeCommit
+      summary: 将 Commit 物化到目标 Volume
+      description: |
+        创建面向目标 Volume 的多源对象物化任务。Central 根据对象级 Placement 规划多个
+        Agent/Gateway 批次；目标 Coverage 完整并完成视图校验前不可用于 Workspace、Delivery 或 S3。
       security:
         - BearerAuth: []
       parameters:
@@ -1252,7 +1256,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CreateCommitReplicationRequest"
+              $ref: "#/components/schemas/CreateCommitMaterializationRequest"
       responses:
         "200":
           description: 复制任务已排队或幂等重放
@@ -1262,7 +1266,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CreateCommitReplicationResponse"
+                $ref: "#/components/schemas/CreateCommitMaterializationResponse"
         "401": { $ref: "#/components/responses/AuthenticationProblem" }
         "403": { $ref: "#/components/responses/AuthorizationProblem" }
         "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
@@ -1271,12 +1275,12 @@ paths:
         "500": { $ref: "#/components/responses/InternalProblem" }
         "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
 
-  /api/commit/replication/query:
+  /api/commit/materialization/query:
     post:
       tags: [Placement]
-      operationId: queryCommitReplication
-      summary: 查询复制任务
-      description: 查询单个 Commit 复制任务及其当前对象和字节进度。
+      operationId: queryCommitMaterialization
+      summary: 查询物化任务
+      description: 查询单个目标 Volume 物化任务及其对象覆盖、批次和字节进度。
       security:
         - BearerAuth: []
       parameters:
@@ -1288,7 +1292,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryCommitReplicationRequest"
+              $ref: "#/components/schemas/QueryCommitMaterializationRequest"
       responses:
         "200":
           description: 复制任务
@@ -1298,19 +1302,19 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryCommitReplicationResponse"
+                $ref: "#/components/schemas/QueryCommitMaterializationResponse"
         "401": { $ref: "#/components/responses/AuthenticationProblem" }
         "403": { $ref: "#/components/responses/AuthorizationProblem" }
         "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
         "422": { $ref: "#/components/responses/ValidationProblem" }
         "500": { $ref: "#/components/responses/InternalProblem" }
 
-  /api/commit/replication/ticket/query:
+  /api/commit/materialization/list/query:
     post:
       tags: [Placement]
-      operationId: queryCommitReplicationTicket
-      summary: 查询复制传输票据
-      description: 返回绑定 Tenant、Commit、ObjectSet、源/目标 Placement 和路由代次的短期传输票据。
+      operationId: queryCommitMaterializationList
+      summary: 查询 Commit 的物化任务
+      description: 查询指定 Commit 的目标 Volume 物化任务及其覆盖状态。
       security:
         - BearerAuth: []
       parameters:
@@ -1322,43 +1326,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryCommitReplicationTicketRequest"
-      responses:
-        "200":
-          description: 短期传输票据
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/QueryCommitReplicationTicketResponse"
-        "401": { $ref: "#/components/responses/AuthenticationProblem" }
-        "403": { $ref: "#/components/responses/AuthorizationProblem" }
-        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
-        "409": { $ref: "#/components/responses/MutationConflictProblem" }
-        "422": { $ref: "#/components/responses/ValidationProblem" }
-        "500": { $ref: "#/components/responses/InternalProblem" }
-        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
-
-  /api/commit/replication/list/query:
-    post:
-      tags: [Placement]
-      operationId: queryCommitReplicationList
-      summary: 查询 Commit 的复制任务
-      description: 查询指定 Commit 的全部复制任务及其目标副本状态。
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/ApiVersion"
-        - $ref: "#/components/parameters/RequestId"
-        - $ref: "#/components/parameters/Traceparent"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/QueryCommitReplicationListRequest"
+              $ref: "#/components/schemas/QueryCommitMaterializationListRequest"
       responses:
         "200":
           description: 复制任务列表
@@ -1368,19 +1336,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryCommitReplicationListResponse"
+                $ref: "#/components/schemas/QueryCommitMaterializationListResponse"
         "401": { $ref: "#/components/responses/AuthenticationProblem" }
         "403": { $ref: "#/components/responses/AuthorizationProblem" }
         "422": { $ref: "#/components/responses/ValidationProblem" }
         "500": { $ref: "#/components/responses/InternalProblem" }
 
-  /api/commit/replication/retry:
+  /api/commit/materialization/retry:
     post:
       tags: [Placement]
-      operationId: retryCommitReplication
-      summary: 重试失败的 Commit 复制
-      description: 使用当前 attempt fence 重新排队失败或取消的 Commit 复制任务。相同 request_id 与完整 payload
-        幂等返回首次重试结果；request_id 复用到不同 payload 时返回 409。
+      operationId: retryCommitMaterialization
+      summary: 重试失败的物化任务
+      description: 使用当前计划版本重新规划未完成对象。目标端已校验的对象和 checkpoint 会被复用。
       security:
         - BearerAuth: []
       parameters:
@@ -1392,7 +1359,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/RetryCommitReplicationRequest"
+              $ref: "#/components/schemas/RetryCommitMaterializationRequest"
       responses:
         "200":
           description: 重试任务
@@ -1402,19 +1369,19 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RetryCommitReplicationResponse"
+                $ref: "#/components/schemas/RetryCommitMaterializationResponse"
         "401": { $ref: "#/components/responses/AuthenticationProblem" }
         "403": { $ref: "#/components/responses/AuthorizationProblem" }
         "409": { $ref: "#/components/responses/MutationConflictProblem" }
         "422": { $ref: "#/components/responses/ValidationProblem" }
         "500": { $ref: "#/components/responses/InternalProblem" }
 
-  /api/commit/replication/cancel:
+  /api/commit/materialization/cancel:
     post:
       tags: [Placement]
-      operationId: cancelCommitReplication
-      summary: 取消 Commit 复制
-      description: 取消仍在进行中的 Commit 复制任务并保留临时数据供后续清理。
+      operationId: cancelCommitMaterialization
+      summary: 取消物化任务
+      description: 取消仍在进行中的目标物化任务；已验证对象不受影响，临时 staging 由租约回收。
       security:
         - BearerAuth: []
       parameters:
@@ -1426,7 +1393,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CancelCommitReplicationRequest"
+              $ref: "#/components/schemas/CancelCommitMaterializationRequest"
       responses:
         "200":
           description: 取消任务
@@ -1436,19 +1403,19 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CancelCommitReplicationResponse"
+                $ref: "#/components/schemas/CancelCommitMaterializationResponse"
         "401": { $ref: "#/components/responses/AuthenticationProblem" }
         "403": { $ref: "#/components/responses/AuthorizationProblem" }
         "409": { $ref: "#/components/responses/MutationConflictProblem" }
         "422": { $ref: "#/components/responses/ValidationProblem" }
         "500": { $ref: "#/components/responses/InternalProblem" }
 
-  /api/commit/placements/query:
+  /api/commit/coverage/query:
     post:
       tags: [Placement]
-      operationId: queryCommitPlacementList
-      summary: 查询 Commit Placement 列表
-      description: 查询 Commit 已发布、可用于读取的物理 PlacementSet 列表。
+      operationId: queryCommitCoverage
+      summary: 查询 Commit 的 Volume 覆盖
+      description: 查询对象级 Placement 派生的 Volume 覆盖摘要；partial 不代表目标视图可读。
       security:
         - BearerAuth: []
       parameters:
@@ -1460,7 +1427,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryCommitPlacementListRequest"
+              $ref: "#/components/schemas/QueryCommitCoverageRequest"
       responses:
         "200":
           description: Placement 列表
@@ -1470,7 +1437,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryCommitPlacementListResponse"
+                $ref: "#/components/schemas/QueryCommitCoverageResponse"
         "401": { $ref: "#/components/responses/AuthenticationProblem" }
         "403": { $ref: "#/components/responses/AuthorizationProblem" }
         "422": { $ref: "#/components/responses/ValidationProblem" }
@@ -1481,7 +1448,9 @@ paths:
       tags: [Placement]
       operationId: queryCommitAvailability
       summary: 查询 Commit 数据健康
-      description: 根据已发布 PlacementSet 计算 Commit 当前对象可用性。
+      description: |
+        返回全局对象内容是否可恢复、当前是否有可服务来源、耐久性策略状态、完整 Volume
+        数量和指定目标视图是否 Ready。结果按对象级 Verified Placement 计算，不依赖完整单盘副本。
       security:
         - BearerAuth: []
       parameters:
@@ -2574,8 +2543,8 @@ paths:
       operationId: querySnapshotList
       summary: 查询租户内 Snapshot
       description: |
-        按 Project、Artifact、Commit 或状态分页查询独立逻辑 Snapshot；物理可读性由已发布 PlacementSet
-        和相关 SnapshotDelivery 动态解析，不作为 Snapshot 筛选条件。
+        按 Project、Artifact、Commit 或状态分页查询独立逻辑 Snapshot；物理可读性由目标 Volume
+        的 Coverage 和相关 SnapshotDelivery 动态解析，不作为 Snapshot 筛选条件。
         opaque cursor 与全部筛选条件绑定。
       security:
         - BearerAuth: []
@@ -7450,10 +7419,33 @@ components:
         snapshot:
           $ref: "#/components/schemas/SnapshotView"
 
-    CreateCommitReplicationRequest:
+    ObjectNamespaceId:
+      type: string
+      minLength: 1
+      maxLength: 256
+      pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+
+    MaterializationCoverageGoal:
+      oneOf:
+        - type: string
+          const: complete
+        - type: object
+          additionalProperties: false
+          required: [object_count]
+          properties:
+            object_count:
+              $ref: "#/components/schemas/CanonicalU64"
+        - type: object
+          additionalProperties: false
+          required: [byte_count]
+          properties:
+            byte_count:
+              $ref: "#/components/schemas/CanonicalU64"
+
+    CreateCommitMaterializationRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, project_id, artifact_id, commit_id, target_storage_volume_id, request_id]
+      required: [tenant_id, project_id, artifact_id, object_namespace_id, commit_id, target_storage_volume_id, request_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -7461,88 +7453,112 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
         target_storage_volume_id:
           $ref: "#/components/schemas/StorageVolumeId"
+        coverage_goal:
+          $ref: "#/components/schemas/MaterializationCoverageGoal"
         request_id:
           $ref: "#/components/schemas/RequestId"
 
-    QueryCommitReplicationRequest:
+    QueryCommitMaterializationRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, replication_id]
+      required: [tenant_id, object_namespace_id, materialization_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
-        replication_id:
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
+        materialization_id:
           $ref: "#/components/schemas/ResourceId"
 
-    QueryCommitReplicationTicketRequest:
+    QueryCommitMaterializationListRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, replication_id]
+      required: [tenant_id, object_namespace_id, commit_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
-        replication_id:
-          $ref: "#/components/schemas/ResourceId"
-
-    QueryCommitReplicationListRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, commit_id]
-      properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
+        target_storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        cursor:
+          $ref: "#/components/schemas/PageCursor"
+        page_size:
+          $ref: "#/components/schemas/PageSize"
 
-    RetryCommitReplicationRequest:
+    RetryCommitMaterializationRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, replication_id, expected_attempt, request_id]
+      required: [tenant_id, object_namespace_id, materialization_id, expected_plan_revision, request_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
-        replication_id:
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
+        materialization_id:
           $ref: "#/components/schemas/ResourceId"
-        expected_attempt:
+        expected_plan_revision:
           $ref: "#/components/schemas/CanonicalU64"
         request_id:
           $ref: "#/components/schemas/RequestId"
 
-    CancelCommitReplicationRequest:
+    CancelCommitMaterializationRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, replication_id, expected_attempt]
+      required: [tenant_id, object_namespace_id, materialization_id, expected_plan_revision]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
-        replication_id:
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
+        materialization_id:
           $ref: "#/components/schemas/ResourceId"
-        expected_attempt:
+        expected_plan_revision:
           $ref: "#/components/schemas/CanonicalU64"
 
-    QueryCommitPlacementListRequest:
+    QueryCommitCoverageRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, commit_id]
+      required: [tenant_id, object_namespace_id, commit_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
+        storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        cursor:
+          $ref: "#/components/schemas/PageCursor"
+        page_size:
+          $ref: "#/components/schemas/PageSize"
 
     QueryCommitAvailabilityRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, commit_id]
+      required: [tenant_id, object_namespace_id, commit_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
+        target_storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        cursor:
+          $ref: "#/components/schemas/PageCursor"
+        page_size:
+          $ref: "#/components/schemas/PageSize"
 
     CreateWorkspaceRequest:
       type: object
@@ -7562,281 +7578,193 @@ components:
         request_id:
           $ref: "#/components/schemas/RequestId"
 
-    ReplicationView:
+    MaterializationView:
       type: object
       additionalProperties: false
-      required: [replication_id, tenant_id, commit_id, target_storage_volume_id, attempt, state, object_set_digest, completed_objects, total_objects, completed_bytes, total_bytes]
+      required: [materialization_id, tenant_id, object_namespace_id, commit_id, target_storage_volume_id, plan_revision, coverage_goal, state, object_set_digest, verified_objects, total_objects, verified_bytes, total_bytes, missing_objects, missing_bytes, source_count]
       properties:
-        replication_id:
+        materialization_id:
           $ref: "#/components/schemas/ResourceId"
         tenant_id:
           $ref: "#/components/schemas/TenantId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
         target_storage_volume_id:
           $ref: "#/components/schemas/StorageVolumeId"
-        attempt:
+        plan_revision:
           $ref: "#/components/schemas/CanonicalU64"
+        coverage_goal:
+          $ref: "#/components/schemas/MaterializationCoverageGoal"
         state:
           type: string
-          enum: [queued, planning, transferring, verifying, published, failed, cancelled]
+          enum: [queued, planning, waiting_for_sources, materializing, verifying, complete, stalled, failed, cancelled]
         object_set_digest:
           $ref: "#/components/schemas/ContentDigest"
-        completed_objects:
+        verified_objects:
           $ref: "#/components/schemas/CanonicalU64"
         total_objects:
           $ref: "#/components/schemas/CanonicalU64"
-        source_placement_set_id:
-          $ref: "#/components/schemas/ResourceId"
-        source_storage_volume_id:
-          $ref: "#/components/schemas/StorageVolumeId"
-        source_edge_cluster_id:
-          $ref: "#/components/schemas/ResourceId"
-        source_gateway_pool_id:
-          $ref: "#/components/schemas/ResourceId"
-        source_agent_id:
-          $ref: "#/components/schemas/ResourceId"
-        source_session_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        source_mount_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        source_route_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        target_edge_cluster_id:
-          $ref: "#/components/schemas/ResourceId"
-        target_gateway_pool_id:
-          $ref: "#/components/schemas/ResourceId"
-        target_agent_id:
-          $ref: "#/components/schemas/ResourceId"
-        target_session_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        target_mount_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        target_route_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        transfer_route_id:
-          $ref: "#/components/schemas/ResourceId"
-        transfer_id:
-          $ref: "#/components/schemas/ResourceId"
-        target_placement_set_id:
-          $ref: "#/components/schemas/ResourceId"
-        staging_id:
-          $ref: "#/components/schemas/ResourceId"
-        completed_bytes:
+        verified_bytes:
           $ref: "#/components/schemas/CanonicalU64"
         total_bytes:
+          $ref: "#/components/schemas/CanonicalU64"
+        missing_objects:
+          $ref: "#/components/schemas/CanonicalU64"
+        missing_bytes:
+          $ref: "#/components/schemas/CanonicalU64"
+        source_count:
           $ref: "#/components/schemas/CanonicalU64"
         issue:
           $ref: "#/components/schemas/ResourceIssueSummary"
 
-    CreateCommitReplicationResponse:
+    CreateCommitMaterializationResponse:
       type: object
       additionalProperties: false
-      required: [replication, replayed]
+      required: [materialization, replayed]
       properties:
-        replication:
-          $ref: "#/components/schemas/ReplicationView"
+        materialization:
+          $ref: "#/components/schemas/MaterializationView"
         replayed:
           type: boolean
 
-    QueryCommitReplicationResponse:
+    QueryCommitMaterializationResponse:
       type: object
       additionalProperties: false
-      required: [replication]
+      required: [materialization]
       properties:
-        replication:
-          $ref: "#/components/schemas/ReplicationView"
+        materialization:
+          $ref: "#/components/schemas/MaterializationView"
 
-    TransferEndpoint:
+    RetryCommitMaterializationResponse:
       type: object
       additionalProperties: false
-      required: [placement_id, agent_id, gateway_pool_id, edge_cluster_id]
+      required: [materialization, replayed]
       properties:
-        placement_id:
-          $ref: "#/components/schemas/ResourceId"
-        agent_id:
-          $ref: "#/components/schemas/ResourceId"
-        gateway_pool_id:
-          $ref: "#/components/schemas/GatewayPoolId"
-        edge_cluster_id:
-          $ref: "#/components/schemas/EdgeClusterId"
-        storage_volume_id:
-          $ref: "#/components/schemas/StorageVolumeId"
-
-    TransferTicket:
-      type: object
-      additionalProperties: false
-      required: [transfer_id, tenant_id, artifact_id, commit_id, object_set_digest, source, target, session_generation, mount_generation, route_generation, deadline_unix_ms, max_bytes, allowed_objects]
-      properties:
-        transfer_id:
-          $ref: "#/components/schemas/ResourceId"
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        artifact_id:
-          $ref: "#/components/schemas/ArtifactId"
-        commit_id:
-          $ref: "#/components/schemas/CommitId"
-        object_set_digest:
-          $ref: "#/components/schemas/ContentDigest"
-        source:
-          $ref: "#/components/schemas/TransferEndpoint"
-        target:
-          $ref: "#/components/schemas/TransferEndpoint"
-        source_session_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        source_mount_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        source_route_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        session_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        mount_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        route_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        deadline_unix_ms:
-          $ref: "#/components/schemas/UnixMillis"
-        max_bytes:
-          $ref: "#/components/schemas/DecimalU64"
-        allowed_objects:
-          type: array
-          maxItems: 65535
-          items:
-            $ref: "#/components/schemas/ContentDigest"
-
-    CentralSignedPayload:
-      type: object
-      additionalProperties: false
-      required: [key_id, certificate_generation, signed_at_unix_ms, expires_at_unix_ms, payload_digest, payload, signature]
-      properties:
-        key_id:
-          type: string
-          minLength: 1
-          maxLength: 1024
-        certificate_generation:
-          $ref: "#/components/schemas/CanonicalU64"
-        signed_at_unix_ms:
-          $ref: "#/components/schemas/UnixMillis"
-        expires_at_unix_ms:
-          $ref: "#/components/schemas/UnixMillis"
-        payload_digest:
-          $ref: "#/components/schemas/ContentDigest"
-        payload:
-          type: string
-          maxLength: 16777216
-          pattern: "^[A-Za-z0-9_-]*$"
-        signature:
-          type: string
-          minLength: 86
-          maxLength: 86
-          pattern: "^[A-Za-z0-9_-]+$"
-        extensions:
-          type: object
-          additionalProperties: false
-
-    SignedTransferTicket:
-      type: object
-      additionalProperties: false
-      required: [ticket, central_signature]
-      properties:
-        ticket:
-          $ref: "#/components/schemas/TransferTicket"
-        central_signature:
-          $ref: "#/components/schemas/CentralSignedPayload"
-
-    QueryCommitReplicationTicketResponse:
-      type: object
-      additionalProperties: false
-      required: [ticket]
-      properties:
-        ticket:
-          $ref: "#/components/schemas/TransferTicket"
-        signed_ticket:
-          $ref: "#/components/schemas/SignedTransferTicket"
-
-    RetryCommitReplicationResponse:
-      type: object
-      additionalProperties: false
-      required: [replication, replayed]
-      properties:
-        replication:
-          $ref: "#/components/schemas/ReplicationView"
+        materialization:
+          $ref: "#/components/schemas/MaterializationView"
         replayed:
           type: boolean
 
-    CancelCommitReplicationResponse:
+    CancelCommitMaterializationResponse:
       type: object
       additionalProperties: false
-      required: [replication]
+      required: [materialization]
       properties:
-        replication:
-          $ref: "#/components/schemas/ReplicationView"
+        materialization:
+          $ref: "#/components/schemas/MaterializationView"
 
-    QueryCommitReplicationListResponse:
+    QueryCommitMaterializationListResponse:
       type: object
       additionalProperties: false
-      required: [replications]
+      required: [materializations]
       properties:
-        replications:
+        materializations:
           type: array
+          maxItems: 100
           items:
-            $ref: "#/components/schemas/ReplicationView"
+            $ref: "#/components/schemas/MaterializationView"
+        next_cursor:
+          $ref: "#/components/schemas/PageCursor"
 
-    CommitPlacementView:
+    VolumeCommitCoverageView:
       type: object
       additionalProperties: false
-      required: [placement_set_id, commit_id, backend_id, object_set_digest, object_count, verified_object_count, placement_generation, state]
+      required: [object_namespace_id, commit_id, storage_volume_id, placement_generation, object_set_digest, total_objects, verified_objects, total_bytes, verified_bytes, missing_objects, missing_bytes, state]
       properties:
-        placement_set_id:
-          $ref: "#/components/schemas/ResourceId"
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
-        backend_id:
-          $ref: "#/components/schemas/ResourceId"
         storage_volume_id:
           $ref: "#/components/schemas/StorageVolumeId"
-        object_set_digest:
-          $ref: "#/components/schemas/ContentDigest"
-        object_count:
-          $ref: "#/components/schemas/CanonicalU64"
-        verified_object_count:
-          $ref: "#/components/schemas/CanonicalU64"
         placement_generation:
+          $ref: "#/components/schemas/CanonicalU64"
+        object_set_digest:
+          $ref: "#/components/schemas/ContentDigest"
+        total_objects:
+          $ref: "#/components/schemas/CanonicalU64"
+        verified_objects:
+          $ref: "#/components/schemas/CanonicalU64"
+        total_bytes:
+          $ref: "#/components/schemas/CanonicalU64"
+        verified_bytes:
+          $ref: "#/components/schemas/CanonicalU64"
+        missing_objects:
+          $ref: "#/components/schemas/CanonicalU64"
+        missing_bytes:
           $ref: "#/components/schemas/CanonicalU64"
         state:
           type: string
-          enum: [staged, published, retiring, deleted]
+          enum: [partial, complete, retiring, deleted]
 
-    QueryCommitPlacementListResponse:
+    QueryCommitCoverageResponse:
       type: object
       additionalProperties: false
-      required: [placements]
+      required: [coverage]
       properties:
-        placements:
+        coverage:
           type: array
+          maxItems: 100
           items:
-            $ref: "#/components/schemas/CommitPlacementView"
+            $ref: "#/components/schemas/VolumeCommitCoverageView"
+        next_cursor:
+          $ref: "#/components/schemas/PageCursor"
 
     CommitAvailabilityView:
       type: object
       additionalProperties: false
-      required: [commit_id, data_health, verified_placements, missing_objects, verified_storage_volume_ids]
+      required: [object_namespace_id, commit_id, object_count, content_presence, source_serving, durability, target_coverage, view_readiness, complete_volume_count, missing_objects, verified_storage_volume_ids]
       properties:
+        object_namespace_id:
+          $ref: "#/components/schemas/ObjectNamespaceId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
-        data_health:
+        object_count:
+          $ref: "#/components/schemas/CanonicalU64"
+        content_presence:
           type: string
           enum: [available, degraded, unavailable]
-        verified_placements:
+        source_serving:
+          type: string
+          enum: [available, degraded, unavailable]
+        durability:
+          type: string
+          enum: [satisfied, under_replicated, unavailable]
+        target_coverage:
+          type: string
+          enum: [not_requested, partial, complete, unavailable]
+        view_readiness:
+          type: string
+          enum: [ready, not_ready, unavailable]
+        complete_volume_count:
           $ref: "#/components/schemas/CanonicalU64"
         missing_objects:
-          $ref: "#/components/schemas/CanonicalU64"
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/MissingObjectView"
         verified_storage_volume_ids:
           type: array
+          maxItems: 100
           items:
             $ref: "#/components/schemas/StorageVolumeId"
+
+    MissingObjectView:
+      type: object
+      additionalProperties: false
+      required: [object_id, size, encoding]
+      properties:
+        object_id:
+          $ref: "#/components/schemas/ContentDigest"
+        size:
+          $ref: "#/components/schemas/CanonicalU64"
+        encoding:
+          type: string
+          enum: [raw, zstd]
 
     QueryCommitAvailabilityResponse:
       type: object
@@ -8245,7 +8173,7 @@ components:
           $ref: "#/components/schemas/SnapshotState"
         data_health:
           type: string
-          description: Commit object availability resolved from the currently published PlacementSets.
+          description: Commit object availability resolved from object-level Verified Placements and derived Volume Coverage.
           enum: [available, degraded, unavailable]
         issue:
           $ref: "#/components/schemas/ResourceIssueSummary"

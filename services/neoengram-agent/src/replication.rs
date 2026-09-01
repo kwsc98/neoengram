@@ -12,7 +12,8 @@ use std::{
 
 use neoengram_domain::core::{ContentDigest, ObjectId};
 use neoengram_domain::protocol::{
-    AgentId, CommitObject, MountGeneration, ReplicationAssignment, ReplicationId,
+    materialization_target_placement_id, AgentId, CommitObject, MaterializationAssignment,
+    MaterializationReport, MountGeneration, ReplicationAssignment, ReplicationId,
     ReplicationObjectState, ReplicationProgressReport, ReplicationState, SignedTransferTicket,
     TenantId, TransferId, TransferTicket, UnixMillis,
 };
@@ -22,8 +23,8 @@ use neoengram_runtime::{
 
 use crate::{AgentDaemonError, AgentDaemonResult, AgentReport, Clock, OutboundReportQueue};
 use crate::{
-    CentralCommandTrustBundle, FilesystemExecution, QuicTransferClientConfig, QuicTransferIdentity,
-    QuicTransferNetwork, SharedSessionFence,
+    CentralCommandTrustBundle, FilesystemExecution, QuicTransferClient, QuicTransferClientConfig,
+    QuicTransferIdentity, QuicTransferNetwork, SharedSessionFence,
 };
 
 const REMOTE_TRANSFER_MAX_RETRIES: u32 = 8;
@@ -58,6 +59,301 @@ pub trait ReplicationAssignmentExecutor: Send + Sync {
         assignment: &ReplicationAssignment,
         progress: &dyn ReplicationProgressSink,
     ) -> AgentDaemonResult<()>;
+}
+
+/// Executes one Central-issued object-level v2 materialization batch.  The executor is deliberately
+/// separate from the legacy whole-Commit replication worker: a batch carries a bounded manifest,
+/// and every successful object produces an independent durable receipt.
+pub trait MaterializationAssignmentExecutor: Send + Sync {
+    fn execute(&self, assignment: &MaterializationAssignment) -> AgentDaemonResult<()>;
+}
+
+/// Mounted-Volume implementation of [`MaterializationAssignmentExecutor`].  It opens the local
+/// artifact-scoped CAS only after validating the Central ticket and target session fence, then
+/// sends the batch through the Gateway relay and persists receipts in the Agent outbox.
+#[derive(Debug, Clone)]
+pub struct MountedVolumeMaterializationExecutor {
+    execution: Arc<FilesystemExecution>,
+    local_tenant_id: TenantId,
+    local_agent_id: AgentId,
+    local_volume_id: neoengram_domain::protocol::StorageVolumeId,
+    trust_bundle: Option<Arc<CentralCommandTrustBundle>>,
+    network: Option<Arc<QuicTransferNetwork>>,
+    session_fence: Option<SharedSessionFence>,
+    local_mount_generation: Option<MountGeneration>,
+    reports: Arc<dyn OutboundReportQueue>,
+    clock: Arc<dyn Clock>,
+}
+
+impl MountedVolumeMaterializationExecutor {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_network_and_session_fence(
+        execution: Arc<FilesystemExecution>,
+        local_tenant_id: TenantId,
+        local_agent_id: AgentId,
+        local_volume_id: neoengram_domain::protocol::StorageVolumeId,
+        trust_bundle: Option<Arc<CentralCommandTrustBundle>>,
+        clock: Arc<dyn Clock>,
+        network: Option<Arc<QuicTransferNetwork>>,
+        session_fence: Option<SharedSessionFence>,
+        local_mount_generation: Option<MountGeneration>,
+        reports: Arc<dyn OutboundReportQueue>,
+    ) -> Self {
+        Self {
+            execution,
+            local_tenant_id,
+            local_agent_id,
+            local_volume_id,
+            trust_bundle,
+            network,
+            session_fence,
+            local_mount_generation,
+            reports,
+            clock,
+        }
+    }
+
+    fn failure_report(
+        &self,
+        assignment: &MaterializationAssignment,
+        code: &str,
+        message: impl Into<String>,
+    ) -> AgentDaemonResult<()> {
+        let ticket = &assignment.signed_ticket.ticket;
+        let issue_message = message.into();
+        let issue_message = issue_message.chars().take(4096).collect::<String>();
+        let report = MaterializationReport::Failed {
+            materialization_id: ticket.materialization_id.clone(),
+            batch_id: ticket.batch_id.clone(),
+            plan_revision: ticket.plan_revision,
+            batch_attempt: ticket.batch_attempt,
+            tenant_id: ticket.tenant_id.clone(),
+            object_namespace_id: ticket.object_namespace_id.clone(),
+            target: ticket.target.clone(),
+            object_id: None,
+            issue_code: code.to_owned(),
+            issue_message,
+            extensions: neoengram_domain::protocol::Extensions::new(),
+        };
+        self.reports
+            .enqueue(
+                AgentReport::Materialization(Box::new(report)),
+                UnixMillis::new(self.clock.now_unix_ms()?),
+            )
+            .map(|_| ())
+            .map_err(AgentDaemonError::from)
+    }
+}
+
+impl MaterializationAssignmentExecutor for MountedVolumeMaterializationExecutor {
+    fn execute(&self, assignment: &MaterializationAssignment) -> AgentDaemonResult<()> {
+        assignment
+            .validate()
+            .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+        let ticket = &assignment.signed_ticket.ticket;
+        if ticket.tenant_id != self.local_tenant_id
+            || ticket.target.tenant_id != self.local_tenant_id
+            || ticket.target.agent_id != self.local_agent_id
+            || ticket.target.storage_volume_id != self.local_volume_id
+        {
+            self.failure_report(
+                assignment,
+                "MATERIALIZATION_TARGET_MISMATCH",
+                "materialization target is not bound to this Agent Volume",
+            )?;
+            return Err(AgentDaemonError::Session(
+                "materialization target is not bound to this Agent Volume".to_owned(),
+            ));
+        }
+        let Some(trust_bundle) = &self.trust_bundle else {
+            self.failure_report(
+                assignment,
+                "MATERIALIZATION_TRUST_UNAVAILABLE",
+                "Central materialization trust bundle is not configured",
+            )?;
+            return Err(AgentDaemonError::Session(
+                "Central materialization trust bundle is not configured".to_owned(),
+            ));
+        };
+        let Some(network) = &self.network else {
+            self.failure_report(
+                assignment,
+                "MATERIALIZATION_ROUTE_UNAVAILABLE",
+                "Gateway QUIC network is not configured",
+            )?;
+            return Err(AgentDaemonError::SessionTransport(
+                "Gateway QUIC network is not configured".to_owned(),
+            ));
+        };
+        let target = self
+            .execution
+            .replication_backend(ticket.tenant_id.clone(), ticket.artifact_id.clone())
+            .map_err(AgentDaemonError::from)?;
+        // A source/Gateway disconnect is recoverable while the signed Batch ticket is still
+        // valid. Retry the same immutable assignment with exponential backoff; the runtime CAS
+        // reads its durable staging offset on every attempt, so no bytes are retransmitted from
+        // zero. Central may still redeliver a later plan revision to switch source routes, but a
+        // short-lived network flap should not consume that recovery path or leave the dispatcher
+        // idle until the next control-channel delivery tick.
+        let mut retry_delay = REMOTE_TRANSFER_INITIAL_RETRY_DELAY;
+        let mut transfer_error = None;
+        let transfer_result = 'transfer: {
+            for retry in 0..=REMOTE_TRANSFER_MAX_RETRIES {
+                let now = self.clock.now_unix_ms()?;
+                if now >= ticket.deadline_unix_ms.get() {
+                    transfer_error = Some(crate::QuicTransferError::Expired);
+                    break;
+                }
+
+                let identity = match (&self.session_fence, self.local_mount_generation) {
+                    (Some(fence), Some(mount_generation)) => {
+                        let current = fence.get().map_err(|error| {
+                            AgentDaemonError::Session(format!(
+                                "materialization session fence: {error}"
+                            ))
+                        })?;
+                        if current.session_generation != ticket.target.session_generation
+                            || mount_generation != ticket.target.mount_generation
+                        {
+                            self.failure_report(
+                                assignment,
+                                "MATERIALIZATION_SESSION_FENCED",
+                                "materialization target session or mount generation is stale",
+                            )?;
+                            return Err(AgentDaemonError::Session(
+                                "materialization target session or mount generation is stale"
+                                    .to_owned(),
+                            ));
+                        }
+                        QuicTransferIdentity::new(self.local_agent_id.clone()).with_session_mount(
+                            current.session_generation.get(),
+                            mount_generation.get(),
+                        )
+                    }
+                    _ => QuicTransferIdentity::new(self.local_agent_id.clone()).with_generations(
+                        ticket.target.session_generation.get(),
+                        ticket.target.mount_generation.get(),
+                        ticket.target.route_generation.get(),
+                    ),
+                };
+
+                let attempt = block_on(network.connect_gateway()).and_then(|connection| {
+                    let client =
+                        QuicTransferClient::new(connection, QuicTransferClientConfig::default())
+                            .map_err(|error| crate::QuicTransferError::Protocol(error.to_string()))?
+                            .with_identity(identity);
+                    block_on(client.materialize_batch(
+                        &assignment.signed_ticket,
+                        &assignment.batch,
+                        &assignment.manifest,
+                        &assignment.pages,
+                        &target,
+                        trust_bundle,
+                        now,
+                    ))
+                });
+                match attempt {
+                    Ok(receipts) => break 'transfer Ok(receipts),
+                    Err(error)
+                        if error.is_transient()
+                            && retry < REMOTE_TRANSFER_MAX_RETRIES
+                            && self.clock.now_unix_ms()? < ticket.deadline_unix_ms.get() =>
+                    {
+                        tracing::debug!(
+                            materialization_id = %ticket.materialization_id,
+                            batch_id = %ticket.batch_id,
+                            retry,
+                            error = %error,
+                            "materialization transport is unavailable; retrying"
+                        );
+                        std::thread::sleep(retry_delay);
+                        retry_delay = retry_delay
+                            .saturating_mul(2)
+                            .min(REMOTE_TRANSFER_MAX_RETRY_DELAY);
+                    }
+                    Err(error) => {
+                        transfer_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            Err(transfer_error
+                .take()
+                .unwrap_or(crate::QuicTransferError::Expired))
+        };
+        let receipts = match transfer_result {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                let transient = error.is_transient();
+                let message = format!("materialization transfer failed: {error}");
+                if !transient {
+                    self.failure_report(assignment, "MATERIALIZATION_TRANSFER_FAILED", &message)?;
+                    return Err(AgentDaemonError::Session(message));
+                }
+                return Err(AgentDaemonError::SessionTransport(message));
+            }
+        };
+        for receipt in receipts {
+            receipt
+                .validate_against_ticket(
+                    ticket,
+                    &receipt_object_ref(assignment, receipt.object_id)?,
+                )
+                .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+            let placement = neoengram_domain::protocol::materialization::ObjectPlacement {
+                placement_id: materialization_target_placement_id(&receipt)
+                    .map_err(|error| AgentDaemonError::Session(error.to_string()))?,
+                tenant_id: receipt.tenant_id.clone(),
+                object_namespace_id: receipt.object_namespace_id.clone(),
+                object_id: receipt.object_id,
+                size: receipt.size,
+                encoding: receipt.encoding,
+                verified_digest: receipt.verified_digest,
+                storage_volume_id: Some(receipt.target_storage_volume_id.clone()),
+                archive_id: None,
+                placement_generation: receipt.target_placement_generation,
+                state: neoengram_domain::protocol::materialization::ObjectPlacementState::Verified,
+                failure_domain: format!("volume:{}", receipt.target_storage_volume_id),
+            };
+            if let Err(error) = self.execution.record_local_placement(placement) {
+                self.failure_report(
+                    assignment,
+                    "MATERIALIZATION_INVENTORY_FAILED",
+                    error.to_string(),
+                )?;
+                return Err(error.into());
+            }
+            self.reports
+                .enqueue(
+                    AgentReport::Materialization(Box::new(MaterializationReport::Receipt {
+                        receipt,
+                        target: ticket.target.clone(),
+                        extensions: neoengram_domain::protocol::Extensions::new(),
+                    })),
+                    UnixMillis::new(self.clock.now_unix_ms()?),
+                )
+                .map_err(AgentDaemonError::from)?;
+        }
+        Ok(())
+    }
+}
+
+fn receipt_object_ref(
+    assignment: &MaterializationAssignment,
+    object_id: ObjectId,
+) -> AgentDaemonResult<neoengram_domain::protocol::ObjectRef> {
+    assignment
+        .pages
+        .iter()
+        .flat_map(|page| page.objects.iter())
+        .find(|object| object.object_id == object_id)
+        .cloned()
+        .ok_or_else(|| {
+            AgentDaemonError::Session(
+                "materialization receipt object is absent from the signed manifest".to_owned(),
+            )
+        })
 }
 
 /// Artifact-scoped replication adapter for a mounted Agent Volume.

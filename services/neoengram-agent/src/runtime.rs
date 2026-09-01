@@ -1113,8 +1113,12 @@ pub(crate) fn agent_capabilities(config: &AgentConfig, replication_ready: bool) 
         "workspace_materialize_v1".to_owned(),
     ];
     capabilities.push("snapshot_delivery_copy_v2".to_owned());
+    // The v2 executor is installed by the approved runtime and uses the same dedicated QUIC
+    // network as the replication worker. Advertise the capability only after the preflight has
+    // succeeded; Central must never route a materialization batch to an Agent whose Gateway
+    // transfer path is unavailable.
     if config.replication.enabled && replication_ready {
-        capabilities.push("commit_replication_quic_v1".to_owned());
+        capabilities.push("commit_materialization_v2".to_owned());
     }
     // The v2 FUSE backend and the device/inode proof required by Hardlink Delivery are only
     // implemented on these Unix targets. Do not advertise a mode that would fail after Central
@@ -2058,6 +2062,30 @@ mod tests {
                 level: "info".into(),
             },
         }
+    }
+
+    #[test]
+    fn materialization_capability_requires_enabled_preflight() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path(), directory.path().join("bootstrap-token"));
+        config.replication.enabled = true;
+
+        let capabilities = agent_capabilities(&config, false);
+
+        assert!(!capabilities
+            .iter()
+            .any(|capability| capability == "commit_materialization_v2"));
+
+        let capabilities = agent_capabilities(&config, true);
+        assert!(capabilities
+            .iter()
+            .any(|capability| capability == "commit_materialization_v2"));
+
+        config.replication.enabled = false;
+        let capabilities = agent_capabilities(&config, true);
+        assert!(!capabilities
+            .iter()
+            .any(|capability| capability == "commit_materialization_v2"));
     }
 
     fn ready_probe() -> FilesystemMountObservation {

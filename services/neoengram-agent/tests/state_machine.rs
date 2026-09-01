@@ -1340,9 +1340,10 @@ impl ReportSink for RecordingReportSink {
             AgentReport::Prepared(_) => Some("prepared_reported"),
             AgentReport::Finalized(_) => Some("finalized_reported"),
             AgentReport::Failed(_) => Some("failure_reported"),
-            AgentReport::Progress(_) | AgentReport::Lifecycle(_) | AgentReport::Replication(_) => {
-                None
-            }
+            AgentReport::Progress(_)
+            | AgentReport::Lifecycle(_)
+            | AgentReport::Replication(_)
+            | AgentReport::Materialization(_) => None,
         };
         if let Some(event) = event {
             self.events.lock().unwrap().push(event);

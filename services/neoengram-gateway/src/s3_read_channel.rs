@@ -413,7 +413,7 @@ impl S3ReadChannelRegistry {
                 return channel_problem(
                     StatusCode::GATEWAY_TIMEOUT,
                     "S3 read channel handshake timed out",
-                )
+                );
             }
         };
         if peer_agent_id
@@ -449,7 +449,7 @@ impl S3ReadChannelRegistry {
                 return channel_problem(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "S3 read channel acknowledgement failed",
-                )
+                );
             }
         };
         if outgoing.try_send(ready).is_err() {
@@ -560,7 +560,7 @@ impl S3ReadChannelRegistry {
                 return channel_problem(
                     StatusCode::GATEWAY_TIMEOUT,
                     "S3 peer read handshake timed out",
-                )
+                );
             }
         };
         if open.start != open.ticket.allowed_start
@@ -581,7 +581,7 @@ impl S3ReadChannelRegistry {
                 return channel_problem(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "S3 peer owner route is unavailable",
-                )
+                );
             }
         };
         peer_stream_response(read, expected_length)

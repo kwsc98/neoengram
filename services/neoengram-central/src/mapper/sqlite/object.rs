@@ -17,13 +17,13 @@ impl ObjectCatalog for SqliteAuthorityStore {
         }
         let payload = encode(evidence)?;
         let result = sqlx::query(
-            "INSERT OR IGNORE INTO object_placements \
+            "INSERT OR IGNORE INTO managed_object_placement_evidence \
              (tenant_id, receipt_id, artifact_id, job_id, storage_volume_id, \
               artifact_placement_id, placement_generation, object_id, size, \
               verified_at_unix_ms, payload) \
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE NOT EXISTS ( \
-                 SELECT 1 FROM object_placements \
+                 SELECT 1 FROM managed_object_placement_evidence \
                  WHERE tenant_id = ? AND artifact_id = ? AND storage_volume_id = ? \
                    AND artifact_placement_id = ? AND placement_generation = ? \
                    AND object_id = ? AND size <> ? \
@@ -55,7 +55,7 @@ impl ObjectCatalog for SqliteAuthorityStore {
         }
 
         let existing_payload: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT payload FROM object_placements WHERE tenant_id = ? AND receipt_id = ?",
+            "SELECT payload FROM managed_object_placement_evidence WHERE tenant_id = ? AND receipt_id = ?",
         )
         .bind(receipt.tenant_id.as_str())
         .bind(receipt.receipt_id.as_str())
@@ -112,7 +112,7 @@ impl ObjectCatalog for SqliteAuthorityStore {
         object_id: ObjectId,
     ) -> CentralResult<Option<ObjectPlacementEvidence>> {
         let payload: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT payload FROM object_placements \
+            "SELECT payload FROM managed_object_placement_evidence \
              WHERE tenant_id = ? AND artifact_id = ? AND storage_volume_id = ? \
                AND artifact_placement_id = ? AND placement_generation = ? AND object_id = ? \
              ORDER BY rowid DESC LIMIT 1",
@@ -152,7 +152,7 @@ impl ObjectCatalog for SqliteAuthorityStore {
         artifact_id: &ArtifactId,
     ) -> CentralResult<Vec<StorageVolumeId>> {
         let values: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT storage_volume_id FROM object_placements \
+            "SELECT DISTINCT storage_volume_id FROM managed_object_placement_evidence \
              WHERE tenant_id = ? AND artifact_id = ? ORDER BY storage_volume_id",
         )
         .bind(tenant_id.as_str())
@@ -178,10 +178,10 @@ impl ObjectCatalog for SqliteAuthorityStore {
         storage_volume_id: &StorageVolumeId,
     ) -> CentralResult<Vec<ArtifactId>> {
         let values: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT candidate.artifact_id FROM object_placements AS candidate \
+            "SELECT DISTINCT candidate.artifact_id FROM managed_object_placement_evidence AS candidate \
              WHERE candidate.tenant_id = ? AND candidate.storage_volume_id = ? \
                AND NOT EXISTS ( \
-                   SELECT 1 FROM object_placements AS replica \
+                   SELECT 1 FROM managed_object_placement_evidence AS replica \
                    WHERE replica.tenant_id = candidate.tenant_id \
                      AND replica.artifact_id = candidate.artifact_id \
                      AND replica.object_id = candidate.object_id \

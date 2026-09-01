@@ -492,6 +492,7 @@ describe('Snapshot detail page', () => {
     expect(api.queryCommitReplicationList).toHaveBeenCalledWith({
       tenant_id: 'tenant-a',
       commit_id: commitId,
+      object_namespace_id: 'artifact-a',
     });
     expect(api.queryGatewayPoolList).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain('路由由 Central 校验');
@@ -559,6 +560,7 @@ describe('Snapshot detail page', () => {
 
     expect(api.cancelCommitReplication.mock.calls[0]?.[0]).toEqual({
       tenant_id: 'tenant-a',
+      object_namespace_id: 'artifact-a',
       replication_id: 'replication-active',
       expected_attempt: '7',
     });
@@ -602,6 +604,7 @@ describe('Snapshot detail page', () => {
 
     expect(api.retryCommitReplication.mock.calls[0]?.[0]).toEqual({
       tenant_id: 'tenant-a',
+      object_namespace_id: 'artifact-a',
       replication_id: 'replication-failed',
       expected_attempt: '3',
       request_id: commitReplicationRetryRequestId('replication-failed', '3'),

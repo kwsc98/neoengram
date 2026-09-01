@@ -216,7 +216,11 @@ const replicationListQuery = useQuery({
     'artifact-detail',
   ]),
   queryFn: () =>
-    queryCommitReplicationList({ tenant_id: tenantId.value, commit_id: selectedCommitId.value }),
+    queryCommitReplicationList({
+      tenant_id: tenantId.value,
+      commit_id: selectedCommitId.value,
+      object_namespace_id: artifactId.value,
+    }),
   enabled: computed(
     () =>
       artifactCommitReplicationEnabled.value &&
@@ -236,7 +240,11 @@ const placementListQuery = useQuery({
     'artifact-detail',
   ]),
   queryFn: () =>
-    queryCommitPlacementList({ tenant_id: tenantId.value, commit_id: selectedCommitId.value }),
+    queryCommitPlacementList({
+      tenant_id: tenantId.value,
+      commit_id: selectedCommitId.value,
+      object_namespace_id: artifactId.value,
+    }),
   enabled: computed(
     () =>
       artifactCommitReplicationEnabled.value &&
@@ -473,6 +481,7 @@ async function retrySelectedReplication(
   if (retryReplicationMutation.isPending.value) return;
   await retryReplicationMutation.mutateAsync({
     tenant_id: tenantId.value,
+    object_namespace_id: replication.artifact_id ?? artifactId.value,
     replication_id: replication.replication_id,
     expected_attempt: replication.attempt,
     request_id: commitReplicationRetryRequestId(replication.replication_id, replication.attempt),
@@ -487,6 +496,7 @@ async function cancelSelectedReplication(
   if (cancelReplicationMutation.isPending.value) return;
   await cancelReplicationMutation.mutateAsync({
     tenant_id: tenantId.value,
+    object_namespace_id: replication.artifact_id ?? artifactId.value,
     replication_id: replication.replication_id,
     expected_attempt: replication.attempt,
   });

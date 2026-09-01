@@ -15,6 +15,8 @@ mod error;
 mod gateway;
 mod ids;
 mod lifecycle;
+/// Clean-slate v2 object placement and multi-source materialization contracts.
+pub mod materialization;
 mod metadata;
 mod placement;
 mod s3;
@@ -36,12 +38,32 @@ pub use gateway::*;
 pub use ids::*;
 pub use lifecycle::*;
 pub use metadata::*;
+// Keep v2 names namespaced under `protocol::materialization` so legacy v1 callers cannot
+// accidentally mix the two placement models during the destructive protocol migration.
+pub use materialization::CommitObjectSet as CommitObjectSetV2;
+pub use materialization::{
+    materialization_target_placement_id, object_read_lease_id, staging_lease_id,
+    AvailabilityStatus, BatchManifest, BatchManifestPage, CommitAvailability, CoverageGoal,
+    CoverageState, DurabilityPolicy, MaterializationAssignment, MaterializationBatch,
+    MaterializationBatchState, MaterializationBatchTicket, MaterializationJob,
+    MaterializationJobKey, MaterializationJobState, MaterializationLease,
+    MaterializationLeaseState, MaterializationManifestSource, MaterializationObject,
+    MaterializationObjectReceipt, MaterializationObjectState, MaterializationProtocolSchema,
+    MaterializationReport, MaterializationSource, MaterializationTarget, MaterializationTicket,
+    NamespaceObjectSet, ObjectPlacement as MaterializationObjectPlacement, ObjectPlacementState,
+    ObjectReadLease, ObjectReceipt, ObjectRef, SignedMaterializationBatchTicket,
+    SignedMaterializationTicket, StagingLease, ViewReadiness, VolumeCommitCoverage,
+    COMMIT_MATERIALIZATION_CAPABILITY_V2, MATERIALIZATION_PROTOCOL_VERSION,
+    MATERIALIZATION_TRANSFER_ALPN_V2, MAX_DURABILITY_REGIONS, MAX_MATERIALIZATION_BATCH_OBJECTS,
+    MAX_MATERIALIZATION_ERROR_BYTES, MAX_MATERIALIZATION_MANIFEST_OBJECTS,
+    MAX_MATERIALIZATION_SOURCES, MAX_STAGING_KEY_BYTES,
+};
 pub use placement::*;
 pub use s3::*;
 pub use scalars::*;
 pub use schema::{
     action_schema, agent_api_schema, control_schema, enrollment_schema, gateway_schema,
-    metadata_schema, snapshot_delivery_schema,
+    materialization_schema, metadata_schema, snapshot_delivery_schema,
 };
 pub use transfer::*;
 pub use validation::decode_bounded_unique_json;

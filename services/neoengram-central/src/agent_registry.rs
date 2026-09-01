@@ -31,6 +31,8 @@ const AGENT_SESSION_OPEN_CAS_RETRIES: u8 = 3;
 /// Capability emitted only after an Agent has validated its Central ticket trust and QUIC data
 /// plane before opening a session.
 pub const AGENT_CAPABILITY_COMMIT_REPLICATION_QUIC_V1: &str = "commit_replication_quic_v1";
+/// Capability required by the clean-slate object-level materialization data plane.
+pub const AGENT_CAPABILITY_COMMIT_MATERIALIZATION_V2: &str = "commit_materialization_v2";
 
 /// Persisted format identity for the current authority record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1815,10 +1817,35 @@ impl AgentRegistryService {
         else {
             return Ok(false);
         };
+        // This helper is intentionally legacy-only.  The v2 object materialization planner uses
+        // `current_ready_volume_supports_materialization`; treating the v2 capability as a v1
+        // whole-Commit replication capability would let the old planner issue incompatible
+        // tickets to a clean-slate Agent.
         Ok(record.instance.is_some_and(|instance| {
             instance
                 .capabilities
                 .contains(AGENT_CAPABILITY_COMMIT_REPLICATION_QUIC_V1)
+        }))
+    }
+
+    /// Returns true only when the current ready owner explicitly advertises the v2
+    /// object-level materialization capability.  This deliberately does not treat the legacy
+    /// whole-Commit replication capability as equivalent.
+    pub async fn current_ready_volume_supports_materialization(
+        &self,
+        tenant_id: &TenantId,
+        storage_volume_id: &StorageVolumeId,
+    ) -> CentralResult<bool> {
+        let Some(record) = self
+            .current_ready_volume_record(tenant_id, storage_volume_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(record.instance.is_some_and(|instance| {
+            instance
+                .capabilities
+                .contains(AGENT_CAPABILITY_COMMIT_MATERIALIZATION_V2)
         }))
     }
 

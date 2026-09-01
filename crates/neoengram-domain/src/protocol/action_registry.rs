@@ -21,6 +21,8 @@ pub const AGENT_LIFECYCLE_ASSIGNMENT_ACTION: &str = "agent.lifecycle.assignment"
 pub const AGENT_JOB_REPORT_ACTION: &str = "agent.job.report.create";
 pub const AGENT_REPLICATION_ASSIGNMENT_ACTION: &str = "agent.replication.assignment";
 pub const AGENT_REPLICATION_REPORT_ACTION: &str = "agent.replication.report";
+pub const AGENT_MATERIALIZATION_ASSIGNMENT_ACTION: &str = "agent.materialization.assignment";
+pub const AGENT_MATERIALIZATION_REPORT_ACTION: &str = "agent.materialization.report";
 pub const AGENT_PROTOCOL_ERROR_ACTION: &str = "agent.protocol.error";
 
 const CONTROL_ACTIONS: &[&str] = &[
@@ -30,6 +32,8 @@ const CONTROL_ACTIONS: &[&str] = &[
     AGENT_JOB_REPORT_ACTION,
     AGENT_REPLICATION_ASSIGNMENT_ACTION,
     AGENT_REPLICATION_REPORT_ACTION,
+    AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
+    AGENT_MATERIALIZATION_REPORT_ACTION,
     AGENT_PROTOCOL_ERROR_ACTION,
     "agent.hello",
     "agent.heartbeat",
@@ -318,37 +322,28 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
     public_action("POST", "/api/artifact/list/query", "queryArtifactList"),
     public_action("POST", "/api/artifact/query", "queryArtifact"),
     public_action("POST", "/api/artifact/create", "createArtifact"),
-    public_action("POST", "/api/commit/replicate", "replicateCommit"),
+    public_action("POST", "/api/commit/materialize", "materializeCommit"),
     public_action(
         "POST",
-        "/api/commit/replication/query",
-        "queryCommitReplication",
+        "/api/commit/materialization/query",
+        "queryCommitMaterialization",
     ),
     public_action(
         "POST",
-        "/api/commit/replication/ticket/query",
-        "queryCommitReplicationTicket",
+        "/api/commit/materialization/list/query",
+        "queryCommitMaterializationList",
     ),
     public_action(
         "POST",
-        "/api/commit/replication/list/query",
-        "queryCommitReplicationList",
+        "/api/commit/materialization/retry",
+        "retryCommitMaterialization",
     ),
     public_action(
         "POST",
-        "/api/commit/replication/retry",
-        "retryCommitReplication",
+        "/api/commit/materialization/cancel",
+        "cancelCommitMaterialization",
     ),
-    public_action(
-        "POST",
-        "/api/commit/replication/cancel",
-        "cancelCommitReplication",
-    ),
-    public_action(
-        "POST",
-        "/api/commit/placements/query",
-        "queryCommitPlacementList",
-    ),
+    public_action("POST", "/api/commit/coverage/query", "queryCommitCoverage"),
     public_action(
         "POST",
         "/api/commit/availability/query",
@@ -755,6 +750,36 @@ mod tests {
         assert!(PUBLIC_ACTION_REGISTRY
             .iter()
             .all(|descriptor| !descriptor.path.starts_with("/internal/")));
+    }
+
+    #[test]
+    fn v1_replication_routes_are_not_exposed_by_the_v2_registry() {
+        for legacy_path in [
+            "/api/commit/replicate",
+            "/api/commit/replication/query",
+            "/api/commit/replication/ticket/query",
+            "/api/commit/replication/list/query",
+            "/api/commit/replication/retry",
+            "/api/commit/replication/cancel",
+            "/api/commit/placements/query",
+        ] {
+            assert_eq!(
+                public_action_descriptor_for_path(legacy_path),
+                None,
+                "legacy replication route {legacy_path} must stay private"
+            );
+        }
+        for v2_path in [
+            "/api/commit/materialize",
+            "/api/commit/materialization/query",
+            "/api/commit/coverage/query",
+            "/api/commit/availability/query",
+        ] {
+            assert!(
+                public_action_descriptor_for_path(v2_path).is_some(),
+                "v2 materialization route {v2_path} must be registered"
+            );
+        }
     }
 
     #[test]

@@ -829,7 +829,7 @@ const advertisedCapabilities = resolveRef(
 ).content["application/json"].example.capabilities;
 assert(
   [
-    "artifact_commit_replication",
+    "commit_materialization_v2",
     "commit_layout_selection_v2",
     "snapshot_delivery_fuse_v2",
     "snapshot_delivery_copy_v2",

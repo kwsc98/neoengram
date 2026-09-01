@@ -15,6 +15,7 @@ mod error;
 mod execution;
 mod health;
 mod identity;
+mod materialization_quic;
 mod replication;
 mod replication_quic;
 mod resource_lifecycle;
@@ -50,14 +51,27 @@ pub use identity::{
     has_pending_outbound_reports, load_or_create_identity, load_persisted_identity,
     signing_key_from_identity, AgentSigningKey, PersistedIdentitySummary,
 };
+pub use materialization_quic::{
+    apply_materialization_checkpoint, materialization_protocol_version,
+    materialization_receipt_from_checkpoint, materialization_transfer_id,
+    switch_materialization_source, validate_materialization_batch,
+    validate_signed_materialization_batch, validate_signed_materialization_batch_with_trust,
+    MaterializationCheckpoint, MaterializationSourceSession, MaterializationTargetSession,
+};
 pub use replication::{
-    DurableReplicationProgressSink, MountedVolumeReplicationExecutor,
+    DurableReplicationProgressSink, MaterializationAssignmentExecutor,
+    MountedVolumeMaterializationExecutor, MountedVolumeReplicationExecutor,
     ReplicationAssignmentExecutor, ReplicationProgressSink, ReplicationWorker,
 };
 pub use replication_quic::{
-    run_quic_sink_stream, serve_quic_source_connection, serve_quic_source_stream,
-    serve_quic_source_stream_from_ticket, QuicTransferClient, QuicTransferClientConfig,
-    QuicTransferError, QuicTransferIdentity, QuicTransferNetwork, QuicTransferNetworkConfig,
+    run_quic_sink_stream, serve_quic_materialization_source_connection,
+    serve_quic_materialization_source_connection_with_resolver,
+    serve_quic_materialization_source_stream,
+    serve_quic_materialization_source_stream_with_resolver, serve_quic_source_connection,
+    serve_quic_source_stream, serve_quic_source_stream_from_ticket,
+    MountedVolumeSourcePlacementResolver, PermissiveSourcePlacementResolver, QuicTransferClient,
+    QuicTransferClientConfig, QuicTransferError, QuicTransferIdentity, QuicTransferNetwork,
+    QuicTransferNetworkConfig, RejectingSourcePlacementResolver, SourcePlacementResolver,
 };
 pub use runtime::{
     run, run_with, run_with_development_directory_probe, run_with_transports,

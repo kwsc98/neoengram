@@ -304,6 +304,10 @@ pub enum AgentReport {
     Failed(JobFailed),
     Lifecycle(Box<ResourceLifecycleReport>),
     Replication(Box<neoengram_domain::protocol::ReplicationProgressReport>),
+    /// Object-level v2 materialization receipt or failure.  It is kept in the same durable
+    /// outbox as legacy Job reports so a disconnect after the target durability barrier cannot
+    /// lose the placement publication evidence.
+    Materialization(Box<neoengram_domain::protocol::MaterializationReport>),
 }
 
 impl AgentReport {
@@ -317,6 +321,7 @@ impl AgentReport {
             Self::Failed(report) => ControlMessage::Failed(report),
             Self::Lifecycle(report) => ControlMessage::LifecycleReport(report),
             Self::Replication(report) => ControlMessage::ReplicationReport(report),
+            Self::Materialization(report) => ControlMessage::MaterializationReport(report),
         }
     }
 }

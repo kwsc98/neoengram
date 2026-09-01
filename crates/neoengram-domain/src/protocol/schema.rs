@@ -88,3 +88,11 @@ pub fn gateway_schema() -> Schema {
 pub fn snapshot_delivery_schema() -> Schema {
     close_flattened_objects(schema_for!(SnapshotDeliveryAssignment))
 }
+
+/// Generates the strict clean-slate v2 object materialization schema.
+#[must_use]
+pub fn materialization_schema() -> Schema {
+    close_flattened_objects(schema_for!(
+        crate::protocol::materialization::MaterializationProtocolSchema
+    ))
+}

@@ -13,10 +13,11 @@ use crate::{
     AgentBootstrapProof, AgentHeartbeat, AgentId, AgentInstallationId, AgentMountIdentityDigest,
     AgentMountStatusReport, AgentResourceLifecycleAssignment, CentralSignedPayload, ControlError,
     ControlMessage, DecimalU64, Envelope, Extensions, IndexDeltaRecord, JobAssignment, JobDecision,
-    JobId, MessageId, MetadataBatchDescriptor, MetadataBatchPage, ProtocolError, ProtocolResult,
-    ProtocolVersion, ReplicationAssignment, RequestId, ResourceVersion, SequenceNumber,
-    SessionGeneration, SessionId, TenantId, UnixMillis, WireChunkRef, WireChunkingStrategy,
-    WireIndexVersion, CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
+    JobId, MaterializationAssignment, MaterializationReport, MessageId, MetadataBatchDescriptor,
+    MetadataBatchPage, ProtocolError, ProtocolResult, ProtocolVersion, ReplicationAssignment,
+    RequestId, ResourceVersion, SequenceNumber, SessionGeneration, SessionId, TenantId, UnixMillis,
+    WireChunkRef, WireChunkingStrategy, WireIndexVersion, CURRENT_WIRE_VERSION,
+    MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
 };
 
 pub const AGENT_REQUEST_SIGNING_DOMAIN_V1: &str = "neoengram-agent-request-v1";
@@ -648,6 +649,9 @@ pub enum AgentChannelUpstreamMessage {
     Heartbeat(AgentHeartbeatReportPayload),
     #[serde(rename = "job.report")]
     Report(AgentJobReportCreatePayload),
+    /// Object-level v2 receipt/failure emitted after the target durability barrier.
+    #[serde(rename = "materialization.report")]
+    MaterializationReport(Box<MaterializationReport>),
     #[serde(rename = "channel.close")]
     Close(AgentSessionClosePayload),
 }
@@ -670,7 +674,11 @@ impl AgentChannelUpstreamMessage {
     pub fn supports_type(message_type: &str) -> bool {
         matches!(
             message_type,
-            "channel.open" | "session.heartbeat" | "job.report" | "channel.close"
+            "channel.open"
+                | "session.heartbeat"
+                | "job.report"
+                | "materialization.report"
+                | "channel.close"
         )
     }
 }
@@ -689,6 +697,9 @@ pub enum AgentChannelDownstreamMessage {
     LifecycleAssignment(Box<AgentResourceLifecycleAssignment>),
     #[serde(rename = "replication.assignment")]
     ReplicationAssignment(Box<ReplicationAssignment>),
+    /// Object-level v2 source-grouped assignment signed by Central.
+    #[serde(rename = "materialization.assignment")]
+    MaterializationAssignment(Box<MaterializationAssignment>),
     #[serde(rename = "channel.ack")]
     Ack(AgentChannelAck),
     #[serde(rename = "protocol.error")]
@@ -705,6 +716,7 @@ impl AgentChannelDownstreamMessage {
                 | "job.decision"
                 | "resource.lifecycle.assignment"
                 | "replication.assignment"
+                | "materialization.assignment"
                 | "channel.ack"
                 | "protocol.error"
         )
@@ -794,6 +806,13 @@ impl AgentChannelUpstreamFrame {
                         "Job Report envelope uses a different session generation",
                     ));
                 }
+                if matches!(&report.report.body, ControlMessage::ReplicationReport(_)) {
+                    // Legacy replication progress remains serde-decodable for reset/inventory
+                    // tooling, but v2 channels only accept object-level materialization reports.
+                    return Err(ProtocolError::UnsupportedMessageType(
+                        "replication.report".to_owned(),
+                    ));
+                }
                 if !matches!(
                     &report.report.body,
                     ControlMessage::Accepted(_)
@@ -802,7 +821,6 @@ impl AgentChannelUpstreamFrame {
                         | ControlMessage::Failed(_)
                         | ControlMessage::Finalized(_)
                         | ControlMessage::LifecycleReport(_)
-                        | ControlMessage::ReplicationReport(_)
                 ) {
                     return Err(invalid_channel_field(
                         "payload.report.type",
@@ -810,6 +828,10 @@ impl AgentChannelUpstreamFrame {
                     ));
                 }
                 validate_extension_keys(&report.extensions, &["tenant_id", "report"])?;
+            }
+            AgentChannelUpstreamMessage::MaterializationReport(report) => {
+                self.request.validate_session()?;
+                report.validate()?;
             }
             AgentChannelUpstreamMessage::Close(close) => {
                 self.request.validate_session()?;
@@ -1016,6 +1038,27 @@ impl AgentChannelDownstreamFrame {
                         "Replication Assignment is a new delivery and cannot correlate an upstream frame",
                     ));
                 }
+                // Keep the legacy DTO deserializable for inventory/reset tooling, but never
+                // allow it over the current channel. v2 uses object-level materialization.
+                let _ = payload;
+                return Err(ProtocolError::UnsupportedMessageType(
+                    "replication.assignment".to_owned(),
+                ));
+            }
+            AgentChannelDownstreamMessage::MaterializationAssignment(payload) => {
+                if self.correlation_id.is_some() {
+                    return Err(invalid_channel_field(
+                        "correlation_id",
+                        "Materialization Assignment is a new delivery and cannot correlate an upstream frame",
+                    ));
+                }
+                if payload.signed_ticket.ticket.target.session_generation != self.session_generation
+                {
+                    return Err(invalid_channel_field(
+                        "session_generation",
+                        "Materialization Assignment target fence differs from its channel frame",
+                    ));
+                }
                 payload.validate()?;
             }
             AgentChannelDownstreamMessage::Ack(payload) => {
@@ -1041,10 +1084,11 @@ impl AgentChannelDownstreamFrame {
                 | AgentChannelDownstreamMessage::Decision(_)
                 | AgentChannelDownstreamMessage::LifecycleAssignment(_)
                 | AgentChannelDownstreamMessage::ReplicationAssignment(_)
+                | AgentChannelDownstreamMessage::MaterializationAssignment(_)
         ) {
             return Err(invalid_channel_field(
                 "message",
-                "only Job Assignment/Decision and resource lifecycle assignment frames may carry a Central signature",
+                "only Job Assignment/Decision, lifecycle assignment, or materialization assignment frames may carry a Central signature",
             ));
         }
         domain_separated_jcs_bytes(
@@ -1425,6 +1469,104 @@ mod tests {
         }
     }
 
+    fn materialization_assignment() -> MaterializationAssignment {
+        let tenant_id = TenantId::new("tenant-materialization").unwrap();
+        let artifact_id = crate::ArtifactId::new("artifact-materialization").unwrap();
+        let object_namespace_id = crate::ObjectNamespaceId::from_artifact(&artifact_id);
+        let materialization_id = crate::MaterializationId::new("materialization-channel").unwrap();
+        let batch_id = crate::MaterializationBatchId::new("batch-channel").unwrap();
+        let source = crate::MaterializationSource {
+            placement_id: crate::PlacementId::new("placement-source").unwrap(),
+            tenant_id: tenant_id.clone(),
+            object_namespace_id: object_namespace_id.clone(),
+            storage_volume_id: Some(crate::StorageVolumeId::new("volume-source").unwrap()),
+            archive_id: None,
+            agent_id: AgentId::new("agent-source").unwrap(),
+            edge_cluster_id: crate::EdgeClusterId::new("cluster-source").unwrap(),
+            gateway_pool_id: crate::GatewayPoolId::new("gateway-source").unwrap(),
+            placement_generation: crate::PlacementGeneration::new(1),
+            session_generation: SessionGeneration::new(1),
+            mount_generation: crate::MountGeneration::new(1),
+            route_generation: crate::RouteGeneration::new(1),
+        };
+        let target = crate::MaterializationTarget {
+            tenant_id: tenant_id.clone(),
+            object_namespace_id: object_namespace_id.clone(),
+            storage_volume_id: crate::StorageVolumeId::new("volume-target").unwrap(),
+            agent_id: AgentId::new("agent-target").unwrap(),
+            edge_cluster_id: crate::EdgeClusterId::new("cluster-target").unwrap(),
+            gateway_pool_id: crate::GatewayPoolId::new("gateway-target").unwrap(),
+            placement_generation: crate::PlacementGeneration::new(1),
+            session_generation: SessionGeneration::new(2),
+            mount_generation: crate::MountGeneration::new(2),
+            route_generation: crate::RouteGeneration::new(2),
+        };
+        let (manifest, pages) = crate::BatchManifest::paginate(
+            materialization_id.clone(),
+            batch_id.clone(),
+            crate::Generation::new(1),
+            crate::Generation::new(1),
+            object_namespace_id.clone(),
+            Vec::new(),
+            1,
+        )
+        .unwrap();
+        let batch = crate::MaterializationBatch {
+            batch_id: batch_id.clone(),
+            materialization_id: materialization_id.clone(),
+            plan_revision: crate::Generation::new(1),
+            batch_attempt: crate::Generation::new(1),
+            source: source.clone(),
+            target: target.clone(),
+            manifest_digest: manifest.manifest_digest,
+            object_ids: Vec::new(),
+            object_count: DecimalU64::new(0),
+            total_bytes: DecimalU64::new(0),
+            state: crate::MaterializationBatchState::Assigned,
+            max_bytes: DecimalU64::new(1),
+            deadline_unix_ms: UnixMillis::new(1_000),
+        };
+        let ticket = crate::MaterializationBatchTicket {
+            ticket_id: crate::ObjectTicketId::new("ticket-channel").unwrap(),
+            materialization_id,
+            batch_id,
+            plan_revision: crate::Generation::new(1),
+            batch_attempt: crate::Generation::new(1),
+            tenant_id,
+            artifact_id,
+            object_namespace_id,
+            commit_id: crate::CommitId::from_bytes([0x42; 32]),
+            manifest_digest: manifest.manifest_digest,
+            source,
+            target,
+            max_bytes: DecimalU64::new(1),
+            deadline_unix_ms: UnixMillis::new(1_000),
+            capability: crate::COMMIT_MATERIALIZATION_CAPABILITY_V2.to_owned(),
+        };
+        let payload = ticket.payload_bytes().unwrap();
+        let signed_ticket = crate::SignedMaterializationBatchTicket::new(
+            ticket,
+            CentralSignedPayload {
+                key_id: "central-channel-key".to_owned(),
+                certificate_generation: crate::CertificateGeneration::new(1),
+                signed_at_unix_ms: UnixMillis::new(10),
+                expires_at_unix_ms: UnixMillis::new(1_000),
+                payload_digest: ContentDigest::hash(&payload),
+                payload: crate::GatewayOpaqueBytes::new(payload).unwrap(),
+                signature: Ed25519Signature::from_bytes([0; 64]),
+                extensions: Extensions::new(),
+            },
+        )
+        .unwrap();
+        MaterializationAssignment {
+            signed_ticket,
+            batch,
+            manifest,
+            pages,
+            extensions: Extensions::new(),
+        }
+    }
+
     fn sign_downstream_command(frame: &mut AgentChannelDownstreamFrame, key_pair: &Ed25519KeyPair) {
         let payload =
             crate::GatewayOpaqueBytes::new(frame.central_command_payload_bytes().unwrap()).unwrap();
@@ -1653,6 +1795,43 @@ mod tests {
             .unwrap()
             .verify(&public_key)
             .is_err());
+    }
+
+    #[test]
+    fn materialization_channel_variants_validate_fences_and_round_trip() {
+        assert!(AgentChannelUpstreamMessage::supports_type(
+            "materialization.report"
+        ));
+        assert!(AgentChannelDownstreamMessage::supports_type(
+            "materialization.assignment"
+        ));
+
+        let assignment = materialization_assignment();
+        let mut frame = AgentChannelDownstreamFrame {
+            wire_version: CURRENT_WIRE_VERSION,
+            sequence: SequenceNumber::new(2),
+            message_id: MessageId::new("materialization-assignment-message").unwrap(),
+            correlation_id: None,
+            session_generation: SessionGeneration::new(2),
+            sent_at_unix_ms: UnixMillis::new(20),
+            central_signature: None,
+            message: AgentChannelDownstreamMessage::MaterializationAssignment(Box::new(assignment)),
+            extensions: Extensions::new(),
+        };
+        frame.validate().unwrap();
+        let encoded = frame.encode_ndjson().unwrap();
+        let decoded =
+            AgentChannelDownstreamFrame::decode_json(&encoded[..encoded.len() - 1]).unwrap();
+        assert_eq!(decoded, frame);
+
+        frame.session_generation = SessionGeneration::new(3);
+        assert!(matches!(
+            frame.validate(),
+            Err(ProtocolError::InvalidField {
+                field: "session_generation",
+                ..
+            })
+        ));
     }
 
     #[test]

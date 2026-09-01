@@ -12,7 +12,8 @@ use std::{
 
 use neoengram_domain::protocol::{
     AgentChannelDownstreamFrame, AgentChannelDownstreamMessage, CentralSignedPayload,
-    CertificateGeneration, Ed25519PublicKeySpki, S3ReadTicket, SignedTransferTicket, UnixMillis,
+    CertificateGeneration, Ed25519PublicKeySpki, S3ReadTicket, SignedMaterializationBatchTicket,
+    SignedTransferTicket, UnixMillis,
 };
 use serde::Deserialize;
 
@@ -174,6 +175,7 @@ impl CentralCommandTrustBundle {
                 | AgentChannelDownstreamMessage::Decision(_)
                 | AgentChannelDownstreamMessage::LifecycleAssignment(_)
                 | AgentChannelDownstreamMessage::ReplicationAssignment(_)
+                | AgentChannelDownstreamMessage::MaterializationAssignment(_)
         ) {
             return Ok(());
         }
@@ -233,6 +235,30 @@ impl CentralCommandTrustBundle {
         verify_signature(
             &ticket.central_signature,
             SignedTransferTicket::payload_bytes(&ticket.ticket),
+            self,
+            now_unix_ms,
+        )
+    }
+
+    /// Verifies a v2 materialization batch ticket before a manifest is accepted or target
+    /// staging is touched. The v2 ticket uses its own domain-separated canonical payload, so a
+    /// valid legacy transfer signature cannot be replayed as a materialization capability.
+    pub(crate) fn verify_materialization_ticket(
+        &self,
+        ticket: &SignedMaterializationBatchTicket,
+        now_unix_ms: UnixMillis,
+    ) -> AgentDaemonResult<()> {
+        ticket
+            .validate()
+            .map_err(|error| command_rejected(error.to_string()))?;
+        if ticket.ticket.deadline_unix_ms != ticket.central_signature.expires_at_unix_ms {
+            return Err(command_rejected(
+                "Central materialization signature expiry does not match the batch ticket deadline",
+            ));
+        }
+        verify_signature(
+            &ticket.central_signature,
+            ticket.ticket.payload_bytes(),
             self,
             now_unix_ms,
         )

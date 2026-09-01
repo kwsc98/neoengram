@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
+use neoengram_domain::protocol::materialization::{
+    MaterializationBatchTicket, SignedMaterializationBatchTicket,
+};
 use neoengram_domain::protocol::{
     CentralSignedPayload, CertificateGeneration, ContentDigest, Ed25519PublicKeySpki,
     Ed25519Signature, Extensions, GatewayOpaqueBytes, SignedTransferTicket, TransferTicket,
@@ -418,6 +421,46 @@ impl CentralCommandKeyring {
     pub fn verify_transfer_ticket(
         &self,
         ticket: &SignedTransferTicket,
+        now_unix_ms: UnixMillis,
+    ) -> Result<(), CentralCommandSecurityError> {
+        ticket.validate().map_err(|error| {
+            CentralCommandSecurityError::InvalidSignedPayload(error.to_string())
+        })?;
+        self.trust_bundle
+            .verify_at(&ticket.central_signature, now_unix_ms)
+            .map(|_| ())
+    }
+
+    /// Signs one v2 source-grouped materialization batch.  The ticket payload is the canonical
+    /// domain-separated ticket bytes, so every Gateway/Agent hop can verify the exact manifest,
+    /// placement and route fences without trusting Central-side mutable state.
+    pub async fn sign_materialization_batch_ticket(
+        &self,
+        ticket: MaterializationBatchTicket,
+        signed_at_unix_ms: UnixMillis,
+        ttl_ms: u64,
+    ) -> Result<SignedMaterializationBatchTicket, CentralCommandSecurityError> {
+        let payload = ticket.payload_bytes().map_err(|error| {
+            CentralCommandSecurityError::InvalidSignedPayload(error.to_string())
+        })?;
+        let signed = self
+            .sign_with_ttl_ms(
+                GatewayOpaqueBytes::new(payload).map_err(|error| {
+                    CentralCommandSecurityError::InvalidSignedPayload(error.to_string())
+                })?,
+                signed_at_unix_ms,
+                ttl_ms,
+            )
+            .await?;
+        SignedMaterializationBatchTicket::new(ticket, signed)
+            .map_err(|error| CentralCommandSecurityError::InvalidSignedPayload(error.to_string()))
+    }
+
+    /// Verifies a v2 materialization ticket against the configured Central trust bundle and time
+    /// fence.  The domain validator also checks namespace, generation and capability bindings.
+    pub fn verify_materialization_batch_ticket(
+        &self,
+        ticket: &SignedMaterializationBatchTicket,
         now_unix_ms: UnixMillis,
     ) -> Result<(), CentralCommandSecurityError> {
         ticket.validate().map_err(|error| {

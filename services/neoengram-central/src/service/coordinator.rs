@@ -1429,10 +1429,11 @@ mod tests {
         ArtifactInitialization, ArtifactRecord, AssignmentOutbox, AuthorityCapabilities,
         AuthorityStore, AuthorizationRequest, Authorizer, CatalogPvcReference, CreateAddJobRequest,
         FinalizeAddRequest, InMemoryComponents, InMemoryJobRepository, JobInsertOutcome,
-        MetadataBatchSubmission, ReceiveReportRequest, SnapshotDeliveryInsertRequest,
-        SnapshotInsertRequest, SnapshotRecord, StageMetadataBatchRequest, StorageAccessMode,
-        StorageBackendType, StorageEnrollmentMetadata, StorageVolumeRecord, StorageVolumeState,
-        TenantRecord, VolumeOwnerRecord, VolumeOwnerState,
+        MetadataBatchSubmission, PlacementRepository, ReceiveReportRequest,
+        SnapshotDeliveryInsertRequest, SnapshotInsertRequest, SnapshotRecord,
+        StageMetadataBatchRequest, StorageAccessMode, StorageBackendType,
+        StorageEnrollmentMetadata, StorageVolumeRecord, StorageVolumeState, TenantRecord,
+        VolumeOwnerRecord, VolumeOwnerState,
     };
     use async_trait::async_trait;
     use neoengram_domain::core::{
@@ -1969,11 +1970,10 @@ mod tests {
         .with_precommits(components.precommits.clone())
         .with_agent_registry(registry.clone())
         .with_control_catalog(components.control_catalog.clone());
-        let control = Arc::new(ControlPlane::new(
-            authorizer,
-            authority,
-            components.clock.clone(),
-        ));
+        let control = Arc::new(
+            ControlPlane::new(authorizer, authority, components.clock.clone())
+                .with_placement_repository(components.placement.clone()),
+        );
         let coordinator = JobCoordinator {
             control: control.clone(),
             jobs,
@@ -2249,6 +2249,54 @@ mod tests {
             })
             .await
             .unwrap();
+        // A successful SnapshotDelivery must be backed by the v2 placement authority.  Seed the
+        // exact Commit ObjectSet and its target-volume object evidence used by the readiness
+        // gate; the test remains focused on replaying an already-completed delivery.
+        let object_id = neoengram_domain::core::ObjectId::from_bytes([1; 32]);
+        let object_set = neoengram_domain::protocol::ObjectSet::new(vec![
+            neoengram_domain::protocol::CommitObject::new(
+                object_id,
+                11,
+                neoengram_domain::protocol::ObjectEncoding::Raw,
+                0,
+            ),
+        ])
+        .unwrap();
+        components
+            .placement
+            .insert_commit_object_set(neoengram_domain::protocol::CommitObjectSet {
+                tenant_id: tenant_id.clone(),
+                commit_id: neoengram_domain::core::CommitId::from_digest(commit_id),
+                object_set: object_set.clone(),
+            })
+            .await
+            .unwrap();
+        let namespace =
+            neoengram_domain::protocol::ObjectNamespaceId::new(artifact_id.to_string()).unwrap();
+        components
+            .placement
+            .insert_object_placement_v2(
+                neoengram_domain::protocol::materialization::ObjectPlacement {
+                    placement_id: neoengram_domain::protocol::PlacementId::new(
+                        "placement-delivery-replay",
+                    )
+                    .unwrap(),
+                    tenant_id: tenant_id.clone(),
+                    object_namespace_id: namespace,
+                    object_id,
+                    size: DecimalU64::new(11),
+                    encoding: neoengram_domain::protocol::ObjectEncoding::Raw,
+                    verified_digest: object_id.digest(),
+                    storage_volume_id: Some(storage_volume_id.clone()),
+                    archive_id: None,
+                    placement_generation: neoengram_domain::protocol::PlacementGeneration::new(1),
+                    state:
+                        neoengram_domain::protocol::materialization::ObjectPlacementState::Verified,
+                    failure_domain: "host-delivery-replay".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
         let record = SnapshotDeliveryRecord {
             tenant_id: tenant_id.clone(),
             delivery_id: delivery_id.clone(),
@@ -2269,7 +2317,7 @@ mod tests {
             delivery_generation: DeliveryGeneration::new(1),
             file_count: 1,
             size_bytes: 11,
-            object_set_digest: ContentDigest::from_bytes([9; 32]),
+            object_set_digest: object_set.object_set_digest,
             resource_version: 1,
             issue_code: None,
             issue_message: None,

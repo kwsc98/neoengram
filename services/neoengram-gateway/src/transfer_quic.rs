@@ -1,10 +1,10 @@
 //! QUIC data-plane boundary for object replication.
 //!
 //! Gateway owns the QUIC hop and relay policy, but never owns object bytes or a Volume mount.
-//! The first frame on every stream is the binary `OpenTransfer` frame; the ticket is validated
-//! before any object request is accepted.  The actual object source/sink remains an Agent
-//! concern, so this module can be wired to either an in-process same-Gateway relay or a peer
-//! Gateway connection without changing the domain protocol.
+//! The migration adapter used to open streams with a binary `OpenTransfer` frame; production v2
+//! listeners reject that legacy frame before any object request is accepted. The actual object
+//! source/sink remains an Agent concern, so this module can be wired to either an in-process
+//! same-Gateway relay or a peer Gateway connection without changing the domain protocol.
 
 use std::{
     collections::BTreeMap,
@@ -16,8 +16,9 @@ use std::{
 
 use async_trait::async_trait;
 use neoengram_domain::protocol::{
-    AgentId, EdgeClusterId, GatewayPoolId, SignedTransferTicket, TransferFrame, TransferFrameError,
-    TransferTicket, MAX_TRANSFER_FRAME_BYTES, TRANSFER_ALPN,
+    AgentId, EdgeClusterId, GatewayPoolId, MaterializationBatchTicket, RouteGeneration,
+    SessionGeneration, SignedMaterializationBatchTicket, SignedTransferTicket, TransferFrame,
+    TransferFrameError, TransferTicket, MATERIALIZATION_TRANSFER_ALPN_V2, MAX_TRANSFER_FRAME_BYTES,
 };
 use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream};
 use tokio::{
@@ -55,6 +56,8 @@ pub(crate) enum QuicTransferError {
     Deadline,
     #[error("transfer ticket does not match Gateway ALPN")]
     Alpn,
+    #[error("legacy transfer ticket is disabled on the v2 ALPN")]
+    LegacyProtocolDisabled,
     #[error("transfer connection did not provide a peer certificate")]
     MissingPeerIdentity,
     #[error("transfer ticket is fenced: {0}")]
@@ -358,6 +361,80 @@ impl QuicTransferFence {
         }
         Ok(())
     }
+
+    /// Applies the same route/session/mount fence to a v2 materialization batch ticket. Gateway
+    /// remains storage-free: this check only compares Central-issued identities and the current
+    /// local route directory before the relay opens its next QUIC hop.
+    pub(crate) fn validate_materialization(
+        &self,
+        ticket: &MaterializationBatchTicket,
+    ) -> Result<(), QuicTransferError> {
+        ticket
+            .validate()
+            .map_err(|_| QuicTransferError::Fenced("materialization_ticket"))?;
+        let (agent_id, gateway_pool_id, edge_cluster_id, session, mount, route, prefix) =
+            match self.role {
+                TransferRelayRole::Target => (
+                    &ticket.target.agent_id,
+                    &ticket.target.gateway_pool_id,
+                    &ticket.target.edge_cluster_id,
+                    ticket.target.session_generation.get(),
+                    ticket.target.mount_generation.get(),
+                    ticket.target.route_generation.get(),
+                    "target",
+                ),
+                TransferRelayRole::Source => (
+                    &ticket.source.agent_id,
+                    &ticket.source.gateway_pool_id,
+                    &ticket.source.edge_cluster_id,
+                    ticket.source.session_generation.get(),
+                    ticket.source.mount_generation.get(),
+                    ticket.source.route_generation.get(),
+                    "source",
+                ),
+            };
+        if gateway_pool_id != &self.gateway_pool_id {
+            return Err(QuicTransferError::Fenced(match prefix {
+                "target" => "target_gateway_pool_id",
+                _ => "source_gateway_pool_id",
+            }));
+        }
+        if edge_cluster_id != &self.edge_cluster_id {
+            return Err(QuicTransferError::Fenced(match prefix {
+                "target" => "target_edge_cluster_id",
+                _ => "source_edge_cluster_id",
+            }));
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| QuicTransferError::Fenced("transfer_route_unavailable"))?;
+        let generations = state
+            .agents
+            .get(agent_id)
+            .copied()
+            .or_else(|| state.agents.is_empty().then_some(state.default).flatten())
+            .ok_or(QuicTransferError::Fenced("transfer_route_unavailable"))?;
+        if generations.session != Some(session) {
+            return Err(QuicTransferError::Fenced(match prefix {
+                "target" => "target_session_generation",
+                _ => "source_session_generation",
+            }));
+        }
+        if generations.mount != Some(mount) {
+            return Err(QuicTransferError::Fenced(match prefix {
+                "target" => "target_mount_generation",
+                _ => "source_mount_generation",
+            }));
+        }
+        if generations.route != Some(route) {
+            return Err(QuicTransferError::Fenced(match prefix {
+                "target" => "target_route_generation",
+                _ => "source_route_generation",
+            }));
+        }
+        Ok(())
+    }
 }
 
 /// A Gateway-owned relay hook.  Implementations may connect to a same-Gateway Agent or to a
@@ -370,6 +447,18 @@ pub(crate) trait TransferRelay: fmt::Debug + Send + Sync {
         send: SendStream,
         recv: RecvStream,
     ) -> Result<(), QuicTransferError>;
+
+    /// Relays one clean-slate v2 materialization stream. Implementations that only support the
+    /// legacy adapter deliberately fail closed instead of treating a v2 capability as a v1
+    /// whole-Commit transfer.
+    async fn relay_materialization(
+        &self,
+        _ticket: SignedMaterializationBatchTicket,
+        _send: SendStream,
+        _recv: RecvStream,
+    ) -> Result<(), QuicTransferError> {
+        Err(QuicTransferError::LegacyProtocolDisabled)
+    }
 }
 
 /// A connector used by [`ConnectedTransferRelay`] to establish the next single QUIC hop.
@@ -378,14 +467,172 @@ pub(crate) trait TransferRelay: fmt::Debug + Send + Sync {
 #[async_trait]
 pub(crate) trait TransferConnectionFactory: fmt::Debug + Send + Sync {
     async fn connect(&self, ticket: &TransferTicket) -> Result<Connection, QuicTransferError>;
+
+    /// Opens the next relay hop for a v2 materialization ticket. The network endpoint remains a
+    /// deployment concern of the factory; the immutable ticket only supplies the deadline and
+    /// identity fences and never turns Gateway into an open proxy.
+    async fn connect_materialization(
+        &self,
+        _ticket: &MaterializationBatchTicket,
+    ) -> Result<Connection, QuicTransferError> {
+        Err(QuicTransferError::LegacyProtocolDisabled)
+    }
 }
 
-/// A configured, storage-free QUIC next hop. Each Gateway owns one outbound endpoint and one
-/// upstream address; the immutable ticket chooses no network address and therefore cannot turn
-/// the relay into an open proxy.
+/// A small, dynamically replaceable directory of Gateway/Agent QUIC next hops. The directory is
+/// populated by deployment wiring, never by a ticket, so a signed capability cannot turn the
+/// relay into an open proxy. Agent IDs are globally scoped by Central and are sufficient to pick
+/// the source route; the ticket still fences the corresponding Gateway pool/cluster and route
+/// generation before a connection is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransferUpstreamRoute {
+    upstream: SocketAddr,
+    /// A configured address is not sufficient to authorize a source hop. The route lease
+    /// generation is recorded separately so a reconnect can revoke an old route while retaining
+    /// the deployment-owned address for the next session.
+    session_generation: Option<SessionGeneration>,
+    route_generation: Option<RouteGeneration>,
+    active: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TransferUpstreamDirectory {
+    routes: Arc<RwLock<BTreeMap<AgentId, TransferUpstreamRoute>>>,
+}
+
+impl TransferUpstreamDirectory {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Installs or replaces an already-authorized QUIC next hop. Deployment wiring uses
+    /// [`Self::configure`] when the address is known before the Central lease is acquired.
+    pub(crate) fn set(&self, agent_id: AgentId, upstream: SocketAddr) {
+        if let Ok(mut routes) = self.routes.write() {
+            routes.insert(
+                agent_id,
+                TransferUpstreamRoute {
+                    upstream,
+                    session_generation: None,
+                    route_generation: None,
+                    active: true,
+                },
+            );
+        }
+    }
+
+    /// Installs a deployment-owned address without making it eligible for relay yet. Source
+    /// routes become active only after the Gateway has an authenticated Central lease for the
+    /// corresponding Agent stream.
+    pub(crate) fn configure(&self, agent_id: AgentId, upstream: SocketAddr) {
+        if let Ok(mut routes) = self.routes.write() {
+            routes.insert(
+                agent_id,
+                TransferUpstreamRoute {
+                    upstream,
+                    session_generation: None,
+                    route_generation: None,
+                    active: false,
+                },
+            );
+        }
+    }
+
+    /// Activates a configured source route after the matching Agent route lease is installed.
+    /// Older delayed grants cannot move an entry back to a fenced generation.
+    pub(crate) fn activate(
+        &self,
+        agent_id: &AgentId,
+        session_generation: SessionGeneration,
+        route_generation: RouteGeneration,
+    ) {
+        if let Ok(mut routes) = self.routes.write() {
+            let Some(route) = routes.get_mut(agent_id) else {
+                return;
+            };
+            if route.route_generation.is_some_and(|current| {
+                route_generation < current
+                    || (route_generation == current
+                        && route.session_generation != Some(session_generation))
+            }) {
+                return;
+            }
+            route.session_generation = Some(session_generation);
+            route.route_generation = Some(route_generation);
+            route.active = true;
+        }
+    }
+
+    /// Deactivates only the exact lease that was removed. Keeping the configured address lets a
+    /// later reconnect reactivate it, while the inactive bit makes relay resolution fail closed
+    /// during the gap between route teardown and the next authenticated Opened frame.
+    pub(crate) fn deactivate_if_current(
+        &self,
+        agent_id: &AgentId,
+        session_generation: SessionGeneration,
+        route_generation: RouteGeneration,
+    ) -> bool {
+        let Ok(mut routes) = self.routes.write() else {
+            return false;
+        };
+        let Some(route) = routes.get_mut(agent_id) else {
+            return false;
+        };
+        if route.session_generation == Some(session_generation)
+            && route.route_generation == Some(route_generation)
+        {
+            route.active = false;
+            return true;
+        }
+        false
+    }
+
+    /// Revokes all Central-authorized entries while retaining their deployment addresses for a
+    /// future control-session reconnect.
+    pub(crate) fn deactivate_all(&self) {
+        if let Ok(mut routes) = self.routes.write() {
+            for route in routes.values_mut() {
+                route.active = false;
+            }
+        }
+    }
+
+    /// Removes a route only from the local network directory. Central's generation fence remains
+    /// the authority for whether an already-open stream may continue.
+    pub(crate) fn remove(&self, agent_id: &AgentId) {
+        if let Ok(mut routes) = self.routes.write() {
+            routes.remove(agent_id);
+        }
+    }
+
+    pub(crate) fn resolve(&self, agent_id: &AgentId) -> Option<SocketAddr> {
+        self.routes
+            .read()
+            .ok()?
+            .get(agent_id)
+            .filter(|route| route.active)
+            .map(|route| route.upstream)
+    }
+
+    /// Returns whether Central has published any dynamic route.  Once the directory is
+    /// authoritative, an unknown Agent must fail closed instead of borrowing a static fallback
+    /// that could point at a different source Volume.
+    fn is_empty(&self) -> bool {
+        self.routes
+            .read()
+            .map(|routes| routes.is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// A configured, storage-free QUIC next hop. A static upstream remains available for a
+/// single-source deployment, while the route directory selects the correct source Gateway or
+/// source Agent for each v2 Materialization ticket.
 pub(crate) struct QuinnTransferConnectionFactory {
     endpoint: Endpoint,
-    upstream: SocketAddr,
+    upstream: Option<SocketAddr>,
+    upstreams: TransferUpstreamDirectory,
     server_name: Arc<str>,
 }
 
@@ -394,6 +641,7 @@ impl fmt::Debug for QuinnTransferConnectionFactory {
         formatter
             .debug_struct("QuinnTransferConnectionFactory")
             .field("upstream", &self.upstream)
+            .field("upstream_routes", &self.upstreams)
             .field("server_name", &self.server_name)
             .finish_non_exhaustive()
     }
@@ -405,8 +653,34 @@ impl QuinnTransferConnectionFactory {
         server_name: impl Into<Arc<str>>,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> Result<Self, QuicTransferError> {
+        Self::bind_with_directory(
+            Some(upstream),
+            server_name,
+            tls_config,
+            TransferUpstreamDirectory::new(),
+        )
+    }
+
+    /// Returns the live route directory used by this connector. Gateway control-plane wiring can
+    /// update it when a source Agent/Gateway route is acquired, renewed, or released without
+    /// replacing the QUIC endpoint or relay task.
+    pub(crate) fn upstream_directory(&self) -> TransferUpstreamDirectory {
+        self.upstreams.clone()
+    }
+
+    /// Builds a connector with no static route. Every v2 source must then have an explicit entry
+    /// in the route directory; this is the production-safe shape for multi-source deployments.
+    pub(crate) fn bind_with_directory(
+        upstream: Option<SocketAddr>,
+        server_name: impl Into<Arc<str>>,
+        tls_config: Arc<rustls::ClientConfig>,
+        upstreams: TransferUpstreamDirectory,
+    ) -> Result<Self, QuicTransferError> {
         let bind_address = SocketAddr::new(
-            match upstream.ip() {
+            match upstream
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+                .ip()
+            {
                 IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             },
@@ -422,28 +696,58 @@ impl QuinnTransferConnectionFactory {
         Ok(Self {
             endpoint,
             upstream,
+            upstreams,
             server_name: server_name.into(),
         })
+    }
+
+    fn resolve_upstream(&self, agent_id: &AgentId) -> Result<SocketAddr, QuicTransferError> {
+        if let Some(upstream) = self.upstreams.resolve(agent_id) {
+            return Ok(upstream);
+        }
+        // A non-empty dynamic directory is the authoritative route set.  Falling back to a
+        // static endpoint here could deliver a validly signed ticket to the wrong Agent; the
+        // receiving identity fence may reject it, but fail-closed routing avoids that hop and
+        // makes the failure deterministic.
+        if !self.upstreams.is_empty() {
+            return Err(QuicTransferError::Fenced("source_route_unavailable"));
+        }
+        self.upstream
+            .ok_or(QuicTransferError::Fenced("source_route_unavailable"))
+    }
+
+    async fn connect_upstream(
+        &self,
+        upstream: SocketAddr,
+        deadline_unix_ms: u64,
+    ) -> Result<Connection, QuicTransferError> {
+        let remaining = deadline_unix_ms.saturating_sub(unix_millis_now());
+        if remaining == 0 {
+            return Err(QuicTransferError::Expired);
+        }
+        let connecting = self.endpoint.connect(upstream, self.server_name.as_ref())?;
+        tokio::time::timeout(Duration::from_millis(remaining), connecting)
+            .await
+            .map_err(|_| QuicTransferError::Deadline)?
+            .map_err(QuicTransferError::Connection)
     }
 }
 
 #[async_trait]
 impl TransferConnectionFactory for QuinnTransferConnectionFactory {
     async fn connect(&self, ticket: &TransferTicket) -> Result<Connection, QuicTransferError> {
-        let remaining = ticket
-            .deadline_unix_ms
-            .get()
-            .saturating_sub(unix_millis_now());
-        if remaining == 0 {
-            return Err(QuicTransferError::Expired);
-        }
-        let connecting = self
-            .endpoint
-            .connect(self.upstream, self.server_name.as_ref())?;
-        tokio::time::timeout(Duration::from_millis(remaining), connecting)
+        let upstream = self.resolve_upstream(&ticket.source.agent_id)?;
+        self.connect_upstream(upstream, ticket.deadline_unix_ms.get())
             .await
-            .map_err(|_| QuicTransferError::Deadline)?
-            .map_err(QuicTransferError::Connection)
+    }
+
+    async fn connect_materialization(
+        &self,
+        ticket: &MaterializationBatchTicket,
+    ) -> Result<Connection, QuicTransferError> {
+        let upstream = self.resolve_upstream(&ticket.source.agent_id)?;
+        self.connect_upstream(upstream, ticket.deadline_unix_ms.get())
+            .await
     }
 }
 
@@ -484,6 +788,26 @@ impl TransferRelay for ConnectedTransferRelay {
         relay_frames(&mut recv, &mut send, &mut peer_recv, &mut peer_send).await?;
         finish_relay_streams(&mut send, &mut peer_send).await
     }
+
+    async fn relay_materialization(
+        &self,
+        ticket: SignedMaterializationBatchTicket,
+        mut send: SendStream,
+        mut recv: RecvStream,
+    ) -> Result<(), QuicTransferError> {
+        let connection = self
+            .connector
+            .connect_materialization(&ticket.ticket)
+            .await?;
+        let (mut peer_send, mut peer_recv) = connection.open_bi().await?;
+        send_frame(
+            &mut peer_send,
+            &TransferFrame::OpenMaterializationSigned(ticket),
+        )
+        .await?;
+        relay_frames(&mut recv, &mut send, &mut peer_recv, &mut peer_send).await?;
+        finish_relay_streams(&mut send, &mut peer_send).await
+    }
 }
 
 async fn finish_relay_streams(
@@ -513,6 +837,9 @@ pub(crate) struct QuicTransferListener {
     endpoint: Arc<Endpoint>,
     fence: Option<QuicTransferFence>,
     relay: Option<Arc<dyn TransferRelay>>,
+    // The v1 TransferTicket relay is retained only for migration tests and explicit local
+    // adapters. Production listeners reject it even though the old frame remains decodable.
+    allow_legacy_transfer: bool,
 }
 
 impl fmt::Debug for QuicTransferListener {
@@ -522,6 +849,7 @@ impl fmt::Debug for QuicTransferListener {
             .field("endpoint", &self.endpoint)
             .field("fence", &self.fence)
             .field("relay", &self.relay.as_ref().map(|_| "configured"))
+            .field("allow_legacy_transfer", &self.allow_legacy_transfer)
             .finish()
     }
 }
@@ -548,6 +876,7 @@ impl QuicTransferListener {
             endpoint: Arc::new(endpoint),
             fence: Some(fence),
             relay: None,
+            allow_legacy_transfer: false,
         })
     }
 
@@ -557,7 +886,17 @@ impl QuicTransferListener {
             endpoint: Arc::new(endpoint),
             fence: None,
             relay: None,
+            allow_legacy_transfer: false,
         }
+    }
+
+    /// Enables the pre-v2 relay only for an explicit compatibility adapter. The production
+    /// binary never calls this method; keeping the opt-in at listener construction makes it
+    /// impossible for a reconnect or route refresh to silently re-enable the old protocol.
+    #[must_use]
+    pub(crate) fn with_legacy_transfer_for_tests(mut self) -> Self {
+        self.allow_legacy_transfer = true;
+        self
     }
 
     #[must_use]
@@ -654,6 +993,33 @@ fn validate_connection_handshake(
     Ok(())
 }
 
+fn validate_materialization_handshake(
+    connection: &Connection,
+    ticket: &MaterializationBatchTicket,
+    fence: Option<&QuicTransferFence>,
+) -> Result<(), QuicTransferError> {
+    let handshake = connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .ok_or(QuicTransferError::Alpn)?;
+    if handshake.protocol.as_deref() != Some(alpn()) {
+        return Err(QuicTransferError::Alpn);
+    }
+    if connection.peer_identity().is_none() {
+        return Err(QuicTransferError::MissingPeerIdentity);
+    }
+    ticket
+        .validate()
+        .map_err(|_| QuicTransferError::Fenced("materialization_ticket"))?;
+    if ticket.deadline_unix_ms.get() <= unix_millis_now() {
+        return Err(QuicTransferError::Expired);
+    }
+    if let Some(fence) = fence {
+        fence.validate_materialization(ticket)?;
+    }
+    Ok(())
+}
+
 /// Reads one length-prefixed binary frame.  Reading only the declared payload keeps a control
 /// stream usable for subsequent ObjectRequest/ObjectAck frames; `read_to_end` would wait forever
 /// on a long-lived transfer stream.
@@ -736,7 +1102,7 @@ pub(crate) async fn serve(
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let admission = Arc::new(Semaphore::new(max_connections.max(1)));
-    info!(address = ?listener.local_addr(), alpn = TRANSFER_ALPN, "Gateway QUIC transfer listener started");
+    info!(address = ?listener.local_addr(), alpn = MATERIALIZATION_TRANSFER_ALPN_V2, "Gateway QUIC transfer listener started");
     let mut tasks: JoinSet<()> = JoinSet::new();
     loop {
         let incoming = tokio::select! {
@@ -758,9 +1124,11 @@ pub(crate) async fn serve(
         };
         let fence = listener.fence().cloned();
         let relay = listener.relay().cloned();
+        let allow_legacy_transfer = listener.allow_legacy_transfer;
         tasks.spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_incoming(incoming, fence, relay).await {
+            if let Err(error) = handle_incoming(incoming, fence, relay, allow_legacy_transfer).await
+            {
                 warn!(%error, "Gateway QUIC transfer rejected");
             }
         });
@@ -774,17 +1142,59 @@ async fn handle_incoming(
     incoming: Incoming,
     fence: Option<QuicTransferFence>,
     relay: Option<Arc<dyn TransferRelay>>,
+    allow_legacy_transfer: bool,
 ) -> Result<(), QuicTransferError> {
     let connection = incoming.await.map_err(QuicTransferError::Connection)?;
     let (send, mut recv) = connection.accept_bi().await?;
-    let signed_ticket =
-        open_signed_transfer_with_fence(&connection, &mut recv, fence.as_ref()).await?;
-    if let Some(relay) = relay {
-        relay.relay(signed_ticket, send, recv).await?;
-    } else {
-        // No route lease means no object bytes may enter the process.  Closing here is the
-        // fail-closed behavior used during startup and drain.
-        connection.close(0x100u32.into(), b"transfer relay unavailable");
+    let first_frame = read_frame(&mut recv).await?;
+    reject_legacy_transfer(&first_frame, allow_legacy_transfer)?;
+    match first_frame {
+        TransferFrame::OpenMaterializationSigned(ticket) => {
+            validate_materialization_handshake(&connection, &ticket.ticket, fence.as_ref())?;
+            if let Some(relay) = relay {
+                relay.relay_materialization(ticket, send, recv).await?;
+            } else {
+                // No route lease means no object bytes may enter the process. Closing here is the
+                // fail-closed behavior used during startup and drain.
+                connection.close(0x100u32.into(), b"transfer relay unavailable");
+            }
+        }
+        TransferFrame::OpenTransferSigned(signed_ticket) => {
+            if !allow_legacy_transfer {
+                return Err(QuicTransferError::LegacyProtocolDisabled);
+            }
+            validate_connection_handshake(&connection, &signed_ticket.ticket, fence.as_ref())?;
+            if let Some(relay) = relay {
+                relay.relay(signed_ticket, send, recv).await?;
+            } else {
+                connection.close(0x100u32.into(), b"transfer relay unavailable");
+            }
+        }
+        TransferFrame::OpenTransfer(_) => {
+            // Unsigned legacy tickets are never accepted by a network listener, including the
+            // migration adapter. They remain available only to in-process worker tests.
+            return Err(QuicTransferError::LegacyProtocolDisabled);
+        }
+        _ => return Err(TransferFrameError::InvalidField("first_frame").into()),
+    }
+    Ok(())
+}
+
+/// Rejects a legacy whole-Commit opening frame unless the caller explicitly installed the
+/// migration-only adapter. Keeping the legacy classification separate makes the boundary
+/// testable and prevents accidental re-use of `OpenTransfer` alongside the v2 manifest stream.
+fn reject_legacy_transfer(
+    frame: &TransferFrame,
+    allow_legacy_transfer: bool,
+) -> Result<(), QuicTransferError> {
+    if allow_legacy_transfer {
+        return Ok(());
+    }
+    if matches!(
+        frame,
+        TransferFrame::OpenTransfer(_) | TransferFrame::OpenTransferSigned(_)
+    ) {
+        return Err(QuicTransferError::LegacyProtocolDisabled);
     }
     Ok(())
 }
@@ -811,7 +1221,7 @@ fn unix_millis_now() -> u64 {
 /// The ALPN value used when constructing a Quinn client/server config.
 #[must_use]
 pub(crate) const fn alpn() -> &'static [u8] {
-    TRANSFER_ALPN.as_bytes()
+    MATERIALIZATION_TRANSFER_ALPN_V2.as_bytes()
 }
 
 #[cfg(test)]
@@ -864,6 +1274,89 @@ mod tests {
             max_bytes: DecimalU64::new(4096),
             allowed_objects: vec![ObjectId::from_bytes([3; 32])],
         }
+    }
+
+    #[test]
+    fn upstream_directory_is_agent_scoped_and_replaceable() {
+        let directory = TransferUpstreamDirectory::new();
+        let source_a = AgentId::new("agent-source-a").unwrap();
+        let source_b = AgentId::new("agent-source-b").unwrap();
+        let address_a: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let address_b: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+
+        assert_eq!(directory.resolve(&source_a), None);
+        directory.set(source_a.clone(), address_a);
+        directory.set(source_b.clone(), address_b);
+        assert_eq!(directory.resolve(&source_a), Some(address_a));
+        assert_eq!(directory.resolve(&source_b), Some(address_b));
+
+        let replacement: SocketAddr = "127.0.0.1:41003".parse().unwrap();
+        directory.set(source_a.clone(), replacement);
+        assert_eq!(directory.resolve(&source_a), Some(replacement));
+        directory.remove(&source_a);
+        assert_eq!(directory.resolve(&source_a), None);
+        assert_eq!(directory.resolve(&source_b), Some(address_b));
+    }
+
+    #[test]
+    fn configured_upstream_requires_an_active_route_lease() {
+        let directory = TransferUpstreamDirectory::new();
+        let agent = AgentId::new("agent-source").unwrap();
+        let address: SocketAddr = "127.0.0.1:41011".parse().unwrap();
+        directory.configure(agent.clone(), address);
+
+        assert_eq!(directory.resolve(&agent), None);
+        directory.activate(&agent, SessionGeneration::new(4), RouteGeneration::new(7));
+        assert_eq!(directory.resolve(&agent), Some(address));
+
+        assert!(!directory.deactivate_if_current(
+            &agent,
+            SessionGeneration::new(3),
+            RouteGeneration::new(6)
+        ));
+        assert_eq!(directory.resolve(&agent), Some(address));
+        assert!(directory.deactivate_if_current(
+            &agent,
+            SessionGeneration::new(4),
+            RouteGeneration::new(7)
+        ));
+        assert_eq!(directory.resolve(&agent), None);
+    }
+
+    #[test]
+    fn reconnect_reactivates_the_same_configured_upstream() {
+        let directory = TransferUpstreamDirectory::new();
+        let agent = AgentId::new("agent-source").unwrap();
+        let address: SocketAddr = "127.0.0.1:41012".parse().unwrap();
+        directory.configure(agent.clone(), address);
+
+        directory.activate(&agent, SessionGeneration::new(1), RouteGeneration::new(2));
+        directory.deactivate_all();
+        assert_eq!(directory.resolve(&agent), None);
+
+        directory.activate(&agent, SessionGeneration::new(3), RouteGeneration::new(4));
+        assert_eq!(directory.resolve(&agent), Some(address));
+    }
+
+    #[tokio::test]
+    async fn dynamic_routes_fail_closed_for_unknown_agents() {
+        let (_server_tls, client_tls) = transfer_tls();
+        let directory = TransferUpstreamDirectory::new();
+        let known = AgentId::new("agent-known").unwrap();
+        let unknown = AgentId::new("agent-unknown").unwrap();
+        directory.set(known, "127.0.0.1:41004".parse().unwrap());
+        let factory = QuinnTransferConnectionFactory::bind_with_directory(
+            Some("127.0.0.1:41005".parse().unwrap()),
+            Arc::<str>::from("localhost"),
+            client_tls,
+            directory,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            factory.resolve_upstream(&unknown),
+            Err(QuicTransferError::Fenced("source_route_unavailable"))
+        ));
     }
 
     fn signed_ticket() -> SignedTransferTicket {
@@ -958,7 +1451,23 @@ mod tests {
         )
         .with_generations(7, 8, 9);
         assert!(fence.validate(&ticket).is_ok());
-        assert_eq!(alpn(), TRANSFER_ALPN.as_bytes());
+        assert_eq!(alpn(), MATERIALIZATION_TRANSFER_ALPN_V2.as_bytes());
+    }
+
+    #[test]
+    fn production_listener_rejects_legacy_signed_ticket_on_v2_alpn() {
+        let frame = TransferFrame::OpenTransferSigned(signed_ticket());
+        assert!(matches!(
+            reject_legacy_transfer(&frame, false),
+            Err(QuicTransferError::LegacyProtocolDisabled)
+        ));
+        assert!(reject_legacy_transfer(&frame, true).is_ok());
+
+        let unsigned = TransferFrame::OpenTransfer(ticket());
+        assert!(matches!(
+            reject_legacy_transfer(&unsigned, false),
+            Err(QuicTransferError::LegacyProtocolDisabled)
+        ));
     }
 
     #[test]
@@ -1096,6 +1605,7 @@ mod tests {
             source_fence,
         )
         .unwrap()
+        .with_legacy_transfer_for_tests()
         .with_relay(Arc::new(ConnectedTransferRelay::new(Arc::new(
             source_connector,
         ))));
@@ -1116,6 +1626,7 @@ mod tests {
         let target_gateway =
             QuicTransferListener::bind("127.0.0.1:0".parse().unwrap(), server_tls, target_fence)
                 .unwrap()
+                .with_legacy_transfer_for_tests()
                 .with_relay(Arc::new(ConnectedTransferRelay::new(Arc::new(
                     target_connector,
                 ))));

@@ -10,15 +10,21 @@ use std::{fmt, str::FromStr};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::materialization::{BatchManifest, BatchManifestPage, SignedMaterializationBatchTicket};
 use super::placement::{CommitObjectSet, ObjectSet};
+use super::validation::parse_unique_json;
 use crate::{
     AgentId, ArtifactId, CentralSignedPayload, CommitId, ContentDigest, DecimalU64, EdgeClusterId,
     GatewayPoolId, MountGeneration, ObjectId, PlacementId, ProtocolError, ProtocolResult,
     RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, TransferId, UnixMillis,
 };
 
-/// ALPN negotiated by all object transfer QUIC connections.
-pub const TRANSFER_ALPN: &str = "neoengram-transfer-v1";
+/// ALPN negotiated by all v2 object materialization QUIC connections.
+pub const TRANSFER_ALPN: &str = "neoengram-transfer-v2";
+/// Legacy v1 ALPN retained only as a named migration marker.  v2 listeners must not advertise or
+/// accept it.
+#[deprecated(note = "v1 transfer is not accepted by the clean-slate materialization protocol")]
+pub const TRANSFER_ALPN_V1: &str = "neoengram-transfer-v1";
 /// Maximum encoded frame, including the four-byte length prefix and one-byte kind.
 pub const MAX_TRANSFER_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum ObjectChunk payload accepted by one frame.  Ranges larger than this are split by the
@@ -213,6 +219,12 @@ enum FrameKind {
     TransferError = 7,
     CloseTransfer = 8,
     OpenTransferSigned = 9,
+    /// A clean-slate v2 materialization capability. This is intentionally a distinct frame kind
+    /// from the legacy whole-Commit opening frames so a v1 ticket cannot be replayed on the v2
+    /// ALPN by a listener that only performs structural decoding.
+    OpenMaterializationSigned = 10,
+    MaterializationManifest = 11,
+    MaterializationManifestPage = 12,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -229,6 +241,9 @@ impl TryFrom<u8> for FrameKind {
             7 => Self::TransferError,
             8 => Self::CloseTransfer,
             9 => Self::OpenTransferSigned,
+            10 => Self::OpenMaterializationSigned,
+            11 => Self::MaterializationManifest,
+            12 => Self::MaterializationManifestPage,
             _ => return Err(TransferFrameError::UnknownKind(value)),
         })
     }
@@ -240,6 +255,9 @@ impl TryFrom<u8> for FrameKind {
 pub enum TransferFrame {
     OpenTransfer(TransferTicket),
     OpenTransferSigned(SignedTransferTicket),
+    OpenMaterializationSigned(SignedMaterializationBatchTicket),
+    MaterializationManifest(BatchManifest),
+    MaterializationManifestPage(BatchManifestPage),
     ObjectRequest(ObjectRequest),
     ObjectChunk(ObjectChunk),
     ObjectProof(ObjectProof),
@@ -405,10 +423,28 @@ impl TransferFrame {
                 payload.push(FrameKind::OpenTransferSigned as u8);
                 encode_signed_ticket(&mut payload, ticket)?;
             }
+            Self::OpenMaterializationSigned(ticket) => {
+                ticket
+                    .validate()
+                    .map_err(|_| TransferFrameError::InvalidField("materialization_ticket"))?;
+                payload.push(FrameKind::OpenMaterializationSigned as u8);
+                encode_signed_materialization_ticket(&mut payload, ticket)?;
+            }
+            Self::MaterializationManifest(manifest) => {
+                manifest
+                    .validate()
+                    .map_err(|_| TransferFrameError::InvalidField("materialization_manifest"))?;
+                payload.push(FrameKind::MaterializationManifest as u8);
+                encode_materialization_json(&mut payload, manifest, "materialization_manifest")?;
+            }
+            Self::MaterializationManifestPage(page) => {
+                page.validate().map_err(|_| {
+                    TransferFrameError::InvalidField("materialization_manifest_page")
+                })?;
+                payload.push(FrameKind::MaterializationManifestPage as u8);
+                encode_materialization_json(&mut payload, page, "materialization_manifest_page")?;
+            }
             Self::ObjectRequest(request) => {
-                if request.length == 0 {
-                    return Err(TransferFrameError::InvalidField("length"));
-                }
                 payload.push(FrameKind::ObjectRequest as u8);
                 put_object_id(&mut payload, request.object_id);
                 put_u64(&mut payload, request.offset);
@@ -514,10 +550,32 @@ impl TransferFrame {
             FrameKind::OpenTransferSigned => {
                 Self::OpenTransferSigned(decode_signed_ticket(&mut reader)?)
             }
+            FrameKind::OpenMaterializationSigned => {
+                Self::OpenMaterializationSigned(decode_signed_materialization_ticket(&mut reader)?)
+            }
+            FrameKind::MaterializationManifest => {
+                let manifest: BatchManifest =
+                    decode_materialization_json(&mut reader, "materialization_manifest")?;
+                manifest
+                    .validate()
+                    .map_err(|_| TransferFrameError::InvalidField("materialization_manifest"))?;
+                Self::MaterializationManifest(manifest)
+            }
+            FrameKind::MaterializationManifestPage => {
+                let page: BatchManifestPage =
+                    decode_materialization_json(&mut reader, "materialization_manifest_page")?;
+                page.validate().map_err(|_| {
+                    TransferFrameError::InvalidField("materialization_manifest_page")
+                })?;
+                Self::MaterializationManifestPage(page)
+            }
             FrameKind::ObjectRequest => Self::ObjectRequest(ObjectRequest {
                 object_id: reader.object_id()?,
                 offset: reader.u64()?,
-                length: reader.u64_nonzero("length")?,
+                // A zero-length request is the explicit completion handshake for an empty
+                // object.  The frame does not carry the object size, so source-side sessions
+                // enforce that zero is only valid for an empty ObjectRef.
+                length: reader.u64()?,
             }),
             FrameKind::ObjectChunk => {
                 let object_id = reader.object_id()?;
@@ -616,12 +674,74 @@ fn decode_signed_ticket(
     reader: &mut Reader<'_>,
 ) -> Result<SignedTransferTicket, TransferFrameError> {
     let bytes = reader.bytes(MAX_TRANSFER_FRAME_BYTES)?;
-    let ticket: SignedTransferTicket = serde_json::from_slice(&bytes)
+    let value =
+        parse_unique_json(&bytes).map_err(|_| TransferFrameError::InvalidField("signed_ticket"))?;
+    let ticket: SignedTransferTicket = serde_json::from_value(value)
         .map_err(|_| TransferFrameError::InvalidField("signed_ticket"))?;
     ticket
         .validate()
         .map_err(|_| TransferFrameError::InvalidField("signed_ticket"))?;
     Ok(ticket)
+}
+
+fn encode_signed_materialization_ticket(
+    out: &mut Vec<u8>,
+    ticket: &SignedMaterializationBatchTicket,
+) -> Result<(), TransferFrameError> {
+    let encoded = serde_json::to_vec(ticket)
+        .map_err(|_| TransferFrameError::InvalidField("materialization_ticket"))?;
+    if encoded.len() > MAX_TRANSFER_FRAME_BYTES {
+        return Err(TransferFrameError::LimitExceeded {
+            field: "materialization_ticket",
+            limit: MAX_TRANSFER_FRAME_BYTES,
+            actual: encoded.len(),
+        });
+    }
+    put_bytes(out, &encoded)
+}
+
+fn decode_signed_materialization_ticket(
+    reader: &mut Reader<'_>,
+) -> Result<SignedMaterializationBatchTicket, TransferFrameError> {
+    let bytes = reader.bytes(MAX_TRANSFER_FRAME_BYTES)?;
+    // Ticket JSON is part of the signed capability.  Parse through the duplicate-key rejecting
+    // decoder before deserializing so an intermediary cannot make two implementations disagree
+    // about which duplicate member was covered by the signature.
+    let value = parse_unique_json(&bytes)
+        .map_err(|_| TransferFrameError::InvalidField("materialization_ticket"))?;
+    let ticket: SignedMaterializationBatchTicket = serde_json::from_value(value)
+        .map_err(|_| TransferFrameError::InvalidField("materialization_ticket"))?;
+    ticket
+        .validate()
+        .map_err(|_| TransferFrameError::InvalidField("materialization_ticket"))?;
+    Ok(ticket)
+}
+
+fn encode_materialization_json<T: Serialize>(
+    out: &mut Vec<u8>,
+    value: &T,
+    field: &'static str,
+) -> Result<(), TransferFrameError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| TransferFrameError::InvalidField(field))?;
+    if encoded.len() > MAX_TRANSFER_FRAME_BYTES {
+        return Err(TransferFrameError::LimitExceeded {
+            field,
+            limit: MAX_TRANSFER_FRAME_BYTES,
+            actual: encoded.len(),
+        });
+    }
+    put_blob(out, &encoded, MAX_TRANSFER_FRAME_BYTES, field)
+}
+
+fn decode_materialization_json<'a, T: for<'de> Deserialize<'de>>(
+    reader: &mut Reader<'a>,
+    field: &'static str,
+) -> Result<T, TransferFrameError> {
+    let bytes = reader.bytes(MAX_TRANSFER_FRAME_BYTES)?;
+    // Manifest descriptors/pages are authenticated indirectly by the ticket's digest. Reject
+    // duplicate JSON members before normal Serde decoding to keep that digest unambiguous.
+    let value = parse_unique_json(&bytes).map_err(|_| TransferFrameError::InvalidField(field))?;
+    serde_json::from_value(value).map_err(|_| TransferFrameError::InvalidField(field))
 }
 
 fn decode_ticket(reader: &mut Reader<'_>) -> Result<TransferTicket, TransferFrameError> {
@@ -800,10 +920,19 @@ fn put_string(out: &mut Vec<u8>, value: &str) -> Result<(), TransferFrameError> 
 }
 
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), TransferFrameError> {
-    if bytes.len() > MAX_TRANSFER_CHUNK_BYTES || bytes.len() > u32::MAX as usize {
+    put_blob(out, bytes, MAX_TRANSFER_CHUNK_BYTES, "bytes")
+}
+
+fn put_blob(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    max: usize,
+    field: &'static str,
+) -> Result<(), TransferFrameError> {
+    if bytes.len() > max || bytes.len() > u32::MAX as usize {
         return Err(TransferFrameError::LimitExceeded {
-            field: "bytes",
-            limit: MAX_TRANSFER_CHUNK_BYTES,
+            field,
+            limit: max,
             actual: bytes.len(),
         });
     }
@@ -918,8 +1047,10 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::materialization::BatchManifestPage;
     use super::*;
     use crate::{BackendId, PlacementGeneration};
+    use crate::{Generation, MaterializationBatchId, MaterializationId, ObjectNamespaceId};
 
     fn object(byte: u8) -> ObjectId {
         ObjectId::from_bytes([byte; 32])
@@ -983,10 +1114,54 @@ mod tests {
     }
 
     #[test]
+    fn empty_object_request_round_trips_with_a_zero_length_range() {
+        let frame = TransferFrame::ObjectRequest(ObjectRequest {
+            object_id: object(1),
+            offset: 0,
+            length: 0,
+        });
+        let encoded = frame.encode().unwrap();
+        assert_eq!(TransferFrame::decode(&encoded).unwrap(), frame);
+    }
+
+    #[test]
     fn unknown_frame_kind_is_rejected() {
         assert!(matches!(
             TransferFrame::decode(&[0, 0, 0, 1, 99]),
             Err(TransferFrameError::UnknownKind(99))
+        ));
+    }
+
+    #[test]
+    fn materialization_manifest_frame_rejects_duplicate_json_members() {
+        let page = BatchManifestPage::new(
+            MaterializationId::new("materialization-1").unwrap(),
+            MaterializationBatchId::new("batch-1").unwrap(),
+            Generation::new(1),
+            Generation::new(1),
+            ObjectNamespaceId::new("artifact-1").unwrap(),
+            0,
+            1,
+            Vec::new(),
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&page).unwrap();
+        let duplicate = format!(
+            "{},\"batch_id\":\"{}\"}}",
+            encoded.trim_end_matches('}'),
+            page.batch_id
+        );
+        let mut payload = vec![FrameKind::MaterializationManifestPage as u8];
+        payload.extend_from_slice(&(duplicate.len() as u32).to_be_bytes());
+        payload.extend_from_slice(duplicate.as_bytes());
+        let mut frame = Vec::with_capacity(payload.len() + 4);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        assert!(matches!(
+            TransferFrame::decode(&frame),
+            Err(TransferFrameError::InvalidField(
+                "materialization_manifest_page"
+            ))
         ));
     }
 

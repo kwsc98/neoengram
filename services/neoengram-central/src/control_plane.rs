@@ -1,17 +1,24 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
+use neoengram_domain::protocol::materialization::{
+    BatchManifest, CoverageState, MaterializationBatch, MaterializationBatchState,
+    MaterializationBatchTicket, MaterializationObjectState, MaterializationReport,
+    VolumeCommitCoverage,
+};
 use neoengram_domain::protocol::{
-    AgentId, AssignmentOperation, ControlError, ControlMessage, DecisionGeneration,
-    DeletionOperationState, DeletionProof, DeletionProofId, DeletionProofResult, Envelope,
-    EnvelopeHeader, ErrorCode, Extensions, IndexRevision, JobAssignment, JobDecision, JobFinalized,
-    JobState, LifecycleEvent, LifecycleEventId, LifecycleEventKind, MessageId, MountGeneration,
-    PrincipalKind, PublishDecision, ReplicationAssignment, ReplicationObjectState,
-    ReplicationProgressReport, ReplicationState, RequestId, ResourceLifecycleReport,
-    ResourceLifecycleReportState, ResourceVersion, RouteGeneration, SessionGeneration,
-    SignedTransferTicket, SnapshotDeliveryAssignment, SnapshotDeliveryState, TraceId,
-    TransferEndpoint, TransferTicket, UnixMillis, WireIndexVersion, WorkspaceMaterializeAssignment,
-    AGENT_JOB_ASSIGNMENT_ACTION, AGENT_JOB_DECISION_ACTION, AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
-    AGENT_REPLICATION_ASSIGNMENT_ACTION, CURRENT_WIRE_VERSION,
+    object_read_lease_id, staging_lease_id, AgentId, AssignmentOperation, CommitObject,
+    ControlError, ControlMessage, DecisionGeneration, DeletionOperationState, DeletionProof,
+    DeletionProofId, DeletionProofResult, Envelope, EnvelopeHeader, ErrorCode, Extensions,
+    IndexRevision, JobAssignment, JobDecision, JobFinalized, JobState, LifecycleEvent,
+    LifecycleEventId, LifecycleEventKind, MessageId, MountGeneration, ObjectNamespaceId, ObjectSet,
+    ObjectTicketId, PlacementGeneration, PrincipalKind, PublishDecision, ReplicationAssignment,
+    ReplicationObjectState, ReplicationProgressReport, ReplicationState, RequestId,
+    ResourceLifecycleReport, ResourceLifecycleReportState, ResourceVersion, RouteGeneration,
+    SessionGeneration, SignedTransferTicket, SnapshotDeliveryAssignment, SnapshotDeliveryState,
+    TraceId, TransferEndpoint, TransferTicket, UnixMillis, WireIndexVersion,
+    WorkspaceMaterializeAssignment, AGENT_JOB_ASSIGNMENT_ACTION, AGENT_JOB_DECISION_ACTION,
+    AGENT_LIFECYCLE_ASSIGNMENT_ACTION, AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
+    CURRENT_WIRE_VERSION,
 };
 
 use crate::{
@@ -24,18 +31,18 @@ use crate::{
     AssignJobResult, AssignSnapshotDeliveryRequest, AssignSnapshotDeliveryResult,
     AssignWorkspaceMaterializationRequest, AssignWorkspaceMaterializationResult, AssignmentOutbox,
     AuditEvent, AuditKind, AuditSink, AuthorityStore, AuthorizationRequest, Authorizer,
-    CentralErrorCode, CentralResult, Clock, ControlCatalogRepository, CreateAddJobRequest,
-    CreateAddJobResult, CreateSnapshotDeliveryRequest, CreateSnapshotDeliveryResult,
-    CreateWorkspaceMaterializationRequest, CreateWorkspaceMaterializationResult,
-    ExpireAddJobRequest, ExpireAddJobResult, FinalizeAddRequest, FinalizeAddResult,
-    FinalizeReplicationRequest, GatewayRegistryRepository, IndexPublishOutcome,
-    IndexPublishRejection, IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobOperation,
-    JobRecord, JobRepository, MetadataBatchStager, MetadataBatchSubmission, ObjectCatalog,
-    PlacementRepository, PublicationCandidate, QueryJobRequest, QueryJobResult,
-    ReceiveReportRequest, ReceiveReportResult, RefreshReplicationRoutesRequest,
-    ReplicationObjectRecord, ReplicationRecord, ReplicationRouteBinding,
-    ReplicationStateTransitionRequest, ResumePublicationRequest, StageMetadataBatchRequest,
-    StageMetadataBatchResult,
+    CentralError, CentralErrorCode, CentralResult, Clock, ControlCatalogRepository,
+    CreateAddJobRequest, CreateAddJobResult, CreateSnapshotDeliveryRequest,
+    CreateSnapshotDeliveryResult, CreateWorkspaceMaterializationRequest,
+    CreateWorkspaceMaterializationResult, ExpireAddJobRequest, ExpireAddJobResult,
+    FinalizeAddRequest, FinalizeAddResult, FinalizeReplicationRequest, GatewayRegistryRepository,
+    IndexPublishOutcome, IndexPublishRejection, IndexPublishRequest, IndexPublisher,
+    JobInsertOutcome, JobOperation, JobRecord, JobRepository, MetadataBatchStager,
+    MetadataBatchSubmission, ObjectCatalog, PlacementRepository, PublicationCandidate,
+    QueryJobRequest, QueryJobResult, ReceiveReportRequest, ReceiveReportResult,
+    RefreshReplicationRoutesRequest, ReplicationObjectRecord, ReplicationRecord,
+    ReplicationRouteBinding, ReplicationStateTransitionRequest, ResumePublicationRequest,
+    StageMetadataBatchRequest, StageMetadataBatchResult,
 };
 
 use crate::service::{CentralCommandKeyring, DEFAULT_CENTRAL_COMMAND_TTL_MS};
@@ -77,6 +84,88 @@ fn assignment_deadline(assignment: &JobAssignment) -> UnixMillis {
     }
 }
 
+async fn target_volume_coverage_complete(
+    placement: &dyn PlacementRepository,
+    tenant_id: &neoengram_domain::protocol::TenantId,
+    artifact_id: &neoengram_domain::protocol::ArtifactId,
+    commit_id: neoengram_domain::core::ContentDigest,
+    volume_id: &neoengram_domain::protocol::StorageVolumeId,
+) -> CentralResult<bool> {
+    let Some(stored) = placement
+        .get_commit_object_set(tenant_id, &commit_id)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if stored.tenant_id != *tenant_id || stored.commit_id.digest() != commit_id {
+        return Ok(false);
+    }
+    let namespace = ObjectNamespaceId::new(artifact_id.to_string())
+        .map_err(|error| invalid(CentralErrorCode::InvalidState, error.to_string()))?;
+    let object_set =
+        neoengram_domain::protocol::materialization::NamespaceObjectSet::from_object_set(
+            tenant_id.clone(),
+            namespace.clone(),
+            stored.commit_id,
+            &stored.object_set,
+        )?;
+    let mut placements = Vec::new();
+    for object in &object_set.objects {
+        placements.extend(
+            placement
+                .object_placements_v2(tenant_id, &namespace, &object.object_id)
+                .await?
+                .into_iter()
+                .filter(|item| {
+                    item.readable()
+                        && item.object_namespace_id == namespace
+                        && item.object_id == object.object_id
+                        && item.size == object.size
+                        && item.encoding == object.encoding
+                }),
+        );
+    }
+    let Some(generation) = placements
+        .iter()
+        .filter(|item| item.storage_volume_id.as_ref() == Some(volume_id))
+        .map(|item| item.placement_generation)
+        .max()
+        .or_else(|| {
+            object_set
+                .objects
+                .is_empty()
+                .then_some(PlacementGeneration::new(1))
+        })
+    else {
+        return Ok(false);
+    };
+    let legacy = ObjectSet::new(
+        object_set
+            .objects
+            .iter()
+            .map(|object| {
+                CommitObject::new(
+                    object.object_id,
+                    object.size.get(),
+                    object.encoding,
+                    object.ordinal.get(),
+                )
+            })
+            .collect(),
+    )?;
+    let coverage = VolumeCommitCoverage::from_placements(
+        tenant_id.clone(),
+        namespace,
+        stored.commit_id,
+        volume_id.clone(),
+        generation,
+        &legacy,
+        &placements,
+    )?;
+    Ok(coverage.state == CoverageState::Complete)
+}
+
+#[allow(dead_code)]
 fn replication_ticket_deadline(now: UnixMillis) -> CentralResult<UnixMillis> {
     now.get()
         .checked_add(DEFAULT_CENTRAL_COMMAND_TTL_MS)
@@ -126,6 +215,149 @@ pub struct ControlPlane {
 pub struct ReplicationReportResult {
     pub resource_version: ResourceVersion,
     pub replayed: bool,
+}
+
+/// Result of applying one object-level materialization report.  Materialization rows do not use
+/// the Job resource-version aggregate, so the channel ACK carries a stable non-zero sentinel;
+/// the actual fencing keys are the plan revision, batch attempt, and target route generations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterializationReportResult {
+    pub resource_version: ResourceVersion,
+    pub replayed: bool,
+}
+
+async fn release_materialization_batch_leases(
+    placement: &dyn PlacementRepository,
+    job: &neoengram_domain::protocol::materialization::MaterializationJob,
+    batch: &MaterializationBatch,
+) -> CentralResult<()> {
+    let tasks = placement
+        .list_materialization_objects(
+            &job.key.tenant_id,
+            &job.key.object_namespace_id,
+            &job.materialization_id,
+        )
+        .await?;
+    for object_id in &batch.object_ids {
+        release_materialization_object_leases(placement, job, batch, &tasks, *object_id).await?;
+    }
+    Ok(())
+}
+
+async fn release_materialization_object_leases(
+    placement: &dyn PlacementRepository,
+    job: &neoengram_domain::protocol::materialization::MaterializationJob,
+    batch: &MaterializationBatch,
+    tasks: &[neoengram_domain::protocol::materialization::MaterializationObject],
+    object_id: neoengram_domain::core::ObjectId,
+) -> CentralResult<()> {
+    if let Some(task) = tasks.iter().find(|task| {
+        task.object.object_namespace_id == job.key.object_namespace_id
+            && task.object.object_id == object_id
+    }) {
+        // Keep every authority-selected source alive for the lifetime of the object attempt.
+        // A source switch can happen after the primary route fails; releasing/protecting only
+        // the primary would let GC reclaim a fallback placement while it is still valid work.
+        let source_ids = task
+            .primary_source
+            .iter()
+            .chain(task.fallback_sources.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for source_id in source_ids {
+            let lease_id = object_read_lease_id(
+                &job.materialization_id,
+                &batch.batch_id,
+                batch.plan_revision,
+                batch.batch_attempt,
+                &job.key.object_namespace_id,
+                object_id,
+                &source_id,
+            )?;
+            placement
+                .release_object_read_lease(
+                    &job.key.tenant_id,
+                    &job.key.object_namespace_id,
+                    &lease_id,
+                )
+                .await?;
+        }
+    }
+    let lease_id = staging_lease_id(
+        &job.materialization_id,
+        batch.plan_revision,
+        &job.key.object_namespace_id,
+        object_id,
+    )?;
+    placement
+        .release_staging_lease(&job.key.tenant_id, &job.key.object_namespace_id, &lease_id)
+        .await?;
+    Ok(())
+}
+
+/// Revalidates the route fence captured in a durable Batch immediately before issuing an Agent
+/// assignment.  A Batch can outlive a Gateway reconnect; checking only the target session (the
+/// control channel's session) is insufficient because the source Gateway may have advanced its
+/// route generation independently.  Tickets are therefore never signed for an old route tuple.
+async fn validate_materialization_route_fence(
+    registry: &dyn GatewayRegistryRepository,
+    agent_id: &AgentId,
+    edge_cluster_id: &neoengram_domain::protocol::EdgeClusterId,
+    gateway_pool_id: &neoengram_domain::protocol::GatewayPoolId,
+    session_generation: SessionGeneration,
+    route_generation: RouteGeneration,
+    now: UnixMillis,
+) -> CentralResult<()> {
+    let route = registry
+        .get_agent_route(agent_id)
+        .await?
+        .filter(|route| route.is_active_at(now))
+        .ok_or_else(|| {
+            invalid(
+                CentralErrorCode::GatewayRouteUnavailable,
+                "materialization route is unavailable",
+            )
+        })?;
+    if route.edge_cluster_id != *edge_cluster_id
+        || route.gateway_pool_id != *gateway_pool_id
+        || route.session_generation != session_generation
+        || route.route_generation != route_generation
+    {
+        return Err(invalid(
+            CentralErrorCode::ConcurrentUpdate,
+            "materialization route generation changed since the Batch was planned",
+        ));
+    }
+    Ok(())
+}
+
+/// A Gateway route can remain alive briefly while Volume ownership is being fenced. Materialization
+/// tickets must carry the owner generation as well, otherwise a reconnecting old Agent could
+/// continue serving or receiving bytes through an otherwise healthy route.
+async fn validate_materialization_owner_fence(
+    registry: &dyn AgentRegistryRepository,
+    agent_id: &AgentId,
+    volume_id: &neoengram_domain::protocol::StorageVolumeId,
+    placement_generation: PlacementGeneration,
+) -> CentralResult<()> {
+    let record = registry.get_by_agent(agent_id).await?.ok_or_else(|| {
+        invalid(
+            CentralErrorCode::GatewayRouteUnavailable,
+            "materialization Agent enrollment is unavailable",
+        )
+    })?;
+    if record.mount.storage_volume_id != *volume_id
+        || record.owner.storage_volume_id != *volume_id
+        || record.owner.active_agent_id.as_ref() != Some(agent_id)
+        || record.owner.active_agent_mount_id.as_ref() != Some(&record.mount.agent_mount_id)
+        || record.owner.owner_generation.get() != placement_generation.get()
+    {
+        return Err(invalid(
+            CentralErrorCode::ConcurrentUpdate,
+            "materialization Volume owner generation changed since the Batch was planned",
+        ));
+    }
+    Ok(())
 }
 
 async fn validate_replication_report_binding(
@@ -239,6 +471,7 @@ fn current_is_terminal_replication(state: ReplicationState) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn replication_delivery_can_wait_for_next_tick(error: &crate::CentralError) -> bool {
     match error.code() {
         CentralErrorCode::GatewayRouteUnavailable => error.retryable(),
@@ -620,47 +853,50 @@ impl ControlPlane {
             }
         }
 
-        // Replication commands are derived from the Placement authority rather than the Job
-        // outbox. They remain deliverable throughout an active attempt so a reconnect can resume
-        // the same staging offsets, while the immutable attempt/object-set/route fences are
-        // rechecked before every delivery.
+        // v2 materialization commands are derived from namespace-scoped object authority. They
+        // remain deliverable while a Batch is active so a reconnect can resume the same stable
+        // staging keys and offsets. Legacy whole-Commit ReplicationRecords are intentionally not
+        // delivered here; they remain readable only to support explicit reset/inventory tooling.
         if messages.len() < limit {
-            if let (Some(placement), Some(_keyring), Some(agent_registry)) = (
-                &self.placement,
-                &self.replication_ticket_keyring,
-                &self.agent_registry,
-            ) {
-                let Some(agent_record) = agent_registry.get_by_agent(agent_id).await? else {
+            if let Some(placement) = &self.placement {
+                let tenant_id = if let Some(registry) = &self.agent_registry {
+                    let Some(record) = registry.get_by_agent(agent_id).await? else {
+                        return Ok(messages);
+                    };
+                    record.enrollment.tenant_id
+                } else {
                     return Ok(messages);
                 };
-                let tenant_id = agent_record.enrollment.tenant_id;
-                for replication in placement
-                    .list_replications_for_agent(&tenant_id, agent_id)
+                for batch in placement
+                    .list_active_materialization_batches_for_agent(&tenant_id, agent_id)
                     .await?
                 {
                     if messages.len() == limit
-                        || !matches!(
-                            replication.state,
-                            ReplicationState::Queued
-                                | ReplicationState::Planning
-                                | ReplicationState::Transferring
-                                | ReplicationState::Verifying
+                        || matches!(
+                            batch.state,
+                            MaterializationBatchState::Succeeded
+                                | MaterializationBatchState::Failed
                         )
                     {
                         continue;
                     }
-                    let assignment = match self.replication_assignment(&replication).await {
+                    let assignment = match self
+                        .materialization_assignment(&batch, session_generation)
+                        .await
+                    {
                         Ok(assignment) => assignment,
-                        Err(error) if replication_delivery_can_wait_for_next_tick(&error) => {
-                            // A single replication can race a Gateway lease refresh or a route
-                            // CAS. Keep unrelated Job/decision/lifecycle messages flowing; the
-                            // active replication remains in Placement and will be retried on the
-                            // next delivery tick. Authority/protocol failures still fail closed.
+                        Err(error)
+                            if matches!(
+                                error.code(),
+                                CentralErrorCode::GatewayRouteUnavailable
+                                    | CentralErrorCode::ConcurrentUpdate
+                            ) =>
+                        {
                             tracing::debug!(
                                 agent_id = %agent_id,
-                                replication_id = %replication.replication_id,
+                                batch_id = %batch.batch_id,
                                 code = error.stable_code(),
-                                "skipping temporarily unavailable replication assignment"
+                                "skipping temporarily unavailable materialization batch"
                             );
                             continue;
                         }
@@ -669,24 +905,19 @@ impl ControlPlane {
                     let Some(assignment) = assignment else {
                         continue;
                     };
-                    // The assignment builder refreshes the live target route. Do not enqueue a
-                    // command for a channel whose session was fenced while the delivery pass was
-                    // reading the registry.
-                    if assignment.signed_ticket.as_ticket().session_generation != session_generation
-                    {
-                        continue;
-                    }
-                    let deadline = assignment.signed_ticket.as_ticket().deadline_unix_ms;
+                    let deadline = assignment.signed_ticket.ticket.deadline_unix_ms;
                     let envelope = action_envelope(
-                        AGENT_REPLICATION_ASSIGNMENT_ACTION,
+                        AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
                         MessageId::new(format!(
-                            "replication-{}-{}",
-                            assignment.replication_id, assignment.attempt
+                            "materialization-{}-{}-{}",
+                            assignment.batch.materialization_id,
+                            assignment.batch.batch_id,
+                            assignment.batch.batch_attempt
                         ))?,
-                        assignment.tenant_id.clone(),
+                        assignment.batch.target.tenant_id.clone(),
                         session_generation,
                         deadline,
-                        ControlMessage::ReplicationAssignment(Box::new(assignment)),
+                        ControlMessage::MaterializationAssignment(Box::new(assignment)),
                     )?;
                     messages.push(envelope);
                 }
@@ -695,6 +926,794 @@ impl ControlPlane {
         Ok(messages)
     }
 
+    /// Builds one Central-signed object-level materialization assignment from the durable Batch.
+    /// Manifest pages are reconstructed from the namespace-scoped object tasks; they are not
+    /// accepted from an Agent and therefore cannot drift from the authority's plan revision.
+    async fn materialization_assignment(
+        &self,
+        batch: &MaterializationBatch,
+        session_generation: SessionGeneration,
+    ) -> CentralResult<Option<neoengram_domain::protocol::MaterializationAssignment>> {
+        if batch.target.session_generation != session_generation {
+            return Ok(None);
+        }
+        let Some(placement) = &self.placement else {
+            return Ok(None);
+        };
+        let Some(keyring) = &self.replication_ticket_keyring else {
+            return Ok(None);
+        };
+        let Some(job) = placement
+            .get_materialization(
+                &batch.target.tenant_id,
+                &batch.target.object_namespace_id,
+                &batch.materialization_id,
+            )
+            .await?
+        else {
+            return Err(invalid(
+                CentralErrorCode::ResourceNotFound,
+                "materialization Batch references a missing Job",
+            ));
+        };
+        // Route generations are part of the signed Batch fence. Recheck both hops at delivery
+        // time so a source or target reconnect cannot receive a ticket for an obsolete route.
+        if let Some(gateway_registry) = &self.gateway_registry {
+            let now = self.clock.now();
+            validate_materialization_route_fence(
+                gateway_registry.as_ref(),
+                &batch.target.agent_id,
+                &batch.target.edge_cluster_id,
+                &batch.target.gateway_pool_id,
+                batch.target.session_generation,
+                batch.target.route_generation,
+                now,
+            )
+            .await?;
+            validate_materialization_route_fence(
+                gateway_registry.as_ref(),
+                &batch.source.agent_id,
+                &batch.source.edge_cluster_id,
+                &batch.source.gateway_pool_id,
+                batch.source.session_generation,
+                batch.source.route_generation,
+                now,
+            )
+            .await?;
+        }
+        if let Some(agent_registry) = &self.agent_registry {
+            validate_materialization_owner_fence(
+                agent_registry.as_ref(),
+                &batch.target.agent_id,
+                &batch.target.storage_volume_id,
+                batch.target.placement_generation,
+            )
+            .await?;
+            if let Some(source_volume_id) = &batch.source.storage_volume_id {
+                validate_materialization_owner_fence(
+                    agent_registry.as_ref(),
+                    &batch.source.agent_id,
+                    source_volume_id,
+                    batch.source.placement_generation,
+                )
+                .await?;
+            }
+        }
+        let mut batch = batch.clone();
+        // Claim a queued Batch before exposing it on the reverse channel. This gives receipt
+        // handling a monotonic state path (Assigned -> Transferring -> Verifying -> Succeeded)
+        // while preserving the durable Batch identity across reconnects.
+        if batch.state == MaterializationBatchState::Queued {
+            let mut claimed = batch.clone();
+            claimed.state = MaterializationBatchState::Assigned;
+            batch = placement
+                .replace_materialization_batch(crate::MaterializationBatchCasRequest {
+                    tenant_id: batch.target.tenant_id.clone(),
+                    object_namespace_id: batch.target.object_namespace_id.clone(),
+                    materialization_id: batch.materialization_id.clone(),
+                    batch_id: batch.batch_id.clone(),
+                    expected_plan_revision: batch.plan_revision,
+                    expected_batch_attempt: batch.batch_attempt,
+                    batch: claimed,
+                })
+                .await?;
+        }
+        if job.plan_revision != batch.plan_revision
+            || job.key.object_namespace_id != batch.target.object_namespace_id
+            || job.key.target_storage_volume_id != batch.target.storage_volume_id
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Batch is stale relative to its Job",
+            ));
+        }
+        let mut tasks = placement
+            .list_materialization_objects(
+                &batch.target.tenant_id,
+                &batch.target.object_namespace_id,
+                &batch.materialization_id,
+            )
+            .await?
+            .into_iter()
+            .filter(|task| {
+                task.plan_revision == batch.plan_revision
+                    && task.object.object_namespace_id == batch.target.object_namespace_id
+                    && batch.object_ids.contains(&task.object.object_id)
+            })
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| task.object.ordinal);
+        if tasks.len() != batch.object_ids.len() {
+            return Err(invalid(
+                CentralErrorCode::BatchIncomplete,
+                "materialization Batch does not have all namespace object tasks",
+            ));
+        }
+        let objects = tasks
+            .iter()
+            .map(|task| task.object.clone())
+            .collect::<Vec<_>>();
+        let source_bindings = tasks
+            .iter()
+            .map(|task| {
+                let placement_id = task.primary_source.clone().ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::BatchIncomplete,
+                        "materialization object task has no selected source Placement",
+                    )
+                })?;
+                Ok(neoengram_domain::protocol::MaterializationManifestSource {
+                    object_id: task.object.object_id,
+                    placement_id,
+                    placement_generation: batch.source.placement_generation,
+                })
+            })
+            .collect::<CentralResult<Vec<_>>>()?;
+        let (manifest, pages) = BatchManifest::paginate_with_sources(
+            batch.materialization_id.clone(),
+            batch.batch_id.clone(),
+            batch.plan_revision,
+            batch.batch_attempt,
+            batch.target.object_namespace_id.clone(),
+            objects,
+            source_bindings,
+            4096,
+        )
+        .map_err(CentralError::from)?;
+        if manifest.manifest_digest != batch.manifest_digest {
+            return Err(invalid(
+                CentralErrorCode::BatchTampered,
+                "materialization Batch manifest digest differs from its object tasks",
+            ));
+        }
+        let now = self.clock.now();
+        if batch.deadline_unix_ms.get() <= now.get() {
+            return Err(invalid(
+                CentralErrorCode::DeadlineExceeded,
+                "materialization Batch deadline has elapsed",
+            ));
+        }
+        let ticket_digest = blake3::hash(
+            format!(
+                "materialization-ticket\0{}\0{}\0{}\0{}",
+                batch.materialization_id, batch.batch_id, batch.plan_revision, batch.batch_attempt
+            )
+            .as_bytes(),
+        );
+        let ticket_id = ObjectTicketId::new(format!("ticket-{}", &ticket_digest.to_hex()[..32]))
+            .map_err(CentralError::from)?;
+        let ticket = MaterializationBatchTicket {
+            ticket_id,
+            materialization_id: batch.materialization_id.clone(),
+            batch_id: batch.batch_id.clone(),
+            plan_revision: batch.plan_revision,
+            batch_attempt: batch.batch_attempt,
+            tenant_id: batch.target.tenant_id.clone(),
+            artifact_id: job.artifact_id,
+            object_namespace_id: batch.target.object_namespace_id.clone(),
+            commit_id: job.key.commit_id,
+            manifest_digest: batch.manifest_digest,
+            source: batch.source.clone(),
+            target: batch.target.clone(),
+            max_bytes: batch.max_bytes,
+            deadline_unix_ms: batch.deadline_unix_ms,
+            capability:
+                neoengram_domain::protocol::materialization::COMMIT_MATERIALIZATION_CAPABILITY_V2
+                    .to_owned(),
+        };
+        let remaining_ms = batch.deadline_unix_ms.get().saturating_sub(now.get());
+        let signed_ticket = keyring
+            .sign_materialization_batch_ticket(
+                ticket,
+                now,
+                remaining_ms.min(DEFAULT_CENTRAL_COMMAND_TTL_MS),
+            )
+            .await
+            .map_err(|error| invalid(CentralErrorCode::Internal, error.to_string()))?;
+        let assignment = neoengram_domain::protocol::MaterializationAssignment {
+            signed_ticket,
+            batch: batch.clone(),
+            manifest,
+            pages,
+            extensions: Extensions::new(),
+        };
+        assignment.validate()?;
+        Ok(Some(assignment))
+    }
+
+    /// Applies one authenticated object-level materialization report. Receipt publication is
+    /// delegated to the PlacementRepository's idempotent durability barrier; failure reports
+    /// fence the matching Batch/Job without ever creating a Placement.
+    pub async fn receive_materialization_report(
+        &self,
+        tenant_id: &neoengram_domain::protocol::TenantId,
+        agent_id: &AgentId,
+        session_generation: SessionGeneration,
+        report: MaterializationReport,
+    ) -> CentralResult<MaterializationReportResult> {
+        report.validate()?;
+        if report.tenant_id() != tenant_id {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "materialization report tenant differs from its authenticated Agent session",
+            ));
+        }
+        let placement = self.placement.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::StorageFailure,
+                "materialization Placement authority is unavailable",
+            )
+        })?;
+        let materialization_id = report.materialization_id().clone();
+        let job = placement
+            .get_materialization(tenant_id, report.object_namespace_id(), &materialization_id)
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization report references an unknown Job",
+                )
+            })?;
+        if job.key.object_namespace_id != *report.object_namespace_id() {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization report namespace or plan revision is stale",
+            ));
+        }
+        let batch = placement
+            .list_materialization_batches(
+                tenant_id,
+                report.object_namespace_id(),
+                &materialization_id,
+            )
+            .await?
+            .into_iter()
+            .find(|batch| batch.batch_id == *report.batch_id())
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization report references an unknown Batch",
+                )
+            })?;
+        if batch.target.agent_id != *agent_id {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "materialization report is not bound to the target Agent",
+            ));
+        }
+        // Every v2 report carries the exact target fence copied from its signed assignment.
+        // Compare it with the durable Batch before consulting live route state so a delayed
+        // report cannot be retargeted merely because the Agent/Gateway has since reconnected.
+        if report.target() != &batch.target {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "materialization report target fence differs from the durable Batch",
+            ));
+        }
+        if batch.plan_revision != report.plan_revision()
+            || batch.batch_attempt != report.batch_attempt()
+            || batch.target.object_namespace_id != *report.object_namespace_id()
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization report does not match the active Batch fence",
+            ));
+        }
+
+        // A receipt is the durable idempotency point. Probe its exact identity before checking
+        // live session, route, and owner generations: an Agent can reconnect after the original
+        // publication succeeded, while the queued report still carries the old signed target
+        // fence. Unknown receipts do not get this exception and continue through all live fences
+        // below, so an authenticated Agent cannot use the replay path to submit a never-committed
+        // stale report.
+        if let MaterializationReport::Receipt { receipt, .. } = &report {
+            if let Some(existing) = placement
+                .get_materialization_receipt(
+                    tenant_id,
+                    &receipt.object_namespace_id,
+                    &receipt.receipt_id,
+                )
+                .await?
+            {
+                if existing != receipt.clone() {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        "materialization receipt ID is already in use",
+                    ));
+                }
+                let object = placement
+                    .list_materialization_objects(
+                        tenant_id,
+                        &receipt.object_namespace_id,
+                        &materialization_id,
+                    )
+                    .await?
+                    .into_iter()
+                    .find(|task| {
+                        task.object.object_namespace_id == receipt.object_namespace_id
+                            && task.object.object_id == receipt.object_id
+                    })
+                    .ok_or_else(|| {
+                        invalid(
+                            CentralErrorCode::ResourceNotFound,
+                            "materialization receipt object task is missing",
+                        )
+                    })?;
+                placement
+                    .record_materialization_receipt(crate::MaterializationReceiptRequest {
+                        receipt: receipt.clone(),
+                        object: object.object,
+                    })
+                    .await?;
+                return Ok(MaterializationReportResult {
+                    resource_version: ResourceVersion::new(1),
+                    replayed: true,
+                });
+            }
+        }
+
+        if batch.target.session_generation != session_generation {
+            return Err(invalid(
+                CentralErrorCode::GenerationMismatch,
+                "materialization report carries a stale target session generation",
+            ));
+        }
+
+        // If route authority is installed, bind the report to the current Agent/Gateway route
+        // and mount generation as well. Focused in-memory Job tests intentionally omit this
+        // registry and rely on the signed Batch route snapshot.
+        if let Some(gateway_registry) = &self.gateway_registry {
+            let route = gateway_registry
+                .get_agent_route(agent_id)
+                .await?
+                .filter(|route| route.is_active_at(self.clock.now()))
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::GatewayRouteUnavailable,
+                        "materialization target route is unavailable",
+                    )
+                })?;
+            if route.session_generation != session_generation
+                || route.edge_cluster_id != batch.target.edge_cluster_id
+                || route.gateway_pool_id != batch.target.gateway_pool_id
+                || route.route_generation != batch.target.route_generation
+            {
+                return Err(invalid(
+                    CentralErrorCode::AssignmentMismatch,
+                    "materialization report is not bound to the current Gateway route",
+                ));
+            }
+        }
+        if let Some(agent_registry) = &self.agent_registry {
+            let record = agent_registry
+                .get_by_agent(agent_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::GatewayRouteUnavailable,
+                        "materialization target Agent enrollment is unavailable",
+                    )
+                })?;
+            if record.mount.storage_volume_id != batch.target.storage_volume_id
+                || record.mount.mount_generation != batch.target.mount_generation
+                || record.owner.storage_volume_id != batch.target.storage_volume_id
+                || record.owner.active_agent_id.as_ref() != Some(agent_id)
+                || record.owner.active_agent_mount_id.as_ref() != Some(&record.mount.agent_mount_id)
+                || record.owner.owner_generation.get() != batch.target.placement_generation.get()
+            {
+                return Err(invalid(
+                    CentralErrorCode::AssignmentMismatch,
+                    "materialization report mount or owner generation is stale",
+                ));
+            }
+        }
+
+        // A receipt is a durable idempotency point.  Replanning advances the live Job and
+        // rewrites the object task, but it intentionally keeps the old Batch/receipt evidence so
+        // an Agent retry can be acknowledged after the response was lost.  Let the repository
+        // perform its durable receipt/Placement replay lookup before applying the live Job plan
+        // fence.  Non-receipt reports never get this exception and remain fenced to the active
+        // plan revision.
+        if job.plan_revision != report.plan_revision() {
+            if let MaterializationReport::Receipt { receipt, .. } = &report {
+                let object = placement
+                    .list_materialization_objects(
+                        tenant_id,
+                        &receipt.object_namespace_id,
+                        &materialization_id,
+                    )
+                    .await?
+                    .into_iter()
+                    .find(|task| {
+                        task.object.object_namespace_id == receipt.object_namespace_id
+                            && task.object.object_id == receipt.object_id
+                    })
+                    .ok_or_else(|| {
+                        invalid(
+                            CentralErrorCode::ResourceNotFound,
+                            "materialization receipt object task is missing",
+                        )
+                    })?;
+                placement
+                    .record_materialization_receipt(crate::MaterializationReceiptRequest {
+                        receipt: receipt.clone(),
+                        object: object.object,
+                    })
+                    .await?;
+                return Ok(MaterializationReportResult {
+                    resource_version: ResourceVersion::new(1),
+                    replayed: true,
+                });
+            }
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization report namespace or plan revision is stale",
+            ));
+        }
+
+        match report {
+            MaterializationReport::Receipt { receipt, .. } => {
+                let task = placement
+                    .list_materialization_objects(
+                        tenant_id,
+                        &receipt.object_namespace_id,
+                        &materialization_id,
+                    )
+                    .await?
+                    .into_iter()
+                    .find(|task| {
+                        task.object.object_namespace_id == receipt.object_namespace_id
+                            && task.object.object_id == receipt.object_id
+                            && task.current_batch_id.as_ref() == Some(&receipt.batch_id)
+                    })
+                    .ok_or_else(|| {
+                        invalid(
+                            CentralErrorCode::ResourceNotFound,
+                            "materialization receipt object task is missing",
+                        )
+                    })?;
+                let replayed = task.complete();
+                let receipt_object_id = receipt.object_id;
+                placement
+                    .record_materialization_receipt(crate::MaterializationReceiptRequest {
+                        receipt,
+                        object: task.object.clone(),
+                    })
+                    .await?;
+                // The receipt has crossed the target durability barrier. Release only this
+                // object's source/staging roots; a different object in the same Batch may still
+                // be transferring and must remain protected.
+                release_materialization_object_leases(
+                    placement.as_ref(),
+                    &job,
+                    &batch,
+                    std::slice::from_ref(&task),
+                    receipt_object_id,
+                )
+                .await?;
+                // A receipt is the object durability point. Once every object in the Batch has a
+                // durable receipt, advance the Batch through the explicit verification states so
+                // it is removed from reconnect delivery. Each step is fenced by the same plan
+                // revision and attempt; a concurrent planner/report will make the caller retry.
+                let current_batch = placement
+                    .list_materialization_batches(
+                        tenant_id,
+                        &batch.target.object_namespace_id,
+                        &materialization_id,
+                    )
+                    .await?
+                    .into_iter()
+                    .find(|candidate| candidate.batch_id == batch.batch_id)
+                    .ok_or_else(|| {
+                        invalid(
+                            CentralErrorCode::ResourceNotFound,
+                            "materialization Batch disappeared after receipt",
+                        )
+                    })?;
+                let tasks = placement
+                    .list_materialization_objects(
+                        tenant_id,
+                        &batch.target.object_namespace_id,
+                        &materialization_id,
+                    )
+                    .await?;
+                let complete = current_batch.object_ids.iter().all(|object_id| {
+                    tasks
+                        .iter()
+                        .any(|task| task.object.object_id == *object_id && task.complete())
+                });
+                if complete && current_batch.state != MaterializationBatchState::Succeeded {
+                    let mut state = current_batch.state;
+                    for next_state in [
+                        MaterializationBatchState::Transferring,
+                        MaterializationBatchState::Verifying,
+                        MaterializationBatchState::Succeeded,
+                    ] {
+                        if state == MaterializationBatchState::Succeeded {
+                            break;
+                        }
+                        if state == next_state {
+                            continue;
+                        }
+                        // Queued is only possible for a report racing the first delivery claim.
+                        // Move it through Assigned before the normal transfer states.
+                        if state == MaterializationBatchState::Queued {
+                            let mut assigned = current_batch.clone();
+                            assigned.state = MaterializationBatchState::Assigned;
+                            placement
+                                .replace_materialization_batch(
+                                    crate::MaterializationBatchCasRequest {
+                                        tenant_id: tenant_id.clone(),
+                                        object_namespace_id: batch
+                                            .target
+                                            .object_namespace_id
+                                            .clone(),
+                                        materialization_id: materialization_id.clone(),
+                                        batch_id: batch.batch_id.clone(),
+                                        expected_plan_revision: current_batch.plan_revision,
+                                        expected_batch_attempt: current_batch.batch_attempt,
+                                        batch: assigned,
+                                    },
+                                )
+                                .await?;
+                            state = MaterializationBatchState::Assigned;
+                        }
+                        if !state.can_transition_to(next_state) {
+                            continue;
+                        }
+                        let mut next = placement
+                            .list_materialization_batches(
+                                tenant_id,
+                                &batch.target.object_namespace_id,
+                                &materialization_id,
+                            )
+                            .await?
+                            .into_iter()
+                            .find(|candidate| candidate.batch_id == batch.batch_id)
+                            .ok_or_else(|| {
+                                invalid(
+                                    CentralErrorCode::ResourceNotFound,
+                                    "materialization Batch disappeared while completing",
+                                )
+                            })?;
+                        next.state = next_state;
+                        placement
+                            .replace_materialization_batch(crate::MaterializationBatchCasRequest {
+                                tenant_id: tenant_id.clone(),
+                                object_namespace_id: batch.target.object_namespace_id.clone(),
+                                materialization_id: materialization_id.clone(),
+                                batch_id: batch.batch_id.clone(),
+                                expected_plan_revision: next.plan_revision,
+                                expected_batch_attempt: next.batch_attempt,
+                                batch: next.clone(),
+                            })
+                            .await?;
+                        state = next_state;
+                    }
+                }
+                Ok(MaterializationReportResult {
+                    resource_version: ResourceVersion::new(1),
+                    replayed,
+                })
+            }
+            MaterializationReport::Failed {
+                object_id,
+                object_namespace_id,
+                issue_code,
+                issue_message,
+                ..
+            } => {
+                let mut replayed = false;
+                let issue = format!("{issue_code}: {issue_message}");
+                // Check the Batch terminal fence before mutating an object task. A second
+                // failure report for an already-failed Batch must be an exact replay or a hard
+                // conflict; updating `last_error` first would leave a partially applied state
+                // even though the report is rejected below.
+                let initial_batch = placement
+                    .list_materialization_batches(
+                        tenant_id,
+                        &batch.target.object_namespace_id,
+                        &materialization_id,
+                    )
+                    .await?
+                    .into_iter()
+                    .find(|candidate| candidate.batch_id == batch.batch_id)
+                    .ok_or_else(|| {
+                        invalid(
+                            CentralErrorCode::ResourceNotFound,
+                            "materialization Batch disappeared before applying failure",
+                        )
+                    })?;
+                if initial_batch.state == MaterializationBatchState::Succeeded {
+                    return Err(invalid(
+                        CentralErrorCode::ConcurrentUpdate,
+                        "materialization failure report arrived after Batch success",
+                    ));
+                }
+                if initial_batch.state == MaterializationBatchState::Failed {
+                    let existing_job = placement
+                        .get_materialization(
+                            tenant_id,
+                            &batch.target.object_namespace_id,
+                            &materialization_id,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            invalid(
+                                CentralErrorCode::ResourceNotFound,
+                                "materialization Job disappeared while checking failure replay",
+                            )
+                        })?;
+                    if existing_job.issue.as_deref() == Some(issue.as_str()) {
+                        return Ok(MaterializationReportResult {
+                            resource_version: ResourceVersion::new(1),
+                            replayed: true,
+                        });
+                    }
+                    return Err(invalid(
+                        CentralErrorCode::ConcurrentUpdate,
+                        "materialization Batch already has a different failure report",
+                    ));
+                }
+                if let Some(object_id) = object_id {
+                    let task = placement
+                        .list_materialization_objects(
+                            tenant_id,
+                            &object_namespace_id,
+                            &materialization_id,
+                        )
+                        .await?
+                        .into_iter()
+                        .find(|task| {
+                            task.object.object_namespace_id == object_namespace_id
+                                && task.object.object_id == object_id
+                                && task.current_batch_id.as_ref() == Some(&batch.batch_id)
+                        })
+                        .ok_or_else(|| {
+                            invalid(
+                                CentralErrorCode::ResourceNotFound,
+                                "materialization failure object task is missing",
+                            )
+                        })?;
+                    if task.state == MaterializationObjectState::Failed
+                        && task.last_error.as_deref() == Some(issue.as_str())
+                    {
+                        replayed = true;
+                    } else {
+                        let mut next = task.clone();
+                        next.state = MaterializationObjectState::Failed;
+                        next.last_error = Some(issue.clone());
+                        placement
+                            .replace_materialization_object(
+                                crate::MaterializationObjectCasRequest {
+                                    tenant_id: tenant_id.clone(),
+                                    object_namespace_id: object_namespace_id.clone(),
+                                    materialization_id: materialization_id.clone(),
+                                    object_id,
+                                    expected_plan_revision: batch.plan_revision,
+                                    expected_attempt: task.attempt,
+                                    object: next,
+                                },
+                            )
+                            .await?;
+                    }
+                }
+                let current_batch = placement
+                    .list_materialization_batches(
+                        tenant_id,
+                        &batch.target.object_namespace_id,
+                        &materialization_id,
+                    )
+                    .await?
+                    .into_iter()
+                    .find(|candidate| candidate.batch_id == batch.batch_id)
+                    .ok_or_else(|| {
+                        invalid(
+                            CentralErrorCode::ResourceNotFound,
+                            "materialization Batch disappeared while applying failure",
+                        )
+                    })?;
+                if current_batch.state == MaterializationBatchState::Failed {
+                    let existing_job = placement
+                        .get_materialization(
+                            tenant_id,
+                            &batch.target.object_namespace_id,
+                            &materialization_id,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            invalid(
+                                CentralErrorCode::ResourceNotFound,
+                                "materialization Job disappeared while checking failure replay",
+                            )
+                        })?;
+                    if existing_job.issue.as_deref() == Some(issue.as_str()) {
+                        replayed = true;
+                    } else {
+                        return Err(invalid(
+                            CentralErrorCode::ConcurrentUpdate,
+                            "materialization Batch already has a different failure report",
+                        ));
+                    }
+                } else if current_batch.state != MaterializationBatchState::Succeeded {
+                    release_materialization_batch_leases(placement.as_ref(), &job, &current_batch)
+                        .await?;
+                    let mut next = current_batch.clone();
+                    next.state = MaterializationBatchState::Failed;
+                    placement
+                        .replace_materialization_batch(crate::MaterializationBatchCasRequest {
+                            tenant_id: tenant_id.clone(),
+                            object_namespace_id,
+                            materialization_id: materialization_id.clone(),
+                            batch_id: current_batch.batch_id.clone(),
+                            expected_plan_revision: current_batch.plan_revision,
+                            expected_batch_attempt: current_batch.batch_attempt,
+                            batch: next,
+                        })
+                        .await?;
+                } else {
+                    return Err(invalid(
+                        CentralErrorCode::ConcurrentUpdate,
+                        "materialization failure report arrived after Batch success",
+                    ));
+                }
+                let latest_job = placement
+                    .get_materialization(
+                        tenant_id,
+                        &batch.target.object_namespace_id,
+                        &materialization_id,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        invalid(
+                            CentralErrorCode::ResourceNotFound,
+                            "materialization Job disappeared while applying failure",
+                        )
+                    })?;
+                if latest_job.state.terminal() {
+                    replayed = true;
+                } else {
+                    let mut next_job = latest_job.clone();
+                    next_job.state = neoengram_domain::protocol::materialization::MaterializationJobState::Stalled;
+                    next_job.issue = Some(issue);
+                    next_job.updated_at_unix_ms = self.clock.now();
+                    placement
+                        .replace_materialization(
+                            tenant_id,
+                            &materialization_id,
+                            latest_job.plan_revision,
+                            next_job,
+                        )
+                        .await?;
+                }
+                Ok(MaterializationReportResult {
+                    resource_version: ResourceVersion::new(1),
+                    replayed,
+                })
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     async fn replication_assignment(
         &self,
         current: &ReplicationRecord,
@@ -2544,6 +3563,28 @@ impl ControlPlane {
                                     ),
                                 ));
                             }
+                            if let Some(base_commit_id) = assignment.base_commit_id {
+                                let placement = self.placement.as_ref().ok_or_else(|| {
+                                    invalid(
+                                        CentralErrorCode::InvalidState,
+                                        "v2 placement authority is required before Workspace becomes Ready",
+                                    )
+                                })?;
+                                if !target_volume_coverage_complete(
+                                    placement.as_ref(),
+                                    &assignment.tenant_id,
+                                    &assignment.artifact_id,
+                                    base_commit_id,
+                                    &assignment.storage_volume_id,
+                                )
+                                .await?
+                                {
+                                    return Err(invalid(
+                                        CentralErrorCode::InvalidState,
+                                        "Workspace materialization succeeded without complete v2 target Coverage",
+                                    ));
+                                }
+                            }
                             catalog
                                 .transition_playground_state(
                                     &assignment.tenant_id,
@@ -2764,6 +3805,26 @@ impl ControlPlane {
                             {
                                 delivery.state = SnapshotDeliveryState::Deleted;
                             } else {
+                                let placement = self.placement.as_ref().ok_or_else(|| {
+                                    invalid(
+                                        CentralErrorCode::InvalidState,
+                                        "v2 placement authority is required before SnapshotDelivery becomes Ready",
+                                    )
+                                })?;
+                                if !target_volume_coverage_complete(
+                                    placement.as_ref(),
+                                    &assignment.tenant_id,
+                                    &assignment.artifact_id,
+                                    assignment.commit_id,
+                                    &assignment.storage_volume_id,
+                                )
+                                .await?
+                                {
+                                    return Err(invalid(
+                                        CentralErrorCode::InvalidState,
+                                        "SnapshotDelivery succeeded without complete v2 target Coverage",
+                                    ));
+                                }
                                 delivery.state = SnapshotDeliveryState::Ready;
                                 delivery.file_count = report.files_completed.get();
                                 delivery.size_bytes = report.bytes_completed.get();
@@ -3187,6 +4248,56 @@ impl ControlPlane {
                     placement_generation: assignment.placement_generation,
                 };
                 self.objects.record_placement(&evidence).await?;
+                // Managed Add receipts are the first source of durable object evidence. Keep
+                // them in the same namespace-scoped v2 Placement authority consumed by the
+                // multi-source planner; the legacy ObjectCatalog remains as the Add recovery
+                // ledger until its callers are retired. The Add data path currently stores raw
+                // objects, matching the Commit ObjectSet builder's encoding contract.
+                if let Some(placement) = &self.placement {
+                    let object_namespace_id =
+                        ObjectNamespaceId::from_artifact(&assignment.artifact_id);
+                    let placement_digest = blake3::hash(
+                        format!(
+                            "managed-add-v2\0{}\0{}\0{}\0{}",
+                            assignment.tenant_id,
+                            assignment.artifact_id,
+                            assignment.artifact_placement_id,
+                            receipt.object_id
+                        )
+                        .as_bytes(),
+                    );
+                    let placement_id = neoengram_domain::protocol::PlacementId::new(format!(
+                        "managed-add-v2-{}",
+                        &placement_digest.to_hex()[..32]
+                    ))
+                    .map_err(|_| {
+                        invalid(
+                            CentralErrorCode::MetadataInvalid,
+                            "managed Add generated an invalid v2 placement identity",
+                        )
+                    })?;
+                    placement
+                        .insert_object_placement_v2(
+                            neoengram_domain::protocol::materialization::ObjectPlacement {
+                                placement_id,
+                                tenant_id: assignment.tenant_id.clone(),
+                                object_namespace_id,
+                                object_id: receipt.object_id,
+                                size: receipt.size,
+                                encoding: neoengram_domain::protocol::ObjectEncoding::Raw,
+                                verified_digest: receipt.object_id.digest(),
+                                storage_volume_id: Some(assignment.storage_volume_id.clone()),
+                                archive_id: None,
+                                placement_generation: assignment.placement_generation,
+                                state: neoengram_domain::protocol::materialization::ObjectPlacementState::Verified,
+                                failure_domain: format!(
+                                    "volume:{}",
+                                    assignment.storage_volume_id
+                                ),
+                            },
+                        )
+                        .await?;
+                }
                 let placed = self
                     .objects
                     .object_placement(
@@ -3513,24 +4624,97 @@ fn validate_frozen_publication(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         action_envelope, bounded_control_error_message,
         reconnected_replication_report_matches_route, replication_delivery_can_wait_for_next_tick,
-        ReplicationRouteGenerations, AGENT_JOB_ASSIGNMENT_ACTION, CONTROL_ERROR_MESSAGE_LIMIT,
+        target_volume_coverage_complete, ReplicationRouteGenerations, AGENT_JOB_ASSIGNMENT_ACTION,
+        CONTROL_ERROR_MESSAGE_LIMIT,
     };
     use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
+    use neoengram_domain::protocol::materialization::{ObjectPlacement, ObjectPlacementState};
     use neoengram_domain::protocol::{
         AgentId, ArtifactId, CommitObject, CommitObjectSet, ControlError, ControlMessage,
-        EdgeClusterId, ErrorCode, Extensions, GatewayPoolId, MessageId, MountGeneration,
-        ObjectEncoding, ObjectSet, PlacementGeneration, PlacementSetId, ReplicationId,
-        ReplicationObjectState, ReplicationProgressReport, ReplicationState, RequestId,
-        RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, UnixMillis,
+        DecimalU64, EdgeClusterId, ErrorCode, Extensions, GatewayPoolId, MessageId,
+        MountGeneration, ObjectEncoding, ObjectNamespaceId, ObjectSet, PlacementGeneration,
+        PlacementId, PlacementSetId, ReplicationId, ReplicationObjectState,
+        ReplicationProgressReport, ReplicationState, RequestId, RouteGeneration, SessionGeneration,
+        StorageVolumeId, TenantId, UnixMillis,
     };
 
     use crate::{
         CancelReplicationRequest, CentralError, CentralErrorCode, InMemoryComponents,
-        PlacementRepository, ReplicationObjectRecord, ReplicationRecord,
+        InMemoryPlacementRepository, PlacementRepository, ReplicationObjectRecord,
+        ReplicationRecord,
     };
+
+    #[tokio::test]
+    async fn target_coverage_requires_all_objects_on_one_volume() {
+        let placement = Arc::new(InMemoryPlacementRepository::default());
+        let tenant_id = TenantId::new("tenant-coverage-gate").unwrap();
+        let artifact_id = ArtifactId::new("artifact-coverage-gate").unwrap();
+        let namespace = ObjectNamespaceId::new(artifact_id.to_string()).unwrap();
+        let volume_id = StorageVolumeId::new("volume-coverage-gate").unwrap();
+        let commit_id = ContentDigest::from_bytes([31; 32]);
+        let first_object = ObjectId::from_bytes([32; 32]);
+        let second_object = ObjectId::from_bytes([33; 32]);
+        let object_set = ObjectSet::new(vec![
+            CommitObject::new(first_object, 4, ObjectEncoding::Raw, 0),
+            CommitObject::new(second_object, 6, ObjectEncoding::Raw, 1),
+        ])
+        .unwrap();
+        placement
+            .insert_commit_object_set(CommitObjectSet {
+                tenant_id: tenant_id.clone(),
+                commit_id: CommitId::from_digest(commit_id),
+                object_set,
+            })
+            .await
+            .unwrap();
+
+        let make_placement = |object_id, id| ObjectPlacement {
+            placement_id: PlacementId::new(id).unwrap(),
+            tenant_id: tenant_id.clone(),
+            object_namespace_id: namespace.clone(),
+            object_id,
+            size: DecimalU64::new(if object_id == first_object { 4 } else { 6 }),
+            encoding: ObjectEncoding::Raw,
+            verified_digest: object_id.digest(),
+            storage_volume_id: Some(volume_id.clone()),
+            archive_id: None,
+            placement_generation: PlacementGeneration::new(1),
+            state: ObjectPlacementState::Verified,
+            failure_domain: "host-coverage-gate".to_owned(),
+        };
+        placement
+            .insert_object_placement_v2(make_placement(first_object, "placement-gate-first"))
+            .await
+            .unwrap();
+        assert!(!target_volume_coverage_complete(
+            placement.as_ref(),
+            &tenant_id,
+            &artifact_id,
+            commit_id,
+            &volume_id,
+        )
+        .await
+        .unwrap());
+
+        placement
+            .insert_object_placement_v2(make_placement(second_object, "placement-gate-second"))
+            .await
+            .unwrap();
+        assert!(target_volume_coverage_complete(
+            placement.as_ref(),
+            &tenant_id,
+            &artifact_id,
+            commit_id,
+            &volume_id,
+        )
+        .await
+        .unwrap());
+    }
 
     #[test]
     fn only_temporary_replication_delivery_errors_leave_the_message_batch_usable() {

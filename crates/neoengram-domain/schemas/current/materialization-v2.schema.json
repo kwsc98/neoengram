@@ -1,0 +1,1570 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MaterializationProtocolSchema",
+  "description": "Schema root containing every public v2 object-materialization contract.  The individual\nstructs remain the preferred Rust API; this enum exists only to make one strict JSON Schema\ndocument that can be published to Central, Agent, and Gateway implementations.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/ObjectRef"
+    },
+    {
+      "$ref": "#/$defs/NamespaceObjectSet"
+    },
+    {
+      "$ref": "#/$defs/ObjectPlacement"
+    },
+    {
+      "$ref": "#/$defs/VolumeCommitCoverage"
+    },
+    {
+      "$ref": "#/$defs/DurabilityPolicy"
+    },
+    {
+      "$ref": "#/$defs/MaterializationJob"
+    },
+    {
+      "$ref": "#/$defs/MaterializationAssignment"
+    },
+    {
+      "$ref": "#/$defs/MaterializationReport"
+    },
+    {
+      "$ref": "#/$defs/MaterializationBatch"
+    },
+    {
+      "$ref": "#/$defs/MaterializationObject"
+    },
+    {
+      "$ref": "#/$defs/BatchManifest"
+    },
+    {
+      "$ref": "#/$defs/BatchManifestPage"
+    },
+    {
+      "$ref": "#/$defs/MaterializationBatchTicket"
+    },
+    {
+      "$ref": "#/$defs/SignedMaterializationBatchTicket"
+    },
+    {
+      "$ref": "#/$defs/MaterializationObjectReceipt"
+    },
+    {
+      "$ref": "#/$defs/ObjectReadLease"
+    },
+    {
+      "$ref": "#/$defs/StagingLease"
+    },
+    {
+      "$ref": "#/$defs/CommitAvailability"
+    }
+  ],
+  "$defs": {
+    "AgentId": {
+      "description": "A validated agent ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ArchiveId": {
+      "description": "A validated archive ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ArtifactId": {
+      "description": "A validated artifact ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "AvailabilityStatus": {
+      "description": "Independent dimensions returned by availability queries.",
+      "type": "string",
+      "enum": [
+        "available",
+        "degraded",
+        "unavailable",
+        "unknown"
+      ]
+    },
+    "BatchManifest": {
+      "description": "Batch manifest descriptor.  The descriptor is small and is what a signed Ticket binds; pages\ncarry the potentially larger exact ObjectRef list.",
+      "type": "object",
+      "properties": {
+        "batch_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "batch_id": {
+          "$ref": "#/$defs/MaterializationBatchId"
+        },
+        "manifest_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "materialization_id": {
+          "$ref": "#/$defs/MaterializationId"
+        },
+        "object_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "page_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "materialization_id",
+        "batch_id",
+        "plan_revision",
+        "batch_attempt",
+        "object_namespace_id",
+        "page_count",
+        "object_count",
+        "total_bytes",
+        "manifest_digest"
+      ]
+    },
+    "BatchManifestPage": {
+      "description": "A paged, exact list of ObjectRefs selected for one batch.",
+      "type": "object",
+      "properties": {
+        "batch_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "batch_id": {
+          "$ref": "#/$defs/MaterializationBatchId"
+        },
+        "materialization_id": {
+          "$ref": "#/$defs/MaterializationId"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "objects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ObjectRef"
+          },
+          "maxItems": 4096
+        },
+        "page_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "page_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "page_number": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "source_placements": {
+          "description": "Central-selected physical source for each object in this page.  The bindings are part of\nthe page digest, so a source Agent cannot substitute another Placement while retaining a\nvalid signed batch ticket.  Generic manifest helpers may omit bindings (for example an\nin-process protocol fixture); production materialization assignments always include one\nbinding per object.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MaterializationManifestSource"
+          },
+          "maxItems": 4096
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "materialization_id",
+        "batch_id",
+        "plan_revision",
+        "batch_attempt",
+        "object_namespace_id",
+        "page_number",
+        "page_count",
+        "objects",
+        "page_digest"
+      ]
+    },
+    "CentralSignedPayload": {
+      "description": "Central-signed bytes carried unchanged through Gateway hops.",
+      "type": "object",
+      "properties": {
+        "certificate_generation": {
+          "$ref": "#/$defs/CertificateGeneration"
+        },
+        "expires_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "key_id": {
+          "type": "string",
+          "maxLength": 1024,
+          "minLength": 1
+        },
+        "payload": {
+          "$ref": "#/$defs/GatewayOpaqueBytes"
+        },
+        "payload_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "signature": {
+          "$ref": "#/$defs/Ed25519Signature"
+        },
+        "signed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        }
+      },
+      "required": [
+        "key_id",
+        "certificate_generation",
+        "signed_at_unix_ms",
+        "expires_at_unix_ms",
+        "payload_digest",
+        "payload",
+        "signature"
+      ]
+    },
+    "CertificateGeneration": {
+      "description": "A certificate generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "CommitAvailability": {
+      "description": "Availability view intentionally separates global content from target readiness.",
+      "type": "object",
+      "properties": {
+        "commit_id": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "complete_volume_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "content_presence": {
+          "$ref": "#/$defs/AvailabilityStatus"
+        },
+        "durability": {
+          "$ref": "#/$defs/AvailabilityStatus"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "source_serving": {
+          "$ref": "#/$defs/AvailabilityStatus"
+        },
+        "target_coverage": {
+          "$ref": "#/$defs/CoverageState"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "view_readiness": {
+          "$ref": "#/$defs/ViewReadiness"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tenant_id",
+        "object_namespace_id",
+        "commit_id",
+        "content_presence",
+        "source_serving",
+        "durability",
+        "target_coverage",
+        "view_readiness",
+        "complete_volume_count"
+      ]
+    },
+    "CommitId": {
+      "description": "A canonical lowercase BLAKE3-256 digest.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ContentDigest": {
+      "description": "A canonical lowercase BLAKE3-256 digest.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "CoverageGoal": {
+      "description": "Desired target coverage for a materialization request.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "complete"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_count": {
+              "$ref": "#/$defs/DecimalU64"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "object_count"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "byte_count": {
+              "$ref": "#/$defs/DecimalU64"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "byte_count"
+          ]
+        }
+      ]
+    },
+    "CoverageState": {
+      "description": "Derived coverage state for one Commit on one target Volume.",
+      "type": "string",
+      "enum": [
+        "partial",
+        "complete",
+        "retiring",
+        "deleted"
+      ]
+    },
+    "DecimalU64": {
+      "description": "A unsigned integer encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "DurabilityPolicy": {
+      "description": "A policy describing the minimum object durability desired by a namespace.",
+      "type": "object",
+      "properties": {
+        "max_cost_units": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecimalU64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "min_failure_domains": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "min_replicas": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "preferred_regions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RegionId"
+          },
+          "maxItems": 64
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "min_replicas",
+        "min_failure_domains"
+      ]
+    },
+    "Ed25519Signature": {
+      "description": "Canonical 64-byte Ed25519 signature, encoded as base64url without padding.",
+      "type": "string",
+      "maxLength": 86,
+      "minLength": 86,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "EdgeClusterId": {
+      "description": "A validated edge cluster ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "GatewayOpaqueBytes": {
+      "description": "Opaque bytes encoded as canonical base64url without padding.",
+      "type": "string",
+      "maxLength": 12582912,
+      "minLength": 0,
+      "pattern": "^[A-Za-z0-9_-]*$"
+    },
+    "GatewayPoolId": {
+      "description": "A validated gateway pool ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "Generation": {
+      "description": "A generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "LeaseId": {
+      "description": "A validated lease ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "MaterializationAssignment": {
+      "description": "Bounded Central-to-Agent command for one source-grouped materialization batch.\n\nThe exact ObjectSet never travels in this control message.  The signed Ticket commits the\nmanifest digest and the pages carry only the objects selected by the planner for this batch.\nReconnects may deliver the same command again; the target Agent uses the stable materialization\nand object identities to resume its durable staging offsets.",
+      "type": "object",
+      "properties": {
+        "batch": {
+          "$ref": "#/$defs/MaterializationBatch"
+        },
+        "manifest": {
+          "$ref": "#/$defs/BatchManifest"
+        },
+        "pages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BatchManifestPage"
+          },
+          "maxItems": 65535
+        },
+        "signed_ticket": {
+          "$ref": "#/$defs/SignedMaterializationBatchTicket"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "signed_ticket",
+        "batch",
+        "manifest",
+        "pages"
+      ]
+    },
+    "MaterializationBatch": {
+      "description": "One source-grouped batch inside a [`MaterializationJob`].",
+      "type": "object",
+      "properties": {
+        "batch_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "batch_id": {
+          "$ref": "#/$defs/MaterializationBatchId"
+        },
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "manifest_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "materialization_id": {
+          "$ref": "#/$defs/MaterializationId"
+        },
+        "max_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "object_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "object_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ObjectId"
+          }
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "source": {
+          "$ref": "#/$defs/MaterializationSource"
+        },
+        "state": {
+          "$ref": "#/$defs/MaterializationBatchState"
+        },
+        "target": {
+          "$ref": "#/$defs/MaterializationTarget"
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "batch_id",
+        "materialization_id",
+        "plan_revision",
+        "batch_attempt",
+        "source",
+        "target",
+        "manifest_digest",
+        "object_ids",
+        "object_count",
+        "total_bytes",
+        "state",
+        "max_bytes",
+        "deadline_unix_ms"
+      ]
+    },
+    "MaterializationBatchId": {
+      "description": "A validated materialization batch ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "MaterializationBatchState": {
+      "description": "State of one source-grouped transfer batch.",
+      "type": "string",
+      "enum": [
+        "queued",
+        "assigned",
+        "transferring",
+        "verifying",
+        "succeeded",
+        "failed"
+      ]
+    },
+    "MaterializationBatchTicket": {
+      "description": "Central-issued, short-lived capability for exactly one source-grouped materialization batch.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "batch_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "batch_id": {
+          "$ref": "#/$defs/MaterializationBatchId"
+        },
+        "capability": {
+          "type": "string"
+        },
+        "commit_id": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "manifest_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "materialization_id": {
+          "$ref": "#/$defs/MaterializationId"
+        },
+        "max_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "source": {
+          "$ref": "#/$defs/MaterializationSource"
+        },
+        "target": {
+          "$ref": "#/$defs/MaterializationTarget"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "ticket_id": {
+          "$ref": "#/$defs/ObjectTicketId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ticket_id",
+        "materialization_id",
+        "batch_id",
+        "plan_revision",
+        "batch_attempt",
+        "tenant_id",
+        "artifact_id",
+        "object_namespace_id",
+        "commit_id",
+        "manifest_digest",
+        "source",
+        "target",
+        "max_bytes",
+        "deadline_unix_ms",
+        "capability"
+      ]
+    },
+    "MaterializationId": {
+      "description": "A validated materialization ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "MaterializationJob": {
+      "description": "User-visible parent task for hydrating one target Volume from one or more sources.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "created_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "issue": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "$ref": "#/$defs/MaterializationJobKey"
+        },
+        "materialization_id": {
+          "$ref": "#/$defs/MaterializationId"
+        },
+        "missing_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "missing_object_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "object_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "source_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "state": {
+          "$ref": "#/$defs/MaterializationJobState"
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "updated_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "verified_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "verified_object_count": {
+          "$ref": "#/$defs/DecimalU64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "materialization_id",
+        "key",
+        "artifact_id",
+        "state",
+        "plan_revision",
+        "object_count",
+        "total_bytes",
+        "verified_object_count",
+        "verified_bytes",
+        "missing_object_count",
+        "missing_bytes",
+        "source_count",
+        "created_at_unix_ms",
+        "updated_at_unix_ms",
+        "deadline_unix_ms"
+      ]
+    },
+    "MaterializationJobKey": {
+      "description": "Stable idempotency identity for one target materialization intent.",
+      "type": "object",
+      "properties": {
+        "commit_id": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "coverage_goal": {
+          "$ref": "#/$defs/CoverageGoal"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "target_storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tenant_id",
+        "object_namespace_id",
+        "commit_id",
+        "target_storage_volume_id",
+        "coverage_goal"
+      ]
+    },
+    "MaterializationJobState": {
+      "description": "Parent materialization state.  `Stalled` is recoverable; Failed and Cancelled are terminal.",
+      "type": "string",
+      "enum": [
+        "queued",
+        "planning",
+        "waiting_for_sources",
+        "materializing",
+        "verifying",
+        "complete",
+        "stalled",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "MaterializationLeaseState": {
+      "description": "Lifecycle of a source/target protection lease.",
+      "type": "string",
+      "enum": [
+        "active",
+        "released",
+        "expired"
+      ]
+    },
+    "MaterializationManifestSource": {
+      "description": "Object-to-Placement binding carried by a materialization manifest page.",
+      "type": "object",
+      "properties": {
+        "object_id": {
+          "$ref": "#/$defs/ObjectId"
+        },
+        "placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "placement_id": {
+          "$ref": "#/$defs/PlacementId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "object_id",
+        "placement_id",
+        "placement_generation"
+      ]
+    },
+    "MaterializationObject": {
+      "description": "A stable per-object task persisted beneath a MaterializationJob.",
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "confirmed_offset": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "current_batch_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MaterializationBatchId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fallback_sources": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PlacementId"
+          },
+          "maxItems": 256
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "materialization_id": {
+          "$ref": "#/$defs/MaterializationId"
+        },
+        "object": {
+          "$ref": "#/$defs/ObjectRef"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "primary_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlacementId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "staging_key": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/MaterializationObjectState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "materialization_id",
+        "object",
+        "state",
+        "staging_key",
+        "confirmed_offset",
+        "plan_revision",
+        "attempt"
+      ]
+    },
+    "MaterializationObjectReceipt": {
+      "description": "Object-level durable receipt emitted by a target Agent after its durability barrier.",
+      "type": "object",
+      "properties": {
+        "batch_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "batch_id": {
+          "$ref": "#/$defs/MaterializationBatchId"
+        },
+        "committed_offset": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "encoding": {
+          "$ref": "#/$defs/ObjectEncoding"
+        },
+        "materialization_id": {
+          "$ref": "#/$defs/MaterializationId"
+        },
+        "object_id": {
+          "$ref": "#/$defs/ObjectId"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "receipt_id": {
+          "$ref": "#/$defs/ObjectReceiptId"
+        },
+        "size": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "target_placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "target_storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "verified_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "verified_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "receipt_id",
+        "materialization_id",
+        "batch_id",
+        "plan_revision",
+        "batch_attempt",
+        "tenant_id",
+        "object_namespace_id",
+        "object_id",
+        "size",
+        "encoding",
+        "verified_digest",
+        "target_storage_volume_id",
+        "target_placement_generation",
+        "committed_offset",
+        "verified_at_unix_ms"
+      ]
+    },
+    "MaterializationObjectState": {
+      "description": "State of one target object task.",
+      "type": "string",
+      "enum": [
+        "missing",
+        "reserved",
+        "transferring",
+        "verified",
+        "published",
+        "already_present",
+        "failed"
+      ]
+    },
+    "MaterializationReport": {
+      "description": "Agent-to-Central object-level report for a materialization batch.\n\nReceipts are emitted only after the target backend has completed its durability barrier.  A\nfailed report is advisory and never creates a Placement; Central keeps the batch retryable.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "receipt"
+            },
+            "payload": {
+              "description": "No extension members are accepted by the current protocol.",
+              "type": "object",
+              "properties": {
+                "receipt": {
+                  "$ref": "#/$defs/MaterializationObjectReceipt"
+                },
+                "target": {
+                  "description": "The target fence copied from the signed batch ticket.  Keeping it on every report\nmakes a delayed receipt/failure self-describing; Central still compares it with the\ndurable Batch and the authenticated session/route before applying the report.",
+                  "$ref": "#/$defs/MaterializationTarget"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "receipt",
+                "target"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "payload"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "failed"
+            },
+            "payload": {
+              "description": "No extension members are accepted by the current protocol.",
+              "type": "object",
+              "properties": {
+                "batch_attempt": {
+                  "$ref": "#/$defs/Generation"
+                },
+                "batch_id": {
+                  "$ref": "#/$defs/MaterializationBatchId"
+                },
+                "issue_code": {
+                  "type": "string"
+                },
+                "issue_message": {
+                  "type": "string"
+                },
+                "materialization_id": {
+                  "$ref": "#/$defs/MaterializationId"
+                },
+                "object_id": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/ObjectId"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "object_namespace_id": {
+                  "$ref": "#/$defs/ObjectNamespaceId"
+                },
+                "plan_revision": {
+                  "$ref": "#/$defs/Generation"
+                },
+                "target": {
+                  "description": "The complete target fence from the signed assignment.  Failure reports must not rely\non whatever route happens to be current when Central receives them.",
+                  "$ref": "#/$defs/MaterializationTarget"
+                },
+                "tenant_id": {
+                  "$ref": "#/$defs/TenantId"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "materialization_id",
+                "batch_id",
+                "plan_revision",
+                "batch_attempt",
+                "tenant_id",
+                "object_namespace_id",
+                "target",
+                "issue_code",
+                "issue_message"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "payload"
+          ]
+        }
+      ]
+    },
+    "MaterializationSource": {
+      "description": "A source route and its current fenced network identity.  The route is shared by every object\nin a Batch; each object's exact Placement identity is carried by the signed manifest page.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "archive_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArchiveId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "edge_cluster_id": {
+          "$ref": "#/$defs/EdgeClusterId"
+        },
+        "gateway_pool_id": {
+          "$ref": "#/$defs/GatewayPoolId"
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "placement_id": {
+          "$ref": "#/$defs/PlacementId"
+        },
+        "route_generation": {
+          "$ref": "#/$defs/RouteGeneration"
+        },
+        "session_generation": {
+          "$ref": "#/$defs/SessionGeneration"
+        },
+        "storage_volume_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StorageVolumeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "placement_id",
+        "tenant_id",
+        "object_namespace_id",
+        "agent_id",
+        "edge_cluster_id",
+        "gateway_pool_id",
+        "placement_generation",
+        "session_generation",
+        "mount_generation",
+        "route_generation"
+      ]
+    },
+    "MaterializationTarget": {
+      "description": "Target Volume and its current fenced route.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "$ref": "#/$defs/AgentId"
+        },
+        "edge_cluster_id": {
+          "$ref": "#/$defs/EdgeClusterId"
+        },
+        "gateway_pool_id": {
+          "$ref": "#/$defs/GatewayPoolId"
+        },
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "route_generation": {
+          "$ref": "#/$defs/RouteGeneration"
+        },
+        "session_generation": {
+          "$ref": "#/$defs/SessionGeneration"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tenant_id",
+        "object_namespace_id",
+        "storage_volume_id",
+        "agent_id",
+        "edge_cluster_id",
+        "gateway_pool_id",
+        "placement_generation",
+        "session_generation",
+        "mount_generation",
+        "route_generation"
+      ]
+    },
+    "MountGeneration": {
+      "description": "A mount generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "NamespaceObjectSet": {
+      "description": "Namespace-scoped form of a Commit ObjectSet.  The content digest intentionally remains the\nsame ObjectSet digest as v1; namespace and tenant are explicit authorization fields around it.",
+      "type": "object",
+      "properties": {
+        "commit_id": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "object_set_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "objects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ObjectRef"
+          }
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tenant_id",
+        "object_namespace_id",
+        "commit_id",
+        "object_set_digest",
+        "objects"
+      ]
+    },
+    "ObjectEncoding": {
+      "description": "Encoding of an immutable object in a CAS backend.",
+      "type": "string",
+      "enum": [
+        "raw",
+        "zstd"
+      ]
+    },
+    "ObjectId": {
+      "description": "A canonical lowercase BLAKE3-256 digest.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ObjectNamespaceId": {
+      "description": "A validated object namespace ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ObjectPlacement": {
+      "description": "A single durable, namespace-scoped physical object copy.",
+      "type": "object",
+      "properties": {
+        "archive_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArchiveId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "encoding": {
+          "$ref": "#/$defs/ObjectEncoding"
+        },
+        "failure_domain": {
+          "type": "string"
+        },
+        "object_id": {
+          "$ref": "#/$defs/ObjectId"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "placement_id": {
+          "$ref": "#/$defs/PlacementId"
+        },
+        "size": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "state": {
+          "$ref": "#/$defs/ObjectPlacementState"
+        },
+        "storage_volume_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StorageVolumeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "verified_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "placement_id",
+        "tenant_id",
+        "object_namespace_id",
+        "object_id",
+        "size",
+        "encoding",
+        "verified_digest",
+        "placement_generation",
+        "state",
+        "failure_domain"
+      ]
+    },
+    "ObjectPlacementState": {
+      "description": "State of an object-level physical copy.",
+      "type": "string",
+      "enum": [
+        "verified",
+        "retiring",
+        "deleted",
+        "lost"
+      ]
+    },
+    "ObjectReadLease": {
+      "description": "Protects a source object placement from GC while it is being read.",
+      "type": "object",
+      "properties": {
+        "batch_id": {
+          "$ref": "#/$defs/MaterializationBatchId"
+        },
+        "expires_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "lease_id": {
+          "$ref": "#/$defs/LeaseId"
+        },
+        "materialization_id": {
+          "$ref": "#/$defs/MaterializationId"
+        },
+        "object_id": {
+          "$ref": "#/$defs/ObjectId"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "placement_id": {
+          "$ref": "#/$defs/PlacementId"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "state": {
+          "$ref": "#/$defs/MaterializationLeaseState"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "lease_id",
+        "materialization_id",
+        "batch_id",
+        "plan_revision",
+        "tenant_id",
+        "object_namespace_id",
+        "object_id",
+        "placement_id",
+        "placement_generation",
+        "expires_at_unix_ms",
+        "state"
+      ]
+    },
+    "ObjectReceiptId": {
+      "description": "A validated object receipt ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ObjectRef": {
+      "description": "A reference to one exact object required by a Commit ObjectSet.",
+      "type": "object",
+      "properties": {
+        "encoding": {
+          "$ref": "#/$defs/ObjectEncoding"
+        },
+        "object_id": {
+          "$ref": "#/$defs/ObjectId"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "ordinal": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "size": {
+          "$ref": "#/$defs/DecimalU64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "object_namespace_id",
+        "object_id",
+        "size",
+        "encoding",
+        "ordinal"
+      ]
+    },
+    "ObjectTicketId": {
+      "description": "A validated object ticket ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "PlacementGeneration": {
+      "description": "A placement generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "PlacementId": {
+      "description": "A validated object placement ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "RegionId": {
+      "description": "A validated region ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "RouteGeneration": {
+      "description": "A route generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "SessionGeneration": {
+      "description": "A session generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "SignedMaterializationBatchTicket": {
+      "description": "A v2 ticket plus the Central signature envelope transported through Gateway hops.",
+      "type": "object",
+      "properties": {
+        "central_signature": {
+          "$ref": "#/$defs/CentralSignedPayload"
+        },
+        "ticket": {
+          "$ref": "#/$defs/MaterializationBatchTicket"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ticket",
+        "central_signature"
+      ]
+    },
+    "StagingLease": {
+      "description": "Protects target staging bytes until a MaterializationObject is published or cleaned up.",
+      "type": "object",
+      "properties": {
+        "expires_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "lease_id": {
+          "$ref": "#/$defs/LeaseId"
+        },
+        "materialization_id": {
+          "$ref": "#/$defs/MaterializationId"
+        },
+        "object_id": {
+          "$ref": "#/$defs/ObjectId"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "staging_key": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/MaterializationLeaseState"
+        },
+        "target_placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "target_storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "lease_id",
+        "materialization_id",
+        "plan_revision",
+        "tenant_id",
+        "object_namespace_id",
+        "object_id",
+        "target_storage_volume_id",
+        "target_placement_generation",
+        "staging_key",
+        "expires_at_unix_ms",
+        "state"
+      ]
+    },
+    "StorageVolumeId": {
+      "description": "A validated storage volume ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TenantId": {
+      "description": "A validated tenant ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "UnixMillis": {
+      "description": "A Unix millisecond timestamp encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "ViewReadiness": {
+      "description": "Whether a target local view can be exposed to Workspace, Delivery, or S3 readers.",
+      "type": "string",
+      "enum": [
+        "not_ready",
+        "ready"
+      ]
+    },
+    "VolumeCommitCoverage": {
+      "description": "Recomputable summary of verified objects on one Volume for one Commit.",
+      "type": "object",
+      "properties": {
+        "commit_id": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "object_count": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "object_set_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "state": {
+          "$ref": "#/$defs/CoverageState"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "verified_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "verified_object_count": {
+          "$ref": "#/$defs/DecimalU64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tenant_id",
+        "object_namespace_id",
+        "commit_id",
+        "storage_volume_id",
+        "placement_generation",
+        "object_set_digest",
+        "object_count",
+        "verified_object_count",
+        "total_bytes",
+        "verified_bytes",
+        "state"
+      ]
+    }
+  }
+}

@@ -670,8 +670,7 @@ async fn sqlite_gateway_integrity_rejects_index_payload_drift() {
 
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("Gateway indexed-column drift must fail closed");
+        .expect_err("Gateway indexed-column drift must fail closed");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 
@@ -703,8 +702,7 @@ async fn sqlite_gateway_integrity_rejects_cross_role_endpoint_duplicates() {
 
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("cross-role Gateway endpoint duplicates must fail closed");
+        .expect_err("cross-role Gateway endpoint duplicates must fail closed");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 
@@ -731,8 +729,7 @@ async fn sqlite_gateway_integrity_rejects_replica_without_credentials() {
 
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("a GatewayReplica without its credential row must fail closed");
+        .expect_err("a GatewayReplica without its credential row must fail closed");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 
@@ -769,8 +766,7 @@ async fn sqlite_gateway_integrity_rejects_cross_role_endpoint_drift() {
     .await;
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("cross-role endpoint corruption must fail closed");
+        .expect_err("cross-role endpoint corruption must fail closed");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 
@@ -785,8 +781,7 @@ async fn sqlite_gateway_schema_drift_is_rejected() {
     execute_raw(directory.path(), "DROP INDEX agent_route_expiry_keyset;").await;
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("Gateway schema drift must fail closed");
+        .expect_err("Gateway schema drift must fail closed");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 
@@ -857,8 +852,7 @@ async fn sqlite_route_integrity_rejects_duplicate_mutation_request_ids() {
     rewrite_route_request_id_payload(directory.path(), &duplicate).await;
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("duplicate Route mutation RequestIds must fail closed");
+        .expect_err("duplicate Route mutation RequestIds must fail closed");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 

@@ -74,12 +74,22 @@ import type {
   RetrySnapshotDeliveryResponse,
   CreateSnapshotDeliveryRequest,
   CreateSnapshotDeliveryResponse,
+  CreateCommitMaterializationRequest,
+  CreateCommitMaterializationResponse,
+  QueryCommitMaterializationRequest,
+  QueryCommitMaterializationResponse,
+  QueryCommitMaterializationListRequest,
+  QueryCommitMaterializationListResponse,
+  RetryCommitMaterializationRequest,
+  RetryCommitMaterializationResponse,
+  CancelCommitMaterializationRequest,
+  CancelCommitMaterializationResponse,
+  QueryCommitCoverageRequest,
+  QueryCommitCoverageResponse,
   CreateCommitReplicationRequest,
   CreateCommitReplicationResponse,
   QueryCommitReplicationRequest,
   QueryCommitReplicationResponse,
-  QueryCommitReplicationTicketRequest,
-  QueryCommitReplicationTicketResponse,
   QueryCommitReplicationListRequest,
   QueryCommitReplicationListResponse,
   QueryCommitPlacementListRequest,
@@ -90,6 +100,10 @@ import type {
   CancelCommitReplicationResponse,
   QueryCommitAvailabilityRequest,
   QueryCommitAvailabilityResponse,
+  MaterializationView,
+  VolumeCommitCoverageView,
+  LegacyReplicationView,
+  LegacyCommitPlacementView,
   CreateWorkspaceRequest,
   CreateWorkspaceResponse,
   QuerySnapshotDeliveryRequest,
@@ -158,6 +172,95 @@ export async function readyProbe(): Promise<ApiResult<HealthResponse>> {
 }
 
 const versionHeader = { header: { 'NeoEngram-API-Version': '1' as const } };
+
+function materializationRequest(
+  request: CreateCommitReplicationRequest,
+): CreateCommitMaterializationRequest {
+  return {
+    ...request,
+    object_namespace_id: request.object_namespace_id ?? request.artifact_id,
+    coverage_goal: request.coverage_goal ?? 'complete',
+  };
+}
+
+function materializationListRequest(
+  request: QueryCommitReplicationListRequest,
+): QueryCommitMaterializationListRequest {
+  const { artifact_id: _artifactId, object_namespace_id, ...wireRequest } = request;
+  const objectNamespaceId = object_namespace_id ?? _artifactId;
+  if (!objectNamespaceId) {
+    throw new Error('object_namespace_id is required for v2 materialization queries');
+  }
+  return {
+    ...wireRequest,
+    object_namespace_id: objectNamespaceId,
+  };
+}
+
+function coverageRequest(request: QueryCommitPlacementListRequest): QueryCommitCoverageRequest {
+  const { artifact_id: _artifactId, object_namespace_id, ...wireRequest } = request;
+  const objectNamespaceId = object_namespace_id ?? _artifactId;
+  if (!objectNamespaceId) {
+    throw new Error('object_namespace_id is required for v2 coverage queries');
+  }
+  return {
+    ...wireRequest,
+    object_namespace_id: objectNamespaceId,
+  };
+}
+
+function toLegacyMaterialization(value: MaterializationView): LegacyReplicationView {
+  const state: LegacyReplicationView['state'] =
+    value.state === 'materializing'
+      ? 'transferring'
+      : value.state === 'complete'
+        ? 'published'
+        : value.state === 'waiting_for_sources' || value.state === 'stalled'
+          ? 'planning'
+          : value.state;
+  const result: LegacyReplicationView = {
+    replication_id: value.materialization_id,
+    tenant_id: value.tenant_id,
+    // v2 namespaces initially map one-to-one to Artifacts. Keep the local page model total even
+    // when an older server omits the optional artifact field from its materialization view.
+    artifact_id: value.artifact_id ?? value.object_namespace_id,
+    commit_id: value.commit_id,
+    target_storage_volume_id: value.target_storage_volume_id,
+    attempt: value.plan_revision,
+    state,
+    object_set_digest: value.object_set_digest,
+    completed_objects: value.verified_objects,
+    total_objects: value.total_objects,
+    completed_bytes: value.verified_bytes,
+    total_bytes: value.total_bytes,
+  };
+  const routing = value as MaterializationView & {
+    target_edge_cluster_id?: string;
+    target_gateway_pool_id?: string;
+  };
+  if (routing.target_edge_cluster_id)
+    result.target_edge_cluster_id = routing.target_edge_cluster_id;
+  if (routing.target_gateway_pool_id)
+    result.target_gateway_pool_id = routing.target_gateway_pool_id;
+  if (value.issue) result.issue = value.issue;
+  return result;
+}
+
+function toLegacyCoverage(value: VolumeCommitCoverageView): LegacyCommitPlacementView {
+  const state: LegacyCommitPlacementView['state'] =
+    value.state === 'complete' ? 'published' : value.state === 'partial' ? 'staged' : value.state;
+  return {
+    placement_set_id: `${value.object_namespace_id}:${value.commit_id}:${value.storage_volume_id}`,
+    backend_id: value.storage_volume_id,
+    commit_id: value.commit_id,
+    storage_volume_id: value.storage_volume_id,
+    object_set_digest: value.object_set_digest,
+    object_count: value.total_objects,
+    verified_object_count: value.verified_objects,
+    placement_generation: value.placement_generation,
+    state,
+  };
+}
 
 export async function queryTenantList(
   request: QueryTenantListRequest = {},
@@ -534,86 +637,200 @@ export async function createSnapshot(
   ) as ApiResult<CreateSnapshotResponse>;
 }
 
+/** Start a multi-source object materialization on a target Volume. */
+export async function materializeCommit(
+  request: CreateCommitMaterializationRequest,
+): Promise<ApiResult<CreateCommitMaterializationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/materialize', { body: request, params: versionHeader }),
+  );
+}
+
+export async function queryCommitMaterialization(
+  request: QueryCommitMaterializationRequest,
+): Promise<ApiResult<QueryCommitMaterializationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/materialization/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryCommitMaterializationList(
+  request: QueryCommitMaterializationListRequest,
+): Promise<ApiResult<QueryCommitMaterializationListResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/materialization/list/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryCommitCoverage(
+  request: QueryCommitCoverageRequest,
+): Promise<ApiResult<QueryCommitCoverageResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/coverage/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function retryCommitMaterialization(
+  request: RetryCommitMaterializationRequest,
+): Promise<ApiResult<RetryCommitMaterializationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/materialization/retry', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function cancelCommitMaterialization(
+  request: CancelCommitMaterializationRequest,
+): Promise<ApiResult<CancelCommitMaterializationResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/commit/materialization/cancel', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+// Legacy UI names remain local aliases while pages migrate to the Materialization terminology.
+// They call only the v2 routes; the removed v1 paths are never emitted by the client.
 export async function replicateCommit(
   request: CreateCommitReplicationRequest,
 ): Promise<ApiResult<CreateCommitReplicationResponse>> {
-  return unwrap(
-    await apiClient.POST('/api/commit/replicate', { body: request, params: versionHeader }),
-  );
+  const result = await materializeCommit(materializationRequest(request));
+  const payload = result.data;
+  return {
+    requestId: result.requestId,
+    data: {
+      replication: toLegacyMaterialization(payload.materialization),
+      replayed: payload.replayed,
+    },
+  };
 }
 
 export async function queryCommitReplication(
   request: QueryCommitReplicationRequest,
 ): Promise<ApiResult<QueryCommitReplicationResponse>> {
-  return unwrap(
-    await apiClient.POST('/api/commit/replication/query', { body: request, params: versionHeader }),
-  );
-}
-
-export async function queryCommitReplicationTicket(
-  request: QueryCommitReplicationTicketRequest,
-): Promise<ApiResult<QueryCommitReplicationTicketResponse>> {
-  return unwrap(
-    await apiClient.POST('/api/commit/replication/ticket/query', {
-      body: request,
-      params: versionHeader,
-    }),
-  );
+  const result = await queryCommitMaterialization({
+    materialization_id: request.replication_id,
+    tenant_id: request.tenant_id,
+    object_namespace_id: request.object_namespace_id,
+  });
+  const payload = result.data;
+  return {
+    requestId: result.requestId,
+    data: { replication: toLegacyMaterialization(payload.materialization) },
+  };
 }
 
 export async function queryCommitReplicationList(
   request: QueryCommitReplicationListRequest,
 ): Promise<ApiResult<QueryCommitReplicationListResponse>> {
-  return unwrap(
-    await apiClient.POST('/api/commit/replication/list/query', {
-      body: request,
-      params: versionHeader,
-    }),
-  );
+  const result = await queryCommitMaterializationList(materializationListRequest(request));
+  const payload = result.data;
+  return {
+    requestId: result.requestId,
+    data: {
+      replications: payload.materializations.map(toLegacyMaterialization),
+      ...(payload.next_cursor === undefined ? {} : { next_cursor: payload.next_cursor }),
+    },
+  };
 }
 
 export async function queryCommitPlacementList(
   request: QueryCommitPlacementListRequest,
 ): Promise<ApiResult<QueryCommitPlacementListResponse>> {
-  return unwrap(
-    await apiClient.POST('/api/commit/placements/query', {
-      body: request,
-      params: versionHeader,
-    }),
-  );
+  const result = await queryCommitCoverage(coverageRequest(request));
+  const payload = result.data;
+  return {
+    requestId: result.requestId,
+    data: {
+      placements: payload.coverage.map(toLegacyCoverage),
+      ...(payload.next_cursor === undefined ? {} : { next_cursor: payload.next_cursor }),
+    },
+  };
 }
 
 export async function retryCommitReplication(
   request: RetryCommitReplicationRequest,
 ): Promise<ApiResult<RetryCommitReplicationResponse>> {
-  return unwrap(
-    await apiClient.POST('/api/commit/replication/retry', {
-      body: request,
-      params: versionHeader,
-    }),
-  );
+  const result = await retryCommitMaterialization({
+    tenant_id: request.tenant_id,
+    object_namespace_id: request.object_namespace_id,
+    materialization_id: request.replication_id,
+    expected_plan_revision: request.expected_attempt,
+    request_id: request.request_id,
+  });
+  const payload = result.data;
+  return {
+    requestId: result.requestId,
+    data: {
+      replication: toLegacyMaterialization(payload.materialization),
+      replayed: payload.replayed,
+    },
+  };
 }
 
 export async function cancelCommitReplication(
   request: CancelCommitReplicationRequest,
 ): Promise<ApiResult<CancelCommitReplicationResponse>> {
-  return unwrap(
-    await apiClient.POST('/api/commit/replication/cancel', {
-      body: request,
-      params: versionHeader,
-    }),
-  );
+  const result = await cancelCommitMaterialization({
+    tenant_id: request.tenant_id,
+    object_namespace_id: request.object_namespace_id,
+    materialization_id: request.replication_id,
+    expected_plan_revision: request.expected_attempt,
+  });
+  const payload = result.data;
+  return {
+    requestId: result.requestId,
+    data: { replication: toLegacyMaterialization(payload.materialization) },
+  };
 }
 
 export async function queryCommitAvailability(
   request: QueryCommitAvailabilityRequest,
 ): Promise<ApiResult<QueryCommitAvailabilityResponse>> {
-  return unwrap(
+  const objectNamespaceId = request.object_namespace_id ?? request.artifact_id;
+  if (!objectNamespaceId) {
+    throw new Error('object_namespace_id is required for v2 availability queries');
+  }
+  const result = unwrap(
     await apiClient.POST('/api/commit/availability/query', {
-      body: request,
+      body: {
+        tenant_id: request.tenant_id,
+        commit_id: request.commit_id,
+        ...(request.target_storage_volume_id === undefined
+          ? {}
+          : { target_storage_volume_id: request.target_storage_volume_id }),
+        ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
+        ...(request.page_size === undefined ? {} : { page_size: request.page_size }),
+        object_namespace_id: objectNamespaceId,
+      },
       params: versionHeader,
     }),
   );
+  const availability = result.data.availability;
+  return {
+    requestId: result.requestId,
+    data: {
+      availability: {
+        commit_id: availability.commit_id,
+        data_health: availability.content_presence,
+        verified_placements: availability.complete_volume_count,
+        missing_objects: String(availability.missing_objects.length),
+        verified_storage_volume_ids: availability.verified_storage_volume_ids,
+      },
+    },
+  };
 }
 
 export async function createWorkspace(

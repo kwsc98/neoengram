@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     convert::Infallible,
     error::Error,
     net::SocketAddr,
@@ -58,6 +59,30 @@ use tunnel::NDJSON_CONTENT_TYPE;
 use tunnel::{
     error_response, json_response, GatewayBody, GatewayIdentity, GatewayTunnel, JSON_CONTENT_TYPE,
 };
+
+#[derive(Debug, Clone)]
+struct TransferUpstreamRoute {
+    agent_id: String,
+    upstream: SocketAddr,
+}
+
+fn parse_transfer_upstream_route(value: &str) -> Result<TransferUpstreamRoute, String> {
+    let (agent_id, upstream) = value
+        .split_once('=')
+        .ok_or_else(|| "transfer upstream route must use AGENT_ID=HOST:PORT syntax".to_owned())?;
+    if agent_id.is_empty() {
+        return Err("transfer upstream route Agent ID must not be empty".to_owned());
+    }
+    neoengram_domain::protocol::AgentId::new(agent_id)
+        .map_err(|error| format!("transfer upstream route Agent ID is invalid: {error}"))?;
+    let upstream = upstream
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("transfer upstream route address is invalid: {error}"))?;
+    Ok(TransferUpstreamRoute {
+        agent_id: agent_id.to_owned(),
+        upstream,
+    })
+}
 
 const DEFAULT_AGENT_LISTEN: &str = "0.0.0.0:8081";
 const DEFAULT_CONTROL_LISTEN: &str = "0.0.0.0:8082";
@@ -122,6 +147,15 @@ struct GatewayConfig {
     /// TLS ServerName expected from the configured transfer upstream.
     #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM_SERVER_NAME")]
     transfer_upstream_server_name: Option<String>,
+    /// Optional per-source next-hop directory. Each entry uses `agent-id=host:port`; the signed
+    /// ticket selects only the Agent identity, while this deployment-owned directory supplies the
+    /// network address. Repeated entries are rejected during config validation.
+    #[arg(
+        long = "transfer-upstream-route",
+        env = "NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM_ROUTE",
+        value_parser = parse_transfer_upstream_route
+    )]
+    transfer_upstream_routes: Vec<TransferUpstreamRoute>,
     /// Optional current session generation for the endpoint selected by transfer_relay_role.
     #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_SESSION_GENERATION")]
     transfer_session_generation: Option<u64>,
@@ -255,12 +289,17 @@ impl GatewayConfig {
             self.transfer_relay_role.is_some(),
             self.transfer_upstream.is_some(),
             self.transfer_upstream_server_name.is_some(),
+            !self.transfer_upstream_routes.is_empty(),
         ];
+        let has_upstream =
+            self.transfer_upstream.is_some() || !self.transfer_upstream_routes.is_empty();
         if relay_fields.iter().any(|configured| *configured)
-            && !relay_fields.iter().all(|configured| *configured)
+            && (self.transfer_relay_role.is_none()
+                || self.transfer_upstream_server_name.is_none()
+                || !has_upstream)
         {
             return Err(
-                "transfer relay role, upstream, and upstream ServerName must be configured together"
+                "transfer relay role, an upstream route, and upstream ServerName must be configured together"
                     .into(),
             );
         }
@@ -273,6 +312,20 @@ impl GatewayConfig {
             .is_some_and(|(upstream, listener)| upstream == listener)
         {
             return Err("transfer upstream must differ from the local transfer listener".into());
+        }
+        let mut route_agents = BTreeSet::new();
+        for route in &self.transfer_upstream_routes {
+            if !route_agents.insert(route.agent_id.as_str()) {
+                return Err(format!(
+                    "transfer upstream route for Agent {} is configured more than once",
+                    route.agent_id
+                ));
+            }
+            if self.transfer_listen == Some(route.upstream) {
+                return Err(
+                    "transfer upstream route must differ from the local transfer listener".into(),
+                );
+            }
         }
         if let Some(server_name) = &self.transfer_upstream_server_name {
             rustls_pki_types::ServerName::try_from(server_name.clone())
@@ -326,7 +379,7 @@ impl GatewayConfig {
                 return Err(
                     "public TLS certificate and private key files must be configured together"
                         .into(),
-                )
+                );
             }
         }
         if self.public_listen.is_none()
@@ -462,6 +515,7 @@ impl GatewayConfig {
             && (self.transfer_relay_role.is_some()
                 || self.transfer_upstream.is_some()
                 || self.transfer_upstream_server_name.is_some()
+                || !self.transfer_upstream_routes.is_empty()
                 || configured_generations != 0)
         {
             return Err(
@@ -710,14 +764,44 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
     ) {
         transfer_fence = transfer_fence.with_generations(session, mount, route);
     }
-    let tunnel = Arc::new(GatewayTunnel::with_peer_forwarder_and_transfer_fence(
-        identity,
-        peer_forwarder.clone(),
-        config
-            .transfer_listen
-            .is_some()
-            .then(|| transfer_fence.clone()),
-    ));
+    // Keep deployment-owned source addresses in a directory shared by the control tunnel and
+    // QUIC relay. The tunnel activates/deactivates entries with the Central route lease, so a
+    // reconnect cannot leave a stale source hop eligible while retaining the configured address.
+    let transfer_upstreams = config
+        .transfer_listen
+        .map(|_| transfer_quic::TransferUpstreamDirectory::new());
+    let manages_source_routes =
+        config.transfer_relay_role == Some(transfer_quic::TransferRelayRole::Source);
+    if let Some(directory) = &transfer_upstreams {
+        for route in &config.transfer_upstream_routes {
+            let agent_id = neoengram_domain::protocol::AgentId::new(route.agent_id.clone())
+                .map_err(|error| {
+                    std::io::Error::other(format!("transfer route Agent ID is invalid: {error}"))
+                })?;
+            if manages_source_routes {
+                directory.configure(agent_id, route.upstream);
+            } else {
+                // A target Gateway's per-source directory points at a remote source Gateway; its
+                // local target Agent lease cannot activate/deactivate that remote hop. The
+                // target transfer fence still gates admission, so keep the deployment route
+                // available while the source Gateway enforces its own lease.
+                directory.set(agent_id, route.upstream);
+            }
+        }
+    }
+    let tunnel = Arc::new(
+        GatewayTunnel::with_peer_forwarder_and_transfer_fence_and_upstreams(
+            identity,
+            peer_forwarder.clone(),
+            config
+                .transfer_listen
+                .is_some()
+                .then(|| transfer_fence.clone()),
+            manages_source_routes
+                .then(|| transfer_upstreams.clone())
+                .flatten(),
+        ),
+    );
     let s3_read_channels = Arc::new(s3_read_channel::S3ReadChannelRegistry::with_peer_reader(
         tunnel.clone(),
         peer_forwarder,
@@ -737,14 +821,15 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
             let mut listener =
                 transfer_quic::QuicTransferListener::bind(address, server_tls, transfer_fence)
                     .map_err(std::io::Error::other)?;
-            if let (Some(upstream), Some(server_name)) = (
-                config.transfer_upstream,
-                config.transfer_upstream_server_name.as_deref(),
-            ) {
-                let connector = transfer_quic::QuinnTransferConnectionFactory::bind(
-                    upstream,
+            if let Some(server_name) = config.transfer_upstream_server_name.as_deref() {
+                let directory = transfer_upstreams
+                    .clone()
+                    .expect("transfer upstream directory is created with transfer listener");
+                let connector = transfer_quic::QuinnTransferConnectionFactory::bind_with_directory(
+                    config.transfer_upstream,
                     Arc::<str>::from(server_name),
                     client_tls,
+                    directory,
                 )
                 .map_err(std::io::Error::other)?;
                 listener = listener.with_relay(Arc::new(
@@ -2098,6 +2183,18 @@ mod tests {
         config.transfer_route_generation = Some(5);
         config.validate().unwrap();
 
+        config.transfer_upstream = None;
+        config.transfer_upstream_routes = vec![TransferUpstreamRoute {
+            agent_id: "agent-source".to_owned(),
+            upstream: "127.0.0.1:8185".parse().unwrap(),
+        }];
+        config.validate().unwrap();
+        config.transfer_upstream_routes.push(TransferUpstreamRoute {
+            agent_id: "agent-source".to_owned(),
+            upstream: "127.0.0.1:8186".parse().unwrap(),
+        });
+        assert!(config.validate().is_err());
+
         config.bootstrap.private_key_file = Some("/bootstrap-private-key.pem".into());
         config.bootstrap.activation_token_file = Some("/bootstrap-token".into());
         config.bootstrap.certificate_chain_file = Some("/bootstrap-chain.pem".into());
@@ -2106,6 +2203,7 @@ mod tests {
         config.transfer_relay_role = None;
         config.transfer_upstream = None;
         config.transfer_upstream_server_name = None;
+        config.transfer_upstream_routes.clear();
         config.transfer_session_generation = None;
         config.transfer_mount_generation = None;
         config.transfer_route_generation = None;

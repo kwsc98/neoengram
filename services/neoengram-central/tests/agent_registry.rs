@@ -160,8 +160,7 @@ async fn sqlite_registry_rejects_schema_drift_on_reopen() {
 
         let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
             .await
-            .err()
-            .expect("schema drift must prevent reopening the Agent registry");
+            .expect_err("schema drift must prevent reopening the Agent registry");
         assert_eq!(error.code(), CentralErrorCode::StorageFailure);
     }
 }
@@ -184,8 +183,7 @@ async fn sqlite_registry_rejects_orphan_status_watermark_on_reopen() {
 
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("orphan bootstrap-status watermark must fail closed during reopen");
+        .expect_err("orphan bootstrap-status watermark must fail closed during reopen");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 
@@ -347,8 +345,7 @@ async fn sqlite_registry_rejects_corrupt_pvc_index_columns_on_reopen() {
 
         let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
             .await
-            .err()
-            .expect("corrupt PVC index column must fail closed during reopen");
+            .expect_err("corrupt PVC index column must fail closed during reopen");
         assert_eq!(error.code(), CentralErrorCode::StorageFailure);
     }
 }
@@ -371,8 +368,7 @@ async fn sqlite_registry_rejects_corrupt_optional_indexes_on_reopen() {
 
         let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
             .await
-            .err()
-            .expect("corrupt optional index must fail closed during reopen");
+            .expect_err("corrupt optional index must fail closed during reopen");
         assert_eq!(error.code(), CentralErrorCode::StorageFailure);
     }
 }
@@ -397,8 +393,7 @@ async fn sqlite_registry_rejects_corrupt_identity_and_session_payload_on_reopen(
 
         let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
             .await
-            .err()
-            .expect("corrupt registry payload must fail closed during reopen");
+            .expect_err("corrupt registry payload must fail closed during reopen");
         assert_eq!(error.code(), CentralErrorCode::StorageFailure);
     }
 }
@@ -1746,8 +1741,7 @@ async fn sqlite_persists_and_validates_server_verified_bootstrap_pop() {
     .await;
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("rich CurrentV3 records without verified PoP status must fail closed");
+        .expect_err("rich CurrentV3 records without verified PoP status must fail closed");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 
@@ -1791,8 +1785,7 @@ async fn sqlite_rejects_current_bootstrap_without_signed_payload_digest() {
     .await;
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .err()
-        .expect("rich CurrentV3 records without signed payload digest must fail closed");
+        .expect_err("rich CurrentV3 records without signed payload digest must fail closed");
     assert_eq!(error.code(), CentralErrorCode::StorageFailure);
 }
 

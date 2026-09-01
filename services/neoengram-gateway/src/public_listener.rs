@@ -361,14 +361,14 @@ where
                 "The Gateway request admission limit has been reached.",
                 "GET, HEAD, OPTIONS",
                 request.method() == Method::HEAD,
-            ))
+            ));
         }
         Err(_) => {
             return Ok(problem_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "request_admission_exhausted",
                 "Gateway request admission limit reached",
-            ))
+            ));
         }
     };
     let response = if state.draining.load(Ordering::Acquire) {
@@ -630,7 +630,7 @@ async fn handle_s3_request<B>(
                 error.message,
                 allow,
                 *method == Method::HEAD,
-            )
+            );
         }
     };
     let response_content_disposition = match response_content_disposition(request.uri()) {
@@ -642,7 +642,7 @@ async fn handle_s3_request<B>(
                 error.message,
                 allow,
                 *method == Method::HEAD,
-            )
+            );
         }
     };
     let operation = match parsed.operation {
@@ -705,7 +705,7 @@ async fn handle_s3_request<B>(
                 "The S3 stream admission limit has been reached.",
                 allow,
                 *method == Method::HEAD,
-            )
+            );
         }
     };
     let control_request = S3ControlRequest {
@@ -812,14 +812,14 @@ fn parse_s3_request<B>(
                 status: StatusCode::NOT_IMPLEMENTED,
                 code: "NotImplemented",
                 message: "Only ListObjectsV2 is supported for bucket GET requests.",
-            })
+            });
         }
         _ => {
             return Err(S3ParseError {
                 status: StatusCode::METHOD_NOT_ALLOWED,
                 code: "MethodNotAllowed",
                 message: "The requested method is not allowed for this S3 resource.",
-            })
+            });
         }
     };
     Ok(ParsedS3Request { bucket, operation })
@@ -1656,7 +1656,7 @@ async fn serve_static<B>(request: Request<B>, state: &PublicListenerState) -> Re
                 StatusCode::BAD_REQUEST,
                 "invalid_static_path",
                 "The requested path is invalid",
-            )
+            );
         }
     };
     let root = match fs::canonicalize(&*state.web_root).await {
@@ -1666,7 +1666,7 @@ async fn serve_static<B>(request: Request<B>, state: &PublicListenerState) -> Re
                 StatusCode::SERVICE_UNAVAILABLE,
                 "web_root_unavailable",
                 "The console assets are unavailable",
-            )
+            );
         }
     };
     let file = match safe_file(&root, &lookup).await {
@@ -1679,14 +1679,14 @@ async fn serve_static<B>(request: Request<B>, state: &PublicListenerState) -> Re
                         StatusCode::SERVICE_UNAVAILABLE,
                         "web_index_unavailable",
                         "The console entrypoint is unavailable",
-                    )
+                    );
                 }
                 Err(_) => {
                     return problem_response(
                         StatusCode::FORBIDDEN,
                         "invalid_static_path",
                         "The requested path is not allowed",
-                    )
+                    );
                 }
             }
         }
@@ -1695,14 +1695,14 @@ async fn serve_static<B>(request: Request<B>, state: &PublicListenerState) -> Re
                 StatusCode::NOT_FOUND,
                 "static_not_found",
                 "The requested console asset was not found",
-            )
+            );
         }
         Err(_) => {
             return problem_response(
                 StatusCode::FORBIDDEN,
                 "invalid_static_path",
                 "The requested path is not allowed",
-            )
+            );
         }
     };
     let metadata = match fs::metadata(&file).await {
@@ -1712,7 +1712,7 @@ async fn serve_static<B>(request: Request<B>, state: &PublicListenerState) -> Re
                 StatusCode::NOT_FOUND,
                 "static_not_found",
                 "The requested console asset was not found",
-            )
+            );
         }
     };
     let content_type = content_type_for(&file);
@@ -1728,7 +1728,7 @@ async fn serve_static<B>(request: Request<B>, state: &PublicListenerState) -> Re
                 StatusCode::SERVICE_UNAVAILABLE,
                 "static_read_failed",
                 "The requested console asset could not be read",
-            )
+            );
         }
     };
     let mut response = response_with_body(StatusCode::OK, Bytes::from(contents));
@@ -1816,7 +1816,7 @@ where
                 StatusCode::BAD_GATEWAY,
                 "central_upstream_invalid",
                 "The Central API upstream address is invalid",
-            )
+            );
         }
     };
     let (mut parts, body) = request.into_parts();
@@ -1850,28 +1850,28 @@ where
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request_too_large",
                 "The request body exceeds the configured Gateway limit",
-            )
+            );
         }
         Ok(Err(CentralProxyError::RequestBody(PublicRequestBodyError::Read))) => {
             return problem_response(
                 StatusCode::BAD_REQUEST,
                 "request_body_invalid",
                 "The request body could not be read",
-            )
+            );
         }
         Ok(Err(CentralProxyError::Upstream)) => {
             return problem_response(
                 StatusCode::BAD_GATEWAY,
                 "central_unavailable",
                 "The Central API upstream is unavailable",
-            )
+            );
         }
         Err(_) => {
             return problem_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "central_deadline_exceeded",
                 "The Central API request deadline was exceeded",
-            )
+            );
         }
     };
     let (mut parts, body) = response.into_parts();

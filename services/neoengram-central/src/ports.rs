@@ -3,9 +3,14 @@ use std::sync::Arc;
 use crate::{CentralError, CentralErrorCode};
 use async_trait::async_trait;
 use neoengram_domain::core::{Manifest, ManifestId, ObjectId};
+use neoengram_domain::protocol::materialization::{
+    MaterializationBatch, MaterializationJob, MaterializationJobKey, MaterializationObject,
+    MaterializationObjectReceipt, ObjectPlacement as ObjectPlacementV2, ObjectReadLease,
+    StagingLease, VolumeCommitCoverage,
+};
 use neoengram_domain::protocol::{
     AgentId, ArtifactId, JobAssignment, MetadataBatchDescriptor, MetadataBatchId,
-    MetadataBatchPage, PlacementGeneration, StorageVolumeId, TenantId, UnixMillis,
+    MetadataBatchPage, ObjectReceiptId, PlacementGeneration, StorageVolumeId, TenantId, UnixMillis,
     WireIndexVersion,
 };
 
@@ -54,6 +59,50 @@ pub enum AssignmentPublishOutcome {
 pub enum AssignmentRetireOutcome {
     Retired,
     AlreadyRetired,
+}
+
+/// Counts materialization protection leases transitioned to `Expired` by one authority sweep.
+///
+/// Lease expiry is an authority concern rather than an Agent liveness guess: the sweep records a
+/// durable terminal state which a later GC pass can use when deciding whether a source object or
+/// staging key is still protected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaterializationLeaseExpiryReconciliation {
+    pub expired_object_read_leases: usize,
+    pub expired_staging_leases: usize,
+}
+
+/// Complete durable state for one materialization plan publication.
+///
+/// A plan is intentionally represented as one aggregate at the repository boundary.  The
+/// Central planner may build it in memory, but the authority must publish the parent Job, child
+/// Objects/Batches, protection Leases, and derived Coverage in one visibility/durability
+/// boundary.  This prevents a process crash from exposing a Job with only a prefix of its plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializationPlan {
+    pub job: MaterializationJob,
+    pub batches: Vec<MaterializationBatch>,
+    pub objects: Vec<MaterializationObject>,
+    pub object_read_leases: Vec<ObjectReadLease>,
+    pub staging_leases: Vec<StagingLease>,
+    pub coverage: VolumeCommitCoverage,
+}
+
+/// Result of publishing a materialization plan.  An exact replay returns `Existing`; conflicting
+/// idempotency keys are rejected by the repository rather than silently selecting another plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializationPlanInsertOutcome {
+    Inserted(MaterializationJob),
+    Existing(MaterializationJob),
+}
+
+/// CAS request for replacing one materialization plan during retry/replanning. The old plan
+/// remains readable for audit, but its active batches and protection leases are retired in the
+/// same transaction that publishes this next revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializationPlanReplacement {
+    pub expected_plan_revision: neoengram_domain::protocol::Generation,
+    pub plan: MaterializationPlan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -713,6 +762,428 @@ pub trait ControlCatalogRepository: Send + Sync {
 /// transfer/workspace state; object bytes remain owned by Agent/Gateway data-plane backends.
 #[async_trait]
 pub trait PlacementRepository: Send + Sync {
+    /// Inserts one namespace-scoped v2 object fact.  Object bytes are never accepted by this
+    /// repository; the Agent receipt has already completed its durability barrier.
+    async fn insert_object_placement_v2(
+        &self,
+        placement: ObjectPlacementV2,
+    ) -> CentralResult<ObjectPlacementV2>;
+    /// Lists readable and historical v2 placements for one exact namespace/object identity.
+    async fn object_placements_v2(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        object_id: &ObjectId,
+    ) -> CentralResult<Vec<ObjectPlacementV2>>;
+    /// Replaces the recomputable Coverage summary at one Volume/generation.  Implementations
+    /// reject metadata that does not match the referenced Commit ObjectSet.
+    async fn upsert_volume_commit_coverage(
+        &self,
+        coverage: VolumeCommitCoverage,
+    ) -> CentralResult<VolumeCommitCoverage>;
+    async fn volume_commit_coverages(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+    ) -> CentralResult<Vec<VolumeCommitCoverage>>;
+    /// Inserts a user-visible target materialization.  The idempotency key is the immutable
+    /// `(tenant, namespace, commit, target Volume, coverage goal)` carried by the Job itself.
+    async fn insert_materialization(
+        &self,
+        job: MaterializationJob,
+    ) -> CentralResult<MaterializationJob>;
+    /// Atomically publishes a complete Job/Batch/Object/Lease/Coverage aggregate.  The operation
+    /// is idempotent: an exact replay returns `Existing`, while any conflicting child or parent
+    /// metadata aborts the whole operation without exposing a partial plan.
+    async fn insert_materialization_plan(
+        &self,
+        plan: MaterializationPlan,
+    ) -> CentralResult<MaterializationPlanInsertOutcome>;
+    /// Atomically advances a plan revision and publishes its replacement children. The expected
+    /// revision is a CAS fence; stale retries are rejected before any old child is retired.
+    async fn replace_materialization_plan(
+        &self,
+        request: MaterializationPlanReplacement,
+    ) -> CentralResult<MaterializationPlanInsertOutcome>;
+    async fn get_materialization(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Option<MaterializationJob>>;
+    async fn get_materialization_by_key(
+        &self,
+        key: &MaterializationJobKey,
+    ) -> CentralResult<Option<MaterializationJob>>;
+    /// Lists materializations for one exact namespace/Commit.  Supplying a target Volume narrows
+    /// the result to the idempotency scope used by the planner; results are stable by job ID.
+    async fn list_materializations(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        commit_id: &neoengram_domain::core::ContentDigest,
+        target_storage_volume_id: Option<&StorageVolumeId>,
+    ) -> CentralResult<Vec<MaterializationJob>>;
+    /// CAS update for plan/state changes. `expected_plan_revision` fences stale planners and old
+    /// Batch reports. State-only updates may retain the same revision; a replan increments it.
+    async fn replace_materialization(
+        &self,
+        tenant_id: &TenantId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+        expected_plan_revision: neoengram_domain::protocol::Generation,
+        job: MaterializationJob,
+    ) -> CentralResult<MaterializationJob>;
+    async fn insert_materialization_batch(
+        &self,
+        batch: MaterializationBatch,
+    ) -> CentralResult<MaterializationBatch>;
+    /// Fenced state/attempt update for one materialization Batch.
+    async fn replace_materialization_batch(
+        &self,
+        request: crate::MaterializationBatchCasRequest,
+    ) -> CentralResult<MaterializationBatch>;
+    async fn list_materialization_batches(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Vec<MaterializationBatch>>;
+    /// Lists non-terminal v2 batches currently assigned to one target Agent.  The result is
+    /// tenant-scoped and deterministic; callers use it to recover work after an Agent reconnects
+    /// without exposing or accepting a stale batch from another target.
+    async fn list_active_materialization_batches_for_agent(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+    ) -> CentralResult<Vec<MaterializationBatch>>;
+    async fn insert_materialization_object(
+        &self,
+        tenant_id: &TenantId,
+        object: MaterializationObject,
+    ) -> CentralResult<MaterializationObject>;
+    /// Fenced update for one object checkpoint.  Replays with the same plan/attempt and payload
+    /// are idempotent; stale reports cannot overwrite a newer source/route assignment.
+    async fn replace_materialization_object(
+        &self,
+        request: crate::MaterializationObjectCasRequest,
+    ) -> CentralResult<MaterializationObject>;
+    async fn list_materialization_objects(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Vec<MaterializationObject>>;
+    /// Looks up a durable receipt identity without applying a live Batch/route fence.
+    ///
+    /// The control plane uses this idempotency probe before checking the current Agent session.
+    /// An exact replay is safe after reconnect because its receipt and Placement are already
+    /// durable; a new receipt still goes through the live fences in
+    /// `record_materialization_receipt`.
+    async fn get_materialization_receipt(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        receipt_id: &ObjectReceiptId,
+    ) -> CentralResult<Option<MaterializationObjectReceipt>>;
+    async fn insert_object_read_lease(
+        &self,
+        lease: ObjectReadLease,
+    ) -> CentralResult<ObjectReadLease>;
+    async fn insert_staging_lease(&self, lease: StagingLease) -> CentralResult<StagingLease>;
+    /// Atomically marks active leases whose TTL has elapsed as `Expired`.  Released and already
+    /// expired history is left unchanged, so repeated sweeps are idempotent.
+    async fn reconcile_materialization_leases(
+        &self,
+        now_unix_ms: UnixMillis,
+    ) -> CentralResult<MaterializationLeaseExpiryReconciliation>;
+    /// Records one durability-barrier receipt and publishes exactly one Verified ObjectPlacement.
+    /// Receipt identity is durable and an exact replay returns the original Placement.
+    async fn record_materialization_receipt(
+        &self,
+        request: crate::MaterializationReceiptRequest,
+    ) -> CentralResult<ObjectPlacementV2> {
+        let receipt = request.receipt;
+        receipt
+            .validate_against(&request.object)
+            .map_err(CentralError::from)?;
+        let placement_id =
+            crate::placement_authority::materialization_target_placement_id(&receipt)?;
+        if let Some(existing) = self
+            .object_placements_v2(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.object_id,
+            )
+            .await?
+            .into_iter()
+            .find(|placement| placement.placement_id == placement_id)
+        {
+            if existing.storage_volume_id.as_ref() == Some(&receipt.target_storage_volume_id)
+                && existing.placement_generation == receipt.target_placement_generation
+                && existing.size == receipt.size
+                && existing.encoding == receipt.encoding
+                && existing.verified_digest == receipt.verified_digest
+                && existing.readable()
+            {
+                return Ok(existing);
+            }
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization receipt placement ID is already bound to different metadata",
+            )
+            .with_retryable(false));
+        }
+        let job = self
+            .get_materialization(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if job.plan_revision != receipt.plan_revision
+            || job.key.object_namespace_id != receipt.object_namespace_id
+            || job.key.target_storage_volume_id != receipt.target_storage_volume_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization receipt is stale or scoped to another target",
+            ));
+        }
+        let batch = self
+            .list_materialization_batches(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?
+            .into_iter()
+            .find(|batch| batch.batch_id == receipt.batch_id)
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization batch not found",
+                )
+            })?;
+        if batch.plan_revision != receipt.plan_revision
+            || batch.batch_attempt != receipt.batch_attempt
+            || batch.target.tenant_id != receipt.tenant_id
+            || batch.target.object_namespace_id != receipt.object_namespace_id
+            || batch.target.storage_volume_id != receipt.target_storage_volume_id
+            || batch.target.placement_generation != receipt.target_placement_generation
+            || !batch.object_ids.contains(&receipt.object_id)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization receipt does not match the active batch fence",
+            ));
+        }
+        let object_set = self
+            .get_commit_object_set(&receipt.tenant_id, &job.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization Commit ObjectSet not found",
+                )
+            })?;
+        let expected = object_set
+            .object_set
+            .objects
+            .iter()
+            .find(|object| object.object_id == receipt.object_id)
+            .copied()
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "receipt object is not part of the Commit ObjectSet",
+                )
+            })?;
+        if expected.object_id != request.object.object_id
+            || expected.size.get() != request.object.size.get()
+            || expected.encoding != request.object.encoding
+            || expected.ordinal.get() != request.object.ordinal.get()
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "receipt ObjectRef disagrees with the Commit ObjectSet",
+            ));
+        }
+        let current = self
+            .list_materialization_objects(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?
+            .into_iter()
+            .find(|task| {
+                task.object.object_namespace_id == receipt.object_namespace_id
+                    && task.object.object_id == receipt.object_id
+            })
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization object not found",
+                )
+            })?;
+        if current.plan_revision != receipt.plan_revision {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization object belongs to an obsolete plan",
+            ));
+        }
+        if current.object != request.object {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization object metadata disagrees with the receipt ObjectRef",
+            )
+            .with_retryable(false));
+        }
+        if !current.complete()
+            && !current.state.can_transition_to(
+                neoengram_domain::protocol::materialization::MaterializationObjectState::Verified,
+            )
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Object cannot be verified from its current state",
+            )
+            .with_retryable(false));
+        }
+        let placement = ObjectPlacementV2 {
+            placement_id: placement_id.clone(),
+            tenant_id: receipt.tenant_id.clone(),
+            object_namespace_id: receipt.object_namespace_id.clone(),
+            object_id: receipt.object_id,
+            size: receipt.size,
+            encoding: receipt.encoding,
+            verified_digest: receipt.verified_digest,
+            storage_volume_id: Some(receipt.target_storage_volume_id.clone()),
+            archive_id: None,
+            placement_generation: receipt.target_placement_generation,
+            state: neoengram_domain::protocol::materialization::ObjectPlacementState::Verified,
+            failure_domain: format!("volume:{}", receipt.target_storage_volume_id),
+        };
+        let stored_placement = self.insert_object_placement_v2(placement).await?;
+        let mut next_object = current.clone();
+        next_object.confirmed_offset = receipt.committed_offset;
+        next_object.state =
+            neoengram_domain::protocol::materialization::MaterializationObjectState::Verified;
+        next_object.attempt = receipt.batch_attempt;
+        self.replace_materialization_object(crate::MaterializationObjectCasRequest {
+            tenant_id: receipt.tenant_id.clone(),
+            object_namespace_id: receipt.object_namespace_id.clone(),
+            materialization_id: receipt.materialization_id.clone(),
+            object_id: receipt.object_id,
+            expected_plan_revision: receipt.plan_revision,
+            expected_attempt: current.attempt,
+            object: next_object,
+        })
+        .await?;
+
+        let tasks = self
+            .list_materialization_objects(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?;
+        let verified_objects = tasks.iter().filter(|task| task.complete()).count() as u64;
+        let verified_bytes = tasks
+            .iter()
+            .filter(|task| task.complete())
+            .map(|task| task.object.size.get())
+            .sum::<u64>();
+        let mut next_job = job.clone();
+        next_job.verified_object_count =
+            neoengram_domain::protocol::DecimalU64::new(verified_objects);
+        next_job.verified_bytes = neoengram_domain::protocol::DecimalU64::new(verified_bytes);
+        next_job.missing_object_count = neoengram_domain::protocol::DecimalU64::new(
+            job.object_count.get().saturating_sub(verified_objects),
+        );
+        next_job.missing_bytes = neoengram_domain::protocol::DecimalU64::new(
+            job.total_bytes.get().saturating_sub(verified_bytes),
+        );
+        next_job.state = if next_job.key.coverage_goal.satisfied_by(
+            next_job.verified_object_count.get(),
+            next_job.verified_bytes.get(),
+            next_job.object_count.get(),
+            next_job.total_bytes.get(),
+        ) {
+            neoengram_domain::protocol::materialization::MaterializationJobState::Complete
+        } else {
+            match job.state {
+                neoengram_domain::protocol::materialization::MaterializationJobState::Queued
+                | neoengram_domain::protocol::materialization::MaterializationJobState::Planning
+                | neoengram_domain::protocol::materialization::MaterializationJobState::WaitingForSources
+                | neoengram_domain::protocol::materialization::MaterializationJobState::Materializing
+                | neoengram_domain::protocol::materialization::MaterializationJobState::Verifying =>
+                    neoengram_domain::protocol::materialization::MaterializationJobState::Verifying,
+                state => state,
+            }
+        };
+        next_job.updated_at_unix_ms = neoengram_domain::protocol::UnixMillis::new(
+            job.updated_at_unix_ms
+                .get()
+                .max(receipt.verified_at_unix_ms.get()),
+        );
+        self.replace_materialization(
+            &receipt.tenant_id,
+            &receipt.materialization_id,
+            receipt.plan_revision,
+            next_job,
+        )
+        .await?;
+
+        let mut placements = Vec::new();
+        for object in &object_set.object_set.objects {
+            placements.extend(
+                self.object_placements_v2(
+                    &receipt.tenant_id,
+                    &receipt.object_namespace_id,
+                    &object.object_id,
+                )
+                .await?
+                .into_iter()
+                .filter(|placement| {
+                    placement.storage_volume_id.as_ref() == Some(&receipt.target_storage_volume_id)
+                        && placement.placement_generation == receipt.target_placement_generation
+                }),
+            );
+        }
+        let coverage =
+            neoengram_domain::protocol::materialization::VolumeCommitCoverage::from_placements(
+                receipt.tenant_id,
+                receipt.object_namespace_id,
+                job.key.commit_id,
+                receipt.target_storage_volume_id,
+                receipt.target_placement_generation,
+                &object_set.object_set,
+                &placements,
+            )
+            .map_err(CentralError::from)?;
+        self.upsert_volume_commit_coverage(coverage).await?;
+        Ok(stored_placement)
+    }
+    async fn release_object_read_lease(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        lease_id: &neoengram_domain::protocol::LeaseId,
+    ) -> CentralResult<Option<ObjectReadLease>>;
+    async fn release_staging_lease(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        lease_id: &neoengram_domain::protocol::LeaseId,
+    ) -> CentralResult<Option<StagingLease>>;
     /// Returns the immutable object manifest required by a Commit, if it has been staged.
     async fn get_commit_object_set(
         &self,

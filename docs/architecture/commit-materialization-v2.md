@@ -1,12 +1,14 @@
 # Commit 分布式对象物化 v2 调研报告
 
-> 状态：调研结论与目标设计，尚未实现
+> 状态：调研结论与目标设计；v2 Domain/Authority/Central planner 以及 Agent/Gateway 本地 payload
+> executor 纵切已观察，真实跨节点数据面与生产 E2E 尚未验收
 >
-> 核验日期：2026-08-28
+> 核验日期：2026-09-01
 >
 > 本报告只讨论 Managed 模式的 Commit 对象分布、跨 Volume 物化和相关控制协议。它不修改当前实现
-> 的能力状态；在 v2 实施完成并通过对应测试前，当前系统仍以单个完整 `CommitPlacementSet` 作为复制
-> 前置条件。
+> 的能力状态；v1 replication 仍以单个完整 `CommitPlacementSet` 作为 legacy 复制前置条件。v2 已有对象级
+> 模型、Authority CAS/幂等、Central planner/API、Agent/Gateway executor、staging/receipt 数据面纵切，
+> 但在真实 route 编排和跨节点 E2E 通过前，不能把 v2 写成已完成复制能力。
 
 ## 1. 结论摘要
 
@@ -64,8 +66,13 @@ Volume B: object-3, object-4
 | Agent CAS 实际按 Artifact 隔离 | [`storage.md`](storage.md) 与 Agent/runtime 的 Volume CAS 实现 | placement authority 不能只用 tenant + object hash 判断可读 |
 | 当前 SQLite 表围绕完整 PlacementSet 建模 | [`authority.rs`](../../services/neoengram-central/src/datasource/sqlite/authority.rs) 的 `commit_placement_sets`、`replications`、`replication_objects` | v2 应重建表和唯一约束，而不是继续堆兼容字段 |
 | 当前健康计算会统计完整 PlacementSet | [`mapper/sqlite/placement.rs`](../../services/neoengram-central/src/mapper/sqlite/placement.rs) 的 `commit_availability` | partial 并集会被误报为不可用或被忽略 |
+| v2 Domain 已定义 namespace、对象 Placement、Coverage、Materialization、Manifest、Ticket/Receipt/Lease 和 availability | [`materialization.rs`](../../crates/neoengram-domain/src/protocol/materialization.rs)、schema golden 和 domain tests | 可表达对象并集和目标覆盖，但不等于数据面已经传输 |
+| v2 Authority 已安装 schema 18 并覆盖对象 Receipt 幂等、Coverage 重算和 checkpoint CAS | [`authority.rs`](../../services/neoengram-central/src/datasource/sqlite/authority.rs)、[`authority_v2_schema.rs`](../../services/neoengram-central/tests/authority_v2_schema.rs)、materialization tests | v1 表/mapper 仍并存，clean-slate 删除和 inventory rebuild 尚未完成 |
+| v2 Central planner/API 可按缺失对象选择多源和 fallback | [`service/materialization.rs`](../../services/neoengram-central/src/service/materialization.rs)、[`materialization_v2.rs`](../../services/neoengram-central/tests/materialization_v2.rs) | 目前是可查询控制面计划，未驱动真实 QUIC payload executor |
+| v2 Agent/Gateway 具备 ALPN、Ticket/generation、manifest/checkpoint 校验、stream/relay 和 staging/receipt 执行路径 | [`materialization_quic.rs`](../../services/neoengram-agent/src/materialization_quic.rs)、Agent/Gateway transfer code、协议/单元测试 | 真实跨 Gateway route、三 Agent 多源失败恢复、背压/配额、生产凭据和跨节点 E2E 仍待验收 |
 
-这些代码路径证明的是 v1 当前行为，不证明 v2 已经存在。现阶段应继续把跨 Volume replication 标记为进行中，不能因为本报告提交就改变能力矩阵。
+前六行代码路径证明的是 v1 当前行为；新增行证明 v2 控制面、协议和本地执行纵切。现阶段仍应把跨
+Volume materialization 标记为进行中，不能因为本报告提交或单节点测试通过就改变为已完成的生产数据面能力。
 
 ## 4. v2 核心对象模型
 
@@ -314,7 +321,7 @@ staging_leases
 - Batch/plan revision 的 CAS 防止旧 source 或旧 route 覆盖新计划；
 - Coverage 由对象证据重算，并在完整校验后原子发布。
 
-Authority schema/user_version 建议提升到新的 clean-slate 版本（当前实现为 17，v2 可使用下一版本，例如 18）。遇到 v1 数据直接拒绝启动；提供显式的数据库 reset 和 Volume inventory rebuild 操作，不在启动时隐式删除业务对象。
+Authority schema/user_version 已提升到 clean-slate v2 版本 18；当前仍需完成 v1 表删除、显式 reset 和 Volume inventory rebuild。遇到 v1 数据直接拒绝启动，不在启动时隐式删除业务对象。
 
 Managed Add 产生的 `ObjectPlacementEvidence` 与复制产生的对象 receipt 必须最终进入同一对象级权威，或明确区分两者的生命周期和可读资格；不能维护两套互相矛盾的“对象已 Durable”事实。
 
@@ -416,8 +423,8 @@ Central: deleted tombstone
 
 ## 15. 证据与状态说明
 
-- `已观察`：本报告第 3 节引用的当前代码、schema 和测试能直接证明的 v1 行为。
+- `已观察`：本报告第 3 节引用的 v1 代码，以及 v2 Domain/Authority/Central planner 的纵切代码、schema 和测试能直接证明的行为。
 - `推断`：由当前 Artifact-scoped CAS、placement API、Agent transport 和现有状态机组合推导出的约束。
-- `目标`：本报告第 4 节以后提出的 v2 类型、协议、数据库、调度和产品行为；在代码和验收测试完成前不得写入当前能力表为“已实现”。
+- `目标`：本报告第 4 节以后尚未接通的 v2 数据面、调度、生命周期和产品行为；在代码和验收测试完成前不得写入当前能力表为“已实现”。
 
 后续实现必须同时更新 [`current-state.md`](../current-state.md)、[`roadmap.md`](../roadmap.md)、[`storage.md`](storage.md)、[`control-plane.md`](control-plane.md)、[`gateway.md`](gateway.md)、OpenAPI/action registry、领域 schema、Agent/Gateway 测试和 Web 生成类型。

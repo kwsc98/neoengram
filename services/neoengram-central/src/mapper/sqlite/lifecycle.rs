@@ -37,7 +37,7 @@ impl AuthorityLifecycleRepository for SqliteAuthorityStore {
 
         let placement_rows = sqlx::query(
             "SELECT artifact_id, storage_volume_id, object_id, size \
-             FROM object_placements WHERE tenant_id = ?",
+             FROM managed_object_placement_evidence WHERE tenant_id = ?",
         )
         .bind(tenant_id.as_str())
         .fetch_all(&self.pool)
@@ -363,10 +363,10 @@ async fn finalize_metadata(
 ) -> CentralResult<()> {
     if let ResourceRef::StorageVolume { storage_volume_id } = &request.target {
         let blockers: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT candidate.artifact_id FROM object_placements AS candidate \
+            "SELECT DISTINCT candidate.artifact_id FROM managed_object_placement_evidence AS candidate \
              WHERE candidate.tenant_id = ? AND candidate.storage_volume_id = ? \
                AND NOT EXISTS ( \
-                   SELECT 1 FROM object_placements AS replica \
+                   SELECT 1 FROM managed_object_placement_evidence AS replica \
                    WHERE replica.tenant_id = candidate.tenant_id \
                      AND replica.artifact_id = candidate.artifact_id \
                      AND replica.object_id = candidate.object_id \
@@ -483,7 +483,7 @@ async fn finalize_metadata(
             .map_err(storage_error)?;
             for table in [
                 "immutable_manifests",
-                "object_placements",
+                "managed_object_placement_evidence",
                 "durable_objects",
             ] {
                 let sql = format!("DELETE FROM {table} WHERE tenant_id = ? AND artifact_id = ?");
@@ -497,7 +497,7 @@ async fn finalize_metadata(
         }
         ResourceRef::StorageVolume { storage_volume_id } => {
             sqlx::query(
-                "DELETE FROM object_placements WHERE tenant_id = ? AND storage_volume_id = ?",
+                "DELETE FROM managed_object_placement_evidence WHERE tenant_id = ? AND storage_volume_id = ?",
             )
             .bind(request.tenant_id.as_str())
             .bind(storage_volume_id.as_str())

@@ -1,14 +1,23 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use async_trait::async_trait;
 use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
-use neoengram_domain::protocol::{
-    AgentId, ArchiveId, ArtifactId, BackendId, CommitObject, CommitObjectSet, CommitPlacementSet,
-    CommitPlacementSetState, DataHealth, DecimalU64, EdgeClusterId, GatewayPoolId, MountGeneration,
-    ObjectEncoding, ObjectPlacement, ObjectSet, PlacementGeneration, PlacementId, PlacementSetId,
-    PlacementState, RegionId, ReplicationId, ReplicationObjectState, ReplicationState, RequestId,
-    RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, TransferId, TransferRouteId,
-    UnixMillis, WorkspaceId, WorkspaceLifecycle,
+use neoengram_domain::protocol::materialization::{
+    MaterializationBatch, MaterializationBatchState, MaterializationJob, MaterializationJobKey,
+    MaterializationJobState, MaterializationLeaseState, MaterializationObject,
+    MaterializationObjectReceipt, MaterializationObjectState, ObjectPlacement as ObjectPlacementV2,
+    ObjectReadLease, ObjectRef, StagingLease, VolumeCommitCoverage,
 };
-use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
+use neoengram_domain::protocol::{
+    object_read_lease_id, staging_lease_id, AgentId, ArchiveId, ArtifactId, BackendId,
+    CommitObject, CommitObjectSet, CommitPlacementSet, CommitPlacementSetState, DataHealth,
+    DecimalU64, EdgeClusterId, GatewayPoolId, Generation, MountGeneration, ObjectEncoding,
+    ObjectPlacement, ObjectSet, PlacementGeneration, PlacementId, PlacementSetId, PlacementState,
+    RegionId, ReplicationId, ReplicationObjectState, ReplicationState, RequestId, RouteGeneration,
+    SessionGeneration, StorageVolumeId, TenantId, TransferId, TransferRouteId, UnixMillis,
+    WorkspaceId, WorkspaceLifecycle,
+};
+use sqlx::{sqlite::SqliteRow, Row, SqliteConnection, SqlitePool};
 
 use super::authority::{
     decode, digest_from_blob, encode, storage_corruption, storage_error, SqliteAuthorityStore,
@@ -17,7 +26,9 @@ use crate::{
     same_retry_request, valid_replication_transition, validate_replication_checkpoints,
     validate_replication_publication, validate_replication_record, CancelReplicationRequest,
     CentralError, CentralErrorCode, CentralResult, CommitAvailabilityRecord,
-    FinalizeReplicationRequest, FinalizeReplicationResult, PlacementRepository,
+    FinalizeReplicationRequest, FinalizeReplicationResult,
+    MaterializationLeaseExpiryReconciliation, MaterializationPlan,
+    MaterializationPlanInsertOutcome, MaterializationPlanReplacement, PlacementRepository,
     RefreshReplicationRoutesRequest, ReplicationObjectRecord, ReplicationRecord,
     ReplicationRouteBinding, ReplicationStateTransitionRequest, RetryReplicationRequest,
     RetryReplicationResult, WorkspaceRecord,
@@ -109,6 +120,470 @@ fn parse_workspace_lifecycle(value: &str) -> CentralResult<WorkspaceLifecycle> {
     }
 }
 
+/// Validates the child identities of a materialization aggregate before any SQLite mutation.
+/// The initial insert path performs the same checks inline; keeping this focused validator here
+/// lets replacement plans use the transaction boundary without accepting a malformed child set.
+fn validate_materialization_plan_shape(
+    plan: &MaterializationPlan,
+    object_set: &ObjectSet,
+) -> CentralResult<()> {
+    let job = &plan.job;
+    let namespace = &job.key.object_namespace_id;
+    let expected_objects = object_set
+        .objects
+        .iter()
+        .map(|object| (object.object_id, object))
+        .collect::<BTreeMap<_, _>>();
+    let mut object_ids = BTreeSet::new();
+    for object in &plan.objects {
+        object.validate().map_err(protocol_invalid)?;
+        let expected = expected_objects
+            .get(&object.object.object_id)
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization Object is not part of the Commit ObjectSet",
+                )
+                .with_retryable(false)
+            })?;
+        if object.materialization_id != job.materialization_id
+            || object.plan_revision != job.plan_revision
+            || object.object.object_namespace_id != *namespace
+            || object.object.size != expected.size
+            || object.object.encoding != expected.encoding
+            || object.object.ordinal != expected.ordinal
+            || !object_ids.insert(object.object.object_id)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Object does not match its Job fence or is duplicated",
+            )
+            .with_retryable(false));
+        }
+    }
+    if object_ids.len() != expected_objects.len() {
+        return Err(CentralError::new(
+            CentralErrorCode::InvalidState,
+            "materialization plan must include every Commit Object",
+        )
+        .with_retryable(false));
+    }
+
+    let mut batch_ids = BTreeSet::new();
+    let mut assigned = BTreeMap::new();
+    for batch in &plan.batches {
+        batch.validate().map_err(protocol_invalid)?;
+        if batch.materialization_id != job.materialization_id
+            || batch.plan_revision != job.plan_revision
+            || batch.target.tenant_id != job.key.tenant_id
+            || batch.target.object_namespace_id != *namespace
+            || batch.target.storage_volume_id != job.key.target_storage_volume_id
+            || !batch_ids.insert(batch.batch_id.clone())
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Batch does not match its Job fence or is duplicated",
+            )
+            .with_retryable(false));
+        }
+        for object_id in &batch.object_ids {
+            if !object_ids.contains(object_id)
+                || assigned
+                    .insert(*object_id, batch.batch_id.clone())
+                    .is_some()
+            {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization Batch object list is invalid or overlaps another Batch",
+                )
+                .with_retryable(false));
+            }
+        }
+    }
+    for object in &plan.objects {
+        if let Some(batch_id) = &object.current_batch_id {
+            if assigned.get(&object.object.object_id) != Some(batch_id) {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization Object current Batch does not match its plan",
+                )
+                .with_retryable(false));
+            }
+        }
+    }
+
+    let mut read_lease_ids = BTreeSet::new();
+    for lease in &plan.object_read_leases {
+        lease.validate_for_acquisition().map_err(protocol_invalid)?;
+        if lease.materialization_id != job.materialization_id
+            || lease.plan_revision != job.plan_revision
+            || lease.tenant_id != job.key.tenant_id
+            || lease.object_namespace_id != *namespace
+            || !batch_ids.contains(&lease.batch_id)
+            || !object_ids.contains(&lease.object_id)
+            || !read_lease_ids.insert(lease.lease_id.clone())
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "object read lease does not match its materialization plan",
+            )
+            .with_retryable(false));
+        }
+        let object = plan
+            .objects
+            .iter()
+            .find(|object| {
+                object.object.object_id == lease.object_id
+                    && object.current_batch_id.as_ref() == Some(&lease.batch_id)
+            })
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "object read lease is not assigned to its Batch",
+                )
+                .with_retryable(false)
+            })?;
+        if object.primary_source.as_ref() != Some(&lease.placement_id)
+            && !object.fallback_sources.contains(&lease.placement_id)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "object read lease placement is not selected for its object task",
+            )
+            .with_retryable(false));
+        }
+    }
+
+    let mut staging_lease_ids = BTreeSet::new();
+    for lease in &plan.staging_leases {
+        lease.validate_for_acquisition().map_err(protocol_invalid)?;
+        if lease.materialization_id != job.materialization_id
+            || lease.plan_revision != job.plan_revision
+            || lease.tenant_id != job.key.tenant_id
+            || lease.object_namespace_id != *namespace
+            || lease.target_storage_volume_id != job.key.target_storage_volume_id
+            || !object_ids.contains(&lease.object_id)
+            || !staging_lease_ids.insert(lease.lease_id.clone())
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "staging lease does not match its materialization plan",
+            )
+            .with_retryable(false));
+        }
+        let object = plan
+            .objects
+            .iter()
+            .find(|object| object.object.object_id == lease.object_id)
+            .expect("object ID was checked above");
+        lease
+            .validate_against_object(object)
+            .map_err(protocol_invalid)?;
+    }
+    for object in &plan.objects {
+        if object.complete() {
+            continue;
+        }
+        let Some(batch_id) = &object.current_batch_id else {
+            continue;
+        };
+        if !plan
+            .object_read_leases
+            .iter()
+            .any(|lease| lease.batch_id == *batch_id && lease.object_id == object.object.object_id)
+            || !plan
+                .staging_leases
+                .iter()
+                .any(|lease| lease.object_id == object.object.object_id)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "every assigned materialization Object requires source and staging leases",
+            )
+            .with_retryable(false));
+        }
+    }
+    Ok(())
+}
+
+/// Resolves every plan read lease to its exact durable Placement while the caller owns the plan
+/// publication transaction. The indexed `storage_volume_id` is deliberately derived from the
+/// Placement, not from the Batch's primary route: fallback leases may protect another Volume,
+/// while the primary lease must still match the signed Batch source fence.
+async fn materialization_read_lease_volumes(
+    connection: &mut SqliteConnection,
+    batches: &[MaterializationBatch],
+    objects: &[MaterializationObject],
+    leases: &[ObjectReadLease],
+) -> CentralResult<BTreeMap<String, StorageVolumeId>> {
+    let mut volumes = BTreeMap::new();
+    for lease in leases {
+        let object = objects
+            .iter()
+            .find(|object| {
+                object.object.object_id == lease.object_id
+                    && object.current_batch_id.as_ref() == Some(&lease.batch_id)
+            })
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "object read lease is not assigned to its Batch",
+                )
+                .with_retryable(false)
+            })?;
+        let batch = batches
+            .iter()
+            .find(|batch| batch.batch_id == lease.batch_id)
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "object read lease references an unknown Batch",
+                )
+                .with_retryable(false)
+            })?;
+        let row = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain \
+             FROM object_placements WHERE tenant_id = ? AND object_namespace_id = ? \
+               AND placement_id = ? AND object_id = ? AND placement_generation = ? LIMIT 1",
+        )
+        .bind(lease.tenant_id.as_str())
+        .bind(lease.object_namespace_id.as_str())
+        .bind(lease.placement_id.as_str())
+        .bind(lease.object_id.as_bytes().as_slice())
+        .bind(v2_i64(
+            lease.placement_generation.get(),
+            "placement_generation",
+        )?)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "object read lease placement is not registered",
+            )
+            .with_retryable(false)
+        })?;
+        let placement = decode_v2_object_placement(&row)?;
+        placement
+            .validate_against(&object.object)
+            .map_err(protocol_invalid)?;
+        if !placement.readable() {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "object read lease placement is not readable",
+            )
+            .with_retryable(false));
+        }
+        let volume = placement.storage_volume_id.clone().ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::InvalidState,
+                "object read lease source must reference a StorageVolume",
+            )
+            .with_retryable(false)
+        })?;
+        if object.primary_source.as_ref() == Some(&lease.placement_id)
+            && (placement.storage_volume_id != batch.source.storage_volume_id
+                || placement.archive_id != batch.source.archive_id
+                || placement.placement_generation != batch.source.placement_generation)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "object read lease primary Placement does not match its Batch source fence",
+            )
+            .with_retryable(false));
+        }
+        volumes.insert(lease.lease_id.to_string(), volume);
+    }
+    Ok(volumes)
+}
+
+/// A replan publishes the next revision in one operation, but its state is logically reached
+/// through the durable `Planning` phase. Accept that two-step path at the aggregate boundary so
+/// retries can move a recoverable/failed Job directly to the state selected by the planner.
+fn materialization_state_transition_allowed(
+    current: MaterializationJobState,
+    next: MaterializationJobState,
+) -> bool {
+    current.can_transition_to(next)
+        || (current.can_transition_to(MaterializationJobState::Planning)
+            && MaterializationJobState::Planning.can_transition_to(next))
+}
+
+impl SqliteAuthorityStore {
+    async fn get_materialization_for_namespace(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Option<MaterializationJob>> {
+        sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+             FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? LIMIT 1",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(materialization_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .map(|row| decode_v2_materialization(&row))
+        .transpose()
+    }
+
+    async fn get_active_materialization_for_target(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        commit_id: &CommitId,
+        target_storage_volume_id: &StorageVolumeId,
+    ) -> CentralResult<Option<MaterializationJob>> {
+        sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+             FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND commit_id = ? \
+               AND target_storage_volume_id = ? AND state IN \
+               ('queued', 'planning', 'waiting_for_sources', 'materializing', 'verifying', 'stalled') \
+             ORDER BY updated_at_unix_ms DESC, materialization_id DESC LIMIT 1",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(commit_id.digest().as_bytes().as_slice())
+        .bind(target_storage_volume_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .map(|row| decode_v2_materialization(&row))
+        .transpose()
+    }
+
+    async fn release_receipt_leases(
+        &self,
+        receipt: &MaterializationObjectReceipt,
+        _batch: &MaterializationBatch,
+        task: &MaterializationObject,
+    ) -> CentralResult<()> {
+        let source_ids = task
+            .primary_source
+            .iter()
+            .chain(task.fallback_sources.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for source_id in source_ids {
+            let lease_id = object_read_lease_id(
+                &receipt.materialization_id,
+                &receipt.batch_id,
+                receipt.plan_revision,
+                receipt.batch_attempt,
+                &receipt.object_namespace_id,
+                receipt.object_id,
+                &source_id,
+            )?;
+            self.release_object_read_lease(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &lease_id,
+            )
+            .await?;
+        }
+        let lease_id = staging_lease_id(
+            &receipt.materialization_id,
+            receipt.plan_revision,
+            &receipt.object_namespace_id,
+            receipt.object_id,
+        )?;
+        self.release_staging_lease(&receipt.tenant_id, &receipt.object_namespace_id, &lease_id)
+            .await?;
+        Ok(())
+    }
+
+    async fn replay_materialization_receipt(
+        &self,
+        receipt: &MaterializationObjectReceipt,
+    ) -> CentralResult<Option<ObjectPlacementV2>> {
+        let row = sqlx::query(
+            "SELECT payload, tenant_id, object_namespace_id, receipt_id, materialization_id, batch_id, \
+             plan_revision, batch_attempt, object_id, size, encoding, verified_digest, \
+             target_storage_volume_id, target_placement_generation, committed_offset, verified_at_unix_ms \
+             FROM materialization_receipts WHERE tenant_id = ? AND object_namespace_id = ? AND receipt_id = ? LIMIT 1",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.receipt_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let old = decode_v2_materialization_receipt(&row)?;
+        if old != *receipt {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization receipt ID is already in use",
+            )
+            .with_retryable(false));
+        }
+        let placement_row = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND object_id = ? \
+               AND storage_volume_id = ? AND placement_generation = ? LIMIT 1",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.object_id.as_bytes().as_slice())
+        .bind(receipt.target_storage_volume_id.as_str())
+        .bind(v2_i64(
+            receipt.target_placement_generation.get(),
+            "target_placement_generation",
+        )?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| storage_corruption("materialization receipt has no Placement"))?;
+        let placement = decode_v2_object_placement(&placement_row)?;
+        if placement.object_id != receipt.object_id
+            || placement.object_namespace_id != receipt.object_namespace_id
+            || placement.size != receipt.size
+            || placement.encoding != receipt.encoding
+            || placement.verified_digest != receipt.verified_digest
+            || placement.storage_volume_id.as_ref() != Some(&receipt.target_storage_volume_id)
+            || placement.placement_generation != receipt.target_placement_generation
+            || !placement.readable()
+        {
+            return Err(storage_corruption(
+                "materialization receipt Placement disagrees with its evidence",
+            ));
+        }
+        let batch = self
+            .list_materialization_batches(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.batch_id == receipt.batch_id)
+            .ok_or_else(|| storage_corruption("materialization receipt replay has no Batch"))?;
+        let task = self
+            .list_materialization_objects(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?
+            .into_iter()
+            .find(|candidate| {
+                candidate.object.object_namespace_id == receipt.object_namespace_id
+                    && candidate.object.object_id == receipt.object_id
+            })
+            .ok_or_else(|| {
+                storage_corruption("materialization receipt replay has no Object task")
+            })?;
+        self.release_receipt_leases(receipt, &batch, &task).await?;
+        Ok(Some(placement))
+    }
+}
+
 fn protocol_invalid(error: impl std::fmt::Display) -> CentralError {
     CentralError::new(CentralErrorCode::ProtocolInvalid, error.to_string()).with_retryable(false)
 }
@@ -181,6 +656,689 @@ fn parse_placement_state(value: &str) -> CentralResult<PlacementState> {
         _ => Err(storage_corruption(format!(
             "stored object placement state {value:?} is unknown"
         ))),
+    }
+}
+
+fn v2_placement_state_name(
+    state: neoengram_domain::protocol::materialization::ObjectPlacementState,
+) -> &'static str {
+    use neoengram_domain::protocol::materialization::ObjectPlacementState;
+    match state {
+        ObjectPlacementState::Verified => "verified",
+        ObjectPlacementState::Retiring => "retiring",
+        ObjectPlacementState::Deleted => "deleted",
+        ObjectPlacementState::Lost => "lost",
+    }
+}
+
+fn parse_v2_placement_state(
+    value: &str,
+) -> CentralResult<neoengram_domain::protocol::materialization::ObjectPlacementState> {
+    use neoengram_domain::protocol::materialization::ObjectPlacementState;
+    match value {
+        "verified" => Ok(ObjectPlacementState::Verified),
+        "retiring" => Ok(ObjectPlacementState::Retiring),
+        "deleted" => Ok(ObjectPlacementState::Deleted),
+        "lost" => Ok(ObjectPlacementState::Lost),
+        _ => Err(storage_corruption(format!(
+            "stored v2 placement state {value:?} is unknown"
+        ))),
+    }
+}
+
+fn coverage_state_name(
+    state: neoengram_domain::protocol::materialization::CoverageState,
+) -> &'static str {
+    use neoengram_domain::protocol::materialization::CoverageState;
+    match state {
+        CoverageState::Partial => "partial",
+        CoverageState::Complete => "complete",
+        CoverageState::Retiring => "retiring",
+        CoverageState::Deleted => "deleted",
+    }
+}
+
+fn parse_coverage_state(
+    value: &str,
+) -> CentralResult<neoengram_domain::protocol::materialization::CoverageState> {
+    use neoengram_domain::protocol::materialization::CoverageState;
+    match value {
+        "partial" => Ok(CoverageState::Partial),
+        "complete" => Ok(CoverageState::Complete),
+        "retiring" => Ok(CoverageState::Retiring),
+        "deleted" => Ok(CoverageState::Deleted),
+        _ => Err(storage_corruption(format!(
+            "stored Coverage state {value:?} is unknown"
+        ))),
+    }
+}
+
+fn materialization_job_state_name(state: MaterializationJobState) -> &'static str {
+    match state {
+        MaterializationJobState::Queued => "queued",
+        MaterializationJobState::Planning => "planning",
+        MaterializationJobState::WaitingForSources => "waiting_for_sources",
+        MaterializationJobState::Materializing => "materializing",
+        MaterializationJobState::Verifying => "verifying",
+        MaterializationJobState::Complete => "complete",
+        MaterializationJobState::Stalled => "stalled",
+        MaterializationJobState::Failed => "failed",
+        MaterializationJobState::Cancelled => "cancelled",
+    }
+}
+
+fn parse_materialization_job_state(value: &str) -> CentralResult<MaterializationJobState> {
+    match value {
+        "queued" => Ok(MaterializationJobState::Queued),
+        "planning" => Ok(MaterializationJobState::Planning),
+        "waiting_for_sources" => Ok(MaterializationJobState::WaitingForSources),
+        "materializing" => Ok(MaterializationJobState::Materializing),
+        "verifying" => Ok(MaterializationJobState::Verifying),
+        "complete" => Ok(MaterializationJobState::Complete),
+        "stalled" => Ok(MaterializationJobState::Stalled),
+        "failed" => Ok(MaterializationJobState::Failed),
+        "cancelled" => Ok(MaterializationJobState::Cancelled),
+        _ => Err(storage_corruption(format!(
+            "stored materialization Job state {value:?} is unknown"
+        ))),
+    }
+}
+
+fn materialization_batch_state_name(state: MaterializationBatchState) -> &'static str {
+    match state {
+        MaterializationBatchState::Queued => "queued",
+        MaterializationBatchState::Assigned => "assigned",
+        MaterializationBatchState::Transferring => "transferring",
+        MaterializationBatchState::Verifying => "verifying",
+        MaterializationBatchState::Succeeded => "succeeded",
+        MaterializationBatchState::Failed => "failed",
+    }
+}
+
+fn parse_materialization_batch_state(value: &str) -> CentralResult<MaterializationBatchState> {
+    match value {
+        "queued" => Ok(MaterializationBatchState::Queued),
+        "assigned" => Ok(MaterializationBatchState::Assigned),
+        "transferring" => Ok(MaterializationBatchState::Transferring),
+        "verifying" => Ok(MaterializationBatchState::Verifying),
+        "succeeded" => Ok(MaterializationBatchState::Succeeded),
+        "failed" => Ok(MaterializationBatchState::Failed),
+        _ => Err(storage_corruption(format!(
+            "stored materialization Batch state {value:?} is unknown"
+        ))),
+    }
+}
+
+fn materialization_object_state_name(state: MaterializationObjectState) -> &'static str {
+    match state {
+        MaterializationObjectState::Missing => "missing",
+        MaterializationObjectState::Reserved => "reserved",
+        MaterializationObjectState::Transferring => "transferring",
+        MaterializationObjectState::Verified => "verified",
+        MaterializationObjectState::Published => "published",
+        MaterializationObjectState::AlreadyPresent => "already_present",
+        MaterializationObjectState::Failed => "failed",
+    }
+}
+
+fn parse_materialization_object_state(value: &str) -> CentralResult<MaterializationObjectState> {
+    match value {
+        "missing" => Ok(MaterializationObjectState::Missing),
+        "reserved" => Ok(MaterializationObjectState::Reserved),
+        "transferring" => Ok(MaterializationObjectState::Transferring),
+        "verified" => Ok(MaterializationObjectState::Verified),
+        "published" => Ok(MaterializationObjectState::Published),
+        "already_present" => Ok(MaterializationObjectState::AlreadyPresent),
+        "failed" => Ok(MaterializationObjectState::Failed),
+        _ => Err(storage_corruption(format!(
+            "stored materialization Object state {value:?} is unknown"
+        ))),
+    }
+}
+
+fn materialization_lease_state_name(state: MaterializationLeaseState) -> &'static str {
+    match state {
+        MaterializationLeaseState::Active => "active",
+        MaterializationLeaseState::Released => "released",
+        MaterializationLeaseState::Expired => "expired",
+    }
+}
+
+fn parse_materialization_lease_state(value: &str) -> CentralResult<MaterializationLeaseState> {
+    match value {
+        "active" => Ok(MaterializationLeaseState::Active),
+        "released" => Ok(MaterializationLeaseState::Released),
+        "expired" => Ok(MaterializationLeaseState::Expired),
+        _ => Err(storage_corruption(format!(
+            "stored materialization lease state {value:?} is unknown"
+        ))),
+    }
+}
+
+fn v2_i64(value: u64, field: &str) -> CentralResult<i64> {
+    i64::try_from(value).map_err(|_| {
+        CentralError::new(
+            CentralErrorCode::ProtocolInvalid,
+            format!("{field} exceeds SQLite integer range"),
+        )
+    })
+}
+
+fn v2_decode<T: serde::de::DeserializeOwned>(row: &SqliteRow, field: &str) -> CentralResult<T> {
+    let payload = row
+        .try_get::<Vec<u8>, _>("payload")
+        .map_err(storage_error)?;
+    decode(&payload).map_err(|error| {
+        storage_corruption(format!("stored v2 {field} payload is invalid: {error}"))
+    })
+}
+
+fn decode_v2_object_placement(row: &SqliteRow) -> CentralResult<ObjectPlacementV2> {
+    let placement: ObjectPlacementV2 = v2_decode(row, "object placement")?;
+    placement.validate().map_err(protocol_invalid)?;
+    let state = parse_v2_placement_state(
+        row.try_get::<String, _>("state")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    if state != placement.state
+        || row
+            .try_get::<String, _>("tenant_id")
+            .map_err(storage_error)?
+            != placement.tenant_id.as_str()
+        || row
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?
+            != placement.object_namespace_id.as_str()
+        || row
+            .try_get::<String, _>("placement_id")
+            .map_err(storage_error)?
+            != placement.placement_id.as_str()
+        || row
+            .try_get::<Vec<u8>, _>("object_id")
+            .map_err(storage_error)?
+            != placement.object_id.as_bytes().to_vec()
+        || row
+            .try_get::<String, _>("storage_volume_id")
+            .map_err(storage_error)?
+            != placement
+                .storage_volume_id
+                .as_ref()
+                .map(StorageVolumeId::as_str)
+                .unwrap_or_default()
+        || u64::try_from(row.try_get::<i64, _>("size").map_err(storage_error)?)
+            .map_err(|_| storage_corruption("stored v2 object placement size is negative"))?
+            != placement.size.get()
+        || row
+            .try_get::<String, _>("encoding")
+            .map_err(storage_error)?
+            != object_encoding_name(placement.encoding)
+        || row
+            .try_get::<Vec<u8>, _>("verified_digest")
+            .map_err(storage_error)?
+            != placement.verified_digest.as_bytes().to_vec()
+        || u64::try_from(
+            row.try_get::<i64, _>("placement_generation")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 object placement generation is negative"))?
+            != placement.placement_generation.get()
+        || row
+            .try_get::<String, _>("failure_domain")
+            .map_err(storage_error)?
+            != placement.failure_domain
+    {
+        return Err(storage_corruption(
+            "v2 object placement indexed identity disagrees with its payload",
+        ));
+    }
+    Ok(placement)
+}
+
+fn same_v2_placement_evidence(left: &ObjectPlacementV2, right: &ObjectPlacementV2) -> bool {
+    left.tenant_id == right.tenant_id
+        && left.object_namespace_id == right.object_namespace_id
+        && left.object_id == right.object_id
+        && left.size == right.size
+        && left.encoding == right.encoding
+        && left.verified_digest == right.verified_digest
+        && left.storage_volume_id == right.storage_volume_id
+        && left.archive_id == right.archive_id
+        && left.placement_generation == right.placement_generation
+        && left.state == right.state
+        && left.failure_domain == right.failure_domain
+}
+
+fn decode_v2_coverage(row: &SqliteRow) -> CentralResult<VolumeCommitCoverage> {
+    let coverage: VolumeCommitCoverage = v2_decode(row, "coverage")?;
+    coverage.validate().map_err(protocol_invalid)?;
+    let state = parse_coverage_state(
+        row.try_get::<String, _>("state")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    if state != coverage.state
+        || row
+            .try_get::<String, _>("tenant_id")
+            .map_err(storage_error)?
+            != coverage.tenant_id.as_str()
+        || row
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?
+            != coverage.object_namespace_id.as_str()
+        || row
+            .try_get::<String, _>("storage_volume_id")
+            .map_err(storage_error)?
+            != coverage.storage_volume_id.as_str()
+        || row
+            .try_get::<Vec<u8>, _>("commit_id")
+            .map_err(storage_error)?
+            != coverage.commit_id.digest().as_bytes().to_vec()
+        || row
+            .try_get::<Vec<u8>, _>("object_set_digest")
+            .map_err(storage_error)?
+            != coverage.object_set_digest.as_bytes().to_vec()
+        || u64::try_from(
+            row.try_get::<i64, _>("placement_generation")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 Coverage generation is negative"))?
+            != coverage.placement_generation.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("object_count")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 Coverage object_count is negative"))?
+            != coverage.object_count.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("verified_object_count")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 Coverage verified_object_count is negative"))?
+            != coverage.verified_object_count.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("total_bytes")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 Coverage total_bytes is negative"))?
+            != coverage.total_bytes.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("verified_bytes")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 Coverage verified_bytes is negative"))?
+            != coverage.verified_bytes.get()
+    {
+        return Err(storage_corruption(
+            "v2 Coverage indexed identity disagrees with its payload",
+        ));
+    }
+    Ok(coverage)
+}
+
+fn decode_v2_materialization(row: &SqliteRow) -> CentralResult<MaterializationJob> {
+    let job: MaterializationJob = v2_decode(row, "materialization")?;
+    job.validate().map_err(protocol_invalid)?;
+    let state = parse_materialization_job_state(
+        row.try_get::<String, _>("state")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    if state != job.state
+        || row
+            .try_get::<String, _>("tenant_id")
+            .map_err(storage_error)?
+            != job.key.tenant_id.as_str()
+        || row
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?
+            != job.key.object_namespace_id.as_str()
+        || row
+            .try_get::<String, _>("target_storage_volume_id")
+            .map_err(storage_error)?
+            != job.key.target_storage_volume_id.as_str()
+        || row
+            .try_get::<String, _>("artifact_id")
+            .map_err(storage_error)?
+            != job.artifact_id.as_str()
+        || row
+            .try_get::<Vec<u8>, _>("commit_id")
+            .map_err(storage_error)?
+            != job.key.commit_id.digest().as_bytes().to_vec()
+        || row
+            .try_get::<String, _>("coverage_goal")
+            .map_err(storage_error)?
+            != coverage_goal_parts(job.key.coverage_goal)?.0
+        || u64::try_from(
+            row.try_get::<i64, _>("coverage_goal_value")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored materialization coverage goal is negative"))?
+            != coverage_goal_parts(job.key.coverage_goal)?.1
+    {
+        return Err(storage_corruption(
+            "v2 materialization indexed identity disagrees with its payload",
+        ));
+    }
+    Ok(job)
+}
+
+fn decode_v2_batch(row: &SqliteRow) -> CentralResult<MaterializationBatch> {
+    let batch: MaterializationBatch = v2_decode(row, "materialization batch")?;
+    batch.validate().map_err(protocol_invalid)?;
+    let state = parse_materialization_batch_state(
+        row.try_get::<String, _>("state")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    if state != batch.state
+        || row
+            .try_get::<String, _>("tenant_id")
+            .map_err(storage_error)?
+            != batch.target.tenant_id.as_str()
+        || row
+            .try_get::<String, _>("target_storage_volume_id")
+            .map_err(storage_error)?
+            != batch.target.storage_volume_id.as_str()
+        || row
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?
+            != batch.target.object_namespace_id.as_str()
+        || row
+            .try_get::<String, _>("materialization_id")
+            .map_err(storage_error)?
+            != batch.materialization_id.as_str()
+        || u64::try_from(
+            row.try_get::<i64, _>("plan_revision")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 Batch plan revision is negative"))?
+            != batch.plan_revision.get()
+        || u64::try_from(row.try_get::<i64, _>("attempt").map_err(storage_error)?)
+            .map_err(|_| storage_corruption("stored v2 Batch attempt is negative"))?
+            != batch.batch_attempt.get()
+        || row
+            .try_get::<Vec<u8>, _>("manifest_digest")
+            .map_err(storage_error)?
+            != batch.manifest_digest.as_bytes().to_vec()
+        || row
+            .try_get::<Option<String>, _>("source_storage_volume_id")
+            .map_err(storage_error)?
+            != batch
+                .source
+                .storage_volume_id
+                .as_ref()
+                .map(ToString::to_string)
+    {
+        return Err(storage_corruption(
+            "v2 materialization Batch indexed identity disagrees with its payload",
+        ));
+    }
+    Ok(batch)
+}
+
+fn decode_v2_object(row: &SqliteRow) -> CentralResult<MaterializationObject> {
+    let object: MaterializationObject = v2_decode(row, "materialization object")?;
+    object.validate().map_err(protocol_invalid)?;
+    let state = parse_materialization_object_state(
+        row.try_get::<String, _>("state")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    if state != object.state
+        || row
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?
+            != object.object.object_namespace_id.as_str()
+        || row
+            .try_get::<String, _>("staging_key")
+            .map_err(storage_error)?
+            != object.staging_key
+        || row
+            .try_get::<Vec<u8>, _>("object_id")
+            .map_err(storage_error)?
+            != object.object.object_id.as_bytes().to_vec()
+        || u64::try_from(row.try_get::<i64, _>("size").map_err(storage_error)?)
+            .map_err(|_| storage_corruption("stored v2 materialization object size is negative"))?
+            != object.object.size.get()
+        || row
+            .try_get::<String, _>("encoding")
+            .map_err(storage_error)?
+            != object_encoding_name(object.object.encoding)
+        || u64::try_from(
+            row.try_get::<i64, _>("confirmed_offset")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 materialization object offset is negative"))?
+            != object.confirmed_offset.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("plan_revision")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| {
+            storage_corruption("stored v2 materialization object plan revision is negative")
+        })? != object.plan_revision.get()
+        || u64::try_from(row.try_get::<i64, _>("attempt").map_err(storage_error)?).map_err(
+            |_| storage_corruption("stored v2 materialization object attempt is negative"),
+        )? != object.attempt.get()
+    {
+        return Err(storage_corruption(
+            "v2 materialization Object indexed identity disagrees with its payload",
+        ));
+    }
+    Ok(object)
+}
+
+fn decode_v2_materialization_receipt(
+    row: &SqliteRow,
+) -> CentralResult<MaterializationObjectReceipt> {
+    let receipt: MaterializationObjectReceipt = v2_decode(row, "materialization receipt")?;
+    let object = ObjectRef::new(
+        receipt.object_namespace_id.clone(),
+        receipt.object_id,
+        receipt.size.get(),
+        receipt.encoding,
+        0,
+    );
+    receipt
+        .validate_against(&object)
+        .map_err(protocol_invalid)?;
+    if row
+        .try_get::<String, _>("tenant_id")
+        .map_err(storage_error)?
+        != receipt.tenant_id.as_str()
+        || row
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?
+            != receipt.object_namespace_id.as_str()
+        || row
+            .try_get::<String, _>("receipt_id")
+            .map_err(storage_error)?
+            != receipt.receipt_id.as_str()
+        || row
+            .try_get::<String, _>("materialization_id")
+            .map_err(storage_error)?
+            != receipt.materialization_id.as_str()
+        || row
+            .try_get::<String, _>("batch_id")
+            .map_err(storage_error)?
+            != receipt.batch_id.as_str()
+        || u64::try_from(
+            row.try_get::<i64, _>("plan_revision")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| {
+            storage_corruption("stored materialization receipt plan revision is negative")
+        })? != receipt.plan_revision.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("batch_attempt")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| {
+            storage_corruption("stored materialization receipt batch attempt is negative")
+        })? != receipt.batch_attempt.get()
+        || row
+            .try_get::<Vec<u8>, _>("object_id")
+            .map_err(storage_error)?
+            != receipt.object_id.as_bytes().to_vec()
+        || u64::try_from(row.try_get::<i64, _>("size").map_err(storage_error)?)
+            .map_err(|_| storage_corruption("stored materialization receipt size is negative"))?
+            != receipt.size.get()
+        || row
+            .try_get::<String, _>("encoding")
+            .map_err(storage_error)?
+            != object_encoding_name(receipt.encoding)
+        || row
+            .try_get::<Vec<u8>, _>("verified_digest")
+            .map_err(storage_error)?
+            != receipt.verified_digest.as_bytes().to_vec()
+        || row
+            .try_get::<String, _>("target_storage_volume_id")
+            .map_err(storage_error)?
+            != receipt.target_storage_volume_id.as_str()
+        || u64::try_from(
+            row.try_get::<i64, _>("target_placement_generation")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored materialization receipt generation is negative"))?
+            != receipt.target_placement_generation.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("committed_offset")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored materialization receipt offset is negative"))?
+            != receipt.committed_offset.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("verified_at_unix_ms")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored materialization receipt timestamp is negative"))?
+            != receipt.verified_at_unix_ms.get()
+    {
+        return Err(storage_corruption(
+            "materialization receipt indexed identity disagrees with its payload",
+        ));
+    }
+    Ok(receipt)
+}
+
+fn decode_v2_read_lease(row: &SqliteRow) -> CentralResult<ObjectReadLease> {
+    let lease: ObjectReadLease = v2_decode(row, "object read lease")?;
+    lease.validate().map_err(protocol_invalid)?;
+    let state = parse_materialization_lease_state(
+        row.try_get::<String, _>("state")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    if state != lease.state
+        || row
+            .try_get::<String, _>("tenant_id")
+            .map_err(storage_error)?
+            != lease.tenant_id.as_str()
+        || row
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?
+            != lease.object_namespace_id.as_str()
+        || row
+            .try_get::<String, _>("materialization_id")
+            .map_err(storage_error)?
+            != lease.materialization_id.as_str()
+        || row
+            .try_get::<Option<String>, _>("batch_id")
+            .map_err(storage_error)?
+            != Some(lease.batch_id.as_str().to_owned())
+        || row
+            .try_get::<Vec<u8>, _>("object_id")
+            .map_err(storage_error)?
+            != lease.object_id.as_bytes().to_vec()
+        || row
+            .try_get::<String, _>("placement_id")
+            .map_err(storage_error)?
+            != lease.placement_id.as_str()
+        || u64::try_from(
+            row.try_get::<i64, _>("placement_generation")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 read lease generation is negative"))?
+            != lease.placement_generation.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("expires_at_unix_ms")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 read lease expiry is negative"))?
+            != lease.expires_at_unix_ms.get()
+    {
+        return Err(storage_corruption(
+            "v2 read lease indexed identity disagrees with its payload",
+        ));
+    }
+    Ok(lease)
+}
+
+fn decode_v2_staging_lease(row: &SqliteRow) -> CentralResult<StagingLease> {
+    let lease: StagingLease = v2_decode(row, "staging lease")?;
+    lease.validate().map_err(protocol_invalid)?;
+    let state = parse_materialization_lease_state(
+        row.try_get::<String, _>("state")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    if state != lease.state
+        || row
+            .try_get::<String, _>("tenant_id")
+            .map_err(storage_error)?
+            != lease.tenant_id.as_str()
+        || row
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?
+            != lease.object_namespace_id.as_str()
+        || row
+            .try_get::<String, _>("target_storage_volume_id")
+            .map_err(storage_error)?
+            != lease.target_storage_volume_id.as_str()
+        || row
+            .try_get::<String, _>("materialization_id")
+            .map_err(storage_error)?
+            != lease.materialization_id.as_str()
+        || row
+            .try_get::<Vec<u8>, _>("object_id")
+            .map_err(storage_error)?
+            != lease.object_id.as_bytes().to_vec()
+        || row
+            .try_get::<String, _>("staging_key")
+            .map_err(storage_error)?
+            != lease.staging_key
+        || u64::try_from(
+            row.try_get::<i64, _>("target_placement_generation")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 staging lease generation is negative"))?
+            != lease.target_placement_generation.get()
+        || u64::try_from(
+            row.try_get::<i64, _>("expires_at_unix_ms")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored v2 staging lease expiry is negative"))?
+            != lease.expires_at_unix_ms.get()
+    {
+        return Err(storage_corruption(
+            "v2 staging lease indexed identity disagrees with its payload",
+        ));
+    }
+    Ok(lease)
+}
+
+fn coverage_goal_parts(
+    goal: neoengram_domain::protocol::materialization::CoverageGoal,
+) -> CentralResult<(&'static str, u64)> {
+    match goal {
+        neoengram_domain::protocol::materialization::CoverageGoal::Complete => Ok(("complete", 0)),
+        neoengram_domain::protocol::materialization::CoverageGoal::ObjectCount(value) => {
+            Ok(("object_count", value.get()))
+        }
+        neoengram_domain::protocol::materialization::CoverageGoal::ByteCount(value) => {
+            Ok(("byte_count", value.get()))
+        }
     }
 }
 
@@ -693,8 +1851,8 @@ const REPLICATION_COLUMNS: &str = "tenant_id, replication_id, commit_id, target_
     transfer_id, target_placement_set_id, staging_id, object_set_digest, state, request_id, \
     attempt, completed_objects, total_objects, completed_bytes, total_bytes, error_code, \
     error_message, created_at_unix_ms, updated_at_unix_ms, \
-    (SELECT artifact_id FROM replication_artifacts AS a WHERE a.tenant_id = replications.tenant_id \
-      AND a.replication_id = replications.replication_id) AS artifact_id";
+    (SELECT artifact_id FROM legacy_replication_artifacts AS a WHERE a.tenant_id = legacy_replications.tenant_id \
+      AND a.replication_id = legacy_replications.replication_id) AS artifact_id";
 const WORKSPACE_COLUMNS: &str = "tenant_id, workspace_id, request_id, project_id, artifact_id, \
     base_commit_id, target_storage_volume_id, lifecycle, created_at_unix_ms, updated_at_unix_ms";
 
@@ -726,7 +1884,7 @@ async fn refresh_replication_routes_cas(
     expected_updated_at_unix_ms: UnixMillis,
 ) -> CentralResult<u64> {
     let result = sqlx::query(
-        "UPDATE replications SET source_edge_cluster_id = ?, source_gateway_pool_id = ?, \
+        "UPDATE legacy_replications SET source_edge_cluster_id = ?, source_gateway_pool_id = ?, \
          source_session_generation = ?, source_mount_generation = ?, source_route_generation = ?, \
          target_edge_cluster_id = ?, target_gateway_pool_id = ?, target_session_generation = ?, \
          target_mount_generation = ?, target_route_generation = ?, updated_at_unix_ms = ? \
@@ -815,7 +1973,7 @@ async fn cancel_replication_cas(
     expected_updated_at_unix_ms: UnixMillis,
 ) -> CentralResult<u64> {
     let result = sqlx::query(
-        "UPDATE replications SET state = 'cancelled', error_code = ?, error_message = ?, \
+        "UPDATE legacy_replications SET state = 'cancelled', error_code = ?, error_message = ?, \
          updated_at_unix_ms = ? WHERE tenant_id = ? AND replication_id = ? AND attempt = ? \
          AND updated_at_unix_ms = ? \
          AND state NOT IN ('published', 'failed', 'cancelled')",
@@ -881,6 +2039,3655 @@ fn decode_replication_object(row: &SqliteRow) -> CentralResult<ReplicationObject
 
 #[async_trait]
 impl PlacementRepository for SqliteAuthorityStore {
+    async fn insert_object_placement_v2(
+        &self,
+        placement: ObjectPlacementV2,
+    ) -> CentralResult<ObjectPlacementV2> {
+        placement.validate().map_err(protocol_invalid)?;
+        let volume = placement.storage_volume_id.clone().ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "v2 object placements currently require a StorageVolume",
+            )
+            .with_retryable(false)
+        })?;
+        let key = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND object_id = ? \
+               AND storage_volume_id = ? AND placement_generation = ?",
+        )
+        .bind(placement.tenant_id.as_str())
+        .bind(placement.object_namespace_id.as_str())
+        .bind(placement.object_id.as_bytes().as_slice())
+        .bind(volume.as_str())
+        .bind(v2_i64(placement.placement_generation.get(), "placement_generation")?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if let Some(row) = key {
+            let existing = decode_v2_object_placement(&row)?;
+            return if existing == placement {
+                Ok(existing)
+            } else if same_v2_placement_evidence(&existing, &placement) {
+                // A duplicate receipt may choose a different receipt-derived PlacementId. The
+                // durable physical identity is still one namespace/object/Volume/generation;
+                // return the first row so both concurrent callers converge on one Placement.
+                Ok(existing)
+            } else {
+                Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "v2 object placement identity is already bound to different metadata",
+                )
+                .with_retryable(false))
+            };
+        }
+        let payload = encode(&placement)?;
+        let result = sqlx::query(
+            "INSERT INTO object_placements \
+             (tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, \
+              storage_volume_id, placement_generation, state, failure_domain, \
+              created_at_unix_ms, updated_at_unix_ms, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+        )
+        .bind(placement.tenant_id.as_str())
+        .bind(placement.object_namespace_id.as_str())
+        .bind(placement.placement_id.as_str())
+        .bind(placement.object_id.as_bytes().as_slice())
+        .bind(v2_i64(placement.size.get(), "object size")?)
+        .bind(object_encoding_name(placement.encoding))
+        .bind(placement.verified_digest.as_bytes().as_slice())
+        .bind(volume.as_str())
+        .bind(v2_i64(placement.placement_generation.get(), "placement_generation")?)
+        .bind(v2_placement_state_name(placement.state))
+        .bind(&placement.failure_domain)
+        .bind(payload)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(placement),
+            Err(error) if is_unique(&error) => {
+                let row = sqlx::query(
+                    "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements \
+                     WHERE tenant_id = ? AND object_namespace_id = ? AND placement_id = ?",
+                )
+                .bind(placement.tenant_id.as_str())
+                .bind(placement.object_namespace_id.as_str())
+                .bind(placement.placement_id.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage_error)?
+                .or(sqlx::query(
+                    "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements \
+                     WHERE tenant_id = ? AND object_namespace_id = ? AND object_id = ? \
+                       AND storage_volume_id = ? AND placement_generation = ?",
+                )
+                .bind(placement.tenant_id.as_str())
+                .bind(placement.object_namespace_id.as_str())
+                .bind(placement.object_id.as_bytes().as_slice())
+                .bind(volume.as_str())
+                .bind(v2_i64(placement.placement_generation.get(), "placement_generation")?)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage_error)?)
+                .ok_or_else(|| storage_corruption("v2 placement uniqueness conflict has no row"))?;
+                let existing = decode_v2_object_placement(&row)?;
+                if same_v2_placement_evidence(&existing, &placement) {
+                    Ok(existing)
+                } else {
+                    Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "v2 object placement identity is already bound to different metadata",
+                    )
+                    .with_retryable(false))
+                }
+            }
+            Err(error) => Err(storage_error(error)),
+        }
+    }
+
+    async fn object_placements_v2(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        object_id: &ObjectId,
+    ) -> CentralResult<Vec<ObjectPlacementV2>> {
+        let rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain \
+             FROM object_placements \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND object_id = ? \
+             ORDER BY storage_volume_id, placement_generation",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(object_id.as_bytes().as_slice())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        rows.iter().map(decode_v2_object_placement).collect()
+    }
+
+    async fn upsert_volume_commit_coverage(
+        &self,
+        coverage: VolumeCommitCoverage,
+    ) -> CentralResult<VolumeCommitCoverage> {
+        coverage.validate().map_err(protocol_invalid)?;
+        let object_set = self
+            .get_commit_object_set(&coverage.tenant_id, &coverage.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "coverage references an unknown Commit ObjectSet",
+                )
+            })?;
+        coverage
+            .validate_against(&object_set.object_set)
+            .map_err(protocol_invalid)?;
+        let placement_rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain \
+             FROM object_placements \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND storage_volume_id = ? \
+               AND placement_generation = ?",
+        )
+        .bind(coverage.tenant_id.as_str())
+        .bind(coverage.object_namespace_id.as_str())
+        .bind(coverage.storage_volume_id.as_str())
+        .bind(v2_i64(
+            coverage.placement_generation.get(),
+            "placement_generation",
+        )?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let placements = placement_rows
+            .iter()
+            .map(decode_v2_object_placement)
+            .collect::<CentralResult<Vec<_>>>()?;
+        let recomputed = VolumeCommitCoverage::from_placements(
+            coverage.tenant_id.clone(),
+            coverage.object_namespace_id.clone(),
+            coverage.commit_id,
+            coverage.storage_volume_id.clone(),
+            coverage.placement_generation,
+            &object_set.object_set,
+            &placements,
+        )
+        .map_err(protocol_invalid)?;
+        if coverage.object_set_digest != recomputed.object_set_digest
+            || coverage.object_count != recomputed.object_count
+            || coverage.verified_object_count != recomputed.verified_object_count
+            || coverage.total_bytes != recomputed.total_bytes
+            || coverage.verified_bytes != recomputed.verified_bytes
+            || (matches!(
+                coverage.state,
+                neoengram_domain::protocol::materialization::CoverageState::Partial
+                    | neoengram_domain::protocol::materialization::CoverageState::Complete
+            ) && coverage.state != recomputed.state)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "coverage does not match verified object placement evidence",
+            )
+            .with_retryable(false));
+        }
+        let payload = encode(&coverage)?;
+        let result = sqlx::query(
+            "INSERT INTO volume_commit_coverages \
+             (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, \
+              object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, \
+              state, created_at_unix_ms, updated_at_unix_ms, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?) \
+             ON CONFLICT (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation) \
+             DO UPDATE SET object_set_digest = excluded.object_set_digest, \
+                 object_count = excluded.object_count, verified_object_count = excluded.verified_object_count, \
+                 total_bytes = excluded.total_bytes, verified_bytes = excluded.verified_bytes, \
+                 state = excluded.state, updated_at_unix_ms = excluded.updated_at_unix_ms, payload = excluded.payload",
+        )
+        .bind(coverage.tenant_id.as_str())
+        .bind(coverage.object_namespace_id.as_str())
+        .bind(coverage.commit_id.digest().as_bytes().as_slice())
+        .bind(coverage.storage_volume_id.as_str())
+        .bind(v2_i64(coverage.placement_generation.get(), "placement_generation")?)
+        .bind(coverage.object_set_digest.as_bytes().as_slice())
+        .bind(v2_i64(coverage.object_count.get(), "object_count")?)
+        .bind(v2_i64(coverage.verified_object_count.get(), "verified_object_count")?)
+        .bind(v2_i64(coverage.total_bytes.get(), "total_bytes")?)
+        .bind(v2_i64(coverage.verified_bytes.get(), "verified_bytes")?)
+        .bind(coverage_state_name(coverage.state))
+        .bind(payload)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(coverage),
+            Err(error) => Err(storage_error(error)),
+        }
+    }
+
+    async fn volume_commit_coverages(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        commit_id: &ContentDigest,
+    ) -> CentralResult<Vec<VolumeCommitCoverage>> {
+        let rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes \
+             FROM volume_commit_coverages \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND commit_id = ? \
+             ORDER BY storage_volume_id, placement_generation",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(commit_id.as_bytes().as_slice())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        rows.iter().map(decode_v2_coverage).collect()
+    }
+
+    async fn insert_materialization(
+        &self,
+        job: MaterializationJob,
+    ) -> CentralResult<MaterializationJob> {
+        job.validate().map_err(protocol_invalid)?;
+        let (goal, goal_value) = coverage_goal_parts(job.key.coverage_goal)?;
+        if let Some(existing) = self
+            .get_materialization_for_namespace(
+                &job.key.tenant_id,
+                &job.key.object_namespace_id,
+                &job.materialization_id,
+            )
+            .await?
+        {
+            return if existing == job {
+                Ok(existing)
+            } else {
+                Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization ID is already bound to different metadata",
+                )
+                .with_retryable(false))
+            };
+        }
+        if let Some(existing) = self.get_materialization_by_key(&job.key).await? {
+            if existing == job {
+                return Ok(existing);
+            }
+            return Err(CentralError::new(
+                if existing.state.terminal() {
+                    CentralErrorCode::InvalidState
+                } else {
+                    CentralErrorCode::ReplicationAlreadyActive
+                },
+                "materialization idempotency key is already bound to different metadata",
+            )
+            .with_retryable(false));
+        }
+        if self
+            .get_active_materialization_for_target(
+                &job.key.tenant_id,
+                &job.key.object_namespace_id,
+                &job.key.commit_id,
+                &job.key.target_storage_volume_id,
+            )
+            .await?
+            .is_some()
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ReplicationAlreadyActive,
+                "a materialization for this Commit target is already active",
+            )
+            .with_retryable(false));
+        }
+        let object_set_digest = self
+            .get_commit_object_set(&job.key.tenant_id, &job.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?
+            .object_set
+            .object_set_digest;
+        let payload = encode(&job)?;
+        let result = sqlx::query(
+            "INSERT INTO materializations \
+             (tenant_id, materialization_id, object_namespace_id, artifact_id, commit_id, \
+              target_storage_volume_id, coverage_goal, coverage_goal_value, object_set_digest, plan_revision, state, \
+              object_count, total_bytes, verified_object_count, verified_bytes, missing_object_count, missing_bytes, \
+              source_count, deadline_unix_ms, request_id, payload, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(job.key.tenant_id.as_str())
+        .bind(job.materialization_id.as_str())
+        .bind(job.key.object_namespace_id.as_str())
+        .bind(job.artifact_id.as_str())
+        .bind(job.key.commit_id.digest().as_bytes().as_slice())
+        .bind(job.key.target_storage_volume_id.as_str())
+        .bind(goal)
+        .bind(v2_i64(goal_value, "coverage_goal_value")?)
+        .bind(object_set_digest.as_bytes().as_slice())
+        .bind(v2_i64(job.plan_revision.get(), "plan_revision")?)
+        .bind(materialization_job_state_name(job.state))
+        .bind(v2_i64(job.object_count.get(), "object_count")?)
+        .bind(v2_i64(job.total_bytes.get(), "total_bytes")?)
+        .bind(v2_i64(job.verified_object_count.get(), "verified_object_count")?)
+        .bind(v2_i64(job.verified_bytes.get(), "verified_bytes")?)
+        .bind(v2_i64(job.missing_object_count.get(), "missing_object_count")?)
+        .bind(v2_i64(job.missing_bytes.get(), "missing_bytes")?)
+        .bind(v2_i64(job.source_count.get(), "source_count")?)
+        .bind(v2_i64(job.deadline_unix_ms.get(), "deadline_unix_ms")?)
+        .bind(job.materialization_id.as_str())
+        .bind(payload)
+        .bind(v2_i64(job.created_at_unix_ms.get(), "created_at_unix_ms")?)
+        .bind(v2_i64(job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(job),
+            Err(error) if is_unique(&error) => {
+                // The key and materialization ID are both unique.  A conflict on either must
+                // return an exact replay only; silently returning a different Job would allow a
+                // terminal row or another tenant's ID to be mistaken for this request.
+                let existing = sqlx::query(
+                    "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+                     FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? LIMIT 1",
+                )
+                .bind(job.key.tenant_id.as_str())
+                .bind(job.key.object_namespace_id.as_str())
+                .bind(job.materialization_id.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage_error)?
+                .map(|row| decode_v2_materialization(&row))
+                .transpose()?;
+                if let Some(existing) = existing {
+                    return if existing == job {
+                        Ok(existing)
+                    } else {
+                        Err(CentralError::new(
+                            CentralErrorCode::InvalidState,
+                            "materialization ID is already bound to different metadata",
+                        )
+                        .with_retryable(false))
+                    };
+                }
+                let existing = self
+                    .get_materialization_by_key(&job.key)
+                    .await?
+                    .or(self
+                        .get_active_materialization_for_target(
+                            &job.key.tenant_id,
+                            &job.key.object_namespace_id,
+                            &job.key.commit_id,
+                            &job.key.target_storage_volume_id,
+                        )
+                        .await?)
+                    .ok_or_else(|| {
+                        storage_corruption("materialization uniqueness conflict has no row")
+                    })?;
+                if existing == job {
+                    Ok(existing)
+                } else {
+                    Err(CentralError::new(
+                        if existing.state.terminal() {
+                            CentralErrorCode::InvalidState
+                        } else {
+                            CentralErrorCode::ReplicationAlreadyActive
+                        },
+                        "materialization idempotency key is already bound to different metadata",
+                    ))
+                }
+            }
+            Err(error) => Err(storage_error(error)),
+        }
+    }
+
+    async fn insert_materialization_plan(
+        &self,
+        plan: MaterializationPlan,
+    ) -> CentralResult<MaterializationPlanInsertOutcome> {
+        // Serialize aggregate publication with receipt publication. Both paths mutate the
+        // materialization/object/placement protection boundary and must not overwrite one another.
+        let _gate = self.materialization_receipt_gate.lock().await;
+        let MaterializationPlan {
+            job,
+            batches,
+            objects,
+            object_read_leases,
+            staging_leases,
+            coverage,
+        } = plan;
+        job.validate().map_err(protocol_invalid)?;
+        coverage.validate().map_err(protocol_invalid)?;
+        if coverage.tenant_id != job.key.tenant_id
+            || coverage.object_namespace_id != job.key.object_namespace_id
+            || coverage.commit_id != job.key.commit_id
+            || coverage.storage_volume_id != job.key.target_storage_volume_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Coverage identity does not match its Job",
+            )
+            .with_retryable(false));
+        }
+        let object_set = self
+            .get_commit_object_set(&job.key.tenant_id, &job.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?;
+        coverage
+            .validate_against(&object_set.object_set)
+            .map_err(protocol_invalid)?;
+        let expected_objects = object_set
+            .object_set
+            .objects
+            .iter()
+            .map(|object| (object.object_id, object))
+            .collect::<BTreeMap<_, _>>();
+        let mut object_ids = BTreeSet::new();
+        for object in &objects {
+            object.validate().map_err(protocol_invalid)?;
+            let expected = expected_objects
+                .get(&object.object.object_id)
+                .ok_or_else(|| {
+                    CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "materialization Object is not part of the Commit ObjectSet",
+                    )
+                    .with_retryable(false)
+                })?;
+            if object.materialization_id != job.materialization_id
+                || object.plan_revision != job.plan_revision
+                || object.object.object_namespace_id != job.key.object_namespace_id
+                || object.object.object_id != expected.object_id
+                || object.object.size != expected.size
+                || object.object.encoding != expected.encoding
+                || object.object.ordinal != expected.ordinal
+                || !object_ids.insert(object.object.object_id)
+            {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization Object does not match its Job fence or is duplicated",
+                )
+                .with_retryable(false));
+            }
+        }
+        if object_ids.len() != expected_objects.len() {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization plan must include every Commit Object",
+            )
+            .with_retryable(false));
+        }
+        let mut batch_ids = BTreeSet::new();
+        let mut assigned_objects = BTreeMap::new();
+        for batch in &batches {
+            batch.validate().map_err(protocol_invalid)?;
+            if batch.materialization_id != job.materialization_id
+                || batch.plan_revision != job.plan_revision
+                || batch.target.tenant_id != job.key.tenant_id
+                || batch.target.object_namespace_id != job.key.object_namespace_id
+                || batch.target.storage_volume_id != job.key.target_storage_volume_id
+                || !batch_ids.insert(batch.batch_id.clone())
+            {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization Batch does not match its Job fence or is duplicated",
+                )
+                .with_retryable(false));
+            }
+            for object_id in &batch.object_ids {
+                if !object_ids.contains(object_id)
+                    || assigned_objects
+                        .insert(*object_id, batch.batch_id.clone())
+                        .is_some()
+                {
+                    return Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "materialization Batch object list is invalid or overlaps another Batch",
+                    )
+                    .with_retryable(false));
+                }
+            }
+        }
+        for object in &objects {
+            if let Some(batch_id) = &object.current_batch_id {
+                if assigned_objects.get(&object.object.object_id) != Some(batch_id) {
+                    return Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "materialization Object current Batch does not match its plan",
+                    )
+                    .with_retryable(false));
+                }
+            }
+        }
+        let mut read_lease_ids = BTreeSet::new();
+        for lease in &object_read_leases {
+            lease.validate_for_acquisition().map_err(protocol_invalid)?;
+            if lease.materialization_id != job.materialization_id
+                || lease.plan_revision != job.plan_revision
+                || lease.tenant_id != job.key.tenant_id
+                || lease.object_namespace_id != job.key.object_namespace_id
+                || !batch_ids.contains(&lease.batch_id)
+                || !object_ids.contains(&lease.object_id)
+                || !read_lease_ids.insert(lease.lease_id.clone())
+            {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "object read lease does not match its materialization plan",
+                )
+                .with_retryable(false));
+            }
+            let batch = batches
+                .iter()
+                .find(|batch| batch.batch_id == lease.batch_id)
+                .expect("batch ID was checked above");
+            let Some(object) = objects.iter().find(|object| {
+                object.object.object_id == lease.object_id
+                    && object.current_batch_id.as_ref() == Some(&lease.batch_id)
+            }) else {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "object read lease is not assigned to its Batch",
+                )
+                .with_retryable(false));
+            };
+            let source_selected = object.primary_source.as_ref() == Some(&lease.placement_id)
+                || object.fallback_sources.contains(&lease.placement_id);
+            if !batch.object_ids.contains(&lease.object_id) || !source_selected {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "object read lease placement is not selected for its object task",
+                )
+                .with_retryable(false));
+            }
+        }
+        let mut staging_lease_ids = BTreeSet::new();
+        for lease in &staging_leases {
+            lease.validate_for_acquisition().map_err(protocol_invalid)?;
+            if lease.materialization_id != job.materialization_id
+                || lease.plan_revision != job.plan_revision
+                || lease.tenant_id != job.key.tenant_id
+                || lease.object_namespace_id != job.key.object_namespace_id
+                || lease.target_storage_volume_id != job.key.target_storage_volume_id
+                || !object_ids.contains(&lease.object_id)
+                || !staging_lease_ids.insert(lease.lease_id.clone())
+            {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "staging lease does not match its materialization plan",
+                )
+                .with_retryable(false));
+            }
+            let object = objects
+                .iter()
+                .find(|object| object.object.object_id == lease.object_id)
+                .expect("object ID was checked above");
+            lease
+                .validate_against_object(object)
+                .map_err(protocol_invalid)?;
+        }
+        for object in &objects {
+            if object.complete() {
+                continue;
+            }
+            let Some(batch_id) = &object.current_batch_id else {
+                continue;
+            };
+            if !object_read_leases.iter().any(|lease| {
+                lease.batch_id == *batch_id && lease.object_id == object.object.object_id
+            }) || !staging_leases
+                .iter()
+                .any(|lease| lease.object_id == object.object.object_id)
+            {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "every assigned materialization Object requires source and staging leases",
+                )
+                .with_retryable(false));
+            }
+        }
+
+        let (goal, goal_value) = coverage_goal_parts(job.key.coverage_goal)?;
+        let object_set_digest = object_set.object_set.object_set_digest;
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let lease_volumes = materialization_read_lease_volumes(
+            &mut transaction,
+            &batches,
+            &objects,
+            &object_read_leases,
+        )
+        .await?;
+
+        // The transaction is the publication boundary. Existing exact rows are accepted so a
+        // retried request can repair an interrupted pre-v2 write without creating duplicates.
+        let existing_job = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+             FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? LIMIT 1",
+        )
+        .bind(job.key.tenant_id.as_str())
+        .bind(job.key.object_namespace_id.as_str())
+        .bind(job.materialization_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .map(|row| decode_v2_materialization(&row))
+        .transpose()?;
+        if let Some(existing) = &existing_job {
+            if existing != &job {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization ID is already bound to different metadata",
+                )
+                .with_retryable(false));
+            }
+        } else {
+            let existing_key = sqlx::query(
+                "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+                 FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND commit_id = ? \
+                   AND target_storage_volume_id = ? AND coverage_goal = ? AND coverage_goal_value = ? LIMIT 1",
+            )
+            .bind(job.key.tenant_id.as_str())
+            .bind(job.key.object_namespace_id.as_str())
+            .bind(job.key.commit_id.digest().as_bytes().as_slice())
+            .bind(job.key.target_storage_volume_id.as_str())
+            .bind(goal)
+            .bind(v2_i64(goal_value, "coverage_goal_value")?)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(|row| decode_v2_materialization(&row))
+            .transpose()?;
+            if let Some(existing) = existing_key {
+                return Err(CentralError::new(
+                    if existing.state.terminal() {
+                        CentralErrorCode::InvalidState
+                    } else {
+                        CentralErrorCode::ReplicationAlreadyActive
+                    },
+                    "materialization idempotency key is already bound to different metadata",
+                )
+                .with_retryable(false));
+            }
+            // The partial target index deliberately ignores coverage thresholds: a target may
+            // have only one active Job for this Commit.  Check the broader identity here so a
+            // concurrent insert with a different threshold is reported as a stable conflict
+            // instead of leaking a raw SQLite uniqueness error.
+            let active_target = sqlx::query(
+                "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+                 FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND commit_id = ? \
+                   AND target_storage_volume_id = ? AND state IN \
+                   ('queued', 'planning', 'waiting_for_sources', 'materializing', 'verifying', 'stalled') \
+                 ORDER BY updated_at_unix_ms DESC, materialization_id DESC LIMIT 1",
+            )
+            .bind(job.key.tenant_id.as_str())
+            .bind(job.key.object_namespace_id.as_str())
+            .bind(job.key.commit_id.digest().as_bytes().as_slice())
+            .bind(job.key.target_storage_volume_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(|row| decode_v2_materialization(&row))
+            .transpose()?;
+            if active_target.is_some() {
+                return Err(CentralError::new(
+                    CentralErrorCode::ReplicationAlreadyActive,
+                    "a materialization for this Commit target is already active",
+                )
+                .with_retryable(false));
+            }
+            let payload = encode(&job)?;
+            sqlx::query(
+                "INSERT INTO materializations \
+                 (tenant_id, materialization_id, object_namespace_id, artifact_id, commit_id, \
+                  target_storage_volume_id, coverage_goal, coverage_goal_value, object_set_digest, plan_revision, state, \
+                  object_count, total_bytes, verified_object_count, verified_bytes, missing_object_count, missing_bytes, \
+                  source_count, deadline_unix_ms, request_id, payload, created_at_unix_ms, updated_at_unix_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(job.key.tenant_id.as_str())
+            .bind(job.materialization_id.as_str())
+            .bind(job.key.object_namespace_id.as_str())
+            .bind(job.artifact_id.as_str())
+            .bind(job.key.commit_id.digest().as_bytes().as_slice())
+            .bind(job.key.target_storage_volume_id.as_str())
+            .bind(goal)
+            .bind(v2_i64(goal_value, "coverage_goal_value")?)
+            .bind(object_set_digest.as_bytes().as_slice())
+            .bind(v2_i64(job.plan_revision.get(), "plan_revision")?)
+            .bind(materialization_job_state_name(job.state))
+            .bind(v2_i64(job.object_count.get(), "object_count")?)
+            .bind(v2_i64(job.total_bytes.get(), "total_bytes")?)
+            .bind(v2_i64(job.verified_object_count.get(), "verified_object_count")?)
+            .bind(v2_i64(job.verified_bytes.get(), "verified_bytes")?)
+            .bind(v2_i64(job.missing_object_count.get(), "missing_object_count")?)
+            .bind(v2_i64(job.missing_bytes.get(), "missing_bytes")?)
+            .bind(v2_i64(job.source_count.get(), "source_count")?)
+            .bind(v2_i64(job.deadline_unix_ms.get(), "deadline_unix_ms")?)
+            .bind(job.materialization_id.as_str())
+            .bind(payload)
+            .bind(v2_i64(job.created_at_unix_ms.get(), "created_at_unix_ms")?)
+            .bind(v2_i64(job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                if is_unique(&error) {
+                    CentralError::new(
+                        CentralErrorCode::ReplicationAlreadyActive,
+                        "a materialization for this Commit target is already active",
+                    )
+                    .with_retryable(false)
+                } else {
+                    storage_error(error)
+                }
+            })?;
+        }
+
+        for batch in &batches {
+            let existing = sqlx::query(
+                "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id \
+                 FROM materialization_batches WHERE tenant_id = ? AND object_namespace_id = ? AND batch_id = ? LIMIT 1",
+            )
+            .bind(job.key.tenant_id.as_str())
+            .bind(job.key.object_namespace_id.as_str())
+            .bind(batch.batch_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(|row| decode_v2_batch(&row))
+            .transpose()?;
+            if let Some(existing) = existing {
+                if existing != *batch {
+                    return Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "materialization Batch ID is already bound to different metadata",
+                    )
+                    .with_retryable(false));
+                }
+                continue;
+            }
+            let payload = encode(batch)?;
+            sqlx::query(
+                "INSERT INTO materialization_batches \
+                 (tenant_id, object_namespace_id, batch_id, materialization_id, plan_revision, attempt, source_storage_volume_id, \
+                  target_storage_volume_id, manifest_digest, state, payload, created_at_unix_ms, updated_at_unix_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+            )
+            .bind(job.key.tenant_id.as_str())
+            .bind(job.key.object_namespace_id.as_str())
+            .bind(batch.batch_id.as_str())
+            .bind(batch.materialization_id.as_str())
+            .bind(v2_i64(batch.plan_revision.get(), "plan_revision")?)
+            .bind(v2_i64(batch.batch_attempt.get(), "batch_attempt")?)
+            .bind(batch.source.storage_volume_id.as_ref().map(StorageVolumeId::as_str))
+            .bind(batch.target.storage_volume_id.as_str())
+            .bind(batch.manifest_digest.as_bytes().as_slice())
+            .bind(materialization_batch_state_name(batch.state))
+            .bind(payload)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        for object in &objects {
+            let existing = sqlx::query(
+                "SELECT payload, state, object_namespace_id, staging_key, object_id, size, encoding, confirmed_offset, plan_revision, attempt \
+                 FROM materialization_objects WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? LIMIT 1",
+            )
+            .bind(job.key.tenant_id.as_str())
+            .bind(job.materialization_id.as_str())
+            .bind(job.key.object_namespace_id.as_str())
+            .bind(object.object.object_id.as_bytes().as_slice())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(|row| decode_v2_object(&row))
+            .transpose()?;
+            if let Some(existing) = existing {
+                if existing != *object {
+                    return Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "materialization Object ID is already bound to different metadata",
+                    )
+                    .with_retryable(false));
+                }
+                continue;
+            }
+            let payload = encode(object)?;
+            sqlx::query(
+                "INSERT INTO materialization_objects \
+                 (tenant_id, materialization_id, object_namespace_id, object_id, size, encoding, \
+                  staging_key, confirmed_offset, state, current_batch_id, plan_revision, attempt, \
+                  payload, created_at_unix_ms, updated_at_unix_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+            )
+            .bind(job.key.tenant_id.as_str())
+            .bind(object.materialization_id.as_str())
+            .bind(object.object.object_namespace_id.as_str())
+            .bind(object.object.object_id.as_bytes().as_slice())
+            .bind(v2_i64(object.object.size.get(), "object size")?)
+            .bind(object_encoding_name(object.object.encoding))
+            .bind(&object.staging_key)
+            .bind(v2_i64(object.confirmed_offset.get(), "confirmed_offset")?)
+            .bind(materialization_object_state_name(object.state))
+            .bind(object.current_batch_id.as_ref().map(|id| id.as_str()))
+            .bind(v2_i64(object.plan_revision.get(), "plan_revision")?)
+            .bind(v2_i64(object.attempt.get(), "attempt")?)
+            .bind(payload)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        for lease in &object_read_leases {
+            let existing = sqlx::query(
+                "SELECT payload, state, tenant_id, object_namespace_id, materialization_id, batch_id, object_id, placement_id, placement_generation, expires_at_unix_ms \
+                 FROM object_read_leases WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ? LIMIT 1",
+            )
+            .bind(job.key.tenant_id.as_str())
+            .bind(job.key.object_namespace_id.as_str())
+            .bind(lease.lease_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(|row| decode_v2_read_lease(&row))
+            .transpose()?;
+            if let Some(existing) = existing {
+                if existing != *lease {
+                    return Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "object read lease ID is already in use",
+                    )
+                    .with_retryable(false));
+                }
+                continue;
+            }
+            let storage_volume_id = lease_volumes
+                .get(lease.lease_id.as_str())
+                .ok_or_else(|| storage_corruption("object read lease source volume is missing"))?;
+            let payload = encode(lease)?;
+            sqlx::query(
+                "INSERT INTO object_read_leases \
+                 (tenant_id, lease_id, materialization_id, batch_id, object_namespace_id, object_id, \
+                  placement_id, storage_volume_id, placement_generation, expires_at_unix_ms, state, payload) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(lease.tenant_id.as_str())
+            .bind(lease.lease_id.as_str())
+            .bind(lease.materialization_id.as_str())
+            .bind(lease.batch_id.as_str())
+            .bind(lease.object_namespace_id.as_str())
+            .bind(lease.object_id.as_bytes().as_slice())
+            .bind(lease.placement_id.as_str())
+            .bind(storage_volume_id.as_str())
+            .bind(v2_i64(lease.placement_generation.get(), "placement_generation")?)
+            .bind(v2_i64(lease.expires_at_unix_ms.get(), "expires_at_unix_ms")?)
+            .bind(materialization_lease_state_name(lease.state))
+            .bind(payload)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        for lease in &staging_leases {
+            let existing = sqlx::query(
+                "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, object_id, staging_key, target_placement_generation, expires_at_unix_ms \
+                 FROM staging_leases WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ? LIMIT 1",
+            )
+            .bind(job.key.tenant_id.as_str())
+            .bind(job.key.object_namespace_id.as_str())
+            .bind(lease.lease_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(|row| decode_v2_staging_lease(&row))
+            .transpose()?;
+            if let Some(existing) = existing {
+                if existing != *lease {
+                    return Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "staging lease ID is already in use",
+                    )
+                    .with_retryable(false));
+                }
+                continue;
+            }
+            let payload = encode(lease)?;
+            sqlx::query(
+                "INSERT INTO staging_leases \
+                 (tenant_id, lease_id, materialization_id, object_namespace_id, object_id, target_storage_volume_id, \
+                  target_placement_generation, staging_key, expires_at_unix_ms, state, payload) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(lease.tenant_id.as_str())
+            .bind(lease.lease_id.as_str())
+            .bind(lease.materialization_id.as_str())
+            .bind(lease.object_namespace_id.as_str())
+            .bind(lease.object_id.as_bytes().as_slice())
+            .bind(lease.target_storage_volume_id.as_str())
+            .bind(v2_i64(lease.target_placement_generation.get(), "target_placement_generation")?)
+            .bind(&lease.staging_key)
+            .bind(v2_i64(lease.expires_at_unix_ms.get(), "expires_at_unix_ms")?)
+            .bind(materialization_lease_state_name(lease.state))
+            .bind(payload)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+
+        // Coverage remains a derived summary, but it is published in this same transaction so a
+        // reader can never observe a new Job and stale coverage (or vice versa).
+        let placement_rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain \
+             FROM object_placements WHERE tenant_id = ? AND object_namespace_id = ? AND storage_volume_id = ? AND placement_generation = ?",
+        )
+        .bind(coverage.tenant_id.as_str())
+        .bind(coverage.object_namespace_id.as_str())
+        .bind(coverage.storage_volume_id.as_str())
+        .bind(v2_i64(coverage.placement_generation.get(), "placement_generation")?)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let placements = placement_rows
+            .iter()
+            .map(decode_v2_object_placement)
+            .collect::<CentralResult<Vec<_>>>()?;
+        let recomputed = VolumeCommitCoverage::from_placements(
+            coverage.tenant_id.clone(),
+            coverage.object_namespace_id.clone(),
+            coverage.commit_id,
+            coverage.storage_volume_id.clone(),
+            coverage.placement_generation,
+            &object_set.object_set,
+            &placements,
+        )
+        .map_err(protocol_invalid)?;
+        if coverage.object_set_digest != recomputed.object_set_digest
+            || coverage.object_count != recomputed.object_count
+            || coverage.verified_object_count != recomputed.verified_object_count
+            || coverage.total_bytes != recomputed.total_bytes
+            || coverage.verified_bytes != recomputed.verified_bytes
+            || (matches!(
+                coverage.state,
+                neoengram_domain::protocol::materialization::CoverageState::Partial
+                    | neoengram_domain::protocol::materialization::CoverageState::Complete
+            ) && coverage.state != recomputed.state)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Coverage does not match Placement evidence",
+            )
+            .with_retryable(false));
+        }
+        let payload = encode(&coverage)?;
+        sqlx::query(
+            "INSERT INTO volume_commit_coverages \
+             (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, \
+              object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, \
+              state, created_at_unix_ms, updated_at_unix_ms, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?) \
+             ON CONFLICT (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation) \
+             DO UPDATE SET object_set_digest = excluded.object_set_digest, object_count = excluded.object_count, \
+                 verified_object_count = excluded.verified_object_count, total_bytes = excluded.total_bytes, \
+                 verified_bytes = excluded.verified_bytes, state = excluded.state, payload = excluded.payload",
+        )
+        .bind(coverage.tenant_id.as_str())
+        .bind(coverage.object_namespace_id.as_str())
+        .bind(coverage.commit_id.digest().as_bytes().as_slice())
+        .bind(coverage.storage_volume_id.as_str())
+        .bind(v2_i64(coverage.placement_generation.get(), "placement_generation")?)
+        .bind(coverage.object_set_digest.as_bytes().as_slice())
+        .bind(v2_i64(coverage.object_count.get(), "object_count")?)
+        .bind(v2_i64(coverage.verified_object_count.get(), "verified_object_count")?)
+        .bind(v2_i64(coverage.total_bytes.get(), "total_bytes")?)
+        .bind(v2_i64(coverage.verified_bytes.get(), "verified_bytes")?)
+        .bind(coverage_state_name(coverage.state))
+        .bind(payload)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(if existing_job.is_some() {
+            MaterializationPlanInsertOutcome::Existing(job)
+        } else {
+            MaterializationPlanInsertOutcome::Inserted(job)
+        })
+    }
+
+    async fn replace_materialization_plan(
+        &self,
+        request: MaterializationPlanReplacement,
+    ) -> CentralResult<MaterializationPlanInsertOutcome> {
+        // Serialize replanning with receipt publication. Replanning retires leases and replaces
+        // the active Batch fence, so it must share the same aggregate publication boundary.
+        let _gate = self.materialization_receipt_gate.lock().await;
+        let expected_revision = request.expected_plan_revision;
+        let plan = request.plan;
+        let next_revision = expected_revision
+            .get()
+            .checked_add(1)
+            .map(Generation::new)
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization plan revision is exhausted",
+                )
+            })?;
+        plan.job.validate().map_err(protocol_invalid)?;
+        plan.coverage.validate().map_err(protocol_invalid)?;
+        if plan.job.plan_revision != next_revision {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "replacement materialization plan must advance exactly one revision",
+            )
+            .with_retryable(false));
+        }
+        if plan.coverage.tenant_id != plan.job.key.tenant_id
+            || plan.coverage.object_namespace_id != plan.job.key.object_namespace_id
+            || plan.coverage.commit_id != plan.job.key.commit_id
+            || plan.coverage.storage_volume_id != plan.job.key.target_storage_volume_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "replacement Coverage identity does not match its Job",
+            )
+            .with_retryable(false));
+        }
+        let object_set = self
+            .get_commit_object_set(&plan.job.key.tenant_id, &plan.job.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?;
+        plan.coverage
+            .validate_against(&object_set.object_set)
+            .map_err(protocol_invalid)?;
+        validate_materialization_plan_shape(&plan, &object_set.object_set)?;
+
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let lease_volumes = materialization_read_lease_volumes(
+            &mut transaction,
+            &plan.batches,
+            &plan.objects,
+            &plan.object_read_leases,
+        )
+        .await?;
+        let current = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+             FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? LIMIT 1",
+        )
+        .bind(plan.job.key.tenant_id.as_str())
+        .bind(plan.job.key.object_namespace_id.as_str())
+        .bind(plan.job.materialization_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .map(|row| decode_v2_materialization(&row))
+        .transpose()?;
+        let current = current.ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "materialization not found",
+            )
+        })?;
+        if current.plan_revision != expected_revision {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision changed",
+            ));
+        }
+        if current.key != plan.job.key || current.materialization_id != plan.job.materialization_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "replacement materialization identity is invalid",
+            )
+            .with_retryable(false));
+        }
+        if !materialization_state_transition_allowed(current.state, plan.job.state) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "replacement materialization state transition is invalid",
+            )
+            .with_retryable(false));
+        }
+
+        // Read and validate every existing child before changing the parent row. This makes
+        // malformed or stale replacements fail without even advancing the Job CAS fence.
+        let old_object_rows = sqlx::query(
+            "SELECT payload, state, object_namespace_id, staging_key, object_id, size, encoding, confirmed_offset, plan_revision, attempt \
+             FROM materialization_objects WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? \
+             ORDER BY object_id",
+        )
+        .bind(plan.job.key.tenant_id.as_str())
+        .bind(plan.job.materialization_id.as_str())
+        .bind(plan.job.key.object_namespace_id.as_str())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let old_objects = old_object_rows
+            .iter()
+            .map(decode_v2_object)
+            .collect::<CentralResult<Vec<_>>>()?;
+        let old_by_id = old_objects
+            .iter()
+            .map(|object| (object.object.object_id, object))
+            .collect::<BTreeMap<_, _>>();
+        for object in &plan.objects {
+            let previous = old_by_id.get(&object.object.object_id).ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization replacement is missing an existing Object row",
+                )
+            })?;
+            if previous.plan_revision != expected_revision {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Object belongs to a different plan revision",
+                ));
+            }
+            if previous.object != object.object || previous.staging_key != object.staging_key {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization Object identity or staging key cannot change",
+                )
+                .with_retryable(false));
+            }
+            if object.confirmed_offset < previous.confirmed_offset {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Object confirmed offset cannot move backwards",
+                ));
+            }
+            if previous.complete() && !object.complete() {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "completed materialization Object cannot regress",
+                )
+                .with_retryable(false));
+            }
+            let expected_attempt = previous.attempt.get().checked_add(1).ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Object attempt is exhausted",
+                )
+            })?;
+            if object.attempt.get() != expected_attempt {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Object attempt must advance exactly one step",
+                ));
+            }
+        }
+
+        let payload = encode(&plan.job)?;
+        let result = sqlx::query(
+            "UPDATE materializations SET plan_revision = ?, state = ?, object_set_digest = ?, \
+                 object_count = ?, total_bytes = ?, verified_object_count = ?, verified_bytes = ?, \
+                 missing_object_count = ?, missing_bytes = ?, source_count = ?, deadline_unix_ms = ?, \
+                 payload = ?, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? AND plan_revision = ?",
+        )
+        .bind(v2_i64(plan.job.plan_revision.get(), "plan_revision")?)
+        .bind(materialization_job_state_name(plan.job.state))
+        .bind(object_set.object_set.object_set_digest.as_bytes().as_slice())
+        .bind(v2_i64(plan.job.object_count.get(), "object_count")?)
+        .bind(v2_i64(plan.job.total_bytes.get(), "total_bytes")?)
+        .bind(v2_i64(plan.job.verified_object_count.get(), "verified_object_count")?)
+        .bind(v2_i64(plan.job.verified_bytes.get(), "verified_bytes")?)
+        .bind(v2_i64(plan.job.missing_object_count.get(), "missing_object_count")?)
+        .bind(v2_i64(plan.job.missing_bytes.get(), "missing_bytes")?)
+        .bind(v2_i64(plan.job.source_count.get(), "source_count")?)
+        .bind(v2_i64(plan.job.deadline_unix_ms.get(), "deadline_unix_ms")?)
+        .bind(payload)
+        .bind(v2_i64(plan.job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
+        .bind(plan.job.key.tenant_id.as_str())
+        .bind(plan.job.key.object_namespace_id.as_str())
+        .bind(plan.job.materialization_id.as_str())
+        .bind(v2_i64(expected_revision.get(), "expected_plan_revision")?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if result.rows_affected() != 1 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision changed",
+            ));
+        }
+
+        // Decode active batches and leases before retirement so their payload state remains in
+        // lockstep with the indexed state column. Every mutation below is part of this transaction.
+        let old_batch_rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id \
+             FROM materialization_batches WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? \
+             ORDER BY batch_id",
+        )
+        .bind(plan.job.key.tenant_id.as_str())
+        .bind(plan.job.key.object_namespace_id.as_str())
+        .bind(plan.job.materialization_id.as_str())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let old_batches = old_batch_rows
+            .iter()
+            .map(decode_v2_batch)
+            .collect::<CentralResult<Vec<_>>>()?;
+        let old_read_rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, materialization_id, batch_id, object_id, placement_id, placement_generation, expires_at_unix_ms \
+             FROM object_read_leases WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? \
+             ORDER BY lease_id",
+        )
+        .bind(plan.job.key.tenant_id.as_str())
+        .bind(plan.job.key.object_namespace_id.as_str())
+        .bind(plan.job.materialization_id.as_str())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let old_read_leases = old_read_rows
+            .iter()
+            .map(decode_v2_read_lease)
+            .collect::<CentralResult<Vec<_>>>()?;
+        let old_staging_rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, object_id, staging_key, target_placement_generation, expires_at_unix_ms \
+             FROM staging_leases WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? \
+             ORDER BY lease_id",
+        )
+        .bind(plan.job.key.tenant_id.as_str())
+        .bind(plan.job.key.object_namespace_id.as_str())
+        .bind(plan.job.materialization_id.as_str())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let old_staging_leases = old_staging_rows
+            .iter()
+            .map(decode_v2_staging_lease)
+            .collect::<CentralResult<Vec<_>>>()?;
+
+        for old in old_batches.iter().filter(|batch| {
+            !matches!(
+                batch.state,
+                MaterializationBatchState::Succeeded | MaterializationBatchState::Failed
+            )
+        }) {
+            let mut retired = old.clone();
+            retired.state = MaterializationBatchState::Failed;
+            let payload = encode(&retired)?;
+            let result = sqlx::query(
+                "UPDATE materialization_batches SET state = ?, payload = ? \
+                 WHERE tenant_id = ? AND object_namespace_id = ? AND batch_id = ? \
+                   AND plan_revision = ? AND attempt = ? AND state = ?",
+            )
+            .bind(materialization_batch_state_name(retired.state))
+            .bind(payload)
+            .bind(old.target.tenant_id.as_str())
+            .bind(old.target.object_namespace_id.as_str())
+            .bind(old.batch_id.as_str())
+            .bind(v2_i64(old.plan_revision.get(), "plan_revision")?)
+            .bind(v2_i64(old.batch_attempt.get(), "attempt")?)
+            .bind(materialization_batch_state_name(old.state))
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if result.rows_affected() != 1 {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Batch changed during plan replacement",
+                ));
+            }
+        }
+        for old in old_read_leases
+            .iter()
+            .filter(|lease| lease.state == MaterializationLeaseState::Active)
+        {
+            let mut retired = old.clone();
+            retired.state = MaterializationLeaseState::Released;
+            let payload = encode(&retired)?;
+            let result = sqlx::query(
+                "UPDATE object_read_leases SET state = ?, payload = ? \
+                 WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ? AND state = ?",
+            )
+            .bind(materialization_lease_state_name(retired.state))
+            .bind(payload)
+            .bind(old.tenant_id.as_str())
+            .bind(old.object_namespace_id.as_str())
+            .bind(old.lease_id.as_str())
+            .bind(materialization_lease_state_name(old.state))
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if result.rows_affected() != 1 {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "object read lease changed during plan replacement",
+                ));
+            }
+        }
+        for old in old_staging_leases
+            .iter()
+            .filter(|lease| lease.state == MaterializationLeaseState::Active)
+        {
+            let mut retired = old.clone();
+            retired.state = MaterializationLeaseState::Released;
+            let payload = encode(&retired)?;
+            let result = sqlx::query(
+                "UPDATE staging_leases SET state = ?, payload = ? \
+                 WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ? AND state = ?",
+            )
+            .bind(materialization_lease_state_name(retired.state))
+            .bind(payload)
+            .bind(old.tenant_id.as_str())
+            .bind(old.object_namespace_id.as_str())
+            .bind(old.lease_id.as_str())
+            .bind(materialization_lease_state_name(old.state))
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if result.rows_affected() != 1 {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "staging lease changed during plan replacement",
+                ));
+            }
+        }
+
+        // Child identities include plan revision/attempt in the payload. New batches and leases
+        // are inserted, while stable object rows are advanced with a fenced update.
+        for batch in &plan.batches {
+            let payload = encode(batch)?;
+            sqlx::query(
+                "INSERT INTO materialization_batches (tenant_id, object_namespace_id, batch_id, materialization_id, plan_revision, attempt, source_storage_volume_id, target_storage_volume_id, manifest_digest, state, payload, created_at_unix_ms, updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+            )
+            .bind(plan.job.key.tenant_id.as_str())
+            .bind(plan.job.key.object_namespace_id.as_str())
+            .bind(batch.batch_id.as_str())
+            .bind(batch.materialization_id.as_str())
+            .bind(v2_i64(batch.plan_revision.get(), "plan_revision")?)
+            .bind(v2_i64(batch.batch_attempt.get(), "batch_attempt")?)
+            .bind(batch.source.storage_volume_id.as_ref().map(StorageVolumeId::as_str))
+            .bind(batch.target.storage_volume_id.as_str())
+            .bind(batch.manifest_digest.as_bytes().as_slice())
+            .bind(materialization_batch_state_name(batch.state))
+            .bind(payload)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        for object in &plan.objects {
+            let payload = encode(object)?;
+            let previous = old_by_id
+                .get(&object.object.object_id)
+                .expect("object rows were validated above");
+            let result = sqlx::query(
+                "UPDATE materialization_objects SET size = ?, encoding = ?, staging_key = ?, \
+                 confirmed_offset = ?, state = ?, current_batch_id = ?, plan_revision = ?, attempt = ?, payload = ? \
+                 WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? \
+                   AND plan_revision = ? AND attempt = ?",
+            )
+            .bind(v2_i64(object.object.size.get(), "object size")?)
+            .bind(object_encoding_name(object.object.encoding))
+            .bind(&object.staging_key)
+            .bind(v2_i64(object.confirmed_offset.get(), "confirmed_offset")?)
+            .bind(materialization_object_state_name(object.state))
+            .bind(object.current_batch_id.as_ref().map(|id| id.as_str()))
+            .bind(v2_i64(object.plan_revision.get(), "plan_revision")?)
+            .bind(v2_i64(object.attempt.get(), "attempt")?)
+            .bind(payload)
+            .bind(plan.job.key.tenant_id.as_str())
+            .bind(object.materialization_id.as_str())
+            .bind(object.object.object_namespace_id.as_str())
+            .bind(object.object.object_id.as_bytes().as_slice())
+            .bind(v2_i64(previous.plan_revision.get(), "expected_plan_revision")?)
+            .bind(v2_i64(previous.attempt.get(), "expected_attempt")?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if result.rows_affected() != 1 {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Object changed during plan replacement",
+                ));
+            }
+        }
+        for lease in &plan.object_read_leases {
+            let payload = encode(lease)?;
+            let storage_volume_id =
+                lease_volumes.get(lease.lease_id.as_str()).ok_or_else(|| {
+                    CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "object read lease source must reference a StorageVolume",
+                    )
+                    .with_retryable(false)
+                })?;
+            sqlx::query(
+                "INSERT INTO object_read_leases (tenant_id, lease_id, materialization_id, batch_id, object_namespace_id, object_id, placement_id, storage_volume_id, placement_generation, expires_at_unix_ms, state, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(lease.tenant_id.as_str())
+            .bind(lease.lease_id.as_str())
+            .bind(lease.materialization_id.as_str())
+            .bind(lease.batch_id.as_str())
+            .bind(lease.object_namespace_id.as_str())
+            .bind(lease.object_id.as_bytes().as_slice())
+            .bind(lease.placement_id.as_str())
+            .bind(storage_volume_id.as_str())
+            .bind(v2_i64(lease.placement_generation.get(), "placement_generation")?)
+            .bind(v2_i64(lease.expires_at_unix_ms.get(), "expires_at_unix_ms")?)
+            .bind(materialization_lease_state_name(lease.state))
+            .bind(payload)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        for lease in &plan.staging_leases {
+            let payload = encode(lease)?;
+            sqlx::query(
+                "INSERT INTO staging_leases (tenant_id, lease_id, materialization_id, object_namespace_id, object_id, target_storage_volume_id, target_placement_generation, staging_key, expires_at_unix_ms, state, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(lease.tenant_id.as_str())
+            .bind(lease.lease_id.as_str())
+            .bind(lease.materialization_id.as_str())
+            .bind(lease.object_namespace_id.as_str())
+            .bind(lease.object_id.as_bytes().as_slice())
+            .bind(lease.target_storage_volume_id.as_str())
+            .bind(v2_i64(lease.target_placement_generation.get(), "target_placement_generation")?)
+            .bind(&lease.staging_key)
+            .bind(v2_i64(lease.expires_at_unix_ms.get(), "expires_at_unix_ms")?)
+            .bind(materialization_lease_state_name(lease.state))
+            .bind(payload)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        let placement_rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements WHERE tenant_id = ? AND object_namespace_id = ? AND storage_volume_id = ? AND placement_generation = ?",
+        )
+        .bind(plan.coverage.tenant_id.as_str())
+        .bind(plan.coverage.object_namespace_id.as_str())
+        .bind(plan.coverage.storage_volume_id.as_str())
+        .bind(v2_i64(plan.coverage.placement_generation.get(), "placement_generation")?)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let placements = placement_rows
+            .iter()
+            .map(decode_v2_object_placement)
+            .collect::<CentralResult<Vec<_>>>()?;
+        let recomputed = VolumeCommitCoverage::from_placements(
+            plan.coverage.tenant_id.clone(),
+            plan.coverage.object_namespace_id.clone(),
+            plan.coverage.commit_id,
+            plan.coverage.storage_volume_id.clone(),
+            plan.coverage.placement_generation,
+            &object_set.object_set,
+            &placements,
+        )
+        .map_err(protocol_invalid)?;
+        if recomputed != plan.coverage {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "replacement Coverage does not match Placement evidence",
+            )
+            .with_retryable(false));
+        }
+        let coverage_payload = encode(&plan.coverage)?;
+        sqlx::query(
+            "INSERT INTO volume_commit_coverages (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, state, created_at_unix_ms, updated_at_unix_ms, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?) ON CONFLICT (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation) DO UPDATE SET object_set_digest = excluded.object_set_digest, object_count = excluded.object_count, verified_object_count = excluded.verified_object_count, total_bytes = excluded.total_bytes, verified_bytes = excluded.verified_bytes, state = excluded.state, payload = excluded.payload",
+        )
+        .bind(plan.coverage.tenant_id.as_str())
+        .bind(plan.coverage.object_namespace_id.as_str())
+        .bind(plan.coverage.commit_id.digest().as_bytes().as_slice())
+        .bind(plan.coverage.storage_volume_id.as_str())
+        .bind(v2_i64(plan.coverage.placement_generation.get(), "placement_generation")?)
+        .bind(plan.coverage.object_set_digest.as_bytes().as_slice())
+        .bind(v2_i64(plan.coverage.object_count.get(), "object_count")?)
+        .bind(v2_i64(plan.coverage.verified_object_count.get(), "verified_object_count")?)
+        .bind(v2_i64(plan.coverage.total_bytes.get(), "total_bytes")?)
+        .bind(v2_i64(plan.coverage.verified_bytes.get(), "verified_bytes")?)
+        .bind(coverage_state_name(plan.coverage.state))
+        .bind(coverage_payload)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(MaterializationPlanInsertOutcome::Inserted(plan.job))
+    }
+
+    async fn get_materialization(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Option<MaterializationJob>> {
+        sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+             FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? LIMIT 1",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(materialization_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .map(|row| decode_v2_materialization(&row))
+        .transpose()
+    }
+
+    async fn get_materialization_by_key(
+        &self,
+        key: &MaterializationJobKey,
+    ) -> CentralResult<Option<MaterializationJob>> {
+        let (goal, goal_value) = coverage_goal_parts(key.coverage_goal)?;
+        sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+             FROM materializations \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND commit_id = ? \
+               AND target_storage_volume_id = ? AND coverage_goal = ? AND coverage_goal_value = ? \
+             ORDER BY updated_at_unix_ms DESC LIMIT 1",
+        )
+        .bind(key.tenant_id.as_str())
+        .bind(key.object_namespace_id.as_str())
+        .bind(key.commit_id.digest().as_bytes().as_slice())
+        .bind(key.target_storage_volume_id.as_str())
+        .bind(goal)
+        .bind(v2_i64(goal_value, "coverage_goal_value")?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .map(|row| decode_v2_materialization(&row))
+        .transpose()
+    }
+
+    async fn list_materializations(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        commit_id: &ContentDigest,
+        target_storage_volume_id: Option<&StorageVolumeId>,
+    ) -> CentralResult<Vec<MaterializationJob>> {
+        let rows = if let Some(target) = target_storage_volume_id {
+            sqlx::query(
+                "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+                 FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND commit_id = ? \
+                   AND target_storage_volume_id = ? ORDER BY materialization_id",
+            )
+            .bind(tenant_id.as_str())
+            .bind(object_namespace_id.as_str())
+            .bind(commit_id.as_bytes().as_slice())
+            .bind(target.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?
+        } else {
+            sqlx::query(
+                "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, artifact_id, commit_id, coverage_goal, coverage_goal_value \
+                 FROM materializations WHERE tenant_id = ? AND object_namespace_id = ? AND commit_id = ? \
+                 ORDER BY materialization_id",
+            )
+            .bind(tenant_id.as_str())
+            .bind(object_namespace_id.as_str())
+            .bind(commit_id.as_bytes().as_slice())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?
+        };
+        rows.iter().map(decode_v2_materialization).collect()
+    }
+
+    async fn replace_materialization(
+        &self,
+        tenant_id: &TenantId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+        expected_plan_revision: neoengram_domain::protocol::Generation,
+        job: MaterializationJob,
+    ) -> CentralResult<MaterializationJob> {
+        // Receipt publication updates the same Job/object/Placement aggregate while holding this
+        // gate. Serialize ordinary Job state transitions with that boundary as well; otherwise a
+        // concurrent failure/cancel update could validate an old revision and overwrite receipt
+        // progress after the receipt transaction commits.
+        let _gate = self.materialization_receipt_gate.lock().await;
+        job.validate().map_err(protocol_invalid)?;
+        let _ = coverage_goal_parts(job.key.coverage_goal)?;
+        if &job.key.tenant_id != tenant_id || &job.materialization_id != materialization_id {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization replacement identity does not match its key",
+            )
+            .with_retryable(false));
+        }
+        if job.plan_revision < expected_plan_revision {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision moved backwards",
+            ));
+        }
+        let current = self
+            .get_materialization_for_namespace(
+                tenant_id,
+                &job.key.object_namespace_id,
+                materialization_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if current.key != job.key {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization replacement cannot change its immutable target key",
+            )
+            .with_retryable(false));
+        }
+        if !current.state.can_transition_to(job.state) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization state transition is not allowed",
+            )
+            .with_retryable(false));
+        }
+        if job.plan_revision > Generation::new(expected_plan_revision.get().saturating_add(1)) {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision advanced by more than one",
+            ));
+        }
+        let object_set_digest = self
+            .get_commit_object_set(&job.key.tenant_id, &job.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?
+            .object_set
+            .object_set_digest;
+        let payload = encode(&job)?;
+        let result = sqlx::query(
+            "UPDATE materializations SET plan_revision = ?, state = ?, object_set_digest = ?, \
+                 object_count = ?, total_bytes = ?, verified_object_count = ?, verified_bytes = ?, \
+                 missing_object_count = ?, missing_bytes = ?, source_count = ?, deadline_unix_ms = ?, \
+                 payload = ?, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? AND plan_revision = ?",
+        )
+        .bind(v2_i64(job.plan_revision.get(), "plan_revision")?)
+        .bind(materialization_job_state_name(job.state))
+        .bind(object_set_digest.as_bytes().as_slice())
+        .bind(v2_i64(job.object_count.get(), "object_count")?)
+        .bind(v2_i64(job.total_bytes.get(), "total_bytes")?)
+        .bind(v2_i64(job.verified_object_count.get(), "verified_object_count")?)
+        .bind(v2_i64(job.verified_bytes.get(), "verified_bytes")?)
+        .bind(v2_i64(job.missing_object_count.get(), "missing_object_count")?)
+        .bind(v2_i64(job.missing_bytes.get(), "missing_bytes")?)
+        .bind(v2_i64(job.source_count.get(), "source_count")?)
+        .bind(v2_i64(job.deadline_unix_ms.get(), "deadline_unix_ms")?)
+        .bind(payload)
+        .bind(v2_i64(job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
+        .bind(tenant_id.as_str())
+        .bind(job.key.object_namespace_id.as_str())
+        .bind(materialization_id.as_str())
+        .bind(v2_i64(expected_plan_revision.get(), "expected_plan_revision")?)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization plan revision changed",
+            ));
+        }
+        Ok(job)
+    }
+
+    async fn insert_materialization_batch(
+        &self,
+        batch: MaterializationBatch,
+    ) -> CentralResult<MaterializationBatch> {
+        batch.validate().map_err(protocol_invalid)?;
+        let parent = self
+            .get_materialization(
+                &batch.target.tenant_id,
+                &batch.target.object_namespace_id,
+                &batch.materialization_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != batch.target.object_namespace_id
+            || parent.key.target_storage_volume_id != batch.target.storage_volume_id
+            || parent.plan_revision != batch.plan_revision
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "batch target does not match its materialization",
+            )
+            .with_retryable(false));
+        }
+        let payload = encode(&batch)?;
+        let result = sqlx::query(
+            "INSERT INTO materialization_batches \
+             (tenant_id, object_namespace_id, batch_id, materialization_id, plan_revision, attempt, source_storage_volume_id, \
+              target_storage_volume_id, manifest_digest, state, payload, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(batch.target.tenant_id.as_str())
+        .bind(batch.target.object_namespace_id.as_str())
+        .bind(batch.batch_id.as_str())
+        .bind(batch.materialization_id.as_str())
+        .bind(v2_i64(batch.plan_revision.get(), "plan_revision")?)
+        .bind(v2_i64(batch.batch_attempt.get(), "batch_attempt")?)
+        .bind(batch.source.storage_volume_id.as_ref().map(StorageVolumeId::as_str))
+        .bind(batch.target.storage_volume_id.as_str())
+        .bind(batch.manifest_digest.as_bytes().as_slice())
+        .bind(materialization_batch_state_name(batch.state))
+        .bind(payload)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(batch),
+            Err(error) if is_unique(&error) => {
+                let row = sqlx::query(
+                    "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id FROM materialization_batches \
+                     WHERE tenant_id = ? AND object_namespace_id = ? AND batch_id = ?",
+                )
+                .bind(batch.target.tenant_id.as_str())
+                .bind(batch.target.object_namespace_id.as_str())
+                .bind(batch.batch_id.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage_error)?
+                .ok_or_else(|| storage_corruption("materialization Batch uniqueness conflict has no row"))?;
+                let existing = decode_v2_batch(&row)?;
+                if existing == batch {
+                    Ok(existing)
+                } else {
+                    Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "materialization batch ID is already bound to different metadata",
+                    )
+                    .with_retryable(false))
+                }
+            }
+            Err(error) => Err(storage_error(error)),
+        }
+    }
+
+    async fn replace_materialization_batch(
+        &self,
+        request: crate::MaterializationBatchCasRequest,
+    ) -> CentralResult<MaterializationBatch> {
+        request.batch.validate().map_err(protocol_invalid)?;
+        if request.batch.materialization_id != request.materialization_id
+            || request.batch.batch_id != request.batch_id
+            || request.batch.target.tenant_id != request.tenant_id
+            || request.batch.target.object_namespace_id != request.object_namespace_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Batch replacement identity does not match its key",
+            )
+            .with_retryable(false));
+        }
+        let parent = self
+            .get_materialization(
+                &request.tenant_id,
+                &request.object_namespace_id,
+                &request.materialization_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != request.object_namespace_id
+            || parent.key.target_storage_volume_id != request.batch.target.storage_volume_id
+            || parent.plan_revision != request.expected_plan_revision
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Batch target or revision does not match its parent",
+            )
+            .with_retryable(false));
+        }
+        let row = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id \
+             FROM materialization_batches WHERE tenant_id = ? AND object_namespace_id = ? AND batch_id = ? LIMIT 1",
+        )
+        .bind(request.tenant_id.as_str())
+        .bind(request.object_namespace_id.as_str())
+        .bind(request.batch_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "materialization Batch not found",
+            )
+        })?;
+        let current = decode_v2_batch(&row)?;
+        if current.plan_revision != request.expected_plan_revision
+            || current.batch_attempt != request.expected_batch_attempt
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Batch revision or attempt changed",
+            ));
+        }
+        if request.batch.plan_revision != request.expected_plan_revision
+            || request.batch.batch_attempt < request.expected_batch_attempt
+            || request.batch.batch_attempt
+                > Generation::new(request.expected_batch_attempt.get().saturating_add(1))
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Batch advanced by more than one attempt",
+            ));
+        }
+        if !current.state.can_transition_to(request.batch.state) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Batch state transition is not allowed",
+            )
+            .with_retryable(false));
+        }
+        let payload = encode(&request.batch)?;
+        let result = sqlx::query(
+            "UPDATE materialization_batches SET plan_revision = ?, attempt = ?, source_storage_volume_id = ?, \
+             target_storage_volume_id = ?, manifest_digest = ?, state = ?, payload = ? \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND batch_id = ? \
+               AND plan_revision = ? AND attempt = ?",
+        )
+        .bind(v2_i64(
+            request.batch.plan_revision.get(),
+            "plan_revision",
+        )?)
+        .bind(v2_i64(
+            request.batch.batch_attempt.get(),
+            "batch_attempt",
+        )?)
+        .bind(
+            request
+                .batch
+                .source
+                .storage_volume_id
+                .as_ref()
+                .map(StorageVolumeId::as_str),
+        )
+        .bind(request.batch.target.storage_volume_id.as_str())
+        .bind(request.batch.manifest_digest.as_bytes().as_slice())
+        .bind(materialization_batch_state_name(request.batch.state))
+        .bind(payload)
+        .bind(request.tenant_id.as_str())
+        .bind(request.object_namespace_id.as_str())
+        .bind(request.batch_id.as_str())
+        .bind(v2_i64(
+            request.expected_plan_revision.get(),
+            "expected_plan_revision",
+        )?)
+        .bind(v2_i64(
+            request.expected_batch_attempt.get(),
+            "expected_batch_attempt",
+        )?)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Batch revision or attempt changed",
+            ));
+        }
+        Ok(request.batch)
+    }
+
+    async fn list_materialization_batches(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Vec<MaterializationBatch>> {
+        let rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id FROM materialization_batches \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? ORDER BY batch_id",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(materialization_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        rows.iter()
+            .map(decode_v2_batch)
+            .collect::<CentralResult<Vec<_>>>()
+    }
+
+    async fn list_active_materialization_batches_for_agent(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+    ) -> CentralResult<Vec<MaterializationBatch>> {
+        // Target agent identity is part of the signed JSON payload rather than a separately
+        // mutable SQL column. Decode the bounded tenant slice first, then apply the same strict
+        // state/identity filter as the in-memory authority.
+        let rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id FROM materialization_batches \
+             WHERE tenant_id = ? ORDER BY materialization_id, plan_revision, batch_id",
+        )
+        .bind(tenant_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let mut batches = rows
+            .iter()
+            .map(decode_v2_batch)
+            .collect::<CentralResult<Vec<_>>>()?;
+        batches.retain(|batch| {
+            batch.target.tenant_id == *tenant_id
+                && batch.target.agent_id == *agent_id
+                && matches!(
+                    batch.state,
+                    MaterializationBatchState::Queued
+                        | MaterializationBatchState::Assigned
+                        | MaterializationBatchState::Transferring
+                        | MaterializationBatchState::Verifying
+                )
+        });
+        Ok(batches)
+    }
+
+    async fn insert_materialization_object(
+        &self,
+        tenant_id: &TenantId,
+        object: MaterializationObject,
+    ) -> CentralResult<MaterializationObject> {
+        object.validate().map_err(protocol_invalid)?;
+        let parent = sqlx::query(
+            "SELECT tenant_id, object_namespace_id, target_storage_volume_id, commit_id FROM materializations \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? LIMIT 1",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object.object.object_namespace_id.as_str())
+        .bind(object.materialization_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| CentralError::new(CentralErrorCode::ResourceNotFound, "materialization not found"))?;
+        let tenant_id = parent
+            .try_get::<String, _>("tenant_id")
+            .map_err(storage_error)?;
+        let namespace = parent
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?;
+        if namespace != object.object.object_namespace_id.as_str() {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization object namespace does not match its parent",
+            )
+            .with_retryable(false));
+        }
+        let tenant = TenantId::new(tenant_id.clone()).map_err(|error| {
+            storage_corruption(format!("stored materialization tenant ID: {error}"))
+        })?;
+        let parent_job = self
+            .get_materialization(
+                &tenant,
+                &object.object.object_namespace_id,
+                &object.materialization_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent_job.plan_revision != object.plan_revision {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization object plan revision does not match its parent",
+            )
+            .with_retryable(false));
+        }
+        let commit_id = CommitId::from_digest(digest_from_blob(
+            parent
+                .try_get::<Vec<u8>, _>("commit_id")
+                .map_err(storage_error)?,
+            "materialization commit_id",
+        )?);
+        let object_set = self
+            .get_commit_object_set(&tenant, &commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?;
+        let expected = object_set
+            .object_set
+            .objects
+            .iter()
+            .find(|candidate| candidate.object_id == object.object.object_id)
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization object is not part of the Commit ObjectSet",
+                )
+                .with_retryable(false)
+            })?;
+        if expected.size != object.object.size
+            || expected.encoding != object.object.encoding
+            || expected.ordinal != object.object.ordinal
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization object metadata disagrees with the Commit ObjectSet",
+            )
+            .with_retryable(false));
+        }
+        let payload = encode(&object)?;
+        let result = sqlx::query(
+            "INSERT INTO materialization_objects \
+             (tenant_id, materialization_id, object_namespace_id, object_id, size, encoding, \
+              staging_key, confirmed_offset, state, current_batch_id, plan_revision, attempt, \
+              payload, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+        )
+        .bind(&tenant_id)
+        .bind(object.materialization_id.as_str())
+        .bind(object.object.object_namespace_id.as_str())
+        .bind(object.object.object_id.as_bytes().as_slice())
+        .bind(v2_i64(object.object.size.get(), "object size")?)
+        .bind(object_encoding_name(object.object.encoding))
+        .bind(&object.staging_key)
+        .bind(v2_i64(object.confirmed_offset.get(), "confirmed_offset")?)
+        .bind(materialization_object_state_name(object.state))
+        .bind(object.current_batch_id.as_ref().map(|id| id.as_str()))
+        .bind(v2_i64(object.plan_revision.get(), "plan_revision")?)
+        .bind(v2_i64(object.attempt.get(), "attempt")?)
+        .bind(payload)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(object),
+            Err(error) if is_unique(&error) => {
+                let row = sqlx::query(
+                    "SELECT payload, state, object_namespace_id, staging_key, object_id, size, encoding, confirmed_offset, plan_revision, attempt FROM materialization_objects \
+                     WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ?",
+                )
+                .bind(&tenant_id)
+                .bind(object.materialization_id.as_str())
+                .bind(object.object.object_namespace_id.as_str())
+                .bind(object.object.object_id.as_bytes().as_slice())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage_error)?
+                .ok_or_else(|| storage_corruption("materialization Object uniqueness conflict has no row"))?;
+                let existing = decode_v2_object(&row)?;
+                if existing == object {
+                    Ok(existing)
+                } else if existing
+                    .plan_revision
+                    .get()
+                    .checked_add(1)
+                    .is_some_and(|next| object.plan_revision.get() == next)
+                    && object.object == existing.object
+                    && object.staging_key == existing.staging_key
+                    && object.confirmed_offset >= existing.confirmed_offset
+                    && (!existing.complete()
+                        || (object.complete()
+                            && object.confirmed_offset == existing.confirmed_offset))
+                    && existing
+                        .attempt
+                        .get()
+                        .checked_add(1)
+                        .is_some_and(|next| object.attempt.get() == next)
+                {
+                    // A retry/replan reuses the stable object row and staging key. Keep the
+                    // checkpoint and completion fence while advancing exactly one plan/attempt.
+                    let payload = encode(&object)?;
+                    let result = sqlx::query(
+                        "UPDATE materialization_objects SET size = ?, encoding = ?, staging_key = ?, \
+                         confirmed_offset = ?, state = ?, current_batch_id = ?, plan_revision = ?, attempt = ?, payload = ? \
+                         WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? \
+                           AND plan_revision = ? AND attempt = ?",
+                    )
+                    .bind(v2_i64(object.object.size.get(), "object size")?)
+                    .bind(object_encoding_name(object.object.encoding))
+                    .bind(&object.staging_key)
+                    .bind(v2_i64(object.confirmed_offset.get(), "confirmed_offset")?)
+                    .bind(materialization_object_state_name(object.state))
+                    .bind(object.current_batch_id.as_ref().map(|id| id.as_str()))
+                    .bind(v2_i64(object.plan_revision.get(), "plan_revision")?)
+                    .bind(v2_i64(object.attempt.get(), "attempt")?)
+                    .bind(payload)
+                    .bind(&tenant_id)
+                    .bind(object.materialization_id.as_str())
+                    .bind(object.object.object_namespace_id.as_str())
+                    .bind(object.object.object_id.as_bytes().as_slice())
+                    .bind(v2_i64(existing.plan_revision.get(), "expected_plan_revision")?)
+                    .bind(v2_i64(existing.attempt.get(), "expected_attempt")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(storage_error)?;
+                    if result.rows_affected() == 0 {
+                        Err(CentralError::new(
+                            CentralErrorCode::ConcurrentUpdate,
+                            "materialization object changed during replanning",
+                        ))
+                    } else {
+                        Ok(object)
+                    }
+                } else {
+                    Err(CentralError::new(
+                        CentralErrorCode::ConcurrentUpdate,
+                        "materialization object identity, checkpoint, or plan revision changed",
+                    )
+                    .with_retryable(false))
+                }
+            }
+            Err(error) => Err(storage_error(error)),
+        }
+    }
+
+    async fn replace_materialization_object(
+        &self,
+        request: crate::MaterializationObjectCasRequest,
+    ) -> CentralResult<MaterializationObject> {
+        request.object.validate().map_err(protocol_invalid)?;
+        if request.object.materialization_id != request.materialization_id
+            || request.object.object.object_namespace_id != request.object_namespace_id
+            || request.object.object.object_id != request.object_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Object replacement identity does not match its key",
+            )
+            .with_retryable(false));
+        }
+        let parent = self
+            .get_materialization(
+                &request.tenant_id,
+                &request.object_namespace_id,
+                &request.materialization_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != request.object_namespace_id
+            || parent.plan_revision != request.expected_plan_revision
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Object parent revision does not match",
+            )
+            .with_retryable(false));
+        }
+        let row = sqlx::query(
+            "SELECT payload, state, object_namespace_id, staging_key, object_id, size, encoding, confirmed_offset, plan_revision, attempt \
+             FROM materialization_objects WHERE tenant_id = ? AND materialization_id = ? \
+               AND object_namespace_id = ? AND object_id = ? LIMIT 1",
+        )
+        .bind(request.tenant_id.as_str())
+        .bind(request.materialization_id.as_str())
+        .bind(request.object_namespace_id.as_str())
+        .bind(request.object_id.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "materialization Object not found",
+            )
+        })?;
+        let current = decode_v2_object(&row)?;
+        if current.plan_revision != request.expected_plan_revision
+            || current.attempt != request.expected_attempt
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Object revision or attempt changed",
+            ));
+        }
+        if current.object != request.object.object
+            || current.staging_key != request.object.staging_key
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Object immutable metadata cannot change",
+            )
+            .with_retryable(false));
+        }
+        if request.object.confirmed_offset < current.confirmed_offset {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Object confirmed offset cannot move backwards",
+            ));
+        }
+        if request.object.plan_revision != request.expected_plan_revision
+            || request.object.attempt < request.expected_attempt
+            || request.object.attempt
+                > Generation::new(request.expected_attempt.get().saturating_add(1))
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Object advanced by more than one attempt",
+            ));
+        }
+        if !current.state.can_transition_to(request.object.state) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Object state transition is not allowed",
+            )
+            .with_retryable(false));
+        }
+        let payload = encode(&request.object)?;
+        let result = sqlx::query(
+            "UPDATE materialization_objects SET size = ?, encoding = ?, staging_key = ?, \
+             confirmed_offset = ?, state = ?, current_batch_id = ?, plan_revision = ?, attempt = ?, payload = ? \
+             WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? \
+               AND plan_revision = ? AND attempt = ?",
+        )
+        .bind(v2_i64(request.object.object.size.get(), "object size")?)
+        .bind(object_encoding_name(request.object.object.encoding))
+        .bind(&request.object.staging_key)
+        .bind(v2_i64(
+            request.object.confirmed_offset.get(),
+            "confirmed_offset",
+        )?)
+        .bind(materialization_object_state_name(request.object.state))
+        .bind(
+            request
+                .object
+                .current_batch_id
+                .as_ref()
+                .map(|id| id.as_str()),
+        )
+        .bind(v2_i64(
+            request.object.plan_revision.get(),
+            "plan_revision",
+        )?)
+        .bind(v2_i64(request.object.attempt.get(), "attempt")?)
+        .bind(payload)
+        .bind(request.tenant_id.as_str())
+        .bind(request.materialization_id.as_str())
+        .bind(request.object_namespace_id.as_str())
+        .bind(request.object_id.as_bytes().as_slice())
+        .bind(v2_i64(
+            request.expected_plan_revision.get(),
+            "expected_plan_revision",
+        )?)
+        .bind(v2_i64(request.expected_attempt.get(), "expected_attempt")?)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Object revision or attempt changed",
+            ));
+        }
+        Ok(request.object)
+    }
+
+    async fn list_materialization_objects(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        materialization_id: &neoengram_domain::protocol::MaterializationId,
+    ) -> CentralResult<Vec<MaterializationObject>> {
+        let rows = sqlx::query(
+            "SELECT payload, state, object_namespace_id, staging_key, object_id, size, encoding, confirmed_offset, plan_revision, attempt FROM materialization_objects \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? ORDER BY object_id",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(materialization_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        rows.iter()
+            .map(decode_v2_object)
+            .collect::<CentralResult<Vec<_>>>()
+    }
+
+    async fn get_materialization_receipt(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        receipt_id: &neoengram_domain::protocol::ObjectReceiptId,
+    ) -> CentralResult<Option<MaterializationObjectReceipt>> {
+        let row = sqlx::query(
+            "SELECT payload, tenant_id, object_namespace_id, receipt_id, materialization_id, batch_id, \
+             plan_revision, batch_attempt, object_id, size, encoding, verified_digest, \
+             target_storage_volume_id, target_placement_generation, committed_offset, verified_at_unix_ms \
+             FROM materialization_receipts WHERE tenant_id = ? AND object_namespace_id = ? AND receipt_id = ? LIMIT 1",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(receipt_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        row.map(|row| decode_v2_materialization_receipt(&row))
+            .transpose()
+    }
+
+    async fn insert_object_read_lease(
+        &self,
+        lease: ObjectReadLease,
+    ) -> CentralResult<ObjectReadLease> {
+        lease.validate_for_acquisition().map_err(protocol_invalid)?;
+        let parent = self
+            .get_materialization(
+                &lease.tenant_id,
+                &lease.object_namespace_id,
+                &lease.materialization_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != lease.object_namespace_id {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease namespace mismatch",
+            )
+            .with_retryable(false));
+        }
+        if parent.plan_revision != lease.plan_revision {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease plan revision does not match its parent",
+            )
+            .with_retryable(false));
+        }
+        let batch_row = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id \
+             FROM materialization_batches WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? AND batch_id = ? LIMIT 1",
+        )
+        .bind(lease.tenant_id.as_str())
+        .bind(lease.object_namespace_id.as_str())
+        .bind(lease.materialization_id.as_str())
+        .bind(lease.batch_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let Some(batch_row) = batch_row else {
+            return Err(CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "read lease batch is not registered for this materialization",
+            )
+            .with_retryable(false));
+        };
+        let batch = decode_v2_batch(&batch_row)?;
+        if batch.plan_revision != lease.plan_revision
+            || batch.target.storage_volume_id != parent.key.target_storage_volume_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease batch does not match its materialization",
+            )
+            .with_retryable(false));
+        }
+        if !batch.object_ids.contains(&lease.object_id) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease object is not included in its batch manifest",
+            )
+            .with_retryable(false));
+        }
+        let objects = self
+            .list_materialization_objects(
+                &lease.tenant_id,
+                &lease.object_namespace_id,
+                &lease.materialization_id,
+            )
+            .await?;
+        let Some(object) = objects.iter().find(|object| {
+            object.object.object_id == lease.object_id
+                && object.current_batch_id.as_ref() == Some(&lease.batch_id)
+        }) else {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "object read lease is not assigned to its Batch",
+            )
+            .with_retryable(false));
+        };
+        let source_selected = batch.source.placement_id == lease.placement_id
+            || object.fallback_sources.contains(&lease.placement_id)
+            || object.primary_source.as_ref() == Some(&lease.placement_id);
+        if !source_selected {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "object read lease placement is not selected for its object task",
+            )
+            .with_retryable(false));
+        }
+        if object.primary_source.as_ref() == Some(&lease.placement_id)
+            && batch.source.placement_generation != lease.placement_generation
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease source generation differs from its Batch fence",
+            )
+            .with_retryable(false));
+        }
+        let object_set = self
+            .get_commit_object_set(&parent.key.tenant_id, &parent.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization references an unknown Commit ObjectSet",
+                )
+            })?;
+        let expected = object_set
+            .object_set
+            .objects
+            .iter()
+            .find(|object| object.object_id == lease.object_id)
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "read lease object is not part of the Commit ObjectSet",
+                )
+                .with_retryable(false)
+            })?;
+        if expected.object_id != lease.object_id {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease object identity mismatch",
+            )
+            .with_retryable(false));
+        }
+        let placement_row = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain \
+             FROM object_placements \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND placement_id = ? \
+               AND object_id = ? AND placement_generation = ? LIMIT 1",
+        )
+        .bind(lease.tenant_id.as_str())
+        .bind(lease.object_namespace_id.as_str())
+        .bind(lease.placement_id.as_str())
+        .bind(lease.object_id.as_bytes().as_slice())
+        .bind(v2_i64(
+            lease.placement_generation.get(),
+            "placement_generation",
+        )?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let Some(placement_row) = placement_row else {
+            return Err(CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "read lease placement is not registered",
+            )
+            .with_retryable(false));
+        };
+        let placement = decode_v2_object_placement(&placement_row)?;
+        if !placement.readable() {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease placement is not readable",
+            )
+            .with_retryable(false));
+        }
+        if placement.size.get() != expected.size.get() || placement.encoding != expected.encoding {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease placement metadata disagrees with the Commit ObjectSet",
+            )
+            .with_retryable(false));
+        }
+        if placement.storage_volume_id.is_none() {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease placement must reference a StorageVolume",
+            )
+            .with_retryable(false));
+        }
+        if object.primary_source.as_ref() == Some(&lease.placement_id)
+            && (placement.storage_volume_id != batch.source.storage_volume_id
+                || placement.archive_id != batch.source.archive_id)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "read lease placement Volume does not match its Batch source fence",
+            )
+            .with_retryable(false));
+        }
+        let payload = encode(&lease)?;
+        let result = sqlx::query(
+            "INSERT INTO object_read_leases \
+             (tenant_id, lease_id, materialization_id, batch_id, object_namespace_id, object_id, \
+              placement_id, storage_volume_id, placement_generation, expires_at_unix_ms, state, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(lease.tenant_id.as_str())
+        .bind(lease.lease_id.as_str())
+        .bind(lease.materialization_id.as_str())
+        .bind(lease.batch_id.as_str())
+        .bind(lease.object_namespace_id.as_str())
+        .bind(lease.object_id.as_bytes().as_slice())
+        .bind(lease.placement_id.as_str())
+        .bind(
+            placement
+                .storage_volume_id
+                .as_ref()
+                .map(StorageVolumeId::as_str)
+                .ok_or_else(|| {
+                    CentralError::new(
+                        CentralErrorCode::ProtocolInvalid,
+                        "read lease source placement must reference a StorageVolume",
+                    )
+                    .with_retryable(false)
+                })?,
+        )
+        .bind(v2_i64(
+            lease.placement_generation.get(),
+            "placement_generation",
+        )?)
+        .bind(v2_i64(
+            lease.expires_at_unix_ms.get(),
+            "expires_at_unix_ms",
+        )?)
+        .bind(materialization_lease_state_name(lease.state))
+        .bind(payload)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(lease),
+            Err(error) if is_unique(&error) => {
+                let row = sqlx::query("SELECT payload, state, tenant_id, object_namespace_id, materialization_id, batch_id, object_id, placement_id, placement_generation, expires_at_unix_ms FROM object_read_leases WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ?")
+                    .bind(lease.tenant_id.as_str())
+                    .bind(lease.object_namespace_id.as_str())
+                    .bind(lease.lease_id.as_str())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(storage_error)?
+                    .ok_or_else(|| storage_corruption("read lease uniqueness conflict has no row"))?;
+                let existing = decode_v2_read_lease(&row)?;
+                if existing == lease {
+                    Ok(existing)
+                } else {
+                    Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "read lease ID is already in use",
+                    )
+                    .with_retryable(false))
+                }
+            }
+            Err(error) => Err(storage_error(error)),
+        }
+    }
+
+    async fn insert_staging_lease(&self, lease: StagingLease) -> CentralResult<StagingLease> {
+        lease.validate_for_acquisition().map_err(protocol_invalid)?;
+        let parent = self
+            .get_materialization(
+                &lease.tenant_id,
+                &lease.object_namespace_id,
+                &lease.materialization_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != lease.object_namespace_id
+            || parent.key.target_storage_volume_id != lease.target_storage_volume_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "staging lease target mismatch",
+            )
+            .with_retryable(false));
+        }
+        let object_row = sqlx::query(
+            "SELECT payload, state, object_namespace_id, staging_key, object_id, size, encoding, confirmed_offset, plan_revision, attempt \
+             FROM materialization_objects \
+             WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? \
+               AND object_id = ? LIMIT 1",
+        )
+        .bind(lease.tenant_id.as_str())
+        .bind(lease.materialization_id.as_str())
+        .bind(lease.object_namespace_id.as_str())
+        .bind(lease.object_id.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let Some(object_row) = object_row else {
+            return Err(CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "staging lease object is not registered",
+            )
+            .with_retryable(false));
+        };
+        let object = decode_v2_object(&object_row)?;
+        if object.staging_key != lease.staging_key || object.plan_revision != lease.plan_revision {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "staging lease does not match materialization object",
+            )
+            .with_retryable(false));
+        }
+        let Some(batch_id) = object.current_batch_id.as_ref() else {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "staging lease object has no current batch",
+            )
+            .with_retryable(false));
+        };
+        let batch_row = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id \
+             FROM materialization_batches WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? AND batch_id = ? LIMIT 1",
+        )
+        .bind(lease.tenant_id.as_str())
+        .bind(lease.object_namespace_id.as_str())
+        .bind(lease.materialization_id.as_str())
+        .bind(batch_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let Some(batch_row) = batch_row else {
+            return Err(CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "staging lease object current batch is not registered",
+            )
+            .with_retryable(false));
+        };
+        let batch = decode_v2_batch(&batch_row)?;
+        if batch.plan_revision != lease.plan_revision
+            || batch.target.storage_volume_id != lease.target_storage_volume_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "staging lease batch does not match its materialization",
+            )
+            .with_retryable(false));
+        }
+        if !batch.object_ids.contains(&lease.object_id) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "staging lease object is not included in its batch manifest",
+            )
+            .with_retryable(false));
+        }
+        if batch.target.placement_generation != lease.target_placement_generation {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "staging lease target generation does not match its batch target fence",
+            )
+            .with_retryable(false));
+        }
+        let payload = encode(&lease)?;
+        let result = sqlx::query(
+            "INSERT INTO staging_leases \
+             (tenant_id, lease_id, materialization_id, object_namespace_id, object_id, \
+              target_storage_volume_id, target_placement_generation, staging_key, \
+              expires_at_unix_ms, state, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(lease.tenant_id.as_str())
+        .bind(lease.lease_id.as_str())
+        .bind(lease.materialization_id.as_str())
+        .bind(lease.object_namespace_id.as_str())
+        .bind(lease.object_id.as_bytes().as_slice())
+        .bind(lease.target_storage_volume_id.as_str())
+        .bind(v2_i64(
+            lease.target_placement_generation.get(),
+            "target_placement_generation",
+        )?)
+        .bind(&lease.staging_key)
+        .bind(v2_i64(
+            lease.expires_at_unix_ms.get(),
+            "expires_at_unix_ms",
+        )?)
+        .bind(materialization_lease_state_name(lease.state))
+        .bind(payload)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(lease),
+            Err(error) if is_unique(&error) => {
+                let row = sqlx::query("SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, object_id, staging_key, target_placement_generation, expires_at_unix_ms FROM staging_leases WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ?")
+                    .bind(lease.tenant_id.as_str())
+                    .bind(lease.object_namespace_id.as_str())
+                    .bind(lease.lease_id.as_str())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(storage_error)?
+                    .ok_or_else(|| storage_corruption("staging lease uniqueness conflict has no row"))?;
+                let existing = decode_v2_staging_lease(&row)?;
+                if existing == lease {
+                    Ok(existing)
+                } else {
+                    Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "staging lease ID is already in use",
+                    )
+                    .with_retryable(false))
+                }
+            }
+            Err(error) => Err(storage_error(error)),
+        }
+    }
+
+    async fn reconcile_materialization_leases(
+        &self,
+        now_unix_ms: UnixMillis,
+    ) -> CentralResult<MaterializationLeaseExpiryReconciliation> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let now = v2_i64(now_unix_ms.get(), "now_unix_ms")?;
+        let read_rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, materialization_id, batch_id, \
+                    object_id, placement_id, placement_generation, expires_at_unix_ms \
+             FROM object_read_leases \
+             WHERE state = 'active' AND expires_at_unix_ms <= ? \
+             ORDER BY tenant_id, object_namespace_id, lease_id",
+        )
+        .bind(now)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let mut result = MaterializationLeaseExpiryReconciliation::default();
+        for row in read_rows {
+            let mut lease = decode_v2_read_lease(&row)?;
+            if lease.state != MaterializationLeaseState::Active
+                || lease.expires_at_unix_ms.get() > now_unix_ms.get()
+            {
+                return Err(storage_corruption(
+                    "active object read lease expiry index disagrees with its payload",
+                ));
+            }
+            lease.state = MaterializationLeaseState::Expired;
+            let payload = encode(&lease)?;
+            let update = sqlx::query(
+                "UPDATE object_read_leases SET state = ?, payload = ? \
+                 WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ? \
+                   AND state = 'active' AND expires_at_unix_ms <= ?",
+            )
+            .bind(materialization_lease_state_name(lease.state))
+            .bind(payload)
+            .bind(lease.tenant_id.as_str())
+            .bind(lease.object_namespace_id.as_str())
+            .bind(lease.lease_id.as_str())
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if update.rows_affected() != 1 {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "object read lease changed during expiry reconciliation",
+                ));
+            }
+            result.expired_object_read_leases += 1;
+        }
+
+        let staging_rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, \
+                    materialization_id, object_id, staging_key, target_placement_generation, \
+                    expires_at_unix_ms \
+             FROM staging_leases \
+             WHERE state = 'active' AND expires_at_unix_ms <= ? \
+             ORDER BY tenant_id, object_namespace_id, lease_id",
+        )
+        .bind(now)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        for row in staging_rows {
+            let mut lease = decode_v2_staging_lease(&row)?;
+            if lease.state != MaterializationLeaseState::Active
+                || lease.expires_at_unix_ms.get() > now_unix_ms.get()
+            {
+                return Err(storage_corruption(
+                    "active staging lease expiry index disagrees with its payload",
+                ));
+            }
+            lease.state = MaterializationLeaseState::Expired;
+            let payload = encode(&lease)?;
+            let update = sqlx::query(
+                "UPDATE staging_leases SET state = ?, payload = ? \
+                 WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ? \
+                   AND state = 'active' AND expires_at_unix_ms <= ?",
+            )
+            .bind(materialization_lease_state_name(lease.state))
+            .bind(payload)
+            .bind(lease.tenant_id.as_str())
+            .bind(lease.object_namespace_id.as_str())
+            .bind(lease.lease_id.as_str())
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            if update.rows_affected() != 1 {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "staging lease changed during expiry reconciliation",
+                ));
+            }
+            result.expired_staging_leases += 1;
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(result)
+    }
+
+    async fn record_materialization_receipt(
+        &self,
+        request: crate::MaterializationReceiptRequest,
+    ) -> CentralResult<ObjectPlacementV2> {
+        let receipt = request.receipt;
+        let object = request.object;
+        object.validate().map_err(protocol_invalid)?;
+        receipt
+            .validate_against(&object)
+            .map_err(protocol_invalid)?;
+        let _gate = self.materialization_receipt_gate.lock().await;
+        if let Some(placement) = self.replay_materialization_receipt(&receipt).await? {
+            return Ok(placement);
+        }
+        let parent = self
+            .get_materialization(
+                &receipt.tenant_id,
+                &receipt.object_namespace_id,
+                &receipt.materialization_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization not found",
+                )
+            })?;
+        if parent.key.object_namespace_id != receipt.object_namespace_id
+            || parent.key.target_storage_volume_id != receipt.target_storage_volume_id
+            || parent.plan_revision != receipt.plan_revision
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization receipt does not match its parent",
+            )
+            .with_retryable(false));
+        }
+        let batch_row = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id \
+             FROM materialization_batches WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? AND batch_id = ? LIMIT 1",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.materialization_id.as_str())
+        .bind(receipt.batch_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "materialization Batch not found",
+            )
+        })?;
+        let batch = decode_v2_batch(&batch_row)?;
+        if batch.plan_revision != receipt.plan_revision
+            || batch.batch_attempt != receipt.batch_attempt
+            || batch.target.tenant_id != receipt.tenant_id
+            || batch.target.object_namespace_id != receipt.object_namespace_id
+            || batch.target.placement_generation != receipt.target_placement_generation
+            || batch.target.storage_volume_id != receipt.target_storage_volume_id
+            || !batch.object_ids.contains(&receipt.object_id)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization receipt does not match its Batch fence",
+            )
+            .with_retryable(false));
+        }
+        if receipt.verified_at_unix_ms.get() >= batch.deadline_unix_ms.get() {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "receipt verification must occur before the materialization batch deadline",
+            )
+            .with_retryable(false));
+        }
+        let object_row = sqlx::query(
+            "SELECT payload, state, object_namespace_id, staging_key, object_id, size, encoding, confirmed_offset, plan_revision, attempt \
+             FROM materialization_objects WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? LIMIT 1",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.materialization_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.object_id.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "materialization Object not found",
+            )
+        })?;
+        let task = decode_v2_object(&object_row)?;
+        if task.object != object || task.plan_revision != receipt.plan_revision {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization receipt does not match its Object task",
+            )
+            .with_retryable(false));
+        }
+        if !task.complete()
+            && !task.state.can_transition_to(
+                neoengram_domain::protocol::materialization::MaterializationObjectState::Verified,
+            )
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Object cannot be verified from its current state",
+            )
+            .with_retryable(false));
+        }
+        if receipt.batch_attempt < task.attempt
+            || receipt.batch_attempt > Generation::new(task.attempt.get().saturating_add(1))
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization receipt attempt is stale or skipped",
+            )
+            .with_retryable(false));
+        }
+        let object_set = self
+            .get_commit_object_set(&receipt.tenant_id, &parent.key.commit_id.digest())
+            .await?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization Commit ObjectSet not found",
+                )
+            })?;
+        let expected = object_set
+            .object_set
+            .objects
+            .iter()
+            .find(|candidate| candidate.object_id == receipt.object_id)
+            .copied()
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "receipt object is not part of the Commit ObjectSet",
+                )
+                .with_retryable(false)
+            })?;
+        if expected.object_id != object.object_id
+            || expected.size != object.size
+            || expected.encoding != object.encoding
+            || expected.ordinal != object.ordinal
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "receipt ObjectRef disagrees with the Commit ObjectSet",
+            )
+            .with_retryable(false));
+        }
+
+        // The receipt, placement, checkpoint, Job progress and derived Coverage form one durable
+        // publication boundary.  All reads below are repeated through this transaction where a
+        // concurrent planner could otherwise change the active Batch fence after validation.
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let existing = sqlx::query(
+            "SELECT payload, tenant_id, object_namespace_id, receipt_id, materialization_id, batch_id, \
+             plan_revision, batch_attempt, object_id, size, encoding, verified_digest, \
+             target_storage_volume_id, target_placement_generation, committed_offset, verified_at_unix_ms \
+             FROM materialization_receipts WHERE tenant_id = ? AND object_namespace_id = ? AND receipt_id = ? LIMIT 1",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.receipt_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if let Some(row) = existing {
+            let old = decode_v2_materialization_receipt(&row)?;
+            if old != receipt {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "materialization receipt ID is already in use",
+                )
+                .with_retryable(false));
+            }
+            let placement_row = sqlx::query(
+                "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements \
+                 WHERE tenant_id = ? AND object_namespace_id = ? AND object_id = ? \
+                   AND storage_volume_id = ? AND placement_generation = ? LIMIT 1",
+            )
+            .bind(receipt.tenant_id.as_str())
+            .bind(receipt.object_namespace_id.as_str())
+            .bind(receipt.object_id.as_bytes().as_slice())
+            .bind(receipt.target_storage_volume_id.as_str())
+            .bind(v2_i64(
+                receipt.target_placement_generation.get(),
+                "target_placement_generation",
+            )?)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| storage_corruption("materialization receipt has no Placement"))?;
+            let placement = decode_v2_object_placement(&placement_row)?;
+            if placement.object_id != receipt.object_id
+                || placement.object_namespace_id != receipt.object_namespace_id
+                || placement.size != receipt.size
+                || placement.encoding != receipt.encoding
+                || placement.verified_digest != receipt.verified_digest
+                || placement.storage_volume_id.as_ref() != Some(&receipt.target_storage_volume_id)
+                || placement.placement_generation != receipt.target_placement_generation
+                || !placement.readable()
+            {
+                return Err(storage_corruption(
+                    "materialization receipt Placement disagrees with its evidence",
+                ));
+            }
+            transaction.commit().await.map_err(storage_error)?;
+            let batch = self
+                .list_materialization_batches(
+                    &receipt.tenant_id,
+                    &receipt.object_namespace_id,
+                    &receipt.materialization_id,
+                )
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.batch_id == receipt.batch_id)
+                .ok_or_else(|| storage_corruption("materialization receipt replay has no Batch"))?;
+            let task = self
+                .list_materialization_objects(
+                    &receipt.tenant_id,
+                    &receipt.object_namespace_id,
+                    &receipt.materialization_id,
+                )
+                .await?
+                .into_iter()
+                .find(|candidate| {
+                    candidate.object.object_namespace_id == receipt.object_namespace_id
+                        && candidate.object.object_id == receipt.object_id
+                })
+                .ok_or_else(|| {
+                    storage_corruption("materialization receipt replay has no Object task")
+                })?;
+            self.release_receipt_leases(&receipt, &batch, &task).await?;
+            return Ok(placement);
+        }
+
+        let batch_row = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id \
+             FROM materialization_batches WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? AND batch_id = ? LIMIT 1",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.materialization_id.as_str())
+        .bind(receipt.batch_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "materialization Batch not found",
+            )
+        })?;
+        let batch = decode_v2_batch(&batch_row)?;
+        if batch.plan_revision != receipt.plan_revision
+            || batch.batch_attempt != receipt.batch_attempt
+            || batch.target.tenant_id != receipt.tenant_id
+            || batch.target.object_namespace_id != receipt.object_namespace_id
+            || batch.target.placement_generation != receipt.target_placement_generation
+            || batch.target.storage_volume_id != receipt.target_storage_volume_id
+            || !batch.object_ids.contains(&receipt.object_id)
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization receipt does not match the active Batch fence",
+            )
+            .with_retryable(false));
+        }
+
+        let object_row = sqlx::query(
+            "SELECT payload, state, object_namespace_id, staging_key, object_id, size, encoding, confirmed_offset, plan_revision, attempt \
+             FROM materialization_objects WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? LIMIT 1",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.materialization_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.object_id.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "materialization Object not found",
+            )
+        })?;
+        let task = decode_v2_object(&object_row)?;
+        if task.object != object
+            || task.plan_revision != receipt.plan_revision
+            || receipt.batch_attempt < task.attempt
+            || receipt.batch_attempt > Generation::new(task.attempt.get().saturating_add(1))
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization receipt does not match the current Object fence",
+            )
+            .with_retryable(false));
+        }
+        if task.current_batch_id.as_ref() != Some(&receipt.batch_id) {
+            // Source-grouped batches can race for one object after a retry or scheduler replay.
+            // A losing receipt may converge only when this exact plan/attempt already has a
+            // complete, matching target Placement; stale attempts remain fenced.
+            if receipt.batch_attempt != task.attempt {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization receipt belongs to an obsolete Batch or attempt",
+                )
+                .with_retryable(false));
+            }
+            let target_evidence = sqlx::query(
+                "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements \
+                 WHERE tenant_id = ? AND object_namespace_id = ? AND object_id = ? \
+                   AND storage_volume_id = ? AND placement_generation = ? LIMIT 1",
+            )
+            .bind(receipt.tenant_id.as_str())
+            .bind(receipt.object_namespace_id.as_str())
+            .bind(receipt.object_id.as_bytes().as_slice())
+            .bind(receipt.target_storage_volume_id.as_str())
+            .bind(v2_i64(
+                receipt.target_placement_generation.get(),
+                "target_placement_generation",
+            )?)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            let target_has_evidence = target_evidence
+                .as_ref()
+                .map(decode_v2_object_placement)
+                .transpose()?
+                .is_some_and(|placement| placement.readable() && placement.matches_ref(&object));
+            if !target_has_evidence {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization receipt belongs to an obsolete Batch",
+                )
+                .with_retryable(false));
+            }
+        }
+        let object_id = crate::placement_authority::materialization_target_placement_id(&receipt)?;
+        let placement = ObjectPlacementV2 {
+            placement_id: object_id,
+            tenant_id: receipt.tenant_id.clone(),
+            object_namespace_id: receipt.object_namespace_id.clone(),
+            object_id: receipt.object_id,
+            size: receipt.size,
+            encoding: receipt.encoding,
+            verified_digest: receipt.verified_digest,
+            storage_volume_id: Some(receipt.target_storage_volume_id.clone()),
+            archive_id: None,
+            placement_generation: receipt.target_placement_generation,
+            state: neoengram_domain::protocol::materialization::ObjectPlacementState::Verified,
+            failure_domain: format!("volume:{}", receipt.target_storage_volume_id),
+        };
+        let placement_payload = encode(&placement)?;
+        let placement_result = sqlx::query(
+            "INSERT INTO object_placements \
+             (tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, \
+              storage_volume_id, placement_generation, state, failure_domain, created_at_unix_ms, updated_at_unix_ms, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+        )
+        .bind(placement.tenant_id.as_str())
+        .bind(placement.object_namespace_id.as_str())
+        .bind(placement.placement_id.as_str())
+        .bind(placement.object_id.as_bytes().as_slice())
+        .bind(v2_i64(placement.size.get(), "object size")?)
+        .bind(object_encoding_name(placement.encoding))
+        .bind(placement.verified_digest.as_bytes().as_slice())
+        .bind(placement.storage_volume_id.as_ref().map(StorageVolumeId::as_str))
+        .bind(v2_i64(placement.placement_generation.get(), "placement_generation")?)
+        .bind(v2_placement_state_name(placement.state))
+        .bind(&placement.failure_domain)
+        .bind(placement_payload)
+        .execute(&mut *transaction)
+        .await;
+        let stored_placement = match placement_result {
+            Ok(_) => placement.clone(),
+            Err(error) if is_unique(&error) => {
+                let row = sqlx::query(
+                    "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements \
+                     WHERE tenant_id = ? AND object_namespace_id = ? AND object_id = ? AND storage_volume_id = ? AND placement_generation = ? LIMIT 1",
+                )
+                .bind(placement.tenant_id.as_str())
+                .bind(placement.object_namespace_id.as_str())
+                .bind(placement.object_id.as_bytes().as_slice())
+                .bind(placement.storage_volume_id.as_ref().map(StorageVolumeId::as_str))
+                .bind(v2_i64(placement.placement_generation.get(), "placement_generation")?)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+                let row = if let Some(row) = row {
+                    row
+                } else {
+                    sqlx::query(
+                        "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements \
+                         WHERE tenant_id = ? AND object_namespace_id = ? AND placement_id = ? LIMIT 1",
+                    )
+                    .bind(placement.tenant_id.as_str())
+                    .bind(placement.object_namespace_id.as_str())
+                    .bind(placement.placement_id.as_str())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?
+                    .ok_or_else(|| {
+                        storage_corruption("v2 placement uniqueness conflict has no row")
+                    })?
+                };
+                let existing = decode_v2_object_placement(&row)?;
+                if existing == placement || same_v2_placement_evidence(&existing, &placement) {
+                    existing
+                } else {
+                    return Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "v2 object placement identity is already bound to different metadata",
+                    )
+                    .with_retryable(false));
+                }
+            }
+            Err(error) => return Err(storage_error(error)),
+        };
+        let receipt_payload = encode(&receipt)?;
+        let insert = sqlx::query(
+            "INSERT INTO materialization_receipts (tenant_id, object_namespace_id, receipt_id, materialization_id, batch_id, plan_revision, batch_attempt, object_id, size, encoding, verified_digest, target_storage_volume_id, target_placement_generation, committed_offset, verified_at_unix_ms, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.receipt_id.as_str())
+        .bind(receipt.materialization_id.as_str())
+        .bind(receipt.batch_id.as_str())
+        .bind(v2_i64(receipt.plan_revision.get(), "plan_revision")?)
+        .bind(v2_i64(receipt.batch_attempt.get(), "batch_attempt")?)
+        .bind(receipt.object_id.as_bytes().as_slice())
+        .bind(v2_i64(receipt.size.get(), "size")?)
+        .bind(object_encoding_name(receipt.encoding))
+        .bind(receipt.verified_digest.as_bytes().as_slice())
+        .bind(receipt.target_storage_volume_id.as_str())
+        .bind(v2_i64(receipt.target_placement_generation.get(), "target_placement_generation")?)
+        .bind(v2_i64(receipt.committed_offset.get(), "committed_offset")?)
+        .bind(v2_i64(receipt.verified_at_unix_ms.get(), "verified_at_unix_ms")?)
+        .bind(receipt_payload)
+        .execute(&mut *transaction)
+        .await;
+        if let Err(error) = insert {
+            if is_unique(&error) {
+                let row = sqlx::query(
+                    "SELECT payload, tenant_id, object_namespace_id, receipt_id, materialization_id, batch_id, \
+                     plan_revision, batch_attempt, object_id, size, encoding, verified_digest, \
+                     target_storage_volume_id, target_placement_generation, committed_offset, verified_at_unix_ms \
+                     FROM materialization_receipts WHERE tenant_id = ? AND object_namespace_id = ? AND receipt_id = ? LIMIT 1",
+                )
+                .bind(receipt.tenant_id.as_str())
+                .bind(receipt.object_namespace_id.as_str())
+                .bind(receipt.receipt_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+                let row = if let Some(row) = row {
+                    row
+                } else {
+                    sqlx::query(
+                        "SELECT payload, tenant_id, object_namespace_id, receipt_id, materialization_id, batch_id, \
+                         plan_revision, batch_attempt, object_id, size, encoding, verified_digest, \
+                         target_storage_volume_id, target_placement_generation, committed_offset, verified_at_unix_ms \
+                         FROM materialization_receipts WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? AND batch_id = ? AND object_id = ? LIMIT 1",
+                    )
+                    .bind(receipt.tenant_id.as_str())
+                    .bind(receipt.object_namespace_id.as_str())
+                    .bind(receipt.materialization_id.as_str())
+                    .bind(receipt.batch_id.as_str())
+                    .bind(receipt.object_id.as_bytes().as_slice())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(storage_error)?
+                    .ok_or_else(|| {
+                        storage_corruption("materialization receipt uniqueness conflict has no row")
+                    })?
+                };
+                let old = decode_v2_materialization_receipt(&row)?;
+                if old != receipt {
+                    return Err(CentralError::new(
+                        CentralErrorCode::InvalidState,
+                        "materialization receipt ID is already in use",
+                    )
+                    .with_retryable(false));
+                }
+                transaction.commit().await.map_err(storage_error)?;
+                self.release_receipt_leases(&receipt, &batch, &task).await?;
+                return Ok(stored_placement);
+            }
+            return Err(storage_error(error));
+        }
+
+        let mut next_object = task.clone();
+        next_object.confirmed_offset = DecimalU64::new(
+            task.confirmed_offset
+                .get()
+                .max(receipt.committed_offset.get()),
+        );
+        if !task.complete() {
+            next_object.state =
+                neoengram_domain::protocol::materialization::MaterializationObjectState::Verified;
+        }
+        next_object.attempt = task.attempt.max(receipt.batch_attempt);
+        let next_object_payload = encode(&next_object)?;
+        // The receipt may belong to a competing Batch that already lost the object CAS.  In that
+        // case the transaction-local `task` is authoritative: bind the update to its current
+        // Batch, not to the losing receipt's Batch, so convergence advances the same durable task
+        // without reopening the planner race.
+        let current_batch_id = task.current_batch_id.as_ref().ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Object has no active Batch fence",
+            )
+        })?;
+        let updated_object = sqlx::query(
+            "UPDATE materialization_objects SET confirmed_offset = ?, state = ?, attempt = ?, payload = ? \
+             WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? \
+               AND current_batch_id = ? AND plan_revision = ? AND attempt = ? AND state = ?",
+        )
+        .bind(v2_i64(next_object.confirmed_offset.get(), "confirmed_offset")?)
+        .bind(materialization_object_state_name(next_object.state))
+        .bind(v2_i64(next_object.attempt.get(), "attempt")?)
+        .bind(next_object_payload)
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.materialization_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.object_id.as_bytes().as_slice())
+        .bind(current_batch_id.as_str())
+        .bind(v2_i64(receipt.plan_revision.get(), "plan_revision")?)
+        .bind(v2_i64(task.attempt.get(), "expected_attempt")?)
+        .bind(materialization_object_state_name(task.state))
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if updated_object.rows_affected() == 0 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Object revision or batch changed",
+            ));
+        }
+
+        let task_rows = sqlx::query(
+            "SELECT payload, state, object_namespace_id, staging_key, object_id, size, encoding, confirmed_offset, plan_revision, attempt \
+             FROM materialization_objects WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? ORDER BY object_id",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.materialization_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let tasks = task_rows
+            .iter()
+            .map(decode_v2_object)
+            .collect::<CentralResult<Vec<_>>>()?;
+        let verified_objects = tasks.iter().filter(|task| task.complete()).count() as u64;
+        let verified_bytes = tasks
+            .iter()
+            .filter(|task| task.complete())
+            .map(|task| task.object.size.get())
+            .sum::<u64>();
+        let mut next_job = parent.clone();
+        next_job.verified_object_count = DecimalU64::new(verified_objects);
+        next_job.verified_bytes = DecimalU64::new(verified_bytes);
+        next_job.missing_object_count =
+            DecimalU64::new(parent.object_count.get().saturating_sub(verified_objects));
+        next_job.missing_bytes =
+            DecimalU64::new(parent.total_bytes.get().saturating_sub(verified_bytes));
+        next_job.state = if next_job.key.coverage_goal.satisfied_by(
+            next_job.verified_object_count.get(),
+            next_job.verified_bytes.get(),
+            next_job.object_count.get(),
+            next_job.total_bytes.get(),
+        ) {
+            MaterializationJobState::Complete
+        } else {
+            match parent.state {
+                MaterializationJobState::Queued
+                | MaterializationJobState::Planning
+                | MaterializationJobState::WaitingForSources
+                | MaterializationJobState::Materializing
+                | MaterializationJobState::Verifying => MaterializationJobState::Verifying,
+                state => state,
+            }
+        };
+        if !parent.state.can_transition_to(next_job.state) {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "materialization Job state transition is not allowed",
+            )
+            .with_retryable(false));
+        }
+        next_job.updated_at_unix_ms = UnixMillis::new(
+            parent
+                .updated_at_unix_ms
+                .get()
+                .max(receipt.verified_at_unix_ms.get()),
+        );
+        let next_job_payload = encode(&next_job)?;
+        let object_set_digest = object_set.object_set.object_set_digest;
+        let updated_job = sqlx::query(
+            "UPDATE materializations SET state = ?, object_set_digest = ?, object_count = ?, total_bytes = ?, \
+                 verified_object_count = ?, verified_bytes = ?, missing_object_count = ?, missing_bytes = ?, \
+                 source_count = ?, deadline_unix_ms = ?, payload = ?, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? AND plan_revision = ? AND state = ?",
+        )
+        .bind(materialization_job_state_name(next_job.state))
+        .bind(object_set_digest.as_bytes().as_slice())
+        .bind(v2_i64(next_job.object_count.get(), "object_count")?)
+        .bind(v2_i64(next_job.total_bytes.get(), "total_bytes")?)
+        .bind(v2_i64(next_job.verified_object_count.get(), "verified_object_count")?)
+        .bind(v2_i64(next_job.verified_bytes.get(), "verified_bytes")?)
+        .bind(v2_i64(next_job.missing_object_count.get(), "missing_object_count")?)
+        .bind(v2_i64(next_job.missing_bytes.get(), "missing_bytes")?)
+        .bind(v2_i64(next_job.source_count.get(), "source_count")?)
+        .bind(v2_i64(next_job.deadline_unix_ms.get(), "deadline_unix_ms")?)
+        .bind(next_job_payload)
+        .bind(v2_i64(next_job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.materialization_id.as_str())
+        .bind(v2_i64(receipt.plan_revision.get(), "plan_revision")?)
+        .bind(materialization_job_state_name(parent.state))
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if updated_job.rows_affected() == 0 {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Job plan revision changed",
+            ));
+        }
+
+        let placement_rows = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain \
+             FROM object_placements WHERE tenant_id = ? AND object_namespace_id = ? AND storage_volume_id = ? AND placement_generation = ? ORDER BY object_id, placement_id",
+        )
+        .bind(receipt.tenant_id.as_str())
+        .bind(receipt.object_namespace_id.as_str())
+        .bind(receipt.target_storage_volume_id.as_str())
+        .bind(v2_i64(receipt.target_placement_generation.get(), "placement_generation")?)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let object_ids = object_set
+            .object_set
+            .objects
+            .iter()
+            .map(|object| object.object_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let placements = placement_rows
+            .iter()
+            .map(decode_v2_object_placement)
+            .collect::<CentralResult<Vec<_>>>()?
+            .into_iter()
+            .filter(|candidate| object_ids.contains(&candidate.object_id))
+            .collect::<Vec<_>>();
+        let coverage = VolumeCommitCoverage::from_placements(
+            receipt.tenant_id.clone(),
+            receipt.object_namespace_id.clone(),
+            parent.key.commit_id,
+            receipt.target_storage_volume_id.clone(),
+            receipt.target_placement_generation,
+            &object_set.object_set,
+            &placements,
+        )
+        .map_err(protocol_invalid)?;
+        let existing_coverage = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes \
+             FROM volume_commit_coverages WHERE tenant_id = ? AND object_namespace_id = ? AND commit_id = ? AND storage_volume_id = ? AND placement_generation = ? LIMIT 1",
+        )
+        .bind(coverage.tenant_id.as_str())
+        .bind(coverage.object_namespace_id.as_str())
+        .bind(coverage.commit_id.digest().as_bytes().as_slice())
+        .bind(coverage.storage_volume_id.as_str())
+        .bind(v2_i64(coverage.placement_generation.get(), "placement_generation")?)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if let Some(row) = existing_coverage {
+            let existing = decode_v2_coverage(&row)?;
+            if existing.state
+                == neoengram_domain::protocol::materialization::CoverageState::Complete
+                && coverage.state
+                    != neoengram_domain::protocol::materialization::CoverageState::Complete
+            {
+                transaction.commit().await.map_err(storage_error)?;
+                self.release_receipt_leases(&receipt, &batch, &task).await?;
+                return Ok(stored_placement);
+            }
+        }
+        let coverage_payload = encode(&coverage)?;
+        sqlx::query(
+            "INSERT INTO volume_commit_coverages \
+             (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, state, created_at_unix_ms, updated_at_unix_ms, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?) \
+             ON CONFLICT (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation) \
+             DO UPDATE SET object_set_digest = excluded.object_set_digest, object_count = excluded.object_count, verified_object_count = excluded.verified_object_count, total_bytes = excluded.total_bytes, verified_bytes = excluded.verified_bytes, state = excluded.state, payload = excluded.payload",
+        )
+        .bind(coverage.tenant_id.as_str())
+        .bind(coverage.object_namespace_id.as_str())
+        .bind(coverage.commit_id.digest().as_bytes().as_slice())
+        .bind(coverage.storage_volume_id.as_str())
+        .bind(v2_i64(coverage.placement_generation.get(), "placement_generation")?)
+        .bind(coverage.object_set_digest.as_bytes().as_slice())
+        .bind(v2_i64(coverage.object_count.get(), "object_count")?)
+        .bind(v2_i64(coverage.verified_object_count.get(), "verified_object_count")?)
+        .bind(v2_i64(coverage.total_bytes.get(), "total_bytes")?)
+        .bind(v2_i64(coverage.verified_bytes.get(), "verified_bytes")?)
+        .bind(coverage_state_name(coverage.state))
+        .bind(coverage_payload)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        self.release_receipt_leases(&receipt, &batch, &task).await?;
+        Ok(stored_placement)
+    }
+
+    async fn release_object_read_lease(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        lease_id: &neoengram_domain::protocol::LeaseId,
+    ) -> CentralResult<Option<ObjectReadLease>> {
+        let row = sqlx::query("SELECT payload, state, tenant_id, object_namespace_id, materialization_id, batch_id, object_id, placement_id, placement_generation, expires_at_unix_ms FROM object_read_leases WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ?")
+            .bind(tenant_id.as_str())
+            .bind(object_namespace_id.as_str())
+            .bind(lease_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut lease = decode_v2_read_lease(&row)?;
+        if lease.state == MaterializationLeaseState::Active {
+            lease.state = MaterializationLeaseState::Released;
+        }
+        let payload = encode(&lease)?;
+        sqlx::query("UPDATE object_read_leases SET state = ?, payload = ? WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ?")
+            .bind(materialization_lease_state_name(lease.state))
+            .bind(payload)
+            .bind(tenant_id.as_str())
+            .bind(object_namespace_id.as_str())
+            .bind(lease_id.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        Ok(Some(lease))
+    }
+
+    async fn release_staging_lease(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        lease_id: &neoengram_domain::protocol::LeaseId,
+    ) -> CentralResult<Option<StagingLease>> {
+        let row = sqlx::query("SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, object_id, staging_key, target_placement_generation, expires_at_unix_ms FROM staging_leases WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ?")
+            .bind(tenant_id.as_str())
+            .bind(object_namespace_id.as_str())
+            .bind(lease_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut lease = decode_v2_staging_lease(&row)?;
+        if lease.state == MaterializationLeaseState::Active {
+            lease.state = MaterializationLeaseState::Released;
+        }
+        let payload = encode(&lease)?;
+        sqlx::query(
+            "UPDATE staging_leases SET state = ?, payload = ? WHERE tenant_id = ? AND object_namespace_id = ? AND lease_id = ?",
+        )
+        .bind(materialization_lease_state_name(lease.state))
+        .bind(payload)
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(lease_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        Ok(Some(lease))
+    }
+
     async fn get_commit_object_set(
         &self,
         tenant_id: &TenantId,
@@ -1069,7 +5876,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         backend_id: &BackendId,
     ) -> CentralResult<Option<CommitPlacementSet>> {
         let sql = format!(
-            "SELECT {PLACEMENT_SET_COLUMNS} FROM commit_placement_sets \
+            "SELECT {PLACEMENT_SET_COLUMNS} FROM legacy_commit_placement_sets \
              WHERE tenant_id = ? AND commit_id = ? AND backend_id = ?",
         );
         sqlx::query(&sql)
@@ -1089,7 +5896,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         commit_id: &ContentDigest,
     ) -> CentralResult<Vec<CommitPlacementSet>> {
         let sql = format!(
-            "SELECT {PLACEMENT_SET_COLUMNS} FROM commit_placement_sets \
+            "SELECT {PLACEMENT_SET_COLUMNS} FROM legacy_commit_placement_sets \
              WHERE tenant_id = ? AND commit_id = ? AND state = 'published' \
              ORDER BY backend_id",
         );
@@ -1108,7 +5915,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         commit_id: &ContentDigest,
     ) -> CentralResult<Vec<CommitPlacementSet>> {
         let sql = format!(
-            "SELECT {PLACEMENT_SET_COLUMNS} FROM commit_placement_sets \
+            "SELECT {PLACEMENT_SET_COLUMNS} FROM legacy_commit_placement_sets \
              WHERE tenant_id = ? AND commit_id = ? ORDER BY backend_id, placement_generation",
         );
         let rows = sqlx::query(&sql)
@@ -1144,7 +5951,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let result = sqlx::query(
-            "INSERT INTO commit_placement_sets \
+            "INSERT INTO legacy_commit_placement_sets \
              (tenant_id, placement_set_id, commit_id, backend_id, storage_volume_id, archive_id, \
               object_set_digest, object_count, verified_object_count, placement_generation, state, \
               created_at_unix_ms, updated_at_unix_ms) \
@@ -1274,7 +6081,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         let commit_id = object_set.commit_id.digest();
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         if let Some(existing) = sqlx::query(&format!(
-            "SELECT {PLACEMENT_SET_COLUMNS} FROM commit_placement_sets \
+            "SELECT {PLACEMENT_SET_COLUMNS} FROM legacy_commit_placement_sets \
              WHERE tenant_id = ? AND commit_id = ? AND state = 'published' \
              ORDER BY backend_id LIMIT 1",
         ))
@@ -1475,7 +6282,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         for placement in &placements {
             let placement_id = placement_id_for(placement)?;
             sqlx::query(
-                "INSERT INTO placement_objects \
+                "INSERT INTO legacy_placement_objects \
                  (tenant_id, placement_id, object_id, backend_id, storage_volume_id, archive_id, \
                   edge_cluster_id, gateway_pool_id, region, placement_generation, state, \
                   verified_size, verified_digest, failure_domain, created_at_unix_ms, \
@@ -1521,7 +6328,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .await
             .map_err(storage_error)?;
             let stored = sqlx::query(&format!(
-                "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM placement_objects \
+                "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM legacy_placement_objects \
                  WHERE tenant_id = ? AND object_id = ? AND backend_id = ? \
                    AND placement_generation = ?",
             ))
@@ -1545,7 +6352,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         }
 
         sqlx::query(
-            "INSERT INTO commit_placement_sets \
+            "INSERT INTO legacy_commit_placement_sets \
              (tenant_id, placement_set_id, commit_id, backend_id, storage_volume_id, archive_id, \
               object_set_digest, object_count, verified_object_count, placement_generation, state, \
               created_at_unix_ms, updated_at_unix_ms) \
@@ -1580,7 +6387,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         .await
         .map_err(storage_error)?;
         let stored = sqlx::query(&format!(
-            "SELECT {PLACEMENT_SET_COLUMNS} FROM commit_placement_sets \
+            "SELECT {PLACEMENT_SET_COLUMNS} FROM legacy_commit_placement_sets \
              WHERE tenant_id = ? AND commit_id = ? AND backend_id = ?",
         ))
         .bind(tenant_id.as_str())
@@ -1608,7 +6415,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         let tenant_id = placement.tenant_id.clone();
         let placement_id = placement_id_for(&placement)?;
         let result = sqlx::query(
-            "INSERT INTO placement_objects \
+            "INSERT INTO legacy_placement_objects \
              (tenant_id, placement_id, object_id, backend_id, storage_volume_id, archive_id, \
               edge_cluster_id, gateway_pool_id, region, placement_generation, state, verified_size, \
               verified_digest, failure_domain, created_at_unix_ms, updated_at_unix_ms) \
@@ -1638,7 +6445,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             Ok(_) => Ok(placement),
             Err(error) if is_unique(&error) => {
                 let row = sqlx::query(&format!(
-                    "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM placement_objects \
+                    "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM legacy_placement_objects \
                      WHERE tenant_id = ? AND object_id = ? AND backend_id = ? AND placement_generation = ?",
                 ))
                 .bind(tenant_id.as_str())
@@ -1678,7 +6485,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         // aligned with the in-memory authority: a deleted copy may only be replayed as deleted,
         // never resurrected as readable, retiring, or lost.
         let current = sqlx::query(&format!(
-            "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM placement_objects \
+            "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM legacy_placement_objects \
              WHERE tenant_id = ? AND object_id = ? AND backend_id = ? AND placement_generation = ?"
         ))
         .bind(tenant_id.as_str())
@@ -1710,7 +6517,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let result = sqlx::query(
-            "UPDATE placement_objects SET state = ?, updated_at_unix_ms = updated_at_unix_ms \
+            "UPDATE legacy_placement_objects SET state = ?, updated_at_unix_ms = updated_at_unix_ms \
              WHERE tenant_id = ? AND object_id = ? AND backend_id = ? AND placement_generation = ?",
         )
         .bind(placement_state_name(state))
@@ -1732,7 +6539,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         sqlx::query(&format!(
-            "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM placement_objects \
+            "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM legacy_placement_objects \
              WHERE tenant_id = ? AND object_id = ? AND backend_id = ? AND placement_generation = ?"
         ))
         .bind(tenant_id.as_str())
@@ -1756,7 +6563,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         object_id: &ObjectId,
     ) -> CentralResult<Vec<ObjectPlacement>> {
         let sql = format!(
-            "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM placement_objects \
+            "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM legacy_placement_objects \
              WHERE tenant_id = ? AND object_id = ? ORDER BY backend_id, placement_generation",
         );
         let rows = sqlx::query(&sql)
@@ -1774,7 +6581,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         replication_id: &ReplicationId,
     ) -> CentralResult<Option<ReplicationRecord>> {
         let sql = format!(
-            "SELECT {REPLICATION_COLUMNS} FROM replications WHERE tenant_id = ? AND replication_id = ?"
+            "SELECT {REPLICATION_COLUMNS} FROM legacy_replications WHERE tenant_id = ? AND replication_id = ?"
         );
         sqlx::query(&sql)
             .bind(tenant_id.as_str())
@@ -1792,7 +6599,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         request_id: &RequestId,
     ) -> CentralResult<Option<ReplicationRecord>> {
         let sql = format!(
-            "SELECT {REPLICATION_COLUMNS} FROM replications WHERE tenant_id = ? AND request_id = ?"
+            "SELECT {REPLICATION_COLUMNS} FROM legacy_replications WHERE tenant_id = ? AND request_id = ?"
         );
         sqlx::query(&sql)
             .bind(tenant_id.as_str())
@@ -1810,7 +6617,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         commit_id: &ContentDigest,
     ) -> CentralResult<Vec<ReplicationRecord>> {
         let sql = format!(
-            "SELECT {REPLICATION_COLUMNS} FROM replications \
+            "SELECT {REPLICATION_COLUMNS} FROM legacy_replications \
              WHERE tenant_id = ? AND commit_id = ? ORDER BY created_at_unix_ms, replication_id",
         );
         let rows = sqlx::query(&sql)
@@ -1828,7 +6635,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         agent_id: &AgentId,
     ) -> CentralResult<Vec<ReplicationRecord>> {
         let sql = format!(
-            "SELECT {REPLICATION_COLUMNS} FROM replications \
+            "SELECT {REPLICATION_COLUMNS} FROM legacy_replications \
              WHERE tenant_id = ? AND target_agent_id = ? ORDER BY created_at_unix_ms, replication_id",
         );
         let rows = sqlx::query(&sql)
@@ -1978,7 +6785,7 @@ impl PlacementRepository for SqliteAuthorityStore {
                 | ReplicationState::Verifying
         ) {
             let target_placement_exists: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM commit_placement_sets \
+                "SELECT 1 FROM legacy_commit_placement_sets \
                  WHERE tenant_id = ? AND commit_id = ? AND backend_id = ? LIMIT 1",
             )
             .bind(record.tenant_id.as_str())
@@ -1997,7 +6804,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             }
         }
         let result = sqlx::query(
-            "INSERT INTO replications \
+            "INSERT INTO legacy_replications \
              (tenant_id, replication_id, commit_id, target_backend_id, target_storage_volume_id, \
               target_archive_id, source_placement_set_id, source_backend_id, source_storage_volume_id, \
               source_edge_cluster_id, source_gateway_pool_id, source_placement_generation, \
@@ -2063,7 +6870,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             Ok(_) => {
                 if let Some(artifact_id) = &record.artifact_id {
                     sqlx::query(
-                        "INSERT INTO replication_artifacts (tenant_id, replication_id, artifact_id) \
+                        "INSERT INTO legacy_replication_artifacts (tenant_id, replication_id, artifact_id) \
                          VALUES (?, ?, ?)",
                     )
                     .bind(record.tenant_id.as_str())
@@ -2168,7 +6975,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let result = sqlx::query(
-            "UPDATE replications SET state = ?, completed_objects = ?, completed_bytes = ?, \
+            "UPDATE legacy_replications SET state = ?, completed_objects = ?, completed_bytes = ?, \
              error_code = ?, error_message = ?, updated_at_unix_ms = ? \
              WHERE tenant_id = ? AND replication_id = ? AND state = ? AND attempt = ? \
                AND completed_objects = ? AND completed_bytes = ? AND updated_at_unix_ms = ?",
@@ -2229,7 +7036,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .await
             .map_err(storage_error)?;
         if let Some(row) = sqlx::query(
-            "SELECT request_payload, result_payload FROM replication_retry_mutations \
+            "SELECT request_payload, result_payload FROM legacy_replication_retry_mutations \
              WHERE tenant_id = ? AND request_id = ?",
         )
         .bind(request.tenant_id.as_str())
@@ -2262,7 +7069,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         }
 
         let current = sqlx::query(&format!(
-            "SELECT {REPLICATION_COLUMNS} FROM replications \
+            "SELECT {REPLICATION_COLUMNS} FROM legacy_replications \
              WHERE tenant_id = ? AND replication_id = ?",
         ))
         .bind(request.tenant_id.as_str())
@@ -2311,7 +7118,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false)
         })?;
         let active_exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM replications \
+            "SELECT 1 FROM legacy_replications \
              WHERE tenant_id = ? AND commit_id = ? AND target_backend_id = ? \
                AND replication_id <> ? \
                AND state IN ('queued', 'planning', 'transferring', 'verifying') LIMIT 1",
@@ -2331,7 +7138,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let target_placement_exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM commit_placement_sets \
+            "SELECT 1 FROM legacy_commit_placement_sets \
              WHERE tenant_id = ? AND commit_id = ? AND backend_id = ? LIMIT 1",
         )
         .bind(current.tenant_id.as_str())
@@ -2348,7 +7155,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let update = sqlx::query(
-            "UPDATE replications SET state = 'queued', attempt = ?, error_code = NULL, \
+            "UPDATE legacy_replications SET state = 'queued', attempt = ?, error_code = NULL, \
              error_message = NULL, updated_at_unix_ms = ? \
              WHERE tenant_id = ? AND replication_id = ? AND state = ? AND attempt = ?",
         )
@@ -2385,7 +7192,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let result = sqlx::query(&format!(
-            "SELECT {REPLICATION_COLUMNS} FROM replications \
+            "SELECT {REPLICATION_COLUMNS} FROM legacy_replications \
              WHERE tenant_id = ? AND replication_id = ?",
         ))
         .bind(request.tenant_id.as_str())
@@ -2397,7 +7204,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         .transpose()?
         .ok_or_else(|| storage_corruption("retried replication disappeared"))?;
         sqlx::query(
-            "INSERT INTO replication_retry_mutations \
+            "INSERT INTO legacy_replication_retry_mutations \
              (tenant_id, request_id, replication_id, request_payload, result_payload) \
              VALUES (?, ?, ?, ?, ?)",
         )
@@ -2559,7 +7366,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         // Acquire SQLite's writer lock before reading checkpoints. This keeps a concurrent Agent
         // checkpoint update from landing between validation and the publication writes.
         let fence = sqlx::query(
-            "UPDATE replications SET updated_at_unix_ms = updated_at_unix_ms \
+            "UPDATE legacy_replications SET updated_at_unix_ms = updated_at_unix_ms \
              WHERE tenant_id = ? AND replication_id = ? AND state = 'verifying' AND attempt = ?",
         )
         .bind(request.tenant_id.as_str())
@@ -2580,7 +7387,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let current_row = sqlx::query(
-            "SELECT state, attempt FROM replications WHERE tenant_id = ? AND replication_id = ?",
+            "SELECT state, attempt FROM legacy_replications WHERE tenant_id = ? AND replication_id = ?",
         )
         .bind(request.tenant_id.as_str())
         .bind(request.replication_id.as_str())
@@ -2607,7 +7414,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let conflicting_active_target: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM replications \
+            "SELECT 1 FROM legacy_replications \
              WHERE tenant_id = ? AND commit_id = ? AND target_backend_id = ? \
                AND replication_id <> ? \
                AND state IN ('queued', 'planning', 'transferring', 'verifying') LIMIT 1",
@@ -2629,7 +7436,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         }
         let checkpoint_rows = sqlx::query(
             "SELECT tenant_id, replication_id, object_id, offset, state, retry_count, updated_at_unix_ms \
-             FROM replication_objects WHERE tenant_id = ? AND replication_id = ? ORDER BY object_id",
+             FROM legacy_replication_objects WHERE tenant_id = ? AND replication_id = ? ORDER BY object_id",
         )
         .bind(request.tenant_id.as_str())
         .bind(request.replication_id.as_str())
@@ -2645,7 +7452,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         for placement in &request.placements {
             let placement_id = placement_id_for(placement)?;
             sqlx::query(
-                "INSERT INTO placement_objects \
+                "INSERT INTO legacy_placement_objects \
                  (tenant_id, placement_id, object_id, backend_id, storage_volume_id, archive_id, \
                   edge_cluster_id, gateway_pool_id, region, placement_generation, state, \
                   verified_size, verified_digest, failure_domain, created_at_unix_ms, updated_at_unix_ms) \
@@ -2669,7 +7476,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .await
             .map_err(storage_error)?;
             let stored = sqlx::query(&format!(
-                "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM placement_objects \
+                "SELECT {OBJECT_PLACEMENT_COLUMNS} FROM legacy_placement_objects \
                  WHERE tenant_id = ? AND object_id = ? AND backend_id = ? AND placement_generation = ?",
             ))
             .bind(placement.tenant_id.as_str())
@@ -2692,7 +7499,7 @@ impl PlacementRepository for SqliteAuthorityStore {
 
         let placement_set = &request.placement_set;
         sqlx::query(
-            "INSERT INTO commit_placement_sets \
+            "INSERT INTO legacy_commit_placement_sets \
              (tenant_id, placement_set_id, commit_id, backend_id, storage_volume_id, archive_id, \
               object_set_digest, object_count, verified_object_count, placement_generation, state, \
               created_at_unix_ms, updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0) \
@@ -2713,7 +7520,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         .await
         .map_err(storage_error)?;
         let stored_set = sqlx::query(&format!(
-            "SELECT {PLACEMENT_SET_COLUMNS} FROM commit_placement_sets \
+            "SELECT {PLACEMENT_SET_COLUMNS} FROM legacy_commit_placement_sets \
              WHERE tenant_id = ? AND commit_id = ? AND backend_id = ?",
         ))
         .bind(placement_set.tenant_id.as_str())
@@ -2732,7 +7539,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let result = sqlx::query(
-            "UPDATE replications SET state = 'published', target_placement_set_id = ?, \
+            "UPDATE legacy_replications SET state = 'published', target_placement_set_id = ?, \
              completed_objects = total_objects, completed_bytes = total_bytes, error_code = NULL, \
              error_message = NULL, updated_at_unix_ms = ? \
              WHERE tenant_id = ? AND replication_id = ? AND state = 'verifying' AND attempt = ?",
@@ -2777,7 +7584,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         // and checkpoint write one atomic operation relative to finalize/cancel.
         let fence =
             sqlx::query(
-                "UPDATE replications SET updated_at_unix_ms = updated_at_unix_ms \
+                "UPDATE legacy_replications SET updated_at_unix_ms = updated_at_unix_ms \
              WHERE tenant_id = ? AND replication_id = ? AND attempt = ? \
                AND state NOT IN ('published', 'failed', 'cancelled')",
             )
@@ -2809,7 +7616,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         let object_id = record.object_id;
         let existing = sqlx::query(
             "SELECT tenant_id, replication_id, object_id, offset, state, retry_count, updated_at_unix_ms \
-             FROM replication_objects WHERE tenant_id = ? AND replication_id = ? AND object_id = ?",
+             FROM legacy_replication_objects WHERE tenant_id = ? AND replication_id = ? AND object_id = ?",
         )
         .bind(record.tenant_id.as_str())
         .bind(record.replication_id.as_str())
@@ -2835,7 +7642,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             }
         }
         sqlx::query(
-            "INSERT INTO replication_objects \
+            "INSERT INTO legacy_replication_objects \
              (tenant_id, replication_id, object_id, offset, state, retry_count, updated_at_unix_ms) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (tenant_id, replication_id, object_id) DO UPDATE SET \
@@ -2863,7 +7670,7 @@ impl PlacementRepository for SqliteAuthorityStore {
     ) -> CentralResult<Vec<ReplicationObjectRecord>> {
         let rows = sqlx::query(
             "SELECT tenant_id, replication_id, object_id, offset, state, retry_count, updated_at_unix_ms \
-             FROM replication_objects WHERE tenant_id = ? AND replication_id = ? ORDER BY object_id",
+             FROM legacy_replication_objects WHERE tenant_id = ? AND replication_id = ? ORDER BY object_id",
         )
         .bind(tenant_id.as_str())
         .bind(replication_id.as_str())
@@ -3008,9 +7815,9 @@ impl PlacementRepository for SqliteAuthorityStore {
         for object in &object_set.object_set.objects {
             let rows = sqlx::query(
                 "SELECT p.backend_id, p.state, p.storage_volume_id, p.archive_id, p.placement_generation, \
-                        p.verified_size, p.verified_digest FROM placement_objects p \
+                        p.verified_size, p.verified_digest FROM legacy_placement_objects p \
                  WHERE p.tenant_id = ? AND p.object_id = ? \
-                   AND EXISTS (SELECT 1 FROM commit_placement_sets s \
+                   AND EXISTS (SELECT 1 FROM legacy_commit_placement_sets s \
                      WHERE s.tenant_id = p.tenant_id AND s.commit_id = ? \
                        AND s.backend_id = p.backend_id \
                        AND s.placement_generation = p.placement_generation \

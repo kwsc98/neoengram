@@ -127,19 +127,28 @@ NEOENGRAM_GATEWAY_TRANSFER_TLS_CLIENT_CA_FILE
 The `ca.crt` value must be a PEM bundle that trusts both the Gateway workload CA and the Agent
 replication CA. A production overlay may mount a separate transfer Secret, but it must keep these
 three paths complete and independent from the HTTP/H2 listener configuration. Transfer ALPN is
-`neoengram-transfer-v1`; Central is never a payload proxy and Gateway Pods never mount a business
+`neoengram-transfer-v2`; legacy v1 tickets are rejected by the production listener. Central is
+never a payload proxy and Gateway Pods never mount a business
 Volume.
 
 Relay routing is deliberately overlay-specific. A target Gateway accepts the target Agent hop and
 forwards to the source Gateway; a source Gateway accepts that hop and forwards to the source Agent.
 When a relay is enabled, the role and fixed next hop are required together. Generation values are
 optional startup hints; the Gateway refreshes the tuple from the Central-authorized Agent
-`channel.opened` response and keeps the transfer listener fail-closed until that route is active:
+`channel.opened` response and keeps the transfer listener fail-closed until that route is active.
+For per-source routes, use `NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM_ROUTE` entries in the form
+`<agent-id>=<host>:<port>`. Source Gateways keep these deployment addresses but only activate them
+after the matching local Agent lease is authenticated; disconnect, release, or takeover deactivates
+the entry without losing the address, so a reconnect can reactivate it. Target Gateways treat the
+same entries as remote source-Gateway hops and keep them configured while their own target route
+fence controls admission:
 
 ```text
 NEOENGRAM_GATEWAY_TRANSFER_RELAY_ROLE=target|source
 NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM=<fixed-next-hop-address>
 NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM_SERVER_NAME=<upstream-TLS-server-name>
+# Optional source-specific next hops (repeat for each source Agent):
+NEOENGRAM_GATEWAY_TRANSFER_UPSTREAM_ROUTE=<agent-id>=<host>:<port>
 # Optional static startup fence; omit all three to learn it at runtime.
 NEOENGRAM_GATEWAY_TRANSFER_SESSION_GENERATION=<current-session-generation>
 NEOENGRAM_GATEWAY_TRANSFER_MOUNT_GENERATION=<current-mount-generation>

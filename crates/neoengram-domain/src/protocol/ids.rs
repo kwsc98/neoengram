@@ -86,6 +86,10 @@ macro_rules! resource_id {
 resource_id!(TenantId, "tenant ID");
 resource_id!(ProjectId, "project ID");
 resource_id!(ArtifactId, "artifact ID");
+// A first-class namespace for content-addressed objects.  The initial product mapping is one
+// namespace per Artifact, but the namespace is deliberately carried independently on every v2
+// placement and transfer contract.
+resource_id!(ObjectNamespaceId, "object namespace ID");
 resource_id!(PlaygroundId, "playground ID");
 resource_id!(SnapshotId, "snapshot ID");
 resource_id!(EdgeClusterId, "edge cluster ID");
@@ -132,6 +136,8 @@ resource_id!(PlacementId, "object placement ID");
 resource_id!(PlacementSetId, "commit placement set ID");
 resource_id!(ReplicationId, "replication ID");
 resource_id!(TransferId, "transfer ID");
+resource_id!(MaterializationId, "materialization ID");
+resource_id!(MaterializationBatchId, "materialization batch ID");
 resource_id!(WorkspaceId, "workspace ID");
 
 /// Alias used by placement APIs when the backend is specifically a storage volume or archive.
@@ -139,6 +145,23 @@ pub type StorageBackendId = BackendId;
 
 /// Alias emphasizing that a placement set belongs to a Commit.
 pub type CommitPlacementSetId = PlacementSetId;
+
+impl From<ArtifactId> for ObjectNamespaceId {
+    fn from(value: ArtifactId) -> Self {
+        // Resource IDs have the same strict grammar.  ArtifactId can only have been constructed
+        // through that grammar, so this conversion is infallible while preserving the explicit
+        // namespace on the wire.
+        Self::new(value.into_string()).expect("validated ArtifactId is a valid object namespace")
+    }
+}
+
+impl ObjectNamespaceId {
+    /// Returns the initial v2 namespace mapping for an Artifact.
+    #[must_use]
+    pub fn from_artifact(artifact_id: &ArtifactId) -> Self {
+        artifact_id.clone().into()
+    }
+}
 
 #[cfg(test)]
 mod tests {

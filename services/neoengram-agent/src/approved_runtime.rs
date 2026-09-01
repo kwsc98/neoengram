@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    Agent, AgentAssignmentState, AgentError, AgentErrorCode, Clock, DurableReportSink,
+    Agent, AgentAssignmentState, AgentError, AgentErrorCode, AgentReport, Clock, DurableReportSink,
     LifecycleJournal, OutboundReportQueue, SingleVolumeAgentConfig,
     SingleVolumeAssignmentValidator, SingleVolumeMountProbe, SqliteLedger, SqliteLedgerConfig,
     SqliteLifecycleJournal, SqliteLifecycleJournalConfig, SqliteOutboundReportQueue,
@@ -36,9 +36,10 @@ use crate::{
     AgentConfig, AgentDaemonError, AgentDaemonResult, AgentMessageProcessor, AgentRequestSigner,
     AgentSessionBinding, AgentSessionClient, AgentSessionClientError, AgentSessionFence,
     AgentSigningKey, CentralCommandTrustBundle, CoreAgentMessageProcessor, ExecutionBridge,
-    FilesystemExecution, MountProbe, MountedVolumeReplicationExecutor, RuntimeHealthPhase,
-    S3ReadExecutor, S3SnapshotSource, SessionExecutionBridge, SharedResourceVersion,
-    SharedSessionFence, SnapshotCasReaderFactory, SnapshotDeliveryMountManager,
+    FilesystemExecution, LocalPlacementInventory, MountProbe, MountedVolumeMaterializationExecutor,
+    MountedVolumeReplicationExecutor, PlacementInventoryConfig, RuntimeHealthPhase, S3ReadExecutor,
+    S3SnapshotSource, SessionExecutionBridge, SharedResourceVersion, SharedSessionFence,
+    SnapshotCasReaderFactory, SnapshotDeliveryMountManager, SqlitePlacementInventory,
     WorkspaceMaterializer,
 };
 
@@ -103,6 +104,13 @@ impl AgentMessageProcessor for DeferredProcessor {
         assignment: neoengram_domain::protocol::ReplicationAssignment,
     ) -> AgentDaemonResult<()> {
         self.current()?.handle_replication(assignment).await
+    }
+
+    async fn handle_materialization(
+        &self,
+        assignment: neoengram_domain::protocol::MaterializationAssignment,
+    ) -> AgentDaemonResult<()> {
+        self.current()?.handle_materialization(assignment).await
     }
 
     async fn handle_lifecycle_assignment(
@@ -322,7 +330,19 @@ where
         )
         .with_shutdown_signal(Arc::clone(&shutdown_signal)),
     );
-    let execution = FilesystemExecution::new(&config.storage.mount_path, Arc::clone(&bridge));
+    // Source authorization is based on durable Agent-local placement metadata, never on fields
+    // copied from the Central ticket. The inventory is scoped to this exact Agent/Tenant/Volume
+    // and shares the process-owned SQLite lock with the other Agent state adapters.
+    let source_inventory: Arc<dyn LocalPlacementInventory> = Arc::new(
+        SqlitePlacementInventory::open(PlacementInventoryConfig::new(
+            config.storage.state_dir.clone(),
+            volume.agent_id.clone(),
+            volume.tenant_id.clone(),
+            volume.storage_volume_id.clone(),
+        ))?,
+    );
+    let execution = FilesystemExecution::new(&config.storage.mount_path, Arc::clone(&bridge))
+        .with_placement_inventory(Arc::clone(&source_inventory));
     execution.initialize()?;
     let execution = Arc::new(execution);
 
@@ -334,17 +354,25 @@ where
         let source_execution = Arc::clone(&execution);
         let source_tenant = config.tenant_id.clone();
         let source_agent = volume.agent_id.clone();
+        let source_volume = volume.storage_volume_id.clone();
         let source_fence = fence.clone();
         let source_mount_generation = volume.mount_generation;
+        let source_inventory = Arc::clone(&source_inventory);
         tokio::spawn(async move {
+            let resolver = Arc::new(crate::MountedVolumeSourcePlacementResolver::with_inventory(
+                source_volume.clone(),
+                source_inventory,
+            ));
             if let Err(error) = source_network
-                .serve_source(
+                .serve_source_with_volume_and_resolver(
                     trust_bundle,
                     source_tenant,
                     source_agent,
+                    Some(source_volume),
                     source_fence,
                     source_mount_generation,
                     source_execution,
+                    resolver,
                     replication_shutdown_receiver,
                 )
                 .await
@@ -472,6 +500,20 @@ where
                 replication_network.clone(),
                 Some(fence.clone()),
                 Some(volume.mount_generation),
+            ),
+        ))
+        .with_materialization_executor(Arc::new(
+            MountedVolumeMaterializationExecutor::new_with_network_and_session_fence(
+                Arc::clone(&execution),
+                volume.tenant_id.clone(),
+                volume.agent_id.clone(),
+                volume.storage_volume_id.clone(),
+                command_trust_bundle.clone(),
+                Arc::clone(&clock),
+                replication_network.clone(),
+                Some(fence.clone()),
+                Some(volume.mount_generation),
+                reports.clone(),
             ),
         )),
     ))?;
@@ -1216,20 +1258,32 @@ async fn send_queued_reports(
         if pending.contains_key(&queued.message_id) {
             continue;
         }
-        let request_id = RequestId::new(queued.message_id.to_string())
-            .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
-        let trace_id = TraceId::new(format!("report-{}", queued.message_id))
-            .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
-        let envelope = new_control_envelope(
-            request_id,
-            trace_id,
-            Some(tenant_id.clone()),
-            Some(fence.session_generation),
-            queued.enqueued_at_unix_ms,
-            queued.report.clone().into_control_message(),
-        );
-        neoengram_domain::protocol::validate_control_envelope(&envelope)
-            .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+        let report_message = match &queued.report {
+            AgentReport::Materialization(report) => {
+                AgentChannelUpstreamMessage::MaterializationReport(report.clone())
+            }
+            _ => {
+                let request_id = RequestId::new(queued.message_id.to_string())
+                    .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+                let trace_id = TraceId::new(format!("report-{}", queued.message_id))
+                    .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+                let envelope = new_control_envelope(
+                    request_id,
+                    trace_id,
+                    Some(tenant_id.clone()),
+                    Some(fence.session_generation),
+                    queued.enqueued_at_unix_ms,
+                    queued.report.clone().into_control_message(),
+                );
+                neoengram_domain::protocol::validate_control_envelope(&envelope)
+                    .map_err(|error| AgentDaemonError::Session(error.to_string()))?;
+                AgentChannelUpstreamMessage::Report(AgentJobReportCreatePayload {
+                    tenant_id: tenant_id.clone(),
+                    report: envelope,
+                    extensions: Extensions::new(),
+                })
+            }
+        };
         let durable_message_id = queued.message_id.clone();
         let (message_id, sequence) = send_signed(
             channel,
@@ -1237,11 +1291,7 @@ async fn send_queued_reports(
             fence,
             upstream_sequence,
             Some(durable_message_id.clone()),
-            AgentChannelUpstreamMessage::Report(AgentJobReportCreatePayload {
-                tenant_id: tenant_id.clone(),
-                report: envelope,
-                extensions: Extensions::new(),
-            }),
+            report_message,
             None,
         )
         .await?;
@@ -1309,6 +1359,23 @@ async fn handle_downstream(
                 .await
                 .map_err(|_| {
                     AgentDaemonError::Session("Agent replication dispatcher is closed".to_owned())
+                })
+        }
+        AgentChannelDownstreamMessage::MaterializationAssignment(assignment) => {
+            // Active v2 batches remain deliverable until every object receipt is authoritative.
+            // The dispatcher coalesces an identical attempt and preserves durable staging when
+            // Central replans a later attempt after a transient route failure.
+            dispatcher
+                .sender
+                .send(FencedAgentWork {
+                    generation,
+                    work: AgentWork::Materialization(*assignment),
+                })
+                .await
+                .map_err(|_| {
+                    AgentDaemonError::Session(
+                        "Agent materialization dispatcher is closed".to_owned(),
+                    )
                 })
         }
         AgentChannelDownstreamMessage::LifecycleAssignment(assignment) => {

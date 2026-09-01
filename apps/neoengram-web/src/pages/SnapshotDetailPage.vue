@@ -171,6 +171,7 @@ const replicationListQuery = useQuery({
     queryCommitReplicationList({
       tenant_id: tenantId.value,
       commit_id: snapshot.value!.commit_id,
+      object_namespace_id: artifactId.value,
     }),
   enabled: computed(() => replicationCapabilityEnabled.value && Boolean(snapshot.value?.commit_id)),
   refetchInterval: (query) => {
@@ -203,7 +204,11 @@ watchEffect(() => {
 const availabilityQuery = useQuery({
   queryKey: computed(() => ['commit-availability', tenantId.value, snapshot.value?.commit_id]),
   queryFn: () =>
-    queryCommitAvailability({ tenant_id: tenantId.value, commit_id: snapshot.value!.commit_id }),
+    queryCommitAvailability({
+      tenant_id: tenantId.value,
+      commit_id: snapshot.value!.commit_id,
+      object_namespace_id: artifactId.value,
+    }),
   enabled: computed(() => Boolean(snapshot.value?.commit_id)),
   refetchInterval: () =>
     commitReplications.value.some((item) => isCommitReplicationActive(item.state)) ? 1_000 : false,
@@ -439,6 +444,7 @@ async function retryReplication(): Promise<void> {
   if (!current || retryReplicationMutation.isPending.value) return;
   await retryReplicationMutation.mutateAsync({
     tenant_id: tenantId.value,
+    object_namespace_id: current.artifact_id ?? artifactId.value,
     replication_id: current.replication_id,
     expected_attempt: current.attempt,
     request_id: commitReplicationRetryRequestId(current.replication_id, current.attempt),
@@ -452,6 +458,7 @@ async function cancelReplication(): Promise<void> {
   if (!current || cancelReplicationMutation.isPending.value) return;
   await cancelReplicationMutation.mutateAsync({
     tenant_id: tenantId.value,
+    object_namespace_id: current.artifact_id ?? artifactId.value,
     replication_id: current.replication_id,
     expected_attempt: current.attempt,
   });
