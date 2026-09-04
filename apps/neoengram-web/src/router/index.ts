@@ -19,7 +19,7 @@ import { useAuthStore } from '@/stores/auth';
 import { useTenantsStore } from '@/stores/tenants';
 
 const tenantMeta = { requiresAuth: true, requiresTenant: true };
-const snapshotMaterializeMeta = { ...tenantMeta, requiredCapability: 'snapshot_materialize' };
+const snapshotMaterializeMeta = { ...tenantMeta, requiredCapability: 'commit_materialization_v2' };
 const playgroundPreCommitMeta = { ...tenantMeta, requiredCapability: 'playground_precommit' };
 const s3ReadonlyMeta = {
   ...tenantMeta,
@@ -88,6 +88,12 @@ const routes: RouteRecordRaw[] = [
     meta: tenantMeta,
   },
   {
+    path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/commits/:commitId',
+    name: 'commit-detail',
+    component: () => import('@/pages/CommitDetailPage.vue'),
+    meta: tenantMeta,
+  },
+  {
     path: '/tenants/:tenantId/playgrounds',
     name: 'playground-list',
     component: () => import('@/pages/PlaygroundListPage.vue'),
@@ -124,21 +130,15 @@ const routes: RouteRecordRaw[] = [
     meta: snapshotMaterializeMeta,
   },
   {
-    path: '/tenants/:tenantId/jobs/new',
-    name: 'job-create',
-    component: () => import('@/pages/CreateJobPage.vue'),
+    path: '/tenants/:tenantId/tasks',
+    name: 'task-list',
+    component: () => import('@/pages/TaskListPage.vue'),
     meta: tenantMeta,
   },
   {
-    path: '/tenants/:tenantId/jobs/query',
-    name: 'job-query',
-    component: () => import('@/pages/QueryJobPage.vue'),
-    meta: tenantMeta,
-  },
-  {
-    path: '/tenants/:tenantId/jobs/:jobId',
-    name: 'job-detail',
-    component: () => import('@/pages/JobDetailPage.vue'),
+    path: '/tenants/:tenantId/tasks/:taskId',
+    name: 'task-detail',
+    component: () => import('@/pages/TaskDetailPage.vue'),
     meta: tenantMeta,
   },
   {
@@ -192,7 +192,7 @@ export function createAppRouter(history: RouterHistory = createWebHistory()): Ro
       capabilities = undefined;
     }
     if (
-      (requiredCapability === 'snapshot_materialize' &&
+      (requiredCapability === 'commit_materialization_v2' &&
         supportsSnapshotMaterialize(capabilities)) ||
       (requiredCapability === 'playground_precommit' &&
         supportsPlaygroundPreCommit(capabilities)) ||

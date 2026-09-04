@@ -63,7 +63,7 @@ fn api_version_advertises_the_minimal_artifact_catalog() {
     assert!(!version
         .capabilities
         .iter()
-        .any(|capability| capability == "artifact_commit_replication"));
+        .any(|capability| capability == "commit_materialization_v2"));
     assert!(!version
         .capabilities
         .iter()
@@ -71,7 +71,7 @@ fn api_version_advertises_the_minimal_artifact_catalog() {
     for capability in [
         "playground_materialize",
         "playground_precommit",
-        "snapshot_materialize",
+        "commit_materialization_v2",
     ] {
         assert!(!version
             .capabilities
@@ -91,11 +91,7 @@ fn api_version_advertises_the_minimal_artifact_catalog() {
     assert!(storage_enabled
         .capabilities
         .iter()
-        .any(|capability| capability == "snapshot_materialize"));
-    assert!(storage_enabled
-        .capabilities
-        .iter()
-        .any(|capability| capability == "artifact_commit_replication"));
+        .any(|capability| capability == "commit_materialization_v2"));
     for capability in [
         "commit_layout_selection_v2",
         "snapshot_delivery_fuse_v2",
@@ -724,6 +720,7 @@ async fn storage_volume_views_use_live_availability_when_configured() {
             QueryStorageVolumeRequest {
                 tenant_id: tenant_id.to_string(),
                 storage_volume_id: storage_volume_id.to_string(),
+                snapshot_id: None,
             },
         )
         .await

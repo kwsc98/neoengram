@@ -19,10 +19,11 @@ import {
   disableS3AccessPoint,
   enableS3AccessPoint,
   queryS3AccessPointList,
+  querySnapshotDeliveryList,
   querySnapshotList,
 } from '@/api/operations';
 import { isApiProblem } from '@/api/problem';
-import type { S3AccessPointView, UpdateS3AccessPointRequest } from '@/api/types';
+import type { S3AccessPointView, SnapshotView, UpdateS3AccessPointRequest } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
@@ -71,17 +72,43 @@ const accessPointsQuery = useQuery({
 });
 const snapshotsQuery = useQuery({
   queryKey: computed(() => ['ready-snapshots', tenantId.value]),
-  queryFn: () => querySnapshotList({ tenant_id: tenantId.value, page_size: 100 }),
+  queryFn: async () => {
+    const result = await querySnapshotList({ tenant_id: tenantId.value, page_size: 100 });
+    const candidates = result.data.items.filter((snapshot) => snapshot.state === 'ready');
+    const delivered = await Promise.all(
+      candidates.map(async (snapshot) => {
+        try {
+          const deliveries = await querySnapshotDeliveryList({
+            tenant_id: tenantId.value,
+            snapshot_id: snapshot.snapshot_id,
+            page_size: 100,
+          });
+          return deliveries.data.items.some(
+            (delivery) =>
+              delivery.delivery_id === snapshot.delivery_id && delivery.state === 'ready',
+          )
+            ? snapshot
+            : undefined;
+        } catch {
+          return undefined;
+        }
+      }),
+    );
+    return {
+      ...result,
+      data: {
+        ...result.data,
+        items: delivered.filter((snapshot): snapshot is SnapshotView => Boolean(snapshot)),
+      },
+    };
+  },
   enabled: computed(() => createOpen.value),
 });
 const createMutation = useMutation({ mutationFn: createS3AccessPoint });
 const enableMutation = useMutation({ mutationFn: enableS3AccessPoint });
 const disableMutation = useMutation({ mutationFn: disableS3AccessPoint });
 const accessPoints = computed(() => accessPointsQuery.data.value?.data.items ?? []);
-const readySnapshots = computed(
-  () =>
-    snapshotsQuery.data.value?.data.items.filter((snapshot) => snapshot.state === 'ready') ?? [],
-);
+const readySnapshots = computed(() => snapshotsQuery.data.value?.data.items ?? []);
 
 watch(tenantId, () => {
   cursor.value = undefined;
@@ -128,7 +155,7 @@ function openCreate(snapshotId = ''): void {
 async function submitCreate(): Promise<void> {
   const bucketName = createForm.bucketName.trim().toLowerCase();
   if (!createForm.snapshotId) {
-    createError.value = new Error('请选择 Ready Snapshot');
+    createError.value = new Error('请选择已完成 Delivery 的 Ready Snapshot');
     return;
   }
   if (
@@ -419,11 +446,11 @@ function stateTagType(state: S3AccessPointView['state']): 'success' | 'warning' 
         @retry="snapshotsQuery.refetch"
       />
       <el-form label-position="top" @submit.prevent="submitCreate">
-        <el-form-item label="Ready Snapshot" required>
+        <el-form-item label="已交付 Snapshot" required>
           <el-select
             v-model="createForm.snapshotId"
             filterable
-            placeholder="选择固定版本"
+            placeholder="选择已完成只读交付的固定版本"
             :loading="snapshotsQuery.isPending.value"
           >
             <el-option

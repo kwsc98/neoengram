@@ -4,7 +4,7 @@ import {
   supportsArtifactCatalog,
   supportsArtifactCommitDiff,
   supportsArtifactCommitGraph,
-  supportsArtifactCommitReplication,
+  supportsCommitMaterializationV2,
   supportsCommitLayoutSelection,
   supportsPlaygroundBrowser,
   supportsPlaygroundMaterialize,
@@ -19,7 +19,7 @@ describe('server capability gates', () => {
     expect(supportsArtifactCatalog(['artifact_catalog'])).toBe(true);
     expect(supportsArtifactCommitGraph(['artifact_catalog'])).toBe(false);
     expect(supportsArtifactCommitDiff(['artifact_catalog'])).toBe(false);
-    expect(supportsArtifactCommitReplication(['artifact_catalog'])).toBe(false);
+    expect(supportsCommitMaterializationV2(['artifact_catalog'])).toBe(false);
     expect(supportsSnapshotMaterialize(['artifact_catalog'])).toBe(false);
   });
 
@@ -37,21 +37,21 @@ describe('server capability gates', () => {
     expect(supportsArtifactCommitGraph(['artifact_commit_graph'])).toBe(true);
     expect(supportsArtifactCommitDiff(['artifact_commit_graph'])).toBe(false);
     expect(supportsArtifactCommitDiff(['artifact_commit_diff'])).toBe(true);
-    expect(supportsArtifactCommitReplication(['artifact_commit_diff'])).toBe(false);
-    expect(supportsArtifactCommitReplication(['artifact_commit_replication'])).toBe(true);
+    expect(supportsCommitMaterializationV2(['artifact_commit_diff'])).toBe(false);
+    expect(supportsCommitMaterializationV2(['commit_materialization_v2'])).toBe(true);
     expect(supportsPlaygroundMaterialize(['playground_materialize'])).toBe(true);
     expect(supportsPlaygroundBrowser(['playground_materialize'])).toBe(false);
     expect(supportsPlaygroundBrowser(['playground_browser'])).toBe(true);
     expect(supportsPlaygroundPreCommit(['playground_precommit'])).toBe(true);
     expect(supportsPlaygroundMaterialize(['playground_precommit'])).toBe(false);
-    expect(supportsSnapshotMaterialize(['snapshot_materialize'])).toBe(true);
+    expect(supportsSnapshotMaterialize(['commit_materialization_v2'])).toBe(true);
   });
 
   it('keeps both resource families hidden when neither capability is declared', () => {
     expect(supportsArtifactCatalog(['managed_add'])).toBe(false);
     expect(supportsArtifactCommitGraph(undefined)).toBe(false);
     expect(supportsArtifactCommitDiff(undefined)).toBe(false);
-    expect(supportsArtifactCommitReplication(undefined)).toBe(false);
+    expect(supportsCommitMaterializationV2(undefined)).toBe(false);
     expect(supportsPlaygroundMaterialize(undefined)).toBe(false);
     expect(supportsPlaygroundBrowser(undefined)).toBe(false);
     expect(supportsPlaygroundPreCommit(undefined)).toBe(false);

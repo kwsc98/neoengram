@@ -20,10 +20,10 @@ use super::{
 use crate::{
     domain_separated_jcs_bytes, jcs_blake3, AgentId, ArchiveId, ArtifactId, BackendId,
     CentralSignedPayload, CommitId, ContentDigest, DecimalU64, EdgeClusterId, GatewayConnectionId,
-    GatewayPoolId, Generation, MaterializationBatchId, MaterializationId, MountGeneration,
-    ObjectId, ObjectNamespaceId, ObjectTicketId, PlacementGeneration, PlacementId, ProtocolError,
-    ProtocolResult, RegionId, RouteGeneration, SessionGeneration, StorageVolumeId, TenantId,
-    UnixMillis,
+    GatewayPoolId, Generation, IntegrityScanId, MaterializationBatchId, MaterializationId,
+    MountGeneration, ObjectId, ObjectNamespaceId, ObjectTicketId, PlacementGeneration, PlacementId,
+    ProtocolError, ProtocolResult, RegionId, RouteGeneration, SessionGeneration, StorageVolumeId,
+    TaskAttemptId, TaskId, TenantId, UnixMillis,
 };
 
 /// Version advertised by materialization-specific control and transfer contracts.
@@ -59,6 +59,7 @@ pub enum MaterializationProtocolSchema {
     NamespaceObjectSet(NamespaceObjectSet),
     ObjectPlacement(ObjectPlacement),
     VolumeCommitCoverage(VolumeCommitCoverage),
+    IntegrityScanReport(IntegrityScanReport),
     DurabilityPolicy(DurabilityPolicy),
     MaterializationJob(MaterializationJob),
     MaterializationAssignment(MaterializationAssignment),
@@ -274,6 +275,179 @@ pub struct ObjectPlacement {
     pub placement_generation: PlacementGeneration,
     pub state: ObjectPlacementState,
     pub failure_domain: String,
+}
+
+/// Result of checking one physical object against the immutable Placement evidence.
+///
+/// This is deliberately separate from `ObjectPlacementState`: a transient I/O error must not
+/// silently retire durable evidence, while an independently confirmed missing or corrupt file
+/// must be excluded from source selection until a later scan proves it healthy again.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlacementHealthState {
+    Healthy,
+    Missing,
+    Corrupt,
+    Orphan,
+    Unknown,
+}
+
+impl PlacementHealthState {
+    #[must_use]
+    pub const fn source_eligible(self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+}
+
+/// Durable observation emitted by an Agent Volume scrub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementHealthObservation {
+    pub scan_id: IntegrityScanId,
+    pub tenant_id: TenantId,
+    pub object_namespace_id: ObjectNamespaceId,
+    pub placement_id: PlacementId,
+    pub object_id: ObjectId,
+    pub storage_volume_id: StorageVolumeId,
+    pub placement_generation: PlacementGeneration,
+    pub state: PlacementHealthState,
+    pub observed_size: DecimalU64,
+    pub observed_digest: ContentDigest,
+    pub observed_at_unix_ms: UnixMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl PlacementHealthObservation {
+    pub fn validate(&self) -> ProtocolResult<()> {
+        validate_positive("placement_generation", self.placement_generation.get())?;
+        if self.observed_at_unix_ms.get() == 0 {
+            return Err(invalid("observed_at_unix_ms", "must be positive"));
+        }
+        if self.observed_digest != self.object_id.digest()
+            && matches!(self.state, PlacementHealthState::Healthy)
+        {
+            return Err(ProtocolError::InvalidDigest(
+                "healthy observation digest must equal object_id".to_owned(),
+            ));
+        }
+        if let Some(detail) = &self.detail {
+            validate_nonempty_limited("detail", detail, MAX_MATERIALIZATION_ERROR_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+/// Aggregate state of one explicit or scheduled Volume integrity scan.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum VolumeIntegrityScanState {
+    Queued,
+    Running,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeIntegrityScan {
+    pub scan_id: IntegrityScanId,
+    pub tenant_id: TenantId,
+    pub storage_volume_id: StorageVolumeId,
+    pub placement_generation: PlacementGeneration,
+    pub state: VolumeIntegrityScanState,
+    pub checked_objects: DecimalU64,
+    pub healthy_objects: DecimalU64,
+    pub missing_objects: DecimalU64,
+    pub corrupt_objects: DecimalU64,
+    pub orphan_objects: DecimalU64,
+    pub started_at_unix_ms: UnixMillis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_unix_ms: Option<UnixMillis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Agent-to-Central report for one completed Volume scrub.
+///
+/// The scan aggregate is useful for operator diagnostics while the per-placement observations
+/// are the durable input to source selection and target coverage.  Agent/session/mount identity
+/// is supplied by the authenticated channel frame; Central still checks every scope field before
+/// accepting the observations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrityScanReport {
+    pub scan: VolumeIntegrityScan,
+    pub mount_generation: MountGeneration,
+    #[schemars(length(max = MAX_MATERIALIZATION_BATCH_OBJECTS))]
+    pub observations: Vec<PlacementHealthObservation>,
+    #[serde(default, flatten)]
+    pub extensions: crate::Extensions,
+}
+
+impl IntegrityScanReport {
+    pub fn validate(&self) -> ProtocolResult<()> {
+        self.scan.validate()?;
+        validate_positive("mount_generation", self.mount_generation.get())?;
+        if self.observations.len() > MAX_MATERIALIZATION_BATCH_OBJECTS {
+            return Err(ProtocolError::LimitExceeded {
+                limit_name: "integrity observation count",
+                limit: MAX_MATERIALIZATION_BATCH_OBJECTS,
+                actual: self.observations.len(),
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for observation in &self.observations {
+            observation.validate()?;
+            if observation.scan_id != self.scan.scan_id
+                || observation.tenant_id != self.scan.tenant_id
+                || observation.storage_volume_id != self.scan.storage_volume_id
+                || !seen.insert(observation.placement_id.clone())
+            {
+                return Err(invalid(
+                    "observations",
+                    "observation identity does not match the scan or is duplicated",
+                ));
+            }
+        }
+        validate_extension_keys(
+            &self.extensions,
+            &["scan", "mount_generation", "observations"],
+        )
+    }
+}
+
+impl VolumeIntegrityScan {
+    pub fn validate(&self) -> ProtocolResult<()> {
+        validate_positive("placement_generation", self.placement_generation.get())?;
+        if self.started_at_unix_ms.get() == 0 {
+            return Err(invalid("started_at_unix_ms", "must be positive"));
+        }
+        for (name, count) in [
+            ("healthy_objects", self.healthy_objects),
+            ("missing_objects", self.missing_objects),
+            ("corrupt_objects", self.corrupt_objects),
+            ("orphan_objects", self.orphan_objects),
+        ] {
+            if count.get() > self.checked_objects.get() && name != "orphan_objects" {
+                return Err(invalid(name, "cannot exceed checked_objects"));
+            }
+        }
+        if let Some(finished) = self.finished_at_unix_ms {
+            if finished.get() < self.started_at_unix_ms.get() {
+                return Err(invalid("finished_at_unix_ms", "cannot precede start"));
+            }
+        }
+        if let Some(error) = &self.error {
+            validate_nonempty_limited("error", error, MAX_MATERIALIZATION_ERROR_BYTES)?;
+        }
+        Ok(())
+    }
 }
 
 impl ObjectPlacement {
@@ -692,6 +866,10 @@ impl MaterializationJobKey {
 #[serde(deny_unknown_fields)]
 pub struct MaterializationJob {
     pub materialization_id: MaterializationId,
+    /// Unified operation identity that owns this domain detail record.
+    pub operation_task_id: TaskId,
+    /// Attempt identity used when Central fences data-plane reports.
+    pub task_attempt_id: TaskAttemptId,
     pub key: MaterializationJobKey,
     pub artifact_id: ArtifactId,
     pub state: MaterializationJobState,
@@ -744,7 +922,7 @@ impl MaterializationJobState {
             (self, next),
             (
                 Self::Queued,
-                Self::Planning | Self::Cancelled | Self::Failed
+                Self::Planning | Self::Stalled | Self::Cancelled | Self::Failed
             ) | (
                 Self::Planning,
                 Self::WaitingForSources
@@ -1374,6 +1552,10 @@ pub struct BatchManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationAssignment {
+    /// Unified operation identity copied from the signed ticket and durable Job.
+    pub operation_task_id: TaskId,
+    /// Exact execution attempt authorized for this assignment.
+    pub task_attempt_id: TaskAttemptId,
     pub signed_ticket: SignedMaterializationBatchTicket,
     pub batch: MaterializationBatch,
     pub manifest: BatchManifest,
@@ -1386,6 +1568,14 @@ pub struct MaterializationAssignment {
 impl MaterializationAssignment {
     pub fn validate(&self) -> ProtocolResult<()> {
         self.signed_ticket.validate()?;
+        if self.operation_task_id != self.signed_ticket.ticket.operation_task_id
+            || self.task_attempt_id != self.signed_ticket.ticket.task_attempt_id
+        {
+            return Err(invalid(
+                "task_identity",
+                "assignment task identity does not match its signed ticket",
+            ));
+        }
         self.batch.validate()?;
         self.manifest.validate()?;
         if self.pages.is_empty() || self.pages.len() > 65_535 {
@@ -1429,6 +1619,8 @@ pub enum MaterializationReport {
         extensions: crate::Extensions,
     },
     Failed {
+        operation_task_id: TaskId,
+        task_attempt_id: TaskAttemptId,
         materialization_id: MaterializationId,
         batch_id: MaterializationBatchId,
         plan_revision: Generation,
@@ -1502,6 +1694,26 @@ impl MaterializationReport {
     }
 
     #[must_use]
+    pub fn operation_task_id(&self) -> &TaskId {
+        match self {
+            Self::Receipt { receipt, .. } => &receipt.operation_task_id,
+            Self::Failed {
+                operation_task_id, ..
+            } => operation_task_id,
+        }
+    }
+
+    #[must_use]
+    pub fn task_attempt_id(&self) -> &TaskAttemptId {
+        match self {
+            Self::Receipt { receipt, .. } => &receipt.task_attempt_id,
+            Self::Failed {
+                task_attempt_id, ..
+            } => task_attempt_id,
+        }
+    }
+
+    #[must_use]
     pub fn target(&self) -> &MaterializationTarget {
         match self {
             Self::Receipt { target, .. } | Self::Failed { target, .. } => target,
@@ -1532,6 +1744,8 @@ impl MaterializationReport {
                 validate_extension_keys(extensions, &["receipt"])
             }
             Self::Failed {
+                operation_task_id,
+                task_attempt_id,
                 materialization_id,
                 batch_id,
                 plan_revision,
@@ -1559,6 +1773,12 @@ impl MaterializationReport {
                 {
                     return Err(invalid("identity", "report identities must not be empty"));
                 }
+                if operation_task_id.as_str().is_empty() || task_attempt_id.as_str().is_empty() {
+                    return Err(invalid(
+                        "task_identity",
+                        "report task identities must not be empty",
+                    ));
+                }
                 target.validate()?;
                 if target.tenant_id != *tenant_id
                     || target.object_namespace_id != *object_namespace_id
@@ -1572,6 +1792,8 @@ impl MaterializationReport {
                     extensions,
                     &[
                         "materialization_id",
+                        "operation_task_id",
+                        "task_attempt_id",
                         "batch_id",
                         "plan_revision",
                         "batch_attempt",
@@ -1620,6 +1842,8 @@ impl MaterializationReport {
                 receipt.validate_against_ticket(ticket, object)
             }
             Self::Failed {
+                operation_task_id,
+                task_attempt_id,
                 materialization_id,
                 batch_id,
                 plan_revision,
@@ -1631,6 +1855,8 @@ impl MaterializationReport {
                 ..
             } => {
                 if materialization_id != &ticket.materialization_id
+                    || operation_task_id != &ticket.operation_task_id
+                    || task_attempt_id != &ticket.task_attempt_id
                     || batch_id != &ticket.batch_id
                     || plan_revision != &ticket.plan_revision
                     || batch_attempt != &ticket.batch_attempt
@@ -1989,6 +2215,8 @@ impl BatchManifest {
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBatchTicket {
     pub ticket_id: ObjectTicketId,
+    pub operation_task_id: TaskId,
+    pub task_attempt_id: TaskAttemptId,
     pub materialization_id: MaterializationId,
     pub batch_id: MaterializationBatchId,
     pub plan_revision: Generation,
@@ -2009,6 +2237,12 @@ impl MaterializationBatchTicket {
     pub fn validate(&self) -> ProtocolResult<()> {
         validate_positive("plan_revision", self.plan_revision.get())?;
         validate_positive("batch_attempt", self.batch_attempt.get())?;
+        if self.operation_task_id.as_str().is_empty() || self.task_attempt_id.as_str().is_empty() {
+            return Err(invalid(
+                "task_identity",
+                "ticket task identities must not be empty",
+            ));
+        }
         self.source.validate()?;
         self.target.validate()?;
         if self.source.tenant_id != self.tenant_id
@@ -2149,6 +2383,8 @@ impl SignedMaterializationBatchTicket {
 #[serde(deny_unknown_fields)]
 pub struct MaterializationObjectReceipt {
     pub receipt_id: crate::ObjectReceiptId,
+    pub operation_task_id: TaskId,
+    pub task_attempt_id: TaskAttemptId,
     pub materialization_id: MaterializationId,
     pub batch_id: MaterializationBatchId,
     pub plan_revision: Generation,
@@ -2171,6 +2407,12 @@ pub type ObjectReceipt = MaterializationObjectReceipt;
 impl MaterializationObjectReceipt {
     /// Validates receipt-local evidence before checking it against a Commit object or ticket.
     pub fn validate(&self) -> ProtocolResult<()> {
+        if self.operation_task_id.as_str().is_empty() || self.task_attempt_id.as_str().is_empty() {
+            return Err(invalid(
+                "task_identity",
+                "receipt task identities must not be empty",
+            ));
+        }
         validate_positive("plan_revision", self.plan_revision.get())?;
         validate_positive("batch_attempt", self.batch_attempt.get())?;
         validate_positive(
@@ -2214,6 +2456,8 @@ impl MaterializationObjectReceipt {
         ticket.validate()?;
         self.validate_against(object)?;
         if self.materialization_id != ticket.materialization_id
+            || self.operation_task_id != ticket.operation_task_id
+            || self.task_attempt_id != ticket.task_attempt_id
             || self.batch_id != ticket.batch_id
             || self.plan_revision != ticket.plan_revision
             || self.batch_attempt != ticket.batch_attempt
@@ -2616,6 +2860,86 @@ mod tests {
         }
     }
 
+    fn operation_task_id() -> TaskId {
+        TaskId::new("task-materialization-test").unwrap()
+    }
+
+    fn task_attempt_id() -> TaskAttemptId {
+        TaskAttemptId::new("task-materialization-test-attempt-1").unwrap()
+    }
+
+    fn empty_assignment() -> MaterializationAssignment {
+        let namespace = ObjectNamespaceId::new("artifact-a").unwrap();
+        let materialization_id = MaterializationId::new("materialization-assignment").unwrap();
+        let batch_id = MaterializationBatchId::new("batch-assignment").unwrap();
+        let (manifest, pages) = BatchManifest::paginate(
+            materialization_id.clone(),
+            batch_id.clone(),
+            Generation::new(1),
+            Generation::new(1),
+            namespace.clone(),
+            Vec::new(),
+            1,
+        )
+        .unwrap();
+        let ticket = MaterializationBatchTicket {
+            ticket_id: ObjectTicketId::new("ticket-assignment").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
+            materialization_id: materialization_id.clone(),
+            batch_id: batch_id.clone(),
+            plan_revision: Generation::new(1),
+            batch_attempt: Generation::new(1),
+            tenant_id: TenantId::new("tenant-a").unwrap(),
+            artifact_id: ArtifactId::new("artifact-a").unwrap(),
+            object_namespace_id: namespace,
+            commit_id: CommitId::from_bytes([9; 32]),
+            manifest_digest: manifest.manifest_digest,
+            source: source(),
+            target: target(),
+            max_bytes: DecimalU64::new(1),
+            deadline_unix_ms: UnixMillis::new(2_000),
+            capability: COMMIT_MATERIALIZATION_CAPABILITY_V2.to_owned(),
+        };
+        let payload = ticket.payload_bytes().unwrap();
+        let central_signature = CentralSignedPayload {
+            key_id: "central-key".to_owned(),
+            certificate_generation: crate::CertificateGeneration::new(1),
+            signed_at_unix_ms: UnixMillis::new(100),
+            expires_at_unix_ms: ticket.deadline_unix_ms,
+            payload_digest: ContentDigest::hash(&payload),
+            payload: crate::GatewayOpaqueBytes::new(payload).unwrap(),
+            signature: crate::Ed25519Signature::from_bytes([0; 64]),
+            extensions: crate::Extensions::new(),
+        };
+        let signed_ticket =
+            SignedMaterializationBatchTicket::new(ticket, central_signature).unwrap();
+        let batch = MaterializationBatch {
+            batch_id,
+            materialization_id,
+            plan_revision: Generation::new(1),
+            batch_attempt: Generation::new(1),
+            source: source(),
+            target: target(),
+            manifest_digest: manifest.manifest_digest,
+            object_ids: Vec::new(),
+            object_count: DecimalU64::new(0),
+            total_bytes: DecimalU64::new(0),
+            state: MaterializationBatchState::Queued,
+            max_bytes: DecimalU64::new(1),
+            deadline_unix_ms: UnixMillis::new(2_000),
+        };
+        MaterializationAssignment {
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
+            signed_ticket,
+            batch,
+            manifest,
+            pages,
+            extensions: crate::Extensions::new(),
+        }
+    }
+
     #[test]
     fn namespace_is_explicit_and_artifact_mapping_is_infallible() {
         let artifact = ArtifactId::new("artifact-a").unwrap();
@@ -2714,6 +3038,8 @@ mod tests {
 
         let ticket = MaterializationBatchTicket {
             ticket_id: ObjectTicketId::new("ticket-a").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -2757,6 +3083,8 @@ mod tests {
         .unwrap();
         let ticket = MaterializationBatchTicket {
             ticket_id: ObjectTicketId::new("ticket-a").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -2795,10 +3123,75 @@ mod tests {
     }
 
     #[test]
+    fn ticket_signature_binds_operation_task_identity() {
+        let signed = {
+            let assignment = empty_assignment();
+            assignment.signed_ticket
+        };
+        let mut forged = signed;
+        forged.ticket.operation_task_id = TaskId::new("task-other").unwrap();
+        assert!(forged.validate().is_err());
+
+        let mut forged = empty_assignment().signed_ticket;
+        forged.ticket.task_attempt_id = TaskAttemptId::new("task-other-attempt-1").unwrap();
+        assert!(forged.validate().is_err());
+    }
+
+    #[test]
+    fn assignment_and_reports_fence_operation_task_identity() {
+        let assignment = empty_assignment();
+        assignment.validate().unwrap();
+
+        let mut forged_assignment = assignment.clone();
+        forged_assignment.operation_task_id = TaskId::new("task-other").unwrap();
+        assert!(forged_assignment.validate().is_err());
+        let mut forged_assignment = assignment.clone();
+        forged_assignment.task_attempt_id = TaskAttemptId::new("task-other-attempt-1").unwrap();
+        assert!(forged_assignment.validate().is_err());
+
+        let base = MaterializationReport::Failed {
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
+            materialization_id: assignment.batch.materialization_id.clone(),
+            batch_id: assignment.batch.batch_id.clone(),
+            plan_revision: assignment.batch.plan_revision,
+            batch_attempt: assignment.batch.batch_attempt,
+            tenant_id: TenantId::new("tenant-a").unwrap(),
+            object_namespace_id: ObjectNamespaceId::new("artifact-a").unwrap(),
+            target: target(),
+            object_id: None,
+            issue_code: "SOURCE_UNAVAILABLE".to_owned(),
+            issue_message: "source route unavailable".to_owned(),
+            extensions: crate::Extensions::new(),
+        };
+        base.validate_for_assignment(&assignment).unwrap();
+
+        let mut forged_report = base.clone();
+        if let MaterializationReport::Failed {
+            operation_task_id, ..
+        } = &mut forged_report
+        {
+            *operation_task_id = TaskId::new("task-other").unwrap();
+        }
+        assert!(forged_report.validate_for_assignment(&assignment).is_err());
+
+        let mut forged_report = base;
+        if let MaterializationReport::Failed {
+            task_attempt_id, ..
+        } = &mut forged_report
+        {
+            *task_attempt_id = TaskAttemptId::new("task-other-attempt-1").unwrap();
+        }
+        assert!(forged_report.validate_for_assignment(&assignment).is_err());
+    }
+
+    #[test]
     fn materialization_report_carries_and_validates_target_fence() {
         let object = object(1, 0);
         let receipt = MaterializationObjectReceipt {
             receipt_id: crate::ObjectReceiptId::new("receipt-report").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -2986,6 +3379,8 @@ mod tests {
     fn threshold_complete_job_may_keep_partial_commit_counters() {
         let mut job = MaterializationJob {
             materialization_id: MaterializationId::new("materialization-threshold").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
             key: MaterializationJobKey {
                 tenant_id: TenantId::new("tenant-a").unwrap(),
                 object_namespace_id: ObjectNamespaceId::new("artifact-a").unwrap(),
@@ -3020,6 +3415,8 @@ mod tests {
     fn job_and_batch_fence_namespace_and_target_identity() {
         let mut job = MaterializationJob {
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
             key: MaterializationJobKey {
                 tenant_id: TenantId::new("tenant-a").unwrap(),
                 object_namespace_id: ObjectNamespaceId::new("artifact-a").unwrap(),
@@ -3084,6 +3481,8 @@ mod tests {
         let object = object(1, 0);
         let mut receipt = MaterializationObjectReceipt {
             receipt_id: crate::ObjectReceiptId::new("receipt-a").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -3112,6 +3511,8 @@ mod tests {
         let object = object(1, 0);
         let mut receipt = MaterializationObjectReceipt {
             receipt_id: crate::ObjectReceiptId::new("receipt-deadline").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -3129,6 +3530,8 @@ mod tests {
         };
         let mut ticket = MaterializationBatchTicket {
             ticket_id: ObjectTicketId::new("ticket-deadline").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -3157,6 +3560,8 @@ mod tests {
         let object = object(1, 0);
         let receipt = MaterializationObjectReceipt {
             receipt_id: crate::ObjectReceiptId::new("receipt-a").unwrap(),
+            operation_task_id: operation_task_id(),
+            task_attempt_id: task_attempt_id(),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),

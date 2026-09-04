@@ -431,17 +431,19 @@ test('creates an Artifact, Playground, Commit and Snapshot from resource pages',
   await page.getByRole('button', { name: '创建 Snapshot', exact: true }).click();
   await expect(page.locator('.delivery-heading small')).toHaveText('可用');
   await expect(page.getByText('新请求', { exact: true })).toBeVisible();
+  await expect(page.getByText('Snapshot 已绑定一个目标 Volume 和唯一只读交付')).toBeVisible();
+  await expect(
+    page.locator('.delivery-facts > div').filter({ hasText: 'Delivery' }).locator('code'),
+  ).toContainText('delivery-');
   await expectNoOperatorDetails(page);
   await page.getByRole('button', { name: '查看 Snapshot' }).click();
   await expect(page).toHaveURL(/\/snapshots\/snap-/);
   await expect(page.getByRole('heading', { name: '建立自动驾驶评测基线' })).toBeVisible();
   await expect(page.locator('.snapshot-state-band > .el-tag')).toHaveText('可用');
   await expect(page.getByText(/cn-shanghai/).first()).toBeVisible();
-  await expect(
-    page
-      .getByRole('paragraph')
-      .filter({ hasText: '请先将 Commit 复制到当前目标 Volume，并等待 PlacementSet published' }),
-  ).toBeVisible();
+  await expect(page.getByText('固定交付模式', { exact: true })).toBeVisible();
+  await expect(page.getByText('唯一 Delivery', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '创建交付', exact: true })).toHaveCount(0);
   await expectNoOperatorDetails(page);
   await expectHealthyLayout(page);
 });
@@ -813,27 +815,18 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
 
   await expect(page.locator('.delivery-heading small')).toHaveText('可用');
   await expect(page.getByText('新请求', { exact: true })).toBeVisible();
-  await expect(page.getByText('下一步在详情页处理 Replicate 和 Delivery')).toBeVisible();
+  await expect(page.getByText('Snapshot 已绑定一个目标 Volume 和唯一只读交付')).toBeVisible();
+  await expect(
+    page.locator('.delivery-facts > div').filter({ hasText: 'Delivery' }).locator('code'),
+  ).toContainText('delivery-');
   await page.getByRole('button', { name: '查看 Snapshot' }).click();
   await expect(page).toHaveURL(/\/snapshots\/snap-/);
-  await expect(page.getByRole('heading', { name: '先复制 Commit，再创建交付' })).toBeVisible();
-  await expect(
-    page
-      .getByRole('paragraph')
-      .filter({ hasText: '请先将 Commit 复制到当前目标 Volume，并等待 PlacementSet published' }),
-  ).toBeVisible();
-  await expect(page.getByRole('button', { name: '创建交付', exact: true })).toBeDisabled();
-  await expect(page.getByText(/Gateway 集群：华东 Gateway/)).toBeVisible();
-  await page.getByRole('button', { name: '复制 Commit', exact: true }).click();
-  await expect(page.locator('.replication-status')).toContainText('published', {
-    timeout: 15_000,
-  });
-  await expect(page.getByRole('button', { name: '副本已发布', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: '创建交付', exact: true })).toBeEnabled({
-    timeout: 15_000,
-  });
-  await page.getByRole('button', { name: '创建交付', exact: true }).click();
-  await expect(page.getByText('等待调度', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '只读交付' })).toBeVisible();
+  await expect(page.getByText('目标 EdgeCluster', { exact: true })).toBeVisible();
+  await expect(page.getByText('目标 StorageVolume', { exact: true })).toBeVisible();
+  await expect(page.getByText('固定交付模式', { exact: true })).toBeVisible();
+  await expect(page.getByText('唯一 Delivery', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '创建交付', exact: true })).toHaveCount(0);
   await expectNoOperatorDetails(page);
   await expectHealthyLayout(page);
   await expect(page.locator('.el-message')).toHaveCount(0);
@@ -845,78 +838,10 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   });
 });
 
-test('creates, advances, finalizes and replays a Managed Add Job', async ({ page }, testInfo) => {
-  await page.goto(
-    '/tenants/tenant-a/jobs/new?project_id=project-vision&artifact_id=road-scenes&playground_id=labeling',
-  );
-  await expect(page.getByText('当前租户：tenant-a')).toBeVisible();
-  await expect(page.getByLabel('Tenant ID')).toHaveCount(0);
-  await expect(
-    page.locator('.index-version-field').filter({ hasText: 'Expected revision' }).locator('code'),
-  ).toHaveText('31');
-  await expect(
-    page.locator('.index-version-field').filter({ hasText: 'Expected digest' }).locator('code'),
-  ).toHaveText('a'.repeat(64));
-  const jobId = await page
-    .locator('.el-form-item')
-    .filter({ hasText: 'Job ID' })
-    .locator('input')
-    .inputValue();
-  await page.getByRole('button', { name: '开始扫描' }).click();
-  await expect(page).toHaveURL(new RegExp(`/tenants/tenant-a/jobs/${jobId}$`));
-  await expect(page.getByText('待发布').first()).toBeVisible({ timeout: 7000 });
-  await page.getByRole('button', { name: 'Finalize', exact: true }).click();
-  await page.getByRole('dialog').getByRole('button', { name: 'Finalize' }).click();
-  await expect(page.getByText('已成功').first()).toBeVisible();
-  await expect(page.getByText('publish', { exact: true })).toBeVisible();
+test('handles Task routes and invisible Tenant routes', async ({ page }) => {
+  await page.goto('/tenants/tenant-a/tasks');
+  await expect(page.getByRole('heading', { name: '操作任务' })).toBeVisible();
   await expectHealthyLayout(page);
-  await page.screenshot({
-    path: testInfo.outputPath('finalized-job.png'),
-    animations: 'disabled',
-    fullPage: true,
-  });
-
-  const replayed = await page.evaluate(
-    async ({ id }) => {
-      const response = await fetch('/api/job/add/finalize', {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer mock-access-token',
-          'Content-Type': 'application/json',
-          'NeoEngram-API-Version': '1',
-          'X-Request-ID': 'req-playwright-replay',
-        },
-        body: JSON.stringify({ tenant_id: 'tenant-a', job_id: id }),
-      });
-      return (await response.json()) as { replayed: boolean };
-    },
-    { id: jobId },
-  );
-  expect(replayed.replayed).toBe(true);
-});
-
-test('handles missing, validation, unavailable and invisible Tenant routes', async ({ page }) => {
-  await page.goto('/tenants/tenant-a/jobs/query');
-  await page.getByLabel('Job ID').fill('job-missing');
-  await page.getByRole('button', { name: '查询', exact: true }).click();
-  await expect(page.getByText('未找到请求的资源')).toBeVisible();
-
-  await page.goto(
-    '/tenants/tenant-a/jobs/new?project_id=project-vision&artifact_id=road-scenes&playground_id=labeling',
-  );
-  await page
-    .locator('.el-form-item')
-    .filter({ hasText: 'Job ID' })
-    .locator('input')
-    .fill('invalid job id');
-  await page.getByRole('button', { name: '开始扫描' }).click();
-  await expect(page.getByText('请输入合法 Job ID')).toBeVisible();
-
-  await page.goto(
-    '/tenants/tenant-unavailable/jobs/new?project_id=project-vision&artifact_id=road-scenes&playground_id=labeling',
-  );
-  await expect(page.getByText('服务暂时不可用')).toBeVisible();
-  await expect(page.getByRole('button', { name: '重试' })).toBeVisible();
 
   await page.goto('/tenants/tenant-secret/artifacts');
   await expect(page).toHaveURL(/\/tenants\/tenant-a\/overview$/);

@@ -1,14 +1,14 @@
 use fusen_rs::SensitiveFields;
 use serde::{Deserialize, Serialize};
 
-use super::ResourceIssueSummary;
+use super::{ResourceIssueSummary, TaskView};
 
 /// Public v2 request for hydrating a target Volume from object-level placements.
 ///
 /// The request deliberately carries the object namespace even though the first namespace mapping
 /// is ArtifactId == ObjectNamespaceId.  Keeping it explicit prevents a future namespace alias
 /// from making a materialization accidentally cross tenant or artifact boundaries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
 pub struct CreateCommitMaterializationRequest {
@@ -23,7 +23,7 @@ pub struct CreateCommitMaterializationRequest {
     pub request_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
 pub struct QueryCommitMaterializationRequest {
@@ -32,7 +32,7 @@ pub struct QueryCommitMaterializationRequest {
     pub materialization_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
 pub struct QueryCommitMaterializationListRequest {
@@ -124,15 +124,17 @@ pub struct MaterializationView {
     pub issue: Option<ResourceIssueSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
 pub struct CreateCommitMaterializationResponse {
     pub materialization: MaterializationView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
 pub struct QueryCommitMaterializationResponse {
@@ -466,10 +468,12 @@ pub struct WorkspaceView {
     pub lifecycle: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
 pub struct CreateWorkspaceResponse {
     pub workspace: WorkspaceView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }

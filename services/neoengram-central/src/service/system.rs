@@ -41,10 +41,10 @@ impl SystemService {
         ];
         if self.storage_execution_enabled {
             capabilities.extend([
-                "artifact_commit_replication".to_owned(),
+                neoengram_domain::protocol::OPERATION_TASK_CAPABILITY_V1.to_owned(),
+                "commit_materialization_v2".to_owned(),
                 "playground_materialize".to_owned(),
                 "playground_precommit".to_owned(),
-                "snapshot_materialize".to_owned(),
                 "commit_layout_selection_v2".to_owned(),
                 "snapshot_delivery_fuse_v2".to_owned(),
                 "snapshot_delivery_copy_v2".to_owned(),

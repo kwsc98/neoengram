@@ -1,6 +1,8 @@
 use fusen_rs::SensitiveFields;
 use serde::{Deserialize, Serialize};
 
+use super::TaskView;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
@@ -72,6 +74,8 @@ pub struct GatewayPoolResponse {
     pub gateway_pool: GatewayPoolView,
     #[sensitive(kind = "public")]
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -158,6 +162,8 @@ pub struct CreateGatewayReplicaResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation_token: Option<String>,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -166,6 +172,8 @@ pub struct GatewayReplicaResponse {
     pub gateway_replica: GatewayReplicaView,
     #[sensitive(kind = "public")]
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]

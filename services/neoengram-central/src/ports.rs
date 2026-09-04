@@ -6,12 +6,16 @@ use neoengram_domain::core::{Manifest, ManifestId, ObjectId};
 use neoengram_domain::protocol::materialization::{
     MaterializationBatch, MaterializationJob, MaterializationJobKey, MaterializationObject,
     MaterializationObjectReceipt, ObjectPlacement as ObjectPlacementV2, ObjectReadLease,
-    StagingLease, VolumeCommitCoverage,
+    PlacementHealthObservation, StagingLease, VolumeCommitCoverage,
 };
 use neoengram_domain::protocol::{
     AgentId, ArtifactId, JobAssignment, MetadataBatchDescriptor, MetadataBatchId,
     MetadataBatchPage, ObjectReceiptId, PlacementGeneration, StorageVolumeId, TenantId, UnixMillis,
     WireIndexVersion,
+};
+use neoengram_domain::protocol::{
+    OperationTask, ResourceVersion, SequenceNumber, TaskActor, TaskAttempt, TaskEvent, TaskId,
+    TaskKind, TaskRelation, TaskResourceLink, TaskState,
 };
 
 use crate::{
@@ -38,6 +42,144 @@ use crate::{
 pub enum JobInsertOutcome {
     Inserted(JobRecord),
     Existing(JobRecord),
+}
+
+/// Result of creating a unified operation task. An exact request replay returns `Existing`;
+/// reusing either identity with a different immutable payload is rejected by the repository.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskInsertOutcome {
+    Inserted(OperationTask),
+    Existing(OperationTask),
+}
+
+/// Result of changing a task through a lifecycle control operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskMutationOutcome {
+    pub task: OperationTask,
+    pub replayed: bool,
+}
+
+/// Stable keyset/list filters for task operations. All optional dimensions are ANDed; values in
+/// `task_kinds` and `states` are ORed within their respective dimension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskListRequest {
+    pub tenant_id: TenantId,
+    pub project_id: Option<neoengram_domain::protocol::ProjectId>,
+    pub artifact_id: Option<ArtifactId>,
+    pub object_namespace_id: Option<neoengram_domain::protocol::ObjectNamespaceId>,
+    pub commit_id: Option<neoengram_domain::core::CommitId>,
+    pub playground_id: Option<neoengram_domain::protocol::PlaygroundId>,
+    pub snapshot_id: Option<neoengram_domain::protocol::SnapshotId>,
+    pub storage_volume_id: Option<StorageVolumeId>,
+    pub task_kinds: Vec<TaskKind>,
+    pub states: Vec<TaskState>,
+    pub parent_task_id: Option<TaskId>,
+    pub created_after_unix_ms: Option<UnixMillis>,
+    pub created_before_unix_ms: Option<UnixMillis>,
+    pub updated_after_unix_ms: Option<UnixMillis>,
+    pub updated_before_unix_ms: Option<UnixMillis>,
+    /// Opaque cursor returned by a previous page. The current implementation uses task ID as the
+    /// keyset value, but callers must treat it as an opaque string.
+    pub cursor: Option<String>,
+    pub page_size: usize,
+}
+
+impl Default for TaskListRequest {
+    fn default() -> Self {
+        Self {
+            // Callers should always replace this sentinel with an authenticated tenant. Keeping
+            // a total Default is useful for DTO adapters which progressively fill filters.
+            tenant_id: TenantId::new("tenant").expect("static tenant ID is valid"),
+            project_id: None,
+            artifact_id: None,
+            object_namespace_id: None,
+            commit_id: None,
+            playground_id: None,
+            snapshot_id: None,
+            storage_volume_id: None,
+            task_kinds: Vec::new(),
+            states: Vec::new(),
+            parent_task_id: None,
+            created_after_unix_ms: None,
+            created_before_unix_ms: None,
+            updated_after_unix_ms: None,
+            updated_before_unix_ms: None,
+            cursor: None,
+            page_size: 100,
+        }
+    }
+}
+
+impl TaskListRequest {
+    #[must_use]
+    pub fn for_tenant(tenant_id: TenantId) -> Self {
+        Self {
+            tenant_id,
+            page_size: 100,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskListPage {
+    pub items: Vec<OperationTask>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskEventListRequest {
+    pub tenant_id: TenantId,
+    pub task_id: TaskId,
+    pub after_sequence: Option<SequenceNumber>,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskEventListPage {
+    pub items: Vec<TaskEvent>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskSummary {
+    pub total: u64,
+    pub queued: u64,
+    pub running: u64,
+    pub waiting: u64,
+    pub verifying: u64,
+    pub succeeded: u64,
+    pub stalled: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+}
+
+impl TaskSummary {
+    pub fn add(&mut self, state: TaskState) {
+        self.total = self.total.saturating_add(1);
+        match state {
+            TaskState::Queued => self.queued = self.queued.saturating_add(1),
+            TaskState::Running => self.running = self.running.saturating_add(1),
+            TaskState::Waiting => self.waiting = self.waiting.saturating_add(1),
+            TaskState::Verifying => self.verifying = self.verifying.saturating_add(1),
+            TaskState::Succeeded => self.succeeded = self.succeeded.saturating_add(1),
+            TaskState::Stalled => self.stalled = self.stalled.saturating_add(1),
+            TaskState::Failed => self.failed = self.failed.saturating_add(1),
+            TaskState::Cancelled => self.cancelled = self.cancelled.saturating_add(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskResourceLinkRecord {
+    pub tenant_id: TenantId,
+    pub link: TaskResourceLink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRelationRecord {
+    pub tenant_id: TenantId,
+    pub relation: TaskRelation,
 }
 
 /// Result of durably reserving an AssignmentId in the delivery outbox.
@@ -448,12 +590,27 @@ pub trait ControlCatalogRepository: Send + Sync {
         request: &crate::SnapshotListRequest,
     ) -> CentralResult<crate::SnapshotListPage>;
 
-    /// Idempotently inserts a Snapshot while atomically validating its Artifact Head fence,
-    /// Ready Volume binding, request identity, and reusable Commit/Volume placement identity.
-    async fn insert_snapshot_fenced(
+    /// Atomically advances the Snapshot's physical-delivery state.  A replay which already
+    /// observes `next` is idempotent; every other source state must match `expected`.
+    async fn transition_snapshot_state(
         &self,
-        request: crate::SnapshotInsertRequest,
-    ) -> CentralResult<crate::SnapshotInsertOutcome>;
+        tenant_id: &TenantId,
+        snapshot_id: &neoengram_domain::protocol::SnapshotId,
+        expected: crate::SnapshotState,
+        next: crate::SnapshotState,
+        updated_at_unix_ms: UnixMillis,
+    ) -> CentralResult<crate::SnapshotRecord>;
+
+    /// Publishes the immutable Snapshot and its exactly-one Delivery in one atomic operation.
+    ///
+    /// Implementations must validate the immutable identities, request idempotency, Artifact
+    /// head fence, target Volume policy, and retention roots before making either record visible.
+    /// There is intentionally no default implementation: composing the two standalone insert
+    /// primitives would permit a failed Delivery insert to leave an orphan Snapshot.
+    async fn insert_snapshot_with_delivery(
+        &self,
+        request: crate::SnapshotWithDeliveryInsertRequest,
+    ) -> CentralResult<crate::SnapshotWithDeliveryInsertResult>;
 
     /// Durable read-only projection records for a Snapshot. Implementations that predate the
     /// delivery catalog fail closed instead of silently treating a request as an in-memory mount.
@@ -775,6 +932,26 @@ pub trait PlacementRepository: Send + Sync {
         object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
         object_id: &ObjectId,
     ) -> CentralResult<Vec<ObjectPlacementV2>>;
+    /// Persists the latest Agent scrub observation for one placement. Implementations retain
+    /// observations by scan identity and must not let an older timestamp overwrite a newer one.
+    async fn record_placement_health_observation(
+        &self,
+        observation: PlacementHealthObservation,
+    ) -> CentralResult<PlacementHealthObservation> {
+        observation.validate().map_err(CentralError::from)?;
+        Ok(observation)
+    }
+    /// Returns the newest scrub observation for an exact placement generation. `None` means the
+    /// placement has not been scrubbed yet and remains eligible until an explicit bad observation.
+    async fn latest_placement_health(
+        &self,
+        _tenant_id: &TenantId,
+        _object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        _placement_id: &neoengram_domain::protocol::PlacementId,
+        _placement_generation: PlacementGeneration,
+    ) -> CentralResult<Option<PlacementHealthObservation>> {
+        Ok(None)
+    }
     /// Replaces the recomputable Coverage summary at one Volume/generation.  Implementations
     /// reject metadata that does not match the referenced Commit ObjectSet.
     async fn upsert_volume_commit_coverage(
@@ -1389,6 +1566,133 @@ pub trait JobRepository: Send + Sync {
     async fn replace(&self, expected: u64, job: JobRecord) -> CentralResult<JobRecord>;
 }
 
+/// Durable authority for the unified operation-task lifecycle and append-only audit stream.
+///
+/// Domain detail tables (control Jobs, materializations, pre-commits, and resources) remain the
+/// source of their own invariants. This repository only owns the task identity, coarse lifecycle,
+/// attempts, task events, and navigation links used by operations/audit views.
+#[async_trait]
+pub trait TaskRepository: Send + Sync {
+    async fn get(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Option<OperationTask>>;
+
+    async fn get_by_request_id(
+        &self,
+        tenant_id: &TenantId,
+        request_id: &neoengram_domain::protocol::RequestId,
+    ) -> CentralResult<Option<OperationTask>>;
+
+    async fn list(&self, request: &TaskListRequest) -> CentralResult<TaskListPage>;
+
+    async fn list_events(&self, request: &TaskEventListRequest)
+        -> CentralResult<TaskEventListPage>;
+
+    async fn summary(&self, request: &TaskListRequest) -> CentralResult<TaskSummary>;
+
+    /// Inserts a task row. The initial Attempt and Created event can be committed atomically with
+    /// the task using [`Self::insert_with_history`].
+    async fn insert(&self, task: OperationTask) -> CentralResult<TaskInsertOutcome>;
+
+    /// Atomically inserts a task and optional initial attempt/event history. Implementations must
+    /// reject a replay whose immutable task/request payload differs from the stored row.
+    async fn insert_with_history(
+        &self,
+        task: OperationTask,
+        attempt: Option<TaskAttempt>,
+        event: Option<TaskEvent>,
+    ) -> CentralResult<TaskInsertOutcome>;
+
+    /// Replaces a task under optimistic concurrency. `task.resource_version` must equal
+    /// `expected_resource_version + 1`.
+    async fn replace(
+        &self,
+        expected_resource_version: ResourceVersion,
+        task: OperationTask,
+    ) -> CentralResult<OperationTask>;
+
+    /// Atomically transitions the task row and current Attempt, then appends the matching audit
+    /// event. A state replay returns the current task without producing another event.
+    #[allow(clippy::too_many_arguments)]
+    async fn transition(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+        expected_resource_version: ResourceVersion,
+        next: TaskState,
+        actor: TaskActor,
+        issue: Option<neoengram_domain::protocol::TaskIssue>,
+        message: Option<String>,
+        now: UnixMillis,
+    ) -> CentralResult<TaskMutationOutcome>;
+
+    async fn attempts(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskAttempt>>;
+
+    async fn insert_attempt(
+        &self,
+        tenant_id: &TenantId,
+        attempt: TaskAttempt,
+    ) -> CentralResult<TaskAttempt>;
+
+    async fn replace_attempt(
+        &self,
+        tenant_id: &TenantId,
+        expected_resource_version: ResourceVersion,
+        attempt: TaskAttempt,
+    ) -> CentralResult<TaskAttempt>;
+
+    /// Appends an immutable event. Sequence numbers are strictly increasing per task and replay
+    /// of the same event identity/payload is idempotent.
+    async fn append_event(
+        &self,
+        tenant_id: &TenantId,
+        event: TaskEvent,
+    ) -> CentralResult<TaskEvent>;
+
+    async fn link_resource(&self, link: TaskResourceLinkRecord) -> CentralResult<bool>;
+
+    async fn resources(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskResourceLink>>;
+
+    async fn add_relation(&self, relation: TaskRelationRecord) -> CentralResult<bool>;
+
+    async fn relations(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskRelation>>;
+
+    /// Retries the existing task identity with a new Attempt and Retried event.
+    async fn retry(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+        expected_resource_version: ResourceVersion,
+        actor: TaskActor,
+        now: UnixMillis,
+    ) -> CentralResult<TaskMutationOutcome>;
+
+    /// Cancels an active task and appends a Cancelled event. Repeating a cancellation is
+    /// idempotent and returns `replayed = true`.
+    async fn cancel(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+        expected_resource_version: Option<ResourceVersion>,
+        actor: TaskActor,
+        now: UnixMillis,
+    ) -> CentralResult<TaskMutationOutcome>;
+}
+
 /// Durable Pre-commit aggregate and immutable Commit repository.
 ///
 /// `commit` consumes a candidate and inserts its Commit in one authority transaction. Publishing
@@ -1670,6 +1974,7 @@ pub struct AuthorityStore {
     control_catalog: Option<Arc<dyn ControlCatalogRepository>>,
     authority_lifecycle: Option<Arc<dyn AuthorityLifecycleRepository>>,
     placement: Option<Arc<dyn PlacementRepository>>,
+    tasks: Option<Arc<dyn TaskRepository>>,
     capabilities: AuthorityCapabilities,
 }
 
@@ -1698,6 +2003,7 @@ impl AuthorityStore {
             control_catalog: None,
             authority_lifecycle: None,
             placement: None,
+            tasks: None,
             capabilities,
         }
     }
@@ -1801,6 +2107,18 @@ impl AuthorityStore {
     #[must_use]
     pub fn placement(&self) -> Option<Arc<dyn PlacementRepository>> {
         self.placement.clone()
+    }
+
+    /// Adds the unified operation-task/audit repository to this composition root.
+    #[must_use]
+    pub fn with_tasks(mut self, repository: Arc<dyn TaskRepository>) -> Self {
+        self.tasks = Some(repository);
+        self
+    }
+
+    #[must_use]
+    pub fn tasks(&self) -> Option<Arc<dyn TaskRepository>> {
+        self.tasks.clone()
     }
 
     #[must_use]

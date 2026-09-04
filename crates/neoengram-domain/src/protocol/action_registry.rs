@@ -323,26 +323,6 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
     public_action("POST", "/api/artifact/query", "queryArtifact"),
     public_action("POST", "/api/artifact/create", "createArtifact"),
     public_action("POST", "/api/commit/materialize", "materializeCommit"),
-    public_action(
-        "POST",
-        "/api/commit/materialization/query",
-        "queryCommitMaterialization",
-    ),
-    public_action(
-        "POST",
-        "/api/commit/materialization/list/query",
-        "queryCommitMaterializationList",
-    ),
-    public_action(
-        "POST",
-        "/api/commit/materialization/retry",
-        "retryCommitMaterialization",
-    ),
-    public_action(
-        "POST",
-        "/api/commit/materialization/cancel",
-        "cancelCommitMaterialization",
-    ),
     public_action("POST", "/api/commit/coverage/query", "queryCommitCoverage"),
     public_action(
         "POST",
@@ -410,11 +390,6 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
         "POST",
         "/api/snapshot/delivery/retry",
         "retrySnapshotDelivery",
-    ),
-    public_action(
-        "POST",
-        "/api/snapshot/delivery/create",
-        "createSnapshotDelivery",
     ),
     public_action(
         "POST",
@@ -543,9 +518,12 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
         "/api/gateway/replica/revoke",
         "revokeGatewayReplica",
     ),
-    public_action("POST", "/api/job/add/create", "createAddJob"),
-    public_action("POST", "/api/job/query", "queryJob"),
-    public_action("POST", "/api/job/add/finalize", "finalizeAddJob"),
+    public_action("POST", "/api/task/list/query", "queryTaskList"),
+    public_action("POST", "/api/task/query", "queryTask"),
+    public_action("POST", "/api/task/event/list/query", "queryTaskEventList"),
+    public_action("POST", "/api/task/summary/query", "queryTaskSummary"),
+    public_action("POST", "/api/task/retry", "retryTask"),
+    public_action("POST", "/api/task/cancel", "cancelTask"),
     public_action("GET", "/health/live", "liveProbe"),
     public_action("GET", "/health/ready", "readyProbe"),
 ];
@@ -771,7 +749,6 @@ mod tests {
         }
         for v2_path in [
             "/api/commit/materialize",
-            "/api/commit/materialization/query",
             "/api/commit/coverage/query",
             "/api/commit/availability/query",
         ] {

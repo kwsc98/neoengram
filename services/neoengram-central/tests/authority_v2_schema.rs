@@ -7,7 +7,7 @@ use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use tempfile::TempDir;
 
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4155;
-const SQLITE_SCHEMA_VERSION: i64 = 18;
+const SQLITE_SCHEMA_VERSION: i64 = 20;
 
 #[tokio::test]
 async fn fresh_authority_advertises_v2_identity_and_materialization_tables() {
@@ -39,6 +39,11 @@ async fn fresh_authority_advertises_v2_identity_and_materialization_tables() {
         "object_read_leases",
         "staging_leases",
         "materialization_receipts",
+        "operation_tasks",
+        "task_attempts",
+        "task_events",
+        "task_resource_links",
+        "task_relations",
     ] {
         let count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = ?",

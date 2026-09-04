@@ -10,10 +10,10 @@ export function supportsArtifactCommitDiff(capabilities: readonly string[] | und
   return capabilities?.includes('artifact_commit_diff') ?? false;
 }
 
-export function supportsArtifactCommitReplication(
+export function supportsCommitMaterializationV2(
   capabilities: readonly string[] | undefined,
 ): boolean {
-  return capabilities?.includes('artifact_commit_replication') ?? false;
+  return capabilities?.includes('commit_materialization_v2') ?? false;
 }
 
 export function supportsPlaygroundMaterialize(
@@ -31,7 +31,7 @@ export function supportsPlaygroundPreCommit(capabilities: readonly string[] | un
 }
 
 export function supportsSnapshotMaterialize(capabilities: readonly string[] | undefined): boolean {
-  return capabilities?.includes('snapshot_materialize') ?? false;
+  return supportsCommitMaterializationV2(capabilities);
 }
 
 export function supportsCommitLayoutSelection(

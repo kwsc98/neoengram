@@ -82,6 +82,7 @@ impl SqliteAuthority {
             self.inner.clone(),
             AuthorityCapabilities::SQLITE,
         )
+        .with_tasks(self.inner.clone())
         .with_precommits(self.inner.clone())
         .with_agent_registry(self.agent_registry.repository())
         .with_gateway_registry(self.agent_registry.gateway_repository())

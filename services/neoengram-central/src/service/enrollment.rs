@@ -14,7 +14,8 @@ use neoengram_domain::protocol::{
     AgentBootstrapProbe, AgentEnrollmentApprovalRequest, AgentEnrollmentDecision,
     AgentEnrollmentId, AgentEnrollmentTokenCreateRequest, AgentEnrollmentTokenId, AgentId,
     AgentMountId, EdgeClusterId, Extensions, MountAccessMode, PvcIdentityDigest, RequestId,
-    ResourceHealth, ResourceVersion, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId,
+    ResourceHealth, ResourceVersion, StorageVolumeId, TaskActor, TaskKind, TaskResourceKind,
+    TaskResourceLink, TaskResourceRole, TaskScope, TenantId, UnixMillis, VolumeMarkerId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,13 +27,13 @@ use crate::{
         QueryStorageEnrollmentListRequest, QueryStorageEnrollmentListResponse,
         QueryStorageEnrollmentRequest, QueryStorageEnrollmentResponse,
         RejectStorageEnrollmentRequest, RejectStorageEnrollmentResponse,
-        StorageEnrollmentProbeSummary, StorageEnrollmentView,
+        StorageEnrollmentProbeSummary, StorageEnrollmentView, TaskView,
     },
     error::{application_error, invalid_request, map_central_error, storage_enrollment_not_found},
     identity::{AuthenticatedIdentity, Permission, StaticRbacPolicy},
 };
 
-use super::{catalog::storage_volume_view, EnrollmentKeyring};
+use super::{catalog::storage_volume_view, EnrollmentKeyring, TaskCoordinator};
 
 const TOKEN_TTL_MS: u64 = 15 * 60 * 1_000;
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -47,6 +48,7 @@ pub struct EnrollmentService {
     policy: Arc<StaticRbacPolicy>,
     keyring: Arc<EnrollmentKeyring>,
     clock: Arc<dyn Clock>,
+    task_coordinator: Option<Arc<TaskCoordinator>>,
 }
 
 impl EnrollmentService {
@@ -64,7 +66,89 @@ impl EnrollmentService {
             policy,
             keyring,
             clock,
+            task_coordinator: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_task_coordinator(mut self, coordinator: Arc<TaskCoordinator>) -> Self {
+        self.task_coordinator = Some(coordinator);
+        self
+    }
+
+    async fn begin_task<T: Serialize>(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request_id: RequestId,
+        request: &T,
+        tenant_id: &TenantId,
+        storage_volume_id: &StorageVolumeId,
+        detail_id: &str,
+    ) -> Result<(Option<neoengram_domain::protocol::OperationTask>, bool), Error> {
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok((None, false));
+        };
+        let (task, replayed) = coordinator
+            .create_root(
+                TaskKind::StorageLifecycle,
+                TaskScope {
+                    tenant_id: tenant_id.clone(),
+                    project_id: None,
+                    artifact_id: None,
+                    object_namespace_id: None,
+                    commit_id: None,
+                    playground_id: None,
+                    snapshot_id: None,
+                    storage_volume_id: Some(storage_volume_id.clone()),
+                },
+                request_id,
+                request,
+                TaskActor::Principal(identity.principal().clone()),
+                Some("storage_enrollment"),
+                Some(detail_id),
+            )
+            .await
+            .map_err(map_central_error)?;
+        Ok((Some(task), replayed))
+    }
+
+    async fn link_task_enrollment(
+        &self,
+        task: &Option<neoengram_domain::protocol::OperationTask>,
+        enrollment_id: &AgentEnrollmentId,
+    ) -> Result<(), Error> {
+        let (Some(coordinator), Some(task)) = (&self.task_coordinator, task) else {
+            return Ok(());
+        };
+        coordinator
+            .repository()
+            .link_resource(crate::TaskResourceLinkRecord {
+                tenant_id: task.tenant_id.clone(),
+                link: TaskResourceLink::new(
+                    task.task_id.clone(),
+                    TaskResourceKind::StorageEnrollment,
+                    enrollment_id.to_string(),
+                    TaskResourceRole::Primary,
+                ),
+            })
+            .await
+            .map(|_| ())
+            .map_err(map_central_error)
+    }
+
+    async fn complete_task(
+        &self,
+        task: Option<neoengram_domain::protocol::OperationTask>,
+        identity: &AuthenticatedIdentity,
+    ) -> Result<Option<TaskView>, Error> {
+        let (Some(coordinator), Some(task)) = (&self.task_coordinator, task) else {
+            return Ok(None);
+        };
+        let task = coordinator
+            .complete_immediate(&task, TaskActor::Principal(identity.principal().clone()))
+            .await
+            .map_err(map_central_error)?;
+        Ok(Some(super::task::task_view(&task)))
     }
 
     pub async fn create_token(
@@ -72,12 +156,23 @@ impl EnrollmentService {
         identity: &AuthenticatedIdentity,
         request: CreateStorageEnrollmentTokenRequest,
     ) -> Result<CreateStorageEnrollmentTokenResponse, Error> {
+        let task_request = request.clone();
         let parsed = ParsedCreateRequest::parse(request)?;
         self.policy.authorize_identity(
             identity,
             Permission::StorageEnrollmentCreate,
             &parsed.tenant_id,
         )?;
+        let (task, task_replayed) = self
+            .begin_task(
+                identity,
+                parsed.token_request_id.clone(),
+                &task_request,
+                &parsed.tenant_id,
+                &parsed.storage_volume_id,
+                parsed.storage_volume_id.as_str(),
+            )
+            .await?;
 
         if let Some(existing) = self
             .registry
@@ -91,7 +186,11 @@ impl EnrollmentService {
                     "token request identity was reused with another enrollment intent",
                 )));
             }
-            return self.token_response(&existing, true);
+            self.link_task_enrollment(&task, &existing.enrollment.enrollment_id)
+                .await?;
+            let mut response = self.token_response(&existing, true)?;
+            response.task = self.complete_task(task, identity).await?;
+            return Ok(response);
         }
 
         let now = self.clock.now();
@@ -157,7 +256,11 @@ impl EnrollmentService {
             })
             .await
             .map_err(map_storage_enrollment_error)?;
-        self.token_response(&result.record, result.replayed)
+        self.link_task_enrollment(&task, &result.record.enrollment.enrollment_id)
+            .await?;
+        let mut response = self.token_response(&result.record, result.replayed || task_replayed)?;
+        response.task = self.complete_task(task, identity).await?;
+        Ok(response)
     }
 
     pub async fn list(
@@ -255,6 +358,7 @@ impl EnrollmentService {
         identity: &AuthenticatedIdentity,
         request: ApproveStorageEnrollmentRequest,
     ) -> Result<ApproveStorageEnrollmentResponse, Error> {
+        let task_request = request.clone();
         let tenant_id = parse_tenant(&request.tenant_id)?;
         self.policy.authorize_identity(
             identity,
@@ -262,16 +366,27 @@ impl EnrollmentService {
             &tenant_id,
         )?;
         let enrollment_id = parse_enrollment_id(&request.storage_enrollment_id)?;
-        self.registry
+        let current = self
+            .registry
             .query_enrollment(&tenant_id, &enrollment_id)
             .await
             .map_err(map_storage_enrollment_error)?;
+        let decision_request_id =
+            parse_request_id("approval_request_id", &request.approval_request_id)?;
+        let (task, task_replayed) = self
+            .begin_task(
+                identity,
+                decision_request_id.clone(),
+                &task_request,
+                &tenant_id,
+                &current.enrollment.storage_volume_id,
+                enrollment_id.as_str(),
+            )
+            .await?;
+        self.link_task_enrollment(&task, &enrollment_id).await?;
         let decision = AgentEnrollmentApprovalRequest {
             enrollment_id,
-            decision_request_id: parse_request_id(
-                "approval_request_id",
-                &request.approval_request_id,
-            )?,
+            decision_request_id,
             expected_resource_version: ResourceVersion::new(parse_canonical_u64(
                 "expected_resource_version",
                 &request.expected_resource_version,
@@ -292,10 +407,12 @@ impl EnrollmentService {
             .await
             .map_err(map_storage_enrollment_error)?
             .ok_or_else(internal_enrollment_error)?;
+        let task = self.complete_task(task, identity).await?;
         Ok(ApproveStorageEnrollmentResponse {
             enrollment,
             storage_volume: storage_volume_view(&storage_volume),
-            replayed: result.replayed,
+            replayed: result.replayed || task_replayed,
+            task,
         })
     }
 
@@ -304,6 +421,7 @@ impl EnrollmentService {
         identity: &AuthenticatedIdentity,
         request: RejectStorageEnrollmentRequest,
     ) -> Result<RejectStorageEnrollmentResponse, Error> {
+        let task_request = request.clone();
         let tenant_id = parse_tenant(&request.tenant_id)?;
         self.policy.authorize_identity(
             identity,
@@ -311,17 +429,28 @@ impl EnrollmentService {
             &tenant_id,
         )?;
         let enrollment_id = parse_enrollment_id(&request.storage_enrollment_id)?;
-        self.registry
+        let current = self
+            .registry
             .query_enrollment(&tenant_id, &enrollment_id)
             .await
             .map_err(map_storage_enrollment_error)?;
         let reason = request.reason.map(validate_rejection_reason).transpose()?;
+        let decision_request_id =
+            parse_request_id("rejection_request_id", &request.rejection_request_id)?;
+        let (task, task_replayed) = self
+            .begin_task(
+                identity,
+                decision_request_id.clone(),
+                &task_request,
+                &tenant_id,
+                &current.enrollment.storage_volume_id,
+                enrollment_id.as_str(),
+            )
+            .await?;
+        self.link_task_enrollment(&task, &enrollment_id).await?;
         let decision = AgentEnrollmentApprovalRequest {
             enrollment_id,
-            decision_request_id: parse_request_id(
-                "rejection_request_id",
-                &request.rejection_request_id,
-            )?,
+            decision_request_id,
             expected_resource_version: ResourceVersion::new(parse_canonical_u64(
                 "expected_resource_version",
                 &request.expected_resource_version,
@@ -335,9 +464,11 @@ impl EnrollmentService {
             .decide_storage_enrollment(decision, identity.principal().clone(), reason)
             .await
             .map_err(map_storage_enrollment_error)?;
+        let task = self.complete_task(task, identity).await?;
         Ok(RejectStorageEnrollmentResponse {
             enrollment: record_to_view(&result.record)?,
-            replayed: result.replayed,
+            replayed: result.replayed || task_replayed,
+            task,
         })
     }
 
@@ -346,6 +477,7 @@ impl EnrollmentService {
         identity: &AuthenticatedIdentity,
         request: CompleteStorageRecoveryRequest,
     ) -> Result<CompleteStorageRecoveryResponse, Error> {
+        let task_request = request.clone();
         let tenant_id = parse_tenant(&request.tenant_id)?;
         self.policy.authorize_identity(
             identity,
@@ -353,6 +485,27 @@ impl EnrollmentService {
             &tenant_id,
         )?;
         let enrollment_id = parse_enrollment_id(&request.storage_enrollment_id)?;
+        let current = self
+            .registry
+            .query_enrollment(&tenant_id, &enrollment_id)
+            .await
+            .map_err(map_storage_enrollment_error)?;
+        let task_digest = neoengram_domain::jcs_blake3(&task_request)
+            .map_err(|error| invalid_request(format!("recovery task request: {error}")))?;
+        let task_request_id =
+            RequestId::new(format!("storage-recovery-{}", &task_digest.to_hex()[..32]))
+                .map_err(|error| invalid_request(format!("recovery task request_id: {error}")))?;
+        let (task, _task_replayed) = self
+            .begin_task(
+                identity,
+                task_request_id,
+                &task_request,
+                &tenant_id,
+                &current.enrollment.storage_volume_id,
+                enrollment_id.as_str(),
+            )
+            .await?;
+        self.link_task_enrollment(&task, &enrollment_id).await?;
         let expected_resource_version = ResourceVersion::new(parse_canonical_u64(
             "expected_resource_version",
             &request.expected_resource_version,
@@ -375,9 +528,11 @@ impl EnrollmentService {
             .await
             .map_err(map_storage_enrollment_error)?
             .ok_or_else(internal_enrollment_error)?;
+        let task = self.complete_task(task, identity).await?;
         Ok(CompleteStorageRecoveryResponse {
             enrollment: record_to_view(&record)?,
             storage_volume: storage_volume_view(&storage_volume),
+            task,
         })
     }
 
@@ -396,6 +551,7 @@ impl EnrollmentService {
             volume_descriptor_digest: record.enrollment.volume_descriptor_digest.to_string(),
             expires_at_unix_ms: record.enrollment.expires_at_unix_ms.to_string(),
             replayed,
+            task: None,
         })
     }
 

@@ -993,6 +993,24 @@ fn validate_connection_handshake(
     Ok(())
 }
 
+/// Validates the transport identity for a network-only preflight. Unlike a materialization
+/// opening, this probe intentionally has no Central ticket or Agent route generation to fence;
+/// it only proves that the v2 ALPN and mutual TLS policy are usable before the Agent advertises
+/// its dynamic materialization capability. Real object streams still use the ticket fence below.
+fn validate_preflight_handshake(connection: &Connection) -> Result<(), QuicTransferError> {
+    let handshake = connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .ok_or(QuicTransferError::Alpn)?;
+    if handshake.protocol.as_deref() != Some(alpn()) {
+        return Err(QuicTransferError::Alpn);
+    }
+    if connection.peer_identity().is_none() {
+        return Err(QuicTransferError::MissingPeerIdentity);
+    }
+    Ok(())
+}
+
 fn validate_materialization_handshake(
     connection: &Connection,
     ticket: &MaterializationBatchTicket,
@@ -1145,10 +1163,21 @@ async fn handle_incoming(
     allow_legacy_transfer: bool,
 ) -> Result<(), QuicTransferError> {
     let connection = incoming.await.map_err(QuicTransferError::Connection)?;
-    let (send, mut recv) = connection.accept_bi().await?;
+    let (mut send, mut recv) = connection.accept_bi().await?;
     let first_frame = read_frame(&mut recv).await?;
     reject_legacy_transfer(&first_frame, allow_legacy_transfer)?;
     match first_frame {
+        TransferFrame::Preflight => {
+            validate_preflight_handshake(&connection)?;
+            send_frame(&mut send, &TransferFrame::PreflightAck).await?;
+            // The probe has no long-lived stream. Finishing after the acknowledgement gives the
+            // Agent a deterministic response while keeping the Gateway free of transfer state.
+            let _ = send.finish();
+            // Keep the connection handle alive until QUIC acknowledges the response. Dropping the
+            // handler immediately after `finish` can close the connection before a fast Agent has
+            // a chance to read the acknowledgement.
+            let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+        }
         TransferFrame::OpenMaterializationSigned(ticket) => {
             validate_materialization_handshake(&connection, &ticket.ticket, fence.as_ref())?;
             if let Some(relay) = relay {
@@ -1468,6 +1497,46 @@ mod tests {
             reject_legacy_transfer(&unsigned, false),
             Err(QuicTransferError::LegacyProtocolDisabled)
         ));
+    }
+
+    #[tokio::test]
+    async fn preflight_acknowledges_mtls_without_an_active_route() {
+        let (server_tls, client_tls) = transfer_tls();
+        let listener = QuicTransferListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_tls,
+            QuicTransferFence::new(
+                GatewayPoolId::new("gateway-target").unwrap(),
+                EdgeClusterId::new("cluster-target").unwrap(),
+            ),
+        )
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let server = tokio::spawn(serve(listener, 2, shutdown_receiver));
+
+        let crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from((*client_tls).clone()).unwrap();
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        let connection = endpoint
+            .connect(address, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send_frame(&mut send, &TransferFrame::Preflight)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut recv).await.unwrap(),
+            TransferFrame::PreflightAck
+        );
+
+        connection.close(0u32.into(), b"test complete");
+        endpoint.wait_idle().await;
+        shutdown_sender.send(true).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[test]

@@ -955,6 +955,24 @@ impl RegistryAgentApiHandler {
                     extensions: Extensions::new(),
                 })
             }
+            AgentChannelUpstreamMessage::IntegrityReport(report) => {
+                let result = self
+                    .require_control()?
+                    .receive_integrity_report(
+                        &report.scan.tenant_id,
+                        &context.agent_id,
+                        context.session_generation,
+                        report.as_ref().clone(),
+                    )
+                    .await
+                    .map_err(map_registry_error)?;
+                AppliedChannelFrame::Continue(AgentChannelAck {
+                    acknowledged_sequence: sequence,
+                    resource_version: result.resource_version,
+                    replayed: result.replayed,
+                    extensions: Extensions::new(),
+                })
+            }
             AgentChannelUpstreamMessage::Close(payload) => {
                 let record = self
                     .registry
@@ -1013,15 +1031,44 @@ impl RegistryAgentApiHandler {
         downstream_sequence: &mut u64,
         last_delivered: &mut BTreeMap<MessageId, Instant>,
     ) -> Result<(), AgentHttpError> {
-        let messages = self
+        if output.is_closed() {
+            return Err(AgentHttpError::unavailable());
+        }
+        // Do this before asking the ControlPlane to build materialization manifests. A full
+        // bounded response queue is normal backpressure, not a reason to claim a queued Batch or
+        // rebuild a signed Assignment on every delivery tick.
+        if output.capacity() == 0 {
+            return Err(AgentHttpError::backpressure());
+        }
+        // Bound the authority query to the queue capacity.  A slow Agent should never make
+        // Central build a full materialization manifest when only one downstream frame can be
+        // admitted; the next delivery tick will continue from the durable outbox/checkpoint.
+        let delivery_limit = output.capacity().min(MAX_AGENT_CHANNEL_MESSAGES);
+        let messages = match self
             .require_control()?
             .deliverable_agent_messages(
                 &context.agent_id,
                 context.session_generation,
-                MAX_AGENT_CHANNEL_MESSAGES,
+                delivery_limit,
             )
             .await
-            .map_err(map_registry_error)?;
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                // Keep the stable HTTP error contract for Agents, but retain the authoritative
+                // code and detail in Central logs. Without this context a planning/signing/route
+                // failure is indistinguishable from a closed reverse channel and an active Batch
+                // can appear to be stuck forever.
+                tracing::warn!(
+                    agent_id = %context.agent_id,
+                    session_generation = context.session_generation.get(),
+                    central_code = error.stable_code(),
+                    central_error = %error,
+                    "could not build Agent reverse-channel delivery"
+                );
+                return Err(map_registry_error(error));
+            }
+        };
         let pending = messages
             .iter()
             .filter_map(|envelope| MessageId::new(envelope.header.request_id.as_str()).ok())
@@ -1098,9 +1145,15 @@ impl RegistryAgentApiHandler {
                 message,
             )
             .await?;
-        output
-            .try_send(bytes)
-            .map_err(|_| AgentHttpError::unavailable())?;
+        match output.try_send(bytes) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                return Err(AgentHttpError::backpressure());
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(AgentHttpError::unavailable());
+            }
+        }
         *downstream_sequence = next;
         Ok(())
     }
@@ -1797,6 +1850,25 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(backpressure.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(backpressure.code, "AGENT_CHANNEL_BACKPRESSURE");
+        assert_eq!(sequence, 7);
+
+        let (closed_output, closed_receiver) = tokio::sync::mpsc::channel(1);
+        drop(closed_receiver);
+        let closed = handler
+            .try_send_channel_message(
+                &closed_output,
+                &context,
+                &mut sequence,
+                MessageId::new("message-closed").unwrap(),
+                None,
+                UnixMillis::new(1),
+                channel_error("closed channel".to_owned()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(closed.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(closed.code, "SERVICE_UNAVAILABLE");
         assert_eq!(sequence, 7);
 
         let (empty_output, _empty_receiver) = tokio::sync::mpsc::channel(1);

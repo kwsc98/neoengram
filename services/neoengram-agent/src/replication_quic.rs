@@ -370,13 +370,29 @@ impl QuicTransferNetwork {
     }
 
     /// Performs the bounded network half of replication preflight. A successful result means the
-    /// configured Gateway endpoint completed QUIC TLS/ALPN negotiation with this Agent identity;
-    /// it does not authorize a transfer or consume object bytes. The control stream is closed
-    /// immediately because only a Central-signed ticket can open a transfer.
+    /// configured Gateway endpoint completed QUIC TLS/ALPN negotiation with this Agent identity
+    /// and accepted the v2 preflight frame. It does not authorize a transfer or consume object
+    /// bytes; only a Central-signed ticket can open a transfer.
     pub async fn preflight_gateway(&self) -> Result<(), QuicTransferError> {
         let connection = tokio::time::timeout(Duration::from_secs(5), self.connect_gateway())
             .await
             .map_err(|_| QuicTransferError::PreflightTimeout)??;
+        let (mut send, mut recv) =
+            tokio::time::timeout(Duration::from_secs(5), connection.open_bi())
+                .await
+                .map_err(|_| QuicTransferError::PreflightTimeout)??;
+        send_frame(&mut send, &TransferFrame::Preflight).await?;
+        // Explicitly finish the probe stream so the Gateway can distinguish a complete probe
+        // from a client that disappeared before sending its first frame.
+        let _ = send.finish();
+        let response = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut recv))
+            .await
+            .map_err(|_| QuicTransferError::PreflightTimeout)??;
+        if !matches!(response, TransferFrame::PreflightAck) {
+            return Err(QuicTransferError::Protocol(
+                "Gateway returned an invalid replication preflight response".into(),
+            ));
+        }
         connection.close(0u32.into(), b"replication preflight");
         Ok(())
     }
@@ -2181,7 +2197,7 @@ mod tests {
         MaterializationBatchId, MaterializationId, MaterializationSource, MaterializationTarget,
         MountGeneration, ObjectEncoding, ObjectNamespaceId, ObjectRef, ObjectTicketId,
         PlacementGeneration, PlacementId, RouteGeneration, SessionGeneration, StorageVolumeId,
-        TenantId, TransferEndpoint, TransferId, UnixMillis,
+        TaskAttemptId, TaskId, TenantId, TransferEndpoint, TransferId, UnixMillis,
     };
     use neoengram_domain::{CommitId, ContentDigest, Generation};
 
@@ -2219,6 +2235,9 @@ mod tests {
     fn materialization_ticket(object: &ObjectRef) -> MaterializationBatchTicket {
         MaterializationBatchTicket {
             ticket_id: ObjectTicketId::new("ticket-source-placement").unwrap(),
+            operation_task_id: TaskId::new("task-materialization-source-placement").unwrap(),
+            task_attempt_id: TaskAttemptId::new("task-materialization-source-placement-attempt-1")
+                .unwrap(),
             materialization_id: MaterializationId::new("materialization-source-placement").unwrap(),
             batch_id: MaterializationBatchId::new("batch-source-placement").unwrap(),
             plan_revision: Generation::new(1),

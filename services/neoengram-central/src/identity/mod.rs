@@ -847,6 +847,10 @@ pub enum Permission {
     GatewayRead,
     #[serde(rename = "gateway.manage")]
     GatewayManage,
+    #[serde(rename = "task.read")]
+    TaskRead,
+    #[serde(rename = "task.manage")]
+    TaskManage,
 }
 
 impl Permission {
@@ -880,6 +884,8 @@ impl Permission {
             Self::RetentionManage => "retention.manage",
             Self::GatewayRead => "gateway.read",
             Self::GatewayManage => "gateway.manage",
+            Self::TaskRead => "task.read",
+            Self::TaskManage => "task.manage",
         }
     }
 }
@@ -1094,6 +1100,8 @@ impl StaticRbacPolicy {
                 Permission::ResourceLifecycleRead,
                 Permission::ResourceLifecycleManage,
                 Permission::RetentionManage,
+                Permission::TaskRead,
+                Permission::TaskManage,
             ]);
         }
         permissions
@@ -1113,6 +1121,8 @@ fn permission_is_granted(permissions: &BTreeSet<Permission>, requested: Permissi
                     | Permission::ResourceLifecycleRead
                     | Permission::ResourceLifecycleManage
                     | Permission::RetentionManage
+                    | Permission::TaskRead
+                    | Permission::TaskManage
             ))
 }
 
@@ -1306,6 +1316,8 @@ mod tests {
                 "resource.lifecycle.read".to_owned(),
                 "resource.lifecycle.manage".to_owned(),
                 "retention.manage".to_owned(),
+                "task.read".to_owned(),
+                "task.manage".to_owned(),
             ]
         );
     }

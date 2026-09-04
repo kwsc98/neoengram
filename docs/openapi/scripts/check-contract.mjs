@@ -285,117 +285,6 @@ for (const [path, [method, operationId]] of Object.entries(
   assert(successMedia?.schema, `${operationId} has no JSON success DTO`);
 }
 
-const jobContracts = {
-  createAddJob: {
-    path: "/api/job/add/create",
-    successSchema: "#/components/schemas/CreateAddJobResponse",
-    statuses: [
-      "200",
-      "401",
-      "403",
-      "408",
-      "409",
-      "413",
-      "422",
-      "429",
-      "500",
-      "503",
-      "504",
-    ],
-    successExamples: ["created", "replayed"],
-  },
-  queryJob: {
-    path: "/api/job/query",
-    successSchema: "#/components/schemas/QueryJobResponse",
-    statuses: [
-      "200",
-      "401",
-      "403",
-      "404",
-      "413",
-      "422",
-      "429",
-      "500",
-      "503",
-      "504",
-    ],
-    successExamples: ["current", "repeated"],
-  },
-  finalizeAddJob: {
-    path: "/api/job/add/finalize",
-    successSchema: "#/components/schemas/FinalizeAddJobResponse",
-    statuses: [
-      "200",
-      "401",
-      "403",
-      "404",
-      "408",
-      "409",
-      "413",
-      "422",
-      "429",
-      "500",
-      "503",
-      "504",
-    ],
-    successExamples: ["published", "replayed"],
-  },
-};
-
-for (const [operationId, contract] of Object.entries(jobContracts)) {
-  const operation = document.paths[contract.path].post;
-  assert(
-    operation.security?.some((entry) => Object.hasOwn(entry, "BearerAuth")),
-    `${operationId} does not require BearerAuth`,
-  );
-
-  const parameters = operation.parameters.map(resolveRef);
-  const version = parameters.find(
-    (parameter) => parameter.name === "NeoEngram-API-Version",
-  );
-  assert(
-    version?.in === "header" && version.required === true,
-    `${operationId} lacks a required API version header`,
-  );
-  assertSameMembers(
-    version.schema?.enum ?? [],
-    ["1"],
-    `${operationId} accepts the wrong API versions`,
-  );
-
-  assertSameMembers(
-    Object.keys(operation.responses),
-    contract.statuses,
-    `${operationId} status mapping changed`,
-  );
-  const successMedia = resolveRef(operation.responses["200"]).content?.[
-    "application/json"
-  ];
-  assert(
-    successMedia?.schema?.$ref === contract.successSchema,
-    `${operationId} returns the wrong success DTO`,
-  );
-  assertSameMembers(
-    Object.keys(successMedia.examples ?? {}),
-    contract.successExamples,
-    `${operationId} success/replay examples changed`,
-  );
-
-  const hasFailureExample = Object.entries(operation.responses)
-    .filter(([status]) => !status.startsWith("2"))
-    .some(([, responseRef]) => {
-      const media =
-        resolveRef(responseRef).content?.["application/problem+json"];
-      return Boolean(
-        media?.example || Object.keys(media?.examples ?? {}).length,
-      );
-    });
-  assert(
-    hasFailureExample,
-    `${operationId} has no representative failure example`,
-  );
-}
-
 const versionQuery = document.paths["/api/system/version/query"].post;
 assert(
   JSON.stringify(versionQuery.security) === "[]",
@@ -410,9 +299,6 @@ assert(
 
 for (const operationId of [
   "queryApiVersion",
-  "createAddJob",
-  "queryJob",
-  "finalizeAddJob",
   "createStorageEnrollmentToken",
   "queryStorageEnrollmentList",
   "queryStorageEnrollment",
@@ -436,62 +322,6 @@ for (const operationId of [
   );
 }
 
-const createRequest = document.components.schemas.CreateAddJobRequest;
-assert(
-  createRequest.additionalProperties === false,
-  "Add request must reject unknown fields",
-);
-assertSameMembers(
-  createRequest.required,
-  [
-    "tenant_id",
-    "project_id",
-    "artifact_id",
-    "playground_id",
-    "job_id",
-    "expected_index_version",
-    "deadline_unix_ms",
-    "paths",
-    "all",
-  ],
-  "Add request fields changed",
-);
-assert(
-  !createRequest.properties.principal &&
-    !createRequest.properties.actor &&
-    !createRequest.properties.request_digest,
-  "client request must not declare actor, principal, or request_digest",
-);
-assert(
-  createRequest.properties.paths.maxItems === 4096,
-  "Add path limit must match neoengram-domain",
-);
-
-const jobView = document.components.schemas.JobView;
-assert(
-  jobView.additionalProperties === false,
-  "JobView must reject unknown fields",
-);
-assertSameMembers(
-  Object.keys(jobView.properties),
-  [
-    "operation",
-    "tenant_id",
-    "project_id",
-    "artifact_id",
-    "playground_id",
-    "job_id",
-    "state",
-    "resource_version",
-    "deadline_unix_ms",
-    "progress",
-    "decision",
-    "failure",
-    "finalized_at_unix_ms",
-  ],
-  "public JobView fields changed",
-);
-
 const canonicalU64 = document.components.schemas.CanonicalU64;
 assert(
   canonicalU64.type === "string" && canonicalU64.pattern,
@@ -509,11 +339,10 @@ assert(
 );
 
 const canonicalFields = [
-  jobView.properties.resource_version,
-  document.components.schemas.PublicJobProgress.properties.files_completed,
-  document.components.schemas.PublicJobProgress.properties.bytes_completed,
-  document.components.schemas.PublicJobProgress.properties.retry_after_ms,
-  document.components.schemas.JobError.properties.retry_after_ms,
+  document.components.schemas.TaskView.properties.attempt,
+  document.components.schemas.TaskProgressView.properties.completed,
+  document.components.schemas.TaskProgressView.properties.completed_bytes,
+  document.components.schemas.TaskView.properties.resource_version,
   document.components.schemas.ProblemDetails.properties.retry_after_ms,
   document.components.schemas.IndexVersion.properties.revision,
   document.components.schemas.CommitDiffSummary.properties.files_added,
@@ -545,15 +374,6 @@ assertSameMembers(
   ],
   "ProblemDetails required fields changed",
 );
-
-for (const target of Object.values(
-  document.components.schemas.PublicJobDecision.discriminator.mapping,
-)) {
-  assert(
-    resolveRef({ $ref: target }),
-    `unresolved Job decision discriminator target ${target}`,
-  );
-}
 
 const resourceContracts = {
   queryTenantList: ["QueryTenantListRequest", "QueryTenantListResponse"],
@@ -643,10 +463,6 @@ const resourceContracts = {
   querySnapshotList: ["QuerySnapshotListRequest", "QuerySnapshotListResponse"],
   querySnapshot: ["QuerySnapshotRequest", "QuerySnapshotResponse"],
   createSnapshot: ["CreateSnapshotRequest", "CreateSnapshotResponse"],
-  createSnapshotDelivery: [
-    "CreateSnapshotDeliveryRequest",
-    "CreateSnapshotDeliveryResponse",
-  ],
   querySnapshotDelivery: [
     "QuerySnapshotDeliveryRequest",
     "QuerySnapshotDeliveryResponse",
@@ -793,9 +609,8 @@ assert(
 assertSameMembers(
   document.components.schemas.PermissionName.enum,
   [
-    "job.create",
-    "job.read",
-    "job.finalize",
+    "task.read",
+    "task.manage",
     "tenant.read",
     "tenant.create",
     "tenant.admin",
@@ -1029,6 +844,9 @@ assertSameMembers(
     "project_id",
     "artifact_id",
     "commit_id",
+    "target_edge_cluster_id",
+    "target_storage_volume_id",
+    "delivery_mode",
     "request_id",
   ],
   "Snapshot create must bind Commit and request identity",
@@ -1039,7 +857,7 @@ assert(
 );
 assertDescriptionIncludes(
   createSnapshotRequest,
-  ["Commit 确属该 Artifact", "不能创建 Artifact", "切换 Commit"],
+  ["固定 Commit", "目标 EdgeCluster/StorageVolume", "不能创建 Artifact", "切换 Commit"],
   "Snapshot create must preserve Artifact/Commit authority",
 );
 assert(
@@ -1287,7 +1105,7 @@ assertSameMembers(
 );
 assertDescriptionIncludes(
   document.components.schemas.SnapshotView,
-  ["SnapshotDelivery", "不保存挂载或物化模式"],
+  ["SnapshotDelivery", "目标物理交付", "不可变"],
   "Snapshot view must delegate materialization to SnapshotDelivery",
 );
 
@@ -1306,6 +1124,10 @@ assert(
     deliveryListResponses["409"]?.$ref ===
       "#/components/responses/CursorConflictProblem",
   "SnapshotDelivery list must expose missing Snapshot and cursor conflicts",
+);
+assert(
+  document.components.schemas.QuerySnapshotDeliveryListResponse.properties.items.maxItems === 1,
+  "SnapshotDelivery list must allow at most one Delivery per Snapshot",
 );
 const snapshotDeliveryView = document.components.schemas.SnapshotDeliveryView;
 for (const field of ["source_index_digest", "object_set_digest"]) {
@@ -1405,8 +1227,18 @@ assert(
   "SnapshotView must expose dynamic Commit data health",
 );
 assert(
-  !snapshotView.properties.storage_volume_id && !snapshotView.properties.region,
-  "SnapshotView must not bind a physical Volume or Region",
+  snapshotView.properties.delivery_id &&
+    snapshotView.properties.edge_cluster_id &&
+    snapshotView.properties.storage_volume_id &&
+    snapshotView.properties.delivery_mode,
+  "SnapshotView must expose its immutable delivery target",
+);
+assertSameMembers(
+  snapshotView.required.filter((field) =>
+    ["delivery_id", "edge_cluster_id", "storage_volume_id", "delivery_mode"].includes(field),
+  ),
+  ["delivery_id", "edge_cluster_id", "storage_volume_id", "delivery_mode"],
+  "SnapshotView delivery target fields changed",
 );
 assertSameMembers(
   document.components.schemas.PlaygroundView.required.filter((field) =>
@@ -1441,10 +1273,14 @@ assert(
   "CreatePlaygroundRequest must select a StorageVolume",
 );
 assert(
-  !document.components.schemas.CreateSnapshotRequest.required.includes(
-    "storage_volume_id",
-  ),
-  "CreateSnapshotRequest must remain placement-free",
+  document.components.schemas.CreateSnapshotRequest.required.includes(
+    "target_edge_cluster_id",
+  ) &&
+    document.components.schemas.CreateSnapshotRequest.required.includes(
+      "target_storage_volume_id",
+    ) &&
+    document.components.schemas.CreateSnapshotRequest.required.includes("delivery_mode"),
+  "CreateSnapshotRequest must select its immutable delivery target",
 );
 
 assertSameMembers(
@@ -1497,10 +1333,11 @@ assertDescriptionIncludes(
     "固定 Commit",
     "不能创建 Artifact",
     "切换 Commit",
-    "源 Placement",
-    "不能为 Snapshot 选择 Volume",
+    "目标 EdgeCluster",
+    "目标 Volume",
+    "唯一 SnapshotDelivery",
   ],
-  "Snapshot placement-free creation boundary is not documented",
+  "Snapshot target-first creation boundary is not documented",
 );
 
 const startPreCommit = document.paths["/api/playground/precommit/start"].post;
@@ -1549,8 +1386,8 @@ const [snapshotCreatePath, [snapshotCreateMethod]] = Object.entries(
 ).find(([, [, candidate]]) => candidate === "createSnapshot");
 assertDescriptionIncludes(
   document.paths[snapshotCreatePath][snapshotCreateMethod],
-  ["不绑定 StorageVolume", "复制", "交付"],
-  "createSnapshot placement-first semantics are not documented",
+  ["绑定一个目标 EdgeCluster", "StorageVolume", "唯一 SnapshotDelivery"],
+  "createSnapshot target-first semantics are not documented",
 );
 
 assertDescriptionIncludes(
@@ -1765,10 +1602,9 @@ assert(
   "Storage enrollment replacement confirmation conflict code drifted",
 );
 assert(
-  !document.components.responses.DeadlineProblem.description
-    .toLowerCase()
-    .includes("lease"),
-  "Public Job deadline response must not expose assignment lease semantics",
+  document.paths["/api/task/retry"].post.description.includes("Attempt") &&
+    document.paths["/api/task/cancel"].post.description.includes("审计"),
+  "Task retry/cancel operations must document unified lifecycle semantics",
 );
 
 const createEnrollmentTokenOperation =
@@ -1835,7 +1671,7 @@ assertSameMembers(
 );
 assertSameMembers(
   Object.keys(createEnrollmentTokenResponse.properties),
-  createEnrollmentTokenResponseFields,
+  [...createEnrollmentTokenResponseFields, "task"],
   "Storage enrollment token response fields changed",
 );
 assert(

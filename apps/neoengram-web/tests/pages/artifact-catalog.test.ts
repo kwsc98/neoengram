@@ -5,12 +5,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type {
-  ArtifactView,
-  CommitGraphView,
-  CreateCommitReplicationRequest,
-  TenantView,
-} from '@/api/types';
+import type { ArtifactView, CommitGraphView, TenantView } from '@/api/types';
 import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
@@ -18,20 +13,13 @@ import ArtifactDetailPage from '@/pages/ArtifactDetailPage.vue';
 import { useTenantsStore } from '@/stores/tenants';
 
 const api = vi.hoisted(() => ({
-  cancelCommitReplication: vi.fn(),
   createPlayground: vi.fn(),
   queryApiVersion: vi.fn(),
   queryArtifact: vi.fn(),
-  queryArtifactCommitDiff: vi.fn(),
   queryArtifactCommitGraph: vi.fn(),
-  queryCommitPlacementList: vi.fn(),
-  queryCommitReplicationList: vi.fn(),
-  queryGatewayPoolList: vi.fn(),
   queryPlaygroundList: vi.fn(),
   querySnapshotList: vi.fn(),
   queryStorageVolumeList: vi.fn(),
-  replicateCommit: vi.fn(),
-  retryCommitReplication: vi.fn(),
 }));
 
 vi.mock('@/api/operations', () => api);
@@ -147,38 +135,6 @@ async function mountPage(
     data: { items: [] },
     requestId: 'request-snapshots',
   });
-  api.queryGatewayPoolList.mockResolvedValue({
-    data: { items: [] },
-    requestId: 'request-gateway-pools',
-  });
-  api.queryCommitReplicationList.mockResolvedValue({
-    data: { replications: [] },
-    requestId: 'request-replications',
-  });
-  api.queryCommitPlacementList.mockResolvedValue({
-    data: { placements: [] },
-    requestId: 'request-placements',
-  });
-  api.replicateCommit.mockResolvedValue({
-    data: {
-      replication: {
-        replication_id: 'replication-a',
-        tenant_id: 'tenant-a',
-        artifact_id: 'artifact-a',
-        commit_id: headCommitId,
-        target_storage_volume_id: 'volume-a',
-        attempt: '1',
-        state: 'queued',
-        object_set_digest: 'd'.repeat(64),
-        completed_objects: '0',
-        total_objects: '3',
-        completed_bytes: '0',
-        total_bytes: '30',
-      },
-      replayed: false,
-    },
-    requestId: 'request-replicate',
-  });
 
   const pinia = createPinia();
   setActivePinia(pinia);
@@ -199,6 +155,11 @@ async function mountPage(
         path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId',
         name: 'artifact-detail',
         component: ArtifactDetailPage,
+      },
+      {
+        path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/commits/:commitId',
+        name: 'commit-detail',
+        component: { template: '<div />' },
       },
       { path: '/playground', name: 'playground-detail', component: { template: '<div />' } },
       {
@@ -243,7 +204,6 @@ describe('Artifact catalog detail', () => {
       page_size: 100,
     });
     expect(api.queryArtifactCommitGraph).not.toHaveBeenCalled();
-    expect(api.queryArtifactCommitDiff).not.toHaveBeenCalled();
     expect(api.querySnapshotList).not.toHaveBeenCalled();
     expect(wrapper.findComponent(PageHeading).props('title')).toBe('Authoritative data');
     expect(wrapper.findAll('button').some((button) => button.text() === '创建 Playground')).toBe(
@@ -290,7 +250,7 @@ describe('Artifact catalog detail', () => {
     const { queryClient, router, wrapper } = await mountPage(
       '/tenants/tenant-a/projects/project-a/artifacts/artifact-a',
       artifact,
-      ['artifact_catalog', 'snapshot_materialize'],
+      ['artifact_catalog', 'commit_materialization_v2'],
     );
 
     const createButton = wrapper
@@ -378,13 +338,12 @@ describe('Artifact catalog detail', () => {
     queryClient.clear();
   });
 
-  it('ignores Commit deep links when the resource browser is unavailable', async () => {
+  it('does not treat a Commit query parameter as a detail fallback', async () => {
     const { queryClient, wrapper } = await mountPage(
       `/tenants/tenant-a/projects/project-a/artifacts/artifact-a?tab=commits&commit_id=${headCommitId}`,
     );
 
     expect(api.queryArtifactCommitGraph).not.toHaveBeenCalled();
-    expect(api.queryArtifactCommitDiff).not.toHaveBeenCalled();
     expect(wrapper.findComponent({ name: 'ElDrawer' }).exists()).toBe(false);
     expect(wrapper.findComponent({ name: 'ElTabs' }).props('modelValue')).toBe('overview');
 
@@ -462,44 +421,7 @@ describe('Artifact catalog detail', () => {
     queryClient.clear();
   });
 
-  it('loads Commit details from the selected node and follows its parent', async () => {
-    const target = {
-      commit_id: headCommitId,
-      parent_commit_id: historicalCommitId,
-      message: 'Current head',
-      description: 'Current head description',
-      tag_names: ['release-candidate'],
-      data_layout: 'fast_cdc' as const,
-      created_at_unix_ms: '2',
-    };
-    const parent = {
-      commit_id: historicalCommitId,
-      message: 'Historical baseline',
-      description: 'Historical baseline description',
-      tag_names: ['v1.0'],
-      data_layout: 'fast_cdc' as const,
-      created_at_unix_ms: '1',
-    };
-    api.queryArtifactCommitDiff.mockImplementation(
-      (_tenantId: string, _projectId: string, _artifactId: string, commitId: string) => ({
-        data: {
-          diff: {
-            ...(commitId === target.commit_id ? { base_commit: parent } : {}),
-            target_commit: commitId === target.commit_id ? target : parent,
-            summary: {
-              files_added: '0',
-              files_modified: '0',
-              files_deleted: '0',
-              files_renamed: '0',
-              bytes_added: '0',
-              bytes_removed: '0',
-            },
-            changes: [],
-          },
-        },
-        requestId: `request-diff-${commitId}`,
-      }),
-    );
+  it('navigates from a selected Commit node to the dedicated detail route', async () => {
     const { queryClient, router, wrapper } = await mountPage(
       `/tenants/tenant-a/projects/project-a/artifacts/artifact-a?tab=commits`,
       artifact,
@@ -509,224 +431,16 @@ describe('Artifact catalog detail', () => {
     await wrapper.find(`[data-commit-id="${headCommitId}"]`).find('button').trigger('click');
     await flushPromises();
 
-    expect(api.queryArtifactCommitDiff).toHaveBeenLastCalledWith(
-      'tenant-a',
-      'project-a',
-      'artifact-a',
-      headCommitId,
+    expect(router.currentRoute.value.name).toBe('commit-detail');
+    expect(router.currentRoute.value.path).toBe(
+      `/tenants/tenant-a/projects/project-a/artifacts/artifact-a/commits/${headCommitId}`,
     );
-    expect(wrapper.text()).toContain('Current head description');
-    expect(wrapper.text()).toContain('与基线没有文件变化');
-
-    await wrapper
-      .findAll('button')
-      .find((button) => button.text() === '查看父 Commit')!
-      .trigger('click');
-    await flushPromises();
-    expect(router.currentRoute.value.query.commit_id).toBe(historicalCommitId);
-    expect(api.queryArtifactCommitDiff).toHaveBeenLastCalledWith(
-      'tenant-a',
-      'project-a',
-      'artifact-a',
-      historicalCommitId,
-    );
-    expect(wrapper.text()).toContain('Historical baseline description');
-
-    wrapper.unmount();
-    queryClient.clear();
-  });
-
-  it('opens the Commit replication drawer without Diff capability and submits a scoped request', async () => {
-    const { queryClient, wrapper } = await mountPage(
-      '/tenants/tenant-a/projects/project-a/artifacts/artifact-a?tab=commits',
-      artifact,
-      ['artifact_catalog', 'artifact_commit_graph', 'artifact_commit_replication'],
-      undefined,
-      ['artifact.read', 'artifact.commit.replicate'],
-    );
-
-    await wrapper.find(`[data-commit-id="${headCommitId}"]`).find('button').trigger('click');
-    await flushPromises();
-
-    expect(api.queryArtifactCommitDiff).not.toHaveBeenCalled();
-    expect(api.queryCommitReplicationList).toHaveBeenCalledWith({
-      tenant_id: 'tenant-a',
-      commit_id: headCommitId,
-      object_namespace_id: 'artifact-a',
+    expect(router.currentRoute.value.params).toMatchObject({
+      tenantId: 'tenant-a',
+      projectId: 'project-a',
+      artifactId: 'artifact-a',
+      commitId: headCommitId,
     });
-    expect(api.queryCommitPlacementList).toHaveBeenCalledWith({
-      tenant_id: 'tenant-a',
-      commit_id: headCommitId,
-      object_namespace_id: 'artifact-a',
-    });
-    expect(api.queryGatewayPoolList).not.toHaveBeenCalled();
-    expect(wrapper.text()).toContain('路由由 Central 校验');
-
-    await wrapper
-      .findAll('button')
-      .find((button) => button.text().trim() === '复制 Commit')!
-      .trigger('click');
-    await flushPromises();
-
-    const request = api.replicateCommit.mock.calls[0]?.[0] as
-      CreateCommitReplicationRequest | undefined;
-    expect(request).toMatchObject({
-      tenant_id: 'tenant-a',
-      project_id: 'project-a',
-      artifact_id: 'artifact-a',
-      commit_id: headCommitId,
-      target_storage_volume_id: 'volume-a',
-    });
-    expect(request?.request_id).toMatch(/^commit-replicate-[a-f0-9]{32}$/);
-    expect(request?.request_id.length).toBeLessThanOrEqual(128);
-
-    wrapper.unmount();
-    queryClient.clear();
-  });
-
-  it('refreshes live StorageVolume availability while the replication drawer is open', async () => {
-    vi.useFakeTimers();
-    const mounted = await mountPage(
-      '/tenants/tenant-a/projects/project-a/artifacts/artifact-a?tab=commits',
-      artifact,
-      ['artifact_catalog', 'artifact_commit_graph', 'artifact_commit_replication'],
-      undefined,
-      ['artifact.read', 'artifact.commit.replicate'],
-    );
-    try {
-      const { wrapper } = mounted;
-
-      await wrapper.find(`[data-commit-id="${headCommitId}"]`).find('button').trigger('click');
-      await flushPromises();
-      expect(api.queryStorageVolumeList).toHaveBeenCalledTimes(1);
-
-      api.queryStorageVolumeList.mockResolvedValueOnce({
-        data: {
-          items: [
-            {
-              tenant_id: 'tenant-a',
-              storage_volume_id: 'volume-a',
-              display_name: 'Volume A',
-              edge_cluster_id: 'edge-a',
-              backend_type: 'pvc',
-              access_mode: 'read_write_once',
-              region: 'cn-shanghai',
-              allowed_delivery_modes: ['copy'],
-              hardlink_policy: 'disabled',
-              max_whole_file_bytes: '1024',
-              copy_reserve_bytes: '0',
-              state: 'unavailable',
-              resource_version: '2',
-              lifecycle: { state: 'active', generation: '1', resource_version: '2' },
-              created_at_unix_ms: '1',
-              updated_at_unix_ms: '2',
-            },
-          ],
-        },
-        requestId: 'request-volumes-unavailable',
-      });
-      await vi.advanceTimersByTimeAsync(5_000);
-      await flushPromises();
-
-      expect(api.queryStorageVolumeList).toHaveBeenCalledTimes(2);
-      expect(
-        wrapper
-          .findAll('button')
-          .find((button) => button.text().trim() === '复制 Commit')
-          ?.attributes('disabled'),
-      ).toBeDefined();
-    } finally {
-      mounted.wrapper.unmount();
-      mounted.queryClient.clear();
-      vi.useRealTimers();
-    }
-  });
-
-  it('restores an active task for the target and does not create a duplicate', async () => {
-    api.queryCommitReplicationList.mockResolvedValueOnce({
-      data: {
-        replications: [
-          {
-            replication_id: 'replication-existing',
-            tenant_id: 'tenant-a',
-            artifact_id: 'artifact-a',
-            commit_id: headCommitId,
-            target_storage_volume_id: 'volume-a',
-            attempt: '1',
-            state: 'transferring',
-            object_set_digest: 'd'.repeat(64),
-            completed_objects: '1',
-            total_objects: '3',
-            completed_bytes: '10',
-            total_bytes: '30',
-          },
-        ],
-      },
-      requestId: 'request-existing-replication',
-    });
-    const { queryClient, wrapper } = await mountPage(
-      '/tenants/tenant-a/projects/project-a/artifacts/artifact-a?tab=commits',
-      artifact,
-      ['artifact_catalog', 'artifact_commit_graph', 'artifact_commit_replication'],
-      undefined,
-      ['artifact.read', 'artifact.commit.replicate'],
-    );
-
-    await wrapper.find(`[data-commit-id="${headCommitId}"]`).find('button').trigger('click');
-    await flushPromises();
-
-    expect(wrapper.text()).toContain('replication-existing');
-    const action = wrapper
-      .findAll('button')
-      .find((button) => button.text().trim() === '复制进行中');
-    expect(action?.attributes('disabled')).toBeDefined();
-    await action!.trigger('click');
-    expect(api.replicateCommit).not.toHaveBeenCalled();
-
-    wrapper.unmount();
-    queryClient.clear();
-  });
-
-  it('disables a target below a known unhealthy GatewayPool', async () => {
-    api.queryGatewayPoolList.mockResolvedValueOnce({
-      data: {
-        items: [
-          {
-            gateway_pool_id: 'pool-a',
-            edge_cluster_id: 'edge-a',
-            display_name: 'Gateway A',
-            agent_endpoint: 'https://gateway.example.test',
-            desired_replicas: 1,
-            minimum_ready_replicas: 1,
-            state: 'draining',
-            config_generation: '1',
-            resource_version: '1',
-            created_at_unix_ms: '1',
-            updated_at_unix_ms: '1',
-          },
-        ],
-      },
-      requestId: 'request-gateway-pools',
-    });
-    const { queryClient, wrapper } = await mountPage(
-      '/tenants/tenant-a/projects/project-a/artifacts/artifact-a?tab=commits',
-      artifact,
-      ['artifact_catalog', 'artifact_commit_graph', 'artifact_commit_replication'],
-      undefined,
-      ['artifact.read', 'artifact.commit.replicate', 'gateway.read'],
-    );
-
-    await wrapper.find(`[data-commit-id="${headCommitId}"]`).find('button').trigger('click');
-    await flushPromises();
-
-    expect(api.queryGatewayPoolList).toHaveBeenCalledWith({});
-    expect(wrapper.text()).toContain('路由不可用');
-    expect(
-      wrapper
-        .findAll('button')
-        .find((button) => button.text().trim() === '复制 Commit')
-        ?.attributes('disabled'),
-    ).toBeDefined();
 
     wrapper.unmount();
     queryClient.clear();
@@ -740,7 +454,7 @@ describe('Artifact catalog detail', () => {
         'artifact_catalog',
         'artifact_commit_graph',
         'playground_materialize',
-        'snapshot_materialize',
+        'commit_materialization_v2',
       ],
     );
 

@@ -11,3 +11,4 @@ mod object;
 mod outbox;
 mod placement;
 mod precommit;
+mod task;

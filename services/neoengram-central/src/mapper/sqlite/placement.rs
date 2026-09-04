@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
@@ -6,7 +7,8 @@ use neoengram_domain::protocol::materialization::{
     MaterializationBatch, MaterializationBatchState, MaterializationJob, MaterializationJobKey,
     MaterializationJobState, MaterializationLeaseState, MaterializationObject,
     MaterializationObjectReceipt, MaterializationObjectState, ObjectPlacement as ObjectPlacementV2,
-    ObjectReadLease, ObjectRef, StagingLease, VolumeCommitCoverage,
+    ObjectReadLease, ObjectRef, PlacementHealthObservation, PlacementHealthState, StagingLease,
+    VolumeCommitCoverage,
 };
 use neoengram_domain::protocol::{
     object_read_lease_id, staging_lease_id, AgentId, ArchiveId, ArtifactId, BackendId,
@@ -405,7 +407,12 @@ fn materialization_state_transition_allowed(
     current: MaterializationJobState,
     next: MaterializationJobState,
 ) -> bool {
-    current.can_transition_to(next)
+    // A completed Job is normally terminal, but a later integrity observation can make its
+    // derived target Coverage partial. The explicit retry path then reopens it for one fenced
+    // planning revision; all other terminal transitions remain rejected by the domain state
+    // machine.
+    (current == MaterializationJobState::Complete && next == MaterializationJobState::Planning)
+        || current.can_transition_to(next)
         || (current.can_transition_to(MaterializationJobState::Planning)
             && MaterializationJobState::Planning.can_transition_to(next))
 }
@@ -686,6 +693,29 @@ fn parse_v2_placement_state(
     }
 }
 
+fn placement_health_state_name(state: PlacementHealthState) -> &'static str {
+    match state {
+        PlacementHealthState::Healthy => "healthy",
+        PlacementHealthState::Missing => "missing",
+        PlacementHealthState::Corrupt => "corrupt",
+        PlacementHealthState::Orphan => "orphan",
+        PlacementHealthState::Unknown => "unknown",
+    }
+}
+
+fn parse_placement_health_state(value: &str) -> CentralResult<PlacementHealthState> {
+    match value {
+        "healthy" => Ok(PlacementHealthState::Healthy),
+        "missing" => Ok(PlacementHealthState::Missing),
+        "corrupt" => Ok(PlacementHealthState::Corrupt),
+        "orphan" => Ok(PlacementHealthState::Orphan),
+        "unknown" => Ok(PlacementHealthState::Unknown),
+        _ => Err(storage_corruption(format!(
+            "stored placement health state {value:?} is unknown"
+        ))),
+    }
+}
+
 fn coverage_state_name(
     state: neoengram_domain::protocol::materialization::CoverageState,
 ) -> &'static str {
@@ -824,6 +854,21 @@ fn v2_i64(value: u64, field: &str) -> CentralResult<i64> {
     })
 }
 
+/// Returns the wall-clock time used for derived v2 projections that do not carry timestamps in
+/// their protocol value (for example, Coverage summaries). Materialization children inherit the
+/// parent Job timestamps instead; this fallback keeps standalone projection writes sortable and
+/// prevents the SQLite timestamp columns from being left at their zero sentinel.
+fn current_unix_ms() -> CentralResult<UnixMillis> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            storage_corruption(format!("system clock is before Unix epoch: {error}"))
+        })?;
+    let millis = u64::try_from(elapsed.as_millis())
+        .map_err(|_| storage_corruption("system clock timestamp exceeds u64 range"))?;
+    Ok(UnixMillis::new(millis))
+}
+
 fn v2_decode<T: serde::de::DeserializeOwned>(row: &SqliteRow, field: &str) -> CentralResult<T> {
     let payload = row
         .try_get::<Vec<u8>, _>("payload")
@@ -893,6 +938,69 @@ fn decode_v2_object_placement(row: &SqliteRow) -> CentralResult<ObjectPlacementV
         ));
     }
     Ok(placement)
+}
+
+fn decode_placement_health_observation(
+    row: &SqliteRow,
+) -> CentralResult<PlacementHealthObservation> {
+    let observation: PlacementHealthObservation = v2_decode(row, "placement health observation")?;
+    observation.validate().map_err(protocol_invalid)?;
+    let state = parse_placement_health_state(
+        row.try_get::<String, _>("state")
+            .map_err(storage_error)?
+            .as_str(),
+    )?;
+    let observed_size = u64::try_from(
+        row.try_get::<i64, _>("observed_size")
+            .map_err(storage_error)?,
+    )
+    .map_err(|_| storage_corruption("stored observed size is negative"))?;
+    let observed_at = u64::try_from(
+        row.try_get::<i64, _>("observed_at_unix_ms")
+            .map_err(storage_error)?,
+    )
+    .map_err(|_| storage_corruption("stored observation timestamp is negative"))?;
+    if state != observation.state
+        || row
+            .try_get::<String, _>("tenant_id")
+            .map_err(storage_error)?
+            != observation.tenant_id.as_str()
+        || row
+            .try_get::<String, _>("object_namespace_id")
+            .map_err(storage_error)?
+            != observation.object_namespace_id.as_str()
+        || row.try_get::<String, _>("scan_id").map_err(storage_error)?
+            != observation.scan_id.as_str()
+        || row
+            .try_get::<String, _>("placement_id")
+            .map_err(storage_error)?
+            != observation.placement_id.as_str()
+        || row
+            .try_get::<Vec<u8>, _>("object_id")
+            .map_err(storage_error)?
+            != observation.object_id.as_bytes().to_vec()
+        || row
+            .try_get::<String, _>("storage_volume_id")
+            .map_err(storage_error)?
+            != observation.storage_volume_id.as_str()
+        || u64::try_from(
+            row.try_get::<i64, _>("placement_generation")
+                .map_err(storage_error)?,
+        )
+        .map_err(|_| storage_corruption("stored observation generation is negative"))?
+            != observation.placement_generation.get()
+        || observed_size != observation.observed_size.get()
+        || row
+            .try_get::<Vec<u8>, _>("observed_digest")
+            .map_err(storage_error)?
+            != observation.observed_digest.as_bytes().to_vec()
+        || observed_at != observation.observed_at_unix_ms.get()
+    {
+        return Err(storage_corruption(
+            "placement health indexed identity disagrees with its payload",
+        ));
+    }
+    Ok(observation)
 }
 
 fn same_v2_placement_evidence(left: &ObjectPlacementV2, right: &ObjectPlacementV2) -> bool {
@@ -2082,12 +2190,13 @@ impl PlacementRepository for SqliteAuthorityStore {
             };
         }
         let payload = encode(&placement)?;
+        let now = current_unix_ms()?;
         let result = sqlx::query(
             "INSERT INTO object_placements \
              (tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, \
               storage_volume_id, placement_generation, state, failure_domain, \
               created_at_unix_ms, updated_at_unix_ms, payload) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(placement.tenant_id.as_str())
         .bind(placement.object_namespace_id.as_str())
@@ -2100,6 +2209,8 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(v2_i64(placement.placement_generation.get(), "placement_generation")?)
         .bind(v2_placement_state_name(placement.state))
         .bind(&placement.failure_domain)
+        .bind(v2_i64(now.get(), "created_at_unix_ms")?)
+        .bind(v2_i64(now.get(), "updated_at_unix_ms")?)
         .bind(payload)
         .execute(&self.pool)
         .await;
@@ -2166,6 +2277,163 @@ impl PlacementRepository for SqliteAuthorityStore {
         rows.iter().map(decode_v2_object_placement).collect()
     }
 
+    async fn record_placement_health_observation(
+        &self,
+        observation: PlacementHealthObservation,
+    ) -> CentralResult<PlacementHealthObservation> {
+        observation.validate().map_err(protocol_invalid)?;
+        let placement_row = sqlx::query(
+            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain \
+             FROM object_placements WHERE tenant_id = ? AND object_namespace_id = ? \
+               AND placement_id = ? AND object_id = ? AND storage_volume_id = ? \
+               AND placement_generation = ? LIMIT 1",
+        )
+        .bind(observation.tenant_id.as_str())
+        .bind(observation.object_namespace_id.as_str())
+        .bind(observation.placement_id.as_str())
+        .bind(observation.object_id.as_bytes().as_slice())
+        .bind(observation.storage_volume_id.as_str())
+        .bind(v2_i64(
+            observation.placement_generation.get(),
+            "placement_generation",
+        )?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ResourceNotFound,
+                "integrity observation references an unknown placement",
+            )
+        })?;
+        let placement = decode_v2_object_placement(&placement_row)?;
+        if observation.state == PlacementHealthState::Healthy
+            && observation.observed_size != placement.size
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "healthy integrity observation size differs from placement evidence",
+            ));
+        }
+
+        let existing_row = sqlx::query(
+            "SELECT payload, tenant_id, object_namespace_id, scan_id, placement_id, object_id, \
+                    storage_volume_id, placement_generation, state, observed_size, observed_digest, \
+                    observed_at_unix_ms, detail \
+             FROM placement_health_observations \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND scan_id = ? AND placement_id = ? LIMIT 1",
+        )
+        .bind(observation.tenant_id.as_str())
+        .bind(observation.object_namespace_id.as_str())
+        .bind(observation.scan_id.as_str())
+        .bind(observation.placement_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if let Some(row) = existing_row {
+            let existing = decode_placement_health_observation(&row)?;
+            if existing == observation {
+                return Ok(existing);
+            }
+            return Err(CentralError::new(
+                CentralErrorCode::InvalidState,
+                "integrity scan observation identity is already bound to different metadata",
+            )
+            .with_retryable(false));
+        }
+
+        let latest_row = sqlx::query(
+            "SELECT payload, tenant_id, object_namespace_id, scan_id, placement_id, object_id, \
+                    storage_volume_id, placement_generation, state, observed_size, observed_digest, \
+                    observed_at_unix_ms, detail \
+             FROM placement_health_observations \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND placement_id = ? \
+               AND placement_generation = ? \
+             ORDER BY observed_at_unix_ms DESC, scan_id DESC LIMIT 1",
+        )
+        .bind(observation.tenant_id.as_str())
+        .bind(observation.object_namespace_id.as_str())
+        .bind(observation.placement_id.as_str())
+        .bind(v2_i64(
+            observation.placement_generation.get(),
+            "placement_generation",
+        )?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        if let Some(row) = latest_row {
+            let latest = decode_placement_health_observation(&row)?;
+            if observation.observed_at_unix_ms < latest.observed_at_unix_ms {
+                return Ok(latest);
+            }
+            if observation.observed_at_unix_ms == latest.observed_at_unix_ms {
+                return Err(CentralError::new(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "integrity observations have conflicting timestamps",
+                ));
+            }
+        }
+
+        let payload = encode(&observation)?;
+        sqlx::query(
+            "INSERT INTO placement_health_observations \
+             (tenant_id, object_namespace_id, scan_id, placement_id, object_id, storage_volume_id, \
+              placement_generation, state, observed_size, observed_digest, observed_at_unix_ms, detail, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(observation.tenant_id.as_str())
+        .bind(observation.object_namespace_id.as_str())
+        .bind(observation.scan_id.as_str())
+        .bind(observation.placement_id.as_str())
+        .bind(observation.object_id.as_bytes().as_slice())
+        .bind(observation.storage_volume_id.as_str())
+        .bind(v2_i64(
+            observation.placement_generation.get(),
+            "placement_generation",
+        )?)
+        .bind(placement_health_state_name(observation.state))
+        .bind(v2_i64(observation.observed_size.get(), "observed_size")?)
+        .bind(observation.observed_digest.as_bytes().as_slice())
+        .bind(v2_i64(
+            observation.observed_at_unix_ms.get(),
+            "observed_at_unix_ms",
+        )?)
+        .bind(observation.detail.as_deref())
+        .bind(payload)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        Ok(observation)
+    }
+
+    async fn latest_placement_health(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        placement_id: &PlacementId,
+        placement_generation: PlacementGeneration,
+    ) -> CentralResult<Option<PlacementHealthObservation>> {
+        let row = sqlx::query(
+            "SELECT payload, tenant_id, object_namespace_id, scan_id, placement_id, object_id, \
+                    storage_volume_id, placement_generation, state, observed_size, observed_digest, \
+                    observed_at_unix_ms, detail \
+             FROM placement_health_observations \
+             WHERE tenant_id = ? AND object_namespace_id = ? AND placement_id = ? \
+               AND placement_generation = ? \
+             ORDER BY observed_at_unix_ms DESC, scan_id DESC LIMIT 1",
+        )
+        .bind(tenant_id.as_str())
+        .bind(object_namespace_id.as_str())
+        .bind(placement_id.as_str())
+        .bind(v2_i64(placement_generation.get(), "placement_generation")?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        row.as_ref()
+            .map(decode_placement_health_observation)
+            .transpose()
+    }
+
     async fn upsert_volume_commit_coverage(
         &self,
         coverage: VolumeCommitCoverage,
@@ -2199,10 +2467,30 @@ impl PlacementRepository for SqliteAuthorityStore {
         .fetch_all(&self.pool)
         .await
         .map_err(storage_error)?;
-        let placements = placement_rows
-            .iter()
-            .map(decode_v2_object_placement)
-            .collect::<CentralResult<Vec<_>>>()?;
+        // Health observations are the latest evidence about whether a Placement is physically
+        // readable. Coverage is derived from healthy evidence, not from the durable Placement
+        // row alone; otherwise a scrub-reported missing object could not demote a cached summary.
+        let mut placements = Vec::with_capacity(placement_rows.len());
+        for row in &placement_rows {
+            let placement = decode_v2_object_placement(row)?;
+            let unhealthy = self
+                .latest_placement_health(
+                    &placement.tenant_id,
+                    &coverage.object_namespace_id,
+                    &placement.placement_id,
+                    placement.placement_generation,
+                )
+                .await?
+                .is_some_and(|observation| {
+                    matches!(
+                        observation.state,
+                        PlacementHealthState::Missing | PlacementHealthState::Corrupt
+                    )
+                });
+            if !unhealthy {
+                placements.push(placement);
+            }
+        }
         let recomputed = VolumeCommitCoverage::from_placements(
             coverage.tenant_id.clone(),
             coverage.object_namespace_id.clone(),
@@ -2231,12 +2519,13 @@ impl PlacementRepository for SqliteAuthorityStore {
             .with_retryable(false));
         }
         let payload = encode(&coverage)?;
+        let now = current_unix_ms()?;
         let result = sqlx::query(
             "INSERT INTO volume_commit_coverages \
              (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, \
               object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, \
               state, created_at_unix_ms, updated_at_unix_ms, payload) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation) \
              DO UPDATE SET object_set_digest = excluded.object_set_digest, \
                  object_count = excluded.object_count, verified_object_count = excluded.verified_object_count, \
@@ -2254,6 +2543,8 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(v2_i64(coverage.total_bytes.get(), "total_bytes")?)
         .bind(v2_i64(coverage.verified_bytes.get(), "verified_bytes")?)
         .bind(coverage_state_name(coverage.state))
+        .bind(v2_i64(now.get(), "created_at_unix_ms")?)
+        .bind(v2_i64(now.get(), "updated_at_unix_ms")?)
         .bind(payload)
         .execute(&self.pool)
         .await;
@@ -2816,7 +3107,7 @@ impl PlacementRepository for SqliteAuthorityStore {
                 "INSERT INTO materialization_batches \
                  (tenant_id, object_namespace_id, batch_id, materialization_id, plan_revision, attempt, source_storage_volume_id, \
                   target_storage_volume_id, manifest_digest, state, payload, created_at_unix_ms, updated_at_unix_ms) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(job.key.tenant_id.as_str())
             .bind(job.key.object_namespace_id.as_str())
@@ -2829,6 +3120,8 @@ impl PlacementRepository for SqliteAuthorityStore {
             .bind(batch.manifest_digest.as_bytes().as_slice())
             .bind(materialization_batch_state_name(batch.state))
             .bind(payload)
+            .bind(v2_i64(job.created_at_unix_ms.get(), "created_at_unix_ms")?)
+            .bind(v2_i64(job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -2863,7 +3156,7 @@ impl PlacementRepository for SqliteAuthorityStore {
                  (tenant_id, materialization_id, object_namespace_id, object_id, size, encoding, \
                   staging_key, confirmed_offset, state, current_batch_id, plan_revision, attempt, \
                   payload, created_at_unix_ms, updated_at_unix_ms) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(job.key.tenant_id.as_str())
             .bind(object.materialization_id.as_str())
@@ -2878,6 +3171,8 @@ impl PlacementRepository for SqliteAuthorityStore {
             .bind(v2_i64(object.plan_revision.get(), "plan_revision")?)
             .bind(v2_i64(object.attempt.get(), "attempt")?)
             .bind(payload)
+            .bind(v2_i64(job.created_at_unix_ms.get(), "created_at_unix_ms")?)
+            .bind(v2_i64(job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -2980,8 +3275,15 @@ impl PlacementRepository for SqliteAuthorityStore {
         // Coverage remains a derived summary, but it is published in this same transaction so a
         // reader can never observe a new Job and stale coverage (or vice versa).
         let placement_rows = sqlx::query(
-            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain \
-             FROM object_placements WHERE tenant_id = ? AND object_namespace_id = ? AND storage_volume_id = ? AND placement_generation = ?",
+            "SELECT p.payload, p.state, p.tenant_id, p.object_namespace_id, p.placement_id, p.object_id, p.size, p.encoding, p.verified_digest, p.storage_volume_id, p.placement_generation, p.failure_domain \
+             FROM object_placements p WHERE p.tenant_id = ? AND p.object_namespace_id = ? AND p.storage_volume_id = ? AND p.placement_generation = ? \
+               AND NOT EXISTS (SELECT 1 FROM placement_health_observations h \
+                 WHERE h.tenant_id = p.tenant_id AND h.object_namespace_id = p.object_namespace_id \
+                   AND h.placement_id = p.placement_id AND h.placement_generation = p.placement_generation \
+                   AND h.observed_at_unix_ms = (SELECT MAX(h2.observed_at_unix_ms) FROM placement_health_observations h2 \
+                     WHERE h2.tenant_id = p.tenant_id AND h2.object_namespace_id = p.object_namespace_id \
+                       AND h2.placement_id = p.placement_id AND h2.placement_generation = p.placement_generation) \
+                   AND h.state IN ('missing', 'corrupt'))",
         )
         .bind(coverage.tenant_id.as_str())
         .bind(coverage.object_namespace_id.as_str())
@@ -3025,13 +3327,14 @@ impl PlacementRepository for SqliteAuthorityStore {
         sqlx::query(
             "INSERT INTO volume_commit_coverages \
              (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, \
-              object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, \
-              state, created_at_unix_ms, updated_at_unix_ms, payload) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?) \
+             object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, \
+             state, created_at_unix_ms, updated_at_unix_ms, payload) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation) \
              DO UPDATE SET object_set_digest = excluded.object_set_digest, object_count = excluded.object_count, \
                  verified_object_count = excluded.verified_object_count, total_bytes = excluded.total_bytes, \
-                 verified_bytes = excluded.verified_bytes, state = excluded.state, payload = excluded.payload",
+                 verified_bytes = excluded.verified_bytes, state = excluded.state, \
+                 updated_at_unix_ms = excluded.updated_at_unix_ms, payload = excluded.payload",
         )
         .bind(coverage.tenant_id.as_str())
         .bind(coverage.object_namespace_id.as_str())
@@ -3044,6 +3347,8 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(v2_i64(coverage.total_bytes.get(), "total_bytes")?)
         .bind(v2_i64(coverage.verified_bytes.get(), "verified_bytes")?)
         .bind(coverage_state_name(coverage.state))
+        .bind(v2_i64(job.created_at_unix_ms.get(), "created_at_unix_ms")?)
+        .bind(v2_i64(job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
         .bind(payload)
         .execute(&mut *transaction)
         .await
@@ -3198,13 +3503,23 @@ impl PlacementRepository for SqliteAuthorityStore {
                 )
                 .with_retryable(false));
             }
-            if object.confirmed_offset < previous.confirmed_offset {
+            // A completed target may be reset only for an integrity repair plan: the parent must
+            // reopen through Planning, and the new task must start at byte zero.
+            let integrity_repair_reset = current.state == MaterializationJobState::Complete
+                && plan.job.state != MaterializationJobState::Complete
+                && previous.complete()
+                && object.confirmed_offset.get() == 0
+                && matches!(
+                    object.state,
+                    MaterializationObjectState::Missing | MaterializationObjectState::Reserved
+                );
+            if object.confirmed_offset < previous.confirmed_offset && !integrity_repair_reset {
                 return Err(CentralError::new(
                     CentralErrorCode::ConcurrentUpdate,
                     "materialization Object confirmed offset cannot move backwards",
                 ));
             }
-            if previous.complete() && !object.complete() {
+            if previous.complete() && !object.complete() && !integrity_repair_reset {
                 return Err(CentralError::new(
                     CentralErrorCode::InvalidState,
                     "completed materialization Object cannot regress",
@@ -3318,12 +3633,16 @@ impl PlacementRepository for SqliteAuthorityStore {
             retired.state = MaterializationBatchState::Failed;
             let payload = encode(&retired)?;
             let result = sqlx::query(
-                "UPDATE materialization_batches SET state = ?, payload = ? \
+                "UPDATE materialization_batches SET state = ?, payload = ?, updated_at_unix_ms = ? \
                  WHERE tenant_id = ? AND object_namespace_id = ? AND batch_id = ? \
                    AND plan_revision = ? AND attempt = ? AND state = ?",
             )
             .bind(materialization_batch_state_name(retired.state))
             .bind(payload)
+            .bind(v2_i64(
+                plan.job.updated_at_unix_ms.get(),
+                "updated_at_unix_ms",
+            )?)
             .bind(old.target.tenant_id.as_str())
             .bind(old.target.object_namespace_id.as_str())
             .bind(old.batch_id.as_str())
@@ -3400,7 +3719,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         for batch in &plan.batches {
             let payload = encode(batch)?;
             sqlx::query(
-                "INSERT INTO materialization_batches (tenant_id, object_namespace_id, batch_id, materialization_id, plan_revision, attempt, source_storage_volume_id, target_storage_volume_id, manifest_digest, state, payload, created_at_unix_ms, updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+                "INSERT INTO materialization_batches (tenant_id, object_namespace_id, batch_id, materialization_id, plan_revision, attempt, source_storage_volume_id, target_storage_volume_id, manifest_digest, state, payload, created_at_unix_ms, updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(plan.job.key.tenant_id.as_str())
             .bind(plan.job.key.object_namespace_id.as_str())
@@ -3413,6 +3732,8 @@ impl PlacementRepository for SqliteAuthorityStore {
             .bind(batch.manifest_digest.as_bytes().as_slice())
             .bind(materialization_batch_state_name(batch.state))
             .bind(payload)
+            .bind(v2_i64(plan.job.created_at_unix_ms.get(), "created_at_unix_ms")?)
+            .bind(v2_i64(plan.job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -3424,7 +3745,7 @@ impl PlacementRepository for SqliteAuthorityStore {
                 .expect("object rows were validated above");
             let result = sqlx::query(
                 "UPDATE materialization_objects SET size = ?, encoding = ?, staging_key = ?, \
-                 confirmed_offset = ?, state = ?, current_batch_id = ?, plan_revision = ?, attempt = ?, payload = ? \
+                 confirmed_offset = ?, state = ?, current_batch_id = ?, plan_revision = ?, attempt = ?, payload = ?, updated_at_unix_ms = ? \
                  WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? \
                    AND plan_revision = ? AND attempt = ?",
             )
@@ -3437,6 +3758,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             .bind(v2_i64(object.plan_revision.get(), "plan_revision")?)
             .bind(v2_i64(object.attempt.get(), "attempt")?)
             .bind(payload)
+            .bind(v2_i64(plan.job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
             .bind(plan.job.key.tenant_id.as_str())
             .bind(object.materialization_id.as_str())
             .bind(object.object.object_namespace_id.as_str())
@@ -3503,7 +3825,14 @@ impl PlacementRepository for SqliteAuthorityStore {
             .map_err(storage_error)?;
         }
         let placement_rows = sqlx::query(
-            "SELECT payload, state, tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, storage_volume_id, placement_generation, failure_domain FROM object_placements WHERE tenant_id = ? AND object_namespace_id = ? AND storage_volume_id = ? AND placement_generation = ?",
+            "SELECT p.payload, p.state, p.tenant_id, p.object_namespace_id, p.placement_id, p.object_id, p.size, p.encoding, p.verified_digest, p.storage_volume_id, p.placement_generation, p.failure_domain FROM object_placements p WHERE p.tenant_id = ? AND p.object_namespace_id = ? AND p.storage_volume_id = ? AND p.placement_generation = ? \
+               AND NOT EXISTS (SELECT 1 FROM placement_health_observations h \
+                 WHERE h.tenant_id = p.tenant_id AND h.object_namespace_id = p.object_namespace_id \
+                   AND h.placement_id = p.placement_id AND h.placement_generation = p.placement_generation \
+                   AND h.observed_at_unix_ms = (SELECT MAX(h2.observed_at_unix_ms) FROM placement_health_observations h2 \
+                     WHERE h2.tenant_id = p.tenant_id AND h2.object_namespace_id = p.object_namespace_id \
+                       AND h2.placement_id = p.placement_id AND h2.placement_generation = p.placement_generation) \
+                   AND h.state IN ('missing', 'corrupt'))",
         )
         .bind(plan.coverage.tenant_id.as_str())
         .bind(plan.coverage.object_namespace_id.as_str())
@@ -3535,7 +3864,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         }
         let coverage_payload = encode(&plan.coverage)?;
         sqlx::query(
-            "INSERT INTO volume_commit_coverages (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, state, created_at_unix_ms, updated_at_unix_ms, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?) ON CONFLICT (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation) DO UPDATE SET object_set_digest = excluded.object_set_digest, object_count = excluded.object_count, verified_object_count = excluded.verified_object_count, total_bytes = excluded.total_bytes, verified_bytes = excluded.verified_bytes, state = excluded.state, payload = excluded.payload",
+            "INSERT INTO volume_commit_coverages (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, state, created_at_unix_ms, updated_at_unix_ms, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation) DO UPDATE SET object_set_digest = excluded.object_set_digest, object_count = excluded.object_count, verified_object_count = excluded.verified_object_count, total_bytes = excluded.total_bytes, verified_bytes = excluded.verified_bytes, state = excluded.state, updated_at_unix_ms = excluded.updated_at_unix_ms, payload = excluded.payload",
         )
         .bind(plan.coverage.tenant_id.as_str())
         .bind(plan.coverage.object_namespace_id.as_str())
@@ -3548,6 +3877,8 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(v2_i64(plan.coverage.total_bytes.get(), "total_bytes")?)
         .bind(v2_i64(plan.coverage.verified_bytes.get(), "verified_bytes")?)
         .bind(coverage_state_name(plan.coverage.state))
+        .bind(v2_i64(plan.job.created_at_unix_ms.get(), "created_at_unix_ms")?)
+        .bind(v2_i64(plan.job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
         .bind(coverage_payload)
         .execute(&mut *transaction)
         .await
@@ -3778,7 +4109,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             "INSERT INTO materialization_batches \
              (tenant_id, object_namespace_id, batch_id, materialization_id, plan_revision, attempt, source_storage_volume_id, \
               target_storage_volume_id, manifest_digest, state, payload, created_at_unix_ms, updated_at_unix_ms) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(batch.target.tenant_id.as_str())
         .bind(batch.target.object_namespace_id.as_str())
@@ -3791,6 +4122,8 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(batch.manifest_digest.as_bytes().as_slice())
         .bind(materialization_batch_state_name(batch.state))
         .bind(payload)
+        .bind(v2_i64(parent.created_at_unix_ms.get(), "created_at_unix_ms")?)
+        .bind(v2_i64(parent.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
         .execute(&self.pool)
         .await;
         match result {
@@ -3906,7 +4239,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         let payload = encode(&request.batch)?;
         let result = sqlx::query(
             "UPDATE materialization_batches SET plan_revision = ?, attempt = ?, source_storage_volume_id = ?, \
-             target_storage_volume_id = ?, manifest_digest = ?, state = ?, payload = ? \
+             target_storage_volume_id = ?, manifest_digest = ?, state = ?, payload = ?, updated_at_unix_ms = ? \
              WHERE tenant_id = ? AND object_namespace_id = ? AND batch_id = ? \
                AND plan_revision = ? AND attempt = ?",
         )
@@ -3930,6 +4263,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(request.batch.manifest_digest.as_bytes().as_slice())
         .bind(materialization_batch_state_name(request.batch.state))
         .bind(payload)
+        .bind(v2_i64(parent.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
         .bind(request.tenant_id.as_str())
         .bind(request.object_namespace_id.as_str())
         .bind(request.batch_id.as_str())
@@ -4104,7 +4438,7 @@ impl PlacementRepository for SqliteAuthorityStore {
              (tenant_id, materialization_id, object_namespace_id, object_id, size, encoding, \
               staging_key, confirmed_offset, state, current_batch_id, plan_revision, attempt, \
               payload, created_at_unix_ms, updated_at_unix_ms) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&tenant_id)
         .bind(object.materialization_id.as_str())
@@ -4119,6 +4453,14 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(v2_i64(object.plan_revision.get(), "plan_revision")?)
         .bind(v2_i64(object.attempt.get(), "attempt")?)
         .bind(payload)
+        .bind(v2_i64(
+            parent_job.created_at_unix_ms.get(),
+            "created_at_unix_ms",
+        )?)
+        .bind(v2_i64(
+            parent_job.updated_at_unix_ms.get(),
+            "updated_at_unix_ms",
+        )?)
         .execute(&self.pool)
         .await;
         match result {
@@ -4161,7 +4503,7 @@ impl PlacementRepository for SqliteAuthorityStore {
                     let payload = encode(&object)?;
                     let result = sqlx::query(
                         "UPDATE materialization_objects SET size = ?, encoding = ?, staging_key = ?, \
-                         confirmed_offset = ?, state = ?, current_batch_id = ?, plan_revision = ?, attempt = ?, payload = ? \
+                         confirmed_offset = ?, state = ?, current_batch_id = ?, plan_revision = ?, attempt = ?, payload = ?, updated_at_unix_ms = ? \
                          WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? \
                            AND plan_revision = ? AND attempt = ?",
                     )
@@ -4174,6 +4516,7 @@ impl PlacementRepository for SqliteAuthorityStore {
                     .bind(v2_i64(object.plan_revision.get(), "plan_revision")?)
                     .bind(v2_i64(object.attempt.get(), "attempt")?)
                     .bind(payload)
+                    .bind(v2_i64(parent_job.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
                     .bind(&tenant_id)
                     .bind(object.materialization_id.as_str())
                     .bind(object.object.object_namespace_id.as_str())
@@ -4302,7 +4645,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         let payload = encode(&request.object)?;
         let result = sqlx::query(
             "UPDATE materialization_objects SET size = ?, encoding = ?, staging_key = ?, \
-             confirmed_offset = ?, state = ?, current_batch_id = ?, plan_revision = ?, attempt = ?, payload = ? \
+             confirmed_offset = ?, state = ?, current_batch_id = ?, plan_revision = ?, attempt = ?, payload = ?, updated_at_unix_ms = ? \
              WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? \
                AND plan_revision = ? AND attempt = ?",
         )
@@ -4327,6 +4670,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         )?)
         .bind(v2_i64(request.object.attempt.get(), "attempt")?)
         .bind(payload)
+        .bind(v2_i64(parent.updated_at_unix_ms.get(), "updated_at_unix_ms")?)
         .bind(request.tenant_id.as_str())
         .bind(request.materialization_id.as_str())
         .bind(request.object_namespace_id.as_str())
@@ -4934,6 +5278,14 @@ impl PlacementRepository for SqliteAuthorityStore {
             )
             .with_retryable(false));
         }
+        // The receipt verification time is the logical mutation time for the target placement,
+        // object checkpoint, and derived Coverage. Keep it monotonic with the parent Job clock.
+        let receipt_updated_at_unix_ms = UnixMillis::new(
+            parent
+                .updated_at_unix_ms
+                .get()
+                .max(receipt.verified_at_unix_ms.get()),
+        );
         let batch_row = sqlx::query(
             "SELECT payload, state, tenant_id, object_namespace_id, target_storage_volume_id, materialization_id, plan_revision, attempt, manifest_digest, source_storage_volume_id \
              FROM materialization_batches WHERE tenant_id = ? AND object_namespace_id = ? AND materialization_id = ? AND batch_id = ? LIMIT 1",
@@ -5260,7 +5612,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             "INSERT INTO object_placements \
              (tenant_id, object_namespace_id, placement_id, object_id, size, encoding, verified_digest, \
               storage_volume_id, placement_generation, state, failure_domain, created_at_unix_ms, updated_at_unix_ms, payload) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(placement.tenant_id.as_str())
         .bind(placement.object_namespace_id.as_str())
@@ -5273,6 +5625,8 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(v2_i64(placement.placement_generation.get(), "placement_generation")?)
         .bind(v2_placement_state_name(placement.state))
         .bind(&placement.failure_domain)
+        .bind(v2_i64(parent.created_at_unix_ms.get(), "created_at_unix_ms")?)
+        .bind(v2_i64(receipt_updated_at_unix_ms.get(), "updated_at_unix_ms")?)
         .bind(placement_payload)
         .execute(&mut *transaction)
         .await;
@@ -5416,7 +5770,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             )
         })?;
         let updated_object = sqlx::query(
-            "UPDATE materialization_objects SET confirmed_offset = ?, state = ?, attempt = ?, payload = ? \
+            "UPDATE materialization_objects SET confirmed_offset = ?, state = ?, attempt = ?, payload = ?, updated_at_unix_ms = ? \
              WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ? \
                AND current_batch_id = ? AND plan_revision = ? AND attempt = ? AND state = ?",
         )
@@ -5424,6 +5778,10 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(materialization_object_state_name(next_object.state))
         .bind(v2_i64(next_object.attempt.get(), "attempt")?)
         .bind(next_object_payload)
+        .bind(v2_i64(
+            receipt_updated_at_unix_ms.get(),
+            "updated_at_unix_ms",
+        )?)
         .bind(receipt.tenant_id.as_str())
         .bind(receipt.materialization_id.as_str())
         .bind(receipt.object_namespace_id.as_str())
@@ -5493,12 +5851,7 @@ impl PlacementRepository for SqliteAuthorityStore {
             )
             .with_retryable(false));
         }
-        next_job.updated_at_unix_ms = UnixMillis::new(
-            parent
-                .updated_at_unix_ms
-                .get()
-                .max(receipt.verified_at_unix_ms.get()),
-        );
+        next_job.updated_at_unix_ms = receipt_updated_at_unix_ms;
         let next_job_payload = encode(&next_job)?;
         let object_set_digest = object_set.object_set.object_set_digest;
         let updated_job = sqlx::query(
@@ -5596,9 +5949,9 @@ impl PlacementRepository for SqliteAuthorityStore {
         sqlx::query(
             "INSERT INTO volume_commit_coverages \
              (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation, object_set_digest, object_count, verified_object_count, total_bytes, verified_bytes, state, created_at_unix_ms, updated_at_unix_ms, payload) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (tenant_id, object_namespace_id, commit_id, storage_volume_id, placement_generation) \
-             DO UPDATE SET object_set_digest = excluded.object_set_digest, object_count = excluded.object_count, verified_object_count = excluded.verified_object_count, total_bytes = excluded.total_bytes, verified_bytes = excluded.verified_bytes, state = excluded.state, payload = excluded.payload",
+             DO UPDATE SET object_set_digest = excluded.object_set_digest, object_count = excluded.object_count, verified_object_count = excluded.verified_object_count, total_bytes = excluded.total_bytes, verified_bytes = excluded.verified_bytes, state = excluded.state, updated_at_unix_ms = excluded.updated_at_unix_ms, payload = excluded.payload",
         )
         .bind(coverage.tenant_id.as_str())
         .bind(coverage.object_namespace_id.as_str())
@@ -5611,6 +5964,8 @@ impl PlacementRepository for SqliteAuthorityStore {
         .bind(v2_i64(coverage.total_bytes.get(), "total_bytes")?)
         .bind(v2_i64(coverage.verified_bytes.get(), "verified_bytes")?)
         .bind(coverage_state_name(coverage.state))
+        .bind(v2_i64(parent.created_at_unix_ms.get(), "created_at_unix_ms")?)
+        .bind(v2_i64(receipt_updated_at_unix_ms.get(), "updated_at_unix_ms")?)
         .bind(coverage_payload)
         .execute(&mut *transaction)
         .await

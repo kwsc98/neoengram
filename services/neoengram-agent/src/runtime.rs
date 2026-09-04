@@ -283,7 +283,7 @@ where
 {
     config.validate()?;
     validate_replication_prerequisites(&config, command_trust_bundle.as_ref())?;
-    let replication_ready = if config.replication.enabled {
+    let (replication_network, replication_ready) = if config.replication.enabled {
         // Preserve the startup invariant that a failed mount probe performs no network I/O.
         let observation = probe.probe();
         validate_bootstrap_probe(&observation)?;
@@ -291,7 +291,7 @@ where
         // local config parsing or a socket bind. A temporarily unavailable Gateway leaves the
         // Agent usable for non-replication work and simply withholds the dynamic capability.
         let network = crate::approved_runtime::build_replication_network(&config)?;
-        match network
+        let ready = match network
             .as_ref()
             .expect("enabled replication always builds a network")
             .preflight_gateway()
@@ -302,9 +302,13 @@ where
                 tracing::warn!(%error, "replication Gateway QUIC preflight failed; capability will not be advertised");
                 false
             }
-        }
+        };
+        // Keep the preflight endpoint alive for the approved session. Building a second endpoint
+        // on the same fixed listener would race Quinn's asynchronous driver shutdown and fail
+        // with EADDRINUSE even though no other process owns the port.
+        (network, ready)
     } else {
-        false
+        (None, false)
     };
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
@@ -374,6 +378,7 @@ where
                 signing_key,
                 resource_version,
                 command_trust_bundle,
+                replication_network,
                 wait_for_shutdown(shutdown_receiver),
             )
             .await;
@@ -388,6 +393,7 @@ where
             Arc::clone(&signing_key),
             resource_version,
             command_trust_bundle.clone(),
+            replication_network.clone(),
             wait_for_shutdown_or_reload(shutdown_receiver.clone(), reload_receiver),
         );
         let renewal = renew_workload_certificate(
@@ -1107,6 +1113,7 @@ fn build_bootstrap_request(
 pub(crate) fn agent_capabilities(config: &AgentConfig, replication_ready: bool) -> Vec<String> {
     let mut capabilities = vec![
         "h2_control_channel_v1".to_owned(),
+        neoengram_domain::protocol::OPERATION_TASK_CAPABILITY_V1.to_owned(),
         "managed_add_v1".to_owned(),
         "single_volume_v1".to_owned(),
         "volume_local_cas_v1".to_owned(),

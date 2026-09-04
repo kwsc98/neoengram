@@ -357,6 +357,20 @@ impl AgentHttpError {
         .with_retry_after_ms(1_000)
     }
 
+    /// The reverse channel is healthy, but its bounded response queue cannot accept another
+    /// frame yet. Callers should retry after the Agent drains the queue; this is distinct from a
+    /// closed channel so diagnostics do not hide backpressure as a generic outage.
+    #[must_use]
+    pub const fn backpressure() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AGENT_CHANNEL_BACKPRESSURE",
+            "Agent reverse channel is applying backpressure",
+            true,
+        )
+        .with_retry_after_ms(100)
+    }
+
     #[must_use]
     pub const fn status(&self) -> StatusCode {
         self.status

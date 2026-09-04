@@ -1,7 +1,7 @@
 use fusen_rs::SensitiveFields;
 use serde::{Deserialize, Serialize};
 
-use super::{IndexVersionBody, PlaygroundView, PreCommitView};
+use super::{IndexVersionBody, PlaygroundView, PreCommitView, TaskView};
 
 /// Immutable Commit data layout. The value is frozen when a Pre-commit starts and is part of
 /// the resulting Commit identity.
@@ -143,4 +143,6 @@ pub struct CommitPlaygroundResponse {
     pub playground: PlaygroundView,
     pub consumed_precommit: PreCommitView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }

@@ -388,7 +388,30 @@ impl JobCoordinator {
             .ok_or_else(|| {
                 CentralError::new(CentralErrorCode::JobNotFound, "Snapshot no longer exists")
             })?;
-        if !snapshot.lifecycle.is_active() || snapshot.state != SnapshotState::Ready {
+        // A Delivery is an immutable child of exactly one Snapshot.  Do not derive a Job from
+        // an otherwise valid-looking Delivery until every identity field has been checked; a
+        // stale or corrupted child must fail closed instead of being dispatched against the
+        // wrong Commit, Volume, or mode.
+        if snapshot.tenant_id != delivery.tenant_id
+            || snapshot.snapshot_id != delivery.snapshot_id
+            || snapshot.delivery_id != delivery.delivery_id
+            || snapshot.commit_id != delivery.commit_id
+            || snapshot.storage_volume_id != delivery.storage_volume_id
+            || snapshot.delivery_mode != delivery.mode
+            || snapshot.snapshot_request_id != delivery.create_request_id
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Snapshot and Delivery immutable identities do not match",
+            )
+            .with_retryable(false));
+        }
+        if !snapshot.lifecycle.is_active()
+            || !matches!(
+                snapshot.state,
+                SnapshotState::Creating | SnapshotState::Ready
+            )
+        {
             return Err(resource_lifecycle_fenced());
         }
         let volume = self
@@ -403,6 +426,13 @@ impl JobCoordinator {
             })?;
         if !volume.lifecycle.is_active() || volume.state != crate::StorageVolumeState::Ready {
             return Err(resource_lifecycle_fenced());
+        }
+        if snapshot.edge_cluster_id != volume.edge_cluster_id {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Snapshot target EdgeCluster does not match its StorageVolume",
+            )
+            .with_retryable(false));
         }
         let job_id = deterministic_snapshot_delivery_job_id(delivery)?;
         if let Some(existing) = self
@@ -1431,9 +1461,9 @@ mod tests {
         FinalizeAddRequest, InMemoryComponents, InMemoryJobRepository, JobInsertOutcome,
         MetadataBatchSubmission, PlacementRepository, ReceiveReportRequest,
         SnapshotDeliveryInsertRequest, SnapshotInsertRequest, SnapshotRecord,
-        StageMetadataBatchRequest, StorageAccessMode, StorageBackendType,
-        StorageEnrollmentMetadata, StorageVolumeRecord, StorageVolumeState, TenantRecord,
-        VolumeOwnerRecord, VolumeOwnerState,
+        SnapshotWithDeliveryInsertRequest, StageMetadataBatchRequest, StorageAccessMode,
+        StorageBackendType, StorageEnrollmentMetadata, StorageVolumeRecord, StorageVolumeState,
+        TenantRecord, VolumeOwnerRecord, VolumeOwnerState,
     };
     use async_trait::async_trait;
     use neoengram_domain::core::{
@@ -2230,22 +2260,64 @@ mod tests {
         let commit_id = ContentDigest::from_bytes([7; 32]);
         components
             .control_catalog
-            .insert_snapshot_fenced(SnapshotInsertRequest {
-                record: SnapshotRecord {
-                    tenant_id: tenant_id.clone(),
-                    project_id: project_id.clone(),
-                    artifact_id: artifact_id.clone(),
-                    snapshot_id: snapshot_id.clone(),
-                    snapshot_request_id: RequestId::new("snapshot-request-delivery-replay")
-                        .unwrap(),
-                    commit_id,
-                    state: SnapshotState::Ready,
-                    resource_version: 1,
-                    lifecycle: ResourceLifecycle::active(),
-                    created_at_unix_ms: now,
-                    updated_at_unix_ms: now,
+            .insert_snapshot_with_delivery(SnapshotWithDeliveryInsertRequest {
+                snapshot: SnapshotInsertRequest {
+                    record: SnapshotRecord {
+                        tenant_id: tenant_id.clone(),
+                        project_id: project_id.clone(),
+                        artifact_id: artifact_id.clone(),
+                        snapshot_id: snapshot_id.clone(),
+                        snapshot_request_id: RequestId::new("snapshot-request-delivery-replay")
+                            .unwrap(),
+                        commit_id,
+                        delivery_id: SnapshotDeliveryId::new("delivery-replay").unwrap(),
+                        edge_cluster_id: EdgeClusterId::new("edge-delivery-preflight").unwrap(),
+                        storage_volume_id: StorageVolumeId::new("volume-delivery-preflight")
+                            .unwrap(),
+                        delivery_mode: SnapshotDeliveryMode::Copy,
+                        state: SnapshotState::Creating,
+                        resource_version: 1,
+                        lifecycle: ResourceLifecycle::active(),
+                        created_at_unix_ms: now,
+                        updated_at_unix_ms: now,
+                    },
+                    artifact_head: ArtifactHeadExpectation::Any,
                 },
-                artifact_head: ArtifactHeadExpectation::Any,
+                delivery: SnapshotDeliveryInsertRequest {
+                    record: SnapshotDeliveryRecord {
+                        tenant_id: tenant_id.clone(),
+                        delivery_id: SnapshotDeliveryId::new("delivery-replay").unwrap(),
+                        create_request_id: RequestId::new("snapshot-request-delivery-replay")
+                            .unwrap(),
+                        snapshot_id: snapshot_id.clone(),
+                        commit_id,
+                        storage_volume_id: StorageVolumeId::new("volume-delivery-preflight")
+                            .unwrap(),
+                        mode: SnapshotDeliveryMode::Copy,
+                        target_relative_root:
+                            SnapshotDeliveryOperation::canonical_target_relative_root(
+                                &project_id,
+                                &artifact_id,
+                                &snapshot_id,
+                                &SnapshotDeliveryId::new("delivery-replay").unwrap(),
+                            )
+                            .unwrap(),
+                        state: SnapshotDeliveryState::Requested,
+                        source_index_digest: ContentDigest::from_bytes([8; 32]),
+                        delivery_generation: DeliveryGeneration::new(1),
+                        file_count: 1,
+                        size_bytes: 11,
+                        object_set_digest: ContentDigest::from_bytes([0; 32]),
+                        resource_version: 1,
+                        issue_code: None,
+                        issue_message: None,
+                        issue_retryable: false,
+                        created_at_unix_ms: now,
+                        updated_at_unix_ms: now,
+                    },
+                    request_id: RequestId::new("snapshot-request-delivery-replay").unwrap(),
+                    retention_roots: Vec::new(),
+                },
             })
             .await
             .unwrap();
@@ -2297,10 +2369,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let record = SnapshotDeliveryRecord {
+        SnapshotDeliveryRecord {
             tenant_id: tenant_id.clone(),
             delivery_id: delivery_id.clone(),
-            create_request_id: RequestId::new("delivery-request-replay").unwrap(),
+            create_request_id: RequestId::new("snapshot-request-delivery-replay").unwrap(),
             snapshot_id: snapshot_id.clone(),
             commit_id,
             storage_volume_id,
@@ -2317,24 +2389,14 @@ mod tests {
             delivery_generation: DeliveryGeneration::new(1),
             file_count: 1,
             size_bytes: 11,
-            object_set_digest: object_set.object_set_digest,
+            object_set_digest: ContentDigest::from_bytes([0; 32]),
             resource_version: 1,
             issue_code: None,
             issue_message: None,
             issue_retryable: false,
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
-        };
-        components
-            .control_catalog
-            .insert_snapshot_delivery_idempotent(SnapshotDeliveryInsertRequest {
-                record: record.clone(),
-                request_id: record.create_request_id.clone(),
-                retention_roots: Vec::new(),
-            })
-            .await
-            .unwrap();
-        record
+        }
     }
 
     fn snapshot_owner_record(capabilities: BTreeSet<String>) -> AgentRegistryRecord {

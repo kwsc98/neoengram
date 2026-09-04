@@ -1,0 +1,2143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#172824" />
+    <title>NeoEngram · 产品原型</title>
+    <style>
+      :root {
+        --canvas: #f5f7f7;
+        --surface: #ffffff;
+        --surface-soft: #eef3f2;
+        --ink: #18252a;
+        --muted: #637279;
+        --muted-light: #8a999f;
+        --line: #dbe3e5;
+        --line-strong: #c7d2d5;
+        --nav: #172824;
+        --nav-soft: #233934;
+        --teal: #14756d;
+        --teal-dark: #0e554f;
+        --teal-soft: #e2f1ed;
+        --blue: #416d89;
+        --blue-soft: #e8f0f5;
+        --amber: #b36d2f;
+        --amber-soft: #fbefe2;
+        --rose: #b3434d;
+        --rose-soft: #f8e8eb;
+        --shadow-xs: 0 1px 2px rgb(24 37 42 / 5%);
+        --shadow-sm: 0 5px 18px rgb(24 37 42 / 7%);
+        --radius: 8px;
+        --header-height: 64px;
+        --sidebar-width: 244px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        min-width: 320px;
+        min-height: 100%;
+        margin: 0;
+      }
+
+      body {
+        color: var(--ink);
+        background: var(--canvas);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+        font-synthesis: none;
+        letter-spacing: 0;
+      }
+
+      button,
+      input,
+      textarea,
+      select {
+        color: inherit;
+        font: inherit;
+        letter-spacing: 0;
+      }
+
+      button {
+        border: 0;
+        cursor: pointer;
+      }
+
+      svg {
+        display: block;
+        width: 18px;
+        height: 18px;
+        fill: none;
+        stroke: currentColor;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 1.8;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      .app-shell {
+        min-height: 100vh;
+      }
+
+      .topbar {
+        position: fixed;
+        inset: 0 0 auto;
+        z-index: 30;
+        display: flex;
+        align-items: center;
+        height: var(--header-height);
+        gap: 18px;
+        padding: 0 20px;
+        color: #f3f8f6;
+        background: var(--nav);
+        border-bottom: 1px solid #32453f;
+      }
+
+      .mobile-menu,
+      .icon-button {
+        display: inline-grid;
+        place-items: center;
+        width: 34px;
+        height: 34px;
+        color: inherit;
+        background: transparent;
+        border-radius: 6px;
+      }
+
+      .mobile-menu {
+        display: none;
+      }
+
+      .mobile-menu:hover,
+      .icon-button:hover {
+        background: rgb(255 255 255 / 9%);
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 192px;
+        color: inherit;
+        text-align: left;
+        background: transparent;
+      }
+
+      .brand__mark {
+        display: grid;
+        place-items: center;
+        width: 32px;
+        height: 32px;
+        color: #12332e;
+        background: #9ed9c9;
+        border-radius: 8px;
+        font-size: 17px;
+        font-weight: 800;
+      }
+
+      .brand__wordmark strong,
+      .brand__wordmark small {
+        display: block;
+      }
+
+      .brand__wordmark strong {
+        font-size: 15px;
+        line-height: 1.05;
+      }
+
+      .brand__wordmark small {
+        margin-top: 4px;
+        color: #9aada6;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .topbar__right {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-left: auto;
+      }
+
+      .mode-tag {
+        padding: 5px 9px;
+        color: #f4c88b;
+        background: rgb(179 109 47 / 17%);
+        border: 1px solid rgb(244 200 139 / 45%);
+        border-radius: 5px;
+        font-size: 11px;
+        font-weight: 750;
+        letter-spacing: 0.04em;
+      }
+
+      .tenant-select {
+        min-width: 220px;
+        height: 38px;
+        padding: 0 34px 0 12px;
+        color: #f5f9f7;
+        appearance: none;
+        background-color: var(--nav-soft);
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23b6c7c0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+        background-position: right 11px center;
+        background-repeat: no-repeat;
+        border: 1px solid #496059;
+        border-radius: 7px;
+      }
+
+      .tenant-select:focus {
+        outline: 2px solid #75c8b5;
+        outline-offset: 2px;
+      }
+
+      .user-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: #dce8e3;
+        font-size: 12px;
+      }
+
+      .user-avatar {
+        display: grid;
+        place-items: center;
+        width: 30px;
+        height: 30px;
+        color: #f8f2e9;
+        background: #755c45;
+        border-radius: 50%;
+        font-size: 12px;
+        font-weight: 750;
+      }
+
+      .sidebar {
+        position: fixed;
+        inset: var(--header-height) auto 0 0;
+        z-index: 20;
+        display: flex;
+        flex-direction: column;
+        width: var(--sidebar-width);
+        padding: 18px 14px;
+        background: #eef3f2;
+        border-right: 1px solid var(--line);
+      }
+
+      .sidebar-tenant {
+        margin: 0 2px 18px;
+        padding: 0 10px 16px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .sidebar-tenant small,
+      .sidebar-tenant strong,
+      .sidebar-tenant code {
+        display: block;
+      }
+
+      .sidebar-tenant small {
+        margin-bottom: 7px;
+        color: var(--muted-light);
+        font-size: 10px;
+        font-weight: 700;
+      }
+
+      .sidebar-tenant strong {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--ink);
+        font-size: 13px;
+      }
+
+      .sidebar-tenant code,
+      .mono {
+        color: var(--muted);
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-size: 11px;
+      }
+
+      .sidebar-tenant code {
+        margin-top: 5px;
+      }
+
+      .status-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        background: #a9b5b1;
+        border-radius: 50%;
+      }
+
+      .status-dot--ok {
+        background: #2e9e78;
+        box-shadow: 0 0 0 3px rgb(46 158 120 / 14%);
+      }
+
+      .nav-group + .nav-group {
+        margin-top: 18px;
+        padding-top: 15px;
+        border-top: 1px solid var(--line);
+      }
+
+      .nav-group__label {
+        display: block;
+        padding: 0 12px 7px;
+        color: var(--muted-light);
+        font-size: 10px;
+        font-weight: 750;
+        letter-spacing: 0.02em;
+      }
+
+      .nav-item {
+        position: relative;
+        display: flex;
+        align-items: center;
+        width: 100%;
+        min-height: 40px;
+        gap: 11px;
+        padding: 0 12px;
+        color: #56686b;
+        text-align: left;
+        background: transparent;
+        border-radius: 6px;
+        font-size: 13px;
+        font-weight: 620;
+      }
+
+      .nav-item:hover {
+        color: var(--teal-dark);
+        background: #e2ecea;
+      }
+
+      .nav-item.is-active {
+        color: var(--teal-dark);
+        background: var(--surface);
+        box-shadow: var(--shadow-xs);
+      }
+
+      .nav-item.is-active::before {
+        position: absolute;
+        inset: 7px auto 7px 0;
+        width: 3px;
+        content: "";
+        background: var(--teal);
+        border-radius: 0 3px 3px 0;
+      }
+
+      .nav-item.is-active svg {
+        color: var(--teal);
+      }
+
+      .sidebar__footer {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        margin-top: auto;
+        padding: 16px 12px 3px;
+        color: var(--muted);
+        border-top: 1px solid var(--line);
+        font-size: 11px;
+        font-weight: 650;
+      }
+
+      .main-content {
+        min-height: 100vh;
+        padding: calc(var(--header-height) + 35px) 40px 58px calc(var(--sidebar-width) + 40px);
+      }
+
+      .page {
+        width: min(1240px, 100%);
+        margin: 0 auto;
+      }
+
+      .page-heading {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 22px;
+        min-height: 68px;
+        margin-bottom: 22px;
+      }
+
+      .page-heading h1 {
+        margin: 0;
+        color: var(--ink);
+        font-size: 28px;
+        font-weight: 760;
+        letter-spacing: -0.015em;
+        line-height: 1.2;
+      }
+
+      .page-heading p {
+        margin: 7px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .page-heading__actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .control-health {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-right: 3px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 40px;
+        gap: 8px;
+        padding: 0 15px;
+        border: 1px solid var(--line-strong);
+        border-radius: 7px;
+        font-size: 13px;
+        font-weight: 700;
+        transition:
+          background 140ms ease,
+          border-color 140ms ease,
+          transform 140ms ease;
+      }
+
+      .button:hover {
+        border-color: #aebdc0;
+        transform: translateY(-1px);
+      }
+
+      .button--primary {
+        color: #fff;
+        background: var(--teal);
+        border-color: var(--teal);
+      }
+
+      .button--primary:hover {
+        background: var(--teal-dark);
+        border-color: var(--teal-dark);
+      }
+
+      .button--quiet {
+        color: var(--muted);
+        background: var(--surface);
+      }
+
+      .status-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        overflow: hidden;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow-xs);
+      }
+
+      .status-card {
+        display: flex;
+        align-items: center;
+        min-height: 88px;
+        gap: 14px;
+        padding: 18px 22px;
+        border-right: 1px solid var(--line);
+      }
+
+      .status-card:last-child {
+        border-right: 0;
+      }
+
+      .status-card__icon {
+        display: grid;
+        flex: 0 0 auto;
+        place-items: center;
+        width: 35px;
+        height: 35px;
+        color: var(--blue);
+        background: var(--blue-soft);
+        border-radius: 8px;
+      }
+
+      .status-card__copy small,
+      .status-card__copy strong {
+        display: block;
+      }
+
+      .status-card__copy small {
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 650;
+      }
+
+      .status-card__copy strong {
+        margin-top: 5px;
+        font-size: 14px;
+      }
+
+      .status-card__copy .status-dot {
+        margin-right: 8px;
+        vertical-align: 1px;
+      }
+
+      .section {
+        margin-top: 32px;
+      }
+
+      .section-heading {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 14px;
+      }
+
+      .section-heading h2 {
+        margin: 0;
+        font-size: 16px;
+        font-weight: 760;
+      }
+
+      .section-heading p {
+        margin: 5px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .section-heading code {
+        color: var(--muted);
+        font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 11px;
+      }
+
+      .resource-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .resource-card {
+        display: grid;
+        grid-template-columns: 44px minmax(0, 1fr) 18px;
+        align-items: center;
+        min-height: 112px;
+        gap: 15px;
+        padding: 19px 20px;
+        color: inherit;
+        text-align: left;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow-xs);
+        transition:
+          border-color 140ms ease,
+          box-shadow 140ms ease,
+          transform 140ms ease;
+      }
+
+      .resource-card:hover,
+      .resource-card:focus-visible {
+        border-color: #aabfc0;
+        box-shadow: var(--shadow-sm);
+        outline: 0;
+        transform: translateY(-1px);
+      }
+
+      .resource-card__icon {
+        display: grid;
+        place-items: center;
+        width: 44px;
+        height: 44px;
+        color: var(--teal);
+        background: var(--teal-soft);
+        border-radius: 9px;
+      }
+
+      .resource-card:nth-child(2) .resource-card__icon {
+        color: var(--blue);
+        background: var(--blue-soft);
+      }
+
+      .resource-card:nth-child(3) .resource-card__icon {
+        color: var(--amber);
+        background: var(--amber-soft);
+      }
+
+      .resource-card:nth-child(4) .resource-card__icon {
+        color: var(--rose);
+        background: var(--rose-soft);
+      }
+
+      .resource-card:nth-child(5) .resource-card__icon {
+        color: var(--teal-dark);
+        background: #e2eeed;
+      }
+
+      .resource-card strong,
+      .resource-card small {
+        display: block;
+      }
+
+      .resource-card strong {
+        font-size: 14px;
+        font-weight: 760;
+      }
+
+      .resource-card small {
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .resource-card__arrow {
+        color: var(--muted-light);
+      }
+
+      .resource-card:hover .resource-card__arrow {
+        color: var(--teal);
+      }
+
+      .workflow {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 0;
+        overflow: hidden;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow-xs);
+      }
+
+      .workflow-step {
+        position: relative;
+        min-height: 126px;
+        padding: 20px 23px 18px;
+        border-right: 1px solid var(--line);
+      }
+
+      .workflow-step:last-child {
+        border-right: 0;
+      }
+
+      .workflow-step:not(:last-child)::after {
+        position: absolute;
+        top: 47px;
+        right: -9px;
+        z-index: 1;
+        width: 17px;
+        height: 17px;
+        color: var(--muted-light);
+        content: "→";
+        background: var(--surface);
+        font-size: 18px;
+        line-height: 17px;
+        text-align: center;
+      }
+
+      .workflow-step__eyebrow {
+        color: var(--muted-light);
+        font-size: 10px;
+        font-weight: 750;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+
+      .workflow-step h3 {
+        margin: 8px 0 5px;
+        font-size: 14px;
+      }
+
+      .workflow-step p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        margin-top: 11px;
+        padding: 4px 8px;
+        color: var(--teal-dark);
+        background: var(--teal-soft);
+        border: 1px solid #c8e5dc;
+        border-radius: 999px;
+        font-size: 10px;
+        font-weight: 750;
+      }
+
+      .status-pill--amber {
+        color: #92541e;
+        background: var(--amber-soft);
+        border-color: #f0d5b6;
+      }
+
+      .flow-map {
+        margin-top: 34px;
+      }
+
+      .flow-map-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .flow-card {
+        display: flex;
+        flex-direction: column;
+        min-height: 138px;
+        padding: 17px 18px 16px;
+        color: inherit;
+        text-align: left;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow-xs);
+        transition:
+          border-color 140ms ease,
+          box-shadow 140ms ease,
+          transform 140ms ease;
+      }
+
+      .flow-card:hover,
+      .flow-card:focus-visible {
+        border-color: #9fb8ba;
+        box-shadow: var(--shadow-sm);
+        outline: 0;
+        transform: translateY(-1px);
+      }
+
+      .flow-card__top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .flow-card__number {
+        display: inline-grid;
+        place-items: center;
+        width: 26px;
+        height: 26px;
+        color: var(--teal-dark);
+        background: var(--teal-soft);
+        border-radius: 7px;
+        font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 11px;
+        font-weight: 800;
+      }
+
+      .flow-card:nth-child(3n + 2) .flow-card__number {
+        color: var(--blue);
+        background: var(--blue-soft);
+      }
+
+      .flow-card:nth-child(3n) .flow-card__number {
+        color: #93531d;
+        background: var(--amber-soft);
+      }
+
+      .flow-card__status {
+        color: var(--muted-light);
+        font-size: 10px;
+        font-weight: 700;
+      }
+
+      .flow-card h3 {
+        margin: 13px 0 5px;
+        font-size: 14px;
+        font-weight: 760;
+      }
+
+      .flow-card p {
+        flex: 1;
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .flow-card__footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-top: 14px;
+        color: var(--teal);
+        font-size: 11px;
+        font-weight: 750;
+      }
+
+      .flow-card__footer svg {
+        width: 15px;
+        height: 15px;
+      }
+
+      .flow-drawer-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 90;
+        background: rgb(18 31 27 / 42%);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 160ms ease;
+      }
+
+      .flow-drawer-backdrop.is-open {
+        opacity: 1;
+        pointer-events: auto;
+      }
+
+      .flow-drawer {
+        position: absolute;
+        inset: 0 0 0 auto;
+        display: flex;
+        flex-direction: column;
+        width: min(620px, 100%);
+        background: var(--surface);
+        box-shadow: -16px 0 42px rgb(18 31 27 / 18%);
+        transform: translateX(100%);
+        transition: transform 180ms ease;
+      }
+
+      .flow-drawer-backdrop.is-open .flow-drawer {
+        transform: translateX(0);
+      }
+
+      .flow-drawer__header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 28px 30px 22px;
+        background: #f8faf9;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .flow-drawer__eyebrow {
+        color: var(--teal);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .flow-drawer__header h2 {
+        margin: 9px 0 0;
+        color: var(--ink);
+        font-size: 21px;
+        line-height: 1.25;
+      }
+
+      .flow-drawer__header p {
+        margin: 7px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .flow-drawer__body {
+        overflow: auto;
+        padding: 26px 30px 34px;
+      }
+
+      .flow-detail-summary {
+        margin: 0;
+        padding: 14px 15px;
+        color: #2d4842;
+        background: var(--teal-soft);
+        border: 1px solid #c6e2da;
+        border-radius: 7px;
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      .flow-detail-heading {
+        margin: 26px 0 12px;
+        font-size: 13px;
+        font-weight: 800;
+      }
+
+      .flow-detail-steps {
+        display: grid;
+        gap: 0;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .flow-detail-step {
+        position: relative;
+        display: grid;
+        grid-template-columns: 29px minmax(0, 1fr);
+        gap: 12px;
+        min-height: 66px;
+      }
+
+      .flow-detail-step:not(:last-child)::before {
+        position: absolute;
+        top: 29px;
+        bottom: 0;
+        left: 13px;
+        width: 1px;
+        content: "";
+        background: var(--line);
+      }
+
+      .flow-detail-step__index {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        place-items: center;
+        width: 27px;
+        height: 27px;
+        color: var(--teal-dark);
+        background: var(--teal-soft);
+        border: 1px solid #b9ddd3;
+        border-radius: 50%;
+        font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 10px;
+        font-weight: 800;
+      }
+
+      .flow-detail-step__copy {
+        padding: 2px 0 19px;
+      }
+
+      .flow-detail-step__copy strong,
+      .flow-detail-step__copy span {
+        display: block;
+      }
+
+      .flow-detail-step__copy strong {
+        font-size: 13px;
+      }
+
+      .flow-detail-step__copy span {
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .flow-detail-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
+      }
+
+      .flow-detail-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 9px;
+        color: var(--muted);
+        background: #f8faf9;
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 10px;
+        font-weight: 650;
+      }
+
+      .flow-detail-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .flow-action-button {
+        min-height: 34px;
+        padding: 0 11px;
+        color: var(--teal-dark);
+        background: #f8fbfa;
+        border: 1px solid #a8cec4;
+        border-radius: 6px;
+        font-size: 11px;
+        font-weight: 750;
+      }
+
+      .flow-action-button:hover {
+        background: var(--teal-soft);
+      }
+
+      .flow-detail-boundary {
+        margin: 0;
+        padding: 13px 14px;
+        color: #92541e;
+        background: var(--amber-soft);
+        border: 1px solid #f0d5b6;
+        border-radius: 7px;
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      .tenant-summary {
+        padding-top: 22px;
+        border-top: 1px solid var(--line);
+      }
+
+      .definition-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        overflow: hidden;
+        margin: 0;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow-xs);
+      }
+
+      .definition-item {
+        min-height: 83px;
+        padding: 17px 15px;
+        border-right: 1px solid var(--line);
+      }
+
+      .definition-item:nth-child(4) {
+        border-right: 0;
+      }
+
+      .definition-item dt {
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 650;
+      }
+
+      .definition-item dd {
+        margin: 8px 0 0;
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 730;
+      }
+
+      .definition-item--wide {
+        grid-column: 1 / -1;
+        min-height: 76px;
+        border-top: 1px solid var(--line);
+        border-right: 0;
+      }
+
+      .permission-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .permission {
+        padding: 4px 8px;
+        color: var(--teal-dark);
+        background: #f7fbfa;
+        border: 1px solid #8fc6bc;
+        border-radius: 5px;
+        font-family: "SFMono-Regular", Consolas, monospace;
+        font-size: 10px;
+        font-weight: 650;
+      }
+
+      .toast {
+        position: fixed;
+        right: 24px;
+        bottom: 24px;
+        z-index: 80;
+        max-width: min(380px, calc(100vw - 32px));
+        padding: 12px 15px;
+        color: #fff;
+        pointer-events: none;
+        background: #203b34;
+        border: 1px solid #4a7568;
+        border-radius: 7px;
+        box-shadow: var(--shadow-sm);
+        font-size: 12px;
+        font-weight: 650;
+        opacity: 0;
+        transform: translateY(8px);
+        transition:
+          opacity 160ms ease,
+          transform 160ms ease;
+      }
+
+      .toast.is-visible {
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .dialog-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 70;
+        display: grid;
+        place-items: center;
+        padding: 20px;
+        background: rgb(18 31 27 / 45%);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 150ms ease;
+      }
+
+      .dialog-backdrop.is-open {
+        opacity: 1;
+        pointer-events: auto;
+      }
+
+      .dialog {
+        width: min(520px, 100%);
+        padding: 25px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        box-shadow: 0 18px 50px rgb(18 31 27 / 22%);
+        transform: translateY(10px);
+        transition: transform 150ms ease;
+      }
+
+      .dialog-backdrop.is-open .dialog {
+        transform: translateY(0);
+      }
+
+      .dialog__header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 15px;
+        margin-bottom: 20px;
+      }
+
+      .dialog__header h2 {
+        margin: 0;
+        font-size: 19px;
+      }
+
+      .dialog__header p {
+        margin: 6px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .dialog__close {
+        color: var(--muted);
+        background: transparent;
+      }
+
+      .form-field + .form-field {
+        margin-top: 15px;
+      }
+
+      .form-field label {
+        display: block;
+        margin-bottom: 7px;
+        color: var(--ink);
+        font-size: 12px;
+        font-weight: 720;
+      }
+
+      .form-field input,
+      .form-field textarea {
+        display: block;
+        width: 100%;
+        padding: 10px 11px;
+        background: #fbfcfc;
+        border: 1px solid var(--line-strong);
+        border-radius: 6px;
+        font-size: 13px;
+        outline: 0;
+      }
+
+      .form-field textarea {
+        min-height: 88px;
+        resize: vertical;
+      }
+
+      .form-field input:focus,
+      .form-field textarea:focus {
+        border-color: var(--teal);
+        box-shadow: 0 0 0 3px rgb(20 117 109 / 12%);
+      }
+
+      .dialog__footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 9px;
+        margin-top: 23px;
+      }
+
+      .mobile-scrim {
+        display: none;
+      }
+
+      @media (max-width: 1050px) {
+        .topbar {
+          gap: 12px;
+          padding: 0 16px;
+        }
+
+        .brand {
+          min-width: 170px;
+        }
+
+        .tenant-select {
+          min-width: 190px;
+        }
+
+        .main-content {
+          padding-right: 28px;
+          padding-left: calc(var(--sidebar-width) + 28px);
+        }
+      }
+
+      @media (max-width: 900px) {
+        .mobile-menu {
+          display: inline-grid;
+        }
+
+        .sidebar {
+          z-index: 60;
+          box-shadow: 12px 0 30px rgb(19 41 34 / 14%);
+          transform: translateX(-100%);
+          transition: transform 180ms ease;
+        }
+
+        .sidebar.is-open {
+          transform: translateX(0);
+        }
+
+        .mobile-scrim {
+          position: fixed;
+          inset: 0;
+          z-index: 50;
+          display: block;
+          background: rgb(15 30 25 / 35%);
+          opacity: 0;
+          pointer-events: none;
+          transition: opacity 180ms ease;
+        }
+
+        .mobile-scrim.is-open {
+          opacity: 1;
+          pointer-events: auto;
+        }
+
+        .main-content {
+          padding-left: 28px;
+        }
+      }
+
+      @media (max-width: 700px) {
+        :root {
+          --header-height: 60px;
+        }
+
+        .topbar {
+          padding: 0 12px;
+        }
+
+        .brand {
+          min-width: 0;
+        }
+
+        .brand__wordmark,
+        .mode-tag,
+        .user-chip span {
+          display: none;
+        }
+
+        .tenant-select {
+          min-width: 0;
+          width: min(190px, 44vw);
+        }
+
+        .main-content {
+          padding: calc(var(--header-height) + 24px) 16px 38px;
+        }
+
+        .page-heading {
+          display: block;
+          margin-bottom: 20px;
+        }
+
+        .page-heading h1 {
+          font-size: 24px;
+        }
+
+        .page-heading__actions {
+          flex-wrap: wrap;
+          margin-top: 17px;
+        }
+
+        .control-health {
+          width: 100%;
+          margin-bottom: 2px;
+        }
+
+        .button {
+          min-height: 40px;
+        }
+
+        .status-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .status-card {
+          min-height: 78px;
+          padding: 15px 16px;
+        }
+
+        .status-card:nth-child(2) {
+          border-right: 0;
+        }
+
+        .status-card:nth-child(3) {
+          grid-column: 1 / -1;
+          border-top: 1px solid var(--line);
+        }
+
+        .resource-grid,
+        .workflow,
+        .flow-map-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .resource-card {
+          min-height: 100px;
+        }
+
+        .workflow-step {
+          min-height: 112px;
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+
+        .workflow-step:last-child {
+          border-bottom: 0;
+        }
+
+        .workflow-step:not(:last-child)::after {
+          top: auto;
+          right: 24px;
+          bottom: -10px;
+          transform: rotate(90deg);
+        }
+
+        .definition-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .definition-item {
+          border-bottom: 1px solid var(--line);
+        }
+
+        .definition-item:nth-child(2) {
+          border-right: 0;
+        }
+
+        .definition-item:nth-child(3) {
+          border-bottom: 0;
+        }
+
+        .definition-item:nth-child(4) {
+          border-right: 0;
+          border-bottom: 0;
+        }
+
+        .definition-item--wide {
+          grid-column: 1 / -1;
+          border-top: 1px solid var(--line);
+        }
+
+        .flow-drawer__header {
+          padding: 22px 18px 18px;
+        }
+
+        .flow-drawer__body {
+          padding: 22px 18px 28px;
+        }
+      }
+
+      @media (max-width: 430px) {
+        .topbar__right {
+          gap: 4px;
+        }
+
+        .tenant-select {
+          width: 43vw;
+          padding-left: 9px;
+          font-size: 12px;
+        }
+
+        .user-chip {
+          margin-left: 2px;
+        }
+
+        .page-heading__actions .button {
+          flex: 1 1 auto;
+        }
+
+        .resource-card {
+          grid-template-columns: 40px minmax(0, 1fr) 18px;
+          gap: 12px;
+          padding: 16px;
+        }
+
+        .resource-card__icon {
+          width: 40px;
+          height: 40px;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <svg class="sr-only" aria-hidden="true" focusable="false">
+      <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" /></symbol>
+      <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 19V5M4 19h16" /><path d="m7 15 3-4 3 2 5-6" /></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5z" /></symbol>
+      <symbol id="i-box" viewBox="0 0 24 24"><path d="m4 8 8-4 8 4-8 4z" /><path d="M4 8v9l8 4 8-4V8M12 12v9" /></symbol>
+      <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5z" /><path d="m3 12 9 5 9-5M3 16l9 5 9-5" /></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h4M9 13h6M9 17h6" /></symbol>
+      <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7" /></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3" /><path d="m16 16 4.5 4.5" /></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" /></symbol>
+      <symbol id="i-server" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="6" rx="1" /><rect x="4" y="14" width="16" height="6" rx="1" /><path d="M8 7h.01M8 17h.01" /></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14-4L4 9" /><path d="M4 5v4h4M4 13a8 8 0 0 0 14 4l2-2" /><path d="M20 19v-4h-4" /></symbol>
+      <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6" /></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></symbol>
+      <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3 12h4l2-7 4 14 2-7h6" /></symbol>
+    </svg>
+
+    <div class="app-shell">
+      <header class="topbar">
+        <button class="mobile-menu" id="menuButton" type="button" title="打开导航" aria-label="打开导航">
+          <svg><use href="#i-menu" /></svg>
+        </button>
+        <button class="brand" type="button" id="brandButton" aria-label="回到概览">
+          <span class="brand__mark">N</span>
+          <span class="brand__wordmark">
+            <strong>NeoEngram</strong>
+            <small>Workspace Console</small>
+          </span>
+        </button>
+        <div class="topbar__right">
+          <span class="mode-tag">MOCK</span>
+          <label class="sr-only" for="tenantSelect">当前租户</label>
+          <select class="tenant-select" id="tenantSelect">
+            <option value="tenant-a">研究数据平台</option>
+            <option value="tenant-b">交付资料库</option>
+          </select>
+          <div class="user-chip" title="开发用户">
+            <span class="user-avatar">开</span>
+            <span>开发用户</span>
+          </div>
+          <button class="icon-button" id="signOutButton" type="button" title="退出登录" aria-label="退出登录">
+            <svg><use href="#i-x" /></svg>
+          </button>
+        </div>
+      </header>
+
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-tenant">
+          <small>当前租户</small>
+          <strong><span id="sideTenantName">研究数据平台</span><i class="status-dot status-dot--ok"></i></strong>
+          <code id="sideTenantCode">tenant-a</code>
+        </div>
+        <nav aria-label="主导航">
+          <div class="nav-group">
+            <span class="nav-group__label">数据工作流</span>
+            <button class="nav-item is-active" type="button" data-nav="概览">
+              <svg><use href="#i-chart" /></svg><span>概览</span>
+            </button>
+            <button class="nav-item" type="button" data-nav="Projects">
+              <svg><use href="#i-folder" /></svg><span>Projects</span>
+            </button>
+            <button class="nav-item" type="button" data-nav="数据资产">
+              <svg><use href="#i-box" /></svg><span>数据资产</span>
+            </button>
+            <button class="nav-item" type="button" data-nav="工作区">
+              <svg><use href="#i-layers" /></svg><span>工作区</span>
+            </button>
+            <button class="nav-item" type="button" data-nav="快照与交付">
+              <svg><use href="#i-file" /></svg><span>快照与交付</span>
+            </button>
+            <button class="nav-item" type="button" data-nav="对象存储">
+              <svg><use href="#i-folder" /></svg><span>对象存储</span>
+            </button>
+            <button class="nav-item" type="button" data-nav="活动">
+              <svg><use href="#i-search" /></svg><span>活动</span>
+            </button>
+            <button class="nav-item" type="button" data-nav="回收站">
+              <svg><use href="#i-trash" /></svg><span>回收站</span>
+            </button>
+          </div>
+          <div class="nav-group">
+            <span class="nav-group__label">基础设施</span>
+            <button class="nav-item" type="button" data-nav="集群与存储">
+              <svg><use href="#i-server" /></svg><span>集群与存储</span>
+            </button>
+          </div>
+        </nav>
+        <div class="sidebar__footer"><i class="status-dot status-dot--ok"></i><span>控制面在线</span></div>
+      </aside>
+      <div class="mobile-scrim" id="mobileScrim"></div>
+
+      <main class="main-content">
+        <div class="page">
+          <section class="page-heading" aria-labelledby="pageTitle">
+            <div>
+              <h1 id="pageTitle">研究数据平台</h1>
+              <p id="pageDescription">模型训练与评估数据的受管空间</p>
+            </div>
+            <div class="page-heading__actions">
+              <span class="control-health"><i class="status-dot status-dot--ok"></i><span>控制面正常</span></span>
+              <button class="button button--primary" id="createProjectButton" type="button">
+                <svg><use href="#i-plus" /></svg><span>创建 Project</span>
+              </button>
+              <button class="button button--quiet" id="refreshButton" type="button">
+                <svg><use href="#i-refresh" /></svg><span>刷新</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="status-grid" aria-label="运行状态">
+            <article class="status-card">
+              <span class="status-card__icon"><svg><use href="#i-server" /></svg></span>
+              <span class="status-card__copy"><small>API 协议</small><strong>v1</strong></span>
+            </article>
+            <article class="status-card">
+              <span class="status-card__icon"><svg><use href="#i-activity" /></svg></span>
+              <span class="status-card__copy"><small>存活探针</small><strong><i class="status-dot status-dot--ok"></i>运行正常</strong></span>
+            </article>
+            <article class="status-card">
+              <span class="status-card__icon"><svg><use href="#i-chart" /></svg></span>
+              <span class="status-card__copy"><small>就绪探针</small><strong><i class="status-dot status-dot--ok"></i>服务就绪</strong></span>
+            </article>
+          </section>
+
+          <section class="section" aria-labelledby="resourceTitle">
+            <div class="section-heading">
+              <div>
+                <h2 id="resourceTitle">租户资源</h2>
+                <p>进入当前租户的数据、工作区与基础设施</p>
+              </div>
+              <code id="resourceTenantCode">tenant-a</code>
+            </div>
+            <div class="resource-grid">
+              <button class="resource-card" type="button" data-resource="Projects">
+                <span class="resource-card__icon"><svg><use href="#i-folder" /></svg></span>
+                <span><strong>Projects</strong><small>创建和管理租户内的逻辑项目</small></span>
+                <svg class="resource-card__arrow"><use href="#i-arrow" /></svg>
+              </button>
+              <button class="resource-card" type="button" data-resource="数据资产">
+                <span class="resource-card__icon"><svg><use href="#i-box" /></svg></span>
+                <span><strong>数据资产</strong><small>管理工作区与快照所依赖的权威数据资产</small></span>
+                <svg class="resource-card__arrow"><use href="#i-arrow" /></svg>
+              </button>
+              <button class="resource-card" type="button" data-resource="工作区">
+                <span class="resource-card__icon"><svg><use href="#i-layers" /></svg></span>
+                <span><strong>工作区</strong><small>查看 Playground 与 Pre-commit 状态</small></span>
+                <svg class="resource-card__arrow"><use href="#i-arrow" /></svg>
+              </button>
+              <button class="resource-card" type="button" data-resource="快照与交付">
+                <span class="resource-card__icon"><svg><use href="#i-file" /></svg></span>
+                <span><strong>快照与交付</strong><small>查看固定 Commit 的区域只读视图</small></span>
+                <svg class="resource-card__arrow"><use href="#i-arrow" /></svg>
+              </button>
+              <button class="resource-card" type="button" data-resource="集群与存储">
+                <span class="resource-card__icon"><svg><use href="#i-database" /></svg></span>
+                <span><strong>集群与存储</strong><small>查看 Gateway 集群及其磁盘状态</small></span>
+                <svg class="resource-card__arrow"><use href="#i-arrow" /></svg>
+              </button>
+            </div>
+          </section>
+
+          <section class="section" aria-labelledby="workflowTitle">
+            <div class="section-heading">
+              <div>
+                <h2 id="workflowTitle">主工作流</h2>
+                <p>从逻辑资产到可读取的固定交付</p>
+              </div>
+              <code>原型示意</code>
+            </div>
+            <div class="workflow">
+              <article class="workflow-step">
+                <span class="workflow-step__eyebrow">Artifact</span>
+                <h3 id="workflowArtifact">道路场景数据集</h3>
+                <p>逻辑资产 · 当前 Commit <span class="mono">aaaa…</span></p>
+                <span class="status-pill"><i class="status-dot status-dot--ok"></i>版本已发布</span>
+              </article>
+              <article class="workflow-step">
+                <span class="workflow-step__eyebrow">Playground</span>
+                <h3 id="workflowPlayground">标注工作区</h3>
+                <p>可写视图 · cn-shanghai</p>
+                <span class="status-pill"><i class="status-dot status-dot--ok"></i>Ready</span>
+              </article>
+              <article class="workflow-step">
+                <span class="workflow-step__eyebrow">Snapshot Delivery</span>
+                <h3 id="workflowSnapshot">snap-road-main3-sha-01</h3>
+                <p>固定版本 · 区域只读视图</p>
+                <span class="status-pill"><i class="status-dot status-dot--ok"></i>已校验 · 只读</span>
+              </article>
+            </div>
+          </section>
+
+          <section class="section flow-map" aria-labelledby="flowMapTitle">
+            <div class="section-heading">
+              <div>
+                <h2 id="flowMapTitle">全部产品流程</h2>
+                <p>点击任一流程查看页面、状态和操作细节</p>
+              </div>
+              <code>11 条链路</code>
+            </div>
+            <div class="flow-map-grid">
+              <button class="flow-card" type="button" data-flow="tenant-entry">
+                <span class="flow-card__top"><span class="flow-card__number">01</span><span class="flow-card__status">入口</span></span>
+                <h3>Tenant 入口与权限</h3>
+                <p>登录后加载可见租户，选择或创建 Tenant，再进入租户概览。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="projects">
+                <span class="flow-card__top"><span class="flow-card__number">02</span><span class="flow-card__status">目录</span></span>
+                <h3>Projects 项目目录</h3>
+                <p>按名称或 ID 搜索，分页浏览并创建租户内的逻辑项目。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="artifact">
+                <span class="flow-card__top"><span class="flow-card__number">03</span><span class="flow-card__status">逻辑资产</span></span>
+                <h3>Artifact 数据资产</h3>
+                <p>创建空资产、浏览版本与 Diff，并从明确 Commit 进入后续工作区或快照。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="playground">
+                <span class="flow-card__top"><span class="flow-card__number">04</span><span class="flow-card__status">可写视图</span></span>
+                <h3>Playground 工作区</h3>
+                <p>从 Artifact 创建，绑定一个 Ready StorageVolume，查看变化、文件和数据画像。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="precommit">
+                <span class="flow-card__top"><span class="flow-card__number">05</span><span class="flow-card__status">显式检查</span></span>
+                <h3>Pre-commit 检查</h3>
+                <p>用户主动发起扫描，冻结 IndexVersion，审查文件变化、阻断项和警告。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="commit">
+                <span class="flow-card__top"><span class="flow-card__number">06</span><span class="flow-card__status">不可变发布</span></span>
+                <h3>Commit 版本发布</h3>
+                <p>填写标题、描述和 Tags，在服务端复核候选 Index 后生成不可变 Commit。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="snapshot">
+                <span class="flow-card__top"><span class="flow-card__number">07</span><span class="flow-card__status">只读交付</span></span>
+                <h3>Snapshot 与 Delivery</h3>
+                <p>固定 Commit、区域、Volume 和交付模式，等待唯一 Delivery 校验并进入 Ready。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="storage">
+                <span class="flow-card__top"><span class="flow-card__number">08</span><span class="flow-card__status">基础设施</span></span>
+                <h3>StorageVolume 接入</h3>
+                <p>登记 NFS 或接入 PVC，生成一次性凭证，审批后等待挂载健康和 Ready。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="s3">
+                <span class="flow-card__top"><span class="flow-card__number">09</span><span class="flow-card__status">只读访问</span></span>
+                <h3>S3 Access Point</h3>
+                <p>仅为 Ready Snapshot 开启只读 S3，凭证只显示一次，再按前缀浏览和下载对象。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="jobs">
+                <span class="flow-card__top"><span class="flow-card__number">10</span><span class="flow-card__status">异步活动</span></span>
+                <h3>Job 与活动</h3>
+                <p>由扫描、物化和发布动作产生异步记录，按 Job ID 查询阶段、进度和失败原因。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+              <button class="flow-card" type="button" data-flow="recycle">
+                <span class="flow-card__top"><span class="flow-card__number">11</span><span class="flow-card__status">生命周期</span></span>
+                <h3>回收站与恢复</h3>
+                <p>查看删除任务、影响和恢复窗口，支持恢复、重试以及合规保留锁。</p>
+                <span class="flow-card__footer"><span>查看流程详情</span><svg><use href="#i-arrow" /></svg></span>
+              </button>
+            </div>
+          </section>
+
+          <section class="section tenant-summary" aria-labelledby="tenantTitle">
+            <div class="section-heading">
+              <div><h2 id="tenantTitle">Tenant 信息</h2></div>
+            </div>
+            <dl class="definition-grid">
+              <div class="definition-item"><dt>Tenant ID</dt><dd class="mono" id="tenantIdValue">tenant-a</dd></div>
+              <div class="definition-item"><dt>Resource version</dt><dd id="resourceVersionValue">3</dd></div>
+              <div class="definition-item"><dt>创建时间</dt><dd id="createdAtValue">2026年7月27日 23:43</dd></div>
+              <div class="definition-item"><dt>更新时间</dt><dd id="updatedAtValue">2026年7月27日 23:53</dd></div>
+              <div class="definition-item definition-item--wide">
+                <dt>当前权限</dt>
+                <dd class="permission-list" id="permissionList"></dd>
+              </div>
+            </dl>
+          </section>
+        </div>
+      </main>
+
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+      <div class="flow-drawer-backdrop" id="flowDrawerBackdrop" role="presentation" aria-hidden="true">
+        <aside class="flow-drawer" role="dialog" aria-modal="true" aria-labelledby="flowDrawerTitle">
+          <header class="flow-drawer__header">
+            <div>
+              <span class="flow-drawer__eyebrow" id="flowDrawerEyebrow">产品流程</span>
+              <h2 id="flowDrawerTitle">流程详情</h2>
+              <p id="flowDrawerDescription"></p>
+            </div>
+            <button class="icon-button" id="closeFlowButton" type="button" title="关闭流程详情" aria-label="关闭流程详情">
+              <svg><use href="#i-x" /></svg>
+            </button>
+          </header>
+          <div class="flow-drawer__body" id="flowDrawerBody"></div>
+        </aside>
+      </div>
+
+      <div class="dialog-backdrop" id="projectDialog" role="presentation">
+        <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialogTitle">
+          <div class="dialog__header">
+            <div><h2 id="dialogTitle">创建 Project</h2><p>为当前租户创建一个新的逻辑项目</p></div>
+            <button class="dialog__close icon-button" id="closeDialogButton" type="button" title="关闭" aria-label="关闭">
+              <svg><use href="#i-x" /></svg>
+            </button>
+          </div>
+          <form id="projectForm">
+            <div class="form-field"><label for="projectId">Project ID</label><input id="projectId" name="projectId" required placeholder="project-vision" /></div>
+            <div class="form-field"><label for="projectName">项目名称</label><input id="projectName" name="projectName" required placeholder="视觉数据" /></div>
+            <div class="form-field"><label for="projectDescription">描述</label><textarea id="projectDescription" name="projectDescription" placeholder="道路场景和视觉评测数据"></textarea></div>
+            <div class="dialog__footer"><button class="button button--quiet" id="cancelDialogButton" type="button">取消</button><button class="button button--primary" type="submit">创建 Project</button></div>
+          </form>
+        </section>
+      </div>
+    </div>
+
+    <script>
+      const tenantData = {
+        "tenant-a": {
+          name: "研究数据平台",
+          description: "模型训练与评估数据的受管空间",
+          version: "3",
+          created: "2026年7月27日 23:43",
+          updated: "2026年7月27日 23:53",
+          permissions: [
+            "tenant.admin", "tenant.read", "storage.read", "storage.create", "storage.enrollment.create",
+            "storage.enrollment.read", "storage.enrollment.review", "artifact.read", "artifact.create",
+            "artifact.commit.replicate", "project.read", "project.create", "playground.create", "snapshot.create",
+            "job.create", "s3.access.read", "s3.access.manage", "resource.lifecycle.read", "resource.lifecycle.manage",
+            "retention.manage", "gateway.read"
+          ],
+          workflow: ["道路场景数据集", "标注工作区", "snap-road-main3-sha-01"]
+        },
+        "tenant-b": {
+          name: "交付资料库",
+          description: "发布物和交付快照的只读归档",
+          version: "7",
+          created: "2026年7月16日 23:43",
+          updated: "2026年7月26日 23:53",
+          permissions: ["tenant.read", "storage.read", "artifact.read", "s3.access.read"],
+          workflow: ["发布资源", "归档浏览", "release-snapshot-01"]
+        }
+      };
+
+      const flowSpecs = {
+        "tenant-entry": {
+          number: "01",
+          eyebrow: "Tenant Entry",
+          title: "登录、选择或创建 Tenant",
+          description: "所有业务页面都在 Tenant 上下文内运行。",
+          summary: "用户完成认证后，控制台加载自己可见的租户；选择租户会先校验资源和权限，再进入概览。没有可见租户时，入口只展示创建租户。",
+          steps: [
+            ["初始化认证", "恢复当前会话；未认证用户进入登录或 Auth callback。"],
+            ["加载可见租户", "按权限分页查询 Tenant，保留最近选择的租户 ID。"],
+            ["进入租户概览", "校验 tenant_id、权限和能力开关；能力不足时入口会隐藏或回退。"],
+            ["创建 Tenant", "填写 Tenant ID、名称和描述；重复请求返回同一结果。"]
+          ],
+          states: ["未登录", "已认证", "无租户"],
+          actions: ["选择 Tenant", "创建 Tenant"],
+          boundary: "Tenant 是所有公开 API 的权限边界；知道资源 ID 不能绕过租户隔离。"
+        },
+        projects: {
+          number: "02",
+          eyebrow: "Projects",
+          title: "Projects 项目目录",
+          description: "用 Project 管理租户内的业务分组。",
+          summary: "Projects 页面提供名称或 ID 搜索、游标分页和创建弹窗。打开一行后进入该 Project 下的 Artifact 目录。",
+          steps: [
+            ["查询目录", "按当前 Tenant 查询 Project，支持搜索、空结果、加载和错误重试。"],
+            ["创建 Project", "填写合法 Project ID、名称和可选描述；校验失败留在弹窗内。"],
+            ["处理幂等结果", "相同 request identity 重放时返回已有 Project，不重复创建。"],
+            ["进入资产", "点击 Project 行跳转到按 project_id 过滤的 Artifact 列表。"]
+          ],
+          states: ["加载中", "空目录", "可用", "无创建权限"],
+          actions: ["搜索 Project", "创建 Project", "查看数据资产"],
+          boundary: "Project 只是 Artifact 的业务分组，不拥有 Region、StorageVolume 或默认 Ref。"
+        },
+        artifact: {
+          number: "03",
+          eyebrow: "Artifact",
+          title: "Artifact 数据资产与版本",
+          description: "逻辑资产不绑定单一存储位置。",
+          summary: "Artifact 是版本化的逻辑文件系统。列表按 Project、名称和 ID 查找；详情用概览、版本、工作区和快照四个视图承接后续操作。",
+          steps: [
+            ["查询资产", "按 Project 和名称/ID 过滤 Artifact，显示当前 Commit 和资源状态。"],
+            ["创建资产", "当前可用的是空 Artifact；从 Commit 派生是目标能力，现阶段返回稳定 409。"],
+            ["查看版本", "在单 parent Commit 树中查看标题、Tags、父版本、创建者、时间和文件 Diff。"],
+            ["选择下一步", "从明确 Commit 创建 Playground 或 Snapshot；也可查看关联工作区和交付。"]
+          ],
+          states: ["空 Artifact", "有当前 Commit", "版本历史", "派生不可用"],
+          actions: ["创建空 Artifact", "查看 Commit Diff", "创建 Playground", "创建 Snapshot"],
+          boundary: "Artifact 没有固定 Region/Volume；普通 Commit 不能脱离 Playground 直接生成。"
+        },
+        playground: {
+          number: "04",
+          eyebrow: "Playground",
+          title: "Playground 可写工作区",
+          description: "唯一可以修改数据的产品视图。",
+          summary: "Playground 从 Artifact 详情创建，必须绑定一个 Ready StorageVolume，可选同一 Artifact 内的 base Commit。Region 从 Volume 派生。",
+          steps: [
+            ["选择基线", "选择当前 Artifact 和可选 base Commit；不能直接引用其他 Artifact 的 Commit。"],
+            ["选择存储", "选择一个 Ready StorageVolume，写入 ID、名称后提交创建。"],
+            ["等待物化", "生命周期从 Creating 进入 Ready；创建或物化失败进入 Abnormal。"],
+            ["检查工作区", "在变化、文件、Dataset Profile 之间切换，文件可打开只读元数据抽屉。"],
+            ["发起检查", "工作区 Ready 且存储可达时，显式发起 Pre-commit；页面刷新不会自动扫描。"]
+          ],
+          states: ["Creating", "Ready", "Degraded", "Unavailable", "Abnormal"],
+          actions: ["创建 Playground", "查看变化", "查看文件", "发起 Pre-commit"],
+          boundary: "一个 Playground 只能绑定一个 StorageVolume，创建后不能直接切换；Degraded/Unavailable 只保留中心查询。"
+        },
+        precommit: {
+          number: "05",
+          eyebrow: "Pre-commit",
+          title: "Pre-commit 检查与重跑",
+          description: "显式触发的 Commit 前检查会话。",
+          summary: "Pre-commit 会扫描 Playground，冻结候选 IndexVersion 和当前 Head，输出文件 Diff、元数据变化、阻断项与警告，再进入 Commit 审查。",
+          steps: [
+            ["发起会话", "用户点击发起后创建新的 precommit_id；打开页面或刷新只恢复现有会话。"],
+            ["执行扫描", "Agent 上报候选 Index，中心生成摘要并检查一致性。"],
+            ["审查结果", "查看新增、修改、删除、重命名、文件/字节摘要和 Dataset Profile 变化。"],
+            ["重新检测", "running/ready 会话先 cancel，再 start 新会话，得到新的 precommit_id。"],
+            ["失败重试或取消", "abnormal/cancelled 用 restart 保留会话 ID 并递增 attempt；取消会清除未发布候选。"]
+          ],
+          states: ["Idle", "Running", "Ready", "Abnormal", "Cancelled"],
+          actions: ["发起 Pre-commit", "重新检测", "失败重试", "取消", "进入 Commit 审查"],
+          boundary: "Pre-commit 不能隐式创建，也不能绕过检查直接在 Playground 页面显示 Commit 动作。"
+        },
+        commit: {
+          number: "06",
+          eyebrow: "Commit",
+          title: "Commit 不可变版本发布",
+          description: "冻结候选经过审查后才会发布。",
+          summary: "Commit 页面把检查结果和版本上下文冻结在一起，用户补充标题、描述和 Tags，服务端复核候选 Index 并执行 Head CAS。",
+          steps: [
+            ["确认上下文", "显示 Parent Commit 完整 ID、标题、Tags、创建时间和创建者。"],
+            ["检查阻断项", "阻断项未解决时禁止提交；警告可保留并进入审计。"],
+            ["填写信息", "Commit 标题必填，描述和 Tags 可选；候选 IndexVersion 与变化摘要保持可见。"],
+            ["执行 CAS", "服务端使用 Pre-commit attempt 内部冻结的 Head，冲突时返回可解释错误。"],
+            ["完成后续", "成功后返回 Playground、版本历史，或从新 Commit 创建 Snapshot。"]
+          ],
+          states: ["Blocked", "Ready to commit", "Creating", "Published", "Conflict"],
+          actions: ["重新检测", "创建 Commit", "查看版本历史", "创建 Snapshot"],
+          boundary: "Commit 不可变、最多一个 parent；普通用户只能从 Playground 发布，不能直接编辑 Artifact。"
+        },
+        snapshot: {
+          number: "07",
+          eyebrow: "Snapshot + Delivery",
+          title: "Snapshot 与唯一 Delivery",
+          description: "为明确 Commit 生成固定的只读交付。",
+          summary: "创建时一次性固定 Commit、目标 EdgeCluster、StorageVolume 和 fuse/copy/hardlink 模式，并原子创建唯一 SnapshotDelivery。",
+          steps: [
+            ["确认版本", "展示 Commit、parent、Tags 和逻辑 Diff 摘要，避免选择可变基线。"],
+            ["选择目标", "选择 Ready StorageVolume 和允许的交付模式；Degraded/Unavailable 不可承接新交付。"],
+            ["创建交付", "Snapshot 进入 Creating，Delivery 进入 Requested，两个资源绑定关系不可修改。"],
+            ["物化与校验", "Delivery 依次经历 Validating/Materializing，完整性通过后进入 Ready。"],
+            ["开放读取", "只有 Snapshot 和唯一 Delivery 都 Ready 才可浏览、挂载或开启 S3。失败可重试同一目标。"]
+          ],
+          states: ["Creating", "Ready", "Abnormal", "Delivery Requested", "Delivery Failed"],
+          actions: ["创建 Snapshot", "重试 Delivery", "查看文件", "开启 S3"],
+          boundary: "一个 Snapshot 只能有一个 Delivery；需要其他区域时为同一 Commit 创建另一个 Snapshot。"
+        },
+        storage: {
+          number: "08",
+          eyebrow: "StorageVolume",
+          title: "StorageVolume 登记与审批",
+          description: "平台管理员管理区域存储的公开状态。",
+          summary: "存储页按 Gateway 集群分组显示已登记 Volume，并在待审批页处理 PVC 接入请求。普通用户只看到公开状态，不看到 Agent 内部身份。",
+          steps: [
+            ["查看集群与磁盘", "按 EdgeCluster 展示 Volume ID、Region、后端类型、访问模式和健康状态。"],
+            ["登记 NFS", "填写 Volume ID、名称、EdgeCluster、Region、NFS Server 和 Export path。"],
+            ["接入 PVC", "填写 PVC Namespace/Claim，生成一次性 bootstrap credential 和部署配置。"],
+            ["等待审批", "Agent 提交后进入 pending_approval；管理员核对脱敏探测和身份摘要。"],
+            ["批准或拒绝", "批准后创建/绑定 Volume，仍需等待健康 RW mount 才进入 Ready。"]
+          ],
+          states: ["Ready", "Degraded", "Unavailable", "待审批", "已拒绝"],
+          actions: ["登记 NFS", "接入 PVC", "批准", "拒绝", "查看状态"],
+          boundary: "只有 Ready Volume 可承接 Playground、复制或 Snapshot；接入审批不授予跨租户权限。"
+        },
+        s3: {
+          number: "09",
+          eyebrow: "Object Storage",
+          title: "S3 Access Point 与对象浏览",
+          description: "Snapshot Delivery 的只读访问协议。",
+          summary: "S3 Access Point 只能绑定已 Ready 的 Snapshot/固定 Commit。创建后凭证只显示一次，用户通过前缀列表和预签名 URL 读取对象。",
+          steps: [
+            ["选择 Snapshot", "创建表单只允许选择 Delivery Ready 的 Snapshot，并校验小写 DNS 兼容 Bucket。"],
+            ["开启访问", "生成 Access Point、Endpoint 和一次性初始凭证，重复请求返回同一访问点。"],
+            ["管理状态", "Access Point 可启用或停用；停用后其 S3 凭证立即失效。"],
+            ["浏览对象", "按 prefix 搜索目录和对象，查看大小、类型、修改时间、ETag 与 S3 URI。"],
+            ["读取文件", "对对象生成预签名下载 URL，支持只读 GET/Range；不会进入写入流程。"]
+          ],
+          states: ["未创建", "Active", "Disabled", "Snapshot 未就绪"],
+          actions: ["开启 S3", "查看凭证", "浏览 Bucket", "下载对象"],
+          boundary: "S3 是 Snapshot 的只读读取协议，不提供 PUT、DELETE、Multipart、Versioning 或内部 Chunk key。"
+        },
+        jobs: {
+          number: "10",
+          eyebrow: "Jobs + Activity",
+          title: "Job 与异步活动",
+          description: "由业务动作产生的可查询执行记录。",
+          summary: "扫描、物化和发布会产生 Job。活动页支持按 Job ID 查询最近访问记录，详情页展示状态、阶段、进度、Prepared 结果和失败原因。",
+          steps: [
+            ["由动作产生", "用户从 Playground 扫描或 Pre-commit 进入操作；不要求先手工创建 Job。"],
+            ["查询身份", "使用 Tenant-scoped Job ID 查询公开 JobView，最近访问记录保存在浏览器内存。"],
+            ["观察进度", "查看类型、阶段、进度、目标资源、时间和结构化错误。"],
+            ["发布 Prepared", "Prepared Add 可在详情页确认，校验 metadata 后执行最终 Index CAS。"],
+            ["稳定终态", "成功、失败或取消后保留可重放的终态和 request identity。"]
+          ],
+          states: ["Queued", "Running", "Prepared", "Succeeded", "Failed"],
+          actions: ["按 Job ID 查询", "打开 Job 详情", "Finalize", "重试/重查"],
+          boundary: "统一 Tenant/资源/时间聚合活动属于 P1；Add Job 是高级运维入口，不是普通用户主流程。"
+        },
+        recycle: {
+          number: "11",
+          eyebrow: "Resource Lifecycle",
+          title: "回收站、恢复与保留锁",
+          description: "删除任务进入可观测、可恢复的生命周期。",
+          summary: "回收站展示资源删除任务的阶段、影响和恢复窗口。详情抽屉可查看级联范围、错误和保留锁，并执行整批恢复或重试。",
+          steps: [
+            ["查看删除任务", "按阶段筛选 deletion operation，显示资源引用、当前状态、恢复截止和更新时间。"],
+            ["预览影响", "详情中查看会级联删除的资源、已停止的 Job/Pre-commit 和结构化失败信息。"],
+            ["整批恢复", "在可恢复窗口内恢复资源；已取消的 Job 和 Pre-commit 不会自动重启。"],
+            ["重试删除", "失败且可重试的任务复用资源版本和请求上下文重新排队。"],
+            ["创建保留锁", "输入合规/业务原因，可设置到期时间；释放保留锁后才可继续清理。"]
+          ],
+          states: ["可恢复", "Purging", "Finalizing", "已恢复", "已永久清理"],
+          actions: ["查看影响", "整批恢复", "重试删除", "创建保留锁", "释放保留锁"],
+          boundary: "进入 Purging/Finalizing 后不可恢复；恢复和重试都不会静默改变原资源目标。"
+        }
+      };
+
+      const $ = (selector) => document.querySelector(selector);
+      const $$ = (selector) => [...document.querySelectorAll(selector)];
+      let toastTimer;
+
+      const navFlowMap = {
+        "概览": "tenant-entry",
+        "Projects": "projects",
+        "数据资产": "artifact",
+        "工作区": "playground",
+        "快照与交付": "snapshot",
+        "对象存储": "s3",
+        "活动": "jobs",
+        "回收站": "recycle",
+        "集群与存储": "storage"
+      };
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function showToast(message) {
+        const toast = $("#toast");
+        toast.textContent = message;
+        toast.classList.add("is-visible");
+        window.clearTimeout(toastTimer);
+        toastTimer = window.setTimeout(() => toast.classList.remove("is-visible"), 2600);
+      }
+
+      function renderFlow(flowKey) {
+        const flow = flowSpecs[flowKey];
+        if (!flow) return;
+        $("#flowDrawerEyebrow").textContent = `${flow.number} · ${flow.eyebrow}`;
+        $("#flowDrawerTitle").textContent = flow.title;
+        $("#flowDrawerDescription").textContent = flow.description;
+        $("#flowDrawerBody").innerHTML = `
+          <p class="flow-detail-summary">${escapeHtml(flow.summary)}</p>
+          <h3 class="flow-detail-heading">执行步骤</h3>
+          <ol class="flow-detail-steps">
+            ${flow.steps.map(([label, detail], index) => `
+              <li class="flow-detail-step">
+                <span class="flow-detail-step__index">${String(index + 1).padStart(2, "0")}</span>
+                <div class="flow-detail-step__copy"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(detail)}</span></div>
+              </li>
+            `).join("")}
+          </ol>
+          <h3 class="flow-detail-heading">关键状态</h3>
+          <div class="flow-detail-chips">${flow.states.map((state) => `<span class="flow-detail-chip"><i class="status-dot status-dot--ok"></i>${escapeHtml(state)}</span>`).join("")}</div>
+          <h3 class="flow-detail-heading">可操作节点</h3>
+          <div class="flow-detail-actions">${flow.actions.map((action) => `<button class="flow-action-button" type="button" data-flow-action="${escapeHtml(action)}">${escapeHtml(action)}</button>`).join("")}</div>
+          <h3 class="flow-detail-heading">产品边界</h3>
+          <p class="flow-detail-boundary">${escapeHtml(flow.boundary)}</p>
+        `;
+        $$("[data-flow-action]").forEach((button) => {
+          button.addEventListener("click", () => showToast(`原型预览：${button.dataset.flowAction}`));
+        });
+      }
+
+      function openFlow(flowKey) {
+        renderFlow(flowKey);
+        $("#flowDrawerBackdrop").classList.add("is-open");
+        $("#flowDrawerBackdrop").setAttribute("aria-hidden", "false");
+        document.body.style.overflow = "hidden";
+      }
+
+      function closeFlow() {
+        $("#flowDrawerBackdrop").classList.remove("is-open");
+        $("#flowDrawerBackdrop").setAttribute("aria-hidden", "true");
+        document.body.style.overflow = "";
+      }
+
+      function renderTenant(tenantId) {
+        const tenant = tenantData[tenantId];
+        if (!tenant) return;
+        $("#pageTitle").textContent = tenant.name;
+        $("#pageDescription").textContent = tenant.description;
+        $("#sideTenantName").textContent = tenant.name;
+        $("#sideTenantCode").textContent = tenantId;
+        $("#resourceTenantCode").textContent = tenantId;
+        $("#tenantIdValue").textContent = tenantId;
+        $("#resourceVersionValue").textContent = tenant.version;
+        $("#createdAtValue").textContent = tenant.created;
+        $("#updatedAtValue").textContent = tenant.updated;
+        $("#workflowArtifact").textContent = tenant.workflow[0];
+        $("#workflowPlayground").textContent = tenant.workflow[1];
+        $("#workflowSnapshot").textContent = tenant.workflow[2];
+        $("#permissionList").innerHTML = tenant.permissions.map((permission) => `<span class="permission">${permission}</span>`).join("");
+      }
+
+      function closeSidebar() {
+        $("#sidebar").classList.remove("is-open");
+        $("#mobileScrim").classList.remove("is-open");
+      }
+
+      $("#tenantSelect").addEventListener("change", (event) => {
+        renderTenant(event.target.value);
+        showToast(`已切换到 ${tenantData[event.target.value].name}`);
+      });
+
+      $$(".nav-item").forEach((item) => {
+        item.addEventListener("click", () => {
+          $$(".nav-item").forEach((navItem) => navItem.classList.remove("is-active"));
+          item.classList.add("is-active");
+          const flowKey = navFlowMap[item.dataset.nav];
+          if (flowKey) openFlow(flowKey);
+          else showToast(`原型预览：${item.dataset.nav}`);
+          closeSidebar();
+        });
+      });
+
+      $$(".resource-card").forEach((card) => {
+        card.addEventListener("click", () => {
+          const flowKey = navFlowMap[card.dataset.resource];
+          if (flowKey) openFlow(flowKey);
+          else showToast(`打开资源：${card.dataset.resource}`);
+        });
+      });
+
+      $$(".flow-card").forEach((card) => {
+        card.addEventListener("click", () => openFlow(card.dataset.flow));
+      });
+
+      $("#brandButton").addEventListener("click", () => {
+        $$(".nav-item").forEach((item) => item.classList.toggle("is-active", item.dataset.nav === "概览"));
+        closeFlow();
+        showToast("已回到租户概览");
+      });
+
+      $("#refreshButton").addEventListener("click", () => {
+        const button = $("#refreshButton");
+        button.disabled = true;
+        button.querySelector("span").textContent = "刷新中…";
+        window.setTimeout(() => {
+          button.disabled = false;
+          button.querySelector("span").textContent = "刷新";
+          showToast("状态已刷新 · 控制面正常");
+        }, 520);
+      });
+
+      function toggleProjectDialog(open) {
+        $("#projectDialog").classList.toggle("is-open", open);
+        document.body.style.overflow = open ? "hidden" : "";
+        if (open) window.setTimeout(() => $("#projectId").focus(), 80);
+      }
+
+      $("#createProjectButton").addEventListener("click", () => toggleProjectDialog(true));
+      $("#closeDialogButton").addEventListener("click", () => toggleProjectDialog(false));
+      $("#cancelDialogButton").addEventListener("click", () => toggleProjectDialog(false));
+      $("#projectDialog").addEventListener("click", (event) => {
+        if (event.target === $("#projectDialog")) toggleProjectDialog(false);
+      });
+      $("#closeFlowButton").addEventListener("click", closeFlow);
+      $("#flowDrawerBackdrop").addEventListener("click", (event) => {
+        if (event.target === $("#flowDrawerBackdrop")) closeFlow();
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          toggleProjectDialog(false);
+          closeFlow();
+          closeSidebar();
+        }
+      });
+      $("#projectForm").addEventListener("submit", (event) => {
+        event.preventDefault();
+        const projectName = $("#projectName").value.trim() || "新 Project";
+        toggleProjectDialog(false);
+        event.target.reset();
+        showToast(`Project「${projectName}」已加入原型目录`);
+      });
+      $("#signOutButton").addEventListener("click", () => showToast("原型预览：退出登录"));
+      $("#menuButton").addEventListener("click", () => {
+        $("#sidebar").classList.add("is-open");
+        $("#mobileScrim").classList.add("is-open");
+      });
+      $("#mobileScrim").addEventListener("click", closeSidebar);
+
+      renderTenant("tenant-a");
+    </script>
+  </body>
+</html>

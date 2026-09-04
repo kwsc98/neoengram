@@ -7,7 +7,7 @@ info:
   summary: NeoEngram 用户、CLI 和 UI 使用的非 REST JSON API 契约
   description: |
     这是 NeoEngram 中心服务的公开 JSON action 契约。Managed 对象副本采用对象级 Placement，
-    Commit 物理复制通过面向目标 Volume 的 MaterializationJob 完成；一个 Job 可以从多个
+    Commit 物理复制通过面向目标 Volume 的 Materialization 任务完成；一个任务可以从多个
     Volume 的 Agent 经 Gateway relay 并行拉取对象。`neoengram-central` 是元数据、调度、租约
     和签名权威，Gateway 不挂载 Volume、不保存对象字节。
 
@@ -60,8 +60,8 @@ tags:
     description: 将 Ready Snapshot 通过 Gateway 暴露为只读 S3 Access Point，并管理短期凭证与对象浏览
   - name: ResourceLifecycle
     description: Tenant 管理员查询安全删除影响、管理回收站任务与 Retention Hold
-  - name: Job
-    description: 用户发起和查询的中心权威 Job 方法
+  - name: Task
+    description: 所有写操作的统一任务生命周期、审计事件与控制方法
   - name: Gateway
     description: 平台管理员管理 EdgeCluster GatewayPool 与 GatewayReplica 的全局方法
   - name: Health
@@ -166,7 +166,7 @@ paths:
                     resource_version: "3"
                     created_at_unix_ms: "1785167000000"
                     updated_at_unix_ms: "1785167600000"
-                    permissions: [tenant.read, artifact.read, job.create]
+                    permissions: [tenant.read, artifact.read, task.read]
                 next_cursor: tenant-page-2
                 can_create_tenant: true
         "401":
@@ -220,7 +220,7 @@ paths:
                   resource_version: "3"
                   created_at_unix_ms: "1785167000000"
                   updated_at_unix_ms: "1785167600000"
-                  permissions: [tenant.read, artifact.read, job.create]
+                  permissions: [tenant.read, artifact.read, task.read]
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -281,7 +281,7 @@ paths:
                       created_at_unix_ms: "1785168000000"
                       updated_at_unix_ms: "1785168000000"
                       permissions:
-                        [tenant.admin, tenant.read, artifact.read, job.create]
+                        [tenant.admin, tenant.read, artifact.read, task.read]
                     replayed: false
                 replayed:
                   value:
@@ -293,7 +293,7 @@ paths:
                       created_at_unix_ms: "1785168000000"
                       updated_at_unix_ms: "1785168000000"
                       permissions:
-                        [tenant.admin, tenant.read, artifact.read, job.create]
+                        [tenant.admin, tenant.read, artifact.read, task.read]
                     replayed: true
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
@@ -1274,141 +1274,6 @@ paths:
         "422": { $ref: "#/components/responses/ValidationProblem" }
         "500": { $ref: "#/components/responses/InternalProblem" }
         "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
-
-  /api/commit/materialization/query:
-    post:
-      tags: [Placement]
-      operationId: queryCommitMaterialization
-      summary: 查询物化任务
-      description: 查询单个目标 Volume 物化任务及其对象覆盖、批次和字节进度。
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/ApiVersion"
-        - $ref: "#/components/parameters/RequestId"
-        - $ref: "#/components/parameters/Traceparent"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/QueryCommitMaterializationRequest"
-      responses:
-        "200":
-          description: 复制任务
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/QueryCommitMaterializationResponse"
-        "401": { $ref: "#/components/responses/AuthenticationProblem" }
-        "403": { $ref: "#/components/responses/AuthorizationProblem" }
-        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
-        "422": { $ref: "#/components/responses/ValidationProblem" }
-        "500": { $ref: "#/components/responses/InternalProblem" }
-
-  /api/commit/materialization/list/query:
-    post:
-      tags: [Placement]
-      operationId: queryCommitMaterializationList
-      summary: 查询 Commit 的物化任务
-      description: 查询指定 Commit 的目标 Volume 物化任务及其覆盖状态。
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/ApiVersion"
-        - $ref: "#/components/parameters/RequestId"
-        - $ref: "#/components/parameters/Traceparent"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/QueryCommitMaterializationListRequest"
-      responses:
-        "200":
-          description: 复制任务列表
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/QueryCommitMaterializationListResponse"
-        "401": { $ref: "#/components/responses/AuthenticationProblem" }
-        "403": { $ref: "#/components/responses/AuthorizationProblem" }
-        "422": { $ref: "#/components/responses/ValidationProblem" }
-        "500": { $ref: "#/components/responses/InternalProblem" }
-
-  /api/commit/materialization/retry:
-    post:
-      tags: [Placement]
-      operationId: retryCommitMaterialization
-      summary: 重试失败的物化任务
-      description: 使用当前计划版本重新规划未完成对象。目标端已校验的对象和 checkpoint 会被复用。
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/ApiVersion"
-        - $ref: "#/components/parameters/RequestId"
-        - $ref: "#/components/parameters/Traceparent"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/RetryCommitMaterializationRequest"
-      responses:
-        "200":
-          description: 重试任务
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/RetryCommitMaterializationResponse"
-        "401": { $ref: "#/components/responses/AuthenticationProblem" }
-        "403": { $ref: "#/components/responses/AuthorizationProblem" }
-        "409": { $ref: "#/components/responses/MutationConflictProblem" }
-        "422": { $ref: "#/components/responses/ValidationProblem" }
-        "500": { $ref: "#/components/responses/InternalProblem" }
-
-  /api/commit/materialization/cancel:
-    post:
-      tags: [Placement]
-      operationId: cancelCommitMaterialization
-      summary: 取消物化任务
-      description: 取消仍在进行中的目标物化任务；已验证对象不受影响，临时 staging 由租约回收。
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/ApiVersion"
-        - $ref: "#/components/parameters/RequestId"
-        - $ref: "#/components/parameters/Traceparent"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CancelCommitMaterializationRequest"
-      responses:
-        "200":
-          description: 取消任务
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CancelCommitMaterializationResponse"
-        "401": { $ref: "#/components/responses/AuthenticationProblem" }
-        "403": { $ref: "#/components/responses/AuthorizationProblem" }
-        "409": { $ref: "#/components/responses/MutationConflictProblem" }
-        "422": { $ref: "#/components/responses/ValidationProblem" }
-        "500": { $ref: "#/components/responses/InternalProblem" }
 
   /api/commit/coverage/query:
     post:
@@ -2543,8 +2408,9 @@ paths:
       operationId: querySnapshotList
       summary: 查询租户内 Snapshot
       description: |
-        按 Project、Artifact、Commit 或状态分页查询独立逻辑 Snapshot；物理可读性由目标 Volume
-        的 Coverage 和相关 SnapshotDelivery 动态解析，不作为 Snapshot 筛选条件。
+        按 Project、Artifact、Commit 或状态分页查询 Snapshot 聚合；每个 Snapshot 都已绑定一个目标
+        Volume 和唯一 SnapshotDelivery。物理可读性仍由该 Delivery 的状态及目标 Coverage 动态解析，
+        不作为 Snapshot 筛选条件。
         opaque cursor 与全部筛选条件绑定。
       security:
         - BearerAuth: []
@@ -2581,6 +2447,10 @@ paths:
                     project_id: project-vision
                     artifact_id: road-scenes
                     commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                    delivery_id: delivery-road-main3-sha-01
+                    edge_cluster_id: cluster-cn-east-1
+                    storage_volume_id: volume-shanghai-vision
+                    delivery_mode: copy
                     data_layout: fast_cdc
                     message: 补充夜间道路场景
                     tag_names: [dataset/v4, release-candidate]
@@ -2654,6 +2524,10 @@ paths:
                   project_id: project-vision
                   artifact_id: road-scenes
                   commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  delivery_id: delivery-road-main3-sha-01
+                  edge_cluster_id: cluster-cn-east-1
+                  storage_volume_id: volume-shanghai-vision
+                  delivery_mode: copy
                   data_layout: fast_cdc
                   message: 补充夜间道路场景
                   tag_names: [dataset/v4, release-candidate]
@@ -2693,10 +2567,10 @@ paths:
       operationId: createSnapshot
       summary: 创建 Snapshot
       description: |
-        为指定 Artifact 的固定 Commit 创建逻辑 Snapshot。Snapshot 不绑定 StorageVolume 或 Region；
-        对象副本由 Placement authority 管理，复制与只读交付是独立动作。相同 `request_id` 和 payload
-        返回 `replayed: true`。200 返回时
-        Snapshot 记录已持久化且可查询，具体物化进度由独立 SnapshotDelivery 表达。
+        为指定 Artifact 的固定 Commit 创建 Snapshot，并在同一原子请求中绑定一个目标 EdgeCluster、
+        StorageVolume 和只读交付模式。Snapshot 与其唯一 SnapshotDelivery 初始分别为 `creating` 和
+        `requested`；只有交付完成后 Snapshot 才会变为 `ready`。相同 `request_id` 和 payload 返回
+        `replayed: true`。
       security:
         - BearerAuth: []
       parameters:
@@ -2714,6 +2588,9 @@ paths:
               project_id: project-vision
               artifact_id: road-scenes
               commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+              target_edge_cluster_id: cluster-cn-east-1
+              target_storage_volume_id: volume-shanghai-vision
+              delivery_mode: copy
               request_id: snapshot-request-main3-shanghai
       responses:
         "200":
@@ -2732,6 +2609,10 @@ paths:
                   project_id: project-vision
                   artifact_id: road-scenes
                   commit_id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                  delivery_id: delivery-road-main3-sha-01
+                  edge_cluster_id: cluster-cn-east-1
+                  storage_volume_id: volume-shanghai-vision
+                  delivery_mode: copy
                   data_layout: fast_cdc
                   message: 补充夜间道路场景
                   tag_names: [dataset/v4, release-candidate]
@@ -2774,8 +2655,9 @@ paths:
       summary: 重试 Snapshot 交付
       description: |
         对 failed SnapshotDelivery 的同一固定 Snapshot/Commit/Volume 交付重新发起 attempt，
-        使 Delivery 状态回到 requested，Snapshot 状态保持不变。相同 `request_id` 和 payload
-        幂等返回；状态不允许重试时返回 409。200 返回时新的交付 attempt 已持久化，
+        使 Delivery 状态回到 requested；如果 Snapshot 因该失败进入 `abnormal`，重试请求成功
+        持久化后会将其恢复为 `creating`。相同 `request_id` 和 payload 幂等返回；状态不允许
+        重试时返回 409。200 返回时新的交付 attempt 已持久化，
         后续进度通过 SnapshotDelivery 查询。
       security:
         - BearerAuth: []
@@ -2838,41 +2720,6 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/snapshot/delivery/create:
-    post:
-      tags: [Snapshot]
-      operationId: createSnapshotDelivery
-      summary: 创建 Snapshot 只读交付
-      description: 为固定 Snapshot 创建 FUSE、Copy 或 Hardlink 只读交付，目标路径由服务端推导。
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/ApiVersion"
-        - $ref: "#/components/parameters/RequestId"
-        - $ref: "#/components/parameters/Traceparent"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateSnapshotDeliveryRequest"
-      responses:
-        "200":
-          description: 已创建或幂等返回的交付
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CreateSnapshotDeliveryResponse"
-        "401": { $ref: "#/components/responses/AuthenticationProblem" }
-        "403": { $ref: "#/components/responses/AuthorizationProblem" }
-        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
-        "409": { $ref: "#/components/responses/MutationConflictProblem" }
-        "422": { $ref: "#/components/responses/ValidationProblem" }
-        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
-
   /api/snapshot/delivery/query:
     post:
       tags: [Snapshot]
@@ -2909,7 +2756,7 @@ paths:
       tags: [Snapshot]
       operationId: querySnapshotDeliveryList
       summary: 查询 Snapshot 只读交付列表
-      description: 分页返回指定 Snapshot 的所有只读交付。
+      description: 分页返回指定 Snapshot 的唯一只读交付；由于一个 Snapshot 只能绑定一个 Delivery，正常响应最多包含一项。
       security:
         - BearerAuth: []
       parameters:
@@ -3161,11 +3008,12 @@ paths:
     post:
       tags: [S3]
       operationId: createS3AccessPoint
-      summary: 为 Ready Snapshot 开启只读 S3 访问
+      summary: 为已交付 Snapshot 开启只读 S3 访问
       description: |
         要求 `s3.access.manage` 权限。为固定 Snapshot 创建唯一只读 Access Point，并在首次成功
-        响应中返回一组短期凭证。Snapshot 必须为 `ready`，对应 GatewayPool 必须可服务；同一
-        Snapshot 已有停用 Access Point 时必须显式调用 enable，不会通过本方法重新签发凭证。
+        响应中返回一组短期凭证。Snapshot 必须为 `ready`，且其绑定的唯一 SnapshotDelivery 必须
+        为 `ready`，目标 Volume 和 GatewayPool 必须可服务；同一 Snapshot 已有停用 Access Point
+        时必须显式调用 enable，不会通过本方法重新签发凭证。
         `secret_access_key` 只在首次创建凭证时返回，幂等重放不会再次返回原 Secret。
       security:
         - BearerAuth: []
@@ -3692,7 +3540,7 @@ paths:
       description: |
         要求 `resource.lifecycle.manage` 权限。仅在任务进入 `purging` 前接受恢复，并以固定依赖批次
         执行；所有目标保持 `restoring`，直到 Agent 物理恢复完成后由 Catalog 原子切回 `active`。
-        已撤销的 S3 凭证、Job 与 Pre-commit 不会随资源自动恢复。
+        已撤销的 S3 凭证、操作任务与 Pre-commit 不会随资源自动恢复。
       security:
         - BearerAuth: []
       parameters:
@@ -4189,20 +4037,13 @@ paths:
         "422": { $ref: "#/components/responses/ValidationProblem" }
         "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
 
-  /api/job/add/create:
+  /api/task/list/query:
     post:
-      tags: [Job]
-      operationId: createAddJob
-      summary: 创建 Managed Add Job
-      description: |
-        创建一个 tenant-scoped Managed Add Job。`principal` 不由请求体声明，而是由
-        Bearer JWT 的认证结果注入。服务端在完成认证和请求校验后，使用 canonical
-        PrincipalRef 与完整 Add operation 计算 `request_digest`；客户端不提交该字段。
-
-        相同 `(tenant_id, job_id, request_digest)` 的重试返回原 Job，并将 `replayed`
-        设为 `true`。相同 Job ID 对应另一份服务端计算 digest 时返回 `JOB_ID_REUSED`。
-      security:
-        - BearerAuth: []
+      tags: [Task]
+      operationId: queryTaskList
+      summary: 查询操作任务列表
+      description: 按租户、项目、数据资产、Commit、资源和状态分页查询统一写操作任务。
+      security: [{ BearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/ApiVersion"
         - $ref: "#/components/parameters/RequestId"
@@ -4211,109 +4052,23 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              $ref: "#/components/schemas/CreateAddJobRequest"
-            examples:
-              selectedPaths:
-                summary: 添加显式路径
-                value:
-                  tenant_id: tenant-a
-                  project_id: project-a
-                  artifact_id: artifact-a
-                  playground_id: playground-a
-                  job_id: job-20260727-001
-                  expected_index_version:
-                    revision: "0"
-                    digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-                  deadline_unix_ms: "1785168000000"
-                  paths:
-                    - dataset/images
-                    - dataset/labels.csv
-                  all: false
-              allPaths:
-                summary: 添加 Playground 全部变化
-                value:
-                  tenant_id: tenant-a
-                  project_id: project-a
-                  artifact_id: artifact-a
-                  playground_id: playground-a
-                  job_id: job-20260727-002
-                  expected_index_version:
-                    revision: "12"
-                    digest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-                  deadline_unix_ms: "1785168000000"
-                  paths: []
-                  all: true
+            schema: { $ref: "#/components/schemas/QueryTaskListRequest" }
       responses:
         "200":
-          description: Job 已创建，或同一请求被幂等重放
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CreateAddJobResponse"
-              examples:
-                created:
-                  summary: 首次创建
-                  value:
-                    job:
-                      operation: add
-                      tenant_id: tenant-a
-                      project_id: project-a
-                      artifact_id: artifact-a
-                      playground_id: playground-a
-                      job_id: job-20260727-001
-                      state: queued
-                      resource_version: "1"
-                      deadline_unix_ms: "1785168000000"
-                    replayed: false
-                replayed:
-                  summary: 响应丢失后的同请求重放
-                  value:
-                    job:
-                      operation: add
-                      tenant_id: tenant-a
-                      project_id: project-a
-                      artifact_id: artifact-a
-                      playground_id: playground-a
-                      job_id: job-20260727-001
-                      state: queued
-                      resource_version: "1"
-                      deadline_unix_ms: "1785168000000"
-                    replayed: true
-        "401":
-          $ref: "#/components/responses/AuthenticationProblem"
-        "403":
-          $ref: "#/components/responses/AuthorizationProblem"
-        "408":
-          $ref: "#/components/responses/DeadlineProblem"
-        "409":
-          $ref: "#/components/responses/CreateConflictProblem"
-        "413":
-          $ref: "#/components/responses/PayloadTooLargeProblem"
-        "422":
-          $ref: "#/components/responses/ValidationProblem"
-        "429":
-          $ref: "#/components/responses/OverloadedProblem"
-        "500":
-          $ref: "#/components/responses/InternalProblem"
-        "503":
-          $ref: "#/components/responses/ServiceUnavailableProblem"
-        "504":
-          $ref: "#/components/responses/RequestTimeoutProblem"
+          description: 任务列表
+          headers: { X-Request-ID: { $ref: "#/components/headers/RequestId" } }
+          content: { application/json: { schema: { $ref: "#/components/schemas/QueryTaskListResponse" } } }
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
 
-  /api/job/query:
+  /api/task/query:
     post:
-      tags: [Job]
-      operationId: queryJob
-      summary: 查询 Job 权威状态
-      description: |
-        只读取中心 authority，不直接访问 Agent。跨租户或调用方不可见的 Job 与不存在的
-        Job 一样返回 `404 JOB_NOT_FOUND`，不得泄漏资源存在性。
-      security:
-        - BearerAuth: []
+      tags: [Task]
+      operationId: queryTask
+      summary: 查询操作任务详情
+      description: 返回任务当前状态、Attempt、子任务和追加式审计事件。
+      security: [{ BearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/ApiVersion"
         - $ref: "#/components/parameters/RequestId"
@@ -4322,90 +4077,24 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              $ref: "#/components/schemas/QueryJobRequest"
-            example:
-              tenant_id: tenant-a
-              job_id: job-20260727-001
+            schema: { $ref: "#/components/schemas/QueryTaskRequest" }
       responses:
         "200":
-          description: 当前权威 Job 视图
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/QueryJobResponse"
-              examples:
-                current:
-                  summary: 首次查询当前状态
-                  value:
-                    job:
-                      operation: add
-                      tenant_id: tenant-a
-                      project_id: project-a
-                      artifact_id: artifact-a
-                      playground_id: playground-a
-                      job_id: job-20260727-001
-                      state: running
-                      resource_version: "4"
-                      deadline_unix_ms: "1785168000000"
-                      progress:
-                        state: running
-                        phase: hashing
-                        files_completed: "320"
-                        bytes_completed: "4294967296"
-                repeated:
-                  summary: 重复查询同一权威版本
-                  value:
-                    job:
-                      operation: add
-                      tenant_id: tenant-a
-                      project_id: project-a
-                      artifact_id: artifact-a
-                      playground_id: playground-a
-                      job_id: job-20260727-001
-                      state: running
-                      resource_version: "4"
-                      deadline_unix_ms: "1785168000000"
-                      progress:
-                        state: running
-                        phase: hashing
-                        files_completed: "320"
-                        bytes_completed: "4294967296"
-        "401":
-          $ref: "#/components/responses/AuthenticationProblem"
-        "403":
-          $ref: "#/components/responses/AuthorizationProblem"
-        "404":
-          $ref: "#/components/responses/JobNotFoundProblem"
-        "413":
-          $ref: "#/components/responses/PayloadTooLargeProblem"
-        "422":
-          $ref: "#/components/responses/ValidationProblem"
-        "429":
-          $ref: "#/components/responses/OverloadedProblem"
-        "500":
-          $ref: "#/components/responses/InternalProblem"
-        "503":
-          $ref: "#/components/responses/ServiceUnavailableProblem"
-        "504":
-          $ref: "#/components/responses/RequestTimeoutProblem"
+          description: 任务详情
+          headers: { X-Request-ID: { $ref: "#/components/headers/RequestId" } }
+          content: { application/json: { schema: { $ref: "#/components/schemas/QueryTaskResponse" } } }
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
 
-  /api/job/add/finalize:
+  /api/task/event/list/query:
     post:
-      tags: [Job]
-      operationId: finalizeAddJob
-      summary: 校验并发布 Managed Add
-      description: |
-        对完整 MetadataBatch、中心 object durability 和 expected IndexVersion 执行最终校验与
-        CAS。成功、冲突和拒绝都会形成稳定的 Job decision；重复调用返回同一终态。
-
-        内部 `ResumePublication` 恢复方法不通过此接口暴露。用户调用始终重新执行授权，
-        但不会为已持久化的 Publishing candidate 重新构造发布内容。
-      security:
-        - BearerAuth: []
+      tags: [Task]
+      operationId: queryTaskEventList
+      summary: 查询任务审计事件
+      description: 按任务读取追加式审计事件，cursor 使用每任务单调递增的事件序号。
+      security: [{ BearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/ApiVersion"
         - $ref: "#/components/parameters/RequestId"
@@ -4414,100 +4103,95 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              $ref: "#/components/schemas/FinalizeAddJobRequest"
-            example:
-              tenant_id: tenant-a
-              job_id: job-20260727-001
+            schema: { $ref: "#/components/schemas/QueryTaskEventListRequest" }
       responses:
         "200":
-          description: Add 已形成稳定发布决定
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/FinalizeAddJobResponse"
-              examples:
-                published:
-                  summary: Index CAS 发布成功
-                  value:
-                    job:
-                      operation: add
-                      tenant_id: tenant-a
-                      project_id: project-a
-                      artifact_id: artifact-a
-                      playground_id: playground-a
-                      job_id: job-20260727-001
-                      state: succeeded
-                      resource_version: "7"
-                      deadline_unix_ms: "1785168000000"
-                      decision:
-                        outcome: publish
-                        final_state: succeeded
-                        published_index_version:
-                          revision: "1"
-                          digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
-                      finalized_at_unix_ms: "1785167999000"
-                    decision:
-                      outcome: publish
-                      final_state: succeeded
-                      published_index_version:
-                        revision: "1"
-                        digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
-                    finalized_at_unix_ms: "1785167999000"
-                    replayed: false
-                replayed:
-                  summary: 终态重放
-                  value:
-                    job:
-                      operation: add
-                      tenant_id: tenant-a
-                      project_id: project-a
-                      artifact_id: artifact-a
-                      playground_id: playground-a
-                      job_id: job-20260727-001
-                      state: succeeded
-                      resource_version: "7"
-                      deadline_unix_ms: "1785168000000"
-                      decision:
-                        outcome: publish
-                        final_state: succeeded
-                        published_index_version:
-                          revision: "1"
-                          digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
-                      finalized_at_unix_ms: "1785167999000"
-                    decision:
-                      outcome: publish
-                      final_state: succeeded
-                      published_index_version:
-                        revision: "1"
-                        digest: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
-                    finalized_at_unix_ms: "1785167999000"
-                    replayed: true
-        "401":
-          $ref: "#/components/responses/AuthenticationProblem"
-        "403":
-          $ref: "#/components/responses/AuthorizationProblem"
-        "404":
-          $ref: "#/components/responses/JobNotFoundProblem"
-        "408":
-          $ref: "#/components/responses/DeadlineProblem"
-        "409":
-          $ref: "#/components/responses/FinalizeConflictProblem"
-        "413":
-          $ref: "#/components/responses/PayloadTooLargeProblem"
-        "422":
-          $ref: "#/components/responses/ValidationProblem"
-        "429":
-          $ref: "#/components/responses/OverloadedProblem"
-        "500":
-          $ref: "#/components/responses/InternalProblem"
-        "503":
-          $ref: "#/components/responses/ServiceUnavailableProblem"
-        "504":
-          $ref: "#/components/responses/RequestTimeoutProblem"
+          description: 追加式事件列表
+          headers: { X-Request-ID: { $ref: "#/components/headers/RequestId" } }
+          content: { application/json: { schema: { $ref: "#/components/schemas/QueryTaskEventListResponse" } } }
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+
+  /api/task/summary/query:
+    post:
+      tags: [Task]
+      operationId: queryTaskSummary
+      summary: 汇总操作任务状态
+      description: 返回当前租户和资源筛选条件下各任务生命周期状态的计数。
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QueryTaskSummaryRequest" }
+      responses:
+        "200":
+          description: 状态计数
+          headers: { X-Request-ID: { $ref: "#/components/headers/RequestId" } }
+          content: { application/json: { schema: { $ref: "#/components/schemas/QueryTaskSummaryResponse" } } }
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+
+  /api/task/retry:
+    post:
+      tags: [Task]
+      operationId: retryTask
+      summary: 重试操作任务
+      description: 在原任务下创建新的 Attempt；需要时使用 resource version 防止覆盖并发更新。
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RetryTaskRequest" }
+      responses:
+        "200":
+          description: 任务已重新排队
+          headers: { X-Request-ID: { $ref: "#/components/headers/RequestId" } }
+          content: { application/json: { schema: { $ref: "#/components/schemas/TaskMutationResponse" } } }
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+
+  /api/task/cancel:
+    post:
+      tags: [Task]
+      operationId: cancelTask
+      summary: 取消操作任务
+      description: 取消尚未完成的写操作任务并追加审计事件；终态重放保持幂等。
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CancelTaskRequest" }
+      responses:
+        "200":
+          description: 任务已取消
+          headers: { X-Request-ID: { $ref: "#/components/headers/RequestId" } }
+          content: { application/json: { schema: { $ref: "#/components/schemas/TaskMutationResponse" } } }
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
 
   /health/live:
     get:
@@ -4637,7 +4321,7 @@ components:
             title: Authentication required
             status: 401
             detail: A valid Bearer token is required
-            instance: /api/job/query
+            instance: /api/task/query
             code: AUTHENTICATION_REQUIRED
             request_id: req-20260727-001
             retryable: false
@@ -4655,26 +4339,8 @@ components:
             title: Authorization denied
             status: 403
             detail: The principal is not authorized for this operation
-            instance: /api/job/add/finalize
+            instance: /api/task/cancel
             code: AUTHORIZATION_DENIED
-            request_id: req-20260727-001
-            retryable: false
-    JobNotFoundProblem:
-      description: Job 不存在或对当前 principal 不可见
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestId"
-      content:
-        application/problem+json:
-          schema:
-            $ref: "#/components/schemas/ProblemDetails"
-          example:
-            type: urn:neoengram:problem:job-not-found
-            title: Job not found
-            status: 404
-            detail: The requested Job was not found
-            instance: /api/job/query
-            code: JOB_NOT_FOUND
             request_id: req-20260727-001
             retryable: false
     ResourceNotFoundProblem:
@@ -4769,7 +4435,7 @@ components:
                 title: Hardlink delivery requires WholeFile layout
                 status: 409
                 detail: Hardlink delivery is only available for a WholeFile Commit
-                instance: /api/snapshot/delivery/create
+                instance: /api/snapshot/create
                 code: HARDLINK_REQUIRES_WHOLE_FILE
                 request_id: req-20260727-002
                 retryable: false
@@ -4779,7 +4445,7 @@ components:
                 title: Hardlink delivery crosses filesystems
                 status: 409
                 detail: The CAS object and delivery target are on different filesystems
-                instance: /api/snapshot/delivery/create
+                instance: /api/snapshot/create
                 code: HARDLINK_CROSS_FILESYSTEM
                 request_id: req-20260727-003
                 retryable: false
@@ -4789,7 +4455,7 @@ components:
                 title: Hardlink delivery is unsafe on this volume
                 status: 409
                 detail: The StorageVolume policy does not provide a sealed read-only hardlink boundary
-                instance: /api/snapshot/delivery/create
+                instance: /api/snapshot/create
                 code: HARDLINK_UNSAFE_VOLUME
                 request_id: req-20260727-004
                 retryable: false
@@ -4799,7 +4465,7 @@ components:
                 title: Hardlink object is not sealed
                 status: 409
                 detail: The referenced CAS object is not sealed for hardlink delivery
-                instance: /api/snapshot/delivery/create
+                instance: /api/snapshot/create
                 code: HARDLINK_OBJECT_NOT_SEALED
                 request_id: req-20260727-005
                 retryable: false
@@ -4809,7 +4475,7 @@ components:
                 title: Delivery target conflict
                 status: 409
                 detail: The derived delivery target is already occupied by another resource
-                instance: /api/snapshot/delivery/create
+                instance: /api/snapshot/create
                 code: DELIVERY_TARGET_CONFLICT
                 request_id: req-20260727-006
                 retryable: false
@@ -4901,90 +4567,6 @@ components:
             code: CURSOR_INVALID
             request_id: req-20260727-001
             retryable: false
-    DeadlineProblem:
-      description: Job deadline 已过期
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestId"
-      content:
-        application/problem+json:
-          schema:
-            $ref: "#/components/schemas/ProblemDetails"
-          example:
-            type: urn:neoengram:problem:job-deadline-exceeded
-            title: Job deadline exceeded
-            status: 408
-            detail: The managed Add deadline has elapsed
-            instance: /api/job/add/finalize
-            code: JOB_DEADLINE_EXCEEDED
-            request_id: req-20260727-001
-            retryable: false
-    CreateConflictProblem:
-      description: Job ID 已绑定另一请求，或 Job 创建发生并发冲突
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestId"
-      content:
-        application/problem+json:
-          schema:
-            $ref: "#/components/schemas/ProblemDetails"
-          examples:
-            reusedJobId:
-              summary: 相同 Job ID 携带另一 request digest
-              value:
-                type: urn:neoengram:problem:job-id-reused
-                title: Job ID reused
-                status: 409
-                detail: The Job ID already belongs to a different managed Add request
-                instance: /api/job/add/create
-                code: JOB_ID_REUSED
-                request_id: req-20260727-001
-                retryable: false
-            concurrentUpdate:
-              summary: authority CAS 发生并发更新
-              value:
-                type: urn:neoengram:problem:concurrent-update
-                title: Concurrent update
-                status: 409
-                detail: The Job resource version changed during the request
-                instance: /api/job/add/create
-                code: CONCURRENT_UPDATE
-                request_id: req-20260727-001
-                retryable: true
-                retry_after_ms: "100"
-    FinalizeConflictProblem:
-      description: Job 状态、MetadataBatch、durability 或 CAS 前置条件尚不满足
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestId"
-      content:
-        application/problem+json:
-          schema:
-            $ref: "#/components/schemas/ProblemDetails"
-          examples:
-            invalidState:
-              summary: Job 尚未进入 Prepared
-              value:
-                type: urn:neoengram:problem:job-invalid-state
-                title: Job state does not allow finalization
-                status: 409
-                detail: Managed Add can only be finalized from Prepared or a stable terminal state
-                instance: /api/job/add/finalize
-                code: JOB_INVALID_STATE
-                request_id: req-20260727-001
-                retryable: false
-            objectNotDurable:
-              summary: 引用对象尚无有效的 Volume placement evidence
-              value:
-                type: urn:neoengram:problem:object-not-durable
-                title: Object is not durable
-                status: 409
-                detail: A referenced object has no evidence on the assigned Volume placement generation
-                instance: /api/job/add/finalize
-                code: OBJECT_NOT_DURABLE
-                request_id: req-20260727-001
-                retryable: true
-                retry_after_ms: "1000"
     PayloadTooLargeProblem:
       description: 请求编码字节数超过当前方法上限
       headers:
@@ -4999,7 +4581,7 @@ components:
             title: Payload too large
             status: 413
             detail: The encoded request exceeds the method limit
-            instance: /api/job/add/create
+            instance: /api/task/list/query
             code: PROTOCOL_LIMIT_EXCEEDED
             request_id: req-20260727-001
             retryable: false
@@ -5020,7 +4602,7 @@ components:
                 title: API version is unsupported
                 status: 422
                 detail: NeoEngram-API-Version must be 1
-                instance: /api/job/query
+                instance: /api/task/query
                 code: API_VERSION_UNSUPPORTED
                 request_id: req-20260727-001
                 retryable: false
@@ -5028,19 +4610,19 @@ components:
                   - field: NeoEngram-API-Version
                     reason: unsupported value
             invalidPathSelection:
-              summary: Add path 集合无效
+              summary: Task 筛选条件无效
               value:
                 type: urn:neoengram:problem:protocol-invalid
                 title: Request validation failed
                 status: 422
-                detail: paths must be non-empty unless all is true
-                instance: /api/job/add/create
+                detail: task filters must contain a supported scope
+                instance: /api/task/list/query
                 code: PROTOCOL_INVALID
                 request_id: req-20260727-001
                 retryable: false
                 violations:
-                  - field: paths
-                    reason: must be non-empty unless all is true
+                  - field: task_kind
+                    reason: contains an unsupported task kind
     OverloadedProblem:
       description: 服务端并发请求配额已耗尽
       headers:
@@ -5055,7 +4637,7 @@ components:
             title: Resource exhausted
             status: 429
             detail: server request concurrency is exhausted
-            instance: /api/job/query
+            instance: /api/task/list/query
             code: OVERLOADED
             request_id: req-20260727-001
             retryable: false
@@ -5073,7 +4655,7 @@ components:
             title: Request deadline exceeded
             status: 504
             detail: service invocation deadline elapsed
-            instance: /api/job/query
+            instance: /api/task/query
             code: DEADLINE_EXCEEDED
             request_id: req-20260727-001
             retryable: false
@@ -5091,7 +4673,7 @@ components:
             title: Internal error
             status: 500
             detail: The server could not complete the request
-            instance: /api/job/query
+            instance: /api/task/query
             code: INTERNAL
             request_id: req-20260727-001
             retryable: true
@@ -5240,6 +4822,8 @@ components:
           $ref: "#/components/schemas/GatewayPoolView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     GatewayPoolListResponse:
       type: object
@@ -5393,6 +4977,8 @@ components:
           pattern: "^nggw_v1_[A-Za-z0-9_-]{43}$"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     GatewayReplicaResponse:
       type: object
@@ -5403,6 +4989,8 @@ components:
           $ref: "#/components/schemas/GatewayReplicaView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     GatewayReplicaListResponse:
       type: object
@@ -5575,6 +5163,8 @@ components:
           $ref: "#/components/schemas/TenantView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     TenantView:
       type: object
@@ -5642,11 +5232,17 @@ components:
       type: object
       additionalProperties: false
       required: [tenant_id, storage_volume_id]
+      description: |
+        查询 StorageVolume 的脱敏视图。通常需要 `storage.read`；Snapshot 只读用户也可以提供
+        `snapshot_id`，但服务端只允许查询该 Snapshot 创建时绑定的唯一 StorageVolume，不得借此
+        枚举其他磁盘。
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
         storage_volume_id:
           $ref: "#/components/schemas/StorageVolumeId"
+        snapshot_id:
+          $ref: "#/components/schemas/SnapshotId"
 
     QueryStorageVolumeResponse:
       type: object
@@ -5719,6 +5315,8 @@ components:
           $ref: "#/components/schemas/StorageVolumeView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     StorageVolumeView:
       type: object
@@ -5841,6 +5439,8 @@ components:
           $ref: "#/components/schemas/UnixMillis"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     QueryStorageEnrollmentListRequest:
       type: object
@@ -5931,6 +5531,8 @@ components:
           $ref: "#/components/schemas/StorageVolumeView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     CompleteStorageRecoveryRequest:
       type: object
@@ -5962,6 +5564,8 @@ components:
           $ref: "#/components/schemas/StorageEnrollmentView"
         storage_volume:
           $ref: "#/components/schemas/StorageVolumeView"
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     RejectStorageEnrollmentRequest:
       type: object
@@ -5998,6 +5602,8 @@ components:
           $ref: "#/components/schemas/StorageEnrollmentView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     StorageEnrollmentView:
       type: object
@@ -6189,6 +5795,8 @@ components:
           $ref: "#/components/schemas/ProjectView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     ProjectView:
       type: object
@@ -6330,6 +5938,8 @@ components:
           $ref: "#/components/schemas/ArtifactView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     ArtifactView:
       type: object
@@ -6796,6 +6406,8 @@ components:
           $ref: "#/components/schemas/PlaygroundView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     CancelPreCommitRequest:
       type: object
@@ -6820,6 +6432,8 @@ components:
           $ref: "#/components/schemas/PlaygroundView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     PreCommitState:
       type: string
@@ -7464,66 +7078,6 @@ components:
         request_id:
           $ref: "#/components/schemas/RequestId"
 
-    QueryCommitMaterializationRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, object_namespace_id, materialization_id]
-      properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        object_namespace_id:
-          $ref: "#/components/schemas/ObjectNamespaceId"
-        materialization_id:
-          $ref: "#/components/schemas/ResourceId"
-
-    QueryCommitMaterializationListRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, object_namespace_id, commit_id]
-      properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        object_namespace_id:
-          $ref: "#/components/schemas/ObjectNamespaceId"
-        commit_id:
-          $ref: "#/components/schemas/CommitId"
-        target_storage_volume_id:
-          $ref: "#/components/schemas/StorageVolumeId"
-        cursor:
-          $ref: "#/components/schemas/PageCursor"
-        page_size:
-          $ref: "#/components/schemas/PageSize"
-
-    RetryCommitMaterializationRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, object_namespace_id, materialization_id, expected_plan_revision, request_id]
-      properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        object_namespace_id:
-          $ref: "#/components/schemas/ObjectNamespaceId"
-        materialization_id:
-          $ref: "#/components/schemas/ResourceId"
-        expected_plan_revision:
-          $ref: "#/components/schemas/CanonicalU64"
-        request_id:
-          $ref: "#/components/schemas/RequestId"
-
-    CancelCommitMaterializationRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, object_namespace_id, materialization_id, expected_plan_revision]
-      properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        object_namespace_id:
-          $ref: "#/components/schemas/ObjectNamespaceId"
-        materialization_id:
-          $ref: "#/components/schemas/ResourceId"
-        expected_plan_revision:
-          $ref: "#/components/schemas/CanonicalU64"
-
     QueryCommitCoverageRequest:
       type: object
       additionalProperties: false
@@ -7630,45 +7184,8 @@ components:
           $ref: "#/components/schemas/MaterializationView"
         replayed:
           type: boolean
-
-    QueryCommitMaterializationResponse:
-      type: object
-      additionalProperties: false
-      required: [materialization]
-      properties:
-        materialization:
-          $ref: "#/components/schemas/MaterializationView"
-
-    RetryCommitMaterializationResponse:
-      type: object
-      additionalProperties: false
-      required: [materialization, replayed]
-      properties:
-        materialization:
-          $ref: "#/components/schemas/MaterializationView"
-        replayed:
-          type: boolean
-
-    CancelCommitMaterializationResponse:
-      type: object
-      additionalProperties: false
-      required: [materialization]
-      properties:
-        materialization:
-          $ref: "#/components/schemas/MaterializationView"
-
-    QueryCommitMaterializationListResponse:
-      type: object
-      additionalProperties: false
-      required: [materializations]
-      properties:
-        materializations:
-          type: array
-          maxItems: 100
-          items:
-            $ref: "#/components/schemas/MaterializationView"
-        next_cursor:
-          $ref: "#/components/schemas/PageCursor"
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     VolumeCommitCoverageView:
       type: object
@@ -7808,15 +7325,19 @@ components:
     CreateSnapshotRequest:
       type: object
       description: |
-        为指定 Artifact 的固定 Commit 创建逻辑 Snapshot。服务端必须验证 Project/Artifact 存在
-        且 Commit 确属该 Artifact；Snapshot 不能创建 Artifact、改写 Artifact Head 或在创建后
-        切换 Commit。Commit 的源 Placement 由服务端解析，客户端不能为 Snapshot 选择 Volume。
+        为指定 Artifact 的固定 Commit 创建 Snapshot，并原子创建其唯一 SnapshotDelivery。
+        服务端必须验证 Project/Artifact、Commit、目标 EdgeCluster/StorageVolume 和交付模式；
+        Snapshot 不能创建 Artifact、改写 Artifact Head 或在创建后切换 Commit/目标。目标 Volume
+        必须属于指定 EdgeCluster 且处于 Ready 状态。
       additionalProperties: false
       required:
         - tenant_id
         - project_id
         - artifact_id
         - commit_id
+        - target_edge_cluster_id
+        - target_storage_volume_id
+        - delivery_mode
         - request_id
       properties:
         tenant_id:
@@ -7827,6 +7348,12 @@ components:
           $ref: "#/components/schemas/ArtifactId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
+        target_edge_cluster_id:
+          $ref: "#/components/schemas/EdgeClusterId"
+        target_storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        delivery_mode:
+          $ref: "#/components/schemas/SnapshotDeliveryMode"
         request_id:
           $ref: "#/components/schemas/ResourceId"
 
@@ -7907,32 +7434,6 @@ components:
         updated_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
 
-    CreateSnapshotDeliveryRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, snapshot_id, target_storage_volume_id, mode, request_id]
-      properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        snapshot_id:
-          $ref: "#/components/schemas/SnapshotId"
-        target_storage_volume_id:
-          $ref: "#/components/schemas/StorageVolumeId"
-        mode:
-          $ref: "#/components/schemas/SnapshotDeliveryMode"
-        request_id:
-          $ref: "#/components/schemas/ResourceId"
-
-    CreateSnapshotDeliveryResponse:
-      type: object
-      additionalProperties: false
-      required: [delivery, replayed]
-      properties:
-        delivery:
-          $ref: "#/components/schemas/SnapshotDeliveryView"
-        replayed:
-          type: boolean
-
     QuerySnapshotDeliveryRequest:
       type: object
       additionalProperties: false
@@ -7972,7 +7473,7 @@ components:
       properties:
         items:
           type: array
-          maxItems: 100
+          maxItems: 1
           items:
             $ref: "#/components/schemas/SnapshotDeliveryView"
         next_cursor:
@@ -7999,6 +7500,8 @@ components:
           $ref: "#/components/schemas/SnapshotDeliveryView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     DeleteSnapshotDeliveryRequest:
       type: object
@@ -8021,6 +7524,8 @@ components:
           $ref: "#/components/schemas/SnapshotDeliveryView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     QuerySnapshotFileListRequest:
       type: object
@@ -8124,9 +7629,11 @@ components:
     SnapshotView:
       type: object
       description: |
-        独立身份，固定一个 Artifact 和 Commit 的不可变逻辑 Snapshot 资源。
-        `tenant_id + project_id + artifact_id + commit_id` 是不可变来源 scope；只读交付由独立的
-        SnapshotDelivery 资源表达，Snapshot 本身不保存挂载或物化模式，也不拥有或改写 Artifact 数据权威。
+        独立身份，固定一个 Artifact、Commit 和目标物理交付的不可变 Snapshot 资源。
+        `tenant_id + project_id + artifact_id + commit_id + delivery_id + storage_volume_id` 是不可变
+        来源 scope；Snapshot 与唯一 SnapshotDelivery 一起创建，交付未完成时 Snapshot 不会进入
+        `ready`。
+        Snapshot 的不可变来源 scope 由 Artifact authority 派生；Snapshot 不拥有或改写 Artifact 数据权威。
       additionalProperties: false
       required:
         - snapshot_id
@@ -8134,6 +7641,10 @@ components:
         - project_id
         - artifact_id
         - commit_id
+        - delivery_id
+        - edge_cluster_id
+        - storage_volume_id
+        - delivery_mode
         - data_layout
         - message
         - tag_names
@@ -8157,6 +7668,14 @@ components:
           $ref: "#/components/schemas/ArtifactId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
+        delivery_id:
+          $ref: "#/components/schemas/SnapshotDeliveryId"
+        edge_cluster_id:
+          $ref: "#/components/schemas/EdgeClusterId"
+        storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        delivery_mode:
+          $ref: "#/components/schemas/SnapshotDeliveryMode"
         data_layout:
           $ref: "#/components/schemas/DataLayout"
         message:
@@ -8682,6 +8201,8 @@ components:
           $ref: "#/components/schemas/DeletionOperationView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     CreateRetentionHoldResponse:
       type: object
@@ -8694,6 +8215,8 @@ components:
           $ref: "#/components/schemas/RetentionHoldView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     ReleaseRetentionHoldResponse:
       type: object
@@ -8706,11 +8229,14 @@ components:
           $ref: "#/components/schemas/RetentionHoldView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     CreateS3AccessPointRequest:
       type: object
       description: |
-        为同 Tenant 下的 Ready Snapshot 开启只读 S3 Access Point。
+        为同 Tenant 下已完成唯一 SnapshotDelivery 的 Ready Snapshot 开启只读 S3 Access Point。
+        不允许根据同 Commit 的其他 Volume 推断或替代该 Delivery。
       additionalProperties: false
       required: [tenant_id, snapshot_id, bucket_name, request_id]
       properties:
@@ -8787,6 +8313,8 @@ components:
           $ref: "#/components/schemas/S3AccessPointView"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     CreateS3AccessPointResponse:
       type: object
@@ -8811,6 +8339,8 @@ components:
           $ref: "#/components/schemas/UnixMillis"
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     CreateS3CredentialRequest:
       type: object
@@ -8839,6 +8369,8 @@ components:
           maxLength: 2048
         replayed:
           type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     QueryS3CredentialListRequest:
       type: object
@@ -8859,6 +8391,8 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/S3CredentialView"
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     RevokeS3CredentialRequest:
       type: object
@@ -8950,6 +8484,9 @@ components:
         - artifact_id
         - snapshot_id
         - commit_id
+        - delivery_id
+        - storage_volume_id
+        - edge_cluster_id
         - bucket_name
         - endpoint
         - region
@@ -8970,6 +8507,12 @@ components:
           $ref: "#/components/schemas/SnapshotId"
         commit_id:
           $ref: "#/components/schemas/CommitId"
+        delivery_id:
+          $ref: "#/components/schemas/SnapshotDeliveryId"
+        storage_volume_id:
+          $ref: "#/components/schemas/StorageVolumeId"
+        edge_cluster_id:
+          $ref: "#/components/schemas/EdgeClusterId"
         bucket_name:
           $ref: "#/components/schemas/S3BucketName"
         endpoint:
@@ -9034,272 +8577,262 @@ components:
         last_modified_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
 
-    CreateAddJobRequest:
+    QueryTaskListRequest:
       type: object
-      description: |
-        公开 Add operation。服务端将认证后的 PrincipalRef 注入 canonical operation 后计算
-        `request_digest` 并写入内部 AddJobSpec；请求字段必须严格匹配本 schema。
       additionalProperties: false
-      required:
-        - tenant_id
-        - project_id
-        - artifact_id
-        - playground_id
-        - job_id
-        - expected_index_version
-        - deadline_unix_ms
-        - paths
-        - all
+      required: [tenant_id]
       properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        project_id:
-          $ref: "#/components/schemas/ProjectId"
-        artifact_id:
-          $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
-        job_id:
-          $ref: "#/components/schemas/JobId"
-        expected_index_version:
-          $ref: "#/components/schemas/IndexVersion"
-        deadline_unix_ms:
-          $ref: "#/components/schemas/UnixMillis"
-        paths:
+        tenant_id: { $ref: "#/components/schemas/TenantId" }
+        project_id: { $ref: "#/components/schemas/ProjectId" }
+        artifact_id: { $ref: "#/components/schemas/ArtifactId" }
+        object_namespace_id: { $ref: "#/components/schemas/ObjectNamespaceId" }
+        commit_id: { $ref: "#/components/schemas/CommitId" }
+        playground_id: { $ref: "#/components/schemas/PlaygroundId" }
+        snapshot_id: { $ref: "#/components/schemas/SnapshotId" }
+        storage_volume_id: { $ref: "#/components/schemas/StorageVolumeId" }
+        task_kind:
           type: array
-          maxItems: 4096
           uniqueItems: true
-          description: |
-            严格排序、无 portable duplicate，且不能同时包含文件路径及其后代。
-            `all` 为 false 时至少包含一项。
-          items:
-            $ref: "#/components/schemas/LogicalPath"
-        all:
-          type: boolean
-
-    CreateAddJobResponse:
-      type: object
-      additionalProperties: false
-      required: [job, replayed]
-      properties:
-        job:
-          $ref: "#/components/schemas/JobView"
-        replayed:
-          type: boolean
-          description: true 表示返回的是已持久化的同一请求结果。
-
-    QueryJobRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, job_id]
-      properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        job_id:
-          $ref: "#/components/schemas/JobId"
-
-    QueryJobResponse:
-      type: object
-      additionalProperties: false
-      required: [job]
-      properties:
-        job:
-          $ref: "#/components/schemas/JobView"
-
-    FinalizeAddJobRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, job_id]
-      properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        job_id:
-          $ref: "#/components/schemas/JobId"
-
-    FinalizeAddJobResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - job
-        - decision
-        - finalized_at_unix_ms
-        - replayed
-      properties:
-        job:
-          $ref: "#/components/schemas/JobView"
-        decision:
-          $ref: "#/components/schemas/PublicJobDecision"
-        finalized_at_unix_ms:
-          $ref: "#/components/schemas/UnixMillis"
-        replayed:
-          type: boolean
-
-    JobView:
-      type: object
-      description: |
-        面向用户的脱敏 Job。不得增加 assignment target、Agent/Volume/Mount identity、
-        generation/fencing、PublicationCandidate、Manifest、IndexDelta 或 authority 物理信息。
-      additionalProperties: false
-      required:
-        - operation
-        - tenant_id
-        - project_id
-        - artifact_id
-        - playground_id
-        - job_id
-        - state
-        - resource_version
-        - deadline_unix_ms
-      properties:
-        operation:
-          type: string
-          const: add
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        project_id:
-          $ref: "#/components/schemas/ProjectId"
-        artifact_id:
-          $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
-        job_id:
-          $ref: "#/components/schemas/JobId"
+          items: { $ref: "#/components/schemas/TaskKind" }
         state:
-          $ref: "#/components/schemas/JobState"
-        resource_version:
-          $ref: "#/components/schemas/CanonicalU64"
-        deadline_unix_ms:
-          $ref: "#/components/schemas/UnixMillis"
-        progress:
-          $ref: "#/components/schemas/PublicJobProgress"
-        decision:
-          $ref: "#/components/schemas/PublicJobDecision"
-        failure:
-          $ref: "#/components/schemas/PublicJobFailure"
-        finalized_at_unix_ms:
-          $ref: "#/components/schemas/UnixMillis"
+          type: array
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/TaskState" }
+        parent_task_id: { $ref: "#/components/schemas/TaskId" }
+        created_after_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        created_before_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        updated_after_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        updated_before_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        cursor: { type: string, minLength: 1, maxLength: 256 }
+        page_size: { type: integer, minimum: 1, maximum: 500 }
 
-    PublicJobProgress:
+    QueryTaskRequest:
       type: object
       additionalProperties: false
-      required:
-        - state
-        - phase
-        - files_completed
-        - bytes_completed
+      required: [tenant_id, task_id]
       properties:
+        tenant_id: { $ref: "#/components/schemas/TenantId" }
+        task_id: { $ref: "#/components/schemas/TaskId" }
+
+    QueryTaskEventListRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, task_id]
+      properties:
+        tenant_id: { $ref: "#/components/schemas/TenantId" }
+        task_id: { $ref: "#/components/schemas/TaskId" }
+        cursor: { $ref: "#/components/schemas/CanonicalU64" }
+        page_size: { type: integer, minimum: 1, maximum: 500 }
+
+    QueryTaskSummaryRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id]
+      properties:
+        tenant_id: { $ref: "#/components/schemas/TenantId" }
+        project_id: { $ref: "#/components/schemas/ProjectId" }
+        artifact_id: { $ref: "#/components/schemas/ArtifactId" }
+        object_namespace_id: { $ref: "#/components/schemas/ObjectNamespaceId" }
+        commit_id: { $ref: "#/components/schemas/CommitId" }
+        playground_id: { $ref: "#/components/schemas/PlaygroundId" }
+        snapshot_id: { $ref: "#/components/schemas/SnapshotId" }
+        storage_volume_id: { $ref: "#/components/schemas/StorageVolumeId" }
+        task_kind:
+          type: array
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/TaskKind" }
         state:
-          $ref: "#/components/schemas/JobState"
-        phase:
-          type: string
-          minLength: 1
-          maxLength: 128
-        files_completed:
-          $ref: "#/components/schemas/CanonicalU64"
-        bytes_completed:
-          $ref: "#/components/schemas/CanonicalU64"
-        retry_after_ms:
-          $ref: "#/components/schemas/CanonicalU64"
+          type: array
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/TaskState" }
 
-    PublicJobDecision:
-      oneOf:
-        - $ref: "#/components/schemas/PublishJobDecision"
-        - $ref: "#/components/schemas/ConflictJobDecision"
-        - $ref: "#/components/schemas/RejectJobDecision"
-      discriminator:
-        propertyName: outcome
-        mapping:
-          publish: "#/components/schemas/PublishJobDecision"
-          conflict: "#/components/schemas/ConflictJobDecision"
-          reject: "#/components/schemas/RejectJobDecision"
-
-    PublishJobDecision:
+    RetryTaskRequest:
       type: object
       additionalProperties: false
-      required: [outcome, final_state, published_index_version]
+      required: [tenant_id, task_id]
       properties:
-        outcome:
-          type: string
-          const: publish
-        final_state:
-          type: string
-          const: succeeded
-        published_index_version:
-          $ref: "#/components/schemas/IndexVersion"
+        tenant_id: { $ref: "#/components/schemas/TenantId" }
+        task_id: { $ref: "#/components/schemas/TaskId" }
+        expected_resource_version: { $ref: "#/components/schemas/CanonicalU64" }
 
-    ConflictJobDecision:
+    CancelTaskRequest:
       type: object
       additionalProperties: false
-      required: [outcome, final_state, current_index_version]
+      required: [tenant_id, task_id]
       properties:
-        outcome:
-          type: string
-          const: conflict
-        final_state:
-          type: string
-          const: conflicted
-        current_index_version:
-          $ref: "#/components/schemas/IndexVersion"
+        tenant_id: { $ref: "#/components/schemas/TenantId" }
+        task_id: { $ref: "#/components/schemas/TaskId" }
+        expected_resource_version: { $ref: "#/components/schemas/CanonicalU64" }
 
-    RejectJobDecision:
+    TaskKind:
+      type: string
+      enum:
+        - workspace.create
+        - workspace.materialize
+        - precommit.check
+        - add.scan
+        - commit.create
+        - snapshot.create
+        - snapshot.delivery.materialize
+        - commit.materialize
+        - integrity.scan
+        - resource.repair
+        - catalog.lifecycle
+        - storage.lifecycle
+        - gateway.lifecycle
+        - s3.lifecycle
+
+    TaskState:
+      type: string
+      enum: [queued, running, waiting, verifying, succeeded, stalled, failed, cancelled]
+
+    TaskProgressView:
       type: object
       additionalProperties: false
-      required: [outcome, final_state, error]
+      required: [completed, total, completed_bytes, total_bytes]
       properties:
-        outcome:
-          type: string
-          const: reject
-        final_state:
-          type: string
-          enum:
-            - rejected
-            - failed
-            - cancelled
-            - timed_out
-            - recovery_required
-        error:
-          $ref: "#/components/schemas/JobError"
+        completed: { $ref: "#/components/schemas/CanonicalU64" }
+        total: { $ref: "#/components/schemas/CanonicalU64" }
+        completed_bytes: { $ref: "#/components/schemas/CanonicalU64" }
+        total_bytes: { $ref: "#/components/schemas/CanonicalU64" }
 
-    PublicJobFailure:
-      type: object
-      additionalProperties: false
-      required: [final_state, failed_at_unix_ms, stage, error]
-      properties:
-        final_state:
-          type: string
-          enum:
-            - rejected
-            - failed
-            - cancelled
-            - timed_out
-            - recovery_required
-        failed_at_unix_ms:
-          $ref: "#/components/schemas/UnixMillis"
-        stage:
-          type: string
-          enum:
-            - execution
-            - object_transfer
-            - reporting
-            - finalization
-        error:
-          $ref: "#/components/schemas/JobError"
-
-    JobError:
+    TaskIssueView:
       type: object
       additionalProperties: false
       required: [code, message, retryable]
       properties:
-        code:
-          $ref: "#/components/schemas/ErrorCode"
-        message:
-          type: string
-          minLength: 1
-          maxLength: 4096
-        retryable:
-          type: boolean
-        retry_after_ms:
-          $ref: "#/components/schemas/CanonicalU64"
+        code: { type: string, minLength: 1, maxLength: 256 }
+        message: { type: string, minLength: 1, maxLength: 512 }
+        retryable: { type: boolean }
+        detail: { type: string, minLength: 1, maxLength: 4096 }
+
+    TaskView:
+      type: object
+      additionalProperties: false
+      required: [task_id, task_kind, state, phase, tenant_id, request_id, request_digest, actor, attempt, progress, deadline_unix_ms, created_at_unix_ms, updated_at_unix_ms, resource_version, origin, executable]
+      properties:
+        task_id: { $ref: "#/components/schemas/TaskId" }
+        task_kind: { $ref: "#/components/schemas/TaskKind" }
+        state: { $ref: "#/components/schemas/TaskState" }
+        phase: { type: string, minLength: 1, maxLength: 512 }
+        tenant_id: { $ref: "#/components/schemas/TenantId" }
+        project_id: { $ref: "#/components/schemas/ProjectId" }
+        artifact_id: { $ref: "#/components/schemas/ArtifactId" }
+        object_namespace_id: { $ref: "#/components/schemas/ObjectNamespaceId" }
+        commit_id: { $ref: "#/components/schemas/CommitId" }
+        playground_id: { $ref: "#/components/schemas/PlaygroundId" }
+        snapshot_id: { $ref: "#/components/schemas/SnapshotId" }
+        storage_volume_id: { $ref: "#/components/schemas/StorageVolumeId" }
+        parent_task_id: { $ref: "#/components/schemas/TaskId" }
+        request_id: { $ref: "#/components/schemas/RequestId" }
+        request_digest: { $ref: "#/components/schemas/ContentDigest" }
+        actor: { type: string, minLength: 1, maxLength: 256 }
+        attempt: { $ref: "#/components/schemas/CanonicalU64" }
+        progress: { $ref: "#/components/schemas/TaskProgressView" }
+        detail_kind: { type: string, minLength: 1, maxLength: 256 }
+        detail_id: { type: string, minLength: 1, maxLength: 256 }
+        deadline_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        issue: { $ref: "#/components/schemas/TaskIssueView" }
+        created_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        updated_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        started_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        finished_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        resource_version: { $ref: "#/components/schemas/CanonicalU64" }
+        origin: { type: string, enum: [user, system, legacy] }
+        executable: { type: boolean }
+
+    TaskAttemptView:
+      type: object
+      additionalProperties: false
+      required: [attempt_id, task_id, attempt, state, phase, created_at_unix_ms, updated_at_unix_ms, resource_version]
+      properties:
+        attempt_id: { $ref: "#/components/schemas/TaskAttemptId" }
+        task_id: { $ref: "#/components/schemas/TaskId" }
+        attempt: { $ref: "#/components/schemas/CanonicalU64" }
+        state: { $ref: "#/components/schemas/TaskState" }
+        phase: { type: string, minLength: 1, maxLength: 512 }
+        created_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        updated_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        started_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        finished_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        issue: { $ref: "#/components/schemas/TaskIssueView" }
+        resource_version: { $ref: "#/components/schemas/CanonicalU64" }
+
+    TaskEventView:
+      type: object
+      additionalProperties: false
+      required: [event_id, task_id, sequence, attempt, kind, state, actor, occurred_at_unix_ms, resource_version]
+      properties:
+        event_id: { $ref: "#/components/schemas/TaskEventId" }
+        task_id: { $ref: "#/components/schemas/TaskId" }
+        sequence: { $ref: "#/components/schemas/CanonicalU64" }
+        attempt: { $ref: "#/components/schemas/CanonicalU64" }
+        kind: { type: string, minLength: 1, maxLength: 64 }
+        state: { $ref: "#/components/schemas/TaskState" }
+        from_state: { $ref: "#/components/schemas/TaskState" }
+        to_state: { $ref: "#/components/schemas/TaskState" }
+        actor: { type: string, minLength: 1, maxLength: 256 }
+        message: { type: string, minLength: 1, maxLength: 4096 }
+        issue: { $ref: "#/components/schemas/TaskIssueView" }
+        progress: { $ref: "#/components/schemas/TaskProgressView" }
+        occurred_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        resource_version: { $ref: "#/components/schemas/CanonicalU64" }
+
+    QueryTaskListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/TaskView" } }
+        next_cursor: { type: string, minLength: 1, maxLength: 256 }
+
+    QueryTaskResponse:
+      type: object
+      additionalProperties: false
+      required: [task, attempts, events, children]
+      properties:
+        task: { $ref: "#/components/schemas/TaskView" }
+        attempts: { type: array, items: { $ref: "#/components/schemas/TaskAttemptView" } }
+        events: { type: array, items: { $ref: "#/components/schemas/TaskEventView" } }
+        children: { type: array, items: { $ref: "#/components/schemas/TaskView" } }
+
+    QueryTaskEventListResponse:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/TaskEventView" } }
+        next_cursor: { $ref: "#/components/schemas/CanonicalU64" }
+
+    TaskSummaryView:
+      type: object
+      additionalProperties: false
+      required: [total, queued, running, waiting, verifying, succeeded, stalled, failed, cancelled]
+      properties:
+        total: { $ref: "#/components/schemas/CanonicalU64" }
+        queued: { $ref: "#/components/schemas/CanonicalU64" }
+        running: { $ref: "#/components/schemas/CanonicalU64" }
+        waiting: { $ref: "#/components/schemas/CanonicalU64" }
+        verifying: { $ref: "#/components/schemas/CanonicalU64" }
+        succeeded: { $ref: "#/components/schemas/CanonicalU64" }
+        stalled: { $ref: "#/components/schemas/CanonicalU64" }
+        failed: { $ref: "#/components/schemas/CanonicalU64" }
+        cancelled: { $ref: "#/components/schemas/CanonicalU64" }
+
+    QueryTaskSummaryResponse:
+      type: object
+      additionalProperties: false
+      required: [summary]
+      properties:
+        summary: { $ref: "#/components/schemas/TaskSummaryView" }
+
+    TaskMutationResponse:
+      type: object
+      additionalProperties: false
+      required: [task, replayed]
+      properties:
+        task: { $ref: "#/components/schemas/TaskView" }
+        replayed: { type: boolean }
 
     ProblemDetails:
       type: object
@@ -9397,6 +8930,8 @@ components:
       $ref: "#/components/schemas/ResourceId"
     SnapshotId:
       $ref: "#/components/schemas/ResourceId"
+    SnapshotDeliveryId:
+      $ref: "#/components/schemas/ResourceId"
     S3AccessPointId:
       $ref: "#/components/schemas/ResourceId"
     S3CredentialId:
@@ -9405,7 +8940,11 @@ components:
       $ref: "#/components/schemas/ResourceId"
     RetentionHoldId:
       $ref: "#/components/schemas/ResourceId"
-    JobId:
+    TaskId:
+      $ref: "#/components/schemas/ResourceId"
+    TaskAttemptId:
+      $ref: "#/components/schemas/ResourceId"
+    TaskEventId:
       $ref: "#/components/schemas/ResourceId"
     RequestId:
       $ref: "#/components/schemas/ResourceId"
@@ -9503,9 +9042,8 @@ components:
       maxLength: 128
       pattern: '^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$'
       enum:
-        - job.create
-        - job.read
-        - job.finalize
+        - task.read
+        - task.manage
         - tenant.read
         - tenant.create
         - tenant.admin
@@ -9604,22 +9142,3 @@ components:
           $ref: "#/components/schemas/CanonicalU64"
         digest:
           $ref: "#/components/schemas/ContentDigest"
-
-    JobState:
-      type: string
-      enum:
-        - queued
-        - assigned
-        - accepted
-        - running
-        - prepared
-        - publishing
-        - cancel_requested
-        - succeeded
-        - conflicted
-        - rejected
-        - failed
-        - cancelled
-        - timed_out
-        - recovery_required
-        - unknown

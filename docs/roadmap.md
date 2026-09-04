@@ -7,7 +7,7 @@
 > Gateway 的连接、安全、HA、数据传输和 S3 专项边界见
 > [`architecture/gateway.md`](architecture/gateway.md)。
 
-最后更新：2026-09-01
+最后更新：2026-09-04
 当前阶段：`0.2.0` P0、中心 `AuthorityStore`/SQLite 默认后端，以及 Volume-bound Agent enrollment、
 本地身份/Ledger SQLite adapter 与 mount probe 领域纵切已实现；`neoengram-central` 提供用户 API，Agent
 action/控制 channel 经 Gateway H2 转发（Central 内的 Hyper raw-body adapter 仅用于 loopback/测试，不是
@@ -22,9 +22,9 @@ issuer/KMS-HSM adapter、真实集群 readiness/failover 和一次性切换尚�
 真实 Kubernetes 验收同样待实现。
 
 G2 的 P2P 对象物化 v2 已进入 Domain、Authority、Central planner/API、Agent source/target executor 和 Gateway relay
-纵切：对象级 Placement、Coverage、MaterializationJob/Batch/Object、namespace、分页 manifest、ticket/receipt/lease
+纵切：对象级 Placement、Coverage、MaterializationJob/Batch/Object、OperationTask、namespace、分页 manifest、ticket/receipt/lease
 及 availability 维度已有代码、schema 和 InMemory/SQLite 契约测试。当前仍是迁移中状态：v1 replication/PlacementSet
-表和 mapper、旧 Assignment/report 路径与 v2 双路径并存；真实跨 Gateway route、三 Agent 多源失败恢复、背压/配额、
+表和 mapper、旧 Assignment/report 路径仅作为私有拒绝/迁移残留；真实跨 Gateway route、三 Agent 多源失败恢复、背压/配额、
 生产凭据和跨节点 E2E 尚未验收。路线中的“已实现”不包含这些未验收部分。
 
 ## 1. 产品目标
@@ -60,7 +60,7 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | `Artifact` | 一个无固定 Region/StorageVolume 的版本化抽象文件系统；目标上创建时为空或从同 Tenant 另一个 Artifact 的明确 Commit 派生，当前 Central 仅实现空初始化；是 Commit、Playground、Snapshot 和对象归属的领域根 |
 | `Commit` | Artifact 的不可变版本节点；v1 单 parent，形成可分支的 Commit 历史树 |
 | `Playground` | 基于某个 Commit 的可读写工作区，拥有独立 IndexVersion，能够发布新 Commit |
-| `Snapshot` | 具有独立 `snapshot_id`，固定 `artifact_id + commit_id` 的逻辑只读引用；物理 Region/StorageVolume 由一个或多个 `SnapshotDelivery` 表示 |
+| `Snapshot` | 具有独立 `snapshot_id`，固定 `artifact_id + commit_id` 以及一个目标 `EdgeCluster`/`StorageVolume`/交付模式；创建时原子生成唯一 `SnapshotDelivery` |
 | `MetadataBatch` | Agent 向中心分页上传的 IndexDelta/ObjectReceipt 临时批次，不是 Artifact |
 | `GatewayPool` | 一个 EdgeCluster 的逻辑 Gateway 入口；生产由多个 GatewayReplica 提供服务 |
 | `GatewayReplica` | GatewayPool 内可独立连接、心跳、drain 和撤销的进程实例 |
@@ -68,8 +68,9 @@ FUSE 是独立的内核只读视图，不自动跟随 HEAD，也不提供远端�
 | `ObjectNamespaceId` | 对象、Placement、Coverage、Materialization 和 Lease 的必填隔离域；首期值等于 `ArtifactId` |
 | `ObjectPlacement` | 一个 namespace/object 在一个 Volume/generation 上经校验并通过 durability barrier 的对象级事实 |
 | `VolumeCommitCoverage` | 根据对象 Placement 派生的某 Volume 对 Commit 的 `partial/complete` 覆盖摘要 |
-| `MaterializationJob` | 面向目标 Volume 的对象补齐意图；业务唯一键为 namespace、Commit、目标 Volume 和 coverage goal |
-| `MaterializationBatch` | Job 内按 source Agent/Volume/route 分组的传输批次，不是独立用户复制任务 |
+| `OperationTask` | 所有写操作的统一生命周期、重试/取消和审计根任务；领域明细通过 detail/resource link 关联 |
+| `MaterializationJob` | `commit.materialize` OperationTask 引用的面向目标 Volume 的对象补齐明细；业务唯一键为 namespace、Commit、目标 Volume 和 coverage goal |
+| `MaterializationBatch` | Job 内按 source Agent/Volume/route 分组的传输批次，不是独立用户复制任务；公开任务只展示 Batch 摘要 |
 
 当前仓库格式 9 和 CLI 中的 `repository`、`workspace` 是 Standalone 名称：在中心领域模型中分别
 映射为 `Artifact`、`Playground`。本地保留 `metadata.sqlite3` 和 `workspace` 命令，不得因此在新
@@ -81,13 +82,13 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
   PostgreSQL 是多实例/HA/RLS 目标；Server ObjectCatalog 只保存 Volume placement evidence；
 - 客户端通过 header-versioned、模块/动作式 HTTP JSON API 访问中心服务，不直接访问数据库；当前
   Fusen 用户 listener 和 Central controller descriptor 已覆盖 registry 中除 3 条 contract-only Snapshot
-  查询外的公开 action，包括 Project、Commit graph/diff、v1 replication/Placement（legacy）、v2 Materialization/Coverage、
-  SnapshotDelivery、S3、lifecycle 和 Gateway 管理；Agent action 契约经 Gateway 转发，Hyper raw-body adapter 只作为 loopback/测试装配，生产不
+  查询外的公开 action，包括 Project、Commit graph/diff、v2 Materialization/Coverage、统一 OperationTask、
+  SnapshotDelivery、S3、lifecycle 和 Gateway 管理；旧 v1 replication/Placement 公开路由已移除。Agent action 契约经 Gateway 转发，Hyper raw-body adapter 只作为 loopback/测试装配，生产不
   暴露独立 Agent listener；
 - Vue 3 Web 控制台作为独立 `apps/neoengram-web` npm 应用，只消费公开 OpenAPI；首版 MSW 可运行，
   已覆盖租户切换/创建、StorageVolume 登记与放置选择、Project 筛选、无固定放置 Artifact、单 Volume
-  Playground、逻辑 Snapshot、SnapshotDelivery、Pre-commit、带描述和 Tags 的 Playground Commit、父版本文件/元数据
-  Diff、资源浏览和 Managed Add Job。Artifact derived 表单、独立 Snapshot ID、同 Snapshot 多 Delivery、
+  Playground、固定目标 Snapshot/唯一 SnapshotDelivery、Pre-commit、带描述和 Tags 的 Playground Commit、父版本文件/元数据
+  Diff、资源浏览和 Managed Add/OperationTask。Artifact derived 表单、独立 Snapshot ID、Snapshot 创建时绑定目标并原子生成唯一 Delivery、
   分页元数据和领域状态机已有契约/Mock；derived 初始化当前 Central 返回稳定 409，Snapshot 文件/活动/Profile
   三条 action 仍是 contract-only。首批真实联网使用 Fusen 0.9.0、外部 OIDC/JWKS 和默认拒绝 RBAC；
 - 第一版远端同步只围绕 `main`/detached Commit，暂不解决多分支合并；
@@ -106,19 +107,19 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
 
 | 决策 | 当前建议 | 状态 |
 | --- | --- | --- |
-| Chunk payload 位置 | 用户 StorageVolume 的 `.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects`；Server 无 payload | Agent Volume CAS 已实现；v1 replication 控制链和 v2 materialization 控制/校验代码已有，跨 Volume payload 执行待验收 |
+| Chunk payload 位置 | 用户 StorageVolume 的 `.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects`；Server 无 payload | Agent Volume CAS 已实现；v1 replication 控制链仅作私有拒绝/迁移残留，v2 materialization 控制/校验代码已有，跨 Volume payload 执行待验收 |
 | API 传输 | protocol 与 transport 分离；Fusen 用户 action API + Gateway 内部 Agent action API | H2 双向 session/Job、enrollment、metadata/index 与 Central registry action 已实现；3 条 Snapshot file/activity/profile 仍 contract-only，其余执行受 capability 约束 |
 | Gateway 控制入口 | 每 EdgeCluster 一个多副本 GatewayPool；Central 主动连接 Gateway，Agent 只连接本集群 Gateway | G1 进行中：Registry/管理面、H2/mTLS tunnel、RouteLease、命令签名与一跳 forwarding 已落地；协议网络 harness 与 Registry 接管契约已分别通过，完整业务 E2E、外部生产凭据、真实集群 readiness/failover 与切换待完成 |
 | Gateway 存储边界 | 不挂载 Volume、不保存 metadata/object；Volume I/O 仍只由 Owner Agent 执行 | 代码与 manifest 约束已实现，真实集群验收待完成 |
 | 一致性模型 | metadata/ref 强一致 CAS；对象具有 namespace、size/digest、Volume/placement generation 凭证并通过 durability barrier 后才能发布 | P0 状态机已实现；v2 ObjectPlacement receipt/CAS 有 InMemory/SQLite 契约 |
 | 中心权威存储 | `AuthorityStore` + 默认 SQLite；PG/MySQL 独立实现相同行为契约 | SQLite 单节点已完成，HA/RLS 待实现 |
 | 身份认证 | `Authenticator` 抽象；v1 外部 OIDC/JWKS + Bearer JWT | 已注册用户接口已接线并默认拒绝；Agent enrollment 使用 token + Ed25519 proof；生产轮换/E2E 持续加固 |
-| 授权范围 | tenant → project → artifact → ref；服务端 RBAC，默认拒绝 | Job 与 Storage enrollment 已接线，其余资源授权待实现 |
+| 授权范围 | tenant → project → artifact → ref；服务端 RBAC，默认拒绝 | OperationTask/领域 Job 与 Storage enrollment 已接线，其余资源授权待实现 |
 | 对象访问 | 当前由 Volume Owner Agent 访问本地对象；v2 跨 Volume 使用 source Placement/Object 范围批次票据和多源 fallback | 本 Volume 已实现；v2 planner/票据校验有代码，跨 Volume payload 执行和 E2E 待实现 |
-| 训练快照 | `artifact_id + commit_id` 的逻辑 Snapshot；单 Region/单 Volume 物理读取由 SnapshotDelivery 提供 | 逻辑引用已实现；Delivery 执行依赖 placement/coordinator/Agent |
+| 训练快照 | `artifact_id + commit_id` 加固定目标的 Snapshot；创建时原子生成唯一 SnapshotDelivery，物理读取由该 Delivery 提供 | 创建与唯一 Delivery 已接入；Delivery 执行依赖 placement/coordinator/Agent，Ready 前不可读 |
 | Kubernetes Agent 放置 | 一个业务 PVC = 一个 StorageVolume = 一个常驻 AgentInstance；固定挂载 `/volume`，Agent 状态使用独立 PVC | enrollment、H2 session daemon、证书安装、mTLS 和模板已实现；生产凭据 provisioner 与真实集群 E2E 待完成 |
 | Agent 注册与接管 | Agent 主动出站注册并等待首次审批；0.0.1 仅支持 generation + 人工 takeover 的 cooperative fencing | 状态语义已冻结，强 fencing 待原型 |
-| 历史保留 | ref、pin/hold、active object-read/staging lease 和有效 v1/v2 transfer ticket 作为 GC roots；隔离期后由 Agent 回收 Volume 对象 | v2 lease 表和校验骨架已存在，GC 编排及竞态 E2E 待实现 |
+| 历史保留 | ref、pin/hold、active object-read/staging lease 和有效 v2 transfer ticket 作为 GC roots；v1 ticket 已拒绝且不作为 root；隔离期后由 Agent 回收 Volume 对象 | v2 lease 表和校验骨架已存在，GC 编排及竞态 E2E 待实现 |
 | 规模与可靠性 | 千万文件、上亿 Chunk、PB 级 payload；99.9%、RPO 0、RTO 1 小时 | 后续基准验证 |
 
 ## 2. 状态标记
@@ -198,13 +199,14 @@ API、数据库 schema 或协议中继续引入第二套概念名称。
   `neoengram-agent`。SQLite authority 支持
   单进程、单 server 副本持久化，不支持 HA/RLS。
 - SQLite authority 独立使用 `authority.sqlite3`/`authority.lock`，不复用 Standalone 仓库格式 9；当前
-  clean-slate identity 为 `application_id = 0x4e454155`、`user_version = 18`。已知的合并 authority
-  v13-v17 会按顺序原子迁移到 v18；其他 application ID、schema 版本、未知表或 record format 均失败关闭，
-  不做猜测式迁移、双读或回退。
+  clean-slate identity 为 `application_id = 0x4e454155`、`user_version = 20`。v19 及更早 authority
+  与当前 DDL 不兼容，必须显式 reset/inventory rebuild；其他 application ID、schema 版本、未知表或
+  record format 均失败关闭，不做猜测式迁移、双读或回退。
 - Volume-bound Agent Registry、GatewayPool/Replica、credential、AgentRouteLease、S3 和生命周期
   表全部安装在同一 `authority.sqlite3`/`authority.lock`，并在一个 SQLite 事务内提交。当前
-  clean-slate schema identity 为 `application_id = 0x4e454155`、`user_version = 18`；已知 v13-v17
-  合并库使用显式迁移，旧的独立 Registry 文件和未知 schema 直接拒绝，不做双读或字段推断。
+  clean-slate schema identity 为 `application_id = 0x4e454155`、`user_version = 20`；v19 及更早
+  合并库必须显式 reset/inventory rebuild，旧的独立 Registry 文件和未知 schema 直接拒绝，不做双读、
+  字段推断或隐式迁移。
 
 ### 3.3 质量基线
 
@@ -237,7 +239,7 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 | 本地控制面 | SQLite 元数据、Merkle Directory、线性历史、HEAD/ref CAS、fsck/gc | SQLite adapter 继续收敛到 engine 分页 ports |
 | 中心/Agent | Gateway H2 双向 channel、统一 Agent state SQLite（Ledger/outbound）、mount probe、enrollment/AuthorityStore；Agent 有界 session 重连、重连期间 readiness 降级、durable report 重放；Gateway ID/协议、Gateway Registry、管理 API/session/activation、Registry-driven outbound connector、H2/mTLS、RouteLease、命令签名、一跳 forwarding 和 Gateway-only Agent 配置；双 Replica 协议 harness 与 Registry 接管契约分别通过 | 完整 Central/Registry/outbox/签名双 Replica E2E、外部生产 issuer/KMS-HSM、真实集群 readiness/failover、切换验收、PostgreSQL HA/RLS、完整授权/调度 |
 | Managed 数据面 | Agent 扫描并将 Chunk 写入 Volume CAS，ObjectReceipt 绑定 placement generation，Server 无 payload；v1 replication 控制链与 v2 ObjectPlacement/Coverage/Materialization planner 已有代码 | v2 跨 Volume payload executor、分页 manifest 的真实 QUIC relay、断点续传 E2E、对象生命周期和 GC 编排 |
-| 读取面 | checkout、权限快照、固定 Commit FUSE、逻辑 Snapshot/SnapshotDelivery API、固定 Commit 的 S3 只读 listener；v2 门控要求目标 Coverage 完整（均按 capability/placement 条件执行） | Shard 分页、mount/read lease、训练读取票据和生产读取 E2E |
+| 读取面 | checkout、权限快照、固定 Commit FUSE、固定目标 Snapshot/SnapshotDelivery API、固定 Commit 的 S3 只读 listener；v2 门控要求目标 Coverage 完整（均按 capability/placement 条件执行） | Shard 分页、mount/read lease、训练读取票据和生产读取 E2E |
 | 安全治理 | 本地路径安全、OIDC/JWKS、已注册接口的默认拒绝 RBAC、租户隐藏和 enrollment proof | RLS、完整资源授权/审计、密钥轮换和生产威胁模型 |
 | 训练数据语义 | 普通文件版本控制 | 可选 dataset sidecar、schema/source 摘要、确定性文件级 ShardSet |
 
@@ -247,15 +249,15 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
 
 这些限制不能在分布式服务上线前被忽略：
 
-1. **联网控制面仍是开发纵切**：已有 Tenant/Storage/Artifact/Playground/Pre-commit/Commit/Job
-  action、Agent enrollment/H2 session/Job delivery、OIDC/JWKS 与 RBAC，以及 Gateway Registry/管理面、
+1. **联网控制面仍是开发纵切**：已有 Tenant/Storage/Artifact/Playground/Pre-commit/Commit/OperationTask
+  action、Agent enrollment/H2 session/内部 Job delivery、OIDC/JWKS 与 RBAC，以及 Gateway Registry/管理面、
    H2/mTLS tunnel、RouteLease、命令签名和一跳 forwarding；仅 Snapshot file/activity/profile 三条 OpenAPI
    path 没有 Central handler，其余执行仍受 capability、外部生产凭据 adapter、
    PostgreSQL HA/RLS、跨 Volume 调度、真实集群 readiness/failover 和切换验收仍未实现。Agent 已无 Central endpoint
    fallback，切换验收前不能视为可用生产控制面；SQLite server 必须保持单副本。
-2. **P2P 对象物化仍未完成生产数据面验收**：v2 Domain、Authority schema 18、Central planner/API、InMemory/SQLite
+2. **P2P 对象物化仍未完成生产数据面验收**：v2 Domain、Authority schema 20、Central planner/API、InMemory/SQLite
    Receipt/CAS/重规划契约以及 Agent/Gateway 的 source/target stream、bounded relay、目标 staging/checkpoint 已有
-   代码和测试；v1 replication 表/mapper、旧 Assignment/report 与 v2 双路径仍并存。真实跨 Gateway route、生产
+   代码和测试；v1 replication 表/mapper、旧 Assignment/report 仅作为私有迁移残留，v2 主链路不读取它们。真实跨 Gateway route、生产
    凭据、背压/配额、durability receipt 的跨节点闭环、fetch/clone/push/pull 或三 Agent 多源失败恢复仍待验收。
 3. **文件语义不完整**：当前模型未保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。
 4. **规模热点仍存在**：Standalone 的部分 SQLite/worktree workspace snapshot 和 GC 仍可能物化完整索引或引用集；
@@ -264,7 +266,7 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
    rebase、tag 和 reflog。
 6. **只读快照不是安全边界**：`0444/0555` 可被拥有权限的用户或 root 修改；hardlink 视图还与
    Loose 对象共享 inode 和权限，写入会污染所有引用该对象的快照。损坏必须从可信副本恢复。
-7. **训练读取语义不完整**：逻辑 Snapshot、SnapshotDelivery 和固定 Commit S3 读取边界已有代码/契约，
+7. **训练读取语义不完整**：固定目标 Snapshot、唯一 SnapshotDelivery 和固定 Commit S3 读取边界已有代码/契约，
    但尚无完整 ShardSet、schema/source 摘要、训练期间 lease/retention root 和生产读取 E2E。
 8. **远端安全治理尚未完整**：已注册用户接口具有 JWT 验证、默认拒绝 RBAC 和跨租户隐藏，但尚无
    数据库 RLS、跨 Volume route/ticket 与 Agent/Gateway 端点鉴权、完整审计、Volume 加密/密钥轮换或
@@ -308,8 +310,8 @@ Agent 访问 Playground 和获批 Volume CAS，将结构化 metadata/placement e
 做最终 CAS。Gateway Registry/管理面、运行时 H2/mTLS tunnel、RouteLease、Central command signing 和
 最多一跳 forwarding 已实现；双 Replica 协议网络 harness 与真实 Registry 接管契约已分别通过，但完整
 业务 E2E、外部生产 issuer/KMS-HSM adapter、真实集群 readiness/failover、切换、PostgreSQL HA/RLS、
-跨 Volume payload 执行和完整用户 API 验收仍待实现；这不否定 replication、S3 和生命周期控制
-action 已经进入 Central descriptor。
+跨 Volume payload 执行和完整用户 API 验收仍待实现；这不否定 v2 Materialization、S3 和生命周期控制
+  action 已经进入 Central descriptor；旧 v1 replication action 不再注册。
 
 边界规则：
 
@@ -464,22 +466,23 @@ endpoint 的切换验收仍待完成。
 #### G2.1 v1 legacy 边界
 
 - 旧 Commit replication create/query/list/retry/cancel、完整 `CommitPlacementSet`、单源
-  `ReplicationRecord`、`TransferRoute`/`TransferTicket` 和旧 Agent assignment/report 仍在代码与数据库中，
-  仅作为迁移/回归路径；它们不能表达多个 partial Volume 的对象并集。
-- Gateway 生产 QUIC listener 在 `neoengram-transfer-v2` 上拒绝旧 v1 signed ticket；旧 relay 仅能由测试显式
-  opt-in，避免把 v1 单源语义误当作 v2 数据面。
+  `ReplicationRecord`、`TransferRoute`/`TransferTicket` 和旧 Agent assignment/report 仍是源码/数据库迁移残留，
+  不属于公开 API 或 v2 调度路径；它们不能表达多个 partial Volume 的对象并集。
+- Gateway 生产 QUIC listener 在 `neoengram-transfer-v2` 上拒绝旧 v1 signed ticket；旧记录只允许显式
+  reset/inventory-rebuild 处理，不能作为 v2 数据面或兼容读取路径。
 
 #### G2.2 v2 已观察纵切
 
 - Domain 已定义必填 `ObjectNamespaceId`、对象级 `ObjectPlacement`、派生 `VolumeCommitCoverage`、
   `DurabilityPolicy`、`MaterializationJob/Batch/Object`、分页 `BatchManifest`、v2 batch Ticket/Receipt/Lease
   和分维度 availability；schema golden 已覆盖这些类型。
-- Authority 新增 SQLite `user_version=18` 的 v2 表和 namespace 复合键；InMemory/SQLite 已覆盖对象 Receipt
+- Authority 新增 SQLite `user_version=20` 的 v2 表和 namespace 复合键，并在 Snapshot 创建时原子绑定唯一
+  Delivery 目标；InMemory/SQLite 已覆盖对象 Receipt
   幂等、竞争对象只产生一个有效 placement、Coverage 重算、CAS 和重规划保留 confirmed offset。
   但 v1 表和 mapper 尚未删除，`object_placements_v2` 与旧对象路径仍并存，因此 clean-slate 尚未完成。
-- Central 已提供 `/api/commit/materialize`、materialization query/list/retry/cancel、coverage/query 和
-  availability/query；planner 可按目标缺失对象查询候选 Placement，过滤健康/权限/generation 并生成多源
-  batch/fallback。该结果是可查询的控制面计划，不是已完成的字节传输。
+- Central 已提供 `/api/commit/materialize`、coverage/query、availability/query 和统一 `/api/task/*` 查询/控制；
+  planner 可按目标缺失对象查询候选 Placement，过滤健康/权限/generation 并生成多源 batch/fallback。该结果是
+  可查询的控制面计划，不是已完成的字节传输。
 - Agent/Gateway 已有 v2 manifest、Ticket、generation fence、checkpoint/receipt、source/target stream 和 bounded
   relay；Agent runtime 仅在 replication 配置及 Gateway QUIC 预检成功后声明 `commit_materialization_v2`。Gateway
   不挂载 Volume、不保存 payload。
@@ -506,7 +509,7 @@ Authority、Agent/Gateway、OpenAPI/Web 和跨节点 E2E 全部通过，才能�
   `ListObjectsV2`、`HEAD`、`GET` 和 Range 的只读响应。
 - S3 Key 使用现有 `LogicalPath` 限制，LIST 查询 Central metadata，GET/Range 由 owning Agent 按
   Manifest 读取 Volume CAS，内部 Chunk namespace 永不公开；不实现 PUT、DELETE、Multipart 或 Versioning。
-- 当前仍要求 command keyring、目标 Volume 的完整 `VolumeCommitCoverage`（legacy v1 仍检查 Ready PlacementSet）、
+- 当前仍要求 command keyring、目标 Volume 的完整 `VolumeCommitCoverage`（历史 v1 PlacementSet 检查不构成当前 Ready 依据）、
   Ready GatewayPool、Agent route 和 signed read ticket；
   外部密钥/凭据、生产 DNS/TLS、限流和真实双 Replica/跨节点验收尚未完成。
 
@@ -542,8 +545,9 @@ ID 和完整引用图校验。
 
 交付：
 
-- 客户端 `remote add` 和 `push` 初版只创建控制面 MaterializationJob，绑定 tenant、
-  `ObjectNamespaceId`、Commit、目标 Volume、coverage goal 和幂等键；v1 TransferJob 仅保留迁移兼容。
+- 客户端 `remote add` 和 `push` 初版只创建控制面 MaterializationJob/OperationTask，绑定 tenant、
+  `ObjectNamespaceId`、Commit、目标 Volume、coverage goal 和幂等键；旧 TransferJob 仅由显式
+  reset/inventory-rebuild 处理，不属于公开或调度兼容路径。
 - Server 授权固定 Commit/Directory/Manifest graph，按对象 Placement 和 BatchManifest digest 签发 v2
   批次 Ticket；Ticket 绑定 source/destination generation、session/mount/route、byte limit、deadline 和
   capability。对象存在性、缺块结果和 CAS 当前值不能泄漏给无权 tenant/project/artifact/ref。
@@ -630,7 +634,7 @@ manifest/generation、过期票据和损坏对象硬失败；传输期间 Server
    `ObjectPlacement`/receipt，并验证完整引用图；`VolumeCommitCoverage` 只能由这些对象证据重算。
 3. ref/HEAD 更新必须带 expected value、幂等键和授权 session，并在服务端事务中完成。
 4. 目标端本地 ref 只在直传对象持久化、校验和 durability barrier 成功后更新。
-5. 重试同一个 MaterializationJob/session 的结果必须与首次成功结果相同；Job/Ticket 必须绑定 tenant、
+5. 重试同一个 `OperationTask`/Attempt（及其 MaterializationJob/session）的结果必须与首次成功结果相同；任务/Ticket 必须绑定 tenant、
    namespace、artifact/commit、principal、source/destination placement generation、plan/attempt 和对象范围，
    不能跨租户、跨 namespace 或跨主体重放。
 6. 客户端、Server 和 Agent/Gateway 都不能信任请求方提供的物理路径，只接受逻辑 ID、大小、
@@ -640,7 +644,7 @@ manifest/generation、过期票据和损坏对象硬失败；传输期间 Server
 8. ref 只在读取开始时解析为固定 Commit ID；后续 ref 移动不得改变该 Snapshot 的 Manifest、Shard
    或对象可见性。
 9. 对象读取必须带 artifact + 固定 Snapshot/Commit 上下文；知道 Chunk ID 不能单独获得读取权限。
-10. lease、pin/hold、ref、活跃 push/fetch/Materialization session、object-read/staging lease 和有效 v1/v2 Ticket
+10. lease、pin/hold、ref、活跃 push/fetch/Materialization session、object-read/staging lease 和有效 v2 Ticket
     都是 GC roots；租约或票据有效期间不得删除 Snapshot 可达的 metadata、有效 ObjectPlacement 或 staging。
 11. 缺失、损坏、大小不符或 hash 不符的 Chunk 必须硬失败，禁止静默跳过、替换或返回部分成功。
 12. Chunk payload 只能由获批 Agent 从 Volume 读取并沿源 Gateway -> 目标 Gateway 流向目标 Agent/Volume，
@@ -713,7 +717,8 @@ ref，并按表中规则向下生效：
   Agent/session/mount/route generation、byte limit、direction 和 capability；禁止 list、delete、任意 prefix、
   未列出的 Object 或永久凭证。旧 v1 `TransferRoute`/`TransferTicket` 仅作为迁移拒绝边界。
 - v2 数据端点只允许 manifest 列出的完整 Object；目标 Agent 必须在原子发布前完成完整 Chunk hash/size
-  校验和 durability barrier。有效 v1/v2 Ticket、object-read lease 和 staging lease 在过期前都是短期 GC root，
+  校验和 durability barrier。有效 v2 Ticket、object-read lease 和 staging lease 在过期前都是短期 GC root；旧
+  v1 Ticket 已拒绝且不作为 GC root，
   且 TTL 不得超过统一 deletion grace；已签发凭证在失权后最多存活到过期，该窗口必须进入威胁模型和审计字段。
 - Central/Gateway、Agent/Gateway 和 Gateway/Gateway 每一跳使用 mTLS；Volume 和数据库使用各自存储侧
   加密及租户密钥引用。数据库、Agent/Gateway 和 KMS 凭证优先使用 workload identity，无法使用时
@@ -739,17 +744,19 @@ source locator、sidecar 私密字段和数据内容不得进入审计或普通�
 ### 9.1 Snapshot 身份与描述
 
 - `Snapshot` 的稳定资源身份是独立 `snapshot_id`；它引用
-  `tenant_id + project_id + artifact_id + commit_id`，Directory ID 只表示文件内容指纹，不另复制一套
+  `tenant_id + project_id + artifact_id + commit_id`，并在创建时固定一个目标
+  `edge_cluster_id + storage_volume_id + delivery_mode`。Directory ID 只表示文件内容指纹，不另复制一套
   文件图。OpenAPI v1 已使用 `tenant_id + snapshot_id` 查询独立 Snapshot。
-- Snapshot 本身不绑定 `storage_volume_id` 或 Region；物理只读视图由独立 SnapshotDelivery 绑定一个
-  目标 Volume 和模式。同一 Snapshot 可以在不同 Volume/Region 拥有多个 Delivery，不能把 Delivery
-  复制成多个 Snapshot。
+- Snapshot create 与唯一 SnapshotDelivery 是同一个原子操作；Snapshot view 返回目标和
+  `delivery_id`。一个 Snapshot 永远只有一个 Delivery，目标 EdgeCluster、Volume 和模式创建后不可切换。
+  需要其他区域或 Volume 时，应为同一 Commit 创建另一个 Snapshot，而不是给已有 Snapshot 追加 Delivery。
 - 内部版本指针只在训练开始时解析一次；产品界面和公开业务请求只展示/记录完整 Commit ID 与
   Tags，不提供 Ref 或 Default Ref 概念。
-- Central 当前在 Commit 已发布校验通过后可直接将逻辑 Snapshot 写为 `Ready`；只有 SnapshotDelivery
-  负责目标 Volume 的校验、物化和可读状态。Delivery 失败不应把逻辑 Snapshot 误标为物理可读。
-- Snapshot 和 Delivery 的 mutation 都使用稳定 request identity；同一 Snapshot 在另一个 Volume 上
-  创建新的 Delivery，不改变 Snapshot 的逻辑引用。
+- Central 创建时先校验已发布 Commit、目标 Volume/EdgeCluster 和交付模式，再原子写入
+  `SnapshotState::Creating` 与 `SnapshotDeliveryState::Requested`；只有该 Delivery 完成目标 Coverage、
+  物化和只读视图校验后，Snapshot 才进入 `Ready`。Delivery 失败使 Snapshot 保持不可读并进入异常处理路径。
+- Snapshot create、Delivery retry/delete 使用稳定 request identity；retry 只复用同一个 Delivery，delete
+  结束该交付及其 Snapshot 生命周期，均不能创建第二个 Delivery 或改写目标。
 - sidecar 存在并通过 schema/source/ShardSet 校验时，独立的 `DatasetProfileState` 进入 `Ready`，训练
   API 只接受具有 Ready profile 的 Snapshot。sidecar 缺失时 Snapshot 仍是合法普通文件快照，但
   显示为未声明训练 profile；sidecar 无效时 profile 进入 `Rejected`，Snapshot 本身不失效。
@@ -935,11 +942,12 @@ P0 基准若需要调整这些值，必须在本文记录问题、实验、结�
 | 2026-07-26 | 完成 `0.2.0` P0 crate/protocol/state-machine 改造并升级仓库格式 9 | core 统一 typed IDs/canonical digest；CLI/Standalone/runtime 分层；Agent/中心提供无网络内存组合测试 |
 | 2026-07-26 | 将 Managed 对象 durability authority 固定为中心 S3，NFS 仅放 Playground/journal/cache（已被 2026-08-06 决策取代） | 当时要求 Finalize 经过 missing upload、中心 durability、MetadataBatch 完整性和 IndexVersion CAS；不再代表当前或未来架构 |
 | 2026-07-27 | 合并 R1.1/R1.2，完成 `AuthorityStore` 与默认 SQLite 中心权威后端 | 全部中心端口可跨重开恢复并运行同一后端契约；SQLite 限单进程且无 RLS/HA，PG/MySQL 后端保持独立 schema/migration |
-| 2026-07-30 | 基于 Web Mock 冻结中心化 Agent 产品定义 | Artifact 无固定放置；Commit 只从 Playground 发起；用户界面仅展示 Commit/Tags；Snapshot 固定逻辑 Commit，物理区域交付由 SnapshotDelivery 表示；Pre-commit 与 Playground 主可用性正交 |
-| 2026-07-30 | 冻结派生 Artifact 与多区域 Snapshot 身份 | Artifact 只能为空或从同 Tenant 明确 Commit 派生；Snapshot 使用独立 ID，同一 Snapshot 可有多个单 Region/Volume SnapshotDelivery；Playground/Snapshot 主状态统一为 Creating/Ready/Abnormal |
+| 2026-07-30 | 基于 Web Mock 冻结中心化 Agent 产品定义（历史） | Artifact 无固定放置；Commit 只从 Playground 发起；当时规定 Snapshot 固定逻辑 Commit、物理区域交付由 SnapshotDelivery 表示；该 Snapshot/Delivery 语义已被 2026-09-01 唯一 Delivery 决策取代；Pre-commit 与 Playground 主可用性正交 |
+| 2026-07-30 | 冻结派生 Artifact 与多区域 Snapshot 身份（历史） | Artifact 只能为空或从同 Tenant 明确 Commit 派生；当时允许同一 Snapshot 拥有多个单 Region/Volume SnapshotDelivery；该多 Delivery 语义已被 2026-09-01 唯一 Delivery 决策取代；Playground/Snapshot 主状态统一为 Creating/Ready/Abnormal |
 | 2026-07-31 | 冻结 0.0.1 Kubernetes Agent 部署和接管边界 | 一个业务 PVC/StorageVolume 对应一个常驻 AgentInstance；固定 `/volume`、独立状态 PVC、主动注册和首次审批；无 Operator/Kubernetes API，故障接管仅承诺 generation + 人工流程的 cooperative fencing |
 | 2026-08-06 | 以用户 StorageVolume 内的 Volume-local CAS 取代 2026-07-26 的中心 S3 durability authority | Chunk payload 由 Volume Owner Agent 持久化；Server 只保存 Manifest、Index 和 `ObjectPlacementEvidence`；跨 Volume 由获批 Agent/Gateway 数据端点直传，payload 不经过 Server |
 | 2026-08-09 | 确认每个 EdgeCluster 一个多副本 NeoEngram GatewayPool，Central 和 Agent 均经 Gateway 建立控制链路 | Gateway 成为固定区域入口和后续跨集群/S3 边界；Central 仍是 metadata authority，Volume Owner Agent 仍是唯一 Volume I/O 执行者；当前 Agent 直连 Server 和可选 Volume-bound Gateway 仅作为历史基线 |
 | 2026-08-10 | 校正 G2/G3、Web 配置与 GatewayPool readiness 的未完成边界 | 当时 G2/G3 数据面仍按后续流程记录；静态 Web 构建必须绑定一个 GatewayPool EdgeCluster，Pool `Ready` 仍需外部 observed readiness/failover 证据；架构检查守护 Web binding，不改变 Central 授权或后端协议 |
-| 2026-08-24 | 以源码、action registry、测试和 Web 路由重新校准当前能力 | 85 条公开契约中 82 条已由 Central descriptor 安装，3 条 Snapshot file/activity/profile 为 contract-only；逻辑 Snapshot、SnapshotDelivery、Commit replication 控制链和只读 S3 已有代码，但 derived Artifact、真实 Agent/Gateway 数据执行、生产凭据和跨节点 E2E 仍按条件或未实现处理 |
+| 2026-08-24 | 以源码、action registry、测试和 Web 路由重新校准当前能力（历史） | 85 条公开契约中 82 条已由 Central descriptor 安装，3 条 Snapshot file/activity/profile 为 contract-only；当时仍记录逻辑 Snapshot、SnapshotDelivery、Commit replication 控制链和只读 S3，后续 v20 已移除旧 replication 公开路由并改由 OperationTask/v2 Materialization 作为当前入口 |
 | 2026-08-28 | 完成 Commit 多源对象物化 v2 调研并登记为目标设计 | 当前单源完整 PlacementSet 模型无法表达多 Volume 对象并集；报告固定对象级副本、Coverage、MaterializationJob/Batch、namespace、健康维度、租约和 clean-slate 协议迁移边界；未改变 v1 当前实现状态 |
+| 2026-09-01 | 确定 Snapshot 单交付原子模型 | 创建 Snapshot 时必须同时选择 EdgeCluster、StorageVolume 和 delivery mode；Central 在同一原子操作中生成唯一 SnapshotDelivery。目标与模式创建后不可切换，不提供第二个 Delivery create；Delivery 仅通过 retry/delete 等状态 mutation 管理，Ready 前 Snapshot、Workspace 视图和 S3 均不可读 |

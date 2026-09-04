@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     IndexVersionBody, PvcReference, ResourceIssueSummary, ResourceLifecycleView, StorageVolumeView,
+    TaskView,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -57,6 +58,8 @@ pub struct CreateTenantRequest {
 pub struct CreateTenantResponse {
     pub tenant: TenantView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -112,6 +115,8 @@ pub struct CreateProjectRequest {
 pub struct CreateProjectResponse {
     pub project: ProjectView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -160,6 +165,11 @@ pub struct QueryStorageVolumeListResponse {
 pub struct QueryStorageVolumeRequest {
     pub tenant_id: String,
     pub storage_volume_id: String,
+    /// Optional Snapshot scope for a read-only caller. When present, Central only permits
+    /// querying the immutable StorageVolume bound to that Snapshot and returns the same
+    /// sanitized projection as the volume list action.
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -208,6 +218,8 @@ pub struct NfsReference {
 pub struct CreateStorageVolumeResponse {
     pub storage_volume: StorageVolumeView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -281,6 +293,8 @@ pub enum ArtifactInitialization {
 pub struct CreateArtifactResponse {
     pub artifact: ArtifactView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -363,12 +377,14 @@ pub struct CreatePlaygroundRequest {
     pub base_commit_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
 pub struct CreatePlaygroundResponse {
     pub playground: PlaygroundView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]

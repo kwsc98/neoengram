@@ -265,6 +265,10 @@ CREATE TABLE snapshot_catalog_records (
     snapshot_id TEXT NOT NULL,
     snapshot_request_id TEXT NOT NULL,
     commit_digest BLOB NOT NULL CHECK (length(commit_digest) = 32),
+    delivery_id TEXT NOT NULL,
+    edge_cluster_id TEXT NOT NULL,
+    storage_volume_id TEXT NOT NULL,
+    delivery_mode TEXT NOT NULL CHECK (delivery_mode IN ('fuse', 'copy', 'hardlink')),
     state TEXT NOT NULL CHECK (state IN ('creating', 'ready', 'abnormal')),
     resource_version TEXT NOT NULL DEFAULT '1' CHECK (
         resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
@@ -283,7 +287,6 @@ CREATE TABLE snapshot_catalog_records (
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
     PRIMARY KEY (tenant_id, snapshot_id),
     UNIQUE (tenant_id, snapshot_request_id),
-    UNIQUE (tenant_id, project_id, artifact_id, commit_digest),
     FOREIGN KEY (tenant_id, project_id, artifact_id)
         REFERENCES artifact_catalog_records(tenant_id, project_id, artifact_id)
 ) STRICT;
@@ -326,6 +329,7 @@ CREATE TABLE snapshot_delivery_records (
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
     PRIMARY KEY (tenant_id, delivery_id),
+    UNIQUE (tenant_id, snapshot_id),
     UNIQUE (tenant_id, create_request_id),
     FOREIGN KEY (tenant_id, snapshot_id)
         REFERENCES snapshot_catalog_records(tenant_id, snapshot_id),
@@ -367,6 +371,9 @@ CREATE TABLE s3_access_point_records (
     artifact_id TEXT NOT NULL,
     snapshot_id TEXT NOT NULL,
     commit_digest BLOB NOT NULL CHECK (length(commit_digest) = 32),
+    delivery_id TEXT NOT NULL,
+    storage_volume_id TEXT NOT NULL,
+    edge_cluster_id TEXT NOT NULL,
     bucket_name TEXT NOT NULL UNIQUE,
     state TEXT NOT NULL CHECK (state IN ('active', 'disabled')),
     policy_generation INTEGER NOT NULL CHECK (policy_generation > 0),
@@ -374,7 +381,11 @@ CREATE TABLE s3_access_point_records (
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
     UNIQUE (tenant_id, snapshot_id),
     FOREIGN KEY (tenant_id, snapshot_id)
-        REFERENCES snapshot_catalog_records(tenant_id, snapshot_id)
+        REFERENCES snapshot_catalog_records(tenant_id, snapshot_id),
+    FOREIGN KEY (tenant_id, delivery_id)
+        REFERENCES snapshot_delivery_records(tenant_id, delivery_id),
+    FOREIGN KEY (tenant_id, storage_volume_id)
+        REFERENCES storage_volume_catalog_records(tenant_id, storage_volume_id)
 ) STRICT;
 CREATE INDEX s3_access_point_tenant_keyset
     ON s3_access_point_records (

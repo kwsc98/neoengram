@@ -2,8 +2,8 @@ use std::{fs, path::Path};
 
 use neoengram_domain::protocol::{
     action_schema, control_schema, enrollment_schema, gateway_schema, is_registered_action,
-    materialization_schema, metadata_schema, snapshot_delivery_schema, DecimalU64, Generation,
-    ProtocolVersion, WireObjectSpec,
+    materialization_schema, metadata_schema, operation_task_schema, snapshot_delivery_schema,
+    DecimalU64, Generation, ProtocolVersion, WireObjectSpec,
 };
 use serde_json::{json, Value};
 
@@ -37,6 +37,10 @@ fn committed_current_schemas_match_the_generator() {
         include_str!("../schemas/current/materialization-v2.schema.json"),
         materialization_schema(),
     );
+    assert_schema(
+        include_str!("../schemas/current/operation-task.schema.json"),
+        operation_task_schema(),
+    );
 }
 
 #[test]
@@ -57,6 +61,7 @@ fn committed_current_schema_catalog_publishes_only_supported_protocols() {
             "gateway-control.schema.json",
             "materialization-v2.schema.json",
             "metadata-batch.schema.json",
+            "operation-task.schema.json",
             "snapshot-delivery.schema.json",
         ]
     );

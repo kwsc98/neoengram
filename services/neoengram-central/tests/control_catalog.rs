@@ -9,13 +9,14 @@ use neoengram_central::{
     GatewayRegistryRepository, InMemoryControlCatalog, LifecycleAssignmentInsertOutcome,
     LifecycleAssignmentOutboxRecord, PlaygroundInsertRequest, PlaygroundListRequest,
     PlaygroundRecord, PlaygroundState, ReleaseRetentionHoldRequest, RestoreDeletionRequest,
-    RetryDeletionRequest, S3AccessPointRecord, S3AccessPointState, S3CredentialRecord,
-    S3CredentialState, S3MutationKind, S3MutationRecord, SnapshotDeliveryInsertOutcome,
-    SnapshotDeliveryInsertRequest, SnapshotDeliveryMutationKind, SnapshotDeliveryMutationRequest,
-    SnapshotDeliveryRecord, SnapshotDeliveryRetentionRoot, SnapshotInsertRequest, SnapshotRecord,
-    SnapshotState, SqliteAuthorityConfig, StorageAccessMode, StorageBackendType,
-    StorageVolumeListRequest, StorageVolumeRecord, StorageVolumeState, TenantListRequest,
-    TenantRecord,
+    RetryDeletionRequest, S3AccessPointInsertOutcome, S3AccessPointRecord, S3AccessPointState,
+    S3CredentialInsertOutcome, S3CredentialRecord, S3CredentialState, S3MutationKind,
+    S3MutationRecord, SnapshotDeliveryInsertOutcome, SnapshotDeliveryInsertRequest,
+    SnapshotDeliveryMutationKind, SnapshotDeliveryMutationRequest, SnapshotDeliveryRecord,
+    SnapshotDeliveryRetentionRoot, SnapshotInsertRequest, SnapshotRecord, SnapshotState,
+    SnapshotWithDeliveryInsertRequest, SqliteAuthorityConfig, StorageAccessMode,
+    StorageBackendType, StorageVolumeListRequest, StorageVolumeRecord, StorageVolumeState,
+    TenantListRequest, TenantRecord,
 };
 use neoengram_domain::core::{ContentDigest, LogicalPath, ObjectId};
 use neoengram_domain::protocol::{
@@ -210,7 +211,7 @@ async fn clean_catalog_creates_current_snapshot_and_delivery_schema() {
         .fetch_one(&mut connection)
         .await
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 20);
 
     let snapshot_columns: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM pragma_table_info('snapshot_catalog_records') ORDER BY cid",
@@ -230,6 +231,10 @@ async fn clean_catalog_creates_current_snapshot_and_delivery_schema() {
             "snapshot_id",
             "snapshot_request_id",
             "commit_digest",
+            "delivery_id",
+            "edge_cluster_id",
+            "storage_volume_id",
+            "delivery_mode",
             "state",
             "resource_version",
             "lifecycle_state",
@@ -820,6 +825,105 @@ async fn s3_mutation_ledger_is_replay_safe_in_memory_and_sqlite() {
 }
 
 #[tokio::test]
+async fn s3_insert_replay_rechecks_current_snapshot_delivery_in_memory_and_sqlite() {
+    let memory: Arc<dyn ControlCatalogRepository> = Arc::new(InMemoryControlCatalog::default());
+    seed_s3_catalog(&memory, None).await;
+    exercise_s3_insert_replay_delivery_gate(memory).await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let repository = authority.authority_store().control_catalog().unwrap();
+    seed_s3_catalog(&repository, None).await;
+    exercise_s3_insert_replay_delivery_gate(repository).await;
+    authority.integrity_check().await.unwrap();
+    authority.close().await;
+}
+
+async fn exercise_s3_insert_replay_delivery_gate(repository: Arc<dyn ControlCatalogRepository>) {
+    let tenant_id = id(TenantId::new, "tenant-a");
+    let access_point_id = id(S3AccessPointId::new, "s3ap-insert-replay");
+    let access_point = S3AccessPointRecord {
+        access_point_id: access_point_id.clone(),
+        tenant_id: tenant_id.clone(),
+        project_id: id(ProjectId::new, "project-a"),
+        artifact_id: id(ArtifactId::new, "artifact-a"),
+        snapshot_id: id(SnapshotId::new, "snapshot-a"),
+        commit_id: ContentDigest::from_bytes([7; 32]),
+        delivery_id: id(SnapshotDeliveryId::new, "delivery-snapshot-a"),
+        storage_volume_id: id(StorageVolumeId::new, "volume-a"),
+        edge_cluster_id: id(EdgeClusterId::new, "cluster-a"),
+        bucket_name: "insert-replay-bucket".to_owned(),
+        state: S3AccessPointState::Active,
+        policy_generation: 1,
+        created_at_unix_ms: UnixMillis::new(300),
+        updated_at_unix_ms: UnixMillis::new(300),
+    };
+    let credential = S3CredentialRecord {
+        credential_id: id(S3CredentialId::new, "s3cred-insert-replay"),
+        access_point_id: access_point_id.clone(),
+        access_key_id: "NGS3INSERTREPLAY".to_owned(),
+        encrypted_secret: vec![1, 2, 3],
+        state: S3CredentialState::Active,
+        expires_at_unix_ms: UnixMillis::new(10_300),
+        created_at_unix_ms: UnixMillis::new(300),
+        last_used_at_unix_ms: None,
+    };
+
+    assert!(matches!(
+        repository
+            .insert_s3_access_point(access_point.clone())
+            .await
+            .unwrap(),
+        S3AccessPointInsertOutcome::Inserted(_)
+    ));
+    assert!(matches!(
+        repository
+            .insert_s3_credential(credential.clone())
+            .await
+            .unwrap(),
+        S3CredentialInsertOutcome::Inserted(_)
+    ));
+
+    let delivery = repository
+        .get_snapshot_delivery(
+            &tenant_id,
+            &id(SnapshotDeliveryId::new, "delivery-snapshot-a"),
+        )
+        .await
+        .unwrap()
+        .expect("seeded SnapshotDelivery");
+    let mut failed_delivery = delivery.clone();
+    failed_delivery.state = SnapshotDeliveryState::Failed;
+    failed_delivery.issue_code = Some("TEST_FAILURE".to_owned());
+    failed_delivery.issue_message = Some("test failure".to_owned());
+    failed_delivery.issue_retryable = true;
+    failed_delivery.updated_at_unix_ms = UnixMillis::new(400);
+    repository
+        .replace_snapshot_delivery(delivery.resource_version, failed_delivery)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repository
+            .insert_s3_access_point(access_point)
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::InvalidState
+    );
+    assert_eq!(
+        repository
+            .insert_s3_credential(credential)
+            .await
+            .unwrap_err()
+            .code(),
+        CentralErrorCode::InvalidState
+    );
+}
+
+#[tokio::test]
 async fn lifecycle_delete_restore_purge_and_outbox_match_memory_and_sqlite() {
     let memory: Arc<dyn ControlCatalogRepository> = Arc::new(InMemoryControlCatalog::default());
     seed_s3_catalog(&memory, None).await;
@@ -1289,7 +1393,7 @@ async fn exercise_snapshot_lifecycle(repository: Arc<dyn ControlCatalogRepositor
         .unwrap()
         .unwrap();
     assert_eq!(restored.lifecycle.state, ResourceLifecycleState::Active);
-    let lifecycle_delivery_id = id(SnapshotDeliveryId::new, "delivery-lifecycle-hardlink");
+    let lifecycle_delivery_id = id(SnapshotDeliveryId::new, "delivery-snapshot-a");
     assert_eq!(
         repository
             .get_snapshot_delivery(&tenant_id, &lifecycle_delivery_id)
@@ -1470,43 +1574,14 @@ async fn exercise_snapshot_lifecycle(repository: Arc<dyn ControlCatalogRepositor
 
 async fn seed_lifecycle_hardlink_delivery(repository: &Arc<dyn ControlCatalogRepository>) {
     let tenant_id = id(TenantId::new, "tenant-a");
-    let delivery_id = id(SnapshotDeliveryId::new, "delivery-lifecycle-hardlink");
-    let request_id = id(RequestId::new, "delivery-lifecycle-create");
+    let delivery_id = id(SnapshotDeliveryId::new, "delivery-snapshot-a");
     let retention_root = SnapshotDeliveryRetentionRoot {
         tenant_id: tenant_id.clone(),
         delivery_id: delivery_id.clone(),
         object_id: ObjectId::from_bytes([0x55; 32]),
     };
     repository
-        .insert_snapshot_delivery_idempotent(SnapshotDeliveryInsertRequest {
-            record: SnapshotDeliveryRecord {
-                tenant_id: tenant_id.clone(),
-                delivery_id: delivery_id.clone(),
-                create_request_id: request_id.clone(),
-                snapshot_id: id(SnapshotId::new, "snapshot-a"),
-                commit_id: ContentDigest::from_bytes([7; 32]),
-                storage_volume_id: id(StorageVolumeId::new, "volume-a"),
-                mode: SnapshotDeliveryMode::Hardlink,
-                target_relative_root: LogicalPath::parse(
-                    "snapshots/project-a/artifact-a/snapshot-a/deliveries/delivery-lifecycle-hardlink",
-                )
-                .unwrap(),
-                state: SnapshotDeliveryState::Ready,
-                source_index_digest: ContentDigest::from_bytes([8; 32]),
-                delivery_generation: DeliveryGeneration::new(1),
-                file_count: 1,
-                size_bytes: 5,
-                object_set_digest: ContentDigest::from_bytes([9; 32]),
-                resource_version: 1,
-                issue_code: None,
-                issue_message: None,
-                issue_retryable: false,
-                created_at_unix_ms: UnixMillis::new(500),
-                updated_at_unix_ms: UnixMillis::new(500),
-            },
-            request_id,
-            retention_roots: vec![retention_root],
-        })
+        .insert_snapshot_delivery_retention_roots(&[retention_root])
         .await
         .unwrap();
 }
@@ -1718,6 +1793,9 @@ async fn create_active_s3_access_point(repository: &Arc<dyn ControlCatalogReposi
                 artifact_id: id(ArtifactId::new, "artifact-a"),
                 snapshot_id: id(SnapshotId::new, "snapshot-a"),
                 commit_id: ContentDigest::from_bytes([7; 32]),
+                delivery_id: id(SnapshotDeliveryId::new, "delivery-snapshot-a"),
+                storage_volume_id: id(StorageVolumeId::new, "volume-a"),
+                edge_cluster_id: id(EdgeClusterId::new, "cluster-a"),
                 bucket_name: "lifecycle-bucket".to_owned(),
                 state: S3AccessPointState::Active,
                 policy_generation: 1,
@@ -1778,31 +1856,67 @@ async fn seed_s3_catalog(
         .await
         .unwrap();
     repository
-        .insert_snapshot_fenced(SnapshotInsertRequest {
-            record: SnapshotRecord {
-                tenant_id: id(TenantId::new, "tenant-a"),
-                project_id: id(ProjectId::new, "project-a"),
-                artifact_id: id(ArtifactId::new, "artifact-a"),
-                snapshot_id: id(SnapshotId::new, "snapshot-a"),
-                snapshot_request_id: id(RequestId::new, "snapshot-request-a"),
-                commit_id: ContentDigest::from_bytes([7; 32]),
-                state: SnapshotState::Ready,
-                resource_version: 1,
-                lifecycle: ResourceLifecycle::active(),
-                created_at_unix_ms: UnixMillis::new(200),
-                updated_at_unix_ms: UnixMillis::new(200),
+        .insert_snapshot_with_delivery(SnapshotWithDeliveryInsertRequest {
+            snapshot: SnapshotInsertRequest {
+                record: SnapshotRecord {
+                    tenant_id: id(TenantId::new, "tenant-a"),
+                    project_id: id(ProjectId::new, "project-a"),
+                    artifact_id: id(ArtifactId::new, "artifact-a"),
+                    snapshot_id: id(SnapshotId::new, "snapshot-a"),
+                    snapshot_request_id: id(RequestId::new, "snapshot-request-a"),
+                    commit_id: ContentDigest::from_bytes([7; 32]),
+                    delivery_id: id(SnapshotDeliveryId::new, "delivery-snapshot-a"),
+                    edge_cluster_id: id(EdgeClusterId::new, "cluster-a"),
+                    storage_volume_id: id(StorageVolumeId::new, "volume-a"),
+                    delivery_mode: SnapshotDeliveryMode::Copy,
+                    state: SnapshotState::Ready,
+                    resource_version: 1,
+                    lifecycle: ResourceLifecycle::active(),
+                    created_at_unix_ms: UnixMillis::new(200),
+                    updated_at_unix_ms: UnixMillis::new(200),
+                },
+                artifact_head: ArtifactHeadExpectation::Any,
             },
-            artifact_head: ArtifactHeadExpectation::Any,
+            delivery: SnapshotDeliveryInsertRequest {
+                request_id: id(RequestId::new, "snapshot-request-a"),
+                record: SnapshotDeliveryRecord {
+                    tenant_id: id(TenantId::new, "tenant-a"),
+                    delivery_id: id(SnapshotDeliveryId::new, "delivery-snapshot-a"),
+                    create_request_id: id(RequestId::new, "snapshot-request-a"),
+                    snapshot_id: id(SnapshotId::new, "snapshot-a"),
+                    commit_id: ContentDigest::from_bytes([7; 32]),
+                    storage_volume_id: id(StorageVolumeId::new, "volume-a"),
+                    mode: SnapshotDeliveryMode::Copy,
+                    target_relative_root: LogicalPath::parse(
+                        "snapshots/project-a/artifact-a/snapshot-a/deliveries/delivery-snapshot-a",
+                    )
+                    .unwrap(),
+                    state: SnapshotDeliveryState::Ready,
+                    source_index_digest: ContentDigest::from_bytes([8; 32]),
+                    delivery_generation: DeliveryGeneration::new(1),
+                    file_count: 0,
+                    size_bytes: 0,
+                    object_set_digest: ContentDigest::from_bytes([9; 32]),
+                    resource_version: 1,
+                    issue_code: None,
+                    issue_message: None,
+                    issue_retryable: false,
+                    created_at_unix_ms: UnixMillis::new(200),
+                    updated_at_unix_ms: UnixMillis::new(200),
+                },
+                retention_roots: Vec::new(),
+            },
         })
         .await
         .unwrap();
 }
 
 async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalogRepository>) {
-    seed_s3_catalog(&repository, None).await;
+    seed_snapshot_catalog_parents(&repository).await;
     let tenant_id = id(TenantId::new, "tenant-a");
     let delivery_id = id(SnapshotDeliveryId::new, "delivery-hardlink-a");
-    let create_request_id = id(RequestId::new, "delivery-create-a");
+    // Snapshot and its atomically-created Delivery share one public request identity.
+    let create_request_id = id(RequestId::new, "snapshot-request-a");
     let mut delivery = SnapshotDeliveryRecord {
         tenant_id: tenant_id.clone(),
         delivery_id: delivery_id.clone(),
@@ -1838,13 +1952,69 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
         .collect::<Vec<_>>();
     let create_request = SnapshotDeliveryInsertRequest {
         record: delivery.clone(),
-        request_id: create_request_id,
+        request_id: create_request_id.clone(),
         retention_roots: roots.clone(),
     };
     repository
-        .insert_snapshot_delivery_idempotent(create_request.clone())
+        .insert_snapshot_with_delivery(SnapshotWithDeliveryInsertRequest {
+            snapshot: SnapshotInsertRequest {
+                record: SnapshotRecord {
+                    tenant_id: tenant_id.clone(),
+                    project_id: id(ProjectId::new, "project-a"),
+                    artifact_id: id(ArtifactId::new, "artifact-a"),
+                    snapshot_id: id(SnapshotId::new, "snapshot-a"),
+                    snapshot_request_id: create_request_id.clone(),
+                    commit_id: ContentDigest::from_bytes([7; 32]),
+                    delivery_id: delivery_id.clone(),
+                    edge_cluster_id: id(EdgeClusterId::new, "cluster-a"),
+                    storage_volume_id: id(StorageVolumeId::new, "volume-a"),
+                    delivery_mode: SnapshotDeliveryMode::Hardlink,
+                    state: SnapshotState::Creating,
+                    resource_version: 1,
+                    lifecycle: ResourceLifecycle::active(),
+                    created_at_unix_ms: UnixMillis::new(200),
+                    updated_at_unix_ms: UnixMillis::new(200),
+                },
+                artifact_head: ArtifactHeadExpectation::Any,
+            },
+            delivery: create_request.clone(),
+        })
         .await
         .unwrap();
+    let mismatched_snapshot_id = id(SnapshotId::new, "snapshot-request-mismatch");
+    let mismatched_delivery_id = id(SnapshotDeliveryId::new, "delivery-request-mismatch");
+    let mut mismatched_snapshot = repository
+        .get_snapshot(&tenant_id, &id(SnapshotId::new, "snapshot-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    mismatched_snapshot.snapshot_id = mismatched_snapshot_id.clone();
+    mismatched_snapshot.snapshot_request_id = id(RequestId::new, "snapshot-request-mismatch");
+    mismatched_snapshot.delivery_id = mismatched_delivery_id.clone();
+    let mut mismatched_delivery = delivery.clone();
+    mismatched_delivery.delivery_id = mismatched_delivery_id;
+    mismatched_delivery.snapshot_id = mismatched_snapshot_id;
+    let request_identity_error = repository
+        .insert_snapshot_with_delivery(SnapshotWithDeliveryInsertRequest {
+            snapshot: SnapshotInsertRequest {
+                record: mismatched_snapshot,
+                artifact_head: ArtifactHeadExpectation::Any,
+            },
+            delivery: SnapshotDeliveryInsertRequest {
+                record: mismatched_delivery,
+                request_id: create_request.record.create_request_id.clone(),
+                retention_roots: Vec::new(),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        request_identity_error.code(),
+        CentralErrorCode::ProtocolInvalid
+    );
+    assert!(request_identity_error
+        .message()
+        .contains("same create request identity"));
     repository
         .insert_snapshot_delivery_idempotent(create_request.clone())
         .await
@@ -1858,25 +2028,61 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
     );
 
     let failed_delivery_id = id(SnapshotDeliveryId::new, "delivery-retryable-failure");
-    let failed_request_id = id(RequestId::new, "delivery-retryable-failure-create");
+    let failed_request_id = id(RequestId::new, "snapshot-request-b");
     let mut failed_delivery = delivery.clone();
     failed_delivery.delivery_id = failed_delivery_id.clone();
     failed_delivery.create_request_id = failed_request_id.clone();
+    failed_delivery.snapshot_id = id(SnapshotId::new, "snapshot-b");
+    failed_delivery.commit_id = ContentDigest::from_bytes([7; 32]);
     failed_delivery.mode = SnapshotDeliveryMode::Copy;
     failed_delivery.target_relative_root = LogicalPath::parse(
         "snapshots/project-a/artifact-a/snapshot-a/deliveries/delivery-retryable-failure",
     )
     .unwrap();
+    // The aggregate is created in a consistent completed state, then the Delivery is moved to a
+    // retryable failure.  A `Ready` Snapshot paired with `Failed` Delivery is intentionally not a
+    // valid insertion state.
+    failed_delivery.state = SnapshotDeliveryState::Ready;
+    failed_delivery.issue_code = None;
+    failed_delivery.issue_message = None;
+    failed_delivery.issue_retryable = false;
+    repository
+        .insert_snapshot_with_delivery(SnapshotWithDeliveryInsertRequest {
+            snapshot: SnapshotInsertRequest {
+                record: SnapshotRecord {
+                    tenant_id: tenant_id.clone(),
+                    project_id: id(ProjectId::new, "project-a"),
+                    artifact_id: id(ArtifactId::new, "artifact-a"),
+                    snapshot_id: id(SnapshotId::new, "snapshot-b"),
+                    snapshot_request_id: failed_request_id.clone(),
+                    commit_id: ContentDigest::from_bytes([7; 32]),
+                    delivery_id: failed_delivery_id.clone(),
+                    edge_cluster_id: id(EdgeClusterId::new, "cluster-a"),
+                    storage_volume_id: id(StorageVolumeId::new, "volume-a"),
+                    delivery_mode: SnapshotDeliveryMode::Copy,
+                    state: SnapshotState::Ready,
+                    resource_version: 1,
+                    lifecycle: ResourceLifecycle::active(),
+                    created_at_unix_ms: UnixMillis::new(250),
+                    updated_at_unix_ms: UnixMillis::new(250),
+                },
+                artifact_head: ArtifactHeadExpectation::Any,
+            },
+            delivery: SnapshotDeliveryInsertRequest {
+                record: failed_delivery.clone(),
+                request_id: failed_request_id,
+                retention_roots: Vec::new(),
+            },
+        })
+        .await
+        .unwrap();
     failed_delivery.state = SnapshotDeliveryState::Failed;
     failed_delivery.issue_code = Some("DELIVERY_OBJECT_UNAVAILABLE".to_owned());
     failed_delivery.issue_message = Some("CAS object is temporarily unavailable".to_owned());
     failed_delivery.issue_retryable = true;
-    repository
-        .insert_snapshot_delivery_idempotent(SnapshotDeliveryInsertRequest {
-            record: failed_delivery.clone(),
-            request_id: failed_request_id,
-            retention_roots: Vec::new(),
-        })
+    failed_delivery.updated_at_unix_ms = UnixMillis::new(320);
+    failed_delivery = repository
+        .replace_snapshot_delivery(1, failed_delivery)
         .await
         .unwrap();
     assert_eq!(
@@ -1884,8 +2090,91 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
             .get_snapshot_delivery(&tenant_id, &failed_delivery_id)
             .await
             .unwrap(),
-        Some(failed_delivery)
+        Some(failed_delivery.clone())
     );
+
+    let invalid_delivery_id = id(SnapshotDeliveryId::new, "delivery-inconsistent-ready");
+    let invalid_request_id = id(RequestId::new, "delivery-inconsistent-ready-create");
+    let mut invalid_delivery = failed_delivery.clone();
+    invalid_delivery.delivery_id = invalid_delivery_id.clone();
+    invalid_delivery.create_request_id = invalid_request_id.clone();
+    invalid_delivery.snapshot_id = id(SnapshotId::new, "snapshot-inconsistent-ready");
+    invalid_delivery.target_relative_root = LogicalPath::parse(
+        "snapshots/project-a/artifact-a/snapshot-inconsistent-ready/deliveries/delivery-inconsistent-ready",
+    )
+    .unwrap();
+    invalid_delivery.state = SnapshotDeliveryState::Failed;
+    invalid_delivery.resource_version = 1;
+    invalid_delivery.delivery_generation = DeliveryGeneration::new(1);
+    invalid_delivery.created_at_unix_ms = UnixMillis::new(400);
+    invalid_delivery.updated_at_unix_ms = UnixMillis::new(400);
+    let invalid_snapshot = SnapshotRecord {
+        tenant_id: tenant_id.clone(),
+        project_id: id(ProjectId::new, "project-a"),
+        artifact_id: id(ArtifactId::new, "artifact-a"),
+        snapshot_id: invalid_delivery.snapshot_id.clone(),
+        snapshot_request_id: invalid_request_id.clone(),
+        commit_id: invalid_delivery.commit_id,
+        delivery_id: invalid_delivery.delivery_id.clone(),
+        edge_cluster_id: id(EdgeClusterId::new, "cluster-a"),
+        storage_volume_id: invalid_delivery.storage_volume_id.clone(),
+        delivery_mode: invalid_delivery.mode,
+        state: SnapshotState::Ready,
+        resource_version: 1,
+        lifecycle: ResourceLifecycle::active(),
+        created_at_unix_ms: UnixMillis::new(400),
+        updated_at_unix_ms: UnixMillis::new(400),
+    };
+    let inconsistent = repository
+        .insert_snapshot_with_delivery(SnapshotWithDeliveryInsertRequest {
+            snapshot: SnapshotInsertRequest {
+                record: invalid_snapshot.clone(),
+                artifact_head: ArtifactHeadExpectation::Any,
+            },
+            delivery: SnapshotDeliveryInsertRequest {
+                record: invalid_delivery.clone(),
+                request_id: invalid_request_id,
+                retention_roots: Vec::new(),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(inconsistent.code(), CentralErrorCode::InvalidState);
+    assert!(inconsistent.message().contains("states are inconsistent"));
+    assert!(repository
+        .get_snapshot(&tenant_id, &invalid_snapshot.snapshot_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repository
+        .get_snapshot_delivery(&tenant_id, &invalid_delivery.delivery_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let failed_snapshot_id = id(SnapshotId::new, "snapshot-b");
+    let abnormal = repository
+        .transition_snapshot_state(
+            &tenant_id,
+            &failed_snapshot_id,
+            SnapshotState::Ready,
+            SnapshotState::Abnormal,
+            UnixMillis::new(325),
+        )
+        .await
+        .unwrap();
+    assert_eq!(abnormal.state, SnapshotState::Abnormal);
+    let retried_snapshot = repository
+        .transition_snapshot_state(
+            &tenant_id,
+            &failed_snapshot_id,
+            SnapshotState::Abnormal,
+            SnapshotState::Creating,
+            UnixMillis::new(326),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried_snapshot.state, SnapshotState::Creating);
 
     let mut invalid_copy = delivery.clone();
     invalid_copy.delivery_id = id(SnapshotDeliveryId::new, "delivery-copy-with-roots");
@@ -2024,7 +2313,7 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
         delivery_id: failed_delivery_id.clone(),
         kind: SnapshotDeliveryMutationKind::Retry,
         request_digest: ContentDigest::hash(b"retry-transition"),
-        expected_resource_version: 1,
+        expected_resource_version: failed_delivery.resource_version,
         desired_delivery: retried_delivery,
     };
     let transition_receipt = match repository
@@ -2035,7 +2324,7 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
         CatalogInsertOutcome::Inserted(receipt) => receipt,
         CatalogInsertOutcome::Existing(_) => panic!("first transition receipt must be inserted"),
     };
-    assert_eq!(transition_receipt.delivery.resource_version, 2);
+    assert_eq!(transition_receipt.delivery.resource_version, 3);
     assert_eq!(
         transition_receipt.delivery.state,
         SnapshotDeliveryState::Requested
@@ -2136,7 +2425,12 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
         .await
         .unwrap_err();
     assert_eq!(mismatch.code(), CentralErrorCode::InvalidState);
-    assert!(mismatch.message().contains("Snapshot identity"));
+    assert!(
+        mismatch.message().contains("Snapshot identity")
+            || mismatch
+                .message()
+                .contains("Snapshot already has a SnapshotDelivery")
+    );
 
     let volume_root = ResourceRef::StorageVolume {
         storage_volume_id: id(StorageVolumeId::new, "volume-b"),
@@ -2194,7 +2488,12 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
         .await
         .unwrap_err();
     assert_eq!(fenced_volume.code(), CentralErrorCode::InvalidState);
-    assert!(fenced_volume.message().contains("StorageVolume"));
+    assert!(
+        fenced_volume.message().contains("StorageVolume")
+            || fenced_volume
+                .message()
+                .contains("Snapshot already has a SnapshotDelivery")
+    );
 
     let snapshot_root = ResourceRef::Snapshot {
         snapshot_id: id(SnapshotId::new, "snapshot-a"),
@@ -2256,6 +2555,21 @@ async fn exercise_snapshot_delivery_retention(repository: Arc<dyn ControlCatalog
     assert!(fenced_snapshot.message().contains("Snapshot"));
 }
 
+async fn seed_snapshot_catalog_parents(repository: &Arc<dyn ControlCatalogRepository>) {
+    repository
+        .insert_tenant(tenant("tenant-a", "Research"))
+        .await
+        .unwrap();
+    repository
+        .insert_artifact(artifact("tenant-a", "project-a", "artifact-a", 100))
+        .await
+        .unwrap();
+    repository
+        .insert_storage_volume(pvc_volume("tenant-a", "volume-a", "claim-a"))
+        .await
+        .unwrap();
+}
+
 async fn exercise_s3_mutation_ledger(repository: Arc<dyn ControlCatalogRepository>) {
     let tenant_id = id(TenantId::new, "tenant-a");
     let access_point_id = id(S3AccessPointId::new, "s3ap-contract");
@@ -2267,6 +2581,9 @@ async fn exercise_s3_mutation_ledger(repository: Arc<dyn ControlCatalogRepositor
         artifact_id: id(ArtifactId::new, "artifact-a"),
         snapshot_id: id(SnapshotId::new, "snapshot-a"),
         commit_id: ContentDigest::from_bytes([7; 32]),
+        delivery_id: id(SnapshotDeliveryId::new, "delivery-snapshot-a"),
+        storage_volume_id: id(StorageVolumeId::new, "volume-a"),
+        edge_cluster_id: id(EdgeClusterId::new, "cluster-a"),
         bucket_name: "contract-bucket".to_owned(),
         state: S3AccessPointState::Active,
         policy_generation: 1,

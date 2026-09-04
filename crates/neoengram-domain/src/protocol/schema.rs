@@ -96,3 +96,15 @@ pub fn materialization_schema() -> Schema {
         crate::protocol::materialization::MaterializationProtocolSchema
     ))
 }
+
+/// Generates the strict unified operation-task and audit schema.
+#[must_use]
+pub fn operation_task_schema() -> Schema {
+    close_flattened_objects(schema_for!(crate::protocol::task::TaskProtocolSchema))
+}
+
+/// Short alias used by callers that refer to the contract as the task schema.
+#[must_use]
+pub fn task_schema() -> Schema {
+    operation_task_schema()
+}

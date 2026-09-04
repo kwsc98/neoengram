@@ -124,6 +124,8 @@ impl MountedVolumeMaterializationExecutor {
         let issue_message = message.into();
         let issue_message = issue_message.chars().take(4096).collect::<String>();
         let report = MaterializationReport::Failed {
+            operation_task_id: ticket.operation_task_id.clone(),
+            task_attempt_id: ticket.task_attempt_id.clone(),
             materialization_id: ticket.materialization_id.clone(),
             batch_id: ticket.batch_id.clone(),
             plan_revision: ticket.plan_revision,

@@ -13,14 +13,16 @@ use neoengram_domain::core::{
 use neoengram_domain::protocol::materialization::{
     MaterializationBatch, MaterializationJob, MaterializationJobKey, MaterializationJobState,
     MaterializationLeaseState, MaterializationObject, MaterializationObjectReceipt,
-    ObjectPlacement as ObjectPlacementV2, ObjectReadLease, StagingLease, VolumeCommitCoverage,
+    MaterializationObjectState, ObjectPlacement as ObjectPlacementV2, ObjectReadLease,
+    PlacementHealthObservation, PlacementHealthState, StagingLease, VolumeCommitCoverage,
 };
 use neoengram_domain::protocol::{
     object_read_lease_id, staging_lease_id, AgentId, ArtifactId, DecimalU64, Generation,
     JobAssignment, JobState, MaterializationBatchId, MetadataBatchDescriptor, MetadataBatchId,
-    MetadataBatchPage, ObjectReceiptId, PlacementGeneration, ReplicationId, ReplicationState,
-    RequestId, ResourceRef, ResourceVersion, StorageVolumeId, TenantId, UnixMillis,
-    WireIndexVersion, WorkspaceId,
+    MetadataBatchPage, ObjectReceiptId, OperationTask, PlacementGeneration, ReplicationId,
+    ReplicationState, RequestId, ResourceRef, ResourceVersion, SequenceNumber, StorageVolumeId,
+    TaskActor, TaskAttempt, TaskAttemptId, TaskEvent, TaskEventId, TaskEventKind, TaskId,
+    TaskRelation, TaskResourceLink, TaskState, TenantId, UnixMillis, WireIndexVersion, WorkspaceId,
 };
 
 use crate::{
@@ -40,7 +42,9 @@ use crate::{
     PreCommitCancelRequest, PreCommitCommitOutcome, PreCommitCommitRequest,
     PreCommitCommitSnapshot, PreCommitKey, PreCommitMutationOutcome, PreCommitPhase,
     PreCommitRecord, PreCommitRepository, PreCommitRestartRequest, PreCommitStartRequest,
-    PreCommitState, PublishedIndex, StagedMetadataBatch,
+    PreCommitState, PublishedIndex, StagedMetadataBatch, TaskEventListPage, TaskEventListRequest,
+    TaskInsertOutcome, TaskListPage, TaskListRequest, TaskMutationOutcome, TaskRelationRecord,
+    TaskRepository, TaskResourceLinkRecord, TaskSummary,
 };
 
 use crate::{
@@ -100,6 +104,12 @@ type MaterializationReceiptKey = (
 );
 type MaterializationReceiptMap =
     BTreeMap<MaterializationReceiptKey, (MaterializationObjectReceipt, ObjectPlacementV2)>;
+type PlacementHealthKey = (
+    TenantId,
+    neoengram_domain::protocol::ObjectNamespaceId,
+    neoengram_domain::protocol::PlacementId,
+    PlacementGeneration,
+);
 
 #[derive(Debug, Default)]
 pub struct InMemoryJobRepository {
@@ -176,6 +186,851 @@ impl JobRepository for InMemoryJobRepository {
         jobs.insert(key, job.clone());
         Ok(job)
     }
+}
+
+type TaskMapKey = (TenantId, TaskId);
+const MAX_TASK_PAGE_SIZE: usize = 500;
+
+#[derive(Debug, Default)]
+struct InMemoryTaskState {
+    tasks: BTreeMap<TaskMapKey, OperationTask>,
+    attempts: BTreeMap<TaskMapKey, Vec<TaskAttempt>>,
+    events: BTreeMap<TaskMapKey, Vec<TaskEvent>>,
+    links: BTreeMap<(TenantId, TaskId), Vec<TaskResourceLink>>,
+    relations: BTreeMap<(TenantId, TaskId), Vec<TaskRelation>>,
+}
+
+/// In-memory implementation of the unified operation-task authority. A single mutex protects
+/// the task row and all of its child audit/relationship records so mutation helpers have the same
+/// atomic visibility semantics as the SQLite transaction implementation.
+#[derive(Debug, Default)]
+pub struct InMemoryTaskRepository {
+    state: Mutex<InMemoryTaskState>,
+}
+
+impl InMemoryTaskRepository {
+    pub fn all(&self) -> CentralResult<Vec<OperationTask>> {
+        Ok(lock(&self.state)?.tasks.values().cloned().collect())
+    }
+
+    fn task_key(tenant_id: &TenantId, task_id: &TaskId) -> TaskMapKey {
+        (tenant_id.clone(), task_id.clone())
+    }
+
+    fn task_or_not_found<'a>(
+        state: &'a InMemoryTaskState,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<&'a OperationTask> {
+        state
+            .tasks
+            .get(&Self::task_key(tenant_id, task_id))
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "operation task not found",
+                )
+            })
+    }
+}
+
+#[async_trait]
+impl TaskRepository for InMemoryTaskRepository {
+    async fn get(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Option<OperationTask>> {
+        Ok(lock(&self.state)?
+            .tasks
+            .get(&Self::task_key(tenant_id, task_id))
+            .cloned())
+    }
+
+    async fn get_by_request_id(
+        &self,
+        tenant_id: &TenantId,
+        request_id: &RequestId,
+    ) -> CentralResult<Option<OperationTask>> {
+        Ok(lock(&self.state)?
+            .tasks
+            .values()
+            .find(|task| &task.tenant_id == tenant_id && &task.request_id == request_id)
+            .cloned())
+    }
+
+    async fn list(&self, request: &TaskListRequest) -> CentralResult<TaskListPage> {
+        if request.page_size > MAX_TASK_PAGE_SIZE {
+            return Err(invalid(
+                CentralErrorCode::ProtocolInvalid,
+                "task page_size must be at most 500",
+            ));
+        }
+        if request.page_size == 0 {
+            return Ok(TaskListPage {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let cursor = request.cursor.as_deref().unwrap_or_default();
+        let state = lock(&self.state)?;
+        let mut items = state
+            .tasks
+            .values()
+            .filter(|task| task_matches_request(task, request))
+            .filter(|task| task.task_id.as_str() > cursor)
+            .take(request.page_size.saturating_add(1))
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_cursor = if items.len() > request.page_size {
+            items.pop().map(|task| task.task_id.to_string())
+        } else {
+            None
+        };
+        Ok(TaskListPage { items, next_cursor })
+    }
+
+    async fn list_events(
+        &self,
+        request: &TaskEventListRequest,
+    ) -> CentralResult<TaskEventListPage> {
+        if request.page_size > MAX_TASK_PAGE_SIZE {
+            return Err(invalid(
+                CentralErrorCode::ProtocolInvalid,
+                "task page_size must be at most 500",
+            ));
+        }
+        if request.page_size == 0 {
+            return Ok(TaskEventListPage {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let state = lock(&self.state)?;
+        Self::task_or_not_found(&state, &request.tenant_id, &request.task_id)?;
+        let after = request.after_sequence.map_or(0, SequenceNumber::get);
+        let mut items = state
+            .events
+            .get(&Self::task_key(&request.tenant_id, &request.task_id))
+            .into_iter()
+            .flat_map(|events| events.iter())
+            .filter(|event| event.sequence.get() > after)
+            .take(request.page_size.saturating_add(1))
+            .cloned()
+            .collect::<Vec<_>>();
+        let next_cursor = if items.len() > request.page_size {
+            items.pop().map(|event| event.sequence.to_string())
+        } else {
+            None
+        };
+        Ok(TaskEventListPage { items, next_cursor })
+    }
+
+    async fn summary(&self, request: &TaskListRequest) -> CentralResult<TaskSummary> {
+        let state = lock(&self.state)?;
+        let mut summary = TaskSummary::default();
+        for task in state
+            .tasks
+            .values()
+            .filter(|task| task_matches_request(task, request))
+        {
+            summary.add(task.state);
+        }
+        Ok(summary)
+    }
+
+    async fn insert(&self, task: OperationTask) -> CentralResult<TaskInsertOutcome> {
+        self.insert_with_history(task, None, None).await
+    }
+
+    async fn insert_with_history(
+        &self,
+        task: OperationTask,
+        attempt: Option<TaskAttempt>,
+        event: Option<TaskEvent>,
+    ) -> CentralResult<TaskInsertOutcome> {
+        task.validate().map_err(CentralError::from)?;
+        if let Some(attempt) = &attempt {
+            attempt.validate().map_err(CentralError::from)?;
+            if attempt.task_id != task.task_id || attempt.attempt != task.attempt {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "initial task attempt does not match task identity",
+                ));
+            }
+        }
+        if let Some(event) = &event {
+            event.validate().map_err(CentralError::from)?;
+            if event.task_id != task.task_id || event.attempt != task.attempt {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "initial task event does not match task identity",
+                ));
+            }
+        }
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(&task.tenant_id, &task.task_id);
+        if let Some(existing) = state.tasks.get(&key) {
+            if existing.request_digest != task.request_digest
+                || existing.request_id != task.request_id
+                || existing.task_kind != task.task_kind
+            {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "operation task identity is already bound to a different request",
+                ));
+            }
+            return Ok(TaskInsertOutcome::Existing(existing.clone()));
+        }
+        if state.tasks.values().any(|existing| {
+            existing.tenant_id == task.tenant_id && existing.request_id == task.request_id
+        }) {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "request ID is already bound to another operation task",
+            ));
+        }
+        if let Some(parent) = &task.parent_task_id {
+            if !state
+                .tasks
+                .contains_key(&(task.tenant_id.clone(), parent.clone()))
+            {
+                return Err(invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "parent operation task does not exist",
+                ));
+            }
+        }
+        if let Some(event) = &event {
+            if event.sequence.get() != 1 {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "the first task event must use sequence 1",
+                ));
+            }
+        }
+        state.tasks.insert(key.clone(), task.clone());
+        if let Some(parent_task_id) = &task.parent_task_id {
+            state.relations.insert(
+                key.clone(),
+                vec![TaskRelation {
+                    task_id: task.task_id.clone(),
+                    related_task_id: parent_task_id.clone(),
+                    relation: neoengram_domain::protocol::TaskRelationKind::Parent,
+                }],
+            );
+        }
+        if let Some(attempt) = attempt {
+            state.attempts.insert(key.clone(), vec![attempt]);
+        }
+        if let Some(event) = event {
+            state.events.insert(key, vec![event]);
+        }
+        Ok(TaskInsertOutcome::Inserted(task))
+    }
+
+    async fn replace(
+        &self,
+        expected_resource_version: ResourceVersion,
+        task: OperationTask,
+    ) -> CentralResult<OperationTask> {
+        task.validate().map_err(CentralError::from)?;
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(&task.tenant_id, &task.task_id);
+        let current = state.tasks.get(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "operation task not found",
+            )
+        })?;
+        if current.resource_version != expected_resource_version
+            || task.resource_version.get() != expected_resource_version.get().saturating_add(1)
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "operation task resource version changed",
+            ));
+        }
+        if current.request_id != task.request_id || current.request_digest != task.request_digest {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "immutable operation task identity changed",
+            ));
+        }
+        state.tasks.insert(key, task.clone());
+        Ok(task)
+    }
+
+    async fn transition(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+        expected_resource_version: ResourceVersion,
+        next: TaskState,
+        actor: TaskActor,
+        issue: Option<neoengram_domain::protocol::TaskIssue>,
+        message: Option<String>,
+        now: UnixMillis,
+    ) -> CentralResult<TaskMutationOutcome> {
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(tenant_id, task_id);
+        let current = state.tasks.get(&key).cloned().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "operation task not found",
+            )
+        })?;
+        if current.resource_version != expected_resource_version {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "operation task resource version changed",
+            ));
+        }
+        if current.state == next {
+            return Ok(TaskMutationOutcome {
+                task: current,
+                replayed: true,
+            });
+        }
+
+        let mut task = current.clone();
+        if let Some(issue) = issue {
+            task.issue = Some(issue);
+        }
+        task.transition_to(next, now).map_err(CentralError::from)?;
+        let attempts = state.attempts.get(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "operation task has no current attempt",
+            )
+        })?;
+        let attempt_index = attempts
+            .iter()
+            .position(|attempt| attempt.attempt == task.attempt)
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "operation task current attempt is missing",
+                )
+            })?;
+        let mut attempt = attempts[attempt_index].clone();
+        attempt.issue = task.issue.clone();
+        attempt
+            .transition_to(next, now)
+            .map_err(CentralError::from)?;
+        let sequence = state
+            .events
+            .get(&key)
+            .and_then(|events| events.last())
+            .map_or(1, |event| event.sequence.get().saturating_add(1));
+        let mut event = TaskEvent::state_change(
+            TaskEventId::new(format!("{}-event-{sequence}", task.task_id))
+                .map_err(CentralError::from)?,
+            task.task_id.clone(),
+            SequenceNumber::new(sequence),
+            task.attempt,
+            actor,
+            current.state,
+            next,
+            now,
+            task.resource_version,
+        );
+        event.message = message;
+        event.issue = task.issue.clone();
+        event.progress = Some(task.progress_summary);
+        task.validate().map_err(CentralError::from)?;
+        attempt.validate().map_err(CentralError::from)?;
+        event.validate().map_err(CentralError::from)?;
+
+        state.tasks.insert(key.clone(), task.clone());
+        state
+            .attempts
+            .get_mut(&key)
+            .expect("attempt collection was validated above")[attempt_index] = attempt;
+        state.events.entry(key).or_default().push(event);
+        Ok(TaskMutationOutcome {
+            task,
+            replayed: false,
+        })
+    }
+
+    async fn attempts(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskAttempt>> {
+        let state = lock(&self.state)?;
+        Self::task_or_not_found(&state, tenant_id, task_id)?;
+        Ok(state
+            .attempts
+            .get(&Self::task_key(tenant_id, task_id))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn insert_attempt(
+        &self,
+        tenant_id: &TenantId,
+        attempt: TaskAttempt,
+    ) -> CentralResult<TaskAttempt> {
+        attempt.validate().map_err(CentralError::from)?;
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(tenant_id, &attempt.task_id);
+        let task = state.tasks.get(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "operation task not found",
+            )
+        })?;
+        if attempt.attempt > task.attempt {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "task attempt exceeds current task attempt",
+            ));
+        }
+        let attempts = state.attempts.entry(key).or_default();
+        if let Some(existing) = attempts
+            .iter()
+            .find(|candidate| candidate.attempt_id == attempt.attempt_id)
+        {
+            if existing == &attempt {
+                return Ok(existing.clone());
+            }
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "task attempt ID was reused",
+            ));
+        }
+        if attempts
+            .iter()
+            .any(|candidate| candidate.attempt == attempt.attempt)
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "task attempt number was reused",
+            ));
+        }
+        attempts.push(attempt.clone());
+        attempts.sort_by_key(|candidate| candidate.attempt);
+        Ok(attempt)
+    }
+
+    async fn replace_attempt(
+        &self,
+        tenant_id: &TenantId,
+        expected_resource_version: ResourceVersion,
+        attempt: TaskAttempt,
+    ) -> CentralResult<TaskAttempt> {
+        attempt.validate().map_err(CentralError::from)?;
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(tenant_id, &attempt.task_id);
+        if !state.tasks.contains_key(&key) {
+            return Err(invalid(
+                CentralErrorCode::ResourceNotFound,
+                "operation task not found",
+            ));
+        }
+        if attempt.attempt
+            > state
+                .tasks
+                .get(&key)
+                .map_or(Generation::new(0), |task| task.attempt)
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "task attempt exceeds current task attempt",
+            ));
+        }
+        let attempts = state
+            .attempts
+            .get_mut(&key)
+            .ok_or_else(|| invalid(CentralErrorCode::ResourceNotFound, "task attempt not found"))?;
+        let current = attempts
+            .iter_mut()
+            .find(|candidate| candidate.attempt_id == attempt.attempt_id)
+            .ok_or_else(|| invalid(CentralErrorCode::ResourceNotFound, "task attempt not found"))?;
+        if current.resource_version != expected_resource_version
+            || attempt.resource_version.get() != expected_resource_version.get().saturating_add(1)
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "task attempt resource version changed",
+            ));
+        }
+        if current.task_id != attempt.task_id || current.attempt != attempt.attempt {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "immutable task attempt identity changed",
+            ));
+        }
+        *current = attempt.clone();
+        Ok(attempt)
+    }
+
+    async fn append_event(
+        &self,
+        tenant_id: &TenantId,
+        event: TaskEvent,
+    ) -> CentralResult<TaskEvent> {
+        event.validate().map_err(CentralError::from)?;
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(tenant_id, &event.task_id);
+        if !state.tasks.contains_key(&key) {
+            return Err(invalid(
+                CentralErrorCode::ResourceNotFound,
+                "operation task not found",
+            ));
+        }
+        if event.attempt
+            > state
+                .tasks
+                .get(&key)
+                .map_or(Generation::new(0), |task| task.attempt)
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "task event attempt exceeds current task attempt",
+            ));
+        }
+        let events = state.events.entry(key).or_default();
+        if let Some(existing) = events
+            .iter()
+            .find(|candidate| candidate.event_id == event.event_id)
+        {
+            if existing == &event {
+                return Ok(existing.clone());
+            }
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "task event ID was reused",
+            ));
+        }
+        let expected = events
+            .last()
+            .map_or(1, |last| last.sequence.get().saturating_add(1));
+        if event.sequence.get() != expected {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                format!("task event sequence must be {expected}"),
+            ));
+        }
+        events.push(event.clone());
+        Ok(event)
+    }
+
+    async fn link_resource(&self, record: TaskResourceLinkRecord) -> CentralResult<bool> {
+        record.link.validate().map_err(CentralError::from)?;
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(&record.tenant_id, &record.link.task_id);
+        let task =
+            Self::task_or_not_found(&state, &record.tenant_id, &record.link.task_id)?.clone();
+        if state
+            .links
+            .get(&key)
+            .is_some_and(|links| links.iter().any(|candidate| candidate == &record.link))
+        {
+            return Ok(true);
+        }
+        let sequence = state
+            .events
+            .get(&key)
+            .and_then(|events| events.last())
+            .map_or(1, |event| event.sequence.get().saturating_add(1));
+        let event = TaskEvent {
+            event_id: TaskEventId::new(format!("{}-event-{sequence}", task.task_id))
+                .map_err(CentralError::from)?,
+            task_id: task.task_id.clone(),
+            sequence: SequenceNumber::new(sequence),
+            attempt: task.attempt,
+            kind: TaskEventKind::ResourceLinked,
+            state: task.state,
+            from_state: None,
+            to_state: None,
+            actor: task.actor,
+            message: Some(
+                format!(
+                    "{:?}:{}:{:?}",
+                    record.link.resource_kind, record.link.resource_id, record.link.role
+                )
+                .to_ascii_lowercase(),
+            ),
+            issue: task.issue,
+            progress: Some(task.progress_summary),
+            occurred_at_unix_ms: task.updated_at_unix_ms,
+            resource_version: task.resource_version,
+        };
+        event.validate().map_err(CentralError::from)?;
+        let links = state.links.entry(key.clone()).or_default();
+        links.push(record.link);
+        links.sort_by(|left, right| {
+            (left.resource_kind, &left.resource_id, left.role).cmp(&(
+                right.resource_kind,
+                &right.resource_id,
+                right.role,
+            ))
+        });
+        state.events.entry(key).or_default().push(event);
+        Ok(false)
+    }
+
+    async fn resources(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskResourceLink>> {
+        let state = lock(&self.state)?;
+        Self::task_or_not_found(&state, tenant_id, task_id)?;
+        Ok(state
+            .links
+            .get(&Self::task_key(tenant_id, task_id))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn add_relation(&self, record: TaskRelationRecord) -> CentralResult<bool> {
+        record.relation.validate().map_err(CentralError::from)?;
+        let mut state = lock(&self.state)?;
+        Self::task_or_not_found(&state, &record.tenant_id, &record.relation.task_id)?;
+        Self::task_or_not_found(&state, &record.tenant_id, &record.relation.related_task_id)?;
+        let key = Self::task_key(&record.tenant_id, &record.relation.task_id);
+        if state.relations.get(&key).is_some_and(|relations| {
+            relations
+                .iter()
+                .any(|existing| existing == &record.relation)
+        }) {
+            return Ok(true);
+        }
+        let mut all = state
+            .relations
+            .iter()
+            .filter(|((tenant, _), _)| tenant == &record.tenant_id)
+            .flat_map(|(_, relations)| relations.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        all.push(record.relation.clone());
+        neoengram_domain::protocol::validate_task_relations(&all).map_err(CentralError::from)?;
+        state
+            .relations
+            .entry(key)
+            .or_default()
+            .push(record.relation);
+        Ok(false)
+    }
+
+    async fn relations(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskRelation>> {
+        let state = lock(&self.state)?;
+        Self::task_or_not_found(&state, tenant_id, task_id)?;
+        Ok(state
+            .relations
+            .get(&Self::task_key(tenant_id, task_id))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn retry(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+        expected_resource_version: ResourceVersion,
+        actor: TaskActor,
+        now: UnixMillis,
+    ) -> CentralResult<TaskMutationOutcome> {
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(tenant_id, task_id);
+        let current = state.tasks.get(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "operation task not found",
+            )
+        })?;
+        if current.resource_version != expected_resource_version {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "operation task resource version changed",
+            ));
+        }
+        let mut task = current.clone();
+        task.retry(now).map_err(CentralError::from)?;
+        let attempt_id = TaskAttemptId::new(format!("{}-attempt-{}", task.task_id, task.attempt))
+            .map_err(CentralError::from)?;
+        let new_attempt = TaskAttempt::new(task.task_id.clone(), attempt_id, task.attempt, now);
+        let sequence = state
+            .events
+            .get(&key)
+            .and_then(|events| events.last())
+            .map_or(1, |event| event.sequence.get().saturating_add(1));
+        let event = TaskEvent {
+            event_id: TaskEventId::new(format!("{}-event-{}", task.task_id, sequence))
+                .map_err(CentralError::from)?,
+            task_id: task.task_id.clone(),
+            sequence: SequenceNumber::new(sequence),
+            attempt: task.attempt,
+            kind: TaskEventKind::Retried,
+            state: task.state,
+            from_state: Some(current.state),
+            to_state: Some(task.state),
+            actor,
+            message: None,
+            issue: None,
+            progress: Some(task.progress_summary),
+            occurred_at_unix_ms: now,
+            resource_version: task.resource_version,
+        };
+        task.validate().map_err(CentralError::from)?;
+        event.validate().map_err(CentralError::from)?;
+        state.tasks.insert(key.clone(), task.clone());
+        state
+            .attempts
+            .entry(key.clone())
+            .or_default()
+            .push(new_attempt);
+        state.events.entry(key).or_default().push(event);
+        Ok(TaskMutationOutcome {
+            task,
+            replayed: false,
+        })
+    }
+
+    async fn cancel(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+        expected_resource_version: Option<ResourceVersion>,
+        actor: TaskActor,
+        now: UnixMillis,
+    ) -> CentralResult<TaskMutationOutcome> {
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(tenant_id, task_id);
+        let current = state.tasks.get(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "operation task not found",
+            )
+        })?;
+        if let Some(expected) = expected_resource_version {
+            if current.resource_version != expected {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "operation task resource version changed",
+                ));
+            }
+        }
+        if current.state == TaskState::Cancelled {
+            return Ok(TaskMutationOutcome {
+                task: current.clone(),
+                replayed: true,
+            });
+        }
+        let mut task = current.clone();
+        task.cancel(now).map_err(CentralError::from)?;
+        let attempts = state.attempts.get(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "operation task has no current attempt",
+            )
+        })?;
+        let attempt_index = attempts
+            .iter()
+            .position(|attempt| attempt.attempt == task.attempt)
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "operation task current attempt is missing",
+                )
+            })?;
+        let mut attempt = attempts[attempt_index].clone();
+        attempt
+            .transition_to(TaskState::Cancelled, now)
+            .map_err(CentralError::from)?;
+        let sequence = state
+            .events
+            .get(&key)
+            .and_then(|events| events.last())
+            .map_or(1, |event| event.sequence.get().saturating_add(1));
+        let event = TaskEvent {
+            event_id: TaskEventId::new(format!("{}-event-{}", task.task_id, sequence))
+                .map_err(CentralError::from)?,
+            task_id: task.task_id.clone(),
+            sequence: SequenceNumber::new(sequence),
+            attempt: task.attempt,
+            kind: TaskEventKind::Cancelled,
+            state: task.state,
+            from_state: Some(current.state),
+            to_state: Some(task.state),
+            actor,
+            message: None,
+            issue: None,
+            progress: Some(task.progress_summary),
+            occurred_at_unix_ms: now,
+            resource_version: task.resource_version,
+        };
+        task.validate().map_err(CentralError::from)?;
+        attempt.validate().map_err(CentralError::from)?;
+        event.validate().map_err(CentralError::from)?;
+        state.tasks.insert(key.clone(), task.clone());
+        state
+            .attempts
+            .get_mut(&key)
+            .expect("attempt collection was validated above")[attempt_index] = attempt;
+        state.events.entry(key).or_default().push(event);
+        Ok(TaskMutationOutcome {
+            task,
+            replayed: false,
+        })
+    }
+}
+
+fn task_matches_request(task: &OperationTask, request: &TaskListRequest) -> bool {
+    task.tenant_id == request.tenant_id
+        && request
+            .project_id
+            .as_ref()
+            .is_none_or(|value| task.project_id.as_ref() == Some(value))
+        && request
+            .artifact_id
+            .as_ref()
+            .is_none_or(|value| task.artifact_id.as_ref() == Some(value))
+        && request
+            .object_namespace_id
+            .as_ref()
+            .is_none_or(|value| task.object_namespace_id.as_ref() == Some(value))
+        && request
+            .commit_id
+            .is_none_or(|value| task.commit_id == Some(value))
+        && request
+            .playground_id
+            .as_ref()
+            .is_none_or(|value| task.playground_id.as_ref() == Some(value))
+        && request
+            .snapshot_id
+            .as_ref()
+            .is_none_or(|value| task.snapshot_id.as_ref() == Some(value))
+        && request
+            .storage_volume_id
+            .as_ref()
+            .is_none_or(|value| task.storage_volume_id.as_ref() == Some(value))
+        && (request.task_kinds.is_empty() || request.task_kinds.contains(&task.task_kind))
+        && (request.states.is_empty() || request.states.contains(&task.state))
+        && request
+            .parent_task_id
+            .as_ref()
+            .is_none_or(|value| task.parent_task_id.as_ref() == Some(value))
+        && request
+            .created_after_unix_ms
+            .is_none_or(|value| task.created_at_unix_ms >= value)
+        && request
+            .created_before_unix_ms
+            .is_none_or(|value| task.created_at_unix_ms <= value)
+        && request
+            .updated_after_unix_ms
+            .is_none_or(|value| task.updated_at_unix_ms >= value)
+        && request
+            .updated_before_unix_ms
+            .is_none_or(|value| task.updated_at_unix_ms <= value)
 }
 
 /// In-memory counterpart of the Placement authority used by service tests and local runs.
@@ -270,6 +1125,7 @@ pub struct InMemoryPlacementRepository {
         >,
     >,
     materialization_receipts: Mutex<MaterializationReceiptMap>,
+    placement_health: Mutex<BTreeMap<PlacementHealthKey, PlacementHealthObservation>>,
     /// Serializes the multi-record receipt publication boundary.  The individual maps remain
     /// independently queryable, while receipt writers observe one deterministic state transition.
     materialization_receipt_gate: tokio::sync::Mutex<()>,
@@ -491,6 +1347,78 @@ impl PlacementRepository for InMemoryPlacementRepository {
             .collect())
     }
 
+    async fn record_placement_health_observation(
+        &self,
+        observation: PlacementHealthObservation,
+    ) -> CentralResult<PlacementHealthObservation> {
+        observation.validate().map_err(CentralError::from)?;
+        let placement = lock(&self.materialization_placements)?
+            .values()
+            .find(|placement| {
+                placement.tenant_id == observation.tenant_id
+                    && placement.object_namespace_id == observation.object_namespace_id
+                    && placement.placement_id == observation.placement_id
+                    && placement.object_id == observation.object_id
+                    && placement.storage_volume_id.as_ref() == Some(&observation.storage_volume_id)
+                    && placement.placement_generation == observation.placement_generation
+            })
+            .cloned()
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "integrity observation references an unknown placement",
+                )
+            })?;
+        if placement.size != observation.observed_size
+            && observation.state == PlacementHealthState::Healthy
+        {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "healthy integrity observation size differs from placement evidence",
+            ));
+        }
+        let key = (
+            observation.tenant_id.clone(),
+            observation.object_namespace_id.clone(),
+            observation.placement_id.clone(),
+            observation.placement_generation,
+        );
+        let mut health = lock(&self.placement_health)?;
+        if let Some(existing) = health.get(&key) {
+            if existing == &observation {
+                return Ok(existing.clone());
+            }
+            if observation.observed_at_unix_ms < existing.observed_at_unix_ms {
+                return Ok(existing.clone());
+            }
+            if observation.observed_at_unix_ms == existing.observed_at_unix_ms {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "integrity observations have conflicting timestamps",
+                ));
+            }
+        }
+        health.insert(key, observation.clone());
+        Ok(observation)
+    }
+
+    async fn latest_placement_health(
+        &self,
+        tenant_id: &TenantId,
+        object_namespace_id: &neoengram_domain::protocol::ObjectNamespaceId,
+        placement_id: &neoengram_domain::protocol::PlacementId,
+        placement_generation: PlacementGeneration,
+    ) -> CentralResult<Option<PlacementHealthObservation>> {
+        Ok(lock(&self.placement_health)?
+            .get(&(
+                tenant_id.clone(),
+                object_namespace_id.clone(),
+                placement_id.clone(),
+                placement_generation,
+            ))
+            .cloned())
+    }
+
     async fn upsert_volume_commit_coverage(
         &self,
         coverage: VolumeCommitCoverage,
@@ -508,6 +1436,10 @@ impl PlacementRepository for InMemoryPlacementRepository {
         coverage
             .validate_against(&object_set.object_set)
             .map_err(CentralError::from)?;
+        // Health observations are the latest evidence about whether a Placement is physically
+        // readable. Coverage is derived from healthy evidence, not from the durable Placement
+        // row alone; otherwise a scrub-reported missing object could not demote a cached summary.
+        let health = lock(&self.placement_health)?;
         let placements = lock(&self.materialization_placements)?
             .values()
             .filter(|placement| {
@@ -515,6 +1447,20 @@ impl PlacementRepository for InMemoryPlacementRepository {
                     && placement.object_namespace_id == coverage.object_namespace_id
                     && placement.storage_volume_id.as_ref() == Some(&coverage.storage_volume_id)
                     && placement.placement_generation == coverage.placement_generation
+            })
+            .filter(|placement| {
+                let key = (
+                    placement.tenant_id.clone(),
+                    placement.object_namespace_id.clone(),
+                    placement.placement_id.clone(),
+                    placement.placement_generation,
+                );
+                !health.get(&key).is_some_and(|observation| {
+                    matches!(
+                        observation.state,
+                        PlacementHealthState::Missing | PlacementHealthState::Corrupt
+                    )
+                })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -553,15 +1499,8 @@ impl PlacementRepository for InMemoryPlacementRepository {
         );
         let mut values = lock(&self.volume_commit_coverages)?;
         if let Some(existing) = values.get(&key) {
-            if existing.state
-                == neoengram_domain::protocol::materialization::CoverageState::Complete
-                && coverage.state
-                    != neoengram_domain::protocol::materialization::CoverageState::Complete
-            {
-                return Ok(existing.clone());
-            }
-            // Coverage is recomputable, so replacing a summary is allowed.  A stale caller may
-            // never move a terminal/deleted summary back to an older generation.
+            // Coverage is recomputable, so replacing a summary is allowed. In particular, a
+            // newer integrity observation may demote `complete` to `partial` for this generation.
             if existing.object_set_digest != coverage.object_set_digest
                 || existing.object_count != coverage.object_count
                 || existing.total_bytes != coverage.total_bytes
@@ -699,8 +1638,23 @@ impl PlacementRepository for InMemoryPlacementRepository {
             .iter()
             .map(|object| (object.object_id, object))
             .collect::<BTreeMap<_, _>>();
+        let health = lock(&self.placement_health)?.clone();
         let relevant_placements = lock(&self.materialization_placements)?
             .values()
+            .filter(|placement| {
+                let key = (
+                    placement.tenant_id.clone(),
+                    placement.object_namespace_id.clone(),
+                    placement.placement_id.clone(),
+                    placement.placement_generation,
+                );
+                !health.get(&key).is_some_and(|observation| {
+                    matches!(
+                        observation.state,
+                        PlacementHealthState::Missing | PlacementHealthState::Corrupt
+                    )
+                })
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut object_ids = BTreeSet::new();
@@ -1162,8 +2116,23 @@ impl PlacementRepository for InMemoryPlacementRepository {
             })?;
         let validator = InMemoryPlacementRepository::default();
         validator.insert_commit_object_set(object_set).await?;
+        let health = lock(&self.placement_health)?.clone();
         let placements = lock(&self.materialization_placements)?
             .values()
+            .filter(|placement| {
+                let key = (
+                    placement.tenant_id.clone(),
+                    placement.object_namespace_id.clone(),
+                    placement.placement_id.clone(),
+                    placement.placement_generation,
+                );
+                !health.get(&key).is_some_and(|observation| {
+                    matches!(
+                        observation.state,
+                        PlacementHealthState::Missing | PlacementHealthState::Corrupt
+                    )
+                })
+            })
             .cloned()
             .collect::<Vec<_>>();
         for placement in placements {
@@ -1196,6 +2165,67 @@ impl PlacementRepository for InMemoryPlacementRepository {
                 CentralErrorCode::ConcurrentUpdate,
                 "materialization plan revision changed",
             ));
+        }
+        // Validate each replacement object against its previous revision before retiring any
+        // active child rows. A completed object may be reset only for an integrity repair plan:
+        // the parent must reopen through Planning, and the new task must start at byte zero.
+        for object in &plan.objects {
+            let key = (
+                tenant_id.clone(),
+                materialization_id.clone(),
+                namespace.clone(),
+                object.object.object_id,
+            );
+            let previous = objects.get(&key).ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "materialization replacement is missing an existing Object row",
+                )
+            })?;
+            if previous.plan_revision != expected_revision {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Object belongs to a different plan revision",
+                ));
+            }
+            if previous.object != object.object || previous.staging_key != object.staging_key {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "materialization Object identity or staging key cannot change",
+                ));
+            }
+            let integrity_repair_reset = persisted.state == MaterializationJobState::Complete
+                && plan.job.state != MaterializationJobState::Complete
+                && previous.complete()
+                && object.confirmed_offset.get() == 0
+                && matches!(
+                    object.state,
+                    MaterializationObjectState::Missing | MaterializationObjectState::Reserved
+                );
+            if object.confirmed_offset < previous.confirmed_offset && !integrity_repair_reset {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Object confirmed offset cannot move backwards",
+                ));
+            }
+            if previous.complete() && !object.complete() && !integrity_repair_reset {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "completed materialization Object cannot regress",
+                ));
+            }
+            let expected_attempt = previous.attempt.get().checked_add(1).ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Object attempt is exhausted",
+                )
+            })?;
+            if object.attempt.get() != expected_attempt {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "materialization Object attempt must advance exactly one step",
+                ));
+            }
         }
         // Object rows are keyed by stable materialization/object identity. Overwrite them below
         // so re-planning preserves the staging key and durable checkpoint selected by the plan.
@@ -3755,7 +4785,12 @@ fn materialization_state_transition_allowed(
     current: MaterializationJobState,
     next: MaterializationJobState,
 ) -> bool {
-    current.can_transition_to(next)
+    // A completed Job is normally terminal, but a later integrity observation can make its
+    // derived target Coverage partial. The explicit retry path then reopens it for one fenced
+    // planning revision; all other terminal transitions remain rejected by the domain state
+    // machine.
+    (current == MaterializationJobState::Complete && next == MaterializationJobState::Planning)
+        || current.can_transition_to(next)
         || (current.can_transition_to(MaterializationJobState::Planning)
             && MaterializationJobState::Planning.can_transition_to(next))
 }
@@ -5601,6 +6636,7 @@ impl Clock for InMemoryClock {
 pub struct InMemoryComponents {
     pub authorizer: Arc<AllowAllAuthorizer>,
     pub jobs: Arc<InMemoryJobRepository>,
+    pub tasks: Arc<InMemoryTaskRepository>,
     pub outbox: Arc<InMemoryAssignmentOutbox>,
     pub metadata: Arc<InMemoryMetadataBatchStager>,
     pub objects: Arc<InMemoryObjectCatalog>,
@@ -5623,6 +6659,7 @@ impl InMemoryComponents {
             agent_registry.clone(),
         ));
         let jobs = Arc::new(InMemoryJobRepository::default());
+        let tasks = Arc::new(InMemoryTaskRepository::default());
         let outbox = Arc::new(InMemoryAssignmentOutbox::default());
         let metadata = Arc::new(InMemoryMetadataBatchStager::default());
         let objects = Arc::new(InMemoryObjectCatalog::default());
@@ -5640,6 +6677,7 @@ impl InMemoryComponents {
         Self {
             authorizer: Arc::new(AllowAllAuthorizer),
             jobs,
+            tasks,
             outbox,
             metadata,
             objects,
@@ -5662,6 +6700,11 @@ impl InMemoryComponents {
             self.authority_store(),
             self.clock.clone(),
         )
+        .with_task_coordinator(Arc::new(crate::service::TaskCoordinator::new(
+            self.tasks.clone(),
+            self.clock.clone(),
+        )))
+        .with_placement_repository(self.placement.clone())
     }
 
     #[must_use]
@@ -5675,6 +6718,7 @@ impl InMemoryComponents {
             self.audit.clone(),
             AuthorityCapabilities::IN_MEMORY,
         )
+        .with_tasks(self.tasks.clone())
         .with_precommits(self.precommits.clone())
         .with_agent_registry(self.agent_registry.clone())
         .with_gateway_registry(self.gateway_registry.clone())

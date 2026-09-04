@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use neoengram_domain::protocol::{
     action_schema, control_schema, enrollment_schema, gateway_schema, materialization_schema,
-    metadata_schema, snapshot_delivery_schema,
+    metadata_schema, operation_task_schema, snapshot_delivery_schema,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,6 +33,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_schema(
         output.join("materialization-v2.schema.json"),
         &materialization_schema(),
+    )?;
+    write_schema(
+        output.join("operation-task.schema.json"),
+        &operation_task_schema(),
     )?;
     Ok(())
 }

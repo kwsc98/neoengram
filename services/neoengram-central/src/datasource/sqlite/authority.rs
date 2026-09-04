@@ -20,7 +20,11 @@ const LOCK_FILE_NAME: &str = "authority.lock";
 // authority identities and schema versions are rejected so no v1 replication facts can be
 // mistaken for namespace-scoped object placements.
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4155;
-const SQLITE_SCHEMA_VERSION: i64 = 18;
+// v20 adds the unified operation task, attempt, event, resource-link, and relation
+// authority tables. The
+// authority schema is clean-slate: an existing v18 database must be explicitly
+// reset/rebuilt rather than migrated implicitly.
+const SQLITE_SCHEMA_VERSION: i64 = 20;
 const LEGACY_DATABASE_FILES: &[&str] = &[
     "agent-registry.sqlite3",
     "gateway-registry.sqlite3",
@@ -31,7 +35,7 @@ const LEGACY_DATABASE_FILES: &[&str] = &[
     "authority.db",
 ];
 
-// In schema v18, `object_placements` is the only canonical namespace-scoped placement table.
+// In schema v20, `object_placements` is the only canonical namespace-scoped placement table.
 // Managed Add still writes its older receipt shape to `managed_object_placement_evidence` until
 // that wire report carries the full v2 descriptor. The whole-Commit replication tables below are
 // transitional internal storage for still-compiled v1 service paths; they must not be read as v2
@@ -449,6 +453,29 @@ CREATE TABLE object_placements (
 CREATE INDEX object_placements_lookup
     ON object_placements (tenant_id, object_namespace_id, object_id, state);
 
+CREATE TABLE placement_health_observations (
+    tenant_id TEXT NOT NULL,
+    object_namespace_id TEXT NOT NULL,
+    scan_id TEXT NOT NULL,
+    placement_id TEXT NOT NULL,
+    object_id BLOB NOT NULL CHECK (length(object_id) = 32),
+    storage_volume_id TEXT NOT NULL,
+    placement_generation INTEGER NOT NULL CHECK (placement_generation > 0),
+    state TEXT NOT NULL CHECK (state IN ('healthy', 'missing', 'corrupt', 'orphan', 'unknown')),
+    observed_size INTEGER NOT NULL CHECK (observed_size >= 0),
+    observed_digest BLOB NOT NULL CHECK (length(observed_digest) = 32),
+    observed_at_unix_ms INTEGER NOT NULL CHECK (observed_at_unix_ms > 0),
+    detail TEXT,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, object_namespace_id, scan_id, placement_id)
+) STRICT;
+
+CREATE INDEX placement_health_latest
+    ON placement_health_observations (
+        tenant_id, object_namespace_id, placement_id, placement_generation,
+        observed_at_unix_ms DESC, scan_id DESC
+    );
+
 CREATE TABLE volume_commit_coverages (
     tenant_id TEXT NOT NULL,
     object_namespace_id TEXT NOT NULL,
@@ -641,6 +668,122 @@ CREATE TABLE materialization_receipts (
 
 CREATE INDEX materialization_receipts_object_lookup
     ON materialization_receipts (tenant_id, object_namespace_id, materialization_id, object_id);
+
+CREATE TABLE operation_tasks (
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    task_kind TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting', 'verifying', 'succeeded', 'stalled', 'failed', 'cancelled')),
+    phase TEXT NOT NULL,
+    project_id TEXT,
+    artifact_id TEXT,
+    object_namespace_id TEXT,
+    commit_id BLOB CHECK (commit_id IS NULL OR length(commit_id) = 32),
+    playground_id TEXT,
+    snapshot_id TEXT,
+    storage_volume_id TEXT,
+    parent_task_id TEXT,
+    request_id TEXT NOT NULL,
+    request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
+    actor BLOB NOT NULL,
+    attempt TEXT NOT NULL CHECK (attempt <> '' AND attempt NOT GLOB '*[^0-9]*'),
+    progress_completed TEXT NOT NULL CHECK (progress_completed <> '' AND progress_completed NOT GLOB '*[^0-9]*'),
+    progress_total TEXT NOT NULL CHECK (progress_total <> '' AND progress_total NOT GLOB '*[^0-9]*'),
+    progress_completed_bytes TEXT NOT NULL CHECK (progress_completed_bytes <> '' AND progress_completed_bytes NOT GLOB '*[^0-9]*'),
+    progress_total_bytes TEXT NOT NULL CHECK (progress_total_bytes <> '' AND progress_total_bytes NOT GLOB '*[^0-9]*'),
+    detail_kind TEXT,
+    detail_id TEXT,
+    deadline_unix_ms TEXT NOT NULL CHECK (deadline_unix_ms <> '' AND deadline_unix_ms NOT GLOB '*[^0-9]*'),
+    issue BLOB,
+    created_at_unix_ms TEXT NOT NULL CHECK (created_at_unix_ms <> '' AND created_at_unix_ms NOT GLOB '*[^0-9]*'),
+    updated_at_unix_ms TEXT NOT NULL CHECK (updated_at_unix_ms <> '' AND updated_at_unix_ms NOT GLOB '*[^0-9]*'),
+    started_at_unix_ms TEXT CHECK (started_at_unix_ms IS NULL OR (started_at_unix_ms <> '' AND started_at_unix_ms NOT GLOB '*[^0-9]*')),
+    finished_at_unix_ms TEXT CHECK (finished_at_unix_ms IS NULL OR (finished_at_unix_ms <> '' AND finished_at_unix_ms NOT GLOB '*[^0-9]*')),
+    resource_version TEXT NOT NULL CHECK (resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'),
+    origin TEXT NOT NULL CHECK (origin IN ('user', 'system', 'legacy')),
+    executable INTEGER NOT NULL CHECK (executable IN (0, 1)),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, task_id),
+    UNIQUE (tenant_id, request_id),
+    CHECK (origin <> 'legacy' OR executable = 0)
+) STRICT;
+
+CREATE INDEX operation_tasks_tenant_state_updated
+    ON operation_tasks (tenant_id, state, updated_at_unix_ms, task_id);
+CREATE INDEX operation_tasks_project_state_updated
+    ON operation_tasks (tenant_id, project_id, state, updated_at_unix_ms, task_id);
+CREATE INDEX operation_tasks_artifact_commit_state
+    ON operation_tasks (tenant_id, artifact_id, commit_id, state, updated_at_unix_ms, task_id);
+
+CREATE TABLE task_attempts (
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    attempt TEXT NOT NULL CHECK (attempt <> '' AND attempt NOT GLOB '*[^0-9]*'),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting', 'verifying', 'succeeded', 'stalled', 'failed', 'cancelled')),
+    phase TEXT NOT NULL,
+    created_at_unix_ms TEXT NOT NULL CHECK (created_at_unix_ms <> '' AND created_at_unix_ms NOT GLOB '*[^0-9]*'),
+    updated_at_unix_ms TEXT NOT NULL CHECK (updated_at_unix_ms <> '' AND updated_at_unix_ms NOT GLOB '*[^0-9]*'),
+    started_at_unix_ms TEXT CHECK (started_at_unix_ms IS NULL OR (started_at_unix_ms <> '' AND started_at_unix_ms NOT GLOB '*[^0-9]*')),
+    finished_at_unix_ms TEXT CHECK (finished_at_unix_ms IS NULL OR (finished_at_unix_ms <> '' AND finished_at_unix_ms NOT GLOB '*[^0-9]*')),
+    issue BLOB,
+    resource_version TEXT NOT NULL CHECK (resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, task_id, attempt_id),
+    UNIQUE (tenant_id, task_id, attempt),
+    FOREIGN KEY (tenant_id, task_id) REFERENCES operation_tasks (tenant_id, task_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX task_attempts_task_order
+    ON task_attempts (tenant_id, task_id, attempt);
+
+CREATE TABLE task_events (
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    sequence TEXT NOT NULL CHECK (sequence <> '' AND sequence NOT GLOB '*[^0-9]*'),
+    attempt TEXT NOT NULL CHECK (attempt <> '' AND attempt NOT GLOB '*[^0-9]*'),
+    kind TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting', 'verifying', 'succeeded', 'stalled', 'failed', 'cancelled')),
+    occurred_at_unix_ms TEXT NOT NULL CHECK (occurred_at_unix_ms <> '' AND occurred_at_unix_ms NOT GLOB '*[^0-9]*'),
+    resource_version TEXT NOT NULL CHECK (resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, task_id, sequence),
+    UNIQUE (tenant_id, event_id),
+    FOREIGN KEY (tenant_id, task_id) REFERENCES operation_tasks (tenant_id, task_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX task_events_sequence_page
+    ON task_events (tenant_id, task_id, sequence);
+
+CREATE TABLE task_resource_links (
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    resource_kind TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, task_id, resource_kind, resource_id, role),
+    FOREIGN KEY (tenant_id, task_id) REFERENCES operation_tasks (tenant_id, task_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX task_resource_links_resource_lookup
+    ON task_resource_links (tenant_id, resource_kind, resource_id, task_id);
+
+CREATE TABLE task_relations (
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    related_task_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, task_id, related_task_id, relation),
+    FOREIGN KEY (tenant_id, task_id) REFERENCES operation_tasks (tenant_id, task_id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id, related_task_id) REFERENCES operation_tasks (tenant_id, task_id) ON DELETE CASCADE,
+    CHECK (task_id <> related_task_id)
+) STRICT;
+
+CREATE INDEX task_relations_related_lookup
+    ON task_relations (tenant_id, related_task_id, task_id);
 "#;
 
 /// Returns the complete current authority schema. Context-specific table definitions remain
@@ -842,7 +985,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 18")
+        sqlx::query("PRAGMA user_version = 20")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;

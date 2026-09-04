@@ -191,6 +191,8 @@ fn transfer_unexpected(expected: &'static str, frame: &TransferFrame) -> AgentTr
         TransferFrame::OpenMaterializationSigned(_) => "OpenMaterializationSigned",
         TransferFrame::MaterializationManifest(_) => "MaterializationManifest",
         TransferFrame::MaterializationManifestPage(_) => "MaterializationManifestPage",
+        TransferFrame::Preflight => "Preflight",
+        TransferFrame::PreflightAck => "PreflightAck",
         TransferFrame::ObjectRequest(_) => "ObjectRequest",
         TransferFrame::ObjectChunk(_) => "ObjectChunk",
         TransferFrame::ObjectProof(_) => "ObjectProof",
@@ -1006,6 +1008,8 @@ pub fn materialization_receipt_from_checkpoint(
     }
     let receipt = MaterializationObjectReceipt {
         receipt_id,
+        operation_task_id: ticket.operation_task_id.clone(),
+        task_attempt_id: ticket.task_attempt_id.clone(),
         materialization_id: ticket.materialization_id.clone(),
         batch_id: ticket.batch_id.clone(),
         plan_revision: ticket.plan_revision,
@@ -1202,6 +1206,11 @@ mod tests {
         };
         let ticket = MaterializationBatchTicket {
             ticket_id: neoengram_domain::ObjectTicketId::new("ticket-v2").unwrap(),
+            operation_task_id: neoengram_domain::TaskId::new("task-materialization-v2").unwrap(),
+            task_attempt_id: neoengram_domain::TaskAttemptId::new(
+                "task-materialization-v2-attempt-1",
+            )
+            .unwrap(),
             materialization_id,
             batch_id,
             plan_revision: Generation::new(1),

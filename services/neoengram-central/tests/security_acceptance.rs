@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -7,19 +7,13 @@ use std::{
 
 use fusen_rs::{RunningServer, ServerState};
 use neoengram_central::{
-    open_sqlite_authority, AddJobSpec, AllowAllAuthorizer, ArtifactInitialization, ArtifactRecord,
-    AssignJobRequest, AssignmentTarget, CatalogPvcReference, ControlPlane, CreateAddJobRequest,
-    InMemoryClock, PlaygroundRecord, PlaygroundState, SqliteAuthorityConfig, StorageAccessMode,
+    open_sqlite_authority, ArtifactInitialization, ArtifactRecord, CatalogPvcReference,
+    PlaygroundRecord, PlaygroundState, SqliteAuthorityConfig, StorageAccessMode,
     StorageBackendType, StorageVolumeRecord, StorageVolumeState, TenantRecord,
 };
 use neoengram_central::{AppState, Config};
-use neoengram_domain::core::{ContentDigest, IndexVersion, LogicalPath};
 use neoengram_domain::protocol::{
-    AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
-    CommitDataLayout, DecisionGeneration, EdgeClusterId, Extensions, JobDecision, JobFinalized,
-    JobId, JobState, MountGeneration, OwnerGeneration, PlacementGeneration, PlaygroundId,
-    PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision, ResourceVersion,
-    StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
+    ArtifactId, EdgeClusterId, PlaygroundId, ProjectId, StorageVolumeId, TenantId, UnixMillis,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -29,7 +23,6 @@ use tokio::{
 };
 
 const AUTHORIZATION_DENIED: &str = "AUTHORIZATION_DENIED";
-const JOB_NOT_FOUND: &str = "JOB_NOT_FOUND";
 
 struct RawResponse {
     status: u16,
@@ -48,22 +41,22 @@ impl RawResponse {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_rejects_every_server_owned_root_field_before_persisting() {
+async fn catalog_create_rejects_task_authority_fields_before_persisting() {
     let authority = TempDir::new().unwrap();
-    seed_job_scopes(authority.path(), &["tenant-a"]).await;
+    seed_catalog_scopes(authority.path(), &["tenant-a"]).await;
     let config = development_config(authority.path().to_path_buf());
     let (state, running) = start(&config).await;
     let address = running.local_addr();
 
     for field in ["actor", "principal", "request_digest"] {
-        let job_id = format!("reserved-{field}");
-        let mut request = add_request("tenant-a", &job_id);
+        let project_id = format!("reserved-{field}");
+        let mut request = project_request("tenant-a", &project_id);
         request
             .as_object_mut()
             .unwrap()
             .insert(field.to_owned(), json!("caller-controlled"));
 
-        let response = post_json(address, "/api/job/add/create", &request).await;
+        let response = post_json(address, "/api/project/create", &request).await;
         assert_problem(
             &response,
             422,
@@ -81,48 +74,49 @@ async fn create_rejects_every_server_owned_root_field_before_persisting() {
 
         let query = post_json(
             address,
-            "/api/job/query",
-            &json!({"tenant_id": "tenant-a", "job_id": job_id}),
+            "/api/task/list/query",
+            &json!({"tenant_id": "tenant-a", "project_id": project_id}),
         )
         .await;
-        assert_problem(
-            &query,
-            404,
-            JOB_NOT_FOUND,
-            "urn:neoengram:problem:job-not-found",
-            false,
+        assert_eq!(
+            query.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&query.body)
         );
+        assert_eq!(query.json()["items"], json!([]));
     }
 
     stop(state, running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn query_survives_restart_and_job_view_never_exposes_internal_identity_or_leases() {
+async fn task_query_survives_restart_and_omits_execution_secrets() {
     let authority = TempDir::new().unwrap();
-    seed_job_scopes(authority.path(), &["tenant-a"]).await;
+    seed_catalog_scopes(authority.path(), &["tenant-a"]).await;
     let config = development_config(authority.path().to_path_buf());
     let (state, running) = start(&config).await;
     let address = running.local_addr();
 
-    let request = add_request("tenant-a", "persistent-job");
-    let created = post_json(address, "/api/job/add/create", &request).await;
+    let request = project_request("tenant-a", "persistent-project");
+    let created = post_json(address, "/api/project/create", &request).await;
     assert_eq!(
         created.status,
         200,
         "{}",
         String::from_utf8_lossy(&created.body)
     );
-    let created_job = created.json()["job"].clone();
-    assert_public_queued_job_view(&created_job);
+    let created_task = created.json()["task"].clone();
+    assert_public_operation_task_view(&created_task);
+    let task_id = created_task["task_id"].as_str().unwrap().to_owned();
 
     stop(state, running).await;
 
     let (restarted_state, restarted) = start(&config).await;
     let queried = post_json(
         restarted.local_addr(),
-        "/api/job/query",
-        &json!({"tenant_id": "tenant-a", "job_id": "persistent-job"}),
+        "/api/task/query",
+        &json!({"tenant_id": "tenant-a", "task_id": task_id}),
     )
     .await;
     assert_eq!(
@@ -131,24 +125,24 @@ async fn query_survives_restart_and_job_view_never_exposes_internal_identity_or_
         "{}",
         String::from_utf8_lossy(&queried.body)
     );
-    let queried_job = queried.json()["job"].clone();
-    assert_public_queued_job_view(&queried_job);
-    assert_eq!(queried_job, created_job);
+    let queried_task = queried.json()["task"].clone();
+    assert_public_operation_task_view(&queried_task);
+    assert_eq!(queried_task, created_task);
 
     stop(restarted_state, restarted).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_hidden() {
+async fn task_rbac_is_deny_by_default_and_hides_cross_tenant_existence() {
     let authority = TempDir::new().unwrap();
-    seed_job_scopes(authority.path(), &["tenant-a", "tenant-b"]).await;
+    seed_catalog_scopes(authority.path(), &["tenant-a", "tenant-b"]).await;
     let mut seed_config = development_config(authority.path().to_path_buf());
     seed_config.development_tenants = vec!["*".to_owned()];
     let (seed_state, seed_server) = start(&seed_config).await;
     let seeded = post_json(
         seed_server.local_addr(),
-        "/api/job/add/create",
-        &add_request("tenant-b", "private-job"),
+        "/api/project/create",
+        &project_request("tenant-b", "private-project"),
     )
     .await;
     assert_eq!(
@@ -157,6 +151,10 @@ async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_
         "{}",
         String::from_utf8_lossy(&seeded.body)
     );
+    let private_task_id = seeded.json()["task"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     stop(seed_state, seed_server).await;
 
     let policy_path = authority.path().join("rbac.json");
@@ -165,7 +163,7 @@ async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_
         json!({
             "roles": {
                 "operator": {
-                    "permissions": ["job.create", "job.read", "job.finalize"]
+                    "permissions": ["project.create", "task.read", "task.manage"]
                 }
             },
             "bindings": []
@@ -175,15 +173,16 @@ async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_
     policy_config.rbac_file = Some(policy_path.clone());
 
     let (missing_state, missing_server) = start(&policy_config).await;
-    let missing_binding_query = query_private_job(missing_server.local_addr()).await;
-    assert_job_not_found(&missing_binding_query);
+    let missing_binding_query =
+        query_private_task(missing_server.local_addr(), &private_task_id).await;
+    assert_authorization_denied(&missing_binding_query);
     let missing_binding_create = post_json(
         missing_server.local_addr(),
-        "/api/job/add/create",
-        &add_request("tenant-a", "missing-binding-create"),
+        "/api/project/create",
+        &project_request("tenant-a", "missing-binding-project"),
     )
     .await;
-    assert_authorization_denied(&missing_binding_create);
+    assert_resource_not_found(&missing_binding_create);
     stop(missing_state, missing_server).await;
 
     write_policy(
@@ -191,7 +190,7 @@ async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_
         json!({
             "roles": {
                 "operator": {
-                    "permissions": ["job.create", "job.read", "job.finalize"]
+                    "permissions": ["project.create", "task.read", "task.manage"]
                 }
             },
             "bindings": [{
@@ -203,15 +202,15 @@ async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_
         }),
     );
     let (disabled_state, disabled_server) = start(&policy_config).await;
-    let disabled_query = query_private_job(disabled_server.local_addr()).await;
-    assert_job_not_found(&disabled_query);
+    let disabled_query = query_private_task(disabled_server.local_addr(), &private_task_id).await;
+    assert_authorization_denied(&disabled_query);
     let disabled_create = post_json(
         disabled_server.local_addr(),
-        "/api/job/add/create",
-        &add_request("tenant-a", "disabled-create"),
+        "/api/project/create",
+        &project_request("tenant-a", "disabled-project"),
     )
     .await;
-    assert_authorization_denied(&disabled_create);
+    assert_resource_not_found(&disabled_create);
     stop(disabled_state, disabled_server).await;
 
     write_policy(
@@ -219,7 +218,7 @@ async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_
         json!({
             "roles": {
                 "operator": {
-                    "permissions": ["job.create", "job.read", "job.finalize"]
+                    "permissions": ["project.create", "task.read", "task.manage"]
                 }
             },
             "bindings": [{
@@ -230,15 +229,15 @@ async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_
         }),
     );
     let (scoped_state, scoped_server) = start(&policy_config).await;
-    let cross_tenant = query_private_job(scoped_server.local_addr()).await;
-    assert_job_not_found(&cross_tenant);
+    let cross_tenant = query_private_task(scoped_server.local_addr(), &private_task_id).await;
+    assert_authorization_denied(&cross_tenant);
     let absent = post_json(
         scoped_server.local_addr(),
-        "/api/job/query",
-        &json!({"tenant_id": "tenant-b", "job_id": "absent-job"}),
+        "/api/task/query",
+        &json!({"tenant_id": "tenant-b", "task_id": "absent-task"}),
     )
     .await;
-    assert_job_not_found(&absent);
+    assert_authorization_denied(&absent);
 
     let expected = problem_without_request_id(&absent);
     for hidden in [&missing_binding_query, &disabled_query, &cross_tenant] {
@@ -249,17 +248,16 @@ async fn rbac_missing_disabled_and_cross_tenant_queries_are_deny_by_default_and_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn successful_finalize_replays_without_exposing_real_assignment_identity() {
+async fn catalog_write_replays_the_same_task_without_exposing_execution_identity() {
     let authority = TempDir::new().unwrap();
-    seed_job_scopes(authority.path(), &["tenant-a"]).await;
-    seed_succeeded_job(authority.path()).await;
+    seed_catalog_scopes(authority.path(), &["tenant-a"]).await;
     let config = development_config(authority.path().to_path_buf());
     let (state, running) = start(&config).await;
 
-    let request = json!({"tenant_id": "tenant-a", "job_id": "terminal-job"});
-    let first = post_json(running.local_addr(), "/api/job/add/finalize", &request).await;
-    let second = post_json(running.local_addr(), "/api/job/add/finalize", &request).await;
-    for response in [&first, &second] {
+    let request = project_request("tenant-a", "replayed-project");
+    let first = post_json(running.local_addr(), "/api/project/create", &request).await;
+    let second = post_json(running.local_addr(), "/api/project/create", &request).await;
+    for (response, replayed) in [(&first, false), (&second, true)] {
         assert_eq!(
             response.status,
             200,
@@ -267,10 +265,10 @@ async fn successful_finalize_replays_without_exposing_real_assignment_identity()
             String::from_utf8_lossy(&response.body)
         );
         let body = response.json();
-        assert_eq!(body["replayed"], true);
-        assert_eq!(body["job"]["state"], "succeeded");
-        assert_eq!(body["decision"]["outcome"], "publish");
-        let encoded = serde_json::to_string(&body["job"]).unwrap();
+        assert_eq!(body["replayed"], replayed);
+        assert_eq!(body["task"]["state"], "succeeded");
+        assert_public_operation_task_view(&body["task"]);
+        let encoded = serde_json::to_string(&body["task"]).unwrap();
         for secret in [
             "assignment-secret",
             "agent-secret",
@@ -278,7 +276,7 @@ async fn successful_finalize_replays_without_exposing_real_assignment_identity()
             "volume-secret",
             "placement-secret",
         ] {
-            assert!(!encoded.contains(secret), "JobView exposed {secret}");
+            assert!(!encoded.contains(secret), "TaskView exposed {secret}");
         }
         for forbidden in [
             "assignment",
@@ -294,12 +292,12 @@ async fn successful_finalize_replays_without_exposing_real_assignment_identity()
             "lease",
         ] {
             assert!(
-                body["job"].get(forbidden).is_none(),
-                "JobView leaked {forbidden}"
+                body["task"].get(forbidden).is_none(),
+                "TaskView leaked {forbidden}"
             );
         }
     }
-    assert_eq!(first.body, second.body);
+    assert_eq!(first.json()["task"], second.json()["task"]);
 
     stop(state, running).await;
 }
@@ -439,7 +437,7 @@ async fn stop(state: AppState, running: RunningServer) {
     state.close().await;
 }
 
-async fn seed_job_scopes(path: &Path, tenants: &[&str]) {
+async fn seed_catalog_scopes(path: &Path, tenants: &[&str]) {
     let authority = open_sqlite_authority(SqliteAuthorityConfig::new(path))
         .await
         .unwrap();
@@ -534,110 +532,6 @@ async fn seed_job_scopes(path: &Path, tenants: &[&str]) {
     authority.close().await;
 }
 
-async fn seed_succeeded_job(path: &Path) {
-    let authority = open_sqlite_authority(SqliteAuthorityConfig::new(path))
-        .await
-        .unwrap();
-    let store = authority.authority_store();
-    let principal = PrincipalRef {
-        kind: PrincipalKind::User,
-        id: PrincipalId::new("user-a").unwrap(),
-        extensions: Extensions::new(),
-    };
-    let expected_index_version = WireIndexVersion {
-        revision: neoengram_domain::protocol::IndexRevision::new(0),
-        digest: ContentDigest::from_bytes([0; 32]),
-        extensions: Extensions::new(),
-    };
-    let mut spec = AddJobSpec {
-        job_id: JobId::new("terminal-job").unwrap(),
-        principal: principal.clone(),
-        tenant_id: TenantId::new("tenant-a").unwrap(),
-        project_id: ProjectId::new("project-a").unwrap(),
-        artifact_id: ArtifactId::new("artifact-a").unwrap(),
-        playground_id: PlaygroundId::new("playground-a").unwrap(),
-        expected_index_version,
-        request_digest: ContentDigest::from_bytes([0; 32]),
-        data_layout: CommitDataLayout::FastCdc,
-        deadline_unix_ms: UnixMillis::new(4_102_444_800_000),
-        paths: vec![LogicalPath::parse("dataset/images").unwrap()],
-        all: false,
-        extensions: Extensions::new(),
-    };
-    spec.request_digest = spec.computed_request_digest().unwrap();
-    let control = ControlPlane::new(
-        std::sync::Arc::new(AllowAllAuthorizer),
-        store.clone(),
-        std::sync::Arc::new(InMemoryClock::new(1_000)),
-    );
-    control
-        .create_add_job(CreateAddJobRequest {
-            actor: principal.clone(),
-            spec: spec.clone(),
-        })
-        .await
-        .unwrap();
-    let assigned = control
-        .assign_job(AssignJobRequest {
-            actor: principal,
-            tenant_id: spec.tenant_id.clone(),
-            job_id: spec.job_id.clone(),
-            target: AssignmentTarget {
-                assignment_id: AssignmentId::new("assignment-secret").unwrap(),
-                assignment_generation: AssignmentGeneration::new(1),
-                agent_id: AgentId::new("agent-secret").unwrap(),
-                edge_cluster_id: EdgeClusterId::new("cluster-secret").unwrap(),
-                storage_volume_id: StorageVolumeId::new("volume-secret").unwrap(),
-                artifact_placement_id: ArtifactPlacementId::new("placement-secret").unwrap(),
-                placement_generation: PlacementGeneration::new(2),
-                agent_mount_id: AgentMountId::new("mount-secret").unwrap(),
-                mount_generation: MountGeneration::new(3),
-                owner_generation: OwnerGeneration::new(4),
-                max_whole_file_bytes: neoengram_domain::protocol::DecimalU64::new(u64::MAX),
-                lease: None,
-            },
-        })
-        .await
-        .unwrap();
-    let mut job = assigned.job;
-    let assignment = job.assignment.as_ref().unwrap();
-    let published_index_version = WireIndexVersion {
-        revision: neoengram_domain::protocol::IndexRevision::new(1),
-        digest: ContentDigest::hash(b"published-index"),
-        extensions: Extensions::new(),
-    };
-    let decision = JobDecision {
-        job_id: job.spec.job_id.clone(),
-        assignment_id: assignment.assignment_id.clone(),
-        assignment_generation: assignment.assignment_generation,
-        decision_generation: DecisionGeneration::new(1),
-        decision: PublishDecision::Publish {
-            published_index_version,
-            extensions: Extensions::new(),
-        },
-        final_state: JobState::Succeeded,
-        extensions: Extensions::new(),
-    };
-    let finalized = JobFinalized {
-        job_id: job.spec.job_id.clone(),
-        assignment_id: assignment.assignment_id.clone(),
-        assignment_generation: assignment.assignment_generation,
-        decision_generation: DecisionGeneration::new(1),
-        final_state: JobState::Succeeded,
-        finalized_at_unix_ms: UnixMillis::new(2_000),
-        extensions: Extensions::new(),
-    };
-    decision.validate().unwrap();
-    finalized.validate().unwrap();
-    let previous = job.resource_version.get();
-    job.resource_version = ResourceVersion::new(previous + 1);
-    job.state = JobState::Succeeded;
-    job.decision = Some(decision);
-    job.finalized = Some(finalized);
-    store.jobs().replace(previous, job).await.unwrap();
-    authority.close().await;
-}
-
 fn development_config(authority_dir: PathBuf) -> Config {
     Config {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -673,21 +567,11 @@ fn protected_headers() -> [(&'static str, &'static str); 3] {
     ]
 }
 
-fn add_request(tenant_id: &str, job_id: &str) -> Value {
-    let index = IndexVersion::from_snapshot(0, &[]).unwrap();
+fn project_request(tenant_id: &str, project_id: &str) -> Value {
     json!({
         "tenant_id": tenant_id,
-        "project_id": "project-a",
-        "artifact_id": "artifact-a",
-        "playground_id": "playground-a",
-        "job_id": job_id,
-        "expected_index_version": {
-            "revision": index.revision.to_string(),
-            "digest": index.digest.to_string()
-        },
-        "deadline_unix_ms": "4102444800000",
-        "paths": ["dataset/images"],
-        "all": false
+        "project_id": project_id,
+        "display_name": format!("Project {project_id}")
     })
 }
 
@@ -695,38 +579,37 @@ fn write_policy(path: &Path, policy: Value) {
     std::fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
 }
 
-async fn query_private_job(address: SocketAddr) -> RawResponse {
+async fn query_private_task(address: SocketAddr, task_id: &str) -> RawResponse {
     post_json(
         address,
-        "/api/job/query",
-        &json!({"tenant_id": "tenant-b", "job_id": "private-job"}),
+        "/api/task/query",
+        &json!({"tenant_id": "tenant-b", "task_id": task_id}),
     )
     .await
 }
 
-fn assert_public_queued_job_view(job: &Value) {
-    let object = job.as_object().expect("JobView must be a JSON object");
-    let actual: BTreeSet<&str> = object.keys().map(String::as_str).collect();
-    let expected = BTreeSet::from([
-        "artifact_id",
-        "deadline_unix_ms",
-        "job_id",
-        "operation",
-        "playground_id",
-        "project_id",
-        "resource_version",
+fn assert_public_operation_task_view(task: &Value) {
+    let object = task.as_object().expect("TaskView must be a JSON object");
+    for required in [
+        "task_id",
+        "task_kind",
         "state",
+        "phase",
         "tenant_id",
-    ]);
-    assert_eq!(
-        actual, expected,
-        "JobView must remain an explicit whitelist"
-    );
-    assert_eq!(object.get("state"), Some(&json!("queued")));
+        "request_id",
+        "request_digest",
+        "actor",
+        "attempt",
+        "progress",
+        "resource_version",
+        "origin",
+        "executable",
+    ] {
+        assert!(object.contains_key(required), "TaskView omitted {required}");
+    }
 
     for forbidden in [
         "accepted",
-        "actor",
         "agent_id",
         "agent_mount_id",
         "artifact_placement_id",
@@ -743,14 +626,11 @@ fn assert_public_queued_job_view(job: &Value) {
         "owner_generation",
         "placement_generation",
         "prepared",
-        "principal",
         "publication_candidate",
-        "request_digest",
-        "storage_volume_id",
     ] {
         assert!(
             !object.contains_key(forbidden),
-            "JobView leaked {forbidden}"
+            "TaskView leaked {forbidden}"
         );
     }
 }
@@ -765,12 +645,12 @@ fn assert_authorization_denied(response: &RawResponse) {
     );
 }
 
-fn assert_job_not_found(response: &RawResponse) {
+fn assert_resource_not_found(response: &RawResponse) {
     assert_problem(
         response,
         404,
-        JOB_NOT_FOUND,
-        "urn:neoengram:problem:job-not-found",
+        "RESOURCE_NOT_FOUND",
+        "urn:neoengram:problem:resource-not-found",
         false,
     );
 }

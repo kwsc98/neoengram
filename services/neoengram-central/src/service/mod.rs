@@ -16,6 +16,7 @@ mod resource_lifecycle;
 mod s3_envelope;
 mod snapshot_delivery;
 mod system;
+mod task;
 mod workload_pki;
 mod workspace_commit;
 
@@ -47,6 +48,7 @@ pub use keyring::{EnrollmentKeyring, KeyringError};
 pub use resource_lifecycle::{ResourceLifecycleCoordinator, ResourceLifecycleReconcileRun};
 pub use s3_envelope::{LocalS3SecretEnvelope, S3SecretEnvelope, S3SecretEnvelopeError};
 pub use system::SystemService;
+pub use task::{TaskCoordinator, TaskService};
 #[cfg(test)]
 pub(crate) use workload_pki::test_issue_workload_certificate;
 pub use workload_pki::{

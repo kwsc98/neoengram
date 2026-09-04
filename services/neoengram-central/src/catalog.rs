@@ -171,6 +171,13 @@ pub struct SnapshotRecord {
     /// Public idempotency identity. It is never accepted as the Snapshot resource identity.
     pub snapshot_request_id: RequestId,
     pub commit_id: ContentDigest,
+    /// The single immutable Delivery selected as part of Snapshot creation.
+    pub delivery_id: SnapshotDeliveryId,
+    /// Edge cluster selected together with the target StorageVolume.  The repository and service
+    /// validate that this matches the Volume's authoritative cluster binding.
+    pub edge_cluster_id: EdgeClusterId,
+    pub storage_volume_id: StorageVolumeId,
+    pub delivery_mode: SnapshotDeliveryMode,
     pub state: SnapshotState,
     pub resource_version: u64,
     pub lifecycle: ResourceLifecycle,
@@ -319,11 +326,9 @@ pub struct SnapshotListPage {
     pub next: Option<SnapshotListCursor>,
 }
 
-/// Independently managed read-only projection of an immutable Snapshot.
-///
-/// Physical exposure is represented by one or more [`SnapshotDeliveryRecord`] values. A
-/// Snapshot itself never names a StorageVolume or region; placement is resolved at delivery or
-/// read time from the Commit's published PlacementSet.
+/// Read-only projection of an immutable Snapshot.  v2 creates exactly one Delivery alongside the
+/// Snapshot, so `snapshot_id` is unique in the Delivery catalog and the target placement is
+/// immutable for the lifetime of both records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotDeliveryRecord {
     pub tenant_id: TenantId,
@@ -517,16 +522,30 @@ pub(crate) fn validate_snapshot_delivery_parents(
         )
         .with_retryable(false));
     }
-    if snapshot.state != SnapshotState::Ready {
+    // A Delivery is created in the same aggregate transaction as its Snapshot.  The only valid
+    // aggregate insertion states are the queued pair (`Creating` + `Requested`) and a consistent
+    // already-completed pair (`Ready` + `Ready`).
+    // In particular, a `Ready` Snapshot can never be paired with a non-ready Delivery: that
+    // would publish a readable logical resource whose physical view is not available.
+    let valid_initial_state = matches!(
+        (snapshot.state, delivery.state),
+        (SnapshotState::Creating, SnapshotDeliveryState::Requested)
+            | (SnapshotState::Ready, SnapshotDeliveryState::Ready)
+    );
+    if !valid_initial_state {
         return Err(crate::CentralError::new(
             crate::CentralErrorCode::InvalidState,
-            "SnapshotDelivery Snapshot is not ready",
+            "Snapshot and SnapshotDelivery states are inconsistent",
         )
         .with_retryable(false));
     }
     if snapshot.tenant_id != delivery.tenant_id
         || snapshot.snapshot_id != delivery.snapshot_id
         || snapshot.commit_id != delivery.commit_id
+        || snapshot.delivery_id != delivery.delivery_id
+        || snapshot.storage_volume_id != delivery.storage_volume_id
+        || snapshot.delivery_mode != delivery.mode
+        || snapshot.edge_cluster_id != volume.edge_cluster_id
     {
         return Err(crate::CentralError::new(
             crate::CentralErrorCode::InvalidState,
@@ -546,6 +565,11 @@ pub struct S3AccessPointRecord {
     pub artifact_id: ArtifactId,
     pub snapshot_id: SnapshotId,
     pub commit_id: ContentDigest,
+    /// The immutable SnapshotDelivery that materializes this Access Point's read view.
+    pub delivery_id: SnapshotDeliveryId,
+    /// The Delivery target is persisted so S3 never falls back to an arbitrary complete Volume.
+    pub storage_volume_id: StorageVolumeId,
+    pub edge_cluster_id: EdgeClusterId,
     pub bucket_name: String,
     pub state: S3AccessPointState,
     pub policy_generation: u64,
@@ -670,11 +694,19 @@ pub struct SnapshotInsertRequest {
     pub artifact_head: ArtifactHeadExpectation,
 }
 
+/// Atomic Snapshot + its one immutable Delivery.  The two records share the same public request
+/// identity and are published in one repository transaction/critical section.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SnapshotInsertOutcome {
-    Inserted(SnapshotRecord),
-    ExistingRequest(SnapshotRecord),
-    ExistingCommit(SnapshotRecord),
+pub struct SnapshotWithDeliveryInsertRequest {
+    pub snapshot: SnapshotInsertRequest,
+    pub delivery: SnapshotDeliveryInsertRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotWithDeliveryInsertResult {
+    pub snapshot: SnapshotRecord,
+    pub delivery: SnapshotDeliveryRecord,
+    pub replayed: bool,
 }
 
 /// One atomic control-catalog publication of an immutable Commit.

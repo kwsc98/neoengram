@@ -107,7 +107,7 @@ const navGroups = computed(() => {
               },
             ]
           : []),
-        { name: 'job-query', label: '活动', icon: Search, params: { tenantId } },
+        { name: 'task-list', label: '操作任务', icon: Search, params: { tenantId } },
         ...(resourceLifecycleEnabled.value
           ? [{ name: 'recycle-bin', label: '回收站', icon: Delete, params: { tenantId } }]
           : []),
@@ -129,6 +129,7 @@ const navGroups = computed(() => {
 
 const activeMenu = computed(() => {
   const name = String(route.name ?? '');
+  if (name === 'commit-detail') return 'artifact-list';
   if (name.startsWith('storage-volume-')) return 'storage-volume-list';
   if (name.startsWith('project-')) return 'project-list';
   if (name.startsWith('artifact-')) return 'artifact-list';
@@ -136,7 +137,7 @@ const activeMenu = computed(() => {
   if (name.startsWith('snapshot-')) return 'snapshot-list';
   if (name.startsWith('object-storage-')) return 'object-storage-list';
   if (name === 'recycle-bin') return 'recycle-bin';
-  if (name === 'job-detail') return 'job-query';
+  if (name === 'task-detail') return 'task-list';
   return name;
 });
 
@@ -155,6 +156,7 @@ async function navigate(name: string, params: Record<string, string>): Promise<v
 
 function targetForTenantSwitch(): string {
   const name = String(route.name ?? '');
+  if (name === 'commit-detail') return 'artifact-list';
   if (name.startsWith('storage-volume-')) return 'storage-volume-list';
   if (name.startsWith('project-')) return 'project-list';
   if (name.startsWith('artifact-')) return 'artifact-list';
@@ -162,8 +164,8 @@ function targetForTenantSwitch(): string {
   if (name.startsWith('snapshot-')) return 'snapshot-list';
   if (name.startsWith('object-storage-')) return 'object-storage-list';
   if (name === 'recycle-bin') return 'recycle-bin';
-  if (name === 'job-create') return 'job-query';
-  if (name === 'job-query' || name === 'job-detail') return 'job-query';
+  if (name === 'task-detail') return 'task-list';
+  if (name === 'task-list') return 'task-list';
   return 'tenant-overview';
 }
 

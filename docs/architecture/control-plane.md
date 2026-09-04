@@ -10,7 +10,7 @@
 > 已分别通过，完整 Central/Registry/outbox/签名业务 E2E、外部生产凭据适配、真实集群故障/就绪与维护
 > 窗口切换仍需验收。
 >
-> 最后更新：2026-09-01。Snapshot 的当前实现基线与目标产品差异见 [`../current-state.md`](../current-state.md)。
+> 最后更新：2026-09-04。Snapshot 的当前实现基线与目标产品差异见 [`../current-state.md`](../current-state.md)。
 >
 > 目标架构决策：Central 主动连接每个 EdgeCluster 的多副本 NeoEngram GatewayPool，Agent 只连接本集群
 > Gateway；Agent 控制链固定经 Gateway，当前 Agent 已改为 Gateway-only 配置。Gateway
@@ -24,8 +24,9 @@
 > Agent enrollment/session/Job transport 开发 adapter。NeoEngram Gateway 的协议、Gateway Registry、管理面和
 > fail-closed 服务/部署骨架和 Replica activation challenge/proof/证书投递已部分实现；生产
 > 外部生产 issuer/KMS-HSM adapter、真实集群 readiness/failover 和切换仍是后续工作。PostgreSQL、跨 Volume 数据通道、NFS fencing、
-> HA 与生产部署也不是当前开发运行能力。G2 v2 已加入对象级 Materialization Domain、Authority schema 18、Central planner/API、
-> Agent/Gateway v2 stream/relay 和 InMemory/SQLite 契约；v1 replication/PlacementSet 表与旧 Assignment/report 仍并存。
+> HA 与生产部署也不是当前开发运行能力。G2 v2 已加入对象级 Materialization Domain、Authority schema 20、Central planner/API、
+> OperationTask 统一任务层、Agent/Gateway v2 stream/relay 和 InMemory/SQLite 契约；v1 replication/PlacementSet 表与旧 Assignment/report
+> 仅作为私有拒绝/迁移残留，不属于公开兼容路径。
 > 真实跨 Gateway route、三 Agent 多源失败恢复、生产凭据和跨节点 payload E2E 尚未验收。
 >
 > 面向产品、交互和公开 API 的资源口径见
@@ -133,7 +134,7 @@ Agent 的签名 Placement receipt 证明“对象已在该 Volume Durable”。
 | 控制入口 | 已确认 | 用户、CLI、UI 和自动化系统只调用 `neoengram-central`，不能直接向 Agent 下发业务命令 |
 | Agent 控制循环 | Gateway 控制面已接入 | Strict Envelope、heartbeat/assignment/report/failed/decision/finalized 已定义；独立 OpenAPI action、HTTP/2 全双工 NDJSON channel、generation fencing、运行时 mTLS 和中央下行签名校验已实现；完整双 Replica 业务 E2E、生产凭据轮换与真实集群切换待验收 |
 | 领域根 | 已确认 | Artifact 是版本化抽象文件系统；产品目标上创建时为空或从同 Tenant 另一个 Artifact 的明确 Commit 派生，当前 Central 仅实现空初始化；不能表示 Job 输出或临时传输文件 |
-| 可变/只读视图 | 已确认 | Playground 是单区域读写工作区；Snapshot 是固定 Commit 的逻辑只读引用；单区域 RO placement 由 SnapshotDelivery 独立表示 |
+| 可变/只读视图 | 已确认 | Playground 是单区域读写工作区；Snapshot create 固定 Commit、EdgeCluster、StorageVolume 和交付模式，并原子生成唯一 SnapshotDelivery；Delivery Ready 后才可读 |
 | 集群边界 | 已确认 | EdgeCluster 是网络/调度/故障域；跨集群不共享 NFS，后续固定经源 Agent/Gateway -> 目标 Gateway/Agent 传输 Commit 对象 |
 | 资源归属 | 已确认 | Index/对象属于 Tenant/Artifact，Playground 属于 StorageVolume placement；均不属于 Agent |
 | Artifact 存储位置 | 已确认 | 一个 Tenant 每集群可有多个 Volume；一个 Volume 可放同租户多个 Artifact；一个 Artifact 每集群最多一个活动 placement |
@@ -174,8 +175,8 @@ Artifact（版本化抽象文件系统）
 │       └── root Directory / Manifest（该版本内部的文件系统树）
 ├── Ref[*] ──▶ Commit
 ├── Playground[*]（读写；从 base Commit 创建，可发布新 Commit）
-└── Snapshot[*] ──▶ snapshot_id + fixed Commit
-    └── SnapshotDelivery[*] ──▶ target Volume/Region + RO mode + materialization state
+└── Snapshot[*] ──▶ snapshot_id + fixed Commit + fixed target
+    └── SnapshotDelivery[1] ──▶ target Volume/Region + RO mode + materialization state
 
 ObjectNamespace[*] ──▶ Commit ObjectSet
 ├── ObjectPlacement[*]（对象级 Durable 事实）
@@ -196,9 +197,10 @@ ObjectNamespace[*] ──▶ Commit ObjectSet
   才把历史模型升级为 DAG；
 - `Playground` 保存 `base_commit_id + PlaygroundIndex/IndexVersion + placement`，是唯一允许产生
   staged/unstaged 变化的视图；一次 commit 从 Playground 发布新的不可变 Commit；
-- `Snapshot` 以独立 `snapshot_id` 为资源身份，只绑定 `artifact_id + commit_id` 的逻辑引用，不绑定
-  StorageVolume 或 Region；物理只读访问由一个或多个 `SnapshotDelivery` 表示。Delivery 固定目标
-  Volume、派生 Region 和模式，状态独立推进；读取会话、lease 和可选 dataset profile 是独立资源；
+- `Snapshot` 以独立 `snapshot_id` 为资源身份，创建时固定 `artifact_id + commit_id`、目标
+  EdgeCluster/StorageVolume 和交付模式，并在同一原子操作中生成唯一 `SnapshotDelivery`。Delivery 固定
+  目标 Volume、派生 Region 和模式，状态独立推进；目标不可切换，也不允许创建第二个 Delivery；读取
+  会话、lease 和可选 dataset profile 是独立资源；
 - Agent 上传的 IndexDelta/ObjectReceipt 分页结果统一称为 `MetadataBatch`，不得再称为 Artifact。
 
 ### 3.2 租户与数据资源
@@ -210,7 +212,7 @@ Tenant
 │   └── Artifact
 │       ├── Ref[*] ──▶ Commit history DAG
 │       ├── Commit[*] ──▶ root Directory / Manifest
-│       ├── Snapshot[*] ──▶ fixed Commit
+│       ├── Snapshot[*] ──▶ fixed Commit + fixed target
 │       ├── PodMountBinding[*] ──▶ SnapshotDelivery / Playground
 │       ├── ArtifactPlacement[*]（每 EdgeCluster 最多一个 active）
 │       ├── PlaygroundIndex / IndexVersion
@@ -219,15 +221,17 @@ Tenant
 │           ├── PlaygroundAttachment[*]
 │           ├── PlaygroundLease[*]（多共享读或单排他写）
 │           └── StatusObservation[*]
-├── Job / MetadataBatch / AuditEvent
-├── TransferTicket（v1 legacy）/ MaterializationBatchTicket（v2）
+├── OperationTask[*]（所有写操作的生命周期/审计根）
+│   └── Job、Materialization、Pre-commit 等领域明细与子任务
+├── MetadataBatch / AuditEvent
+├── MaterializationBatchTicket（v2；旧 TransferTicket 仅作拒绝边界）
 ├── ObjectReadLease / StagingLease / S3BucketBinding / S3AccessPoint
 └── Quota / Usage / RetentionPolicy
 ```
 
 不变量：
 
-- 每个 Artifact 只属于一个 Tenant；Commit、Snapshot、Playground、Job、Ref、对象位置和票据继承相同租户；
+- 每个 Artifact 只属于一个 Tenant；Commit、Snapshot、Playground、OperationTask、Job、Ref、对象位置和票据继承相同租户；
 - Tenant 迁移是显式导出/导入流程，不能通过更新一列 `tenant_id` 完成；
 - 用户或服务身份可以属于多个 Tenant，但一次普通请求只能选择一个已授权租户作用域；
 - ID 是定位符，不是授权凭据。知道 Playground ID、Commit ID 或 BLAKE3 Hash 不产生读取权限；
@@ -263,8 +267,8 @@ EdgeCluster A ──x── EdgeCluster B       # 无 Agent/NFS 直连假设
 | `Artifact` | 一个版本化抽象文件系统；拥有 Commit 历史、Ref、Playground、Snapshot 和对象归属 |
 | `Commit` | Artifact 的不可变版本节点，包含 parent 和该版本文件系统树的 root Directory；v2 不绑定单一 Volume |
 | `Playground` | Artifact 下基于某个 Commit 的读写工作区；引用所在集群的 ArtifactPlacement，并使用其下相对路径 |
-| `Snapshot` | 具有独立 ID、固定到 Artifact 某个 Commit 的逻辑只读引用；不拥有 Volume/Region |
-| `SnapshotDelivery` | Snapshot 在一个目标 Volume/Region 上的 RO 物理投影，固定模式并拥有独立物化状态、generation 和错误 |
+| `Snapshot` | 具有独立 ID，固定到 Artifact 某个 Commit 及一个目标 EdgeCluster/StorageVolume/交付模式；创建时原子生成唯一 Delivery |
+| `SnapshotDelivery` | Snapshot 唯一的 RO 物理投影，固定目标 Volume/Region 和模式并拥有独立物化状态、generation 和错误 |
 | `EdgeCluster` | 一个边缘/Kubernetes 集群及其网络、调度、凭证和故障域 |
 | `ComputeNode` | CPU 主机、VM 或 Kubernetes Node；只表示执行位置 |
 | `AgentInstance` | 与一个 StorageVolume 常驻绑定的 Agent 进程身份、证书、版本、capability、session 和最近 heartbeat |
@@ -279,8 +283,9 @@ EdgeCluster A ──x── EdgeCluster B       # 无 Agent/NFS 直连假设
 | `ObjectNamespaceId` | 所有对象事实、Materialization、Ticket、Lease 和数据库键的必填隔离域；首期等于 `ArtifactId` |
 | `ObjectPlacement` | 一个 namespace/object 在一个 Volume/archive 和 placement generation 上已校验并 Durable 的对象事实 |
 | `VolumeCommitCoverage` | 根据 ObjectPlacement 证据派生的目标 Volume `partial/complete` 覆盖摘要，不是独立事实 |
-| `MaterializationJob` | 面向目标 Volume 的对象补齐意图，唯一键包含 tenant、namespace、Commit、target Volume、coverage goal |
-| `MaterializationBatch` | Job 内按 source Agent/Volume/route 分组的传输批次；不单独产生用户复制任务 |
+| `OperationTask` | 所有写操作的统一生命周期、Attempt、重试/取消和审计根任务；即时操作也记录任务 |
+| `MaterializationJob` | `commit.materialize` OperationTask 关联的面向目标 Volume 的对象补齐明细，唯一键包含 tenant、namespace、Commit、target Volume、coverage goal |
+| `MaterializationBatch` | Job 内按 source Agent/Volume/route 分组的传输批次；不单独产生用户复制任务，公开任务只展示 Batch 摘要 |
 | `MaterializationObject` | 单对象状态、稳定 staging key、confirmed offset、primary/fallback placement、attempt 和 plan revision |
 | `PlaygroundLease` | Playground 共享读/排他写 holder、Job、fencing token、过期时间和状态 |
 | `GatewayPool` | 一个 EdgeCluster 的逻辑控制和后续数据/S3 入口；生产由多个 Replica 提供服务 |
@@ -404,7 +409,7 @@ flowchart TB
             POD_A["现有 User / Training Pod A<br/>/workspace"]
         end
         AGENT_A -->|"本集群 AgentMount"| NFS_A
-        NFS_A -->|"精确 Playground/Snapshot 目录<br/>经节点 NFS/CSI 挂到 /workspace"| POD_A
+        NFS_A -->|"精确 Playground/SnapshotDelivery 目录<br/>经节点 NFS/CSI 挂到 /workspace"| POD_A
     end
 
     subgraph CLUSTER_B["EdgeCluster B：独立网络域 / 目标集群"]
@@ -423,7 +428,7 @@ flowchart TB
             POD_B["现有 User / Training Pod B<br/>/workspace"]
         end
         AGENT_B -->|"本集群 AgentMount"| NFS_B
-        NFS_B -->|"精确 Playground/Snapshot 目录<br/>经节点 NFS/CSI 挂到 /workspace"| POD_B
+        NFS_B -->|"精确 Playground/SnapshotDelivery 目录<br/>经节点 NFS/CSI 挂到 /workspace"| POD_B
     end
 
     USER -->|"tenant-scoped API"| API
@@ -533,12 +538,12 @@ PrepareAdd
 
 | 平面 | 内容 | 权威/路径 |
 | --- | --- | --- |
-| 控制面 | Tenant、RBAC、Job、调度、Desired State | 中心权威；控制消息固定经 Gateway 转发，生产切换验收完成前仍 fail-closed，目标 Central -> Gateway <- Agent |
+| 控制面 | Tenant、RBAC、OperationTask、内部 Job/Assignment、调度、Desired State | 中心权威；控制消息固定经 Gateway 转发，生产切换验收完成前仍 fail-closed，目标 Central -> Gateway <- Agent |
 | 集群拓扑面 | EdgeCluster、GatewayPool/Replica、AgentRouteLease、placement、TransferRoute | 中心 registry；不从 IP/hostname 隐式推断集群 |
 | 发布元数据面 | Playground Index、Commit catalog、Ref、lease/fence | 中心 CAS；P0 内存 publisher，未来 PostgreSQL |
 | 执行元数据面 | Agent Ledger/cache、IndexDelta/Receipt/Job MetadataBatch | 独立 Agent 状态 PVC 或临时 MetadataBatch |
 | Volume 数据面 | Playground、journal 和 Managed 不可变 Object payload | Agent 访问受管根；对象位于 `.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects`；现有 Pod 经 NFS/CSI 直达精确视图目录 |
-| 跨 Volume 数据面 | 固定 Commit/Snapshot 的对象级 Materialization | v1 replication/route/ticket 控制链仍为 legacy；v2 Central planner、ObjectPlacement/Coverage、batch Ticket/manifest/checkpoint 校验和 QUIC 预检辅助已接入；Agent/Gateway 专用 v2 frame/relay、真实 payload/receipt 和跨节点 E2E 仍待验收，Central 只编排且不代理 payload |
+| 跨 Volume 数据面 | 固定 Commit/Snapshot 的对象级 Materialization | v1 replication/route/ticket 控制链仅为私有拒绝/迁移边界；v2 Central planner、ObjectPlacement/Coverage、batch Ticket/manifest/checkpoint 校验和 QUIC 预检辅助已接入；Agent/Gateway 专用 v2 frame/relay、真实 payload/receipt 和跨节点 E2E 仍待验收，Central 只编排且不代理 payload |
 | S3 读取面 | 固定 Commit/Snapshot 的 LIST/HEAD/GET/Range | Central S3 管理/授权与 Gateway 只读 listener 已实现；需目标 Volume 完整 Coverage、视图校验、Ready GatewayPool、Agent route、signed read ticket 和生产凭据，不是中心 durability backend；v1 PlacementSet 仅作 legacy 拒绝边界 |
 | 本地恢复面 | WAL、Job Ledger、临时文件 | 当前 Agent 独立状态 PVC；不作为中心业务权威 |
 
@@ -549,10 +554,10 @@ PrepareAdd
 | Tenant、身份、RBAC、Quota | 中心 | P0 `Authorizer` port；未来 PostgreSQL RLS + 服务层授权 |
 | Cluster/Agent/Node/Volume/Attachment registry | 中心 | Agent 上报 Actual State，中心保存 topology/placement/Desired State |
 | GatewayPool/Replica/AgentRouteLease | 中心 | Gateway 本地连接目录可丢弃；Central 原子判定唯一 Agent owner 和 generation |
-| Job 意图与最终结果 | 中心 | Agent Ledger 是执行恢复副本 |
+| OperationTask 生命周期与审计、领域 Job/Materialization 意图与最终结果 | 中心 | Agent Ledger 是执行恢复副本；领域明细不能替代 OperationTask 生命周期 |
 | 当前 Playground Index/IndexVersion | 中心 | P0 内存 publisher；未来 PostgreSQL 行/分页结构，均通过 expected-version CAS |
 | 已发布 Commit/Ref | 中心 | Ref 只通过 expected-value CAS 更新 |
-| Agent state/Ledger | Agent 本地恢复副本 | 不替代中心 Job/Assignment/Lease 权威 |
+| Agent state/Ledger | Agent 本地恢复副本 | 不替代中心 OperationTask、Job/Assignment/Lease 权威 |
 | Agent Playground cache | 无全局权威 | 只缓存某 IndexVersion，可删除并从中心重建 |
 | Agent Job candidate | 无全局权威 | 中心尚未接收的临时 Delta/Receipt/MetadataBatch |
 | Playground 当前字节 | StorageVolume | 修改必须受 PlaygroundLease 和 journal 保护 |
@@ -565,9 +570,10 @@ PrepareAdd
 
 P0 的 `services/neoengram-central` 是 transport/storage-independent library，已实现：
 
+- 统一 `TaskCoordinator`/`TaskRepository` 的 OperationTask 创建、幂等、CAS 状态、Attempt 和事件；
 - `CreateAddJob`、`AssignJob`、`ReceiveReport`、`StageMetadataBatch`、外部 `FinalizeAdd` 与内部
   `ResumePublication`；
-- `Authorizer`、`JobRepository`、`AssignmentOutbox`、`MetadataBatchStager`、`ObjectCatalog`、
+- `Authorizer`、领域 `JobRepository`、`AssignmentOutbox`、`MetadataBatchStager`、`ObjectCatalog`、
   `IndexPublisher`、`AuditSink`、`Clock` ports；
 - 内存 repositories/outbox/stager/object catalog/audit，以及原子发布 canonical Manifest catalog 与
   expected `IndexVersion` CAS 的幂等 publisher；
@@ -599,9 +605,9 @@ services/neoengram-central/
 
 用户 Web 控制台独立位于 `apps/neoengram-web/`，不嵌入中心 library，也不进入 Cargo workspace。
 它只能调用公开 OpenAPI；首版使用 MSW 模拟已定义 operation，包括 StorageVolume 登记、
-多租户资源创建/浏览、Playground Commit 与 Managed Add Job。当前 Central descriptor 安装 registry 中除
-Snapshot file/activity/profile 三条 contract-only 路由外的公开 action，包含 Project、Commit graph/diff/
-replication、SnapshotDelivery、S3、lifecycle 和 Gateway Registry 管理；实际执行仍受 capabilities 和
+多租户资源创建/浏览、Playground Commit、Managed Add 与统一 OperationTask。当前 Central descriptor 安装 registry 中除
+Snapshot file/activity/profile 三条 contract-only 路由外的公开 action，包含 Project、Commit graph/diff、v2
+Materialization、SnapshotDelivery、OperationTask、S3、lifecycle 和 Gateway Registry 管理；实际执行仍受 capabilities 和
 enrollment/coordinator/keyring 等运行时依赖约束。启用 enrollment 后还提供独立 OpenAPI 定义的 `/agent/*`
 action operations。
 目标切换后 `/agent/*` 只经 Gateway 内部链路到达，旧公网 Agent listener 关闭。
@@ -1123,7 +1129,8 @@ session 状态。运行角色不得拥有 `BYPASSRLS`。
 
 ### 8.3 跨租户操作
 
-普通 `TransferJob` 只允许源和目标属于同一 Tenant。未来如需要租户间复制，必须设计独立
+普通 `commit.materialize` OperationTask（及其 MaterializationJob 明细）只允许源和目标属于同一 Tenant。
+未来如需要租户间复制，必须设计独立
 `CrossTenantCopy`：同时验证源导出和目标导入权限，固定 Snapshot，在目标租户重新验证并发布独立
 对象副本。它不能修改原对象归属、复用源凭证或共享 inode。
 
@@ -1133,7 +1140,7 @@ session 状态。运行角色不得拥有 `BYPASSRLS`。
 active -> suspended -> deleting -> deleted
 ```
 
-- `suspended` 拒绝新写 Job、租约和票据，可按策略保留受控只读导出；
+- `suspended` 拒绝新写 OperationTask、租约和票据，可按策略保留受控只读导出；
 - `deleting` 撤销凭证、停止调度、等待安全点、建立包含中心/NFS/Gateway/备份的删除清单；
 - 删除按 retention/legal hold 执行，不能运行缺少租户过滤的全局删除；
 - 审计按合规期限保留，但与 payload、访问凭证和可恢复 Snapshot 分离；
@@ -1254,9 +1261,11 @@ Managed Agent  -> protocol -> neoengram-central AuthorityStore -> SQLite (defaul
 - 从 Standalone 纳管到 Managed、或反向导出，是显式 import/export 流程，不是两个 MetadataStore
   的双向复制。
 - Managed SQLite 使用单一 `authority.sqlite3`/`authority.lock`，绝不复用仓库格式 9 数据库；当前
-  authority schema identity 为 `application_id = 0x4e454155`、`user_version = 18`；v2 新增 namespace/object
-  placement、Coverage、Materialization 和 read/staging lease 表。v1 v13-v17/旧拆分数据库仍按显式步骤处理，
-  未知 schema 不探测、回退或双读；当前 v1 replication 表尚未从 v18 纵切中删除，clean-slate reset/rebuild 仍是后续运维动作。
+  authority schema identity 为 `application_id = 0x4e454155`、`user_version = 20`；v2 新增 namespace/object
+  placement、Coverage、Materialization 和 read/staging lease 表，并把 Snapshot 的唯一 Delivery 目标绑定
+  固定在同一原子创建路径。v19 及更早 authority 数据库与 v20 DDL 不兼容，旧拆分数据库只能按显式
+  reset/inventory-rebuild 步骤处理；未知 schema 不探测、回退、双读或隐式迁移。旧 v1 replication 表
+  仅作为源码迁移残留，公开路由和 v20 调度不会读取它们。
 - Agent Registry、Gateway Registry、S3、Snapshot 和生命周期表都安装在同一 authority 数据库内，
   所有相关 mutation 使用同一个 SQLite 事务和锁；不再创建独立 Registry 数据库。
 - Control catalog v4 到 v5 不会从旧 Playground 反向合成 Artifact。只要 v4 中存在 Playground，
@@ -1268,7 +1277,7 @@ Managed Agent  -> protocol -> neoengram-central AuthorityStore -> SQLite (defaul
 
 ### 10.2 中心权威范围与未来 PostgreSQL
 
-中心至少权威保存以下数据。当前 Artifact catalog、Job/outbox/MetadataBatch/ObjectPlacement/Playground Index/Manifest/
+中心至少权威保存以下数据。当前 Artifact catalog、OperationTask/TaskAttempt/TaskEvent、领域 Job/outbox/MetadataBatch/ObjectPlacement/Playground Index/Manifest/
 publication outcome/audit 已由 InMemory 与 SQLite 共同契约覆盖；未来 PostgreSQL/MySQL 后端独立实现
 各自 SQL、migration 和物理 schema：
 
@@ -1278,12 +1287,13 @@ publication outcome/audit 已由 InMemory 与 SQLite 共同契约覆盖；未来
 | Artifact、Playground、StorageBinding | 稳定逻辑 ID，不保存 Agent 本地绝对路径 |
 | Playground Index 与 `IndexVersion` | 行或分页结构；通过 expected-version CAS 发布 |
 | IndexUpdateSession、staging rows | 绑定 Job、Tenant、Playground、base IndexVersion 和完整 digest |
+| OperationTask、TaskAttempt、TaskEvent、TaskResourceLink/Relation | 统一写操作身份、状态、重试/取消、父子关系、资源反查和追加审计事件；高频进度只更新任务摘要 |
 | Commit、Directory、Manifest、Ref | 规范内容 ID；完整引用图验证；Ref expected-value CAS |
 | v1 ObjectPlacement/ObjectReceipt/Location（legacy） | 绑定 Tenant/Artifact/Volume/ArtifactPlacement/placement generation；仅保存凭证，不保存 payload 或 mount path |
 | v2 ObjectPlacement/ObjectReceipt | 必须绑定 Tenant/ObjectNamespace/ObjectRef、size/encoding/digest、Volume/archive、failure domain 和 placement generation；只保存 Durable 凭证，不保存 payload 或 mount path |
 | v2 VolumeCommitCoverage | 由 namespace/Commit/target Volume 的 verified ObjectPlacement 重算 `partial/complete`；不作为独立对象存在事实 |
 | v2 MaterializationJob/Batch/Object | Job 唯一键含 tenant/namespace/commit/target Volume/coverage goal；Batch/Object 保存 plan revision、attempt、source fallback、stable staging key 和 confirmed offset |
-| Job、Lease、fencing、AuditEvent | 中心意图和最终结果权威，Agent Ledger 只用于本地恢复 |
+| 领域 Job、Lease、fencing、Decision | 执行明细权威；用户生命周期和审计以 OperationTask 为准，Agent Ledger 只用于本地恢复 |
 
 Index 发布使用 staging table，而不是逐条边验证边改 current 表：中心先完整接收并导入候选，校验页数、
 记录数、路径唯一性、对象引用、配额和 digest，再在一个 PostgreSQL 事务中：
@@ -1420,8 +1430,8 @@ Agent 绝不能在业务 PVC 上打开 SQLite。把 `journal_mode` 改成 DELETE
 用户/CLI/UI 的首版公开契约见 [`../openapi/neoengram-api.yaml`](../openapi/neoengram-api.yaml)。它使用
 OpenAPI 3.1、普通 JSON 和模块/子域/动作路径；path 不含版本，认证业务方法通过
 `NeoEngram-API-Version: 1` header 协商版本，错误使用 RFC 9457 Problem Details。独立
-`neoengram-central` 默认实现版本查询、live/ready、资源 catalog、legacy Commit replication、v2 Commit
-Materialization/Coverage/Availability、SnapshotDelivery、S3/lifecycle、Job 和 Gateway Registry action；启用
+`neoengram-central` 默认实现版本查询、live/ready、资源 catalog、v2 Commit
+Materialization/Coverage/Availability、统一 OperationTask、SnapshotDelivery、S3/lifecycle 和 Gateway Registry action；启用
 enrollment 后还实现 Storage enrollment 管理路径。以下
 清单是主要用户/Agent action 摘要，不替代 `PUBLIC_ACTION_REGISTRY`；精确状态见清单后的说明；
 `neoengram-central` 自身始终保持 library-only：
@@ -1447,12 +1457,14 @@ POST /api/artifact/create
 POST /api/artifact/commit/graph/query
 POST /api/artifact/commit/diff/query
 POST /api/commit/materialize
-POST /api/commit/materialization/query
-POST /api/commit/materialization/list/query
-POST /api/commit/materialization/retry
-POST /api/commit/materialization/cancel
 POST /api/commit/coverage/query
 POST /api/commit/availability/query
+POST /api/task/list/query
+POST /api/task/query
+POST /api/task/event/list/query
+POST /api/task/summary/query
+POST /api/task/retry
+POST /api/task/cancel
 POST /api/playground/list/query
 POST /api/playground/query
 POST /api/playground/create
@@ -1472,9 +1484,6 @@ POST /api/snapshot/delivery/retry
 POST /api/snapshot/file/list/query
 POST /api/snapshot/activity/list/query
 POST /api/snapshot/dataset/profile/query
-POST /api/job/add/create
-POST /api/job/query
-POST /api/job/add/finalize
 GET  /health/live
 GET  /health/ready
 
@@ -1492,15 +1501,15 @@ POST /agent/session/close
 ```
 
 公开 OpenAPI 已定义；当前 server 已实现 Tenant、Project、StorageVolume、Storage enrollment、Artifact
-commit graph/diff、Playground、逻辑 Snapshot、SnapshotDelivery、legacy Commit replication、v2 Commit
-Materialization/Coverage/Availability、S3/lifecycle、Job
+commit graph/diff、Playground、固定目标 Snapshot、SnapshotDelivery、v2 Commit
+Materialization/Coverage/Availability、统一 OperationTask、S3/lifecycle
 和 Gateway Registry action，支持 PVC enrollment token/审批、已有 PVC/NFS StorageVolume 兼容登记与资源放置
 选择。只有 Snapshot file/activity/dataset-profile 三条 path 仍为 contract-only，没有 Central handler；其余
 路由可能因 capability、placement、coordinator、command keyring 或 Agent route 不可执行。v2 Materialization
 action 目前主要证明 Central planner/Authority 状态和幂等行为；Agent 未声明 `commit_materialization_v2` 前不应
 调度真实批次。它不负责创建
 Kubernetes PV/PVC 或 NFS。Gateway Registry 管理 action 和 G1 H2/mTLS tunnel 已实现，但完整双 Replica
-业务 E2E、生产凭据与切换验收仍未完成；统一 Job cancel/list 或文件树等更高层运营能力仍可能尚不可用，也不暴露中心内部 `AssignJob`、`ExpireAddJob` 或
+业务 E2E、生产凭据与切换验收仍未完成；统一 OperationTask 详情、事件和状态控制仍受对应能力开关约束，也不暴露中心内部 `AssignJob`、`ExpireAddJob` 或
 `ResumePublication`。用户 API 与 Agent API 使用不同认证域。用户 API 使用
 OIDC principal 和 Tenant RBAC，身份或授权无法确认时默认拒绝；Agent enrollment 使用一次性 token 与
 Ed25519 proof，批准后每个 session action 继续使用绑定 `AgentInstance/installation/boot/session` 的
@@ -1697,6 +1706,15 @@ PROTOCOL_UNSUPPORTED
 ### 11.5 中心与 Agent 状态机
 
 ```text
+OperationTask（用户/运维统一权威）
+queued -> running -> waiting/verifying -> succeeded
+                         |       |
+                         v       v
+                      stalled   failed
+                         |
+                       queued  // 仅 retryable 任务
+cancelled（终态）
+
 CentralJobState（权威）
 queued -> assigned -> accepted -> running -> prepared -> publishing -> succeeded
                                               |             └-------> conflicted
@@ -1709,6 +1727,7 @@ claimed -> accepted -> running -> prepared -> awaiting_decision -> finalizing ->
 任一可恢复阶段 Agent 重启：recovering -> 对账后的稳定状态
 ```
 
+`CentralJobState` 是 OperationTask 下的 Agent 执行明细状态；用户查询和控制以 OperationTask 为准。
 protocol `JobState` 完整覆盖 `queued`、`assigned`、`accepted`、`running`、`prepared`、`publishing`、
 `cancel_requested`、`succeeded`、`conflicted`、`rejected`、`failed`、`cancelled`、`timed_out`、
 `recovery_required` 和观测用 `unknown`。中心不能把传输状态或 Agent 局部状态绕过状态机直接映射为
@@ -1728,12 +1747,16 @@ Publish/Conflict decision；存在 Prepared candidate 时仍须完成本地 fina
 
 ### 11.6 幂等与重试
 
+所有外部写请求先创建或幂等复用一个 OperationTask。`retry`/`cancel` 不创建新的根任务：retry
+递增同一任务的 Attempt 并回到 `queued`，cancel 追加控制事件并进入终态；领域 Job/Assignment
+仍按下述内部协议执行。
+
 AssignJob 先通过 outbox `reserve` 原子占用 tenant-scoped Assignment ID；reservation 此时耐久但不可
 投递。`JobRepository` CAS 持久化完整 Assignment 后才 `publish`，因此 ID 冲突不会污染 Job，而 publish
 失败可以从已持久化 Assignment 幂等恢复。P0 使用内存 adapter，生产目标使用 PostgreSQL。Agent 先在
 Ledger 持久化，再向中心确认 accepted。
 
-- `(tenant_id, job_id)` 相同且 Request digest 相同：返回原状态/结果；
+- `(tenant_id, task_id/request_id)` 相同且 Request digest 相同：返回同一 OperationTask 及其领域结果；
 - Job ID 相同而 digest 不同：`JOB_ID_REUSED`；
 - 用户提交超时：向中心查询同一 Job/idempotency key，不能生成新 Job 猜测重试；
 - Agent 状态丢失但副作用可能存在：进入 recovering，由 journal、ObjectReceipt、MetadataBatch 和中心 CAS
@@ -1854,7 +1877,7 @@ checkout，或显式 ArtifactPlacement 迁移状态机。
 ### 12.6 跨 EdgeCluster/StorageVolume Checkout
 
 > **G2 v2 目标数据执行流程（控制面纵切已接入，数据面未完成）：**本节定义跨集群对象物化和 checkout 的约束。
-> v1 Commit replication、TransferRoute/TransferTicket 仍是 legacy；v2 Central 已有 MaterializationJob、
+> v1 Commit replication、TransferRoute/TransferTicket 仅是私有拒绝/迁移残留；v2 Central 已有 MaterializationJob、
 > Coverage、批次 Ticket 和签发/校验边界。完整 payload 执行仍要求 ready route、command keyring、Agent executor
 > 和跨节点 E2E，不能把控制记录当成已完成复制。
 
@@ -1874,13 +1897,13 @@ checkout，或显式 ArtifactPlacement 迁移状态机。
 10. Central 重算 Coverage、保存 Materialization 结果并释放 object-read/staging lease；当前步骤 4-8 的真实 executor/E2E 尚未接通
 ```
 
-普通 Transfer 不允许跨租户。禁止目标 Agent 挂载源 NFS，也禁止让 Server API 代理或持久化 payload。
+普通 `commit.materialize` OperationTask 不允许跨租户。禁止目标 Agent 挂载源 NFS，也禁止让 Server API 代理或持久化 payload。
 源端只能在 v2 BatchManifest/Ticket 指定的 namespace/object 范围内供给数据；路由不可达、票据过期、目标空间不足或
 Volume/Gateway 故障时，保留目标卷已经验证的可恢复进度，但绝不发布 partial Coverage 为可读 Playground/SnapshotDelivery。
 
 ### 12.7 ArtifactPlacement 迁移
 
-在同一 EdgeCluster 内改变 Artifact 的 NFS/StorageVolume，或把某个集群的活动副本切到另一 Volume，
+在同一 EdgeCluster 内改变 Artifact 的 NFS/StorageVolume，或把某个集群的活动写入位置切到另一 Volume，
 必须使用显式状态机：
 
 ```text
@@ -1937,7 +1960,7 @@ GatewayReplica 不挂载 source 或 destination Volume，不读取 Playground/jo
 
 > **当前边界（G2/G3）：**Gateway-to-Gateway 传输和只读 S3 的协议/监听器代码已经存在，但实际数据路径
 > 仍由能力开关、目标完整 `VolumeCommitCoverage`/视图校验、GatewayPool/Agent route、v2 batch signed ticket、
-> 外部凭据和部署验收决定；旧 Ready PlacementSet 只属于 v1 legacy。
+> 外部凭据和部署验收决定；历史 Ready PlacementSet 仅属于 v1 legacy，不是 v2 的 Ready 依据。
 > 以下约束仍是目标生产流程，不把 loopback harness 或控制面记录当成跨节点完成证据。
 
 后续跨集群链路固定为：
@@ -2295,10 +2318,10 @@ Agent 重启不丢失已接受只读 Job 的可查询结果；登记的用户 Po
 
 ### A2：中心 MetadataStore 与 Agent 本地数据库
 
-- 已完成中心 `AuthorityStore`、SQLite Job/outbox/MetadataBatch/ObjectCatalog/IndexPublisher/Audit 持久化、
+- 已完成中心 `AuthorityStore`、SQLite OperationTask/TaskEvent 与领域 Job/outbox/MetadataBatch/ObjectCatalog/IndexPublisher/Audit 持久化、
   tenant-scoped 约束、原子 publication 和重开恢复；
 - 后续独立建立 PostgreSQL Playground Index/IndexVersion、staging、Commit/Directory graph、Ref、
-  ObjectPlacement/Coverage、Materialization、Job 和 Audit schema，启用 RLS 和 tenant-scoped 复合约束；
+  ObjectPlacement/Coverage、Materialization、OperationTask 及领域 Job/Audit schema，启用 RLS 和 tenant-scoped 复合约束；
 - 已实现 system identity DB 与按 Tenant 隔离的 SQLite Ledger adapter，包括 `database_identity`
   验证；enrollment daemon 已接 system identity，后续接入 Job Ledger/session 并补齐可选 Playground
   cache/Job candidate adapter；
@@ -2415,7 +2438,7 @@ Gateway 持久存储均没有 payload。
 - activation token 重放、错误 URI SAN、跨集群证书、过期/撤销证书和端到端 payload 篡改失败关闭；
 - 同 Cluster/Volume 不复制、跨 Cluster/Volume 缺块拉取和断点续传；
 - source/destination cluster、Gateway、Agent 或 route 任一不匹配时 Ticket 硬失败；
-- 禁止无 TransferJob/Ticket 的 Agent-to-Agent、目标直接挂载源 NFS 和 Server API payload relay；
+- 禁止无 `commit.materialize` OperationTask/MaterializationBatch Ticket 的 Agent-to-Agent、目标直接挂载源 NFS 和 Server API payload relay；
 - 部分响应、连接中断、Ticket 过期、源下线、对象截断/变长/同大小 Hash 损坏；
 - Tenant/Artifact/Object 白名单、凭证、日志、List/Range 和管理 API 隔离；
 - 256 KiB、1 MiB、4 MiB、WholeFile 在 1/8/32/64/128 并发下的吞吐和 p99；

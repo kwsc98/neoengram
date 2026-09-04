@@ -5,7 +5,7 @@
 //! stores that small piece of local evidence in the shared Agent SQLite database.  It deliberately
 //! stores no object bytes and never accepts a path or placement metadata from the wire.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::RwLock};
+use std::{collections::BTreeMap, num::NonZeroUsize, path::PathBuf, str::FromStr, sync::RwLock};
 
 use neoengram_domain::core::ObjectId;
 use neoengram_domain::protocol::{
@@ -28,6 +28,8 @@ const LOCK_FILE: &str = AGENT_STATE_LOCK_FILE;
 const APPLICATION_ID: i64 = AGENT_STATE_APPLICATION_ID;
 const SCHEMA_VERSION: i64 = AGENT_STATE_SCHEMA_VERSION;
 const INVENTORY_MAGIC: &str = "neoengram-agent-placement-inventory-v2";
+/// Upper bound for one placement inventory enumeration page.
+pub const MAX_PLACEMENT_INVENTORY_PAGE_SIZE: usize = 4_096;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS placement_inventory_metadata (
@@ -65,6 +67,56 @@ pub trait LocalPlacementInventory: std::fmt::Debug + Send + Sync {
     ) -> AgentResult<Option<ObjectPlacement>>;
 
     fn record(&self, placement: ObjectPlacement) -> AgentResult<()>;
+
+    /// Enumerates local placement evidence in a stable order.
+    ///
+    /// Implementations predating the integrity scanner can keep the default error and therefore
+    /// remain source-compatible; a scanner will fail closed if a complete listing is unavailable.
+    fn list_page(
+        &self,
+        _cursor: Option<&str>,
+        _limit: NonZeroUsize,
+    ) -> AgentResult<PlacementInventoryPage> {
+        Err(AgentError::new(
+            AgentErrorCode::InvalidState,
+            "local placement inventory does not support enumeration",
+        ))
+    }
+
+    /// Enumerates every placement using the bounded page API.
+    fn list_all(&self) -> AgentResult<Vec<ObjectPlacement>> {
+        let page_size = NonZeroUsize::new(MAX_PLACEMENT_INVENTORY_PAGE_SIZE)
+            .expect("placement inventory page size is non-zero");
+        let mut cursor = None;
+        let mut placements = Vec::new();
+        loop {
+            let page = self.list_page(cursor.as_deref(), page_size)?;
+            if page.placements.is_empty() && page.next_cursor.is_some() {
+                return Err(AgentError::new(
+                    AgentErrorCode::Internal,
+                    "local placement inventory returned an empty page with a continuation",
+                ));
+            }
+            placements.extend(page.placements);
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(placements);
+            };
+            if cursor.as_deref() == Some(next_cursor.as_str()) {
+                return Err(AgentError::new(
+                    AgentErrorCode::Internal,
+                    "local placement inventory returned a non-advancing cursor",
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+    }
+}
+
+/// A bounded page returned by [`LocalPlacementInventory::list_page`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementInventoryPage {
+    pub placements: Vec<ObjectPlacement>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -318,6 +370,102 @@ impl LocalPlacementInventory for SqlitePlacementInventory {
         drop(connection);
         self.storage.secure_files()
     }
+
+    fn list_page(
+        &self,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> AgentResult<PlacementInventoryPage> {
+        self.validate_metadata()?;
+        let limit = limit.get().min(MAX_PLACEMENT_INVENTORY_PAGE_SIZE);
+        let page_limit = limit.checked_add(1).ok_or_else(|| {
+            AgentError::new(
+                AgentErrorCode::InvalidState,
+                "placement inventory page size overflows",
+            )
+        })?;
+        let decoded_cursor = cursor.map(decode_cursor).transpose()?;
+        if let Some((tenant_id, _, _, _)) = &decoded_cursor {
+            if tenant_id != &self.tenant_id {
+                return Err(AgentError::new(
+                    AgentErrorCode::ScopeMismatch,
+                    "placement inventory cursor belongs to another tenant",
+                ));
+            }
+        }
+
+        let connection = self.storage.connection()?;
+        let mut placements = Vec::with_capacity(page_limit);
+        if let Some((tenant_id, namespace_id, placement_id, object_id)) = decoded_cursor {
+            let mut statement = connection
+                .prepare(
+                    "SELECT tenant_id, object_namespace_id, placement_id, object_id, \
+                            placement_generation, payload \
+                     FROM placement_inventory \
+                     WHERE tenant_id = ?1 AND (\
+                           object_namespace_id > ?2 OR \
+                           (object_namespace_id = ?2 AND placement_id > ?3) OR \
+                           (object_namespace_id = ?2 AND placement_id = ?3 AND object_id > ?4)\
+                     ) \
+                     ORDER BY object_namespace_id, placement_id, object_id \
+                     LIMIT ?5",
+                )
+                .map_err(storage_error)?;
+            let mut rows = statement
+                .query(params![
+                    tenant_id.as_str(),
+                    namespace_id.as_str(),
+                    placement_id.as_str(),
+                    object_id.to_hex(),
+                    page_limit as i64,
+                ])
+                .map_err(storage_error)?;
+            while let Some(row) = rows.next().map_err(storage_error)? {
+                placements.push(decode_inventory_row(
+                    row,
+                    &self.tenant_id,
+                    &self.storage_volume_id,
+                )?);
+            }
+        } else {
+            let mut statement = connection
+                .prepare(
+                    "SELECT tenant_id, object_namespace_id, placement_id, object_id, \
+                            placement_generation, payload \
+                     FROM placement_inventory \
+                     WHERE tenant_id = ?1 \
+                     ORDER BY object_namespace_id, placement_id, object_id \
+                     LIMIT ?2",
+                )
+                .map_err(storage_error)?;
+            let mut rows = statement
+                .query(params![self.tenant_id.as_str(), page_limit as i64])
+                .map_err(storage_error)?;
+            while let Some(row) = rows.next().map_err(storage_error)? {
+                placements.push(decode_inventory_row(
+                    row,
+                    &self.tenant_id,
+                    &self.storage_volume_id,
+                )?);
+            }
+        }
+
+        let has_more = placements.len() > limit;
+        if has_more {
+            placements.truncate(limit);
+        }
+        let next_cursor = has_more.then(|| {
+            encode_cursor(
+                placements
+                    .last()
+                    .expect("a page with more placements cannot be empty"),
+            )
+        });
+        Ok(PlacementInventoryPage {
+            placements,
+            next_cursor,
+        })
+    }
 }
 
 fn identity_mismatch() -> AgentError {
@@ -390,6 +538,132 @@ impl LocalPlacementInventory for InMemoryPlacementInventory {
         entries.insert(key, placement);
         Ok(())
     }
+
+    fn list_page(
+        &self,
+        cursor: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> AgentResult<PlacementInventoryPage> {
+        let limit = limit.get().min(MAX_PLACEMENT_INVENTORY_PAGE_SIZE);
+        let page_limit = limit.checked_add(1).ok_or_else(|| {
+            AgentError::new(
+                AgentErrorCode::InvalidState,
+                "placement inventory page size overflows",
+            )
+        })?;
+        let cursor = cursor.map(decode_cursor).transpose()?;
+        let entries = self.entries.read().map_err(|_| {
+            AgentError::new(
+                AgentErrorCode::Internal,
+                "placement inventory lock poisoned",
+            )
+        })?;
+        let mut placements = Vec::with_capacity(page_limit);
+        for ((tenant, namespace, placement_id, object_id), placement) in entries.iter() {
+            if let Some((cursor_tenant, cursor_namespace, cursor_placement, cursor_object)) =
+                &cursor
+            {
+                let current = (tenant.as_str(), namespace.as_str(), placement_id, object_id);
+                let previous = (
+                    cursor_tenant.as_str(),
+                    cursor_namespace.as_str(),
+                    cursor_placement,
+                    cursor_object,
+                );
+                if current <= previous {
+                    continue;
+                }
+            }
+            placements.push(placement.clone());
+            if placements.len() == page_limit {
+                break;
+            }
+        }
+        let has_more = placements.len() > limit;
+        if has_more {
+            placements.truncate(limit);
+        }
+        let next_cursor = has_more.then(|| {
+            encode_cursor(
+                placements
+                    .last()
+                    .expect("a page with more placements cannot be empty"),
+            )
+        });
+        Ok(PlacementInventoryPage {
+            placements,
+            next_cursor,
+        })
+    }
+}
+
+fn encode_cursor(placement: &ObjectPlacement) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        placement.tenant_id,
+        placement.object_namespace_id,
+        placement.placement_id,
+        placement.object_id.to_hex()
+    )
+}
+
+fn decode_cursor(value: &str) -> AgentResult<(TenantId, ObjectNamespaceId, PlacementId, ObjectId)> {
+    let mut parts = value.split('|');
+    let tenant = parts.next().and_then(|part| TenantId::new(part).ok());
+    let namespace = parts
+        .next()
+        .and_then(|part| ObjectNamespaceId::new(part).ok());
+    let placement = parts.next().and_then(|part| PlacementId::new(part).ok());
+    let object = parts.next().and_then(|part| ObjectId::from_str(part).ok());
+    if parts.next().is_some() {
+        return Err(AgentError::new(
+            AgentErrorCode::ProtocolInvalid,
+            "placement inventory cursor has too many components",
+        ));
+    }
+    match (tenant, namespace, placement, object) {
+        (Some(tenant), Some(namespace), Some(placement), Some(object)) => {
+            Ok((tenant, namespace, placement, object))
+        }
+        _ => Err(AgentError::new(
+            AgentErrorCode::ProtocolInvalid,
+            "placement inventory cursor is invalid",
+        )),
+    }
+}
+
+fn decode_inventory_row(
+    row: &rusqlite::Row<'_>,
+    expected_tenant: &TenantId,
+    expected_volume: &StorageVolumeId,
+) -> AgentResult<ObjectPlacement> {
+    let indexed_tenant = row.get::<_, String>(0).map_err(storage_error)?;
+    let indexed_namespace = row.get::<_, String>(1).map_err(storage_error)?;
+    let indexed_placement = row.get::<_, String>(2).map_err(storage_error)?;
+    let indexed_object = row.get::<_, String>(3).map_err(storage_error)?;
+    let indexed_generation = row.get::<_, String>(4).map_err(storage_error)?;
+    let payload = row.get::<_, Vec<u8>>(5).map_err(storage_error)?;
+    let placement: ObjectPlacement = serde_json::from_slice(&payload)
+        .map_err(|_| storage_corruption("local placement inventory payload is invalid"))?;
+    placement.validate().map_err(|error| {
+        storage_corruption(format!(
+            "local placement inventory record is invalid: {error}"
+        ))
+    })?;
+    if indexed_tenant != placement.tenant_id.as_str()
+        || indexed_tenant != expected_tenant.as_str()
+        || indexed_namespace != placement.object_namespace_id.as_str()
+        || indexed_placement != placement.placement_id.as_str()
+        || indexed_object != placement.object_id.to_hex()
+        || indexed_generation != placement.placement_generation.get().to_string()
+        || placement.storage_volume_id.as_ref() != Some(expected_volume)
+        || placement.archive_id.is_some()
+    {
+        return Err(storage_corruption(
+            "local placement inventory indexed columns differ from payload",
+        ));
+    }
+    Ok(placement)
 }
 
 #[cfg(test)]

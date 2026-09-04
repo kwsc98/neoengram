@@ -30,11 +30,11 @@ use crate::{
     S3MutationKind, S3MutationRecord, SnapshotDeliveryInsertOutcome, SnapshotDeliveryInsertRequest,
     SnapshotDeliveryListRequest, SnapshotDeliveryMutationKind, SnapshotDeliveryMutationRecord,
     SnapshotDeliveryMutationRequest, SnapshotDeliveryRecord, SnapshotDeliveryRetentionRoot,
-    SnapshotInsertOutcome, SnapshotInsertRequest, SnapshotListCursor, SnapshotListPage,
-    SnapshotListRequest, SnapshotRecord, SnapshotState, StorageAccessMode, StorageBackendType,
-    StorageEnrollmentAccessMode, StorageVolumeListCursor, StorageVolumeListPage,
-    StorageVolumeListRequest, StorageVolumeRecord, StorageVolumeState, TenantListCursor,
-    TenantListPage, TenantListRequest, TenantRecord,
+    SnapshotListCursor, SnapshotListPage, SnapshotListRequest, SnapshotRecord, SnapshotState,
+    SnapshotWithDeliveryInsertRequest, SnapshotWithDeliveryInsertResult, StorageAccessMode,
+    StorageBackendType, StorageEnrollmentAccessMode, StorageVolumeListCursor,
+    StorageVolumeListPage, StorageVolumeListRequest, StorageVolumeRecord, StorageVolumeState,
+    TenantListCursor, TenantListPage, TenantListRequest, TenantRecord,
 };
 
 use super::agent_registry::SqliteAgentRegistryStore;
@@ -61,7 +61,8 @@ const PLAYGROUND_COLUMNS: &str = "tenant_id, project_id, artifact_id, playground
     active_deletion_id, delete_requested_at_unix_ms, purge_after_unix_ms, deleted_at_unix_ms, \
     created_at_unix_ms, updated_at_unix_ms";
 const SNAPSHOT_COLUMNS: &str = "tenant_id, project_id, artifact_id, snapshot_id, \
-    snapshot_request_id, commit_digest, state, \
+    snapshot_request_id, commit_digest, delivery_id, edge_cluster_id, storage_volume_id, \
+    delivery_mode, state, \
     resource_version, lifecycle_state, lifecycle_generation, active_deletion_id, \
     delete_requested_at_unix_ms, purge_after_unix_ms, deleted_at_unix_ms, created_at_unix_ms, \
     updated_at_unix_ms";
@@ -70,7 +71,7 @@ const SNAPSHOT_DELIVERY_COLUMNS: &str = "tenant_id, delivery_id, create_request_
     delivery_generation, file_count, size_bytes, object_set_digest, resource_version, issue_code, \
     issue_message, issue_retryable, created_at_unix_ms, updated_at_unix_ms";
 const S3_ACCESS_POINT_COLUMNS: &str = "access_point_id, tenant_id, project_id, artifact_id, \
-    snapshot_id, commit_digest, bucket_name, state, policy_generation, \
+    snapshot_id, commit_digest, delivery_id, storage_volume_id, edge_cluster_id, bucket_name, state, policy_generation, \
     created_at_unix_ms, updated_at_unix_ms";
 const S3_CREDENTIAL_COLUMNS: &str = "credential_id, access_point_id, access_key_id, \
     encrypted_secret, state, expires_at_unix_ms, created_at_unix_ms, last_used_at_unix_ms";
@@ -1282,66 +1283,104 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         snapshot_page(rows, request.limit)
     }
 
-    async fn insert_snapshot_fenced(
+    async fn insert_snapshot_with_delivery(
         &self,
-        request: SnapshotInsertRequest,
-    ) -> CentralResult<SnapshotInsertOutcome> {
-        let SnapshotInsertRequest {
-            record,
-            artifact_head,
-        } = request;
-        validate_new_resource(record.resource_version, &record.lifecycle, "Snapshot")?;
+        request: SnapshotWithDeliveryInsertRequest,
+    ) -> CentralResult<SnapshotWithDeliveryInsertResult> {
+        let SnapshotWithDeliveryInsertRequest { snapshot, delivery } = request;
+        if snapshot.record.delivery_id != delivery.record.delivery_id
+            || snapshot.record.tenant_id != delivery.record.tenant_id
+            || snapshot.record.snapshot_id != delivery.record.snapshot_id
+            || snapshot.record.commit_id != delivery.record.commit_id
+            || snapshot.record.storage_volume_id != delivery.record.storage_volume_id
+            || snapshot.record.delivery_mode != delivery.record.mode
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Snapshot and Delivery immutable identities do not match",
+            )
+            .with_retryable(false));
+        }
+        validate_new_resource(
+            snapshot.record.resource_version,
+            &snapshot.record.lifecycle,
+            "Snapshot",
+        )?;
+        crate::catalog::validate_snapshot_delivery_retention_roots(&delivery)?;
+        if delivery.record.create_request_id != delivery.request_id
+            || delivery.record.delivery_generation.get() == 0
+            || delivery.record.resource_version == 0
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Snapshot delivery create identity or generations are invalid",
+            )
+            .with_retryable(false));
+        }
+        if snapshot.record.snapshot_request_id != delivery.request_id {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Snapshot and Delivery must share the same create request identity",
+            )
+            .with_retryable(false));
+        }
+
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let request_sql = format!(
+        let snapshot_request_sql = format!(
             "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records \
              WHERE tenant_id = ? AND snapshot_request_id = ?"
         );
-        if let Some(existing) = sqlx::query(&request_sql)
-            .bind(record.tenant_id.as_str())
-            .bind(record.snapshot_request_id.as_str())
+        if let Some(existing_snapshot) = sqlx::query(&snapshot_request_sql)
+            .bind(snapshot.record.tenant_id.as_str())
+            .bind(snapshot.record.snapshot_request_id.as_str())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(storage_error)?
             .map(decode_snapshot)
             .transpose()?
         {
-            require_active(&existing.lifecycle, "Snapshot")?;
-            if !snapshot_request_matches(&existing, &record) {
+            require_active(&existing_snapshot.lifecycle, "Snapshot")?;
+            if !snapshot_request_matches(&existing_snapshot, &snapshot.record) {
                 return Err(id_reused(
                     "Snapshot request ID is already bound to another create request",
                 ));
             }
+            let existing_delivery_sql = format!(
+                "SELECT {SNAPSHOT_DELIVERY_COLUMNS} FROM snapshot_delivery_records \
+                 WHERE tenant_id = ? AND delivery_id = ?"
+            );
+            let existing_delivery = sqlx::query(&existing_delivery_sql)
+                .bind(existing_snapshot.tenant_id.as_str())
+                .bind(existing_snapshot.delivery_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(storage_error)?
+                .map(decode_snapshot_delivery)
+                .transpose()?
+                .ok_or_else(|| {
+                    corruption("Snapshot exists without its required SnapshotDelivery")
+                })?;
+            if !existing_delivery.same_create_request(&delivery.record) {
+                return Err(id_reused(
+                    "Snapshot delivery identity changed during request replay",
+                ));
+            }
             transaction.commit().await.map_err(storage_error)?;
-            return Ok(SnapshotInsertOutcome::ExistingRequest(existing));
+            return Ok(SnapshotWithDeliveryInsertResult {
+                snapshot: existing_snapshot,
+                delivery: existing_delivery,
+                replayed: true,
+            });
         }
-        let commit_sql = format!(
-            "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? \
-               AND commit_digest = ?"
-        );
-        if let Some(existing) = sqlx::query(&commit_sql)
-            .bind(record.tenant_id.as_str())
-            .bind(record.project_id.as_str())
-            .bind(record.artifact_id.as_str())
-            .bind(record.commit_id.as_bytes().as_slice())
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(storage_error)?
-            .map(decode_snapshot)
-            .transpose()?
-        {
-            require_active(&existing.lifecycle, "Snapshot")?;
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(SnapshotInsertOutcome::ExistingCommit(existing));
-        }
+
         let artifact_sql = format!(
             "SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records \
              WHERE tenant_id = ? AND project_id = ? AND artifact_id = ?"
         );
         let artifact = sqlx::query(&artifact_sql)
-            .bind(record.tenant_id.as_str())
-            .bind(record.project_id.as_str())
-            .bind(record.artifact_id.as_str())
+            .bind(snapshot.record.tenant_id.as_str())
+            .bind(snapshot.record.project_id.as_str())
+            .bind(snapshot.record.artifact_id.as_str())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(storage_error)?
@@ -1354,8 +1393,8 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 )
             })?;
         require_active(&artifact.lifecycle, "Snapshot Artifact")?;
-        if let ArtifactHeadExpectation::Exact(expected) = artifact_head {
-            if expected != Some(record.commit_id) {
+        if let ArtifactHeadExpectation::Exact(expected) = snapshot.artifact_head {
+            if expected != Some(snapshot.record.commit_id) {
                 return Err(CentralError::new(
                     CentralErrorCode::ProtocolInvalid,
                     "fenced Snapshot Commit does not match the observed Artifact Head",
@@ -1366,50 +1405,283 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 return Err(artifact_head_changed());
             }
         }
-        let result = sqlx::query(
+        let volume_sql = format!(
+            "SELECT {VOLUME_COLUMNS} FROM storage_volume_catalog_records \
+             WHERE tenant_id = ? AND storage_volume_id = ?"
+        );
+        let volume = sqlx::query(&volume_sql)
+            .bind(delivery.record.tenant_id.as_str())
+            .bind(delivery.record.storage_volume_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_volume)
+            .transpose()?
+            .ok_or_else(|| {
+                catalog_parent_error(
+                    CentralErrorCode::StorageVolumeNotFound,
+                    "SnapshotDelivery StorageVolume does not exist",
+                )
+            })?;
+        crate::catalog::validate_snapshot_delivery_parents(
+            &delivery.record,
+            &snapshot.record,
+            &volume,
+        )?;
+
+        let snapshot_record = snapshot.record;
+        let snapshot_insert = sqlx::query(
             "INSERT INTO snapshot_catalog_records \
              (tenant_id, project_id, artifact_id, snapshot_id, snapshot_request_id, commit_digest, \
-              state, created_at_unix_ms, \
+              delivery_id, edge_cluster_id, storage_volume_id, delivery_mode, state, created_at_unix_ms, \
               resource_version, lifecycle_state, lifecycle_generation, active_deletion_id, \
-              delete_requested_at_unix_ms, purge_after_unix_ms, deleted_at_unix_ms, \
-             updated_at_unix_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              delete_requested_at_unix_ms, purge_after_unix_ms, deleted_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(record.tenant_id.as_str())
-        .bind(record.project_id.as_str())
-        .bind(record.artifact_id.as_str())
-        .bind(record.snapshot_id.as_str())
-        .bind(record.snapshot_request_id.as_str())
-        .bind(record.commit_id.as_bytes().as_slice())
-        .bind(snapshot_state_name(record.state))
-        .bind(as_i64(record.created_at_unix_ms)?)
-        .bind(record.resource_version.to_string())
-        .bind(resource_lifecycle_state_name(record.lifecycle.state))
-        .bind(record.lifecycle.generation.to_string())
+        .bind(snapshot_record.tenant_id.as_str())
+        .bind(snapshot_record.project_id.as_str())
+        .bind(snapshot_record.artifact_id.as_str())
+        .bind(snapshot_record.snapshot_id.as_str())
+        .bind(snapshot_record.snapshot_request_id.as_str())
+        .bind(snapshot_record.commit_id.as_bytes().as_slice())
+        .bind(snapshot_record.delivery_id.as_str())
+        .bind(snapshot_record.edge_cluster_id.as_str())
+        .bind(snapshot_record.storage_volume_id.as_str())
+        .bind(snapshot_delivery_mode_name(snapshot_record.delivery_mode))
+        .bind(snapshot_state_name(snapshot_record.state))
+        .bind(as_i64(snapshot_record.created_at_unix_ms)?)
+        .bind(snapshot_record.resource_version.to_string())
+        .bind(resource_lifecycle_state_name(snapshot_record.lifecycle.state))
+        .bind(snapshot_record.lifecycle.generation.to_string())
         .bind(
-            record
+            snapshot_record
                 .lifecycle
                 .active_deletion_id
                 .as_ref()
                 .map(DeletionId::as_str),
         )
         .bind(optional_as_i64(
-            record.lifecycle.delete_requested_at_unix_ms,
+            snapshot_record.lifecycle.delete_requested_at_unix_ms,
         )?)
-        .bind(optional_as_i64(record.lifecycle.purge_after_unix_ms)?)
-        .bind(optional_as_i64(record.lifecycle.deleted_at_unix_ms)?)
-        .bind(as_i64(record.updated_at_unix_ms)?)
+        .bind(optional_as_i64(snapshot_record.lifecycle.purge_after_unix_ms)?)
+        .bind(optional_as_i64(snapshot_record.lifecycle.deleted_at_unix_ms)?)
+        .bind(as_i64(snapshot_record.updated_at_unix_ms)?)
         .execute(&mut *transaction)
         .await;
-        match result {
-            Ok(_) => {
-                transaction.commit().await.map_err(storage_error)?;
-                Ok(SnapshotInsertOutcome::Inserted(record))
+        if let Err(error) = snapshot_insert {
+            if !is_unique(&error) {
+                return Err(storage_error(error));
             }
-            Err(error) if is_unique(&error) => Err(id_reused(
-                "Snapshot identity changed during concurrent creation",
-            )),
-            Err(error) => Err(storage_error(error)),
+            // A concurrent identical request may have won the unique-key race after the
+            // initial lookup. Resolve the winner inside this transaction instead of turning a
+            // safe retry into a false identity conflict.
+            let existing_snapshot = sqlx::query(&snapshot_request_sql)
+                .bind(snapshot_record.tenant_id.as_str())
+                .bind(snapshot_record.snapshot_request_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(storage_error)?
+                .map(decode_snapshot)
+                .transpose()?
+                .ok_or_else(|| id_reused("Snapshot identity changed during concurrent creation"))?;
+            require_active(&existing_snapshot.lifecycle, "Snapshot")?;
+            if !snapshot_request_matches(&existing_snapshot, &snapshot_record) {
+                return Err(id_reused(
+                    "Snapshot request ID is already bound to another create request",
+                ));
+            }
+            let existing_delivery_sql = format!(
+                "SELECT {SNAPSHOT_DELIVERY_COLUMNS} FROM snapshot_delivery_records \
+                 WHERE tenant_id = ? AND delivery_id = ?"
+            );
+            let existing_delivery = sqlx::query(&existing_delivery_sql)
+                .bind(existing_snapshot.tenant_id.as_str())
+                .bind(existing_snapshot.delivery_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(storage_error)?
+                .map(decode_snapshot_delivery)
+                .transpose()?
+                .ok_or_else(|| {
+                    corruption("Snapshot exists without its required SnapshotDelivery")
+                })?;
+            if !existing_delivery.same_create_request(&delivery.record) {
+                return Err(id_reused(
+                    "Snapshot delivery identity changed during request replay",
+                ));
+            }
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(SnapshotWithDeliveryInsertResult {
+                snapshot: existing_snapshot,
+                delivery: existing_delivery,
+                replayed: true,
+            });
         }
+
+        let delivery_record = delivery.record;
+        sqlx::query(
+            "INSERT INTO snapshot_delivery_records \
+             (tenant_id, delivery_id, create_request_id, snapshot_id, commit_digest, \
+              storage_volume_id, mode, target_relative_root, state, source_index_digest, \
+              delivery_generation, file_count, size_bytes, object_set_digest, resource_version, \
+              issue_code, issue_message, issue_retryable, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(delivery_record.tenant_id.as_str())
+        .bind(delivery_record.delivery_id.as_str())
+        .bind(delivery_record.create_request_id.as_str())
+        .bind(delivery_record.snapshot_id.as_str())
+        .bind(delivery_record.commit_id.as_bytes().as_slice())
+        .bind(delivery_record.storage_volume_id.as_str())
+        .bind(snapshot_delivery_mode_name(delivery_record.mode))
+        .bind(delivery_record.target_relative_root.as_str())
+        .bind(snapshot_delivery_state_name(delivery_record.state))
+        .bind(delivery_record.source_index_digest.as_bytes().as_slice())
+        .bind(delivery_record.delivery_generation.to_string())
+        .bind(
+            i64::try_from(delivery_record.file_count)
+                .map_err(|_| storage_error("file_count exceeds SQLite integer"))?,
+        )
+        .bind(
+            i64::try_from(delivery_record.size_bytes)
+                .map_err(|_| storage_error("size_bytes exceeds SQLite integer"))?,
+        )
+        .bind(delivery_record.object_set_digest.as_bytes().as_slice())
+        .bind(delivery_record.resource_version.to_string())
+        .bind(&delivery_record.issue_code)
+        .bind(&delivery_record.issue_message)
+        .bind(delivery_record.issue_retryable)
+        .bind(as_i64(delivery_record.created_at_unix_ms)?)
+        .bind(as_i64(delivery_record.updated_at_unix_ms)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            if is_unique(&error) {
+                id_reused("Snapshot Delivery identity changed during concurrent creation")
+            } else {
+                storage_error(error)
+            }
+        })?;
+        for root in &delivery.retention_roots {
+            sqlx::query(
+                "INSERT INTO snapshot_delivery_object_retention_roots \
+                 (tenant_id, delivery_id, object_id) VALUES (?, ?, ?)",
+            )
+            .bind(root.tenant_id.as_str())
+            .bind(root.delivery_id.as_str())
+            .bind(root.object_id.as_bytes().as_slice())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(SnapshotWithDeliveryInsertResult {
+            snapshot: snapshot_record,
+            delivery: delivery_record,
+            replayed: false,
+        })
+    }
+
+    async fn transition_snapshot_state(
+        &self,
+        tenant_id: &TenantId,
+        snapshot_id: &SnapshotId,
+        expected: SnapshotState,
+        next: SnapshotState,
+        updated_at_unix_ms: UnixMillis,
+    ) -> CentralResult<SnapshotRecord> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let snapshot_sql = format!(
+            "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records \
+             WHERE tenant_id = ? AND snapshot_id = ?"
+        );
+        let current_snapshot = sqlx::query(&snapshot_sql)
+            .bind(tenant_id.as_str())
+            .bind(snapshot_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_snapshot)
+            .transpose()?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ArtifactNotFound,
+                    "Snapshot does not exist",
+                )
+                .with_retryable(false)
+            })?;
+        // State transitions are idempotent.  In particular, a replay of a successful
+        // `Ready -> Ready` report must not consume another ResourceVersion.  Keep this
+        // short-circuit aligned with the InMemory repository before running the CAS update.
+        if current_snapshot.state == next {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(current_snapshot);
+        }
+        if next == SnapshotState::Ready {
+            let delivery_sql = format!(
+                "SELECT {SNAPSHOT_DELIVERY_COLUMNS} FROM snapshot_delivery_records \
+                 WHERE tenant_id = ? AND delivery_id = ?"
+            );
+            let delivery = sqlx::query(&delivery_sql)
+                .bind(tenant_id.as_str())
+                .bind(current_snapshot.delivery_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(storage_error)?
+                .map(decode_snapshot_delivery)
+                .transpose()?
+                .ok_or_else(|| {
+                    corruption("Snapshot exists without its required SnapshotDelivery")
+                })?;
+            if delivery.state != SnapshotDeliveryState::Ready {
+                return Err(CentralError::new(
+                    CentralErrorCode::InvalidState,
+                    "Snapshot cannot become Ready before its SnapshotDelivery is Ready",
+                )
+                .with_retryable(false));
+            }
+        }
+        let update = sqlx::query(
+            "UPDATE snapshot_catalog_records SET state = ?, resource_version = CAST(resource_version AS INTEGER) + 1, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND snapshot_id = ? AND state = ?",
+        )
+        .bind(snapshot_state_name(next))
+        .bind(as_i64(updated_at_unix_ms)?)
+        .bind(tenant_id.as_str())
+        .bind(snapshot_id.as_str())
+        .bind(snapshot_state_name(expected))
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let select = format!(
+            "SELECT {SNAPSHOT_COLUMNS} FROM snapshot_catalog_records WHERE tenant_id = ? AND snapshot_id = ?"
+        );
+        let record = sqlx::query(&select)
+            .bind(tenant_id.as_str())
+            .bind(snapshot_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_snapshot)
+            .transpose()?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ArtifactNotFound,
+                    "Snapshot does not exist",
+                )
+                .with_retryable(false)
+            })?;
+        if update.rows_affected() == 0 && record.state != next {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                format!(
+                    "Snapshot is in {:?}, expected {:?} for state transition",
+                    record.state, expected
+                ),
+            ));
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(record)
     }
 
     async fn get_snapshot_delivery(
@@ -1542,6 +1814,17 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             }
             transaction.commit().await.map_err(storage_error)?;
             return Ok(SnapshotDeliveryInsertOutcome::Existing(existing));
+        }
+        let duplicate_snapshot = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM snapshot_delivery_records WHERE tenant_id = ? AND snapshot_id = ? LIMIT 1",
+        )
+        .bind(request.record.tenant_id.as_str())
+        .bind(request.record.snapshot_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        if duplicate_snapshot.is_some() {
+            return Err(id_reused("Snapshot already has a SnapshotDelivery"));
         }
 
         // Parent lifecycle and immutable placement identity are re-read in the same transaction
@@ -1686,6 +1969,31 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             )
         })?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let current_sql = format!(
+            "SELECT {SNAPSHOT_DELIVERY_COLUMNS} FROM snapshot_delivery_records \
+             WHERE tenant_id = ? AND delivery_id = ?"
+        );
+        let current = sqlx::query(&current_sql)
+            .bind(record.tenant_id.as_str())
+            .bind(record.delivery_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(storage_error)?
+            .map(decode_snapshot_delivery)
+            .transpose()?
+            .ok_or_else(|| {
+                CentralError::new(
+                    CentralErrorCode::ArtifactNotFound,
+                    "Snapshot delivery does not exist",
+                )
+            })?;
+        if !current.same_create_request(&record) {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "SnapshotDelivery replacement cannot change immutable identity",
+            )
+            .with_retryable(false));
+        }
         let result = sqlx::query(
             "UPDATE snapshot_delivery_records SET state = ?, target_relative_root = ?, \
              delivery_generation = ?, file_count = ?, size_bytes = ?, object_set_digest = ?, \
@@ -2104,6 +2412,9 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         record: S3AccessPointRecord,
     ) -> CentralResult<S3AccessPointInsertOutcome> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        // Replays must observe the current physical read gate before returning Existing.  A
+        // previously valid Access Point cannot be used to bypass a failed/deleted Delivery.
+        require_active_s3_snapshot(&mut transaction, &record).await?;
         if let Some(existing) =
             load_s3_access_point(&mut transaction, &record.tenant_id, &record.access_point_id)
                 .await?
@@ -2115,7 +2426,6 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 Err(id_reused("S3 Access Point ID is already used"))
             };
         }
-        require_active_s3_snapshot(&mut transaction, &record).await?;
         insert_s3_access_point_row(&mut transaction, &record).await?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(S3AccessPointInsertOutcome::Inserted(record))
@@ -2168,6 +2478,7 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 load_s3_credential(&mut transaction, &credential.credential_id)
                     .await?
                     .ok_or_else(|| corruption("S3 mutation references a missing credential"))?;
+            require_active_s3_snapshot(&mut transaction, &existing_access_point).await?;
             transaction.commit().await.map_err(storage_error)?;
             return Ok(CatalogInsertOutcome::Existing(S3AccessPointCreateResult {
                 access_point: existing_access_point,
@@ -2190,6 +2501,7 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 if !same_s3_credential_identity(&existing_credential, &credential) {
                     return Err(id_reused("S3 credential identity is already used"));
                 }
+                require_active_s3_snapshot(&mut transaction, &existing_access_point).await?;
                 CatalogInsertOutcome::Existing(S3AccessPointCreateResult {
                     access_point: existing_access_point,
                     credential: existing_credential,
@@ -2243,6 +2555,9 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 load_s3_access_point(&mut transaction, &mutation.tenant_id, access_point_id)
                     .await?
                     .ok_or_else(|| corruption("S3 mutation references a missing Access Point"))?;
+            if state == S3AccessPointState::Active {
+                require_active_s3_snapshot(&mut transaction, &current).await?;
+            }
             transaction.commit().await.map_err(storage_error)?;
             return Ok(CatalogInsertOutcome::Existing(current));
         }
@@ -2400,6 +2715,15 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         record: S3CredentialRecord,
     ) -> CentralResult<S3CredentialInsertOutcome> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        // Validate the parent before the idempotent Existing branch.  Otherwise an old
+        // credential row could be replayed after its SnapshotDelivery became unavailable.
+        let access_point = load_s3_access_point_by_id(&mut transaction, &record.access_point_id)
+            .await?
+            .ok_or_else(|| id_reused("S3 Access Point does not exist"))?;
+        if access_point.state != S3AccessPointState::Active {
+            return Err(id_reused("S3 Access Point is disabled"));
+        }
+        require_active_s3_snapshot(&mut transaction, &access_point).await?;
         if let Some(existing) = load_s3_credential(&mut transaction, &record.credential_id).await? {
             return if same_s3_credential_identity(&existing, &record) {
                 transaction.commit().await.map_err(storage_error)?;
@@ -2407,15 +2731,6 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             } else {
                 Err(id_reused("S3 credential ID is already used"))
             };
-        }
-        let access_point = load_s3_access_point_by_id(&mut transaction, &record.access_point_id)
-            .await?
-            .ok_or_else(|| id_reused("S3 Access Point does not exist"))?;
-        if record.state == S3CredentialState::Active {
-            if access_point.state != S3AccessPointState::Active {
-                return Err(id_reused("S3 Access Point is disabled"));
-            }
-            require_active_s3_snapshot(&mut transaction, &access_point).await?;
         }
         let state = s3_credential_state_name(record.state);
         let result = sqlx::query(
@@ -2476,6 +2791,14 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             let existing = load_s3_credential(&mut transaction, &credential.credential_id)
                 .await?
                 .ok_or_else(|| corruption("S3 mutation references a missing credential"))?;
+            let access_point =
+                load_s3_access_point_by_id(&mut transaction, &credential.access_point_id)
+                    .await?
+                    .ok_or_else(|| corruption("S3 mutation references a missing Access Point"))?;
+            if access_point.state != S3AccessPointState::Active {
+                return Err(id_reused("S3 Access Point is disabled"));
+            }
+            require_active_s3_snapshot(&mut transaction, &access_point).await?;
             transaction.commit().await.map_err(storage_error)?;
             return Ok(CatalogInsertOutcome::Existing(existing));
         }
@@ -4554,6 +4877,40 @@ async fn require_active_s3_snapshot(
     if snapshot.state != SnapshotState::Ready {
         return Err(id_reused("S3 Access Point Snapshot is not Ready"));
     }
+    if snapshot.delivery_id != access_point.delivery_id
+        || snapshot.storage_volume_id != access_point.storage_volume_id
+        || snapshot.edge_cluster_id != access_point.edge_cluster_id
+    {
+        return Err(id_reused(
+            "S3 Access Point Snapshot target binding does not match",
+        ));
+    }
+    let delivery_sql = format!(
+        "SELECT {SNAPSHOT_DELIVERY_COLUMNS} FROM snapshot_delivery_records \
+         WHERE tenant_id = ? AND delivery_id = ?"
+    );
+    let delivery = sqlx::query(&delivery_sql)
+        .bind(access_point.tenant_id.as_str())
+        .bind(access_point.delivery_id.as_str())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?
+        .map(decode_snapshot_delivery)
+        .transpose()?
+        .ok_or_else(|| id_reused("S3 Access Point SnapshotDelivery does not exist"))?;
+    if delivery.tenant_id != access_point.tenant_id
+        || delivery.snapshot_id != access_point.snapshot_id
+        || delivery.commit_id != access_point.commit_id
+        || delivery.storage_volume_id != access_point.storage_volume_id
+        || delivery.mode != snapshot.delivery_mode
+    {
+        return Err(id_reused(
+            "S3 Access Point SnapshotDelivery binding does not match",
+        ));
+    }
+    if delivery.state != SnapshotDeliveryState::Ready {
+        return Err(id_reused("S3 Access Point SnapshotDelivery is not Ready"));
+    }
     Ok(())
 }
 
@@ -4580,8 +4937,9 @@ async fn insert_s3_access_point_row(
     sqlx::query(
         "INSERT INTO s3_access_point_records \
          (access_point_id, tenant_id, project_id, artifact_id, snapshot_id, commit_digest, \
-          bucket_name, state, policy_generation, created_at_unix_ms, updated_at_unix_ms) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          delivery_id, storage_volume_id, edge_cluster_id, bucket_name, state, policy_generation, \
+          created_at_unix_ms, updated_at_unix_ms) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(record.access_point_id.as_str())
     .bind(record.tenant_id.as_str())
@@ -4589,6 +4947,9 @@ async fn insert_s3_access_point_row(
     .bind(record.artifact_id.as_str())
     .bind(record.snapshot_id.as_str())
     .bind(record.commit_id.as_bytes().as_slice())
+    .bind(record.delivery_id.as_str())
+    .bind(record.storage_volume_id.as_str())
+    .bind(record.edge_cluster_id.as_str())
     .bind(&record.bucket_name)
     .bind(s3_access_point_state_name(record.state))
     .bind(i64::try_from(record.policy_generation).map_err(|_| {
@@ -4960,6 +5321,8 @@ fn playground_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<Playground
     Ok(PlaygroundListPage { records, next })
 }
 
+/// Legacy transaction helper retained for adapters that need to compose the lower-level insert.
+#[allow(dead_code)]
 fn snapshot_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<SnapshotListPage> {
     let mut records = rows
         .into_iter()
@@ -5216,6 +5579,21 @@ fn decode_snapshot(row: SqliteRow) -> CentralResult<SnapshotRecord> {
             row.try_get("commit_digest").map_err(storage_error)?,
             "Snapshot Commit digest",
         )?,
+        delivery_id: parse_id(
+            row.try_get("delivery_id").map_err(storage_error)?,
+            SnapshotDeliveryId::new,
+        )?,
+        edge_cluster_id: parse_id(
+            row.try_get("edge_cluster_id").map_err(storage_error)?,
+            EdgeClusterId::new,
+        )?,
+        storage_volume_id: parse_id(
+            row.try_get("storage_volume_id").map_err(storage_error)?,
+            StorageVolumeId::new,
+        )?,
+        delivery_mode: parse_snapshot_delivery_mode(
+            row.try_get("delivery_mode").map_err(storage_error)?,
+        )?,
         state: parse_snapshot_state(row.try_get("state").map_err(storage_error)?)?,
         resource_version: parse_u64(
             row.try_get("resource_version").map_err(storage_error)?,
@@ -5392,6 +5770,18 @@ fn decode_s3_access_point(row: SqliteRow) -> CentralResult<S3AccessPointRecord> 
             row.try_get("commit_digest").map_err(storage_error)?,
             "S3 Access Point Commit digest",
         )?,
+        delivery_id: parse_id(
+            row.try_get("delivery_id").map_err(storage_error)?,
+            SnapshotDeliveryId::new,
+        )?,
+        storage_volume_id: parse_id(
+            row.try_get("storage_volume_id").map_err(storage_error)?,
+            StorageVolumeId::new,
+        )?,
+        edge_cluster_id: parse_id(
+            row.try_get("edge_cluster_id").map_err(storage_error)?,
+            EdgeClusterId::new,
+        )?,
         bucket_name: row.try_get("bucket_name").map_err(storage_error)?,
         state: parse_s3_access_point_state(row.try_get("state").map_err(storage_error)?)?,
         policy_generation,
@@ -5526,8 +5916,13 @@ fn snapshot_request_matches(existing: &SnapshotRecord, requested: &SnapshotRecor
     existing.tenant_id == requested.tenant_id
         && existing.project_id == requested.project_id
         && existing.artifact_id == requested.artifact_id
+        && existing.snapshot_id == requested.snapshot_id
         && existing.snapshot_request_id == requested.snapshot_request_id
         && existing.commit_id == requested.commit_id
+        && existing.delivery_id == requested.delivery_id
+        && existing.edge_cluster_id == requested.edge_cluster_id
+        && existing.storage_volume_id == requested.storage_volume_id
+        && existing.delivery_mode == requested.delivery_mode
 }
 
 fn validate_limit(limit: u16) -> CentralResult<()> {
@@ -5744,6 +6139,9 @@ fn same_s3_access_point_create_identity(
         && existing.artifact_id == requested.artifact_id
         && existing.snapshot_id == requested.snapshot_id
         && existing.commit_id == requested.commit_id
+        && existing.delivery_id == requested.delivery_id
+        && existing.storage_volume_id == requested.storage_volume_id
+        && existing.edge_cluster_id == requested.edge_cluster_id
         && existing.bucket_name == requested.bucket_name
 }
 

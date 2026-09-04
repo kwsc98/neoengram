@@ -14,6 +14,7 @@ use neoengram_central::{
     dto::{
         CommitPlaygroundRequest, CreatePlaygroundRequest, CreateSnapshotRequest, DataLayout,
         IndexVersionBody, QueryArtifactCommitGraphRequest, QueryPlaygroundChangeListRequest,
+        QueryStorageVolumeRequest,
     },
     identity::{AuthenticatedIdentity, Permission, StaticRbacPolicy},
     service::{CatalogService, JobCoordinator, WorkspaceCommitService},
@@ -554,6 +555,9 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
                 project_id: project_id.to_string(),
                 artifact_id: artifact_id.to_string(),
                 commit_id: committed.commit.commit_id.to_string(),
+                target_edge_cluster_id: "cluster-a".to_owned(),
+                target_storage_volume_id: "volume-a".to_owned(),
+                delivery_mode: neoengram_central::dto::SnapshotDeliveryMode::Copy,
                 request_id: "snapshot-request-cross-volume".to_owned(),
             },
         )
@@ -563,6 +567,62 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         source_derived_snapshot.snapshot.commit_id,
         committed.commit.commit_id.to_string()
     );
+
+    // A Snapshot reader may inspect the live state of its immutable target Volume without being
+    // granted the broader storage inventory permission. The scope must not allow querying a
+    // different Volume or omitting the Snapshot binding.
+    let snapshot_reader_policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-a",
+            [tenant_id.to_string()],
+            [Permission::SnapshotRead],
+        )
+        .unwrap(),
+    );
+    let snapshot_reader = CatalogService::new(
+        components.control_catalog.clone(),
+        components.publisher.clone(),
+        snapshot_reader_policy,
+        components.clock.clone(),
+    )
+    .with_storage_availability_provider(Arc::new(ReadyStorageAvailability));
+    let scoped_volume = snapshot_reader
+        .query_storage_volume(
+            &identity,
+            QueryStorageVolumeRequest {
+                tenant_id: tenant_id.to_string(),
+                storage_volume_id: "volume-a".to_owned(),
+                snapshot_id: Some(source_derived_snapshot.snapshot.snapshot_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped_volume.storage_volume.storage_volume_id, "volume-a");
+    assert!(scoped_volume.storage_volume.pvc_reference.is_none());
+    let out_of_scope = snapshot_reader
+        .query_storage_volume(
+            &identity,
+            QueryStorageVolumeRequest {
+                tenant_id: tenant_id.to_string(),
+                storage_volume_id: "volume-b".to_owned(),
+                snapshot_id: Some(source_derived_snapshot.snapshot.snapshot_id.clone()),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(out_of_scope.code().as_str(), "resource_not_found");
+    let unscoped = snapshot_reader
+        .query_storage_volume(
+            &identity,
+            QueryStorageVolumeRequest {
+                tenant_id: tenant_id.to_string(),
+                storage_volume_id: "volume-a".to_owned(),
+                snapshot_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unscoped.code().as_str(), "resource_not_found");
 
     let historical_playground_id = PlaygroundId::new("playground-historical").unwrap();
     components
@@ -930,6 +990,9 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
                 project_id: project_id.to_string(),
                 artifact_id: artifact_id.to_string(),
                 commit_id: commit_id.to_string(),
+                target_edge_cluster_id: "cluster-a".to_owned(),
+                target_storage_volume_id: "volume-a".to_owned(),
+                delivery_mode: neoengram_central::dto::SnapshotDeliveryMode::Copy,
                 request_id: "snapshot-request-unpublished-base".to_owned(),
             },
         )

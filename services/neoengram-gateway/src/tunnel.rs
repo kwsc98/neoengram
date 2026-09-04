@@ -769,6 +769,9 @@ impl GatewayTunnel {
             });
         }
 
+        let mut capabilities = neoengram_domain::protocol::gateway_capabilities_v1();
+        capabilities
+            .insert(neoengram_domain::protocol::COMMIT_MATERIALIZATION_CAPABILITY_V2.to_owned());
         if let Err(error) = self
             .send_control(
                 fresh_request_id("hello")?,
@@ -777,7 +780,7 @@ impl GatewayTunnel {
                     edge_cluster_id: self.identity.edge_cluster_id.clone(),
                     software_version: self.identity.software_version.clone(),
                     wire_version: CURRENT_WIRE_VERSION,
-                    capabilities: neoengram_domain::protocol::gateway_capabilities_v1(),
+                    capabilities,
                 }),
             )
             .await

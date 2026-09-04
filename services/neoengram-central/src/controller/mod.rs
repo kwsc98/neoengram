@@ -4,23 +4,23 @@ mod catalog;
 pub use catalog::*;
 mod gateway;
 pub use gateway::*;
+mod task;
+pub use task::*;
 
 use fusen_rs::{interface, Call, Error, Response};
 
 use crate::{
     dto::{
         ApiVersionResponse, ApproveStorageEnrollmentRequest, ApproveStorageEnrollmentResponse,
-        CompleteStorageRecoveryRequest, CompleteStorageRecoveryResponse, CreateAddJobRequest,
-        CreateAddJobResponse, CreateStorageEnrollmentTokenRequest,
-        CreateStorageEnrollmentTokenResponse, EmptyRequest, FinalizeAddJobRequest,
-        FinalizeAddJobResponse, HealthStatus, QueryJobRequest, QueryJobResponse,
-        QueryStorageEnrollmentListRequest, QueryStorageEnrollmentListResponse,
+        CompleteStorageRecoveryRequest, CompleteStorageRecoveryResponse,
+        CreateStorageEnrollmentTokenRequest, CreateStorageEnrollmentTokenResponse, EmptyRequest,
+        HealthStatus, QueryStorageEnrollmentListRequest, QueryStorageEnrollmentListResponse,
         QueryStorageEnrollmentRequest, QueryStorageEnrollmentResponse,
         RejectStorageEnrollmentRequest, RejectStorageEnrollmentResponse,
     },
     error::unauthenticated,
     identity::AuthenticatedIdentity,
-    service::{EnrollmentService, HealthService, JobService, SystemService},
+    service::{EnrollmentService, HealthService, SystemService},
 };
 
 /// Public system and probe routes.
@@ -37,31 +37,6 @@ pub trait SystemApi {
 
     #[fusen_rs::method(method = "GET", path = "/health/ready")]
     async fn ready_probe(&self) -> Result<Response<HealthStatus>, Error>;
-}
-
-/// Public Managed Add routes.
-#[interface(name = "neoengram.job")]
-pub trait JobApi {
-    #[fusen_rs::method(method = "POST", path = "/api/job/add/create")]
-    async fn create_add_job(
-        &self,
-        #[param(context)] call: Call,
-        #[param(body)] request: CreateAddJobRequest,
-    ) -> Result<Response<CreateAddJobResponse>, Error>;
-
-    #[fusen_rs::method(method = "POST", path = "/api/job/query")]
-    async fn query_job(
-        &self,
-        #[param(context)] call: Call,
-        #[param(body)] request: QueryJobRequest,
-    ) -> Result<Response<QueryJobResponse>, Error>;
-
-    #[fusen_rs::method(method = "POST", path = "/api/job/add/finalize")]
-    async fn finalize_add_job(
-        &self,
-        #[param(context)] call: Call,
-        #[param(body)] request: FinalizeAddJobRequest,
-    ) -> Result<Response<FinalizeAddJobResponse>, Error>;
 }
 
 /// Public storage enrollment administration routes.
@@ -136,55 +111,6 @@ impl SystemApi for SystemController {
 
     async fn ready_probe(&self) -> Result<Response<HealthStatus>, Error> {
         self.health.ready().await.map(Response::new)
-    }
-}
-
-/// Job route implementation.
-pub struct JobController {
-    service: Arc<JobService>,
-}
-
-impl JobController {
-    pub fn new(service: Arc<JobService>) -> Self {
-        Self { service }
-    }
-}
-
-impl JobApi for JobController {
-    async fn create_add_job(
-        &self,
-        call: Call,
-        request: CreateAddJobRequest,
-    ) -> Result<Response<CreateAddJobResponse>, Error> {
-        let identity = authenticated_identity(&call)?;
-        self.service
-            .create_add_job(&identity, request)
-            .await
-            .map(Response::new)
-    }
-
-    async fn query_job(
-        &self,
-        call: Call,
-        request: QueryJobRequest,
-    ) -> Result<Response<QueryJobResponse>, Error> {
-        let identity = authenticated_identity(&call)?;
-        self.service
-            .query_job(&identity, request)
-            .await
-            .map(Response::new)
-    }
-
-    async fn finalize_add_job(
-        &self,
-        call: Call,
-        request: FinalizeAddJobRequest,
-    ) -> Result<Response<FinalizeAddJobResponse>, Error> {
-        let identity = authenticated_identity(&call)?;
-        self.service
-            .finalize_add_job(&identity, request)
-            .await
-            .map(Response::new)
     }
 }
 
@@ -289,7 +215,6 @@ mod action_registry_tests {
     fn compiled_controller_routes_match_the_domain_registry() {
         let descriptors = [
             SystemApiClient::descriptor().unwrap(),
-            JobApiClient::descriptor().unwrap(),
             StorageEnrollmentApiClient::descriptor().unwrap(),
             TenantApiClient::descriptor().unwrap(),
             ProjectApiClient::descriptor().unwrap(),
@@ -302,6 +227,7 @@ mod action_registry_tests {
             S3AuthorizationApiClient::descriptor().unwrap(),
             ResourceLifecycleApiClient::descriptor().unwrap(),
             GatewayRegistryApiClient::descriptor().unwrap(),
+            TaskApiClient::descriptor().unwrap(),
         ];
         let actual = descriptors
             .into_iter()

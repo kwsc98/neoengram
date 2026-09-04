@@ -431,86 +431,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/commit/materialization/query": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * 查询物化任务
-         * @description 查询单个目标 Volume 物化任务及其对象覆盖、批次和字节进度。
-         */
-        post: operations["queryCommitMaterialization"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/commit/materialization/list/query": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * 查询 Commit 的物化任务
-         * @description 查询指定 Commit 的目标 Volume 物化任务及其覆盖状态。
-         */
-        post: operations["queryCommitMaterializationList"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/commit/materialization/retry": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * 重试失败的物化任务
-         * @description 使用当前计划版本重新规划未完成对象。目标端已校验的对象和 checkpoint 会被复用。
-         */
-        post: operations["retryCommitMaterialization"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/commit/materialization/cancel": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * 取消物化任务
-         * @description 取消仍在进行中的目标物化任务；已验证对象不受影响，临时 staging 由租约回收。
-         */
-        post: operations["cancelCommitMaterialization"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/commit/coverage/query": {
         parameters: {
             query?: never;
@@ -894,8 +814,9 @@ export interface paths {
         put?: never;
         /**
          * 查询租户内 Snapshot
-         * @description 按 Project、Artifact、Commit 或状态分页查询独立逻辑 Snapshot；物理可读性由目标 Volume
-         *     的 Coverage 和相关 SnapshotDelivery 动态解析，不作为 Snapshot 筛选条件。
+         * @description 按 Project、Artifact、Commit 或状态分页查询 Snapshot 聚合；每个 Snapshot 都已绑定一个目标
+         *     Volume 和唯一 SnapshotDelivery。物理可读性仍由该 Delivery 的状态及目标 Coverage 动态解析，
+         *     不作为 Snapshot 筛选条件。
          *     opaque cursor 与全部筛选条件绑定。
          */
         post: operations["querySnapshotList"];
@@ -936,10 +857,10 @@ export interface paths {
         put?: never;
         /**
          * 创建 Snapshot
-         * @description 为指定 Artifact 的固定 Commit 创建逻辑 Snapshot。Snapshot 不绑定 StorageVolume 或 Region；
-         *     对象副本由 Placement authority 管理，复制与只读交付是独立动作。相同 `request_id` 和 payload
-         *     返回 `replayed: true`。200 返回时
-         *     Snapshot 记录已持久化且可查询，具体物化进度由独立 SnapshotDelivery 表达。
+         * @description 为指定 Artifact 的固定 Commit 创建 Snapshot，并在同一原子请求中绑定一个目标 EdgeCluster、
+         *     StorageVolume 和只读交付模式。Snapshot 与其唯一 SnapshotDelivery 初始分别为 `creating` 和
+         *     `requested`；只有交付完成后 Snapshot 才会变为 `ready`。相同 `request_id` 和 payload 返回
+         *     `replayed: true`。
          */
         post: operations["createSnapshot"];
         delete?: never;
@@ -960,31 +881,12 @@ export interface paths {
         /**
          * 重试 Snapshot 交付
          * @description 对 failed SnapshotDelivery 的同一固定 Snapshot/Commit/Volume 交付重新发起 attempt，
-         *     使 Delivery 状态回到 requested，Snapshot 状态保持不变。相同 `request_id` 和 payload
-         *     幂等返回；状态不允许重试时返回 409。200 返回时新的交付 attempt 已持久化，
+         *     使 Delivery 状态回到 requested；如果 Snapshot 因该失败进入 `abnormal`，重试请求成功
+         *     持久化后会将其恢复为 `creating`。相同 `request_id` 和 payload 幂等返回；状态不允许
+         *     重试时返回 409。200 返回时新的交付 attempt 已持久化，
          *     后续进度通过 SnapshotDelivery 查询。
          */
         post: operations["retrySnapshotDelivery"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/snapshot/delivery/create": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * 创建 Snapshot 只读交付
-         * @description 为固定 Snapshot 创建 FUSE、Copy 或 Hardlink 只读交付，目标路径由服务端推导。
-         */
-        post: operations["createSnapshotDelivery"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1022,7 +924,7 @@ export interface paths {
         put?: never;
         /**
          * 查询 Snapshot 只读交付列表
-         * @description 分页返回指定 Snapshot 的所有只读交付。
+         * @description 分页返回指定 Snapshot 的唯一只读交付；由于一个 Snapshot 只能绑定一个 Delivery，正常响应最多包含一项。
          */
         post: operations["querySnapshotDeliveryList"];
         delete?: never;
@@ -1124,10 +1026,11 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 为 Ready Snapshot 开启只读 S3 访问
+         * 为已交付 Snapshot 开启只读 S3 访问
          * @description 要求 `s3.access.manage` 权限。为固定 Snapshot 创建唯一只读 Access Point，并在首次成功
-         *     响应中返回一组短期凭证。Snapshot 必须为 `ready`，对应 GatewayPool 必须可服务；同一
-         *     Snapshot 已有停用 Access Point 时必须显式调用 enable，不会通过本方法重新签发凭证。
+         *     响应中返回一组短期凭证。Snapshot 必须为 `ready`，且其绑定的唯一 SnapshotDelivery 必须
+         *     为 `ready`，目标 Volume 和 GatewayPool 必须可服务；同一 Snapshot 已有停用 Access Point
+         *     时必须显式调用 enable，不会通过本方法重新签发凭证。
          *     `secret_access_key` 只在首次创建凭证时返回，幂等重放不会再次返回原 Secret。
          */
         post: operations["createS3AccessPoint"];
@@ -1422,7 +1325,7 @@ export interface paths {
          * 整批恢复回收站资源
          * @description 要求 `resource.lifecycle.manage` 权限。仅在任务进入 `purging` 前接受恢复，并以固定依赖批次
          *     执行；所有目标保持 `restoring`，直到 Agent 物理恢复完成后由 Catalog 原子切回 `active`。
-         *     已撤销的 S3 凭证、Job 与 Pre-commit 不会随资源自动恢复。
+         *     已撤销的 S3 凭证、操作任务与 Pre-commit 不会随资源自动恢复。
          */
         post: operations["restoreResourceDeletion"];
         delete?: never;
@@ -1697,7 +1600,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/job/add/create": {
+    "/api/task/list/query": {
         parameters: {
             query?: never;
             header?: never;
@@ -1707,22 +1610,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 创建 Managed Add Job
-         * @description 创建一个 tenant-scoped Managed Add Job。`principal` 不由请求体声明，而是由
-         *     Bearer JWT 的认证结果注入。服务端在完成认证和请求校验后，使用 canonical
-         *     PrincipalRef 与完整 Add operation 计算 `request_digest`；客户端不提交该字段。
-         *
-         *     相同 `(tenant_id, job_id, request_digest)` 的重试返回原 Job，并将 `replayed`
-         *     设为 `true`。相同 Job ID 对应另一份服务端计算 digest 时返回 `JOB_ID_REUSED`。
+         * 查询操作任务列表
+         * @description 按租户、项目、数据资产、Commit、资源和状态分页查询统一写操作任务。
          */
-        post: operations["createAddJob"];
+        post: operations["queryTaskList"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/job/query": {
+    "/api/task/query": {
         parameters: {
             query?: never;
             header?: never;
@@ -1732,18 +1630,17 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 查询 Job 权威状态
-         * @description 只读取中心 authority，不直接访问 Agent。跨租户或调用方不可见的 Job 与不存在的
-         *     Job 一样返回 `404 JOB_NOT_FOUND`，不得泄漏资源存在性。
+         * 查询操作任务详情
+         * @description 返回任务当前状态、Attempt、子任务和追加式审计事件。
          */
-        post: operations["queryJob"];
+        post: operations["queryTask"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/job/add/finalize": {
+    "/api/task/event/list/query": {
         parameters: {
             query?: never;
             header?: never;
@@ -1753,14 +1650,70 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * 校验并发布 Managed Add
-         * @description 对完整 MetadataBatch、中心 object durability 和 expected IndexVersion 执行最终校验与
-         *     CAS。成功、冲突和拒绝都会形成稳定的 Job decision；重复调用返回同一终态。
-         *
-         *     内部 `ResumePublication` 恢复方法不通过此接口暴露。用户调用始终重新执行授权，
-         *     但不会为已持久化的 Publishing candidate 重新构造发布内容。
+         * 查询任务审计事件
+         * @description 按任务读取追加式审计事件，cursor 使用每任务单调递增的事件序号。
          */
-        post: operations["finalizeAddJob"];
+        post: operations["queryTaskEventList"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/task/summary/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 汇总操作任务状态
+         * @description 返回当前租户和资源筛选条件下各任务生命周期状态的计数。
+         */
+        post: operations["queryTaskSummary"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/task/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 重试操作任务
+         * @description 在原任务下创建新的 Attempt；需要时使用 resource version 防止覆盖并发更新。
+         */
+        post: operations["retryTask"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/task/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 取消操作任务
+         * @description 取消尚未完成的写操作任务并追加审计事件；终态重放保持幂等。
+         */
+        post: operations["cancelTask"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1856,6 +1809,7 @@ export interface components {
         GatewayPoolResponse: {
             gateway_pool: components["schemas"]["GatewayPoolView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         GatewayPoolListResponse: {
             items: components["schemas"]["GatewayPoolView"][];
@@ -1905,10 +1859,12 @@ export interface components {
             gateway_replica: components["schemas"]["GatewayReplicaView"];
             readonly activation_token?: string;
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         GatewayReplicaResponse: {
             gateway_replica: components["schemas"]["GatewayReplicaView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         GatewayReplicaListResponse: {
             items: components["schemas"]["GatewayReplicaView"][];
@@ -1970,6 +1926,7 @@ export interface components {
         CreateTenantResponse: {
             tenant: components["schemas"]["TenantView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         /** @description 当前 principal 可见的脱敏租户视图，不包含认证策略或存储配置。 */
         TenantView: {
@@ -1993,9 +1950,15 @@ export interface components {
             items: components["schemas"]["StorageVolumeView"][];
             next_cursor?: components["schemas"]["PageCursor"];
         };
+        /**
+         * @description 查询 StorageVolume 的脱敏视图。通常需要 `storage.read`；Snapshot 只读用户也可以提供
+         *     `snapshot_id`，但服务端只允许查询该 Snapshot 创建时绑定的唯一 StorageVolume，不得借此
+         *     枚举其他磁盘。
+         */
         QueryStorageVolumeRequest: {
             tenant_id: components["schemas"]["TenantId"];
             storage_volume_id: components["schemas"]["StorageVolumeId"];
+            snapshot_id?: components["schemas"]["SnapshotId"];
         };
         QueryStorageVolumeResponse: {
             storage_volume: components["schemas"]["StorageVolumeView"];
@@ -2026,6 +1989,7 @@ export interface components {
         CreateStorageVolumeResponse: {
             storage_volume: components["schemas"]["StorageVolumeView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         /**
          * @description 租户登记的稳定逻辑存储身份。PVC namespace/claim 可以公开用于运维识别；NFS
@@ -2076,6 +2040,7 @@ export interface components {
             volume_descriptor_digest: components["schemas"]["ContentDigest"];
             expires_at_unix_ms: components["schemas"]["UnixMillis"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         QueryStorageEnrollmentListRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -2117,6 +2082,7 @@ export interface components {
             enrollment: components["schemas"]["StorageEnrollmentView"];
             storage_volume: components["schemas"]["StorageVolumeView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         /**
          * @description 使用 expected_resource_version 和当前 owner_generation 完成 replacement recovery fence。
@@ -2131,6 +2097,7 @@ export interface components {
         CompleteStorageRecoveryResponse: {
             enrollment: components["schemas"]["StorageEnrollmentView"];
             storage_volume: components["schemas"]["StorageVolumeView"];
+            task?: components["schemas"]["TaskView"];
         };
         /**
          * @description 使用 expected_resource_version 对 pending_approval enrollment 执行 CAS；rejection_request_id
@@ -2147,6 +2114,7 @@ export interface components {
         RejectStorageEnrollmentResponse: {
             enrollment: components["schemas"]["StorageEnrollmentView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         /**
          * @description Agent 使用单次 bootstrap token 提交的脱敏 PVC enrollment。pending_approval 自 created_at 起
@@ -2234,6 +2202,7 @@ export interface components {
         CreateProjectResponse: {
             project: components["schemas"]["ProjectView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         ProjectView: {
             tenant_id: components["schemas"]["TenantId"];
@@ -2296,6 +2265,7 @@ export interface components {
         CreateArtifactResponse: {
             artifact: components["schemas"]["ArtifactView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         /**
          * @description Artifact 是不绑定 Region 或 StorageVolume 的版本化逻辑数据资产。初始化血缘只暴露
@@ -2498,6 +2468,7 @@ export interface components {
             precommit: components["schemas"]["PreCommitView"];
             playground: components["schemas"]["PlaygroundView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         CancelPreCommitRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -2508,6 +2479,7 @@ export interface components {
             precommit: components["schemas"]["PreCommitView"];
             playground: components["schemas"]["PlaygroundView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         /**
          * @description 会话结果状态。可提交结果为 `ready`；阻断或执行失败为 `abnormal`。所有非 running 状态的
@@ -2766,32 +2738,6 @@ export interface components {
             coverage_goal?: components["schemas"]["MaterializationCoverageGoal"];
             request_id: components["schemas"]["RequestId"];
         };
-        QueryCommitMaterializationRequest: {
-            tenant_id: components["schemas"]["TenantId"];
-            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
-            materialization_id: components["schemas"]["ResourceId"];
-        };
-        QueryCommitMaterializationListRequest: {
-            tenant_id: components["schemas"]["TenantId"];
-            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
-            commit_id: components["schemas"]["CommitId"];
-            target_storage_volume_id?: components["schemas"]["StorageVolumeId"];
-            cursor?: components["schemas"]["PageCursor"];
-            page_size?: components["schemas"]["PageSize"];
-        };
-        RetryCommitMaterializationRequest: {
-            tenant_id: components["schemas"]["TenantId"];
-            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
-            materialization_id: components["schemas"]["ResourceId"];
-            expected_plan_revision: components["schemas"]["CanonicalU64"];
-            request_id: components["schemas"]["RequestId"];
-        };
-        CancelCommitMaterializationRequest: {
-            tenant_id: components["schemas"]["TenantId"];
-            object_namespace_id: components["schemas"]["ObjectNamespaceId"];
-            materialization_id: components["schemas"]["ResourceId"];
-            expected_plan_revision: components["schemas"]["CanonicalU64"];
-        };
         QueryCommitCoverageRequest: {
             tenant_id: components["schemas"]["TenantId"];
             object_namespace_id: components["schemas"]["ObjectNamespaceId"];
@@ -2840,20 +2786,7 @@ export interface components {
         CreateCommitMaterializationResponse: {
             materialization: components["schemas"]["MaterializationView"];
             replayed: boolean;
-        };
-        QueryCommitMaterializationResponse: {
-            materialization: components["schemas"]["MaterializationView"];
-        };
-        RetryCommitMaterializationResponse: {
-            materialization: components["schemas"]["MaterializationView"];
-            replayed: boolean;
-        };
-        CancelCommitMaterializationResponse: {
-            materialization: components["schemas"]["MaterializationView"];
-        };
-        QueryCommitMaterializationListResponse: {
-            materializations: components["schemas"]["MaterializationView"][];
-            next_cursor?: components["schemas"]["PageCursor"];
+            task?: components["schemas"]["TaskView"];
         };
         VolumeCommitCoverageView: {
             object_namespace_id: components["schemas"]["ObjectNamespaceId"];
@@ -2916,15 +2849,19 @@ export interface components {
             replayed: boolean;
         };
         /**
-         * @description 为指定 Artifact 的固定 Commit 创建逻辑 Snapshot。服务端必须验证 Project/Artifact 存在
-         *     且 Commit 确属该 Artifact；Snapshot 不能创建 Artifact、改写 Artifact Head 或在创建后
-         *     切换 Commit。Commit 的源 Placement 由服务端解析，客户端不能为 Snapshot 选择 Volume。
+         * @description 为指定 Artifact 的固定 Commit 创建 Snapshot，并原子创建其唯一 SnapshotDelivery。
+         *     服务端必须验证 Project/Artifact、Commit、目标 EdgeCluster/StorageVolume 和交付模式；
+         *     Snapshot 不能创建 Artifact、改写 Artifact Head 或在创建后切换 Commit/目标。目标 Volume
+         *     必须属于指定 EdgeCluster 且处于 Ready 状态。
          */
         CreateSnapshotRequest: {
             tenant_id: components["schemas"]["TenantId"];
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
             commit_id: components["schemas"]["CommitId"];
+            target_edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            target_storage_volume_id: components["schemas"]["StorageVolumeId"];
+            delivery_mode: components["schemas"]["SnapshotDeliveryMode"];
             request_id: components["schemas"]["ResourceId"];
         };
         CreateSnapshotResponse: {
@@ -2955,17 +2892,6 @@ export interface components {
             created_at_unix_ms: components["schemas"]["UnixMillis"];
             updated_at_unix_ms: components["schemas"]["UnixMillis"];
         };
-        CreateSnapshotDeliveryRequest: {
-            tenant_id: components["schemas"]["TenantId"];
-            snapshot_id: components["schemas"]["SnapshotId"];
-            target_storage_volume_id: components["schemas"]["StorageVolumeId"];
-            mode: components["schemas"]["SnapshotDeliveryMode"];
-            request_id: components["schemas"]["ResourceId"];
-        };
-        CreateSnapshotDeliveryResponse: {
-            delivery: components["schemas"]["SnapshotDeliveryView"];
-            replayed: boolean;
-        };
         QuerySnapshotDeliveryRequest: {
             tenant_id: components["schemas"]["TenantId"];
             delivery_id: components["schemas"]["ResourceId"];
@@ -2991,6 +2917,7 @@ export interface components {
         RetrySnapshotDeliveryResponse: {
             delivery: components["schemas"]["SnapshotDeliveryView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         DeleteSnapshotDeliveryRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -3000,6 +2927,7 @@ export interface components {
         DeleteSnapshotDeliveryResponse: {
             delivery: components["schemas"]["SnapshotDeliveryView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         QuerySnapshotFileListRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -3041,9 +2969,11 @@ export interface components {
         /** @enum {string} */
         SnapshotState: "creating" | "ready" | "abnormal";
         /**
-         * @description 独立身份，固定一个 Artifact 和 Commit 的不可变逻辑 Snapshot 资源。
-         *     `tenant_id + project_id + artifact_id + commit_id` 是不可变来源 scope；只读交付由独立的
-         *     SnapshotDelivery 资源表达，Snapshot 本身不保存挂载或物化模式，也不拥有或改写 Artifact 数据权威。
+         * @description 独立身份，固定一个 Artifact、Commit 和目标物理交付的不可变 Snapshot 资源。
+         *     `tenant_id + project_id + artifact_id + commit_id + delivery_id + storage_volume_id` 是不可变
+         *     来源 scope；Snapshot 与唯一 SnapshotDelivery 一起创建，交付未完成时 Snapshot 不会进入
+         *     `ready`。
+         *     Snapshot 的不可变来源 scope 由 Artifact authority 派生；Snapshot 不拥有或改写 Artifact 数据权威。
          */
         SnapshotView: {
             snapshot_id: components["schemas"]["SnapshotId"];
@@ -3051,6 +2981,10 @@ export interface components {
             project_id: components["schemas"]["ProjectId"];
             artifact_id: components["schemas"]["ArtifactId"];
             commit_id: components["schemas"]["CommitId"];
+            delivery_id: components["schemas"]["SnapshotDeliveryId"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            delivery_mode: components["schemas"]["SnapshotDeliveryMode"];
             data_layout: components["schemas"]["DataLayout"];
             message: string;
             tag_names: components["schemas"]["TagName"][];
@@ -3261,18 +3195,24 @@ export interface components {
         DeletionMutationResponse: {
             deletion: components["schemas"]["DeletionOperationView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         CreateRetentionHoldResponse: {
             deletion: components["schemas"]["DeletionOperationView"];
             retention_hold: components["schemas"]["RetentionHoldView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         ReleaseRetentionHoldResponse: {
             deletion: components["schemas"]["DeletionOperationView"];
             retention_hold: components["schemas"]["RetentionHoldView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
-        /** @description 为同 Tenant 下的 Ready Snapshot 开启只读 S3 Access Point。 */
+        /**
+         * @description 为同 Tenant 下已完成唯一 SnapshotDelivery 的 Ready Snapshot 开启只读 S3 Access Point。
+         *     不允许根据同 Commit 的其他 Volume 推断或替代该 Delivery。
+         */
         CreateS3AccessPointRequest: {
             tenant_id: components["schemas"]["TenantId"];
             snapshot_id: components["schemas"]["SnapshotId"];
@@ -3303,6 +3243,7 @@ export interface components {
         UpdateS3AccessPointResponse: {
             access_point: components["schemas"]["S3AccessPointView"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         CreateS3AccessPointResponse: {
             access_point: components["schemas"]["S3AccessPointView"];
@@ -3310,6 +3251,7 @@ export interface components {
             secret_access_key?: string;
             credential_expires_at_unix_ms: components["schemas"]["UnixMillis"];
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         CreateS3CredentialRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -3321,6 +3263,7 @@ export interface components {
             credential: components["schemas"]["S3CredentialView"];
             secret_access_key?: string;
             replayed: boolean;
+            task?: components["schemas"]["TaskView"];
         };
         QueryS3CredentialListRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -3328,6 +3271,7 @@ export interface components {
         };
         QueryS3CredentialListResponse: {
             items: components["schemas"]["S3CredentialView"][];
+            task?: components["schemas"]["TaskView"];
         };
         RevokeS3CredentialRequest: {
             tenant_id: components["schemas"]["TenantId"];
@@ -3367,6 +3311,9 @@ export interface components {
             artifact_id: components["schemas"]["ArtifactId"];
             snapshot_id: components["schemas"]["SnapshotId"];
             commit_id: components["schemas"]["CommitId"];
+            delivery_id: components["schemas"]["SnapshotDeliveryId"];
+            storage_volume_id: components["schemas"]["StorageVolumeId"];
+            edge_cluster_id: components["schemas"]["EdgeClusterId"];
             bucket_name: components["schemas"]["S3BucketName"];
             /** Format: uri-reference */
             endpoint: string;
@@ -3392,118 +3339,165 @@ export interface components {
             etag?: string;
             last_modified_unix_ms?: components["schemas"]["UnixMillis"];
         };
-        /**
-         * @description 公开 Add operation。服务端将认证后的 PrincipalRef 注入 canonical operation 后计算
-         *     `request_digest` 并写入内部 AddJobSpec；请求字段必须严格匹配本 schema。
-         */
-        CreateAddJobRequest: {
+        QueryTaskListRequest: {
             tenant_id: components["schemas"]["TenantId"];
-            project_id: components["schemas"]["ProjectId"];
-            artifact_id: components["schemas"]["ArtifactId"];
-            playground_id: components["schemas"]["PlaygroundId"];
-            job_id: components["schemas"]["JobId"];
-            expected_index_version: components["schemas"]["IndexVersion"];
-            deadline_unix_ms: components["schemas"]["UnixMillis"];
-            /**
-             * @description 严格排序、无 portable duplicate，且不能同时包含文件路径及其后代。
-             *     `all` 为 false 时至少包含一项。
-             */
-            paths: components["schemas"]["LogicalPath"][];
-            all: boolean;
+            project_id?: components["schemas"]["ProjectId"];
+            artifact_id?: components["schemas"]["ArtifactId"];
+            object_namespace_id?: components["schemas"]["ObjectNamespaceId"];
+            commit_id?: components["schemas"]["CommitId"];
+            playground_id?: components["schemas"]["PlaygroundId"];
+            snapshot_id?: components["schemas"]["SnapshotId"];
+            storage_volume_id?: components["schemas"]["StorageVolumeId"];
+            task_kind?: components["schemas"]["TaskKind"][];
+            state?: components["schemas"]["TaskState"][];
+            parent_task_id?: components["schemas"]["TaskId"];
+            created_after_unix_ms?: components["schemas"]["UnixMillis"];
+            created_before_unix_ms?: components["schemas"]["UnixMillis"];
+            updated_after_unix_ms?: components["schemas"]["UnixMillis"];
+            updated_before_unix_ms?: components["schemas"]["UnixMillis"];
+            cursor?: string;
+            page_size?: number;
         };
-        CreateAddJobResponse: {
-            job: components["schemas"]["JobView"];
-            /** @description true 表示返回的是已持久化的同一请求结果。 */
-            replayed: boolean;
-        };
-        QueryJobRequest: {
+        QueryTaskRequest: {
             tenant_id: components["schemas"]["TenantId"];
-            job_id: components["schemas"]["JobId"];
+            task_id: components["schemas"]["TaskId"];
         };
-        QueryJobResponse: {
-            job: components["schemas"]["JobView"];
-        };
-        FinalizeAddJobRequest: {
+        QueryTaskEventListRequest: {
             tenant_id: components["schemas"]["TenantId"];
-            job_id: components["schemas"]["JobId"];
+            task_id: components["schemas"]["TaskId"];
+            cursor?: components["schemas"]["CanonicalU64"];
+            page_size?: number;
         };
-        FinalizeAddJobResponse: {
-            job: components["schemas"]["JobView"];
-            decision: components["schemas"]["PublicJobDecision"];
-            finalized_at_unix_ms: components["schemas"]["UnixMillis"];
-            replayed: boolean;
-        };
-        /**
-         * @description 面向用户的脱敏 Job。不得增加 assignment target、Agent/Volume/Mount identity、
-         *     generation/fencing、PublicationCandidate、Manifest、IndexDelta 或 authority 物理信息。
-         */
-        JobView: {
-            /** @constant */
-            operation: "add";
+        QueryTaskSummaryRequest: {
             tenant_id: components["schemas"]["TenantId"];
-            project_id: components["schemas"]["ProjectId"];
-            artifact_id: components["schemas"]["ArtifactId"];
-            playground_id: components["schemas"]["PlaygroundId"];
-            job_id: components["schemas"]["JobId"];
-            state: components["schemas"]["JobState"];
-            resource_version: components["schemas"]["CanonicalU64"];
-            deadline_unix_ms: components["schemas"]["UnixMillis"];
-            progress?: components["schemas"]["PublicJobProgress"];
-            decision?: components["schemas"]["PublicJobDecision"];
-            failure?: components["schemas"]["PublicJobFailure"];
-            finalized_at_unix_ms?: components["schemas"]["UnixMillis"];
+            project_id?: components["schemas"]["ProjectId"];
+            artifact_id?: components["schemas"]["ArtifactId"];
+            object_namespace_id?: components["schemas"]["ObjectNamespaceId"];
+            commit_id?: components["schemas"]["CommitId"];
+            playground_id?: components["schemas"]["PlaygroundId"];
+            snapshot_id?: components["schemas"]["SnapshotId"];
+            storage_volume_id?: components["schemas"]["StorageVolumeId"];
+            task_kind?: components["schemas"]["TaskKind"][];
+            state?: components["schemas"]["TaskState"][];
         };
-        PublicJobProgress: {
-            state: components["schemas"]["JobState"];
-            phase: string;
-            files_completed: components["schemas"]["CanonicalU64"];
-            bytes_completed: components["schemas"]["CanonicalU64"];
-            retry_after_ms?: components["schemas"]["CanonicalU64"];
+        RetryTaskRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            task_id: components["schemas"]["TaskId"];
+            expected_resource_version?: components["schemas"]["CanonicalU64"];
         };
-        PublicJobDecision: components["schemas"]["PublishJobDecision"] | components["schemas"]["ConflictJobDecision"] | components["schemas"]["RejectJobDecision"];
-        PublishJobDecision: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            outcome: "publish";
-            /** @constant */
-            final_state: "succeeded";
-            published_index_version: components["schemas"]["IndexVersion"];
+        CancelTaskRequest: {
+            tenant_id: components["schemas"]["TenantId"];
+            task_id: components["schemas"]["TaskId"];
+            expected_resource_version?: components["schemas"]["CanonicalU64"];
         };
-        ConflictJobDecision: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            outcome: "conflict";
-            /** @constant */
-            final_state: "conflicted";
-            current_index_version: components["schemas"]["IndexVersion"];
+        /** @enum {string} */
+        TaskKind: "workspace.create" | "workspace.materialize" | "precommit.check" | "add.scan" | "commit.create" | "snapshot.create" | "snapshot.delivery.materialize" | "commit.materialize" | "integrity.scan" | "resource.repair" | "catalog.lifecycle" | "storage.lifecycle" | "gateway.lifecycle" | "s3.lifecycle";
+        /** @enum {string} */
+        TaskState: "queued" | "running" | "waiting" | "verifying" | "succeeded" | "stalled" | "failed" | "cancelled";
+        TaskProgressView: {
+            completed: components["schemas"]["CanonicalU64"];
+            total: components["schemas"]["CanonicalU64"];
+            completed_bytes: components["schemas"]["CanonicalU64"];
+            total_bytes: components["schemas"]["CanonicalU64"];
         };
-        RejectJobDecision: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            outcome: "reject";
-            /** @enum {string} */
-            final_state: "rejected" | "failed" | "cancelled" | "timed_out" | "recovery_required";
-            error: components["schemas"]["JobError"];
-        };
-        PublicJobFailure: {
-            /** @enum {string} */
-            final_state: "rejected" | "failed" | "cancelled" | "timed_out" | "recovery_required";
-            failed_at_unix_ms: components["schemas"]["UnixMillis"];
-            /** @enum {string} */
-            stage: "execution" | "object_transfer" | "reporting" | "finalization";
-            error: components["schemas"]["JobError"];
-        };
-        JobError: {
-            code: components["schemas"]["ErrorCode"];
+        TaskIssueView: {
+            code: string;
             message: string;
             retryable: boolean;
-            retry_after_ms?: components["schemas"]["CanonicalU64"];
+            detail?: string;
+        };
+        TaskView: {
+            task_id: components["schemas"]["TaskId"];
+            task_kind: components["schemas"]["TaskKind"];
+            state: components["schemas"]["TaskState"];
+            phase: string;
+            tenant_id: components["schemas"]["TenantId"];
+            project_id?: components["schemas"]["ProjectId"];
+            artifact_id?: components["schemas"]["ArtifactId"];
+            object_namespace_id?: components["schemas"]["ObjectNamespaceId"];
+            commit_id?: components["schemas"]["CommitId"];
+            playground_id?: components["schemas"]["PlaygroundId"];
+            snapshot_id?: components["schemas"]["SnapshotId"];
+            storage_volume_id?: components["schemas"]["StorageVolumeId"];
+            parent_task_id?: components["schemas"]["TaskId"];
+            request_id: components["schemas"]["RequestId"];
+            request_digest: components["schemas"]["ContentDigest"];
+            actor: string;
+            attempt: components["schemas"]["CanonicalU64"];
+            progress: components["schemas"]["TaskProgressView"];
+            detail_kind?: string;
+            detail_id?: string;
+            deadline_unix_ms: components["schemas"]["UnixMillis"];
+            issue?: components["schemas"]["TaskIssueView"];
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+            started_at_unix_ms?: components["schemas"]["UnixMillis"];
+            finished_at_unix_ms?: components["schemas"]["UnixMillis"];
+            resource_version: components["schemas"]["CanonicalU64"];
+            /** @enum {string} */
+            origin: "user" | "system" | "legacy";
+            executable: boolean;
+        };
+        TaskAttemptView: {
+            attempt_id: components["schemas"]["TaskAttemptId"];
+            task_id: components["schemas"]["TaskId"];
+            attempt: components["schemas"]["CanonicalU64"];
+            state: components["schemas"]["TaskState"];
+            phase: string;
+            created_at_unix_ms: components["schemas"]["UnixMillis"];
+            updated_at_unix_ms: components["schemas"]["UnixMillis"];
+            started_at_unix_ms?: components["schemas"]["UnixMillis"];
+            finished_at_unix_ms?: components["schemas"]["UnixMillis"];
+            issue?: components["schemas"]["TaskIssueView"];
+            resource_version: components["schemas"]["CanonicalU64"];
+        };
+        TaskEventView: {
+            event_id: components["schemas"]["TaskEventId"];
+            task_id: components["schemas"]["TaskId"];
+            sequence: components["schemas"]["CanonicalU64"];
+            attempt: components["schemas"]["CanonicalU64"];
+            kind: string;
+            state: components["schemas"]["TaskState"];
+            from_state?: components["schemas"]["TaskState"];
+            to_state?: components["schemas"]["TaskState"];
+            actor: string;
+            message?: string;
+            issue?: components["schemas"]["TaskIssueView"];
+            progress?: components["schemas"]["TaskProgressView"];
+            occurred_at_unix_ms: components["schemas"]["UnixMillis"];
+            resource_version: components["schemas"]["CanonicalU64"];
+        };
+        QueryTaskListResponse: {
+            items: components["schemas"]["TaskView"][];
+            next_cursor?: string;
+        };
+        QueryTaskResponse: {
+            task: components["schemas"]["TaskView"];
+            attempts: components["schemas"]["TaskAttemptView"][];
+            events: components["schemas"]["TaskEventView"][];
+            children: components["schemas"]["TaskView"][];
+        };
+        QueryTaskEventListResponse: {
+            items: components["schemas"]["TaskEventView"][];
+            next_cursor?: components["schemas"]["CanonicalU64"];
+        };
+        TaskSummaryView: {
+            total: components["schemas"]["CanonicalU64"];
+            queued: components["schemas"]["CanonicalU64"];
+            running: components["schemas"]["CanonicalU64"];
+            waiting: components["schemas"]["CanonicalU64"];
+            verifying: components["schemas"]["CanonicalU64"];
+            succeeded: components["schemas"]["CanonicalU64"];
+            stalled: components["schemas"]["CanonicalU64"];
+            failed: components["schemas"]["CanonicalU64"];
+            cancelled: components["schemas"]["CanonicalU64"];
+        };
+        QueryTaskSummaryResponse: {
+            summary: components["schemas"]["TaskSummaryView"];
+        };
+        TaskMutationResponse: {
+            task: components["schemas"]["TaskView"];
+            replayed: boolean;
         };
         /** @description RFC 9457 Problem Details，并携带 NeoEngram 稳定错误字段。 */
         ProblemDetails: {
@@ -3541,11 +3535,14 @@ export interface components {
         CommitId: components["schemas"]["ContentDigest"];
         PreCommitId: components["schemas"]["ResourceId"];
         SnapshotId: components["schemas"]["ResourceId"];
+        SnapshotDeliveryId: components["schemas"]["ResourceId"];
         S3AccessPointId: components["schemas"]["ResourceId"];
         S3CredentialId: components["schemas"]["ResourceId"];
         DeletionId: components["schemas"]["ResourceId"];
         RetentionHoldId: components["schemas"]["ResourceId"];
-        JobId: components["schemas"]["ResourceId"];
+        TaskId: components["schemas"]["ResourceId"];
+        TaskAttemptId: components["schemas"]["ResourceId"];
+        TaskEventId: components["schemas"]["ResourceId"];
         RequestId: components["schemas"]["ResourceId"];
         /** @description 15 分钟有效且只能成功消费一次的 opaque secret；不得写入日志、审计或其他公开 DTO。 */
         StorageEnrollmentBootstrapToken: string;
@@ -3575,7 +3572,7 @@ export interface components {
         S3ObjectKey: components["schemas"]["LogicalPath"];
         S3ObjectKeyPrefix: string;
         /** @enum {string} */
-        PermissionName: "job.create" | "job.read" | "job.finalize" | "tenant.read" | "tenant.create" | "tenant.admin" | "storage.read" | "storage.create" | "storage.enrollment.create" | "storage.enrollment.read" | "storage.enrollment.review" | "artifact.read" | "artifact.create" | "artifact.commit.replicate" | "project.read" | "project.create" | "playground.read" | "playground.create" | "snapshot.read" | "snapshot.create" | "s3.access.read" | "s3.access.manage" | "resource.lifecycle.read" | "resource.lifecycle.manage" | "retention.manage" | "gateway.read" | "gateway.manage";
+        PermissionName: "task.read" | "task.manage" | "tenant.read" | "tenant.create" | "tenant.admin" | "storage.read" | "storage.create" | "storage.enrollment.create" | "storage.enrollment.read" | "storage.enrollment.review" | "artifact.read" | "artifact.create" | "artifact.commit.replicate" | "project.read" | "project.create" | "playground.read" | "playground.create" | "snapshot.read" | "snapshot.create" | "s3.access.read" | "s3.access.manage" | "resource.lifecycle.read" | "resource.lifecycle.manage" | "retention.manage" | "gateway.read" | "gateway.manage";
         TagName: string;
         /** @description 服务端生成、与资源 scope、筛选条件和排序绑定的不透明分页 token。 */
         PageCursor: string;
@@ -3601,8 +3598,6 @@ export interface components {
             revision: components["schemas"]["CanonicalU64"];
             digest: components["schemas"]["ContentDigest"];
         };
-        /** @enum {string} */
-        JobState: "queued" | "assigned" | "accepted" | "running" | "prepared" | "publishing" | "cancel_requested" | "succeeded" | "conflicted" | "rejected" | "failed" | "cancelled" | "timed_out" | "recovery_required" | "unknown";
     };
     responses: {
         /** @description Bearer token 缺失、无效或已过期 */
@@ -3618,7 +3613,7 @@ export interface components {
                  *       "title": "Authentication required",
                  *       "status": 401,
                  *       "detail": "A valid Bearer token is required",
-                 *       "instance": "/api/job/query",
+                 *       "instance": "/api/task/query",
                  *       "code": "AUTHENTICATION_REQUIRED",
                  *       "request_id": "req-20260727-001",
                  *       "retryable": false
@@ -3640,30 +3635,8 @@ export interface components {
                  *       "title": "Authorization denied",
                  *       "status": 403,
                  *       "detail": "The principal is not authorized for this operation",
-                 *       "instance": "/api/job/add/finalize",
+                 *       "instance": "/api/task/cancel",
                  *       "code": "AUTHORIZATION_DENIED",
-                 *       "request_id": "req-20260727-001",
-                 *       "retryable": false
-                 *     }
-                 */
-                "application/problem+json": components["schemas"]["ProblemDetails"];
-            };
-        };
-        /** @description Job 不存在或对当前 principal 不可见 */
-        JobNotFoundProblem: {
-            headers: {
-                "X-Request-ID": components["headers"]["RequestId"];
-                [name: string]: unknown;
-            };
-            content: {
-                /**
-                 * @example {
-                 *       "type": "urn:neoengram:problem:job-not-found",
-                 *       "title": "Job not found",
-                 *       "status": 404,
-                 *       "detail": "The requested Job was not found",
-                 *       "instance": "/api/job/query",
-                 *       "code": "JOB_NOT_FOUND",
                  *       "request_id": "req-20260727-001",
                  *       "retryable": false
                  *     }
@@ -3767,48 +3740,6 @@ export interface components {
                 "application/problem+json": components["schemas"]["ProblemDetails"];
             };
         };
-        /** @description Job deadline 已过期 */
-        DeadlineProblem: {
-            headers: {
-                "X-Request-ID": components["headers"]["RequestId"];
-                [name: string]: unknown;
-            };
-            content: {
-                /**
-                 * @example {
-                 *       "type": "urn:neoengram:problem:job-deadline-exceeded",
-                 *       "title": "Job deadline exceeded",
-                 *       "status": 408,
-                 *       "detail": "The managed Add deadline has elapsed",
-                 *       "instance": "/api/job/add/finalize",
-                 *       "code": "JOB_DEADLINE_EXCEEDED",
-                 *       "request_id": "req-20260727-001",
-                 *       "retryable": false
-                 *     }
-                 */
-                "application/problem+json": components["schemas"]["ProblemDetails"];
-            };
-        };
-        /** @description Job ID 已绑定另一请求，或 Job 创建发生并发冲突 */
-        CreateConflictProblem: {
-            headers: {
-                "X-Request-ID": components["headers"]["RequestId"];
-                [name: string]: unknown;
-            };
-            content: {
-                "application/problem+json": components["schemas"]["ProblemDetails"];
-            };
-        };
-        /** @description Job 状态、MetadataBatch、durability 或 CAS 前置条件尚不满足 */
-        FinalizeConflictProblem: {
-            headers: {
-                "X-Request-ID": components["headers"]["RequestId"];
-                [name: string]: unknown;
-            };
-            content: {
-                "application/problem+json": components["schemas"]["ProblemDetails"];
-            };
-        };
         /** @description 请求编码字节数超过当前方法上限 */
         PayloadTooLargeProblem: {
             headers: {
@@ -3822,7 +3753,7 @@ export interface components {
                  *       "title": "Payload too large",
                  *       "status": 413,
                  *       "detail": "The encoded request exceeds the method limit",
-                 *       "instance": "/api/job/add/create",
+                 *       "instance": "/api/task/list/query",
                  *       "code": "PROTOCOL_LIMIT_EXCEEDED",
                  *       "request_id": "req-20260727-001",
                  *       "retryable": false
@@ -3854,7 +3785,7 @@ export interface components {
                  *       "title": "Resource exhausted",
                  *       "status": 429,
                  *       "detail": "server request concurrency is exhausted",
-                 *       "instance": "/api/job/query",
+                 *       "instance": "/api/task/list/query",
                  *       "code": "OVERLOADED",
                  *       "request_id": "req-20260727-001",
                  *       "retryable": false
@@ -3876,7 +3807,7 @@ export interface components {
                  *       "title": "Request deadline exceeded",
                  *       "status": 504,
                  *       "detail": "service invocation deadline elapsed",
-                 *       "instance": "/api/job/query",
+                 *       "instance": "/api/task/query",
                  *       "code": "DEADLINE_EXCEEDED",
                  *       "request_id": "req-20260727-001",
                  *       "retryable": false
@@ -3898,7 +3829,7 @@ export interface components {
                  *       "title": "Internal error",
                  *       "status": 500,
                  *       "detail": "The server could not complete the request",
-                 *       "instance": "/api/job/query",
+                 *       "instance": "/api/task/query",
                  *       "code": "INTERNAL",
                  *       "request_id": "req-20260727-001",
                  *       "retryable": true
@@ -4073,7 +4004,7 @@ export interface operations {
                      *           "permissions": [
                      *             "tenant.read",
                      *             "artifact.read",
-                     *             "job.create"
+                     *             "task.read"
                      *           ]
                      *         }
                      *       ],
@@ -4145,7 +4076,7 @@ export interface operations {
                      *         "permissions": [
                      *           "tenant.read",
                      *           "artifact.read",
-                     *           "job.create"
+                     *           "task.read"
                      *         ]
                      *       }
                      *     }
@@ -5257,189 +5188,6 @@ export interface operations {
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
-        };
-    };
-    queryCommitMaterialization: {
-        parameters: {
-            query?: never;
-            header: {
-                /**
-                 * @description 公开 API 主版本；不兼容演进不改变 path。
-                 * @example 1
-                 */
-                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
-                /**
-                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
-                 * @example req-20260727-001
-                 */
-                "X-Request-ID"?: components["parameters"]["RequestId"];
-                /**
-                 * @description W3C Trace Context traceparent。
-                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-                 */
-                traceparent?: components["parameters"]["Traceparent"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["QueryCommitMaterializationRequest"];
-            };
-        };
-        responses: {
-            /** @description 复制任务 */
-            200: {
-                headers: {
-                    "X-Request-ID": components["headers"]["RequestId"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["QueryCommitMaterializationResponse"];
-                };
-            };
-            401: components["responses"]["AuthenticationProblem"];
-            403: components["responses"]["AuthorizationProblem"];
-            404: components["responses"]["ResourceNotFoundProblem"];
-            422: components["responses"]["ValidationProblem"];
-            500: components["responses"]["InternalProblem"];
-        };
-    };
-    queryCommitMaterializationList: {
-        parameters: {
-            query?: never;
-            header: {
-                /**
-                 * @description 公开 API 主版本；不兼容演进不改变 path。
-                 * @example 1
-                 */
-                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
-                /**
-                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
-                 * @example req-20260727-001
-                 */
-                "X-Request-ID"?: components["parameters"]["RequestId"];
-                /**
-                 * @description W3C Trace Context traceparent。
-                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-                 */
-                traceparent?: components["parameters"]["Traceparent"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["QueryCommitMaterializationListRequest"];
-            };
-        };
-        responses: {
-            /** @description 复制任务列表 */
-            200: {
-                headers: {
-                    "X-Request-ID": components["headers"]["RequestId"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["QueryCommitMaterializationListResponse"];
-                };
-            };
-            401: components["responses"]["AuthenticationProblem"];
-            403: components["responses"]["AuthorizationProblem"];
-            422: components["responses"]["ValidationProblem"];
-            500: components["responses"]["InternalProblem"];
-        };
-    };
-    retryCommitMaterialization: {
-        parameters: {
-            query?: never;
-            header: {
-                /**
-                 * @description 公开 API 主版本；不兼容演进不改变 path。
-                 * @example 1
-                 */
-                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
-                /**
-                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
-                 * @example req-20260727-001
-                 */
-                "X-Request-ID"?: components["parameters"]["RequestId"];
-                /**
-                 * @description W3C Trace Context traceparent。
-                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-                 */
-                traceparent?: components["parameters"]["Traceparent"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RetryCommitMaterializationRequest"];
-            };
-        };
-        responses: {
-            /** @description 重试任务 */
-            200: {
-                headers: {
-                    "X-Request-ID": components["headers"]["RequestId"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RetryCommitMaterializationResponse"];
-                };
-            };
-            401: components["responses"]["AuthenticationProblem"];
-            403: components["responses"]["AuthorizationProblem"];
-            409: components["responses"]["MutationConflictProblem"];
-            422: components["responses"]["ValidationProblem"];
-            500: components["responses"]["InternalProblem"];
-        };
-    };
-    cancelCommitMaterialization: {
-        parameters: {
-            query?: never;
-            header: {
-                /**
-                 * @description 公开 API 主版本；不兼容演进不改变 path。
-                 * @example 1
-                 */
-                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
-                /**
-                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
-                 * @example req-20260727-001
-                 */
-                "X-Request-ID"?: components["parameters"]["RequestId"];
-                /**
-                 * @description W3C Trace Context traceparent。
-                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-                 */
-                traceparent?: components["parameters"]["Traceparent"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CancelCommitMaterializationRequest"];
-            };
-        };
-        responses: {
-            /** @description 取消任务 */
-            200: {
-                headers: {
-                    "X-Request-ID": components["headers"]["RequestId"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CancelCommitMaterializationResponse"];
-                };
-            };
-            401: components["responses"]["AuthenticationProblem"];
-            403: components["responses"]["AuthorizationProblem"];
-            409: components["responses"]["MutationConflictProblem"];
-            422: components["responses"]["ValidationProblem"];
-            500: components["responses"]["InternalProblem"];
         };
     };
     queryCommitCoverage: {
@@ -6826,6 +6574,10 @@ export interface operations {
                      *           "project_id": "project-vision",
                      *           "artifact_id": "road-scenes",
                      *           "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *           "delivery_id": "delivery-road-main3-sha-01",
+                     *           "edge_cluster_id": "cluster-cn-east-1",
+                     *           "storage_volume_id": "volume-shanghai-vision",
+                     *           "delivery_mode": "copy",
                      *           "data_layout": "fast_cdc",
                      *           "message": "补充夜间道路场景",
                      *           "tag_names": [
@@ -6916,6 +6668,10 @@ export interface operations {
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
                      *         "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "delivery_id": "delivery-road-main3-sha-01",
+                     *         "edge_cluster_id": "cluster-cn-east-1",
+                     *         "storage_volume_id": "volume-shanghai-vision",
+                     *         "delivery_mode": "copy",
                      *         "data_layout": "fast_cdc",
                      *         "message": "补充夜间道路场景",
                      *         "tag_names": [
@@ -6985,6 +6741,9 @@ export interface operations {
                  *       "project_id": "project-vision",
                  *       "artifact_id": "road-scenes",
                  *       "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                 *       "target_edge_cluster_id": "cluster-cn-east-1",
+                 *       "target_storage_volume_id": "volume-shanghai-vision",
+                 *       "delivery_mode": "copy",
                  *       "request_id": "snapshot-request-main3-shanghai"
                  *     }
                  */
@@ -7007,6 +6766,10 @@ export interface operations {
                      *         "project_id": "project-vision",
                      *         "artifact_id": "road-scenes",
                      *         "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                     *         "delivery_id": "delivery-road-main3-sha-01",
+                     *         "edge_cluster_id": "cluster-cn-east-1",
+                     *         "storage_volume_id": "volume-shanghai-vision",
+                     *         "delivery_mode": "copy",
                      *         "data_layout": "fast_cdc",
                      *         "message": "补充夜间道路场景",
                      *         "tag_names": [
@@ -7121,53 +6884,6 @@ export interface operations {
             413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
             500: components["responses"]["InternalProblem"];
-            503: components["responses"]["ServiceUnavailableProblem"];
-        };
-    };
-    createSnapshotDelivery: {
-        parameters: {
-            query?: never;
-            header: {
-                /**
-                 * @description 公开 API 主版本；不兼容演进不改变 path。
-                 * @example 1
-                 */
-                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
-                /**
-                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
-                 * @example req-20260727-001
-                 */
-                "X-Request-ID"?: components["parameters"]["RequestId"];
-                /**
-                 * @description W3C Trace Context traceparent。
-                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
-                 */
-                traceparent?: components["parameters"]["Traceparent"];
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CreateSnapshotDeliveryRequest"];
-            };
-        };
-        responses: {
-            /** @description 已创建或幂等返回的交付 */
-            200: {
-                headers: {
-                    "X-Request-ID": components["headers"]["RequestId"];
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CreateSnapshotDeliveryResponse"];
-                };
-            };
-            401: components["responses"]["AuthenticationProblem"];
-            403: components["responses"]["AuthorizationProblem"];
-            404: components["responses"]["ResourceNotFoundProblem"];
-            409: components["responses"]["MutationConflictProblem"];
-            422: components["responses"]["ValidationProblem"];
             503: components["responses"]["ServiceUnavailableProblem"];
         };
     };
@@ -8844,7 +8560,7 @@ export interface operations {
             503: components["responses"]["ServiceUnavailableProblem"];
         };
     };
-    createAddJob: {
+    queryTaskList: {
         parameters: {
             query?: never;
             header: {
@@ -8869,33 +8585,26 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["CreateAddJobRequest"];
+                "application/json": components["schemas"]["QueryTaskListRequest"];
             };
         };
         responses: {
-            /** @description Job 已创建，或同一请求被幂等重放 */
+            /** @description 任务列表 */
             200: {
                 headers: {
                     "X-Request-ID": components["headers"]["RequestId"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CreateAddJobResponse"];
+                    "application/json": components["schemas"]["QueryTaskListResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];
             403: components["responses"]["AuthorizationProblem"];
-            408: components["responses"]["DeadlineProblem"];
-            409: components["responses"]["CreateConflictProblem"];
-            413: components["responses"]["PayloadTooLargeProblem"];
             422: components["responses"]["ValidationProblem"];
-            429: components["responses"]["OverloadedProblem"];
-            500: components["responses"]["InternalProblem"];
-            503: components["responses"]["ServiceUnavailableProblem"];
-            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
-    queryJob: {
+    queryTask: {
         parameters: {
             query?: never;
             header: {
@@ -8920,38 +8629,27 @@ export interface operations {
         };
         requestBody: {
             content: {
-                /**
-                 * @example {
-                 *       "tenant_id": "tenant-a",
-                 *       "job_id": "job-20260727-001"
-                 *     }
-                 */
-                "application/json": components["schemas"]["QueryJobRequest"];
+                "application/json": components["schemas"]["QueryTaskRequest"];
             };
         };
         responses: {
-            /** @description 当前权威 Job 视图 */
+            /** @description 任务详情 */
             200: {
                 headers: {
                     "X-Request-ID": components["headers"]["RequestId"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["QueryJobResponse"];
+                    "application/json": components["schemas"]["QueryTaskResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];
             403: components["responses"]["AuthorizationProblem"];
-            404: components["responses"]["JobNotFoundProblem"];
-            413: components["responses"]["PayloadTooLargeProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
             422: components["responses"]["ValidationProblem"];
-            429: components["responses"]["OverloadedProblem"];
-            500: components["responses"]["InternalProblem"];
-            503: components["responses"]["ServiceUnavailableProblem"];
-            504: components["responses"]["RequestTimeoutProblem"];
         };
     };
-    finalizeAddJob: {
+    queryTaskEventList: {
         parameters: {
             query?: never;
             header: {
@@ -8976,37 +8674,160 @@ export interface operations {
         };
         requestBody: {
             content: {
-                /**
-                 * @example {
-                 *       "tenant_id": "tenant-a",
-                 *       "job_id": "job-20260727-001"
-                 *     }
-                 */
-                "application/json": components["schemas"]["FinalizeAddJobRequest"];
+                "application/json": components["schemas"]["QueryTaskEventListRequest"];
             };
         };
         responses: {
-            /** @description Add 已形成稳定发布决定 */
+            /** @description 追加式事件列表 */
             200: {
                 headers: {
                     "X-Request-ID": components["headers"]["RequestId"];
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["FinalizeAddJobResponse"];
+                    "application/json": components["schemas"]["QueryTaskEventListResponse"];
                 };
             };
             401: components["responses"]["AuthenticationProblem"];
             403: components["responses"]["AuthorizationProblem"];
-            404: components["responses"]["JobNotFoundProblem"];
-            408: components["responses"]["DeadlineProblem"];
-            409: components["responses"]["FinalizeConflictProblem"];
-            413: components["responses"]["PayloadTooLargeProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
             422: components["responses"]["ValidationProblem"];
-            429: components["responses"]["OverloadedProblem"];
-            500: components["responses"]["InternalProblem"];
-            503: components["responses"]["ServiceUnavailableProblem"];
-            504: components["responses"]["RequestTimeoutProblem"];
+        };
+    };
+    queryTaskSummary: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryTaskSummaryRequest"];
+            };
+        };
+        responses: {
+            /** @description 状态计数 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryTaskSummaryResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            422: components["responses"]["ValidationProblem"];
+        };
+    };
+    retryTask: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetryTaskRequest"];
+            };
+        };
+        responses: {
+            /** @description 任务已重新排队 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
+        };
+    };
+    cancelTask: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description 公开 API 主版本；不兼容演进不改变 path。
+                 * @example 1
+                 */
+                "NeoEngram-API-Version": components["parameters"]["ApiVersion"];
+                /**
+                 * @description 可选的调用方请求 ID。缺失时由服务端生成；无论来源如何，响应都必须回传最终 ID。
+                 * @example req-20260727-001
+                 */
+                "X-Request-ID"?: components["parameters"]["RequestId"];
+                /**
+                 * @description W3C Trace Context traceparent。
+                 * @example 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+                 */
+                traceparent?: components["parameters"]["Traceparent"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CancelTaskRequest"];
+            };
+        };
+        responses: {
+            /** @description 任务已取消 */
+            200: {
+                headers: {
+                    "X-Request-ID": components["headers"]["RequestId"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskMutationResponse"];
+                };
+            };
+            401: components["responses"]["AuthenticationProblem"];
+            403: components["responses"]["AuthorizationProblem"];
+            404: components["responses"]["ResourceNotFoundProblem"];
+            409: components["responses"]["MutationConflictProblem"];
+            422: components["responses"]["ValidationProblem"];
         };
     };
     liveProbe: {

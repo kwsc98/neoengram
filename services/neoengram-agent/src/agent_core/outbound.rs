@@ -370,6 +370,10 @@ fn report_job_id(report: &AgentReport) -> AgentResult<neoengram_domain::protocol
             value.materialization_id()
         ))
         .map_err(AgentError::from),
+        AgentReport::Integrity(value) => {
+            neoengram_domain::protocol::JobId::new(format!("integrity-{}", value.scan.scan_id))
+                .map_err(AgentError::from)
+        }
     }
 }
 
@@ -379,6 +383,7 @@ fn report_tenant_id(report: &AgentReport) -> Option<&TenantId> {
         AgentReport::Lifecycle(value) => Some(&value.tenant_id),
         AgentReport::Replication(value) => Some(value.tenant_id()),
         AgentReport::Materialization(value) => Some(value.tenant_id()),
+        AgentReport::Integrity(value) => Some(&value.scan.tenant_id),
         _ => None,
     }
 }

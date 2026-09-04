@@ -616,7 +616,8 @@ fn queued_workspace_state(
             ),
             AgentReport::Lifecycle(_)
             | AgentReport::Replication(_)
-            | AgentReport::Materialization(_) => continue,
+            | AgentReport::Materialization(_)
+            | AgentReport::Integrity(_) => continue,
         };
         if job_id != &assignment.job_id {
             continue;
@@ -1175,7 +1176,8 @@ fn queued_delivery_state(
             ),
             AgentReport::Lifecycle(_)
             | AgentReport::Replication(_)
-            | AgentReport::Materialization(_) => continue,
+            | AgentReport::Materialization(_)
+            | AgentReport::Integrity(_) => continue,
         };
         if job_id != &assignment.job_id {
             continue;

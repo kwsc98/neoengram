@@ -11,8 +11,10 @@ use fusen_rs::{Error, ErrorCategory};
 use neoengram_domain::core::ContentDigest;
 use neoengram_domain::protocol::{
     CertificateGeneration, EdgeClusterId, GatewayPoolId, GatewayReplicaId, Generation,
-    ProtocolVersion, ResourceVersion, UnixMillis,
+    ProtocolVersion, RequestId, ResourceVersion, TaskActor, TaskId, TaskKind, TaskResourceKind,
+    TaskResourceLink, TaskResourceRole, TaskScope, TenantId, UnixMillis,
 };
+use serde::Serialize;
 
 use crate::{
     dto::{
@@ -20,7 +22,8 @@ use crate::{
         CreateGatewayReplicaResponse, DrainGatewayPoolRequest, GatewayPoolListResponse,
         GatewayPoolResponse, GatewayPoolView, GatewayReplicaListResponse, GatewayReplicaResponse,
         GatewayReplicaView, MutateGatewayReplicaRequest, QueryGatewayPoolListRequest,
-        QueryGatewayPoolRequest, QueryGatewayReplicaListRequest, UpdateGatewayPoolRequest,
+        QueryGatewayPoolRequest, QueryGatewayReplicaListRequest, TaskView,
+        UpdateGatewayPoolRequest,
     },
     error::{application_error, invalid_request, map_central_error},
     gateway_activation_transport::{
@@ -28,18 +31,20 @@ use crate::{
         GatewayReplicaActivationClientError,
     },
     identity::{AuthenticatedIdentity, Permission, StaticRbacPolicy},
-    service::{GatewayReplicaActivationError, WorkloadCertificateIssuerError},
+    service::{GatewayReplicaActivationError, TaskCoordinator, WorkloadCertificateIssuerError},
 };
 
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = GATEWAY_REGISTRY_MAX_PAGE_SIZE - 1;
 const ACTIVATION_TOKEN_BYTES: usize = 32;
+const GATEWAY_TASK_TENANT_ID: &str = "gateway-system";
 
 pub struct GatewayRegistryService {
     repository: Arc<dyn GatewayRegistryRepository>,
     policy: Arc<StaticRbacPolicy>,
     clock: Arc<dyn Clock>,
     activation_client: Option<Arc<GatewayReplicaActivationClient>>,
+    task_coordinator: Option<Arc<TaskCoordinator>>,
 }
 
 impl GatewayRegistryService {
@@ -54,6 +59,7 @@ impl GatewayRegistryService {
             policy,
             clock,
             activation_client: None,
+            task_coordinator: None,
         }
     }
 
@@ -69,6 +75,14 @@ impl GatewayRegistryService {
         self
     }
 
+    /// Attaches the unified operation-task coordinator.  Gateway registry tests and lightweight
+    /// compositions may omit it; the production runtime installs the Authority-backed instance.
+    #[must_use]
+    pub fn with_task_coordinator(mut self, task_coordinator: Arc<TaskCoordinator>) -> Self {
+        self.task_coordinator = Some(task_coordinator);
+        self
+    }
+
     pub async fn create_pool(
         &self,
         identity: &AuthenticatedIdentity,
@@ -78,6 +92,16 @@ impl GatewayRegistryService {
         let create_request = request.clone();
         let gateway_pool_id = parse_pool_id(&request.gateway_pool_id)?;
         let edge_cluster_id = parse_cluster_id(&request.edge_cluster_id)?;
+        let (task, task_replayed) = self
+            .begin_operation_task(
+                identity,
+                &create_request,
+                Some("gateway_pool"),
+                Some(gateway_pool_id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(&task, gateway_pool_id.as_str(), TaskResourceRole::Primary)
+            .await?;
         if let Some(existing) = self
             .repository
             .get_pool(&gateway_pool_id)
@@ -88,6 +112,7 @@ impl GatewayRegistryService {
                 return Ok(GatewayPoolResponse {
                     gateway_pool: pool_view(&existing),
                     replayed: true,
+                    task: self.complete_operation_task(task, identity).await?,
                 });
             }
             return Err(invalid_request(
@@ -135,9 +160,11 @@ impl GatewayRegistryService {
             }
             Err(error) => return Err(map_central_error(error)),
         };
+        let task = self.complete_operation_task(task, identity).await?;
         Ok(GatewayPoolResponse {
             gateway_pool: pool_view(&record),
-            replayed,
+            replayed: replayed || task_replayed,
+            task,
         })
     }
 
@@ -156,6 +183,7 @@ impl GatewayRegistryService {
         Ok(GatewayPoolResponse {
             gateway_pool: pool_view(&record),
             replayed: false,
+            task: None,
         })
     }
 
@@ -202,6 +230,7 @@ impl GatewayRegistryService {
         request: UpdateGatewayPoolRequest,
     ) -> Result<GatewayPoolResponse, Error> {
         self.authorize_manage(identity)?;
+        let task_request = request.clone();
         if request.clear_s3_endpoint && request.s3_endpoint.is_some() {
             return Err(invalid_request(
                 "s3_endpoint and clear_s3_endpoint are mutually exclusive",
@@ -240,6 +269,16 @@ impl GatewayRegistryService {
                 "s3_endpoint is immutable until Gateway workload certificate rotation is supported",
             ));
         }
+        let (task, task_replayed) = self
+            .begin_operation_task(
+                identity,
+                &task_request,
+                Some("gateway_pool"),
+                Some(id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(&task, id.as_str(), TaskResourceRole::Primary)
+            .await?;
         if let Some(value) = request.display_name {
             record.display_name = value;
         }
@@ -271,9 +310,11 @@ impl GatewayRegistryService {
             .replace_pool(expected, record)
             .await
             .map_err(map_central_error)?;
+        let task = self.complete_operation_task(task, identity).await?;
         Ok(GatewayPoolResponse {
             gateway_pool: pool_view(&record),
-            replayed: false,
+            replayed: task_replayed,
+            task,
         })
     }
 
@@ -283,6 +324,7 @@ impl GatewayRegistryService {
         request: DrainGatewayPoolRequest,
     ) -> Result<GatewayPoolResponse, Error> {
         self.authorize_manage(identity)?;
+        let task_request = request.clone();
         let id = parse_pool_id(&request.gateway_pool_id)?;
         let expected = parse_resource_version(&request.expected_resource_version)?;
         let mut record = self
@@ -291,10 +333,21 @@ impl GatewayRegistryService {
             .await
             .map_err(map_central_error)?
             .ok_or_else(gateway_pool_not_found)?;
+        let (task, task_replayed) = self
+            .begin_operation_task(
+                identity,
+                &task_request,
+                Some("gateway_pool"),
+                Some(id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(&task, id.as_str(), TaskResourceRole::Primary)
+            .await?;
         if record.state == GatewayPoolState::Draining {
             return Ok(GatewayPoolResponse {
                 gateway_pool: pool_view(&record),
                 replayed: true,
+                task: self.complete_operation_task(task, identity).await?,
             });
         }
         if record.resource_version != expected {
@@ -310,9 +363,11 @@ impl GatewayRegistryService {
             .replace_pool(expected.get(), record)
             .await
             .map_err(map_central_error)?;
+        let task = self.complete_operation_task(task, identity).await?;
         Ok(GatewayPoolResponse {
             gateway_pool: pool_view(&record),
-            replayed: false,
+            replayed: task_replayed,
+            task,
         })
     }
 
@@ -331,6 +386,16 @@ impl GatewayRegistryService {
             .await
             .map_err(map_central_error)?
             .ok_or_else(gateway_pool_not_found)?;
+        let (task, task_replayed) = self
+            .begin_operation_task(
+                identity,
+                &create_request,
+                Some("gateway_replica"),
+                Some(replica_id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(&task, replica_id.as_str(), TaskResourceRole::Primary)
+            .await?;
         if let Some(existing) = self
             .repository
             .get_replica(&replica_id)
@@ -342,6 +407,7 @@ impl GatewayRegistryService {
                     gateway_replica: replica_view(&existing),
                     activation_token: None,
                     replayed: true,
+                    task: self.complete_operation_task(task, identity).await?,
                 });
             }
             return Err(invalid_request(
@@ -419,10 +485,12 @@ impl GatewayRegistryService {
                 }
                 Err(error) => return Err(map_central_error(error)),
             };
+        let task = self.complete_operation_task(task, identity).await?;
         Ok(CreateGatewayReplicaResponse {
             gateway_replica: replica_view(&record),
             activation_token,
-            replayed,
+            replayed: replayed || task_replayed,
+            task,
         })
     }
 
@@ -480,6 +548,16 @@ impl GatewayRegistryService {
             .await
             .map_err(map_central_error)?
             .ok_or_else(gateway_replica_not_found)?;
+        let (task, task_replayed) = self
+            .begin_operation_task(
+                identity,
+                &request,
+                Some("gateway_replica"),
+                Some(replica_id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(&task, replica_id.as_str(), TaskResourceRole::Primary)
+            .await?;
         let token_matches = ContentDigest::hash(request.activation_token.as_bytes())
             == record.credential.activation_token_digest;
         // Activation has a durable prepare/deliver/commit boundary.  A lost response must be
@@ -493,6 +571,7 @@ impl GatewayRegistryService {
             return Ok(GatewayReplicaResponse {
                 gateway_replica: replica_view(&record),
                 replayed: true,
+                task: self.complete_operation_task(task, identity).await?,
             });
         }
         let resumable = token_matches
@@ -517,9 +596,11 @@ impl GatewayRegistryService {
             .activate(&record, &request.activation_token)
             .await
             .map_err(map_gateway_activation_error)?;
+        let task = self.complete_operation_task(task, identity).await?;
         Ok(GatewayReplicaResponse {
             gateway_replica: replica_view(&activated.replica),
-            replayed: resumable,
+            replayed: resumable || task_replayed,
+            task,
         })
     }
 
@@ -548,13 +629,31 @@ impl GatewayRegistryService {
         mutation: GatewayReplicaMutation,
     ) -> Result<GatewayReplicaResponse, Error> {
         self.authorize_manage(identity)?;
+        let task_request = (
+            match mutation {
+                GatewayReplicaMutation::Drain => "drain",
+                GatewayReplicaMutation::Revoke => "revoke",
+            },
+            request.clone(),
+        );
         let expected = parse_resource_version(&request.expected_resource_version)?;
+        let replica_id = parse_replica_id(&request.gateway_replica_id)?;
         let mut record = self
             .repository
-            .get_replica(&parse_replica_id(&request.gateway_replica_id)?)
+            .get_replica(&replica_id)
             .await
             .map_err(map_central_error)?
             .ok_or_else(gateway_replica_not_found)?;
+        let (task, task_replayed) = self
+            .begin_operation_task(
+                identity,
+                &task_request,
+                Some("gateway_replica"),
+                Some(replica_id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(&task, replica_id.as_str(), TaskResourceRole::Primary)
+            .await?;
         let replayed = match mutation {
             GatewayReplicaMutation::Drain if record.state == GatewayReplicaState::Draining => true,
             GatewayReplicaMutation::Revoke if record.state == GatewayReplicaState::Revoked => true,
@@ -583,6 +682,7 @@ impl GatewayRegistryService {
             return Ok(GatewayReplicaResponse {
                 gateway_replica: replica_view(&record),
                 replayed: true,
+                task: self.complete_operation_task(task, identity).await?,
             });
         }
         if record.resource_version != expected {
@@ -603,10 +703,96 @@ impl GatewayRegistryService {
             .replace_replica(expected_value, record)
             .await
             .map_err(map_central_error)?;
+        let task = self.complete_operation_task(task, identity).await?;
         Ok(GatewayReplicaResponse {
             gateway_replica: replica_view(&record),
-            replayed: false,
+            replayed: task_replayed,
+            task,
         })
+    }
+
+    /// Creates the unified task envelope for a Gateway infrastructure mutation. Gateway registry
+    /// requests are control-plane-wide and therefore use the fixed system tenant scope; the
+    /// concrete pool or replica is attached through a typed resource link below.
+    async fn begin_operation_task<T: Serialize>(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: &T,
+        detail_kind: Option<&str>,
+        detail_id: Option<&str>,
+    ) -> Result<(Option<TaskView>, bool), Error> {
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok((None, false));
+        };
+        let kind = TaskKind::GatewayLifecycle;
+        let task_request_id = derived_task_request_id(kind, request)?;
+        let (task, replayed) = coordinator
+            .create_root(
+                kind,
+                TaskScope::new(gateway_task_tenant_id()),
+                task_request_id,
+                request,
+                TaskActor::Principal(identity.principal().clone()),
+                detail_kind,
+                detail_id,
+            )
+            .await
+            .map_err(map_central_error)?;
+        Ok((Some(super::task::task_view(&task)), replayed))
+    }
+
+    async fn complete_operation_task(
+        &self,
+        task: Option<TaskView>,
+        identity: &AuthenticatedIdentity,
+    ) -> Result<Option<TaskView>, Error> {
+        let (Some(coordinator), Some(task)) = (&self.task_coordinator, task) else {
+            return Ok(None);
+        };
+        let task_id = TaskId::new(task.task_id.clone())
+            .map_err(|error| invalid_request(format!("task_id: {error}")))?;
+        let tenant_id = TenantId::new(task.tenant_id.clone())
+            .map_err(|error| invalid_request(format!("tenant_id: {error}")))?;
+        let current = coordinator
+            .repository()
+            .get(&tenant_id, &task_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| invalid_request("operation task disappeared"))?;
+        let completed = coordinator
+            .complete_immediate(&current, TaskActor::Principal(identity.principal().clone()))
+            .await
+            .map_err(map_central_error)?;
+        Ok(Some(super::task::task_view(&completed)))
+    }
+
+    async fn link_operation_resource(
+        &self,
+        task: &Option<TaskView>,
+        resource_id: &str,
+        role: TaskResourceRole,
+    ) -> Result<(), Error> {
+        let (Some(coordinator), Some(task)) = (&self.task_coordinator, task) else {
+            return Ok(());
+        };
+        let task_id = TaskId::new(task.task_id.clone())
+            .map_err(|error| invalid_request(format!("task_id: {error}")))?;
+        let tenant_id = TenantId::new(task.tenant_id.clone())
+            .map_err(|error| invalid_request(format!("tenant_id: {error}")))?;
+        coordinator
+            .repository()
+            .link_resource(crate::TaskResourceLinkRecord {
+                tenant_id,
+                link: TaskResourceLink::new(
+                    task_id,
+                    TaskResourceKind::Gateway,
+                    resource_id.to_owned(),
+                    role,
+                ),
+            })
+            .await
+            .map_err(map_central_error)?;
+        Ok(())
     }
 
     fn authorize_read(&self, identity: &AuthenticatedIdentity) -> Result<(), Error> {
@@ -817,6 +1003,21 @@ fn activation_token() -> Result<String, Error> {
     Ok(format!("nggw_v1_{}", URL_SAFE_NO_PAD.encode(random)))
 }
 
+fn gateway_task_tenant_id() -> TenantId {
+    TenantId::new(GATEWAY_TASK_TENANT_ID).expect("gateway task system tenant ID is valid")
+}
+
+fn derived_task_request_id<T: Serialize>(kind: TaskKind, request: &T) -> Result<RequestId, Error> {
+    let digest = neoengram_domain::jcs_blake3(request)
+        .map_err(|error| invalid_request(format!("task request: {error}")))?;
+    RequestId::new(format!(
+        "{}-{}",
+        kind.as_str().replace('.', "-"),
+        &digest.to_hex()[..32]
+    ))
+    .map_err(|error| invalid_request(format!("task request_id: {error}")))
+}
+
 fn parse_pool_id(value: &str) -> Result<GatewayPoolId, Error> {
     GatewayPoolId::new(value).map_err(|error| invalid_request(format!("gateway_pool_id: {error}")))
 }
@@ -911,7 +1112,7 @@ fn gateway_replica_not_found() -> Error {
 mod tests {
     use std::sync::Mutex;
 
-    use crate::{InMemoryClock, InMemoryGatewayRegistry};
+    use crate::{InMemoryClock, InMemoryGatewayRegistry, InMemoryTaskRepository, TaskRepository};
     use async_trait::async_trait;
     use neoengram_domain::protocol::{
         Ed25519PublicKeySpki, Ed25519Signature, PrincipalKind, CURRENT_WIRE_VERSION,
@@ -996,6 +1197,39 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_mutations_are_recorded_as_completed_operation_tasks() {
+        let repository = Arc::new(InMemoryGatewayRegistry::new());
+        let tasks = Arc::new(InMemoryTaskRepository::default());
+        let clock = Arc::new(InMemoryClock::new(100));
+        let policy = Arc::new(
+            StaticRbacPolicy::one_principal(
+                "operator",
+                ["*".to_owned()],
+                [Permission::GatewayManage],
+            )
+            .unwrap(),
+        );
+        let coordinator = Arc::new(TaskCoordinator::new(tasks.clone(), clock.clone()));
+        let service = GatewayRegistryService::new(repository, policy, clock)
+            .with_task_coordinator(coordinator);
+        let identity = identity();
+
+        let response = service
+            .create_pool(&identity, create_pool_request())
+            .await
+            .unwrap();
+        let task = response.task.expect("gateway create returns a task");
+        assert_eq!(task.task_kind, "gateway.lifecycle");
+        assert_eq!(task.state, "succeeded");
+        let task_id = TaskId::new(task.task_id).unwrap();
+        let tenant_id = TenantId::new(GATEWAY_TASK_TENANT_ID).unwrap();
+        let links = tasks.resources(&tenant_id, &task_id).await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].resource_kind, TaskResourceKind::Gateway);
+        assert_eq!(links[0].resource_id, "pool-a");
     }
 
     #[tokio::test]

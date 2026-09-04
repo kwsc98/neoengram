@@ -5,7 +5,6 @@ import {
   Delete,
   FolderOpened,
   Lock,
-  Plus,
   RefreshRight,
   WarningFilled,
 } from '@element-plus/icons-vue';
@@ -15,35 +14,26 @@ import { computed, ref, watch, watchEffect } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import {
-  createSnapshotDelivery,
-  cancelCommitReplication,
   deleteSnapshotDelivery,
-  queryCommitAvailability,
-  queryCommitReplicationList,
   queryApiVersion,
   queryGatewayPoolList,
   querySnapshot,
   querySnapshotDeliveryList,
   queryStorageVolume,
   queryStorageVolumeList,
-  replicateCommit,
-  retryCommitReplication,
   retrySnapshotDelivery,
 } from '@/api/operations';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import {
-  commitReplicationRequestId,
-  commitReplicationRetryRequestId,
-  findActiveCommitReplication,
-  findCommitReplicationForTarget,
-  isCommitReplicationActive,
-} from '@/features/commit-replication';
+  isMaterializationActive,
+  materializationRequestId,
+  useCommitMaterialization,
+} from '@/features/materialization';
 import {
-  supportsArtifactCommitReplication,
+  supportsCommitMaterializationV2,
   supportsS3ReadonlyAccessPoint,
   supportsSnapshotDelivery,
-  supportsSnapshotDeliveryMode,
 } from '@/features/capabilities';
 import {
   groupStorageVolumesByCluster,
@@ -96,7 +86,6 @@ const snapshotQuery = useQuery({
 });
 const snapshot = computed(() => snapshotQuery.data.value?.data.snapshot);
 const tags = computed(() => commitTagNames(snapshot.value?.tag_names ?? []));
-const selectedDeliveryMode = ref<'fuse' | 'copy' | 'hardlink'>('fuse');
 const targetVolumeId = ref('');
 const replicationTargetVolumeId = ref('');
 const replicationTargetTouched = ref(false);
@@ -105,15 +94,21 @@ const deliveryCapabilityEnabled = computed(() =>
 );
 const replicationCapabilityEnabled = computed(
   () =>
-    supportsArtifactCommitReplication(versionQuery.data.value?.data.capabilities) &&
+    supportsCommitMaterializationV2(versionQuery.data.value?.data.capabilities) &&
     (tenants.byId(tenantId.value)?.permissions.includes('artifact.commit.replicate') ?? false),
 );
 const gatewayInventoryEnabled = computed(
   () => tenants.byId(tenantId.value)?.permissions.includes('gateway.read') ?? false,
 );
 const volumeQuery = useQuery({
-  queryKey: computed(() => ['storage-volume', tenantId.value, targetVolumeId.value]),
-  queryFn: () => queryStorageVolume(tenantId.value, targetVolumeId.value),
+  queryKey: computed(() => [
+    'storage-volume',
+    tenantId.value,
+    targetVolumeId.value,
+    snapshot.value?.snapshot_id,
+  ]),
+  queryFn: () =>
+    queryStorageVolume(tenantId.value, targetVolumeId.value, snapshot.value?.snapshot_id),
   enabled: computed(() => Boolean(targetVolumeId.value && deliveryCapabilityEnabled.value)),
   staleTime: 30_000,
   // This state is live Agent availability, not a durable lifecycle field.
@@ -123,11 +118,9 @@ const volumeQuery = useQuery({
 const volumeListQuery = useQuery({
   queryKey: computed(() => ['storage-volumes', tenantId.value, 'snapshot-detail']),
   queryFn: () => queryStorageVolumeList({ tenant_id: tenantId.value, page_size: 100 }),
-  enabled: computed(() =>
-    Boolean(
-      snapshot.value && (deliveryCapabilityEnabled.value || replicationCapabilityEnabled.value),
-    ),
-  ),
+  // Snapshot readers obtain only their immutable target through the scoped single-volume query.
+  // The inventory list is reserved for the explicit materialization/replication workflow.
+  enabled: computed(() => Boolean(snapshot.value && replicationCapabilityEnabled.value)),
   refetchInterval: 5_000,
   refetchIntervalInBackground: false,
 });
@@ -157,35 +150,40 @@ const selectedReplicationTargetGroup = computed(() =>
     group.volumes.some((volume) => volume.storage_volume_id === replicationTargetVolumeId.value),
   ),
 );
-const replicationMutation = useMutation({ mutationFn: replicateCommit });
-const retryReplicationMutation = useMutation({ mutationFn: retryCommitReplication });
-const cancelReplicationMutation = useMutation({ mutationFn: cancelCommitReplication });
-const replicationListQuery = useQuery({
-  queryKey: computed(() => [
-    'commit-replications',
-    tenantId.value,
-    snapshot.value?.commit_id,
-    'snapshot-detail',
-  ]),
-  queryFn: () =>
-    queryCommitReplicationList({
-      tenant_id: tenantId.value,
-      commit_id: snapshot.value!.commit_id,
-      object_namespace_id: artifactId.value,
-    }),
-  enabled: computed(() => replicationCapabilityEnabled.value && Boolean(snapshot.value?.commit_id)),
-  refetchInterval: (query) => {
-    const items = query.state.data?.data.replications ?? [];
-    return items.some((item) => isCommitReplicationActive(item.state)) ? 1_000 : false;
+const commitMaterialization = useCommitMaterialization(
+  {
+    tenantId,
+    projectId,
+    artifactId,
+    commitId: computed(() => snapshot.value?.commit_id ?? ''),
   },
-});
-const commitReplications = computed(() => replicationListQuery.data.value?.data.replications ?? []);
-const replication = computed(() =>
-  findCommitReplicationForTarget(commitReplications.value, replicationTargetVolumeId.value),
+  {
+    enabled: computed(
+      () => replicationCapabilityEnabled.value && Boolean(snapshot.value?.commit_id),
+    ),
+  },
 );
-const activeReplication = computed(() => findActiveCommitReplication(commitReplications.value));
+const {
+  materializations: commitReplications,
+  materializationsQuery: replicationListQuery,
+  availabilityQuery: availabilityQuery,
+  materializeOrRepair,
+  repairMaterialization,
+  cancelMaterialization,
+  createMutation: replicationMutation,
+  retryMutation: retryReplicationMutation,
+  cancelMutation: cancelReplicationMutation,
+} = commitMaterialization;
+const replication = computed(() =>
+  commitMaterialization.targetMaterialization(replicationTargetVolumeId.value),
+);
+const activeReplication = computed(() =>
+  commitReplications.value.find((item) => isMaterializationActive(item.state)),
+);
 watchEffect(() => {
-  if (!targetVolumeId.value) {
+  if (snapshot.value?.storage_volume_id) {
+    targetVolumeId.value = snapshot.value.storage_volume_id;
+  } else if (!targetVolumeId.value) {
     targetVolumeId.value =
       targetVolumes.value.find((volume) => volume.state === 'ready')?.storage_volume_id ?? '';
   }
@@ -201,42 +199,21 @@ watchEffect(() => {
     replicationTargetVolumeId.value = replicationTargetVolumes.value[0]?.storage_volume_id ?? '';
   }
 });
-const availabilityQuery = useQuery({
-  queryKey: computed(() => ['commit-availability', tenantId.value, snapshot.value?.commit_id]),
-  queryFn: () =>
-    queryCommitAvailability({
-      tenant_id: tenantId.value,
-      commit_id: snapshot.value!.commit_id,
-      object_namespace_id: artifactId.value,
-    }),
-  enabled: computed(() => Boolean(snapshot.value?.commit_id)),
-  refetchInterval: () =>
-    commitReplications.value.some((item) => isCommitReplicationActive(item.state)) ? 1_000 : false,
-});
 watch(
   commitReplications,
   (next, previous) => {
     if (
-      previous?.some((item) => isCommitReplicationActive(item.state)) &&
-      !next.some((item) => isCommitReplicationActive(item.state))
+      previous?.some((item) => isMaterializationActive(item.state)) &&
+      !next.some((item) => isMaterializationActive(item.state))
     ) {
       void availabilityQuery.refetch();
     }
   },
   { deep: true },
 );
-const availableVolumeIds = computed(
-  () => availabilityQuery.data.value?.data.availability.verified_storage_volume_ids ?? [],
-);
-const targetPlacementPublished = computed(
-  () =>
-    (replication.value?.state === 'published' &&
-      replication.value.target_storage_volume_id === targetVolumeId.value) ||
-    availableVolumeIds.value.includes(targetVolumeId.value),
-);
 const replicationActionLabel = computed(() => {
-  if (replication.value?.state === 'published') return '副本已发布';
-  if (replication.value && isCommitReplicationActive(replication.value.state)) return '复制进行中';
+  if (replication.value?.state === 'complete') return '副本已发布';
+  if (replication.value && isMaterializationActive(replication.value.state)) return '复制进行中';
   if (replication.value?.state === 'failed' || replication.value?.state === 'cancelled') {
     return '请重试任务';
   }
@@ -245,28 +222,6 @@ const replicationActionLabel = computed(() => {
 const replicationTargetBlocked = computed(
   () => !replicationTargetVolumeId.value || Boolean(replication.value),
 );
-const storageVolume = computed(() => volumeQuery.data.value?.data.storage_volume);
-const deliveryModeAvailability = computed(() => {
-  const capabilities = versionQuery.data.value?.data.capabilities;
-  const volume = storageVolume.value;
-  const layout = snapshot.value?.data_layout;
-  return {
-    fuse:
-      targetPlacementPublished.value &&
-      supportsSnapshotDeliveryMode(capabilities, 'fuse') &&
-      Boolean(volume?.allowed_delivery_modes.includes('fuse')),
-    copy:
-      targetPlacementPublished.value &&
-      supportsSnapshotDeliveryMode(capabilities, 'copy') &&
-      Boolean(volume?.allowed_delivery_modes.includes('copy')),
-    hardlink:
-      targetPlacementPublished.value &&
-      supportsSnapshotDeliveryMode(capabilities, 'hardlink') &&
-      Boolean(volume?.allowed_delivery_modes.includes('hardlink')) &&
-      layout === 'whole_file' &&
-      volume?.hardlink_policy !== 'disabled',
-  };
-});
 const deliveryQuery = useQuery({
   queryKey: computed(() => ['snapshot-deliveries', tenantId.value, snapshotId.value]),
   queryFn: () =>
@@ -275,22 +230,29 @@ const deliveryQuery = useQuery({
       snapshot_id: snapshotId.value,
       page_size: 100,
     }),
-  enabled: computed(() =>
-    Boolean(
-      snapshot.value?.state === 'ready' &&
-      snapshot.value.data_health !== 'unavailable' &&
-      deliveryCapabilityEnabled.value,
-    ),
-  ),
+  enabled: computed(() => Boolean(snapshot.value && deliveryCapabilityEnabled.value)),
 });
-const deliveryMutation = useMutation({
-  mutationFn: createSnapshotDelivery,
-  onSuccess: async () => {
-    await queryClient.invalidateQueries({
-      queryKey: ['snapshot-deliveries', tenantId.value, snapshotId.value],
-    });
-    ElMessage.success('只读交付已创建');
-  },
+const deliveries = computed(() => deliveryQuery.data.value?.data.items ?? []);
+const boundDelivery = computed(() =>
+  deliveries.value.find((delivery) => delivery.delivery_id === snapshot.value?.delivery_id),
+);
+const targetVolumeReady = computed(
+  () => volumeQuery.data.value?.data.storage_volume.state === 'ready',
+);
+const snapshotReadable = computed(
+  () =>
+    snapshot.value?.state === 'ready' &&
+    boundDelivery.value?.state === 'ready' &&
+    targetVolumeReady.value,
+);
+const deliveryModeAvailability = computed(() => {
+  const mode = snapshot.value?.delivery_mode;
+  const ready = boundDelivery.value?.state === 'ready';
+  return {
+    fuse: mode === 'fuse' && ready,
+    copy: mode === 'copy' && ready,
+    hardlink: mode === 'hardlink' && ready,
+  };
 });
 const deleteDeliveryMutation = useMutation({
   mutationFn: deleteSnapshotDelivery,
@@ -310,60 +272,11 @@ const retryDeliveryMutation = useMutation({
     ElMessage.success('只读交付已重新提交');
   },
 });
-const deliveries = computed(() => deliveryQuery.data.value?.data.items ?? []);
-
-const copyRequiredBytes = computed(() => {
-  try {
-    const size = BigInt(snapshot.value?.logical_size_bytes ?? '0');
-    const reserve = BigInt(storageVolume.value?.copy_reserve_bytes ?? '0');
-    return (size + reserve).toString();
-  } catch {
-    return undefined;
-  }
-});
-
-const deliveryModeOptions = computed(() => [
-  {
-    label: 'FUSE',
-    value: 'fuse',
-    disabled: !deliveryModeAvailability.value.fuse,
-  },
-  {
-    label: '全部复制',
-    value: 'copy',
-    disabled: !deliveryModeAvailability.value.copy,
-  },
-  {
-    label: '硬链接',
-    value: 'hardlink',
-    disabled: !deliveryModeAvailability.value.hardlink,
-  },
-]);
-
-watchEffect(() => {
-  if (!storageVolume.value || deliveryModeAvailability.value[selectedDeliveryMode.value]) return;
-  const firstAvailable = (['fuse', 'copy', 'hardlink'] as const).find(
-    (mode) => deliveryModeAvailability.value[mode],
-  );
-  if (firstAvailable) selectedDeliveryMode.value = firstAvailable;
-});
-
 function deliveryModeReason(mode: 'fuse' | 'copy' | 'hardlink'): string | undefined {
-  if (snapshot.value?.data_health === 'unavailable') return 'Snapshot 当前没有可用对象副本';
-  if (!targetPlacementPublished.value)
-    return '请先将 Commit 复制到当前目标 Volume，并等待 PlacementSet published';
-  const capabilities = versionQuery.data.value?.data.capabilities;
-  if (!supportsSnapshotDeliveryMode(capabilities, mode)) {
-    return 'Central 未声明该交付能力';
-  }
-  const volume = storageVolume.value;
-  if (!volume) return '正在读取 StorageVolume 策略';
-  if (!volume.allowed_delivery_modes.includes(mode)) return 'StorageVolume 策略未允许该模式';
-  if (mode === 'hardlink' && snapshot.value?.data_layout !== 'whole_file') {
-    return '硬链接要求 WholeFile Commit，系统不会自动转换布局';
-  }
-  if (mode === 'hardlink' && volume.hardlink_policy === 'disabled') {
-    return 'StorageVolume 未配置 sealed ACL 或 trusted-local 策略';
+  if (snapshot.value?.delivery_mode !== mode) return 'Snapshot 创建时已固定其他交付模式';
+  if (!boundDelivery.value) return '唯一 SnapshotDelivery 尚未创建';
+  if (boundDelivery.value.state !== 'ready') {
+    return `唯一 Delivery 当前为 ${deliveryStateLabel(boundDelivery.value.state)}`;
   }
   return undefined;
 }
@@ -391,26 +304,6 @@ function deliveryStateLabel(state: string): string {
   );
 }
 
-async function createDelivery(): Promise<void> {
-  if (
-    snapshot.value?.state !== 'ready' ||
-    snapshot.value.data_health === 'unavailable' ||
-    deliveryMutation.isPending.value ||
-    !deliveryModeAvailability.value[selectedDeliveryMode.value]
-  )
-    return;
-  const requestId = operationRequestId(
-    `delivery-${snapshotId.value}-${selectedDeliveryMode.value}`,
-  );
-  await deliveryMutation.mutateAsync({
-    tenant_id: tenantId.value,
-    snapshot_id: snapshotId.value,
-    target_storage_volume_id: targetVolumeId.value,
-    mode: selectedDeliveryMode.value,
-    request_id: requestId,
-  });
-}
-
 async function replicateSnapshot(): Promise<void> {
   if (
     !snapshot.value ||
@@ -421,13 +314,8 @@ async function replicateSnapshot(): Promise<void> {
   ) {
     return;
   }
-  const result = await replicationMutation.mutateAsync({
-    tenant_id: tenantId.value,
-    project_id: snapshot.value.project_id,
-    artifact_id: snapshot.value.artifact_id,
-    commit_id: snapshot.value.commit_id,
-    target_storage_volume_id: replicationTargetVolumeId.value,
-    request_id: commitReplicationRequestId({
+  const result = await materializeOrRepair(replicationTargetVolumeId.value, {
+    requestId: materializationRequestId({
       tenantId: tenantId.value,
       projectId: snapshot.value.project_id,
       artifactId: snapshot.value.artifact_id,
@@ -435,20 +323,20 @@ async function replicateSnapshot(): Promise<void> {
       targetStorageVolumeId: replicationTargetVolumeId.value,
     }),
   });
-  ElMessage.success(result.data.replayed ? '已返回同一复制请求' : 'Commit 复制已排队');
+  if (result.mode === 'noop') {
+    ElMessage.info('目标副本已经完整，无需复制');
+  } else if (result.mode === 'in_flight') {
+    ElMessage.info('该目标已有物化任务在执行');
+  } else {
+    ElMessage.success(result.result?.data.replayed ? '已返回同一复制任务' : 'Commit 复制已排队');
+  }
   await replicationListQuery.refetch();
 }
 
 async function retryReplication(): Promise<void> {
   const current = replication.value;
   if (!current || retryReplicationMutation.isPending.value) return;
-  await retryReplicationMutation.mutateAsync({
-    tenant_id: tenantId.value,
-    object_namespace_id: current.artifact_id ?? artifactId.value,
-    replication_id: current.replication_id,
-    expected_attempt: current.attempt,
-    request_id: commitReplicationRetryRequestId(current.replication_id, current.attempt),
-  });
+  await repairMaterialization(current);
   ElMessage.success('复制任务已重新提交');
   await replicationListQuery.refetch();
 }
@@ -456,12 +344,7 @@ async function retryReplication(): Promise<void> {
 async function cancelReplication(): Promise<void> {
   const current = replication.value;
   if (!current || cancelReplicationMutation.isPending.value) return;
-  await cancelReplicationMutation.mutateAsync({
-    tenant_id: tenantId.value,
-    object_namespace_id: current.artifact_id ?? artifactId.value,
-    replication_id: current.replication_id,
-    expected_attempt: current.attempt,
-  });
+  await cancelMaterialization(current);
   ElMessage.success('复制任务已取消');
   await replicationListQuery.refetch();
 }
@@ -514,7 +397,7 @@ async function backToArtifact(): Promise<void> {
 }
 
 async function openObjectStorage(): Promise<void> {
-  if (snapshot.value?.state !== 'ready') return;
+  if (!snapshotReadable.value) return;
   await router.push({
     name: 'object-storage-list',
     params: { tenantId: tenantId.value },
@@ -536,7 +419,7 @@ async function openObjectStorage(): Promise<void> {
       <template #actions>
         <el-button :icon="Back" @click="backToArtifact">返回 Artifact</el-button>
         <el-button
-          v-if="snapshot?.state === 'ready' && s3ReadonlyEnabled"
+          v-if="snapshotReadable && s3ReadonlyEnabled"
           :icon="FolderOpened"
           @click="openObjectStorage"
           >对象存储</el-button
@@ -569,10 +452,12 @@ async function openObjectStorage(): Promise<void> {
           <small>{{ snapshotStateLabel(snapshot.state) }}</small>
           <h2>只读 Snapshot</h2>
           <p v-if="snapshot.state === 'creating'">正在冻结不可变 Commit。</p>
-          <p v-else-if="snapshot.state === 'ready' && snapshot.data_health !== 'unavailable'">
-            Snapshot 已固定，可按需创建独立只读交付。
+          <p v-else-if="snapshot.state === 'ready' && snapshotReadable">
+            Snapshot 与唯一 Delivery 均已就绪，可浏览对象存储。
           </p>
-          <p v-else-if="snapshot.state === 'ready'">Snapshot 元数据仍在，但当前没有可用副本。</p>
+          <p v-else-if="snapshot.state === 'ready'">
+            Snapshot 已固定，但绑定的唯一 Delivery 尚未就绪。
+          </p>
           <p v-else>Snapshot 当前不可用于创建只读交付。</p>
         </div>
         <el-tag :type="snapshotStateTagType(snapshot.state)" effect="plain">
@@ -611,6 +496,28 @@ async function openObjectStorage(): Promise<void> {
             <dt>Artifact Commit</dt>
             <dd>
               <code>{{ snapshot.commit_id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>目标 EdgeCluster</dt>
+            <dd>
+              <code>{{ snapshot.edge_cluster_id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>目标 StorageVolume</dt>
+            <dd>
+              <code>{{ snapshot.storage_volume_id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>固定交付模式</dt>
+            <dd>{{ deliveryModeLabel(snapshot.delivery_mode) }}</dd>
+          </div>
+          <div>
+            <dt>唯一 Delivery</dt>
+            <dd>
+              <code>{{ snapshot.delivery_id }}</code>
             </dd>
           </div>
           <div>
@@ -694,13 +601,13 @@ async function openObjectStorage(): Promise<void> {
           <header class="section-heading">
             <div>
               <span>COMMIT PLACEMENT</span>
-              <h2>先复制 Commit，再创建交付</h2>
+              <h2>补齐 Commit 对象副本</h2>
             </div>
             <RefreshRight />
           </header>
           <p class="replication-explanation">
-            Snapshot 不绑定磁盘。选择目标 Volume 后显式复制完整 ObjectSet；目标 PlacementSet
-            发布前不会对 Delivery 或 S3 可见。
+            Snapshot 创建时已经固定目标 Volume 和唯一 Delivery；此处可为该 Commit 补齐其他 Volume
+            的对象 Placement，但不会改变 Snapshot 的交付目标。
           </p>
           <ApiProblemAlert
             v-if="volumeListQuery.error.value"
@@ -809,11 +716,11 @@ async function openObjectStorage(): Promise<void> {
           />
           <div v-if="replication" class="replication-status">
             <span
-              >任务 <code>{{ replication.replication_id }}</code></span
+              >任务 <code>{{ replication.materialization_id }}</code></span
             >
             <el-tag
               :type="
-                replication.state === 'published'
+                replication.state === 'complete'
                   ? 'success'
                   : replication.state === 'failed'
                     ? 'danger'
@@ -823,10 +730,10 @@ async function openObjectStorage(): Promise<void> {
               >{{ replication.state }}</el-tag
             >
             <span
-              >{{ replication.completed_objects }} / {{ replication.total_objects }} objects</span
+              >{{ replication.verified_objects }} / {{ replication.total_objects }} objects</span
             >
             <span
-              >{{ formatBytes(replication.completed_bytes) }} /
+              >{{ formatBytes(replication.verified_bytes) }} /
               {{ formatBytes(replication.total_bytes) }}</span
             >
             <span v-if="replication.issue">{{ replication.issue.message }}</span>
@@ -838,7 +745,7 @@ async function openObjectStorage(): Promise<void> {
               >重试</el-button
             >
             <el-button
-              v-else-if="isCommitReplicationActive(replication.state)"
+              v-else-if="isMaterializationActive(replication.state)"
               size="small"
               type="danger"
               plain
@@ -861,35 +768,26 @@ async function openObjectStorage(): Promise<void> {
           :retrying="volumeQuery.isFetching.value"
           @retry="volumeQuery.refetch"
         />
-        <div v-if="deliveryCapabilityEnabled" class="delivery-toolbar">
-          <el-select
-            v-model="targetVolumeId"
-            placeholder="选择目标 StorageVolume"
-            style="min-width: 240px"
+        <div v-if="deliveryCapabilityEnabled" class="delivery-binding-summary">
+          <span
+            >目标 EdgeCluster：<code>{{ snapshot.edge_cluster_id }}</code></span
           >
-            <el-option
-              v-for="volume in targetVolumes"
-              :key="volume.storage_volume_id"
-              :label="`${volume.display_name} (${volume.region})`"
-              :value="volume.storage_volume_id"
-              :disabled="volume.state !== 'ready'"
-            />
-          </el-select>
-          <el-segmented v-model="selectedDeliveryMode" :options="deliveryModeOptions" />
-          <el-button
-            type="primary"
-            :icon="Plus"
-            :loading="deliveryMutation.isPending.value"
-            :disabled="
-              volumeQuery.isPending.value ||
-              !targetVolumeId ||
-              !deliveryModeAvailability[selectedDeliveryMode]
-            "
-            @click="createDelivery"
-            >创建交付</el-button
+          <span
+            >目标 StorageVolume：<code>{{ snapshot.storage_volume_id }}</code></span
+          >
+          <span>固定模式：{{ deliveryModeLabel(snapshot.delivery_mode) }}</span>
+          <span v-if="boundDelivery"
+            >唯一 Delivery：<code>{{ boundDelivery.delivery_id }}</code></span
           >
         </div>
-        <div class="delivery-mode-status" aria-label="交付模式可用性">
+        <el-alert
+          v-if="deliveryCapabilityEnabled && !snapshotReadable"
+          title="对象存储尚未就绪"
+          description="只有 Snapshot 与其唯一 SnapshotDelivery 均为 Ready 时才可浏览或启用 S3。"
+          type="warning"
+          :closable="false"
+        />
+        <div class="delivery-mode-status" aria-label="交付模式状态">
           <div v-for="mode in ['fuse', 'copy', 'hardlink'] as const" :key="mode">
             <strong>{{ deliveryModeLabel(mode) }}</strong>
             <el-tag
@@ -897,34 +795,11 @@ async function openObjectStorage(): Promise<void> {
               size="small"
               effect="plain"
             >
-              {{ deliveryModeAvailability[mode] ? '可用' : '不可用' }}
+              {{ deliveryModeAvailability[mode] ? '就绪' : '未就绪' }}
             </el-tag>
             <span v-if="deliveryModeReason(mode)">{{ deliveryModeReason(mode) }}</span>
           </div>
         </div>
-        <el-alert
-          v-if="deliveryModeReason(selectedDeliveryMode)"
-          :title="`${deliveryModeLabel(selectedDeliveryMode)} 当前不可用`"
-          :description="deliveryModeReason(selectedDeliveryMode)"
-          type="warning"
-          :closable="false"
-        />
-        <div v-else class="delivery-policy-summary">
-          <span v-if="selectedDeliveryMode === 'copy'">
-            预计需要
-            {{ copyRequiredBytes === undefined ? '未知' : formatBytes(copyRequiredBytes) }}
-            可用空间（含 {{ formatBytes(storageVolume?.copy_reserve_bytes ?? '0') }} 预留）。
-          </span>
-          <span v-else-if="selectedDeliveryMode === 'hardlink'">
-            Volume 策略：{{ storageVolume?.hardlink_policy }}；创建时仍会校验文件系统、inode、BLAKE3
-            与对象封存状态。
-          </span>
-          <span v-else>FUSE 可用性将在创建时由运行环境做最终校验。</span>
-        </div>
-        <ApiProblemAlert
-          v-if="deliveryMutation.error.value"
-          :error="deliveryMutation.error.value"
-        />
         <ApiProblemAlert
           v-if="retryDeliveryMutation.error.value"
           :error="retryDeliveryMutation.error.value"

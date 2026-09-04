@@ -6,28 +6,23 @@ import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import SnapshotDetailPage from '@/pages/SnapshotDetailPage.vue';
-import { commitReplicationRetryRequestId } from '@/features/commit-replication';
 import { useTenantsStore } from '@/stores/tenants';
-import type {
-  CreateCommitReplicationRequest,
-  RetrySnapshotDeliveryRequest,
-  TenantView,
-} from '@/api/types';
+import type { RetrySnapshotDeliveryRequest, TenantView, TaskView } from '@/api/types';
 
 const api = vi.hoisted(() => ({
-  createSnapshotDelivery: vi.fn(),
-  cancelCommitReplication: vi.fn(),
+  cancelTask: vi.fn(),
   deleteSnapshotDelivery: vi.fn(),
   queryApiVersion: vi.fn(),
-  queryCommitAvailability: vi.fn(),
-  queryCommitReplicationList: vi.fn(),
+  queryCommitAvailabilityV2: vi.fn(),
+  queryCommitCoverage: vi.fn(),
+  queryTaskList: vi.fn(),
   queryGatewayPoolList: vi.fn(),
   querySnapshot: vi.fn(),
   querySnapshotDeliveryList: vi.fn(),
   queryStorageVolume: vi.fn(),
   queryStorageVolumeList: vi.fn(),
-  replicateCommit: vi.fn(),
-  retryCommitReplication: vi.fn(),
+  materializeCommit: vi.fn(),
+  retryTask: vi.fn(),
   retrySnapshotDelivery: vi.fn(),
 }));
 vi.mock('@/api/operations', () => api);
@@ -44,6 +39,10 @@ function snapshot(
     project_id: 'project-a',
     artifact_id: 'artifact-a',
     commit_id: commitId,
+    delivery_id: 'delivery-a',
+    edge_cluster_id: 'edge-a',
+    storage_volume_id: 'volume-a',
+    delivery_mode: 'copy' as const,
     data_layout: dataLayout,
     message: 'Freeze training data',
     tag_names: ['dataset/v1'],
@@ -69,6 +68,46 @@ function snapshot(
   };
 }
 
+function materializationTask(
+  taskId: string,
+  state: TaskView['state'],
+  targetStorageVolumeId = 'volume-a',
+  attempt = '1',
+  issue?: TaskView['issue'],
+): TaskView {
+  return {
+    task_id: taskId,
+    task_kind: 'commit.materialize',
+    state,
+    phase: state === 'succeeded' ? 'complete' : state,
+    tenant_id: 'tenant-a',
+    project_id: 'project-a',
+    artifact_id: 'artifact-a',
+    object_namespace_id: 'artifact-a',
+    commit_id: commitId,
+    storage_volume_id: targetStorageVolumeId,
+    request_id: `request-${taskId}`,
+    request_digest: 'e'.repeat(64),
+    actor: 'test-user',
+    attempt,
+    progress: {
+      completed: state === 'succeeded' ? '3' : '2',
+      total: '3',
+      completed_bytes: state === 'succeeded' ? '30' : '20',
+      total_bytes: '30',
+    },
+    detail_kind: 'materialization',
+    detail_id: taskId,
+    deadline_unix_ms: '9999999999999',
+    ...(issue ? { issue } : {}),
+    created_at_unix_ms: '1',
+    updated_at_unix_ms: '2',
+    resource_version: '1',
+    origin: 'user',
+    executable: true,
+  };
+}
+
 async function mountPage(
   state: 'creating' | 'ready' | 'abnormal' = 'ready',
   permissions: TenantView['permissions'] = ['s3.access.read', 'artifact.commit.replicate'],
@@ -79,7 +118,7 @@ async function mountPage(
       api_version: 1,
       capabilities: [
         's3_readonly_access_point',
-        'artifact_commit_replication',
+        'commit_materialization_v2',
         'snapshot_delivery_fuse_v2',
         'snapshot_delivery_copy_v2',
         'snapshot_delivery_hardlink_v2',
@@ -140,22 +179,59 @@ async function mountPage(
     requestId: 'request-volume-list',
   });
   api.querySnapshotDeliveryList.mockResolvedValue({
-    data: { items: [] },
+    data: {
+      items: [
+        {
+          delivery_id: 'delivery-a',
+          snapshot_id: 'snapshot-a',
+          commit_id: commitId,
+          storage_volume_id: 'volume-a',
+          mode: 'copy',
+          target_relative_root: 'snapshots/project-a/artifact-a/snapshot-a/deliveries/delivery-a',
+          state: state === 'ready' ? 'ready' : state === 'abnormal' ? 'failed' : 'requested',
+          source_index_digest: 'b'.repeat(64),
+          delivery_generation: '1',
+          file_count: '3',
+          size_bytes: '30',
+          object_set_digest: 'c'.repeat(64),
+          resource_version: '1',
+          ...(state === 'abnormal'
+            ? {
+                issue: {
+                  code: 'DELIVERY_FAILED',
+                  message: 'Delivery failed',
+                  retryable: true,
+                },
+              }
+            : {}),
+          created_at_unix_ms: '1',
+          updated_at_unix_ms: '2',
+        },
+      ],
+    },
     requestId: 'request-deliveries',
   });
-  api.queryCommitReplicationList.mockResolvedValue({
-    data: {
-      replications: [],
-    },
-    requestId: 'request-replications',
+  api.queryTaskList.mockResolvedValue({
+    data: { items: [] },
+    requestId: 'request-tasks',
   });
-  api.queryCommitAvailability.mockResolvedValue({
+  api.queryCommitCoverage.mockResolvedValue({
+    data: { coverage: [] },
+    requestId: 'request-coverage',
+  });
+  api.queryCommitAvailabilityV2.mockResolvedValue({
     data: {
       availability: {
+        object_namespace_id: 'artifact-a',
         commit_id: commitId,
-        data_health: 'available',
-        verified_placements: '1',
-        missing_objects: '0',
+        object_count: '3',
+        content_presence: 'available',
+        source_serving: 'available',
+        durability: 'satisfied',
+        target_coverage: 'not_requested',
+        view_readiness: 'ready',
+        complete_volume_count: '1',
+        missing_objects: [],
         verified_storage_volume_ids: [],
       },
     },
@@ -165,67 +241,44 @@ async function mountPage(
     data: { items: [] },
     requestId: 'request-gateway-pools',
   });
-  api.replicateCommit.mockResolvedValue({
+  api.materializeCommit.mockResolvedValue({
     data: {
-      replication: {
-        replication_id: 'replication-a',
+      materialization: {
+        materialization_id: 'materialization-a',
         tenant_id: 'tenant-a',
         artifact_id: 'artifact-a',
+        object_namespace_id: 'artifact-a',
         commit_id: commitId,
         target_storage_volume_id: 'volume-a',
-        attempt: '1',
+        plan_revision: '1',
         state: 'queued',
         object_set_digest: 'd'.repeat(64),
-        completed_objects: '0',
+        verified_objects: '0',
         total_objects: '3',
-        completed_bytes: '0',
+        verified_bytes: '0',
         total_bytes: '30',
+        missing_objects: '3',
+        missing_bytes: '30',
+        source_count: '0',
       },
+      task: materializationTask('materialization-a', 'queued'),
       replayed: false,
     },
-    requestId: 'request-replicate',
+    requestId: 'request-materialize',
   });
-  api.retryCommitReplication.mockResolvedValue({
+  api.retryTask.mockResolvedValue({
     data: {
-      replication: {
-        replication_id: 'replication-a',
-        tenant_id: 'tenant-a',
-        artifact_id: 'artifact-a',
-        commit_id: commitId,
-        target_storage_volume_id: 'volume-a',
-        attempt: '2',
-        state: 'queued',
-        object_set_digest: 'd'.repeat(64),
-        completed_objects: '0',
-        total_objects: '3',
-        completed_bytes: '0',
-        total_bytes: '30',
-      },
+      task: materializationTask('materialization-a', 'queued', 'volume-a', '2'),
+      replayed: false,
     },
-    requestId: 'request-retry-replication',
+    requestId: 'request-retry-task',
   });
-  api.cancelCommitReplication.mockResolvedValue({
+  api.cancelTask.mockResolvedValue({
     data: {
-      replication: {
-        replication_id: 'replication-a',
-        tenant_id: 'tenant-a',
-        artifact_id: 'artifact-a',
-        commit_id: commitId,
-        target_storage_volume_id: 'volume-a',
-        attempt: '1',
-        state: 'cancelled',
-        object_set_digest: 'd'.repeat(64),
-        completed_objects: '0',
-        total_objects: '3',
-        completed_bytes: '0',
-        total_bytes: '30',
-      },
+      task: materializationTask('materialization-a', 'cancelled'),
+      replayed: false,
     },
-    requestId: 'request-cancel-replication',
-  });
-  api.createSnapshotDelivery.mockResolvedValue({
-    data: { delivery: {}, replayed: false },
-    requestId: 'request-create-delivery',
+    requestId: 'request-cancel-task',
   });
   api.retrySnapshotDelivery.mockResolvedValue({
     data: { delivery: {}, replayed: false },
@@ -284,8 +337,10 @@ describe('Snapshot detail page', () => {
     const { wrapper, queryClient } = await mountPage();
 
     expect(api.querySnapshot).toHaveBeenCalledWith('tenant-a', 'snapshot-a');
-    expect(wrapper.text()).toContain('Snapshot 已固定，可按需创建独立只读交付');
+    expect(wrapper.text()).toContain('Snapshot 与唯一 Delivery 均已就绪，可浏览对象存储');
     expect(wrapper.text()).toContain('Volume A');
+    expect(wrapper.text()).toContain('edge-a');
+    expect(wrapper.text()).toContain('delivery-a');
     expect(wrapper.text()).toContain(commitId);
     expect(wrapper.text()).toContain('只读');
     expect(wrapper.text()).not.toContain('重试交付');
@@ -294,7 +349,7 @@ describe('Snapshot detail page', () => {
     queryClient.clear();
   });
 
-  it('refreshes live StorageVolume availability while delivery controls are open', async () => {
+  it('refreshes live StorageVolume availability for the immutable delivery target', async () => {
     vi.useFakeTimers();
     const mounted = await mountPage();
     try {
@@ -355,13 +410,8 @@ describe('Snapshot detail page', () => {
 
       expect(api.queryStorageVolumeList).toHaveBeenCalledTimes(2);
       expect(api.queryStorageVolume).toHaveBeenCalledTimes(2);
-      expect(wrapper.text()).toContain('不可用');
-      expect(
-        wrapper
-          .findAllComponents(ElButton)
-          .find((button) => button.text().trim() === '创建交付')
-          ?.attributes('disabled'),
-      ).toBeDefined();
+      expect(wrapper.text()).toContain('目标 StorageVolume：volume-a');
+      expect(wrapper.text()).toContain('对象存储尚未就绪');
     } finally {
       mounted.wrapper.unmount();
       mounted.queryClient.clear();
@@ -452,47 +502,57 @@ describe('Snapshot detail page', () => {
     const { wrapper, queryClient } = await mountPage('ready', ['artifact.commit.replicate']);
 
     expect(wrapper.find('[aria-label="Commit 复制"]').exists()).toBe(false);
-    expect(api.queryCommitReplicationList).not.toHaveBeenCalled();
-    expect(api.replicateCommit).not.toHaveBeenCalled();
+    expect(api.queryTaskList).not.toHaveBeenCalled();
+    expect(api.materializeCommit).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();
   });
 
-  it('keeps Delivery unavailable until the target PlacementSet is published', async () => {
+  it('shows the bound Delivery mode as fixed and does not expose a second-create control', async () => {
     const { wrapper, queryClient } = await mountPage();
 
-    expect(api.queryStorageVolume).toHaveBeenCalledWith('tenant-a', 'volume-a');
-    expect(wrapper.text()).toContain('FUSE不可用');
-    expect(wrapper.text()).toContain('全部复制不可用');
-    expect(wrapper.text()).toContain('硬链接不可用');
-    expect(wrapper.text()).toContain('请先将 Commit 复制到当前目标 Volume');
-    const deliveryModeInputs = wrapper.findAll<HTMLInputElement>('.el-segmented__item-input');
-    await deliveryModeInputs[1]!.setValue(true);
-    await flushPromises();
-    expect(wrapper.text()).toContain('请先将 Commit 复制到当前目标 Volume');
+    expect(api.queryStorageVolume).toHaveBeenCalledWith('tenant-a', 'volume-a', 'snapshot-a');
+    expect(wrapper.text()).toContain('固定模式：全部复制');
+    expect(wrapper.text()).toContain('唯一 Delivery：delivery-a');
+    expect(
+      wrapper.findAllComponents(ElButton).some((button) => button.text().trim() === '创建交付'),
+    ).toBe(false);
 
     wrapper.unmount();
     queryClient.clear();
   });
 
-  it('keeps Hardlink gated until a WholeFile Commit is replicated', async () => {
+  it('keeps a non-bound delivery mode unavailable even for a WholeFile Commit', async () => {
     const { wrapper, queryClient } = await mountPage('ready', ['snapshot.read'], 'whole_file');
 
-    expect(wrapper.text()).toContain('硬链接不可用');
-    expect(wrapper.text()).toContain('请先将 Commit 复制到当前目标 Volume');
+    expect(wrapper.text()).toContain('硬链接未就绪');
+    expect(wrapper.text()).toContain('Snapshot 创建时已固定其他交付模式');
 
     wrapper.unmount();
     queryClient.clear();
   });
 
-  it('creates a Commit replication with project scope and a bounded stable request ID', async () => {
+  it('does not enumerate StorageVolumes for a Snapshot-only reader', async () => {
+    const { wrapper, queryClient } = await mountPage('ready', ['snapshot.read']);
+
+    expect(api.queryStorageVolume).toHaveBeenCalledWith('tenant-a', 'volume-a', 'snapshot-a');
+    expect(api.queryStorageVolumeList).not.toHaveBeenCalled();
+    expect(api.queryGatewayPoolList).not.toHaveBeenCalled();
+
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('creates a Commit materialization with project scope and a bounded stable request ID', async () => {
     const { wrapper, queryClient } = await mountPage();
 
-    expect(api.queryCommitReplicationList).toHaveBeenCalledWith({
+    expect(api.queryTaskList).toHaveBeenCalledWith({
       tenant_id: 'tenant-a',
-      commit_id: commitId,
       object_namespace_id: 'artifact-a',
+      commit_id: commitId,
+      task_kind: ['commit.materialize'],
+      page_size: 100,
     });
     expect(api.queryGatewayPoolList).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain('路由由 Central 校验');
@@ -503,8 +563,8 @@ describe('Snapshot detail page', () => {
       .trigger('click');
     await flushPromises();
 
-    const request = api.replicateCommit.mock.calls[0]?.[0] as
-      CreateCommitReplicationRequest | undefined;
+    const request = api.materializeCommit.mock.calls[0]?.[0] as
+      { request_id?: string; [key: string]: unknown } | undefined;
     expect(request).toMatchObject({
       tenant_id: 'tenant-a',
       project_id: 'project-a',
@@ -512,30 +572,39 @@ describe('Snapshot detail page', () => {
       commit_id: commitId,
       target_storage_volume_id: 'volume-a',
     });
-    expect(request?.request_id).toMatch(/^commit-replicate-[a-f0-9]{32}$/);
-    expect(request?.request_id.length).toBeLessThanOrEqual(128);
+    expect(request?.request_id).toMatch(/^commit-materialize-[a-f0-9]{32}$/);
+    expect(request?.request_id?.length).toBeLessThanOrEqual(128);
 
     wrapper.unmount();
     queryClient.clear();
   });
 
   it('restores and cancels an active Commit replication after opening the page', async () => {
-    api.queryCommitReplicationList.mockResolvedValueOnce({
+    api.queryTaskList.mockResolvedValueOnce({
       data: {
-        replications: [
+        items: [
           {
-            replication_id: 'replication-active',
+            task_id: 'replication-active',
+            task_kind: 'commit.materialize',
+            state: 'running',
+            phase: 'materializing',
             tenant_id: 'tenant-a',
+            project_id: 'project-a',
             artifact_id: 'artifact-a',
+            object_namespace_id: 'artifact-a',
             commit_id: commitId,
-            target_storage_volume_id: 'volume-a',
+            storage_volume_id: 'volume-a',
+            request_id: 'request-active-replication',
             attempt: '7',
-            state: 'transferring',
-            object_set_digest: 'd'.repeat(64),
-            completed_objects: '2',
-            total_objects: '3',
-            completed_bytes: '20',
-            total_bytes: '30',
+            progress: { completed: '2', total: '3', completed_bytes: '20', total_bytes: '30' },
+            detail_kind: 'materialization',
+            detail_id: 'replication-active',
+            deadline_unix_ms: '9999999999999',
+            created_at_unix_ms: '1',
+            updated_at_unix_ms: '2',
+            resource_version: '1',
+            origin: 'user',
+            executable: true,
           },
         ],
       },
@@ -558,36 +627,43 @@ describe('Snapshot detail page', () => {
       .trigger('click');
     await flushPromises();
 
-    expect(api.cancelCommitReplication.mock.calls[0]?.[0]).toEqual({
+    expect(api.cancelTask.mock.calls[0]?.[0]).toEqual({
       tenant_id: 'tenant-a',
-      object_namespace_id: 'artifact-a',
-      replication_id: 'replication-active',
-      expected_attempt: '7',
+      task_id: 'replication-active',
     });
-    expect(api.replicateCommit).not.toHaveBeenCalled();
+    expect(api.materializeCommit).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();
   });
 
   it('retries the failed task instead of creating another task for the same target', async () => {
-    api.queryCommitReplicationList.mockResolvedValueOnce({
+    api.queryTaskList.mockResolvedValueOnce({
       data: {
-        replications: [
+        items: [
           {
-            replication_id: 'replication-failed',
-            tenant_id: 'tenant-a',
-            artifact_id: 'artifact-a',
-            commit_id: commitId,
-            target_storage_volume_id: 'volume-a',
-            attempt: '3',
+            task_id: 'replication-failed',
+            task_kind: 'commit.materialize',
             state: 'failed',
-            object_set_digest: 'd'.repeat(64),
-            completed_objects: '1',
-            total_objects: '3',
-            completed_bytes: '10',
-            total_bytes: '30',
+            phase: 'failed',
+            tenant_id: 'tenant-a',
+            project_id: 'project-a',
+            artifact_id: 'artifact-a',
+            object_namespace_id: 'artifact-a',
+            commit_id: commitId,
+            storage_volume_id: 'volume-a',
+            request_id: 'request-failed-replication',
+            attempt: '3',
+            progress: { completed: '1', total: '3', completed_bytes: '10', total_bytes: '30' },
+            detail_kind: 'materialization',
+            detail_id: 'replication-failed',
+            deadline_unix_ms: '9999999999999',
             issue: { code: 'ROUTE_LOST', message: 'Route lease expired', retryable: true },
+            created_at_unix_ms: '1',
+            updated_at_unix_ms: '2',
+            resource_version: '1',
+            origin: 'user',
+            executable: true,
           },
         ],
       },
@@ -602,14 +678,11 @@ describe('Snapshot detail page', () => {
       .trigger('click');
     await flushPromises();
 
-    expect(api.retryCommitReplication.mock.calls[0]?.[0]).toEqual({
+    expect(api.retryTask.mock.calls[0]?.[0]).toEqual({
       tenant_id: 'tenant-a',
-      object_namespace_id: 'artifact-a',
-      replication_id: 'replication-failed',
-      expected_attempt: '3',
-      request_id: commitReplicationRetryRequestId('replication-failed', '3'),
+      task_id: 'replication-failed',
     });
-    expect(api.replicateCommit).not.toHaveBeenCalled();
+    expect(api.materializeCommit).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();

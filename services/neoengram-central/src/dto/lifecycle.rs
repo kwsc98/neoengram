@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::TaskView;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
@@ -229,6 +231,8 @@ pub struct ReleaseRetentionHoldRequest {
 pub struct DeletionMutationResponse {
     pub deletion: DeletionOperationView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
@@ -238,6 +242,8 @@ pub struct CreateRetentionHoldResponse {
     pub deletion: DeletionOperationView,
     pub retention_hold: RetentionHoldView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
@@ -247,4 +253,6 @@ pub struct ReleaseRetentionHoldResponse {
     pub deletion: DeletionOperationView,
     pub retention_hold: RetentionHoldView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }

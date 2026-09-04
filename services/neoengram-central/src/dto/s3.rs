@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use neoengram_domain::protocol::{S3AuthorizeRequest, S3AuthorizeResponse};
 
+use super::TaskView;
+
 /// Transport wrapper used only by the private Gateway authorization interface. `transparent`
 /// preserves the shared protocol wire shape while keeping Fusen-specific metadata out of the
 /// transport-neutral protocol crate.
@@ -110,6 +112,9 @@ pub struct S3AccessPointView {
     pub artifact_id: String,
     pub snapshot_id: String,
     pub commit_id: String,
+    pub delivery_id: String,
+    pub storage_volume_id: String,
+    pub edge_cluster_id: String,
     pub bucket_name: String,
     pub endpoint: String,
     pub region: String,
@@ -168,6 +173,8 @@ pub struct CreateS3AccessPointResponse {
     pub secret_access_key: String,
     pub credential_expires_at_unix_ms: String,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
@@ -175,6 +182,8 @@ pub struct CreateS3AccessPointResponse {
 pub struct UpdateS3AccessPointResponse {
     pub access_point: S3AccessPointView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
@@ -184,12 +193,16 @@ pub struct CreateS3CredentialResponse {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub secret_access_key: String,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[sensitive(opaque)]
 pub struct QueryS3CredentialListResponse {
     pub items: Vec<S3CredentialView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]

@@ -37,7 +37,7 @@ pub use outbound::{
 };
 pub use placement_inventory::{
     InMemoryPlacementInventory, LocalPlacementInventory, PlacementInventoryConfig,
-    SqlitePlacementInventory,
+    PlacementInventoryPage, SqlitePlacementInventory, MAX_PLACEMENT_INVENTORY_PAGE_SIZE,
 };
 pub use ports::{
     AddExecutor, AssignmentValidator, BasicAssignmentValidator, Clock, Ledger, ObjectTransfer,

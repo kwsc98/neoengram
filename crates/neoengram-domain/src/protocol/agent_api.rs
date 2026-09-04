@@ -12,12 +12,12 @@ use crate::{
     domain_separated_jcs_bytes, jcs_blake3, validate_control_envelope, AgentBootId,
     AgentBootstrapProof, AgentHeartbeat, AgentId, AgentInstallationId, AgentMountIdentityDigest,
     AgentMountStatusReport, AgentResourceLifecycleAssignment, CentralSignedPayload, ControlError,
-    ControlMessage, DecimalU64, Envelope, Extensions, IndexDeltaRecord, JobAssignment, JobDecision,
-    JobId, MaterializationAssignment, MaterializationReport, MessageId, MetadataBatchDescriptor,
-    MetadataBatchPage, ProtocolError, ProtocolResult, ProtocolVersion, ReplicationAssignment,
-    RequestId, ResourceVersion, SequenceNumber, SessionGeneration, SessionId, TenantId, UnixMillis,
-    WireChunkRef, WireChunkingStrategy, WireIndexVersion, CURRENT_WIRE_VERSION,
-    MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
+    ControlMessage, DecimalU64, Envelope, Extensions, IndexDeltaRecord, IntegrityScanReport,
+    JobAssignment, JobDecision, JobId, MaterializationAssignment, MaterializationReport, MessageId,
+    MetadataBatchDescriptor, MetadataBatchPage, ProtocolError, ProtocolResult, ProtocolVersion,
+    ReplicationAssignment, RequestId, ResourceVersion, SequenceNumber, SessionGeneration,
+    SessionId, TenantId, UnixMillis, WireChunkRef, WireChunkingStrategy, WireIndexVersion,
+    CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
 };
 
 pub const AGENT_REQUEST_SIGNING_DOMAIN_V1: &str = "neoengram-agent-request-v1";
@@ -652,6 +652,9 @@ pub enum AgentChannelUpstreamMessage {
     /// Object-level v2 receipt/failure emitted after the target durability barrier.
     #[serde(rename = "materialization.report")]
     MaterializationReport(Box<MaterializationReport>),
+    /// Periodic or operator-triggered Volume integrity observations.
+    #[serde(rename = "integrity.report")]
+    IntegrityReport(Box<IntegrityScanReport>),
     #[serde(rename = "channel.close")]
     Close(AgentSessionClosePayload),
 }
@@ -678,6 +681,7 @@ impl AgentChannelUpstreamMessage {
                 | "session.heartbeat"
                 | "job.report"
                 | "materialization.report"
+                | "integrity.report"
                 | "channel.close"
         )
     }
@@ -830,6 +834,10 @@ impl AgentChannelUpstreamFrame {
                 validate_extension_keys(&report.extensions, &["tenant_id", "report"])?;
             }
             AgentChannelUpstreamMessage::MaterializationReport(report) => {
+                self.request.validate_session()?;
+                report.validate()?;
+            }
+            AgentChannelUpstreamMessage::IntegrityReport(report) => {
                 self.request.validate_session()?;
                 report.validate()?;
             }
@@ -1526,8 +1534,13 @@ mod tests {
             max_bytes: DecimalU64::new(1),
             deadline_unix_ms: UnixMillis::new(1_000),
         };
+        let operation_task_id = crate::TaskId::new("task-materialization-channel").unwrap();
+        let task_attempt_id =
+            crate::TaskAttemptId::new("task-materialization-channel-attempt-1").unwrap();
         let ticket = crate::MaterializationBatchTicket {
             ticket_id: crate::ObjectTicketId::new("ticket-channel").unwrap(),
+            operation_task_id: operation_task_id.clone(),
+            task_attempt_id: task_attempt_id.clone(),
             materialization_id,
             batch_id,
             plan_revision: crate::Generation::new(1),
@@ -1559,6 +1572,8 @@ mod tests {
         )
         .unwrap();
         MaterializationAssignment {
+            operation_task_id,
+            task_attempt_id,
             signed_ticket,
             batch,
             manifest,

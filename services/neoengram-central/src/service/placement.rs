@@ -16,8 +16,9 @@ use neoengram_domain::protocol::{
     ArtifactId, BackendId, CommitPlacementSet, DecimalU64, EdgeClusterId, GatewayPoolId,
     Generation, MaterializationId, MountGeneration, ObjectNamespaceId, PlacementGeneration,
     PlacementId, PlacementSetId, PlacementState, ProjectId, ReplicationId, ReplicationState,
-    RequestId, RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, TransferEndpoint,
-    TransferId, TransferRouteId, TransferTicket, UnixMillis, WorkspaceId, WorkspaceLifecycle,
+    RequestId, RouteGeneration, SessionGeneration, StorageVolumeId, TaskKind, TaskResourceKind,
+    TaskResourceRole, TaskScope, TaskState, TenantId, TransferEndpoint, TransferId,
+    TransferRouteId, TransferTicket, UnixMillis, WorkspaceId, WorkspaceLifecycle,
 };
 use neoengram_domain::CommitId;
 
@@ -1370,6 +1371,25 @@ impl CatalogService {
                     && placement.matches_ref(object)
                     && placement.storage_volume_id.is_some()
             }) {
+                let unhealthy = repository
+                    .latest_placement_health(
+                        &tenant_id,
+                        &namespace_id,
+                        &placement.placement_id,
+                        placement.placement_generation,
+                    )
+                    .await
+                    .map_err(map_central_error)?
+                    .is_some_and(|observation| {
+                        matches!(
+                            observation.state,
+                            neoengram_domain::protocol::PlacementHealthState::Missing
+                                | neoengram_domain::protocol::PlacementHealthState::Corrupt
+                        )
+                    });
+                if unhealthy {
+                    continue;
+                }
                 let volume = placement
                     .storage_volume_id
                     .clone()
@@ -1380,7 +1400,10 @@ impl CatalogService {
                     .push(placement);
             }
         }
-        let existing_keys = coverages
+        // Coverage is a derived projection. Recompute both cached keys and newly discovered
+        // keys from the current healthy Placement evidence; otherwise a previously complete row
+        // could remain `complete` after a scrub reports one of its objects missing or corrupt.
+        let mut coverage_keys = coverages
             .iter()
             .map(|coverage| {
                 (
@@ -1389,22 +1412,25 @@ impl CatalogService {
                 )
             })
             .collect::<BTreeSet<_>>();
-        for ((volume, generation), placements) in grouped {
-            if existing_keys.contains(&(volume.clone(), generation)) {
-                continue;
-            }
-            let coverage = VolumeCommitCoverage::from_placements(
-                tenant_id.clone(),
-                namespace_id.clone(),
-                namespace_set.commit_id,
-                volume,
-                generation,
-                &stored.object_set,
-                &placements,
-            )
-            .map_err(|error| invalid_request(format!("coverage: {error}")))?;
-            coverages.push(coverage);
-        }
+        coverage_keys.extend(grouped.keys().cloned());
+        coverages = coverage_keys
+            .into_iter()
+            .map(|(volume, generation)| {
+                let placements = grouped
+                    .remove(&(volume.clone(), generation))
+                    .unwrap_or_default();
+                VolumeCommitCoverage::from_placements(
+                    tenant_id.clone(),
+                    namespace_id.clone(),
+                    namespace_set.commit_id,
+                    volume,
+                    generation,
+                    &stored.object_set,
+                    &placements,
+                )
+                .map_err(|error| invalid_request(format!("coverage: {error}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         coverages.sort_by_key(|coverage| {
             (
                 coverage.storage_volume_id.clone(),
@@ -1469,15 +1495,33 @@ impl CatalogService {
                 .object_placements_v2(&tenant_id, &namespace_id, &object.object_id)
                 .await
                 .map_err(map_central_error)?;
-            let matching = placements
-                .iter()
-                .filter(|placement| {
-                    placement.state == ObjectPlacementState::Verified
-                        && placement.tenant_id == tenant_id
-                        && placement.object_namespace_id == namespace_id
-                        && placement.matches_ref(object)
-                })
-                .collect::<Vec<_>>();
+            let mut matching = Vec::new();
+            for placement in placements.iter().filter(|placement| {
+                placement.state == ObjectPlacementState::Verified
+                    && placement.tenant_id == tenant_id
+                    && placement.object_namespace_id == namespace_id
+                    && placement.matches_ref(object)
+            }) {
+                let unhealthy = repository
+                    .latest_placement_health(
+                        &tenant_id,
+                        &namespace_id,
+                        &placement.placement_id,
+                        placement.placement_generation,
+                    )
+                    .await
+                    .map_err(map_central_error)?
+                    .is_some_and(|observation| {
+                        matches!(
+                            observation.state,
+                            neoengram_domain::protocol::PlacementHealthState::Missing
+                                | neoengram_domain::protocol::PlacementHealthState::Corrupt
+                        )
+                    });
+                if !unhealthy {
+                    matching.push(placement);
+                }
+            }
             if matching.is_empty() {
                 if target_volume_id.is_none() {
                     missing_objects.push(MissingObjectView {
@@ -2043,16 +2087,45 @@ impl CatalogService {
         identity: &AuthenticatedIdentity,
         request: CreateWorkspaceRequest,
     ) -> Result<CreateWorkspaceResponse, Error> {
-        let tenant_id = parse_tenant(request.tenant_id)?;
+        let task_request = request.clone();
+        let tenant_id = parse_tenant(request.tenant_id.clone())?;
         self.require_tenant(identity, Permission::PlaygroundCreate, &tenant_id)
             .await?;
-        let project_id = ProjectId::new(request.project_id)
+        let project_id = ProjectId::new(request.project_id.clone())
             .map_err(|error| invalid_request(format!("project_id: {error}")))?;
-        let artifact_id = ArtifactId::new(request.artifact_id)
+        let artifact_id = ArtifactId::new(request.artifact_id.clone())
             .map_err(|error| invalid_request(format!("artifact_id: {error}")))?;
-        let target = parse_volume(request.target_storage_volume_id)?;
+        let target = parse_volume(request.target_storage_volume_id.clone())?;
         let request_id = RequestId::new(request.request_id.clone())
             .map_err(|error| invalid_request(format!("request_id: {error}")))?;
+        let workspace_id = workspace_id(&request.request_id)?;
+        let (mut task, _task_replayed) = self
+            .begin_operation_task(
+                TaskKind::WorkspaceCreate,
+                TaskScope {
+                    tenant_id: tenant_id.clone(),
+                    project_id: Some(project_id.clone()),
+                    artifact_id: Some(artifact_id.clone()),
+                    object_namespace_id: Some(ObjectNamespaceId::from_artifact(&artifact_id)),
+                    commit_id: None,
+                    playground_id: None,
+                    snapshot_id: None,
+                    storage_volume_id: Some(target.clone()),
+                },
+                request_id.clone(),
+                &task_request,
+                identity,
+                Some("workspace"),
+                Some(workspace_id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(
+            &task,
+            TaskResourceKind::Playground,
+            workspace_id.to_string(),
+            TaskResourceRole::Primary,
+        )
+        .await?;
         let Some(placement_repository) = &self.placement else {
             return Err(application_error(
                 ErrorCategory::Unavailable,
@@ -2090,6 +2163,7 @@ impl CatalogService {
                     lifecycle: workspace_lifecycle_name(existing.lifecycle).to_owned(),
                 },
                 replayed: true,
+                task,
             });
         }
         let volume = self
@@ -2109,7 +2183,7 @@ impl CatalogService {
                 true,
             ));
         }
-        let id = workspace_id(&request.request_id)?;
+        let id = workspace_id;
         let base_commit_id = request
             .base_commit_id
             .as_deref()
@@ -2155,6 +2229,43 @@ impl CatalogService {
             .map_err(map_central_error)?;
         let replayed = stored != workspace;
         let workspace = stored;
+        let materialize_task = self
+            .begin_child_operation_task(
+                &task,
+                TaskKind::WorkspaceMaterialize,
+                TaskScope {
+                    tenant_id: tenant_id.clone(),
+                    project_id: Some(project_id.clone()),
+                    artifact_id: Some(artifact_id.clone()),
+                    object_namespace_id: Some(ObjectNamespaceId::from_artifact(&artifact_id)),
+                    commit_id: workspace.base_commit_id.map(CommitId::from_digest),
+                    playground_id: None,
+                    snapshot_id: None,
+                    storage_volume_id: Some(workspace.target_storage_volume_id.clone()),
+                },
+                RequestId::new(format!("{}-materialize", request.request_id))
+                    .map_err(|error| invalid_request(format!("task request_id: {error}")))?,
+                &task_request,
+                identity,
+                Some("workspace_materialization"),
+                Some(workspace.workspace_id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(
+            &materialize_task,
+            TaskResourceKind::Playground,
+            workspace.workspace_id.to_string(),
+            TaskResourceRole::Target,
+        )
+        .await?;
+        task = self
+            .transition_operation_task(
+                task,
+                TaskState::Running,
+                identity,
+                Some("workspace created; materialization pending".to_owned()),
+            )
+            .await?;
         Ok(CreateWorkspaceResponse {
             workspace: WorkspaceView {
                 workspace_id: workspace.workspace_id.to_string(),
@@ -2166,6 +2277,7 @@ impl CatalogService {
                 lifecycle: workspace_lifecycle_name(workspace.lifecycle).to_owned(),
             },
             replayed,
+            task,
         })
     }
 }

@@ -69,7 +69,7 @@ async function mountPage({
     {
       tenant_id: 'tenant-a',
       display_name: 'Tenant A',
-      permissions: ['playground.read', 'playground.create', 'job.create'],
+      permissions: ['playground.read', 'playground.create', 'task.manage'],
       resource_version: '1',
       created_at_unix_ms: '1',
       updated_at_unix_ms: '2',
@@ -81,11 +81,6 @@ async function mountPage({
       {
         path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/playgrounds/:playgroundId',
         name: 'playground-detail',
-        component: { template: '<div />' },
-      },
-      {
-        path: '/tenants/:tenantId/jobs/new',
-        name: 'job-create',
         component: { template: '<div />' },
       },
       {

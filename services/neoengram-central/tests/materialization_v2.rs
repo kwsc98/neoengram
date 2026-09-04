@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use neoengram_central::dto::QueryCommitCoverageRequest;
+use neoengram_central::dto::{QueryCommitCoverageRequest, RetryCommitMaterializationRequest};
 use neoengram_central::{
     AllowAllAuthorizer, AuthenticatedIdentity, AuthorityCapabilities, AuthorityStore,
     CatalogService, ControlCatalogRepository, ControlPlane, InMemoryComponents,
@@ -14,13 +14,14 @@ use neoengram_domain::protocol::materialization::{
     MaterializationJob, MaterializationJobKey, MaterializationJobState, MaterializationObject,
     MaterializationObjectReceipt, MaterializationObjectState, MaterializationReport,
     MaterializationSource, MaterializationTarget, ObjectPlacement, ObjectPlacementState,
-    ObjectReadLease, ObjectRef, VolumeCommitCoverage,
+    ObjectReadLease, ObjectRef, PlacementHealthObservation, PlacementHealthState,
+    VolumeCommitCoverage,
 };
 use neoengram_domain::protocol::{
     object_read_lease_id, staging_lease_id, AgentId, ArtifactId, DecimalU64, EdgeClusterId,
-    GatewayPoolId, Generation, LeaseId, MountGeneration, ObjectEncoding, ObjectNamespaceId,
-    ObjectReceiptId, PlacementGeneration, PlacementId, PrincipalKind, RouteGeneration,
-    SessionGeneration, StorageVolumeId, TenantId, UnixMillis,
+    GatewayPoolId, Generation, IntegrityScanId, LeaseId, MountGeneration, ObjectEncoding,
+    ObjectNamespaceId, ObjectReceiptId, PlacementGeneration, PlacementId, PrincipalKind,
+    RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, UnixMillis,
 };
 #[cfg(feature = "authority-sqlite")]
 use sqlx::{sqlite::SqliteConnectOptions, Connection};
@@ -79,10 +80,217 @@ fn placement(object_id: ObjectId, id: &str, volume: &str) -> ObjectPlacement {
     }
 }
 
+fn placement_health(
+    scan_id: &str,
+    state: PlacementHealthState,
+    observed_at_unix_ms: u64,
+) -> PlacementHealthObservation {
+    PlacementHealthObservation {
+        scan_id: IntegrityScanId::new(scan_id).unwrap(),
+        tenant_id: TenantId::new("tenant-v2").unwrap(),
+        object_namespace_id: ObjectNamespaceId::new("artifact-v2").unwrap(),
+        placement_id: PlacementId::new("source-placement-v2").unwrap(),
+        object_id: ObjectId::from_bytes([1; 32]),
+        storage_volume_id: StorageVolumeId::new("volume-source").unwrap(),
+        placement_generation: PlacementGeneration::new(1),
+        state,
+        observed_size: DecimalU64::new(4),
+        observed_digest: ObjectId::from_bytes([1; 32]).digest(),
+        observed_at_unix_ms: UnixMillis::new(observed_at_unix_ms),
+        detail: None,
+    }
+}
+
+fn placement_health_for_integrity_failure(
+    placement: &ObjectPlacement,
+    scan_id: &str,
+    state: PlacementHealthState,
+    observed_at_unix_ms: u64,
+) -> PlacementHealthObservation {
+    PlacementHealthObservation {
+        scan_id: IntegrityScanId::new(scan_id).unwrap(),
+        tenant_id: placement.tenant_id.clone(),
+        object_namespace_id: placement.object_namespace_id.clone(),
+        placement_id: placement.placement_id.clone(),
+        object_id: placement.object_id,
+        storage_volume_id: placement.storage_volume_id.clone().unwrap(),
+        placement_generation: placement.placement_generation,
+        state,
+        observed_size: placement.size,
+        observed_digest: placement.verified_digest,
+        observed_at_unix_ms: UnixMillis::new(observed_at_unix_ms),
+        detail: None,
+    }
+}
+
+async fn assert_coverage_recomputes_after_integrity_failure(repository: &dyn PlacementRepository) {
+    let object_set = object_set();
+    repository
+        .insert_commit_object_set(object_set.clone())
+        .await
+        .unwrap();
+    let first = placement(
+        ObjectId::from_bytes([1; 32]),
+        "coverage-health-first",
+        "volume-a",
+    );
+    let second = placement(
+        ObjectId::from_bytes([2; 32]),
+        "coverage-health-second",
+        "volume-a",
+    );
+    repository
+        .insert_object_placement_v2(first.clone())
+        .await
+        .unwrap();
+    repository
+        .insert_object_placement_v2(second.clone())
+        .await
+        .unwrap();
+
+    let complete = VolumeCommitCoverage::from_placements(
+        TenantId::new("tenant-v2").unwrap(),
+        ObjectNamespaceId::new("artifact-v2").unwrap(),
+        CommitId::from_bytes([9; 32]),
+        StorageVolumeId::new("volume-a").unwrap(),
+        PlacementGeneration::new(1),
+        &object_set.object_set,
+        &[first.clone(), second.clone()],
+    )
+    .unwrap();
+    assert_eq!(complete.state, CoverageState::Complete);
+    repository
+        .upsert_volume_commit_coverage(complete)
+        .await
+        .unwrap();
+
+    repository
+        .record_placement_health_observation(placement_health_for_integrity_failure(
+            &first,
+            "scan-coverage-health-failure",
+            PlacementHealthState::Missing,
+            200,
+        ))
+        .await
+        .unwrap();
+    let partial = VolumeCommitCoverage::from_placements(
+        TenantId::new("tenant-v2").unwrap(),
+        ObjectNamespaceId::new("artifact-v2").unwrap(),
+        CommitId::from_bytes([9; 32]),
+        StorageVolumeId::new("volume-a").unwrap(),
+        PlacementGeneration::new(1),
+        &object_set.object_set,
+        std::slice::from_ref(&second),
+    )
+    .unwrap();
+    assert_eq!(partial.state, CoverageState::Partial);
+    let stored = repository
+        .upsert_volume_commit_coverage(partial)
+        .await
+        .unwrap();
+    assert_eq!(stored.state, CoverageState::Partial);
+    assert_eq!(stored.verified_object_count, DecimalU64::new(1));
+    assert_eq!(
+        repository
+            .volume_commit_coverages(
+                &TenantId::new("tenant-v2").unwrap(),
+                &ObjectNamespaceId::new("artifact-v2").unwrap(),
+                &ContentDigest::from_bytes([9; 32]),
+            )
+            .await
+            .unwrap()[0]
+            .state,
+        CoverageState::Partial
+    );
+}
+
+async fn assert_placement_health_is_idempotent_and_monotonic(repository: &dyn PlacementRepository) {
+    repository
+        .insert_object_placement_v2(placement(
+            ObjectId::from_bytes([1; 32]),
+            "source-placement-v2",
+            "volume-source",
+        ))
+        .await
+        .unwrap();
+
+    let healthy = placement_health("scan-healthy-1", PlacementHealthState::Healthy, 100);
+    assert_eq!(
+        repository
+            .record_placement_health_observation(healthy.clone())
+            .await
+            .unwrap(),
+        healthy
+    );
+    assert_eq!(
+        repository
+            .record_placement_health_observation(healthy.clone())
+            .await
+            .unwrap(),
+        healthy
+    );
+
+    let corrupt = placement_health("scan-corrupt", PlacementHealthState::Corrupt, 200);
+    assert_eq!(
+        repository
+            .record_placement_health_observation(corrupt.clone())
+            .await
+            .unwrap(),
+        corrupt
+    );
+    let stale = placement_health("scan-stale", PlacementHealthState::Healthy, 150);
+    assert_eq!(
+        repository
+            .record_placement_health_observation(stale)
+            .await
+            .unwrap(),
+        corrupt
+    );
+    assert_eq!(
+        repository
+            .latest_placement_health(
+                &TenantId::new("tenant-v2").unwrap(),
+                &ObjectNamespaceId::new("artifact-v2").unwrap(),
+                &PlacementId::new("source-placement-v2").unwrap(),
+                PlacementGeneration::new(1),
+            )
+            .await
+            .unwrap(),
+        Some(corrupt)
+    );
+
+    let recovered = placement_health("scan-recovered", PlacementHealthState::Healthy, 300);
+    assert_eq!(
+        repository
+            .record_placement_health_observation(recovered.clone())
+            .await
+            .unwrap(),
+        recovered.clone()
+    );
+    assert_eq!(
+        repository
+            .latest_placement_health(
+                &TenantId::new("tenant-v2").unwrap(),
+                &ObjectNamespaceId::new("artifact-v2").unwrap(),
+                &PlacementId::new("source-placement-v2").unwrap(),
+                PlacementGeneration::new(1),
+            )
+            .await
+            .unwrap(),
+        Some(recovered)
+    );
+}
+
 fn job() -> MaterializationJob {
     MaterializationJob {
         materialization_id: neoengram_domain::protocol::MaterializationId::new(
             "materialization-v2",
+        )
+        .unwrap(),
+        operation_task_id: neoengram_domain::protocol::TaskId::new("task-materialization-v2")
+            .unwrap(),
+        task_attempt_id: neoengram_domain::protocol::TaskAttemptId::new(
+            "task-materialization-v2-attempt-1",
         )
         .unwrap(),
         key: MaterializationJobKey {
@@ -176,6 +384,12 @@ fn materialization_batch() -> MaterializationBatch {
 fn materialization_receipt(id: &str) -> MaterializationObjectReceipt {
     MaterializationObjectReceipt {
         receipt_id: ObjectReceiptId::new(id).unwrap(),
+        operation_task_id: neoengram_domain::protocol::TaskId::new("task-materialization-v2")
+            .unwrap(),
+        task_attempt_id: neoengram_domain::protocol::TaskAttemptId::new(
+            "task-materialization-v2-attempt-1",
+        )
+        .unwrap(),
         materialization_id: neoengram_domain::protocol::MaterializationId::new(
             "materialization-v2",
         )
@@ -918,6 +1132,145 @@ async fn assert_completed_object_retry_repairs_coverage(repository: &dyn Placeme
         .unwrap();
     assert_eq!(coverages.len(), 1);
     assert_eq!(coverages[0].verified_object_count, DecimalU64::new(1));
+}
+
+async fn assert_completed_materialization_retry_replans_after_integrity_failure(
+    repository: Arc<dyn PlacementRepository>,
+) {
+    let object_set = object_set();
+    let tenant = TenantId::new("tenant-v2").unwrap();
+    let namespace = ObjectNamespaceId::new("artifact-v2").unwrap();
+    let materialization_id =
+        neoengram_domain::protocol::MaterializationId::new("materialization-v2").unwrap();
+    repository
+        .insert_commit_object_set(object_set.clone())
+        .await
+        .unwrap();
+
+    let first_target = placement(
+        ObjectId::from_bytes([1; 32]),
+        "target-placement-integrity-repair-first",
+        "volume-target",
+    );
+    let second_target = placement(
+        ObjectId::from_bytes([2; 32]),
+        "target-placement-integrity-repair-second",
+        "volume-target",
+    );
+    let source = placement(
+        ObjectId::from_bytes([1; 32]),
+        "source-placement-integrity-repair",
+        "volume-source",
+    );
+    for placement in [first_target.clone(), second_target.clone(), source] {
+        repository
+            .insert_object_placement_v2(placement)
+            .await
+            .unwrap();
+    }
+
+    let mut completed_job = job();
+    completed_job.state = MaterializationJobState::Complete;
+    completed_job.verified_object_count = DecimalU64::new(2);
+    completed_job.verified_bytes = DecimalU64::new(10);
+    completed_job.missing_object_count = DecimalU64::new(0);
+    completed_job.missing_bytes = DecimalU64::new(0);
+    completed_job.source_count = DecimalU64::new(0);
+    repository
+        .insert_materialization(completed_job.clone())
+        .await
+        .unwrap();
+
+    let mut first_task = materialization_object();
+    first_task.state = MaterializationObjectState::AlreadyPresent;
+    first_task.confirmed_offset = first_task.object.size;
+    repository
+        .insert_materialization_object(&tenant, first_task)
+        .await
+        .unwrap();
+    let mut second_task = MaterializationObject::new(
+        materialization_id.clone(),
+        ObjectRef::new(
+            namespace.clone(),
+            ObjectId::from_bytes([2; 32]),
+            6,
+            ObjectEncoding::Raw,
+            1,
+        ),
+        Generation::new(1),
+    );
+    second_task.state = MaterializationObjectState::AlreadyPresent;
+    second_task.confirmed_offset = second_task.object.size;
+    repository
+        .insert_materialization_object(&tenant, second_task)
+        .await
+        .unwrap();
+
+    repository
+        .record_placement_health_observation(placement_health_for_integrity_failure(
+            &first_target,
+            "scan-integrity-repair",
+            PlacementHealthState::Missing,
+            200,
+        ))
+        .await
+        .unwrap();
+
+    // A missing target route is sufficient to exercise the durable replan path. The repaired
+    // object remains Waiting/Planning until a later retry sees a healthy source and target route.
+    let components = InMemoryComponents::new(1_000);
+    components
+        .control_catalog
+        .insert_tenant(tenant_record(&tenant))
+        .await
+        .unwrap();
+    let policy = Arc::new(
+        StaticRbacPolicy::one_principal(
+            "user-v2",
+            [tenant.to_string()],
+            [Permission::ArtifactCommitReplicate],
+        )
+        .unwrap(),
+    );
+    let service = CatalogService::new(
+        components.control_catalog.clone(),
+        components.publisher.clone(),
+        policy,
+        components.clock.clone(),
+    )
+    .with_placement_repository(repository.clone());
+    let identity =
+        AuthenticatedIdentity::new("user-v2", PrincipalKind::User, "test", "subject-v2").unwrap();
+    let result = service
+        .retry_commit_materialization(
+            &identity,
+            RetryCommitMaterializationRequest {
+                tenant_id: tenant.to_string(),
+                object_namespace_id: namespace.to_string(),
+                materialization_id: materialization_id.to_string(),
+                expected_plan_revision: "1".to_owned(),
+                request_id: "request-integrity-repair".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!result.replayed);
+    assert_eq!(result.materialization.plan_revision, "2");
+    assert_eq!(result.materialization.state, "planning");
+    assert_eq!(result.materialization.verified_objects, "1");
+    assert_eq!(result.materialization.missing_objects, "1");
+
+    let repaired = repository
+        .list_materialization_objects(&tenant, &namespace, &materialization_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.object.object_id == ObjectId::from_bytes([1; 32]))
+        .unwrap();
+    assert_eq!(repaired.plan_revision, Generation::new(2));
+    assert_eq!(repaired.attempt, Generation::new(2));
+    assert_eq!(repaired.state, MaterializationObjectState::Missing);
+    assert_eq!(repaired.confirmed_offset, DecimalU64::new(0));
 }
 
 async fn assert_competing_batch_converges_on_existing_placement(
@@ -1940,9 +2293,44 @@ async fn in_memory_materialization_is_namespace_scoped_and_idempotent() {
 }
 
 #[tokio::test]
+async fn in_memory_coverage_recomputes_after_integrity_failure() {
+    assert_coverage_recomputes_after_integrity_failure(&InMemoryPlacementRepository::default())
+        .await;
+}
+
+#[tokio::test]
 async fn in_memory_receipt_is_idempotent_and_advances_authority() {
     let repository = InMemoryPlacementRepository::default();
     assert_receipt_semantics(&repository).await;
+}
+
+#[cfg(feature = "authority-sqlite")]
+#[tokio::test]
+async fn sqlite_coverage_recomputes_after_integrity_failure() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let authority = neoengram_central::open_sqlite_authority(
+        neoengram_central::SqliteAuthorityConfig::new(directory.path()),
+    )
+    .await
+    .unwrap();
+    let repository = authority.authority_store().placement().unwrap();
+    assert_coverage_recomputes_after_integrity_failure(repository.as_ref()).await;
+    authority.close().await;
+}
+
+#[cfg(feature = "authority-sqlite")]
+#[tokio::test]
+async fn sqlite_completed_materialization_retry_replans_after_integrity_failure() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let authority = neoengram_central::open_sqlite_authority(
+        neoengram_central::SqliteAuthorityConfig::new(directory.path()),
+    )
+    .await
+    .unwrap();
+    let repository = authority.authority_store().placement().unwrap();
+    assert_completed_materialization_retry_replans_after_integrity_failure(repository).await;
+    authority.integrity_check().await.unwrap();
+    authority.close().await;
 }
 
 #[tokio::test]
@@ -1968,6 +2356,12 @@ async fn in_memory_receipt_progress_is_namespace_scoped() {
 #[tokio::test]
 async fn in_memory_completed_object_retry_repairs_coverage() {
     assert_completed_object_retry_repairs_coverage(&InMemoryPlacementRepository::default()).await;
+}
+
+#[tokio::test]
+async fn in_memory_completed_materialization_retry_replans_after_integrity_failure() {
+    let repository: Arc<dyn PlacementRepository> = Arc::new(InMemoryPlacementRepository::default());
+    assert_completed_materialization_retry_replans_after_integrity_failure(repository).await;
 }
 
 #[tokio::test]
@@ -2292,6 +2686,12 @@ async fn in_memory_materialization_lists_are_namespace_scoped() {
         .await;
 }
 
+#[tokio::test]
+async fn in_memory_placement_health_is_idempotent_and_monotonic() {
+    assert_placement_health_is_idempotent_and_monotonic(&InMemoryPlacementRepository::default())
+        .await;
+}
+
 #[cfg(feature = "authority-sqlite")]
 #[tokio::test]
 async fn sqlite_materialization_plan_publishes_as_one_transaction() {
@@ -2303,6 +2703,51 @@ async fn sqlite_materialization_plan_publishes_as_one_transaction() {
     .unwrap();
     let repository = authority.authority_store().placement().unwrap();
     assert_materialization_plan_publishes_as_one_aggregate(repository.as_ref()).await;
+
+    // Batch/Object/Coverage indexes must inherit the parent Job clock. Zero timestamps make
+    // durable child rows indistinguishable from an uninitialized record and break ordering/GC.
+    let options = SqliteConnectOptions::new()
+        .filename(directory.path().join("authority.sqlite3"))
+        .create_if_missing(false);
+    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .unwrap();
+    let (batch_created, batch_updated): (i64, i64) = sqlx::query_as(
+        "SELECT created_at_unix_ms, updated_at_unix_ms FROM materialization_batches \
+         WHERE tenant_id = ? AND object_namespace_id = ? AND batch_id = ?",
+    )
+    .bind("tenant-v2")
+    .bind("artifact-v2")
+    .bind("batch-v2")
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!((batch_created, batch_updated), (1, 1));
+    let (object_created, object_updated): (i64, i64) = sqlx::query_as(
+        "SELECT created_at_unix_ms, updated_at_unix_ms FROM materialization_objects \
+         WHERE tenant_id = ? AND materialization_id = ? AND object_namespace_id = ? AND object_id = ?",
+    )
+    .bind("tenant-v2")
+    .bind("materialization-v2")
+    .bind("artifact-v2")
+    .bind(ObjectId::from_bytes([1; 32]).as_bytes().as_slice())
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!((object_created, object_updated), (1, 1));
+    let (coverage_created, coverage_updated): (i64, i64) = sqlx::query_as(
+        "SELECT created_at_unix_ms, updated_at_unix_ms FROM volume_commit_coverages \
+         WHERE tenant_id = ? AND object_namespace_id = ? AND commit_id = ? AND storage_volume_id = ?",
+    )
+    .bind("tenant-v2")
+    .bind("artifact-v2")
+    .bind(CommitId::from_bytes([9; 32]).digest().as_bytes().as_slice())
+    .bind("volume-target")
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!((coverage_created, coverage_updated), (1, 1));
+    connection.close().await.unwrap();
     authority.integrity_check().await.unwrap();
     authority.close().await;
 }
@@ -2333,6 +2778,21 @@ async fn sqlite_materialization_lists_are_namespace_scoped() {
     .unwrap();
     let repository = authority.authority_store().placement().unwrap();
     assert_materialization_lists_are_namespace_scoped(repository.as_ref()).await;
+    authority.integrity_check().await.unwrap();
+    authority.close().await;
+}
+
+#[cfg(feature = "authority-sqlite")]
+#[tokio::test]
+async fn sqlite_placement_health_is_idempotent_and_monotonic() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let authority = neoengram_central::open_sqlite_authority(
+        neoengram_central::SqliteAuthorityConfig::new(directory.path()),
+    )
+    .await
+    .unwrap();
+    let repository = authority.authority_store().placement().unwrap();
+    assert_placement_health_is_idempotent_and_monotonic(repository.as_ref()).await;
     authority.integrity_check().await.unwrap();
     authority.close().await;
 }

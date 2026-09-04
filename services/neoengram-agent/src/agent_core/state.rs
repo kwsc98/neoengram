@@ -308,6 +308,9 @@ pub enum AgentReport {
     /// outbox as legacy Job reports so a disconnect after the target durability barrier cannot
     /// lose the placement publication evidence.
     Materialization(Box<neoengram_domain::protocol::MaterializationReport>),
+    /// Durable Volume scrub observations. They share the outbox so a disconnect cannot lose a
+    /// health transition that must reach Central before the next source plan.
+    Integrity(Box<neoengram_domain::protocol::IntegrityScanReport>),
 }
 
 impl AgentReport {
@@ -322,6 +325,9 @@ impl AgentReport {
             Self::Lifecycle(report) => ControlMessage::LifecycleReport(report),
             Self::Replication(report) => ControlMessage::ReplicationReport(report),
             Self::Materialization(report) => ControlMessage::MaterializationReport(report),
+            Self::Integrity(_) => unreachable!(
+                "integrity reports use the dedicated channel variant, not ControlMessage"
+            ),
         }
     }
 }

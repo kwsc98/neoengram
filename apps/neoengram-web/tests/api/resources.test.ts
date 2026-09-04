@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  cancelCommitReplication,
+  cancelTask,
   cancelPlaygroundPreCommit,
   commitPlayground,
   createArtifact,
@@ -13,9 +13,8 @@ import {
   queryArtifactCommitDiff,
   queryArtifactCommitGraph,
   queryArtifactList,
-  queryCommitAvailability,
-  queryCommitPlacementList,
-  queryCommitReplicationList,
+  queryCommitAvailabilityV2,
+  queryCommitCoverage,
   queryGatewayPoolList,
   queryPlayground,
   queryPlaygroundChangeList,
@@ -35,9 +34,10 @@ import {
   queryStorageVolumeList,
   queryTenant,
   queryTenantList,
-  replicateCommit,
+  materializeCommit,
+  queryTaskList,
   restartPlaygroundPreCommit,
-  retryCommitReplication,
+  retryTask,
   retrySnapshotDelivery,
   startPlaygroundPreCommit,
 } from '@/api/operations';
@@ -152,49 +152,52 @@ describe('tenant-scoped public resource operations', () => {
     expect(pools.data.items).toEqual(gatewayPools);
   });
 
-  it('replicates a Commit through the mock cluster route and publishes its PlacementSet', async () => {
+  it('materializes a Commit through the mock cluster route and publishes its Coverage', async () => {
     const request = {
       tenant_id: 'tenant-a',
       project_id: 'project-vision',
       artifact_id: 'road-scenes',
       commit_id: mockCommitIds.roadMain3,
       target_storage_volume_id: 'volume-beijing-language',
-      request_id: 'replicate-road-main-to-beijing',
+      object_namespace_id: 'road-scenes',
+      coverage_goal: 'complete' as const,
+      request_id: 'materialize-road-main-to-beijing',
     };
-    const created = await replicateCommit(request);
+    const created = await materializeCommit(request);
     expect(created.data).toMatchObject({
       replayed: false,
-      replication: {
+      materialization: {
         state: 'queued',
-        target_edge_cluster_id: 'cluster-cn-north-1',
-        target_gateway_pool_id: 'pool-cn-north-1',
+        target_storage_volume_id: request.target_storage_volume_id,
       },
+      task: { task_kind: 'commit.materialize', state: 'queued' },
     });
-    expect((await replicateCommit(request)).data.replayed).toBe(true);
+    expect((await materializeCommit(request)).data.replayed).toBe(true);
 
-    let state = created.data.replication.state;
-    for (let query = 0; query < 4 && state !== 'published'; query += 1) {
-      const replications = await queryCommitReplicationList({
+    let state = created.data.task!.state;
+    for (let query = 0; query < 4 && state !== 'succeeded'; query += 1) {
+      const tasks = await queryTaskList({
         tenant_id: request.tenant_id,
         commit_id: request.commit_id,
         object_namespace_id: request.artifact_id,
+        task_kind: ['commit.materialize'],
       });
-      state = replications.data.replications[0]!.state;
+      state = tasks.data.items[0]!.state;
     }
-    expect(state).toBe('published');
+    expect(state).toBe('succeeded');
 
-    const placements = await queryCommitPlacementList({
+    const placements = await queryCommitCoverage({
       tenant_id: request.tenant_id,
       commit_id: request.commit_id,
       object_namespace_id: request.artifact_id,
     });
-    expect(placements.data.placements).toContainEqual(
+    expect(placements.data.coverage).toContainEqual(
       expect.objectContaining({
         storage_volume_id: request.target_storage_volume_id,
-        state: 'published',
+        state: 'complete',
       }),
     );
-    const availability = await queryCommitAvailability({
+    const availability = await queryCommitAvailabilityV2({
       tenant_id: request.tenant_id,
       commit_id: request.commit_id,
       object_namespace_id: request.artifact_id,
@@ -204,39 +207,37 @@ describe('tenant-scoped public resource operations', () => {
     );
 
     await expect(
-      replicateCommit({
+      materializeCommit({
         ...request,
         project_id: 'project-language',
-        request_id: 'replicate-commit-from-wrong-artifact',
+        request_id: 'materialize-commit-from-wrong-artifact',
       }),
     ).rejects.toMatchObject({ status: 404 });
   });
 
-  it('cancels and retries one immutable Commit replication task', async () => {
-    const created = await replicateCommit({
+  it('cancels one immutable Commit task and preserves terminal cancellation', async () => {
+    const created = await materializeCommit({
       tenant_id: 'tenant-a',
       project_id: 'project-vision',
       artifact_id: 'road-scenes',
       commit_id: mockCommitIds.roadMain2,
       target_storage_volume_id: 'volume-guangzhou-delivery',
-      request_id: 'replicate-road-main-to-guangzhou',
-    });
-    const cancelled = await cancelCommitReplication({
-      tenant_id: 'tenant-a',
       object_namespace_id: 'road-scenes',
-      replication_id: created.data.replication.replication_id,
-      expected_attempt: created.data.replication.attempt,
+      coverage_goal: 'complete',
+      request_id: 'materialize-road-main-to-guangzhou',
     });
-    expect(cancelled.data.replication.state).toBe('cancelled');
+    const cancelled = await cancelTask({
+      tenant_id: 'tenant-a',
+      task_id: created.data.task!.task_id,
+    });
+    expect(cancelled.data.task.state).toBe('cancelled');
 
-    const retried = await retryCommitReplication({
-      tenant_id: 'tenant-a',
-      object_namespace_id: 'road-scenes',
-      replication_id: created.data.replication.replication_id,
-      expected_attempt: cancelled.data.replication.attempt,
-      request_id: 'retry-replicate-road-main-to-guangzhou',
-    });
-    expect(retried.data.replication).toMatchObject({ attempt: '2', state: 'queued' });
+    await expect(
+      retryTask({
+        tenant_id: 'tenant-a',
+        task_id: created.data.task!.task_id,
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'TASK_NOT_RETRYABLE' });
   });
 
   it('keeps Project, Artifact, Playground and Snapshot queries tenant-scoped', async () => {
@@ -288,6 +289,12 @@ describe('tenant-scoped public resource operations', () => {
       (item) => item.artifact_id === 'road-scenes' && item.commit_id === mockCommitIds.roadMain3,
     );
     expect(logicalSnapshots).toHaveLength(2);
+    expect(
+      logicalSnapshots.every(
+        (item) =>
+          item.delivery_id && item.edge_cluster_id && item.storage_volume_id && item.delivery_mode,
+      ),
+    ).toBe(true);
   });
 
   it('rejects new placement on a non-Ready StorageVolume', async () => {
@@ -458,7 +465,7 @@ describe('tenant-scoped public resource operations', () => {
     ).rejects.toMatchObject({ status: 409, code: 'CURSOR_INVALID' });
   });
 
-  it('creates empty Artifacts and regional Snapshots while enforcing Playground readiness', async () => {
+  it('creates empty Artifacts and fixed-target Snapshots while enforcing Playground readiness', async () => {
     const storageRequest = {
       tenant_id: 'tenant-a',
       storage_volume_id: 'volume-test-evaluation',
@@ -633,32 +640,64 @@ describe('tenant-scoped public resource operations', () => {
       project_id: 'project-vision',
       artifact_id: 'road-scenes',
       commit_id: committed.data.commit.commit_id,
+      target_edge_cluster_id: 'cluster-cn-south-1',
+      target_storage_volume_id: 'volume-guangzhou-delivery',
+      delivery_mode: 'copy' as const,
       request_id: 'snapshot-request-evaluation-guangzhou',
     };
     const firstSnapshot = await createSnapshot(snapshotRequest);
     expect(firstSnapshot.data.replayed).toBe(false);
-    expect(firstSnapshot.data.snapshot.state).toBe('ready');
+    expect(firstSnapshot.data.snapshot).toMatchObject({
+      state: 'creating',
+      edge_cluster_id: 'cluster-cn-south-1',
+      storage_volume_id: 'volume-guangzhou-delivery',
+      delivery_mode: 'copy',
+      integrity: { state: 'pending' },
+    });
+    expect(typeof firstSnapshot.data.snapshot.delivery_id).toBe('string');
     expect((await createSnapshot(snapshotRequest)).data.replayed).toBe(true);
-    const reusedPlacement = await createSnapshot({
+    await expect(
+      createSnapshot({
+        ...snapshotRequest,
+        target_edge_cluster_id: 'cluster-cn-east-1',
+        target_storage_volume_id: 'volume-shanghai-vision',
+      }),
+    ).rejects.toMatchObject({ status: 409, code: 'SNAPSHOT_REQUEST_ID_REUSED' });
+    const sameTargetSnapshot = await createSnapshot({
       ...snapshotRequest,
       request_id: 'snapshot-request-evaluation-guangzhou-reused',
     });
-    expect(reusedPlacement.data.replayed).toBe(false);
-    expect(reusedPlacement.data.snapshot.snapshot_id).toBe(firstSnapshot.data.snapshot.snapshot_id);
+    expect(sameTargetSnapshot.data.replayed).toBe(false);
+    expect(sameTargetSnapshot.data.snapshot.snapshot_id).not.toBe(
+      firstSnapshot.data.snapshot.snapshot_id,
+    );
+    expect(sameTargetSnapshot.data.snapshot.delivery_id).not.toBe(
+      firstSnapshot.data.snapshot.delivery_id,
+    );
+    expect(sameTargetSnapshot.data.snapshot.storage_volume_id).toBe(
+      snapshotRequest.target_storage_volume_id,
+    );
+    await querySnapshot(snapshotRequest.tenant_id, firstSnapshot.data.snapshot.snapshot_id);
     const readySnapshot = (
       await querySnapshot(snapshotRequest.tenant_id, firstSnapshot.data.snapshot.snapshot_id)
     ).data.snapshot;
     expect(readySnapshot).toMatchObject({ state: 'ready', integrity: { state: 'verified' } });
 
-    const sameLogicalSnapshot = await createSnapshot({
+    const otherTargetSnapshot = await createSnapshot({
       ...snapshotRequest,
+      target_edge_cluster_id: 'cluster-cn-east-1',
+      target_storage_volume_id: 'volume-shanghai-vision',
       request_id: 'snapshot-request-evaluation-shanghai',
     });
-    expect(sameLogicalSnapshot.data.replayed).toBe(false);
-    expect(sameLogicalSnapshot.data.snapshot.snapshot_id).toBe(
+    expect(otherTargetSnapshot.data.replayed).toBe(false);
+    expect(otherTargetSnapshot.data.snapshot.snapshot_id).not.toBe(
       firstSnapshot.data.snapshot.snapshot_id,
     );
-    expect(sameLogicalSnapshot.data.snapshot.commit_id).toBe(firstSnapshot.data.snapshot.commit_id);
+    expect(otherTargetSnapshot.data.snapshot.storage_volume_id).toBe('volume-shanghai-vision');
+    expect(otherTargetSnapshot.data.snapshot.edge_cluster_id).toBe('cluster-cn-east-1');
+    expect(otherTargetSnapshot.data.snapshot.delivery_id).not.toBe(
+      firstSnapshot.data.snapshot.delivery_id,
+    );
   });
 
   it('drives Pre-commit states and returns paginated logical metadata', async () => {
@@ -780,10 +819,10 @@ describe('tenant-scoped public resource operations', () => {
     expect(profile.data.profile.state).toBe('ready');
   });
 
-  it('retries an independent Snapshot delivery and gates file browsing on Snapshot state', async () => {
+  it("retries the Snapshot's unique Delivery and gates file browsing on delivery readiness", async () => {
     const retry = await retrySnapshotDelivery({
       tenant_id: 'tenant-a',
-      delivery_id: 'delivery-snapshot-main3-01',
+      delivery_id: 'delivery-road-main2-sha-01',
       request_id: 'retry-snapshot-main3-01',
     });
     expect(retry.data.delivery).toMatchObject({ state: 'requested' });
@@ -791,7 +830,7 @@ describe('tenant-scoped public resource operations', () => {
       (
         await retrySnapshotDelivery({
           tenant_id: 'tenant-a',
-          delivery_id: 'delivery-snapshot-main3-01',
+          delivery_id: 'delivery-road-main2-sha-01',
           request_id: 'retry-snapshot-main3-01',
         })
       ).data.replayed,
@@ -799,15 +838,20 @@ describe('tenant-scoped public resource operations', () => {
 
     const firstRetryQuery = await querySnapshotDelivery({
       tenant_id: 'tenant-a',
-      delivery_id: 'delivery-snapshot-main3-01',
+      delivery_id: 'delivery-road-main2-sha-01',
     });
     expect(firstRetryQuery.data.delivery).toMatchObject({ state: 'requested' });
+    const retriedSnapshot = await querySnapshot('tenant-a', 'snap-road-main2-sha-01');
+    expect(retriedSnapshot.data.snapshot).toMatchObject({
+      state: 'creating',
+      integrity: { state: 'pending' },
+    });
     await expect(
       querySnapshotFileList({
         tenant_id: 'tenant-a',
         snapshot_id: 'snap-road-main2-sha-01',
       }),
-    ).rejects.toMatchObject({ status: 409, code: 'SNAPSHOT_NOT_READY' });
+    ).rejects.toMatchObject({ status: 409, code: 'SNAPSHOT_UNAVAILABLE' });
     const unchangedSnapshot = await querySnapshot('tenant-a', 'snap-road-main3-sha-01');
     expect(unchangedSnapshot.data.snapshot).toMatchObject({
       state: 'ready',
@@ -825,7 +869,7 @@ describe('tenant-scoped public resource operations', () => {
         tenant_id: 'tenant-a',
         snapshot_id: 'snap-road-main3-gz-01',
       }),
-    ).rejects.toMatchObject({ status: 409, code: 'SNAPSHOT_NOT_READY' });
+    ).rejects.toMatchObject({ status: 409, code: 'SNAPSHOT_UNAVAILABLE' });
     const activities = await querySnapshotActivityList({
       tenant_id: 'tenant-a',
       snapshot_id: 'snap-road-main3-sha-01',

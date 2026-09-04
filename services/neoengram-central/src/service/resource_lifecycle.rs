@@ -1,5 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
+use serde::Serialize;
+
 use crate::{
     AgentRegistryRepository, AuthorityLifecycleAction, AuthorityLifecycleRepository,
     AuthorityLifecycleRequest, CentralError, CentralErrorCode, CentralResult, Clock,
@@ -7,10 +9,13 @@ use crate::{
     LifecycleAssignmentOutboxRecord, ObjectCatalog, RevokeVolumeForLifecycleRequest,
     TenantListRequest,
 };
+use neoengram_domain::core::ContentDigest;
 use neoengram_domain::protocol::{
     AgentResourceLifecycleAssignment, AgentResourceLifecycleScope, ArtifactId, ArtifactPlacementId,
-    DeletionOperation, DeletionOperationState, LifecycleAssignmentId, PlacementGeneration,
-    ResourceLifecycleAction, ResourceRef, RetentionHoldState, UnixMillis,
+    DeletionId, DeletionOperation, DeletionOperationState, Extensions, LifecycleAssignmentId,
+    OperationTask, PlacementGeneration, PrincipalId, PrincipalKind, PrincipalRef, RequestId,
+    ResourceLifecycleAction, ResourceRef, RetentionHoldState, TaskActor, TaskKind,
+    TaskResourceKind, TaskResourceLink, TaskResourceRole, TaskScope, TaskState, UnixMillis,
 };
 
 const RECONCILE_PAGE_SIZE: u16 = 100;
@@ -31,6 +36,7 @@ pub struct ResourceLifecycleCoordinator {
     authority_lifecycle: Arc<dyn AuthorityLifecycleRepository>,
     objects: Arc<dyn ObjectCatalog>,
     clock: Arc<dyn Clock>,
+    task_coordinator: Option<Arc<super::TaskCoordinator>>,
 }
 
 impl ResourceLifecycleCoordinator {
@@ -48,7 +54,146 @@ impl ResourceLifecycleCoordinator {
             authority_lifecycle,
             objects,
             clock,
+            task_coordinator: None,
         }
+    }
+
+    /// Installs the unified task coordinator used to expose background lifecycle work in the
+    /// central task/audit view. Standalone compositions may omit it; the deletion saga itself is
+    /// unchanged in that mode.
+    #[must_use]
+    pub fn with_task_coordinator(mut self, coordinator: Arc<super::TaskCoordinator>) -> Self {
+        self.task_coordinator = Some(coordinator);
+        self
+    }
+
+    async fn ensure_operation_task(
+        &self,
+        operation: &DeletionOperation,
+    ) -> CentralResult<Option<OperationTask>> {
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok(None);
+        };
+        // A public deletion request may already have created its root task. Reuse that identity
+        // when present so the reconciler acts as its executor rather than creating a duplicate
+        // audit root. The fallback below keeps standalone/background operations observable too.
+        if let Some(task) = coordinator
+            .repository()
+            .get_by_request_id(&operation.tenant_id, &operation.request_id)
+            .await?
+        {
+            coordinator
+                .repository()
+                .link_resource(crate::TaskResourceLinkRecord {
+                    tenant_id: operation.tenant_id.clone(),
+                    link: TaskResourceLink::new(
+                        task.task_id.clone(),
+                        TaskResourceKind::Deletion,
+                        operation.deletion_id.to_string(),
+                        TaskResourceRole::Primary,
+                    ),
+                })
+                .await?;
+            return Ok(Some(task));
+        }
+        // The deletion operation is mutable as it advances through the saga. Bind the task to
+        // immutable identity only, so every reconciliation pass replays the same task instead of
+        // changing its request digest after a state transition.
+        let request = LifecycleTaskRequest {
+            deletion_id: &operation.deletion_id,
+            request_digest: &operation.request_digest,
+        };
+        let digest = blake3::hash(
+            format!(
+                "resource-lifecycle\0{}\0{}",
+                operation.tenant_id, operation.deletion_id
+            )
+            .as_bytes(),
+        );
+        let request_id = RequestId::new(format!("resource-lifecycle-{}", digest.to_hex()))
+            .map_err(CentralError::from)?;
+        let (task, _) = coordinator
+            .create_root(
+                TaskKind::CatalogLifecycle,
+                lifecycle_task_scope(operation),
+                request_id,
+                &request,
+                lifecycle_task_actor(),
+                Some("deletion"),
+                Some(operation.deletion_id.as_str()),
+            )
+            .await?;
+        coordinator
+            .repository()
+            .link_resource(crate::TaskResourceLinkRecord {
+                tenant_id: operation.tenant_id.clone(),
+                link: TaskResourceLink::new(
+                    task.task_id.clone(),
+                    TaskResourceKind::Deletion,
+                    operation.deletion_id.to_string(),
+                    TaskResourceRole::Primary,
+                ),
+            })
+            .await?;
+        Ok(Some(task))
+    }
+
+    async fn transition_task(
+        &self,
+        task: &OperationTask,
+        next: TaskState,
+        message: impl Into<String>,
+    ) -> CentralResult<OperationTask> {
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok(task.clone());
+        };
+        let current = coordinator
+            .repository()
+            .get(&task.tenant_id, &task.task_id)
+            .await?
+            .ok_or_else(|| invalid("resource lifecycle task disappeared"))?;
+        if current.state == next || current.state.is_terminal() {
+            return Ok(current);
+        }
+        coordinator
+            .transition(
+                &current.task_id,
+                &current.tenant_id,
+                next,
+                lifecycle_task_actor(),
+                Some(message.into()),
+            )
+            .await
+    }
+
+    async fn finish_operation_task(
+        &self,
+        operation: &DeletionOperation,
+        task: Option<&OperationTask>,
+    ) -> CentralResult<()> {
+        let Some(task) = task else {
+            return Ok(());
+        };
+        let latest = self
+            .catalog
+            .get_deletion_operation(&operation.tenant_id, &operation.deletion_id)
+            .await?
+            .unwrap_or_else(|| operation.clone());
+        let (next, message) = match latest.state {
+            DeletionOperationState::Completed => (
+                TaskState::Succeeded,
+                "resource lifecycle reconciliation completed",
+            ),
+            DeletionOperationState::Blocked | DeletionOperationState::Failed => (
+                TaskState::Stalled,
+                "resource lifecycle reconciliation is waiting for retry",
+            ),
+            _ => (
+                TaskState::Running,
+                "resource lifecycle reconciliation remains active",
+            ),
+        };
+        self.transition_task(task, next, message).await.map(|_| ())
     }
 
     pub async fn reconcile_once(
@@ -96,18 +241,48 @@ impl ResourceLifecycleCoordinator {
                             continue;
                         }
                         run.examined += 1;
+                        let task = self.ensure_operation_task(operation).await?;
+                        if !matches!(
+                            operation.state,
+                            DeletionOperationState::Blocked | DeletionOperationState::Failed
+                        ) {
+                            if let Some(task) = task.as_ref() {
+                                self.transition_task(
+                                    task,
+                                    TaskState::Running,
+                                    "resource lifecycle reconciliation started",
+                                )
+                                .await?;
+                            }
+                        }
                         match self.reconcile_operation(operation).await {
-                            Ok(StepOutcome::Transitioned) => run.transitioned += 1,
+                            Ok(StepOutcome::Transitioned) => {
+                                run.transitioned += 1;
+                                self.finish_operation_task(operation, task.as_ref()).await?;
+                            }
                             Ok(StepOutcome::AssignmentsPublished(count)) => {
                                 run.assignments_published += count;
+                                self.finish_operation_task(operation, task.as_ref()).await?;
                             }
-                            Ok(StepOutcome::Idle) => {}
+                            Ok(StepOutcome::Idle) => {
+                                self.finish_operation_task(operation, task.as_ref()).await?;
+                            }
                             Err(error) if should_block(&error) => {
                                 if self.block_operation(operation, &error).await.is_ok() {
                                     run.blocked += 1;
                                 }
+                                if let Some(task) = task.as_ref() {
+                                    self.transition_task(task, TaskState::Stalled, error.message())
+                                        .await?;
+                                }
                             }
-                            Err(error) => return Err(error),
+                            Err(error) => {
+                                if let Some(task) = task.as_ref() {
+                                    self.transition_task(task, TaskState::Failed, error.message())
+                                        .await?;
+                                }
+                                return Err(error);
+                            }
                         }
                     }
                     deletion_after = page.next;
@@ -398,13 +573,14 @@ impl ResourceLifecycleCoordinator {
                 volumes.insert(storage_volume_id.clone());
             }
             ResourceRef::Snapshot { snapshot_id } => {
-                // Snapshots are logical Commit references. They do not own a physical Volume;
-                // object placements are retained and garbage-collected independently.
-                let _ = self
+                // A Snapshot owns exactly one immutable physical Delivery. Resolve its target
+                // Volume so the lifecycle saga can fence and purge that Delivery's directory.
+                let snapshot = self
                     .catalog
                     .get_snapshot_for_lifecycle(&operation.tenant_id, snapshot_id)
                     .await?
                     .ok_or_else(|| invalid("Snapshot deletion target no longer exists"))?;
+                volumes.insert(snapshot.storage_volume_id);
             }
             ResourceRef::Playground {
                 project_id,
@@ -432,7 +608,13 @@ impl ResourceLifecycleCoordinator {
                 for target in &operation.targets {
                     match &target.resource {
                         ResourceRef::Snapshot { snapshot_id } => {
-                            let _ = snapshot_id;
+                            if let Some(snapshot) = self
+                                .catalog
+                                .get_snapshot_for_lifecycle(&operation.tenant_id, snapshot_id)
+                                .await?
+                            {
+                                volumes.insert(snapshot.storage_volume_id);
+                            }
                         }
                         ResourceRef::Playground {
                             project_id,
@@ -620,10 +802,28 @@ impl ResourceLifecycleCoordinator {
                 })
             }
             ResourceRef::Snapshot { snapshot_id } => {
-                let _ = (snapshot_id, storage_volume_id);
-                Err(invalid(
-                    "Snapshot logical resources do not have an Agent lifecycle scope",
-                ))
+                let snapshot = self
+                    .catalog
+                    .get_snapshot_for_lifecycle(&operation.tenant_id, snapshot_id)
+                    .await?
+                    .ok_or_else(|| invalid("Snapshot deletion target no longer exists"))?;
+                if snapshot.storage_volume_id != *storage_volume_id {
+                    return Err(internal(
+                        "Snapshot lifecycle command resolved an unrelated Volume",
+                    ));
+                }
+                Ok(AgentResourceLifecycleScope::Snapshot {
+                    project_id: snapshot.project_id,
+                    artifact_id: snapshot.artifact_id.clone(),
+                    snapshot_id: snapshot.snapshot_id,
+                    storage_volume_id: storage_volume_id.clone(),
+                    artifact_placement_id: placement_id(
+                        &operation.tenant_id,
+                        &snapshot.artifact_id,
+                        storage_volume_id,
+                    )?,
+                    placement_generation: PlacementGeneration::new(1),
+                })
             }
         }
     }
@@ -675,6 +875,50 @@ enum StepOutcome {
     Idle,
     Transitioned,
     AssignmentsPublished(usize),
+}
+
+#[derive(Serialize)]
+struct LifecycleTaskRequest<'a> {
+    deletion_id: &'a DeletionId,
+    request_digest: &'a ContentDigest,
+}
+
+fn lifecycle_task_actor() -> TaskActor {
+    TaskActor::Principal(PrincipalRef {
+        kind: PrincipalKind::System,
+        id: PrincipalId::new("resource-lifecycle-reconciler")
+            .expect("static lifecycle reconciler principal is valid"),
+        extensions: Extensions::new(),
+    })
+}
+
+fn lifecycle_task_scope(operation: &DeletionOperation) -> TaskScope {
+    let mut scope = TaskScope::new(operation.tenant_id.clone());
+    match &operation.root {
+        ResourceRef::StorageVolume { storage_volume_id } => {
+            scope.storage_volume_id = Some(storage_volume_id.clone());
+        }
+        ResourceRef::Artifact {
+            project_id,
+            artifact_id,
+        } => {
+            scope.project_id = Some(project_id.clone());
+            scope.artifact_id = Some(artifact_id.clone());
+        }
+        ResourceRef::Playground {
+            project_id,
+            artifact_id,
+            playground_id,
+        } => {
+            scope.project_id = Some(project_id.clone());
+            scope.artifact_id = Some(artifact_id.clone());
+            scope.playground_id = Some(playground_id.clone());
+        }
+        ResourceRef::Snapshot { snapshot_id } => {
+            scope.snapshot_id = Some(snapshot_id.clone());
+        }
+    }
+    scope
 }
 
 fn placement_id(
@@ -743,14 +987,19 @@ fn internal(message: impl Into<String>) -> CentralError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ArtifactInitialization, ArtifactRecord, CatalogInsertOutcome, ControlCatalogRepository,
-        CreateDeletionRequest, DeletionImpactQuery, DeletionTransitionRequest, InMemoryComponents,
-        RetryDeletionRequest, TenantRecord,
+        ArtifactHeadExpectation, ArtifactInitialization, ArtifactRecord, CatalogInsertOutcome,
+        ControlCatalogRepository, CreateDeletionRequest, DeletionImpactQuery,
+        DeletionTransitionRequest, InMemoryComponents, RetryDeletionRequest,
+        SnapshotDeliveryInsertRequest, SnapshotDeliveryRecord, SnapshotInsertRequest,
+        SnapshotRecord, SnapshotState, SnapshotWithDeliveryInsertRequest, StorageAccessMode,
+        StorageBackendType, StorageVolumeRecord, StorageVolumeState, TaskCoordinator, TenantRecord,
     };
     use neoengram_domain::core::ContentDigest;
     use neoengram_domain::protocol::{
-        ArtifactId, DeletionCompletion, DeletionId, ProjectId, RequestId, ResourceLifecycle,
-        ResourceVersion, TenantId,
+        ArtifactId, DecimalU64, DeletionCompletion, DeletionId, DeliveryGeneration, EdgeClusterId,
+        HardlinkPolicy, ProjectId, RequestId, ResourceLifecycle, ResourceVersion,
+        SnapshotDeliveryId, SnapshotDeliveryMode, SnapshotDeliveryOperation, SnapshotDeliveryState,
+        SnapshotId, StorageVolumeId, TenantId,
     };
 
     use super::*;
@@ -898,7 +1147,11 @@ mod tests {
             components.authority_lifecycle.clone(),
             components.objects.clone(),
             components.clock.clone(),
-        );
+        )
+        .with_task_coordinator(Arc::new(TaskCoordinator::new(
+            components.tasks.clone(),
+            components.clock.clone(),
+        )));
         let run = coordinator.reconcile_once(10).await.unwrap();
         assert_eq!(run.transitioned, 1);
         let completed = components
@@ -910,6 +1163,189 @@ mod tests {
         assert_eq!(completed.state, DeletionOperationState::Completed);
         assert_eq!(completed.completion, Some(DeletionCompletion::Purged));
         assert_eq!(completed.resume_state, None);
+        let tasks = components.tasks.all().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_kind, TaskKind::CatalogLifecycle);
+        assert_eq!(tasks[0].state, TaskState::Succeeded);
+        assert_eq!(tasks[0].detail_kind.as_deref(), Some("deletion"));
+        assert_eq!(tasks[0].detail_id.as_deref(), Some("deletion-retry"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_lifecycle_resolves_its_bound_delivery_volume() {
+        let components = InMemoryComponents::new(1_000);
+        let tenant_id = TenantId::new("tenant-snapshot-cleanup").unwrap();
+        let project_id = ProjectId::new("project-snapshot-cleanup").unwrap();
+        let artifact_id = ArtifactId::new("artifact-snapshot-cleanup").unwrap();
+        let snapshot_id = SnapshotId::new("snapshot-snapshot-cleanup").unwrap();
+        let delivery_id = SnapshotDeliveryId::new("delivery-snapshot-cleanup").unwrap();
+        let request_id = RequestId::new("request-snapshot-cleanup").unwrap();
+        let volume_id = StorageVolumeId::new("volume-snapshot-cleanup").unwrap();
+        let edge_cluster_id = EdgeClusterId::new("cluster-snapshot-cleanup").unwrap();
+        let commit_id = ContentDigest::hash(b"snapshot-cleanup-commit");
+
+        components
+            .control_catalog
+            .insert_tenant(TenantRecord {
+                tenant_id: tenant_id.clone(),
+                display_name: "Snapshot cleanup tenant".to_owned(),
+                description: None,
+                resource_version: 1,
+                created_at_unix_ms: UnixMillis::new(1),
+                updated_at_unix_ms: UnixMillis::new(1),
+            })
+            .await
+            .unwrap();
+        components
+            .control_catalog
+            .insert_artifact(ArtifactRecord {
+                tenant_id: tenant_id.clone(),
+                project_id: project_id.clone(),
+                artifact_id: artifact_id.clone(),
+                display_name: "Snapshot cleanup artifact".to_owned(),
+                description: None,
+                initialization: ArtifactInitialization::Empty,
+                head_commit_id: None,
+                resource_version: 1,
+                lifecycle: ResourceLifecycle::active(),
+                created_at_unix_ms: UnixMillis::new(1),
+                updated_at_unix_ms: UnixMillis::new(1),
+            })
+            .await
+            .unwrap();
+        components
+            .control_catalog
+            .insert_storage_volume(StorageVolumeRecord {
+                tenant_id: tenant_id.clone(),
+                storage_volume_id: volume_id.clone(),
+                display_name: "Snapshot cleanup volume".to_owned(),
+                edge_cluster_id: edge_cluster_id.clone(),
+                region: "test".to_owned(),
+                backend_type: StorageBackendType::Pvc,
+                access_mode: StorageAccessMode::ReadWriteMany,
+                allowed_delivery_modes: vec![SnapshotDeliveryMode::Copy],
+                hardlink_policy: HardlinkPolicy::Disabled,
+                max_whole_file_bytes: DecimalU64::new(u64::MAX),
+                copy_reserve_bytes: DecimalU64::new(0),
+                pvc_reference: None,
+                nfs_reference: None,
+                state: StorageVolumeState::Ready,
+                resource_version: 1,
+                lifecycle: ResourceLifecycle::active(),
+                created_at_unix_ms: UnixMillis::new(1),
+                updated_at_unix_ms: UnixMillis::new(1),
+            })
+            .await
+            .unwrap();
+
+        let target_relative_root = SnapshotDeliveryOperation::canonical_target_relative_root(
+            &project_id,
+            &artifact_id,
+            &snapshot_id,
+            &delivery_id,
+        )
+        .unwrap();
+        components
+            .control_catalog
+            .insert_snapshot_with_delivery(SnapshotWithDeliveryInsertRequest {
+                snapshot: SnapshotInsertRequest {
+                    record: SnapshotRecord {
+                        tenant_id: tenant_id.clone(),
+                        project_id: project_id.clone(),
+                        artifact_id: artifact_id.clone(),
+                        snapshot_id: snapshot_id.clone(),
+                        snapshot_request_id: request_id.clone(),
+                        commit_id,
+                        delivery_id: delivery_id.clone(),
+                        edge_cluster_id,
+                        storage_volume_id: volume_id.clone(),
+                        delivery_mode: SnapshotDeliveryMode::Copy,
+                        state: SnapshotState::Creating,
+                        resource_version: 1,
+                        lifecycle: ResourceLifecycle::active(),
+                        created_at_unix_ms: UnixMillis::new(1),
+                        updated_at_unix_ms: UnixMillis::new(1),
+                    },
+                    artifact_head: ArtifactHeadExpectation::Any,
+                },
+                delivery: SnapshotDeliveryInsertRequest {
+                    record: SnapshotDeliveryRecord {
+                        tenant_id: tenant_id.clone(),
+                        delivery_id: delivery_id.clone(),
+                        create_request_id: request_id.clone(),
+                        snapshot_id: snapshot_id.clone(),
+                        commit_id,
+                        storage_volume_id: volume_id.clone(),
+                        mode: SnapshotDeliveryMode::Copy,
+                        target_relative_root,
+                        state: SnapshotDeliveryState::Requested,
+                        source_index_digest: ContentDigest::hash(b"snapshot-cleanup-index"),
+                        delivery_generation: DeliveryGeneration::new(1),
+                        file_count: 0,
+                        size_bytes: 0,
+                        object_set_digest: ContentDigest::hash(b"snapshot-cleanup-objects"),
+                        resource_version: 1,
+                        issue_code: None,
+                        issue_message: None,
+                        issue_retryable: false,
+                        created_at_unix_ms: UnixMillis::new(1),
+                        updated_at_unix_ms: UnixMillis::new(1),
+                    },
+                    request_id,
+                    retention_roots: Vec::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let operation = DeletionOperation {
+            deletion_id: DeletionId::new("deletion-snapshot-cleanup").unwrap(),
+            tenant_id: tenant_id.clone(),
+            root: ResourceRef::Snapshot {
+                snapshot_id: snapshot_id.clone(),
+            },
+            state: DeletionOperationState::Quarantining,
+            resource_version: ResourceVersion::new(1),
+            targets: Vec::new(),
+            request_id: RequestId::new("delete-snapshot-cleanup").unwrap(),
+            request_digest: ContentDigest::hash(b"delete-snapshot-cleanup"),
+            impact_digest: ContentDigest::hash(b"impact-snapshot-cleanup"),
+            cascade: false,
+            confirm_managed_data_erase: false,
+            purge_after_unix_ms: UnixMillis::new(2_000),
+            created_at_unix_ms: UnixMillis::new(1_000),
+            updated_at_unix_ms: UnixMillis::new(1_000),
+            completion: None,
+            last_error: None,
+            resume_state: None,
+            retry_count: DecimalU64::new(0),
+        };
+        let coordinator = ResourceLifecycleCoordinator::new(
+            components.control_catalog.clone(),
+            components.agent_registry.clone(),
+            components.authority_lifecycle.clone(),
+            components.objects.clone(),
+            components.clock.clone(),
+        );
+
+        assert_eq!(
+            coordinator.operation_volume_ids(&operation).await.unwrap(),
+            vec![volume_id.clone()]
+        );
+        assert_eq!(
+            coordinator
+                .lifecycle_scope(&operation, &volume_id)
+                .await
+                .unwrap(),
+            AgentResourceLifecycleScope::Snapshot {
+                project_id,
+                artifact_id: artifact_id.clone(),
+                snapshot_id,
+                storage_volume_id: volume_id.clone(),
+                artifact_placement_id: placement_id(&tenant_id, &artifact_id, &volume_id,).unwrap(),
+                placement_generation: PlacementGeneration::new(1),
+            }
+        );
     }
 
     async fn transition(

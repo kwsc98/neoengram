@@ -8,9 +8,9 @@
 
 关于 Commit 对象分散在多个 Volume、按对象建立覆盖并由多个来源物化到目标 Volume 的 v2 调研与目标设计，见
 [`commit-materialization-v2.md`](commit-materialization-v2.md)。当前 v2 已有 Domain、Authority、Central planner/API、
-Agent source/target executor 和 Gateway relay 纵切及契约测试，但仍处迁移中：v1 replication/PlacementSet 路径与
-v2 双路径并存，真实跨 Gateway route、三 Agent 多源失败恢复和生产 payload E2E 尚未验收。下文凡标注 legacy 的
-完整 PlacementSet/单源 Ticket 均不代表 v2 主链路。
+Agent source/target executor 和 Gateway relay 纵切及契约测试，但仍处迁移中：v1 replication/PlacementSet 私有
+实现残留与 v2 代码并存，旧 API/wire/capability 不再注册或接受；真实跨 Gateway route、三 Agent 多源失败恢复和
+生产 payload E2E 尚未验收。下文凡标注 legacy 的完整 PlacementSet/单源 Ticket 均不代表 v2 主链路。
 
 NeoEngram `0.2.0` 的本地仓库格式为 9。升级允许破坏兼容性：实现明确拒绝所有旧
 格式，不读取、不迁移，也不提供自动回退。仓库格式 9 将可移植内容模型和规范 digest 收敛到
@@ -65,13 +65,14 @@ SQLite 使用 WAL、foreign key、`synchronous=FULL` 和即时写事务。Manife
 
 ## Managed AuthorityStore
 
-Managed 中心的逻辑权威通过异步 `AuthorityStore` 组合 `JobRepository`、`AssignmentOutbox`、
+Managed 中心的逻辑权威通过异步 `AuthorityStore` 组合统一 `TaskRepository`（OperationTask 生命周期/审计）与
+领域 `JobRepository`、`AssignmentOutbox`、
 `MetadataBatchStager`、`ObjectCatalog`、`IndexPublisher` 和 `AuditSink`，不绑定具体数据库。
 默认后端是单节点生产可用的 SQLite：显式目录内固定创建独立 `authority.sqlite3` 和生命周期独占
 `authority.lock`，连接池固定单连接，并启用 WAL、foreign keys、`synchronous=FULL` 和 busy timeout。
 
 该数据库不属于 Standalone 仓库格式 9，也不得与 Standalone 共用文件。它只接受当前
-`application_id`/`user_version=18` 和当前 JSON record format；旧格式、错误 schema 和未知非空数据库
+`application_id`/`user_version=20` 和当前 JSON record format；旧格式、错误 schema 和未知非空数据库
 直接拒绝，不提供 migration、双读、字段别名或回退。所有租户查询和复合键都包含 tenant ID，但
 SQLite 仍是应用层隔离，不伪装成数据库级 RLS、HA 或多进程后端。
 
@@ -96,7 +97,8 @@ Managed 模式使用不同的权威边界：
 - Agent 的 identity、Ledger、outbound 和 candidate 位于独立 `state_dir`，不得在业务 Volume 上创建
   SQLite/WAL；状态盘丢失不会删除 Volume 中的业务对象；
 - 当前不承诺跨 Volume 对象复制的生产执行、强 storage-side fencing、NeoEngram Gateway payload 数据链
-  或生产数据库。v1 replication 的 Central route/ticket 控制链和 Agent/Gateway 协议边界仍保留为 legacy；v2
+  或生产数据库。v1 replication 的 Central route/ticket 控制链和 Agent/Gateway 协议边界仅作为私有迁移残留；旧
+  API、旧 ALPN/capability 和旧 Ticket 不再接受。v2
   `MaterializationJob`/多源 planner、ObjectPlacement、Coverage、Ticket/Receipt/Lease 有代码和契约测试。
   Agent 只有在 replication 配置启用且 Gateway QUIC 预检成功后才声明 `commit_materialization_v2`；当前 Gateway
   生产 listener 使用 `neoengram-transfer-v2`、拒绝旧 v1 ticket，并可通过有界 relay 转发 v2 frame。目标复制链路
@@ -116,10 +118,11 @@ durability barrier 并提交幂等 receipt 后，Placement 才能进入 `verifie
 或 batch attempt 不能改变 `(materialization_id, namespace, object_id)` staging key 或 confirmed offset。Workspace、
 SnapshotDelivery 和 S3 只有在 Coverage 完整且视图校验通过后才能 Ready；全局对象并集完整不等于任一 Volume 可读。
 
-当前 authority schema 为 `user_version=18`，已安装 v2 表（含 `object_placements_v2`、Coverage、Materialization、
+当前 authority schema 为 `user_version=20`，已安装 v2 表（含 `object_placements`、Coverage、Materialization、OperationTask、
 object-read/staging lease），并通过 InMemory/SQLite 的 CAS、幂等 Receipt 和重规划 checkpoint 契约。v1
 `commit_placement_sets`、`replications`、`replication_objects` 和旧 ObjectCatalog/Assignment mapper 尚未删除，
-因此该 schema 仍是迁移中状态；升级不隐式删除，clean-slate reset/inventory rebuild 仍需显式运维动作。
+因此该 schema 仍是开发阶段 clean-slate；v19 及更早 authority 数据库与 v20 DDL 不兼容，升级不隐式删除或迁移，
+clean-slate reset/inventory rebuild 必须由显式运维动作完成。
 
 Managed Add 的固定发布闭环为：
 
@@ -167,8 +170,8 @@ Index 仍可解析；Conflict/Rejected 不发布候选 Manifest。
 当前只读 S3 是 Gateway 暴露固定 Commit/Snapshot 的访问协议，不是 `ObjectStoreKind`、中心归档后端或
 新的 durability authority。S3 `LIST` 查询 Central metadata，`GET`/Range 由 owning Agent 根据 Manifest
 读取 Volume CAS；内部对象目录不映射为公开 Bucket 或 Key。v2 实际调用要求目标 Volume 的完整
-`VolumeCommitCoverage`、视图校验、GatewayPool、Agent route、signed ticket 和生产凭据；legacy 路径仍检查
-Ready PlacementSet，不能把 partial Coverage 当作可读。
+`VolumeCommitCoverage`、视图校验、GatewayPool、Agent route、signed ticket 和生产凭据；历史 v1
+PlacementSet 检查不构成当前 Ready 依据，不能把 partial Coverage 当作可读。
 
 ## 一致性、锁与 mutation
 

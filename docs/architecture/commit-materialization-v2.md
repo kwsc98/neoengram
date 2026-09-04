@@ -3,11 +3,11 @@
 > 状态：调研结论与目标设计；v2 Domain/Authority/Central planner 以及 Agent/Gateway 本地 payload
 > executor 纵切已观察，真实跨节点数据面与生产 E2E 尚未验收
 >
-> 核验日期：2026-09-01
+> 核验日期：2026-09-04
 >
-> 本报告只讨论 Managed 模式的 Commit 对象分布、跨 Volume 物化和相关控制协议。它不修改当前实现
-> 的能力状态；v1 replication 仍以单个完整 `CommitPlacementSet` 作为 legacy 复制前置条件。v2 已有对象级
-> 模型、Authority CAS/幂等、Central planner/API、Agent/Gateway executor、staging/receipt 数据面纵切，
+> 本报告只讨论 Managed 模式的 Commit 对象分布、跨 Volume 物化和相关控制协议。v1 replication/PlacementSet
+> 仅作为历史实现和显式迁移边界保留：它不再是 v20 公开 API、调度或 Ready 依据，旧协议直接拒绝。v2 已有
+> 对象级模型、Authority CAS/幂等、Central planner/API、Agent/Gateway executor、staging/receipt 数据面纵切，
 > 但在真实 route 编排和跨节点 E2E 通过前，不能把 v2 写成已完成复制能力。
 
 ## 1. 结论摘要
@@ -67,11 +67,11 @@ Volume B: object-3, object-4
 | 当前 SQLite 表围绕完整 PlacementSet 建模 | [`authority.rs`](../../services/neoengram-central/src/datasource/sqlite/authority.rs) 的 `commit_placement_sets`、`replications`、`replication_objects` | v2 应重建表和唯一约束，而不是继续堆兼容字段 |
 | 当前健康计算会统计完整 PlacementSet | [`mapper/sqlite/placement.rs`](../../services/neoengram-central/src/mapper/sqlite/placement.rs) 的 `commit_availability` | partial 并集会被误报为不可用或被忽略 |
 | v2 Domain 已定义 namespace、对象 Placement、Coverage、Materialization、Manifest、Ticket/Receipt/Lease 和 availability | [`materialization.rs`](../../crates/neoengram-domain/src/protocol/materialization.rs)、schema golden 和 domain tests | 可表达对象并集和目标覆盖，但不等于数据面已经传输 |
-| v2 Authority 已安装 schema 18 并覆盖对象 Receipt 幂等、Coverage 重算和 checkpoint CAS | [`authority.rs`](../../services/neoengram-central/src/datasource/sqlite/authority.rs)、[`authority_v2_schema.rs`](../../services/neoengram-central/tests/authority_v2_schema.rs)、materialization tests | v1 表/mapper 仍并存，clean-slate 删除和 inventory rebuild 尚未完成 |
+| v2 Authority 已安装 schema 20 并覆盖对象 Receipt 幂等、Coverage 重算、checkpoint CAS 和 OperationTask | [`authority.rs`](../../services/neoengram-central/src/datasource/sqlite/authority.rs)、[`authority_v2_schema.rs`](../../services/neoengram-central/tests/authority_v2_schema.rs)、task/materialization tests | v1 私有 mapper/测试仍是待删除的源码残留，公开旧接口和旧 wire contract 已关闭 |
 | v2 Central planner/API 可按缺失对象选择多源和 fallback | [`service/materialization.rs`](../../services/neoengram-central/src/service/materialization.rs)、[`materialization_v2.rs`](../../services/neoengram-central/tests/materialization_v2.rs) | 目前是可查询控制面计划，未驱动真实 QUIC payload executor |
 | v2 Agent/Gateway 具备 ALPN、Ticket/generation、manifest/checkpoint 校验、stream/relay 和 staging/receipt 执行路径 | [`materialization_quic.rs`](../../services/neoengram-agent/src/materialization_quic.rs)、Agent/Gateway transfer code、协议/单元测试 | 真实跨 Gateway route、三 Agent 多源失败恢复、背压/配额、生产凭据和跨节点 E2E 仍待验收 |
 
-前六行代码路径证明的是 v1 当前行为；新增行证明 v2 控制面、协议和本地执行纵切。现阶段仍应把跨
+前六行代码路径记录的是 v1 历史实现；新增行证明 v2 控制面、协议和本地执行纵切。现阶段仍应把跨
 Volume materialization 标记为进行中，不能因为本报告提交或单节点测试通过就改变为已完成的生产数据面能力。
 
 ## 4. v2 核心对象模型
@@ -137,17 +137,18 @@ state = partial | complete | retiring | deleted
 
 Coverage 可以由 ObjectPlacement 重新计算。它不能单独证明对象存在，也不能绕过对象级 digest、size、namespace 和 generation 校验。
 
-### 4.4 MaterializationJob、Batch 和 ObjectTask
+### 4.4 OperationTask、MaterializationJob、Batch 和 ObjectTask
 
-MaterializationJob 是用户可见的唯一父任务，固定以下身份：
+`OperationTask` 是所有写操作（包括即时完成操作）的统一用户可见根任务和生命周期/审计身份。
+`MaterializationJob` 是该任务引用的领域物化明细，固定以下业务唯一键：
 
 ```text
 (tenant_id, object_namespace_id, commit_id, target_storage_volume_id, coverage_goal)
 ```
 
-同一身份最多有一个活动 Job。目标已有 partial Coverage 时复用并继续；目标已有 complete Coverage 时返回 no-op/replayed；不能再用 `TARGET_COMMIT_PLACEMENT_EXISTS` 把已有部分数据当作冲突。
+同一身份最多有一个活动 Job。目标已有 partial Coverage 时复用并继续；目标已有 complete Coverage 时返回 no-op/replayed；不能再用 `TARGET_COMMIT_PLACEMENT_EXISTS` 把已有部分数据当作冲突。请求重放返回同一个 `OperationTask` 及其 Materialization 明细。
 
-`MaterializationBatch` 是 Job 内部的调度单元，按 source Agent/Volume/route 分组。Batch 不是独立用户复制任务，不单独占用父任务幂等身份。
+`MaterializationBatch` 是 Job 内部的调度单元，按 source Agent/Volume/route 分组。Batch 不是独立用户复制任务，不单独占用根任务幂等身份；公开任务详情只展示到 Batch 摘要，对象状态留在 `MaterializationObject`。
 
 `MaterializationObject` 记录精确 ObjectRef、目标已确认 offset、主源 placement、备用源 placement、当前 batch、plan revision、attempt 和错误。聚合对象数/字节只用于展示，完成状态必须由对象级证据重算。
 
@@ -236,7 +237,7 @@ Object: missing -> reserved -> transferring -> verified -> published
 - 目标 local view 只有在完整 Coverage 原子发布后才可读。
 - 同一 `(namespace, commit, target volume)` 只有一个活动 MaterializationJob。
 - 旧 session/route/mount/placement generation 的报告必须失败关闭。
-- request identity 重放必须返回同一个 Job；相同 request identity 绑定不同 payload 必须冲突。
+- request identity 重放必须返回同一个 `OperationTask`（以及同一 Materialization 明细）；相同 request identity 绑定不同 payload 必须冲突。
 - 取消或失败不能删除已经成为有效 ObjectPlacement 的对象；清理只处理仍受 staging lease 保护的临时数据。
 
 ## 8. v2 传输协议与 API
@@ -275,19 +276,22 @@ source、route 或 batch attempt 变化不能重置目标 offset。对象清单�
 
 ### 8.2 公开 API
 
-建议把用户动作改为 Materialization 语义：
+公开创建和只读证据保持 Materialization 语义，生命周期查询与控制统一由 OperationTask 承担：
 
 ```text
 /api/commit/materialize
-/api/commit/materialization/query
-/api/commit/materialization/list/query
-/api/commit/materialization/retry
-/api/commit/materialization/cancel
 /api/commit/coverage/query
 /api/commit/availability/query
+/api/task/list/query
+/api/task/query
+/api/task/event/list/query
+/api/task/retry
+/api/task/cancel
 ```
 
-创建响应返回 Job ID、状态、plan revision、目标覆盖对象/字节、缺失对象/字节、source count 和 issue。Ticket 不再通过面向用户的公开查询接口暴露，而由受信控制通道向 Agent 下发。
+创建响应返回 `MaterializationView` 和统一 `TaskView`；后续状态、Attempt、事件、重试和取消只通过
+`/api/task/*` 访问。目标覆盖对象/字节和缺失证据继续由 Coverage/Availability 查询提供。Ticket 不再通过
+面向用户的公开查询接口暴露，而由受信控制通道向 Agent 下发。
 
 `queryCommitAvailability` 应返回全局内容、服务可达性、耐久性、完整 Volume 数量以及可分页的缺失对象；不能只返回 `verified_placements` 和 Volume ID 列表。
 
@@ -304,6 +308,11 @@ replication_objects
 新增或重建：
 
 ```text
+operation_tasks
+task_attempts
+task_events
+task_resource_links
+task_relations
 object_placements
 volume_commit_coverages
 materializations
@@ -313,6 +322,7 @@ object_read_leases
 staging_leases
 ```
 
+`operation_tasks` 是统一生命周期和审计权威；领域表（包括 `materializations`）通过 task/detail 关联保存执行事实。
 所有主键/唯一索引都包含 namespace。建议的关键约束：
 
 - `object_placements` 唯一键为 namespace + object + backend + placement_generation；
@@ -321,7 +331,7 @@ staging_leases
 - Batch/plan revision 的 CAS 防止旧 source 或旧 route 覆盖新计划；
 - Coverage 由对象证据重算，并在完整校验后原子发布。
 
-Authority schema/user_version 已提升到 clean-slate v2 版本 18；当前仍需完成 v1 表删除、显式 reset 和 Volume inventory rebuild。遇到 v1 数据直接拒绝启动，不在启动时隐式删除业务对象。
+Authority schema/user_version 已提升到 clean-slate v2 版本 20；当前仍需完成 v1 表删除、显式 reset 和 Volume inventory rebuild。遇到 v1/v19 及更早数据直接拒绝启动，不在启动时隐式删除或迁移业务对象。
 
 Managed Add 产生的 `ObjectPlacementEvidence` 与复制产生的对象 receipt 必须最终进入同一对象级权威，或明确区分两者的生命周期和可读资格；不能维护两套互相矛盾的“对象已 Durable”事实。
 
@@ -329,11 +339,15 @@ Managed Add 产生的 `ObjectPlacementEvidence` 与复制产生的对象 receipt
 
 ### Workspace
 
-带 base Commit 的 Workspace 创建时进入 `Provisioning/Hydrating`，自动 attach 或创建对应 MaterializationJob。只有目标 Coverage complete、视图目录校验完成且 Volume/Agent 可达，才进入 `Active`。
+带 base Commit 的 Workspace 创建时进入 `Provisioning/Hydrating`，创建 `workspace.create` 根任务及其
+`workspace.materialize` 子任务，并自动 attach 或创建对应 MaterializationJob。只有目标 Coverage complete、视图目录校验完成且 Volume/Agent 可达，才进入 `Active`。
 
 ### Snapshot 与 SnapshotDelivery
 
-Snapshot 仍然是没有物理位置的逻辑 Commit 引用。SnapshotDelivery 绑定目标 Volume 和模式，创建时可以复用已有 MaterializationJob；Delivery 只有目标完整物化和只读视图校验完成后才 `Ready`。一个 Snapshot 可以有多个不同目标 Delivery。
+Snapshot 是固定 Commit 及目标 `EdgeCluster + StorageVolume + delivery_mode` 的只读资源。Snapshot create
+在同一个原子操作中生成唯一 SnapshotDelivery，并创建 `snapshot.create` 根任务及其
+`snapshot.delivery.materialize` 子任务；Delivery 可在内部复用或创建 MaterializationJob。公开 API 不提供第二个 Delivery 的创建动作。目标和模式创建后不可切换，Delivery 只有
+目标完整物化和只读视图校验完成后才 `Ready`。失败只能通过 Delivery retry/delete 等状态 mutation 处理。
 
 ### S3/POSIX
 

@@ -33,6 +33,8 @@ const AGENT_SESSION_OPEN_CAS_RETRIES: u8 = 3;
 pub const AGENT_CAPABILITY_COMMIT_REPLICATION_QUIC_V1: &str = "commit_replication_quic_v1";
 /// Capability required by the clean-slate object-level materialization data plane.
 pub const AGENT_CAPABILITY_COMMIT_MATERIALIZATION_V2: &str = "commit_materialization_v2";
+/// Capability required for every task-fenced v20 operation and data-plane report.
+pub const AGENT_CAPABILITY_OPERATION_TASK_V1: &str = "operation_task_v1";
 
 /// Persisted format identity for the current authority record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1846,6 +1848,9 @@ impl AgentRegistryService {
             instance
                 .capabilities
                 .contains(AGENT_CAPABILITY_COMMIT_MATERIALIZATION_V2)
+                && instance
+                    .capabilities
+                    .contains(AGENT_CAPABILITY_OPERATION_TASK_V1)
         }))
     }
 

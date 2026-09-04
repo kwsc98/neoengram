@@ -31,6 +31,7 @@ mod snapshot_reader;
 mod status_clock;
 mod tls;
 mod transfer_quic;
+mod volume_integrity;
 
 pub use agent_core::*;
 pub use backoff::EnrollmentBackoff;
@@ -99,4 +100,7 @@ pub use snapshot_reader::{
 pub use transfer_quic::{
     AgentTransferError, AgentTransferFrameChannel, AgentTransferSinkSession,
     AgentTransferSourceSession,
+};
+pub use volume_integrity::{
+    VolumeIntegrityIssue, VolumeIntegrityIssueKind, VolumeIntegrityReport, VolumeIntegrityScanner,
 };

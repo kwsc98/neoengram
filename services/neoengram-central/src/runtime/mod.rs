@@ -33,13 +33,13 @@ use crate::{
     agent_transport::RegistryAgentApiHandler,
     controller::{
         ArtifactApiServer, ArtifactController, GatewayRegistryApiServer, GatewayRegistryController,
-        JobApiServer, JobController, PlacementApiServer, PlacementController, PlaygroundApiServer,
-        PlaygroundController, ProjectApiServer, ProjectController, ResourceLifecycleApiServer,
+        PlacementApiServer, PlacementController, PlaygroundApiServer, PlaygroundController,
+        ProjectApiServer, ProjectController, ResourceLifecycleApiServer,
         ResourceLifecycleController, S3ApiServer, S3AuthorizationApiServer,
         S3AuthorizationController, S3Controller, SnapshotApiServer, SnapshotController,
         StorageEnrollmentApiServer, StorageEnrollmentController, StorageVolumeApiServer,
-        StorageVolumeController, SystemApiServer, SystemController, TenantApiServer,
-        TenantController,
+        StorageVolumeController, SystemApiServer, SystemController, TaskApiServer, TaskController,
+        TenantApiServer, TenantController,
     },
     error::{application_error, map_central_error, NeoEngramProblemEncoder},
     gateway_activation_transport::{GatewayBootstrapTransport, GatewayReplicaActivationClient},
@@ -53,8 +53,9 @@ use crate::{
         AgentDataPlaneService, AgentWorkloadCertificateService, CatalogService,
         CentralCommandKeyring, EnrollmentKeyring, EnrollmentService,
         GatewayCredentialLifecycleService, GatewayRegistryService, GatewayReplicaActivationService,
-        HealthService, JobCoordinator, JobService, ReadinessProbe, ResourceLifecycleCoordinator,
-        S3SecretEnvelope, SystemService, WorkloadCertificateIssuer, WorkspaceCommitService,
+        HealthService, JobCoordinator, ReadinessProbe, ResourceLifecycleCoordinator,
+        S3SecretEnvelope, SystemService, TaskCoordinator, TaskService, WorkloadCertificateIssuer,
+        WorkspaceCommitService,
     },
 };
 
@@ -64,7 +65,7 @@ const GATEWAY_CREDENTIAL_EXPIRY_RECONCILE_INTERVAL: Duration = Duration::from_se
 const JOB_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const RESOURCE_LIFECYCLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const GATEWAY_REPLICA_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_DEVELOPMENT_PERMISSIONS: [Permission; 27] = [
+const DEFAULT_DEVELOPMENT_PERMISSIONS: [Permission; 29] = [
     Permission::CreateAddJob,
     Permission::QueryJob,
     Permission::FinalizeAdd,
@@ -92,6 +93,8 @@ const DEFAULT_DEVELOPMENT_PERMISSIONS: [Permission; 27] = [
     Permission::RetentionManage,
     Permission::GatewayRead,
     Permission::GatewayManage,
+    Permission::TaskRead,
+    Permission::TaskManage,
 ];
 
 /// Command-line and environment configuration for the HTTP server.
@@ -305,7 +308,7 @@ pub enum RuntimeError {
 pub struct AppState {
     authority: Arc<SqliteAuthority>,
     authenticator: Arc<dyn Authenticator>,
-    jobs: Arc<JobService>,
+    tasks: Arc<TaskService>,
     catalog: Arc<CatalogService>,
     gateways: Arc<GatewayRegistryService>,
     gateway_registry: Arc<dyn GatewayRegistryRepository>,
@@ -455,8 +458,14 @@ impl AppState {
         };
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let authority_store = authority.authority_store();
+        let task_repository: Arc<dyn crate::TaskRepository> = authority_store
+            .tasks()
+            .unwrap_or_else(|| Arc::new(crate::memory::InMemoryTaskRepository::default()));
+        let task_coordinator =
+            Arc::new(TaskCoordinator::new(task_repository.clone(), clock.clone()));
         let mut control_builder =
-            ControlPlane::new(policy.clone(), authority_store.clone(), clock.clone());
+            ControlPlane::new(policy.clone(), authority_store.clone(), clock.clone())
+                .with_task_coordinator(task_coordinator.clone());
         if let Some(placement) = authority_store.placement() {
             control_builder = control_builder.with_placement_repository(placement);
         }
@@ -482,7 +491,8 @@ impl AppState {
         });
         let s3_ticket_signing_enabled = command_keyring_dependency.is_some();
         let mut gateway_service =
-            GatewayRegistryService::new(gateway_repository.clone(), policy.clone(), clock.clone());
+            GatewayRegistryService::new(gateway_repository.clone(), policy.clone(), clock.clone())
+                .with_task_coordinator(task_coordinator.clone());
         if let Some(activation) = activation {
             let activation_service = Arc::new(GatewayReplicaActivationService::new(
                 gateway_repository.clone(),
@@ -534,13 +544,16 @@ impl AppState {
                     return Err(RuntimeError::Authority(error.to_string()));
                 }
             };
-            let enrollments = Arc::new(EnrollmentService::new(
-                registry.clone(),
-                catalog_repository.clone(),
-                policy.clone(),
-                keyring,
-                clock.clone(),
-            ));
+            let enrollments = Arc::new(
+                EnrollmentService::new(
+                    registry.clone(),
+                    catalog_repository.clone(),
+                    policy.clone(),
+                    keyring,
+                    clock.clone(),
+                )
+                .with_task_coordinator(task_coordinator.clone()),
+            );
             let data_plane = Arc::new(AgentDataPlaneService::new(authority.clone()));
             let mut agent_handler = RegistryAgentApiHandler::with_transport(
                 registry.clone(),
@@ -600,13 +613,16 @@ impl AppState {
                         "SQLite authority has no lifecycle cleanup repository".to_owned(),
                     )
                 })?;
-                Some(Arc::new(ResourceLifecycleCoordinator::new(
-                    catalog_repository.clone(),
-                    agent_repository,
-                    authority_lifecycle,
-                    authority_store.objects(),
-                    clock.clone(),
-                )))
+                Some(Arc::new(
+                    ResourceLifecycleCoordinator::new(
+                        catalog_repository.clone(),
+                        agent_repository,
+                        authority_lifecycle,
+                        authority_store.objects(),
+                        clock.clone(),
+                    )
+                    .with_task_coordinator(task_coordinator.clone()),
+                ))
             } else {
                 None
             };
@@ -616,7 +632,8 @@ impl AppState {
             policy.clone(),
             clock.clone(),
         )
-        .with_lifecycle_objects(authority_store.objects());
+        .with_lifecycle_objects(authority_store.objects())
+        .with_task_coordinator(task_coordinator.clone());
         let catalog = match authority_store.placement() {
             Some(placement) => catalog.with_placement_repository(placement),
             None => catalog,
@@ -664,16 +681,14 @@ impl AppState {
                 .map_err(|error| RuntimeError::Authority(error.to_string()))?;
         let catalog = catalog.with_workspace_commits(workspace_commits);
         let catalog = Arc::new(catalog);
-        let jobs = JobService::from_authority(control, &authority_store)
-            .map_err(|error| RuntimeError::Authority(error.to_string()))?;
-        let jobs = match coordinator.as_ref() {
-            Some(coordinator) => jobs.with_coordinator(coordinator.clone()),
-            None => jobs,
-        };
+        let tasks = Arc::new(
+            TaskService::new(task_repository, policy.clone(), clock.clone())
+                .with_materialization_service(catalog.clone()),
+        );
         Ok(Self {
             authority,
             authenticator,
-            jobs: Arc::new(jobs),
+            tasks,
             catalog,
             gateways,
             gateway_registry: gateway_repository,
@@ -760,8 +775,8 @@ impl AppState {
             .interface(SystemApiServer::new(SystemController::new(
                 Arc::new(system),
                 Arc::new(HealthService::new(readiness)),
-            )))
-            .interface(JobApiServer::new(JobController::new(self.jobs.clone())));
+            )));
+        builder = builder.interface(TaskApiServer::new(TaskController::new(self.tasks.clone())));
         builder = builder
             .interface(GatewayRegistryApiServer::new(
                 GatewayRegistryController::new(self.gateways.clone()),

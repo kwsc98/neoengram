@@ -579,6 +579,8 @@ fn frame_name(frame: &TransferFrame) -> &'static str {
         TransferFrame::OpenMaterializationSigned(_) => "OpenMaterializationSigned",
         TransferFrame::MaterializationManifest(_) => "MaterializationManifest",
         TransferFrame::MaterializationManifestPage(_) => "MaterializationManifestPage",
+        TransferFrame::Preflight => "Preflight",
+        TransferFrame::PreflightAck => "PreflightAck",
         TransferFrame::ObjectRequest(_) => "ObjectRequest",
         TransferFrame::ObjectChunk(_) => "ObjectChunk",
         TransferFrame::ObjectProof(_) => "ObjectProof",

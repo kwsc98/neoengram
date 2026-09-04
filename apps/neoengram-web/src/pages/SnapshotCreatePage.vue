@@ -11,12 +11,24 @@ import { ElMessage } from 'element-plus';
 import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { createSnapshot, queryApiVersion, queryArtifact, querySnapshot } from '@/api/operations';
-import type { CreateSnapshotResponse } from '@/api/types';
+import {
+  createSnapshot,
+  queryApiVersion,
+  queryArtifact,
+  queryArtifactCommitGraph,
+  querySnapshot,
+  queryStorageVolumeList,
+} from '@/api/operations';
+import type {
+  CommitNode,
+  CreateSnapshotResponse,
+  SnapshotDeliveryMode,
+  StorageVolumeView,
+} from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import ArtifactCommitSelect from '@/components/ArtifactCommitSelect.vue';
 import PageHeading from '@/components/PageHeading.vue';
-import { supportsArtifactCommitGraph } from '@/features/capabilities';
+import { supportsArtifactCommitGraph, supportsSnapshotDeliveryMode } from '@/features/capabilities';
 import {
   snapshotIntegrityLabel,
   snapshotIntegrityTagType,
@@ -34,6 +46,8 @@ const artifactId = computed(() => String(route.params.artifactId ?? ''));
 const requestedCommitId = computed(() => String(route.query.commit_id ?? ''));
 
 const selectedCommitId = ref(requestedCommitId.value);
+const selectedStorageVolumeId = ref('');
+const selectedDeliveryMode = ref<SnapshotDeliveryMode>('copy');
 const snapshotRequestId = ref<string>();
 const createOutcome = ref<CreateSnapshotResponse>();
 
@@ -50,6 +64,28 @@ const artifact = computed(() => artifactQuery.data.value?.data.artifact);
 const commitGraphEnabled = computed(() =>
   supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
 );
+const commitGraphQuery = useQuery({
+  queryKey: computed(() => [
+    'artifact-commits',
+    tenantId.value,
+    projectId.value,
+    artifactId.value,
+    'snapshot-create',
+  ]),
+  queryFn: () => queryArtifactCommitGraph(tenantId.value, projectId.value, artifactId.value),
+  enabled: computed(
+    () =>
+      commitGraphEnabled.value &&
+      Boolean(
+        tenantId.value && projectId.value && artifactId.value && artifact.value?.head_commit_id,
+      ),
+  ),
+});
+const selectedCommit = computed<CommitNode | undefined>(() =>
+  commitGraphQuery.data.value?.data.graph.nodes.find(
+    (commit) => commit.commit_id === selectedCommitId.value,
+  ),
+);
 watch(
   artifact,
   (value) => {
@@ -58,8 +94,139 @@ watch(
   { immediate: true },
 );
 
+async function queryAllTargetVolumes(): Promise<{
+  data: { items: StorageVolumeView[] };
+  requestId: string;
+}> {
+  const volumes: StorageVolumeView[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const result = await queryStorageVolumeList({
+      tenant_id: tenantId.value,
+      page_size: 100,
+      ...(cursor ? { cursor } : {}),
+    });
+    volumes.push(...result.data.items);
+    cursor = result.data.next_cursor;
+    if (cursor) {
+      if (seenCursors.has(cursor)) {
+        throw new Error('StorageVolume 分页游标重复，无法安全加载目标列表');
+      }
+      seenCursors.add(cursor);
+    }
+  } while (cursor);
+  return {
+    data: { items: volumes },
+    requestId: 'snapshot-target-volumes',
+  };
+}
+
+const storageVolumeQuery = useQuery({
+  queryKey: computed(() => ['snapshot-target-volumes', tenantId.value]),
+  queryFn: queryAllTargetVolumes,
+  enabled: computed(() => Boolean(tenantId.value)),
+});
+const targetVolumes = computed<StorageVolumeView[]>(
+  () =>
+    storageVolumeQuery.data.value?.data.items.filter(
+      (volume) => volume.state === 'ready' && volume.lifecycle.state === 'active',
+    ) ?? [],
+);
+const targetEdgeClusters = computed(() =>
+  [...new Set(targetVolumes.value.map((volume) => volume.edge_cluster_id))].sort((left, right) =>
+    left.localeCompare(right),
+  ),
+);
+const selectedEdgeClusterId = ref('');
+const targetClusterVolumes = computed(() =>
+  targetVolumes.value.filter((volume) => volume.edge_cluster_id === selectedEdgeClusterId.value),
+);
+const selectedStorageVolume = computed(() =>
+  targetClusterVolumes.value.find(
+    (volume) => volume.storage_volume_id === selectedStorageVolumeId.value,
+  ),
+);
+const deliveryModes = computed(() =>
+  (['fuse', 'copy', 'hardlink'] as const).filter((mode) => {
+    const volume = selectedStorageVolume.value;
+    return (
+      supportsSnapshotDeliveryMode(versionQuery.data.value?.data.capabilities, mode) &&
+      Boolean(volume?.allowed_delivery_modes.includes(mode)) &&
+      (mode !== 'hardlink' || volume?.hardlink_policy !== 'disabled') &&
+      (mode !== 'hardlink' || selectedCommit.value?.data_layout === 'whole_file')
+    );
+  }),
+);
+const deliveryModeLabels: Record<SnapshotDeliveryMode, string> = {
+  fuse: 'FUSE',
+  copy: '全部复制',
+  hardlink: '硬链接',
+};
+const deliveryModeOptions = computed(() =>
+  (['fuse', 'copy', 'hardlink'] as const).map((mode) => ({
+    label: deliveryModeLabels[mode],
+    value: mode,
+    disabled: !deliveryModes.value.includes(mode),
+  })),
+);
+watch(
+  targetVolumes,
+  (volumes) => {
+    const nextClusterId = volumes.some(
+      (volume) => volume.edge_cluster_id === selectedEdgeClusterId.value,
+    )
+      ? selectedEdgeClusterId.value
+      : (volumes[0]?.edge_cluster_id ?? '');
+    if (nextClusterId !== selectedEdgeClusterId.value) {
+      selectedEdgeClusterId.value = nextClusterId;
+    }
+    const clusterVolumes = volumes.filter((volume) => volume.edge_cluster_id === nextClusterId);
+    if (
+      !clusterVolumes.some((volume) => volume.storage_volume_id === selectedStorageVolumeId.value)
+    ) {
+      selectedStorageVolumeId.value = clusterVolumes[0]?.storage_volume_id ?? '';
+    }
+  },
+  { immediate: true },
+);
+watch(
+  selectedEdgeClusterId,
+  (edgeClusterId) => {
+    if (
+      !targetClusterVolumes.value.some(
+        (volume) => volume.storage_volume_id === selectedStorageVolumeId.value,
+      )
+    ) {
+      selectedStorageVolumeId.value =
+        targetVolumes.value.find((volume) => volume.edge_cluster_id === edgeClusterId)
+          ?.storage_volume_id ?? '';
+    }
+  },
+  { immediate: true },
+);
+watch(
+  deliveryModes,
+  (modes) => {
+    if (!modes.includes(selectedDeliveryMode.value)) {
+      selectedDeliveryMode.value = modes[0] ?? 'copy';
+    }
+  },
+  { immediate: true },
+);
+
 const createMutation = useMutation({ mutationFn: createSnapshot });
 const createdSnapshotId = computed(() => createOutcome.value?.snapshot.snapshot_id ?? '');
+
+async function retrySnapshotCreateQueries(): Promise<void> {
+  await Promise.all([
+    artifactQuery.refetch(),
+    commitGraphQuery.refetch(),
+    versionQuery.refetch(),
+    storageVolumeQuery.refetch(),
+  ]);
+}
+
 const snapshotQuery = useQuery({
   queryKey: computed(() => ['snapshot', tenantId.value, createdSnapshotId.value]),
   queryFn: async () => {
@@ -83,6 +250,9 @@ const snapshotQuery = useQuery({
 
 watch([tenantId, projectId, artifactId], () => {
   selectedCommitId.value = requestedCommitId.value;
+  selectedEdgeClusterId.value = '';
+  selectedStorageVolumeId.value = '';
+  selectedDeliveryMode.value = 'copy';
   snapshotRequestId.value = undefined;
   createOutcome.value = undefined;
   createMutation.reset();
@@ -94,6 +264,19 @@ async function createSnapshotNow(): Promise<void> {
     ElMessage.warning('请选择 Commit');
     return;
   }
+  if (!selectedEdgeClusterId.value) {
+    ElMessage.warning('请选择 EdgeCluster');
+    return;
+  }
+  const targetVolume = selectedStorageVolume.value;
+  if (!targetVolume || targetVolume.edge_cluster_id !== selectedEdgeClusterId.value) {
+    ElMessage.warning('请选择 Ready StorageVolume');
+    return;
+  }
+  if (!deliveryModes.value.includes(selectedDeliveryMode.value)) {
+    ElMessage.warning('当前 StorageVolume 不支持所选交付模式');
+    return;
+  }
 
   snapshotRequestId.value ??= `snapshot-request-${globalThis.crypto.randomUUID()}`;
   try {
@@ -102,6 +285,9 @@ async function createSnapshotNow(): Promise<void> {
       project_id: projectId.value,
       artifact_id: artifactId.value,
       commit_id: selectedCommitId.value,
+      target_edge_cluster_id: selectedEdgeClusterId.value,
+      target_storage_volume_id: targetVolume.storage_volume_id,
+      delivery_mode: selectedDeliveryMode.value,
       request_id: snapshotRequestId.value,
     });
     createOutcome.value = result.data;
@@ -151,10 +337,25 @@ async function openSnapshot(): Promise<void> {
           <DocumentCopy />
         </header>
         <ApiProblemAlert
-          v-if="artifactQuery.error.value || versionQuery.error.value"
-          :error="artifactQuery.error.value ?? versionQuery.error.value"
-          :retrying="artifactQuery.isFetching.value || versionQuery.isFetching.value"
-          @retry="artifactQuery.refetch"
+          v-if="
+            artifactQuery.error.value ||
+            versionQuery.error.value ||
+            commitGraphQuery.error.value ||
+            storageVolumeQuery.error.value
+          "
+          :error="
+            artifactQuery.error.value ??
+            versionQuery.error.value ??
+            commitGraphQuery.error.value ??
+            storageVolumeQuery.error.value
+          "
+          :retrying="
+            artifactQuery.isFetching.value ||
+            versionQuery.isFetching.value ||
+            commitGraphQuery.isFetching.value ||
+            storageVolumeQuery.isFetching.value
+          "
+          @retry="retrySnapshotCreateQueries"
         />
         <el-skeleton v-if="artifactQuery.isPending.value" :rows="5" animated />
         <template v-else-if="artifact">
@@ -183,6 +384,59 @@ async function openSnapshot(): Promise<void> {
               </dd>
             </div>
           </dl>
+          <div class="snapshot-target">
+            <div>
+              <label for="snapshot-target-cluster">目标 EdgeCluster</label>
+              <el-select
+                id="snapshot-target-cluster"
+                v-model="selectedEdgeClusterId"
+                filterable
+                placeholder="选择目标 EdgeCluster"
+                :loading="storageVolumeQuery.isPending.value"
+                :disabled="storageVolumeQuery.isPending.value"
+              >
+                <el-option
+                  v-for="edgeClusterId in targetEdgeClusters"
+                  :key="edgeClusterId"
+                  :label="edgeClusterId"
+                  :value="edgeClusterId"
+                />
+              </el-select>
+            </div>
+            <div>
+              <label for="snapshot-target-volume">目标 StorageVolume</label>
+              <el-select
+                id="snapshot-target-volume"
+                v-model="selectedStorageVolumeId"
+                filterable
+                placeholder="选择 Ready StorageVolume"
+                :loading="storageVolumeQuery.isPending.value"
+                :disabled="storageVolumeQuery.isPending.value || !selectedEdgeClusterId"
+              >
+                <el-option
+                  v-for="volume in targetClusterVolumes"
+                  :key="volume.storage_volume_id"
+                  :label="`${volume.display_name} · ${volume.region}`"
+                  :value="volume.storage_volume_id"
+                />
+              </el-select>
+            </div>
+            <div>
+              <label for="snapshot-delivery-mode">交付模式</label>
+              <el-segmented
+                id="snapshot-delivery-mode"
+                v-model="selectedDeliveryMode"
+                :options="deliveryModeOptions"
+              />
+            </div>
+            <small v-if="selectedStorageVolume">
+              已选择：<code>{{ selectedStorageVolume.edge_cluster_id }}</code> /
+              <code>{{ selectedStorageVolume.storage_volume_id }}</code>
+            </small>
+            <small v-else-if="!storageVolumeQuery.isPending.value" class="form-error">
+              当前没有可用的 Ready StorageVolume
+            </small>
+          </div>
           <el-alert
             v-if="!artifact.head_commit_id"
             title="空 Artifact 不能创建 Snapshot"
@@ -192,11 +446,17 @@ async function openSnapshot(): Promise<void> {
         </template>
       </section>
       <footer class="snapshot-actions">
-        <span>Snapshot 始终固定到选中的不可变 Commit</span>
+        <span>Snapshot 将绑定选中的 Commit、StorageVolume 和唯一 Delivery</span>
         <el-button
           type="primary"
           :loading="createMutation.isPending.value"
-          :disabled="!selectedCommitId"
+          :disabled="
+            !selectedCommitId ||
+            !selectedEdgeClusterId ||
+            !selectedStorageVolume ||
+            !deliveryModes.includes(selectedDeliveryMode) ||
+            storageVolumeQuery.isPending.value
+          "
           @click="createSnapshotNow"
         >
           创建 Snapshot
@@ -226,7 +486,7 @@ async function openSnapshot(): Promise<void> {
               )
             }}</small>
             <h2>Snapshot 已创建</h2>
-            <p>Snapshot 只保存逻辑 Commit 引用。请在详情页先复制到目标 Volume，再创建只读交付。</p>
+            <p>Snapshot 已绑定一个目标 Volume 和唯一只读交付；交付完成后才会进入 Ready。</p>
           </div>
         </div>
         <el-alert
@@ -242,6 +502,22 @@ async function openSnapshot(): Promise<void> {
             <dd>
               <code>{{ createOutcome.snapshot.snapshot_id }}</code>
             </dd>
+          </div>
+          <div>
+            <dt>Delivery</dt>
+            <dd>
+              <code>{{ createOutcome.snapshot.delivery_id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>目标 Volume</dt>
+            <dd>
+              <code>{{ createOutcome.snapshot.storage_volume_id }}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>交付模式</dt>
+            <dd>{{ deliveryModeLabels[createOutcome.snapshot.delivery_mode] }}</dd>
           </div>
           <div>
             <dt>状态</dt>
@@ -295,7 +571,7 @@ async function openSnapshot(): Promise<void> {
         <span v-if="snapshotQuery.data.value?.data.snapshot.state === 'creating'"
           >页面会持续刷新 Snapshot 状态</span
         >
-        <span v-else>下一步在详情页处理 Replicate 和 Delivery</span>
+        <span v-else>详情页可查看唯一 Delivery 的物化进度</span>
         <el-button type="primary" @click="openSnapshot">查看 Snapshot</el-button>
       </footer>
     </template>

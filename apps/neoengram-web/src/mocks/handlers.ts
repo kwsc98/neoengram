@@ -12,17 +12,12 @@ import type {
   CommitPlaygroundResponse,
   CommitDiffEntry,
   CommitNode,
-  CreateAddJobRequest,
-  CreateAddJobResponse,
   CreateArtifactRequest,
   CreateArtifactResponse,
-  CreateCommitReplicationResponse,
   CreatePlaygroundRequest,
   CreatePlaygroundResponse,
   CreateProjectRequest,
   CreateProjectResponse,
-  CreateSnapshotDeliveryRequest,
-  CreateSnapshotDeliveryResponse,
   CreateSnapshotRequest,
   CreateSnapshotResponse,
   CreateStorageEnrollmentTokenRequest,
@@ -33,21 +28,11 @@ import type {
   CreateTenantResponse,
   CreateCommitMaterializationRequest,
   CreateCommitMaterializationResponse,
-  QueryCommitMaterializationRequest,
-  QueryCommitMaterializationResponse,
-  QueryCommitMaterializationListRequest,
-  QueryCommitMaterializationListResponse,
-  RetryCommitMaterializationRequest,
-  RetryCommitMaterializationResponse,
-  CancelCommitMaterializationRequest,
-  CancelCommitMaterializationResponse,
   QueryCommitCoverageRequest,
   MaterializationView,
   VolumeCommitCoverageView,
   QueryCommitAvailabilityV2Request,
   QueryCommitAvailabilityV2Response,
-  FinalizeAddJobResponse,
-  JobView,
   DeleteSnapshotDeliveryRequest,
   DeleteSnapshotDeliveryResponse,
   PreCommitView,
@@ -143,7 +128,14 @@ import type {
   QueryTenantListRequest,
   QueryTenantListResponse,
   QueryTenantResponse,
-  QueryJobResponse,
+  CancelTaskRequest,
+  QueryTaskEventListRequest,
+  QueryTaskListRequest,
+  QueryTaskRequest,
+  RetryTaskRequest,
+  TaskAttemptView,
+  TaskEventView,
+  TaskView,
   StorageEnrollmentView,
   StorageVolumeView,
   TenantView,
@@ -166,14 +158,6 @@ import {
 } from './data';
 import { resolveMockS3Path } from './s3-files';
 
-interface StoredJob {
-  request: CreateAddJobRequest;
-  requestJson: string;
-  job: JobView;
-  queryCount: number;
-  finalizedAt?: string;
-}
-
 interface PageRequest {
   cursor?: string;
   page_size?: number;
@@ -182,6 +166,24 @@ interface PageRequest {
 interface PageResult<T> {
   items: T[];
   next_cursor?: string;
+}
+
+/** Internal fixture record. Public callers use TaskView and MaterializationView. */
+interface MockMaterializationRecord {
+  materialization_id: string;
+  tenant_id: string;
+  artifact_id?: string;
+  commit_id: string;
+  target_storage_volume_id: string;
+  attempt: string;
+  state: MaterializationView['state'];
+  object_set_digest: string;
+  verified_objects: string;
+  total_objects: string;
+  verified_bytes: string;
+  total_bytes: string;
+  source_storage_volume_id?: string;
+  issue?: NonNullable<MaterializationView['issue']>;
 }
 
 type StorageEnrollmentPermission =
@@ -209,7 +211,6 @@ interface PvcOwner {
   identityFingerprint: string;
 }
 
-const jobs = new Map<string, StoredJob>();
 const tenantCreatePayloads = new Map<string, string>();
 const projectCreatePayloads = new Map<string, string>();
 const storageVolumeCreatePayloads = new Map<string, string>();
@@ -246,10 +247,6 @@ const snapshotCreateRequests = new Map<
   { requestJson: string; response: CreateSnapshotResponse }
 >();
 const snapshotDeliveries: SnapshotDeliveryView[] = [];
-const snapshotDeliveryCreateRequests = new Map<
-  string,
-  { requestJson: string; response: CreateSnapshotDeliveryResponse }
->();
 const snapshotRetryRequests = new Map<
   string,
   { requestJson: string; response: RetrySnapshotDeliveryResponse }
@@ -259,22 +256,16 @@ const snapshotDeliveryDeleteRequests = new Map<
   { requestJson: string; response: DeleteSnapshotDeliveryResponse }
 >();
 const snapshotQueryCounts = new Map<string, number>();
-const commitReplications = new Map<string, CreateCommitReplicationResponse['replication']>();
-const commitReplicationQueryCounts = new Map<string, number>();
-const commitReplicationRetryMutations = new Map<
-  string,
-  {
-    tenant_id: string;
-    object_namespace_id: string;
-    replication_id: string;
-    expected_attempt: string;
-    response: RetryCommitMaterializationResponse;
-  }
->();
-const commitReplicationRequests = new Map<
+const commitMaterializations = new Map<string, MockMaterializationRecord>();
+const commitMaterializationQueryCounts = new Map<string, number>();
+const commitMaterializationRequests = new Map<
   string,
   { requestJson: string; response: CreateCommitMaterializationResponse }
 >();
+const operationTasks = new Map<string, TaskView>();
+const taskAttempts = new Map<string, TaskAttemptView[]>();
+const taskEvents = new Map<string, TaskEventView[]>();
+const taskQueryCounts = new Map<string, number>();
 const s3AccessPointCreateRequests = new Map<
   string,
   { requestJson: string; response: CreateS3AccessPointResponse }
@@ -290,52 +281,45 @@ const retentionHolds: RetentionHoldView[] = [];
 
 const READY_AFTER_QUERY_COUNT = 2;
 
-const commitReplicationProgression = [
+const commitMaterializationProgression = [
   'planning',
-  'transferring',
+  'materializing',
   'verifying',
-  'published',
+  'complete',
 ] as const;
 
-function advanceCommitReplication(
+function advanceCommitMaterialization(
   key: string,
-  replication: CreateCommitReplicationResponse['replication'],
-): CreateCommitReplicationResponse['replication'] {
-  if (!['queued', 'planning', 'transferring', 'verifying'].includes(replication.state)) {
-    return replication;
+  materialization: MockMaterializationRecord,
+): MockMaterializationRecord {
+  if (!['queued', 'planning', 'materializing', 'verifying'].includes(materialization.state)) {
+    return materialization;
   }
-  const queryCount = commitReplicationQueryCounts.get(key) ?? 0;
-  const state = commitReplicationProgression[Math.min(queryCount, 3)]!;
-  const objectsComplete = state === 'verifying' || state === 'published';
+  const queryCount = commitMaterializationQueryCounts.get(key) ?? 0;
+  const state = commitMaterializationProgression[Math.min(queryCount, 3)]!;
+  const objectsComplete = state === 'verifying' || state === 'complete';
   const next = {
-    ...replication,
+    ...materialization,
     state,
-    completed_objects: objectsComplete ? replication.total_objects : replication.completed_objects,
-    completed_bytes: objectsComplete ? replication.total_bytes : replication.completed_bytes,
+    verified_objects: objectsComplete
+      ? materialization.total_objects
+      : materialization.verified_objects,
+    verified_bytes: objectsComplete ? materialization.total_bytes : materialization.verified_bytes,
   };
-  commitReplications.set(key, next);
-  if (state === 'published') commitReplicationQueryCounts.delete(key);
-  else commitReplicationQueryCounts.set(key, queryCount + 1);
+  commitMaterializations.set(key, next);
+  updateTaskForMaterialization(next);
+  if (state === 'complete') commitMaterializationQueryCounts.delete(key);
+  else commitMaterializationQueryCounts.set(key, queryCount + 1);
   return next;
 }
 
-function toMaterializationView(
-  value: CreateCommitReplicationResponse['replication'],
-): MaterializationView {
+function toMaterializationView(value: MockMaterializationRecord): MaterializationView {
   const objectNamespaceId = value.artifact_id;
   if (!objectNamespaceId) {
     throw new Error('v2 materialization state is missing object_namespace_id/artifact_id');
   }
-  const state: MaterializationView['state'] =
-    value.state === 'transferring'
-      ? 'materializing'
-      : value.state === 'published'
-        ? 'complete'
-        : value.state === 'planning'
-          ? 'planning'
-          : value.state;
   const result: MaterializationView = {
-    materialization_id: value.replication_id,
+    materialization_id: value.materialization_id,
     tenant_id: value.tenant_id,
     ...(value.artifact_id ? { artifact_id: value.artifact_id } : {}),
     object_namespace_id: objectNamespaceId,
@@ -343,27 +327,157 @@ function toMaterializationView(
     target_storage_volume_id: value.target_storage_volume_id,
     plan_revision: value.attempt,
     coverage_goal: 'complete',
-    state,
+    state: value.state,
     object_set_digest: value.object_set_digest,
-    verified_objects: value.completed_objects,
+    verified_objects: value.verified_objects,
     total_objects: value.total_objects,
-    verified_bytes: value.completed_bytes,
+    verified_bytes: value.verified_bytes,
     total_bytes: value.total_bytes,
     missing_objects: String(
-      Math.max(0, Number(value.total_objects) - Number(value.completed_objects)),
+      Math.max(0, Number(value.total_objects) - Number(value.verified_objects)),
     ),
-    missing_bytes: String(Math.max(0, Number(value.total_bytes) - Number(value.completed_bytes))),
+    missing_bytes: String(Math.max(0, Number(value.total_bytes) - Number(value.verified_bytes))),
     source_count: value.source_storage_volume_id ? '1' : '0',
   };
   if (value.issue) result.issue = value.issue;
-  // Keep route hints for the local compatibility adapter used by existing Web pages. These are
-  // deliberately not part of the public v2 response contract and are stripped by the API client
-  // adapter before exposing the legacy page model.
-  Object.assign(result, {
-    target_edge_cluster_id: value.target_edge_cluster_id,
-    target_gateway_pool_id: value.target_gateway_pool_id,
-  });
   return result;
+}
+
+function taskKey(tenantId: string, taskId: string): string {
+  return resourceKey(tenantId, taskId);
+}
+
+function taskStateForMaterialization(state: MaterializationView['state']): TaskView['state'] {
+  switch (state) {
+    case 'queued':
+      return 'queued';
+    case 'verifying':
+      return 'verifying';
+    case 'complete':
+      return 'succeeded';
+    case 'failed':
+      return 'failed';
+    case 'cancelled':
+      return 'cancelled';
+    case 'waiting_for_sources':
+      return 'waiting';
+    case 'planning':
+    case 'materializing':
+    case 'stalled':
+      return state === 'stalled' ? 'stalled' : 'running';
+  }
+}
+
+function taskFromMaterialization(value: MockMaterializationRecord, requestId: string): TaskView {
+  const materialization = toMaterializationView(value);
+  const state = taskStateForMaterialization(materialization.state);
+  return {
+    task_id: materialization.materialization_id,
+    task_kind: 'commit.materialize',
+    state,
+    phase: materialization.state,
+    tenant_id: materialization.tenant_id,
+    ...(materialization.artifact_id ? { artifact_id: materialization.artifact_id } : {}),
+    object_namespace_id: materialization.object_namespace_id,
+    commit_id: materialization.commit_id,
+    storage_volume_id: materialization.target_storage_volume_id,
+    request_id: requestId,
+    request_digest: materialization.object_set_digest,
+    actor: 'mock-central',
+    attempt: materialization.plan_revision,
+    progress: {
+      completed: materialization.verified_objects,
+      total: materialization.total_objects,
+      completed_bytes: materialization.verified_bytes,
+      total_bytes: materialization.total_bytes,
+    },
+    detail_kind: 'materialization',
+    detail_id: materialization.materialization_id,
+    deadline_unix_ms: String(Date.now() + 60 * 60 * 1000),
+    ...(materialization.issue
+      ? {
+          issue: {
+            code: materialization.issue.code,
+            message: materialization.issue.message,
+            retryable: materialization.issue.retryable,
+          },
+        }
+      : {}),
+    created_at_unix_ms: String(Date.now()),
+    updated_at_unix_ms: String(Date.now()),
+    resource_version: '1',
+    origin: 'user',
+    executable: true,
+  };
+}
+
+function appendTaskEvent(
+  task: TaskView,
+  kind: string,
+  actor: string,
+  fromState?: TaskView['state'],
+  message?: string,
+): void {
+  const key = taskKey(task.tenant_id, task.task_id);
+  const events = taskEvents.get(key) ?? [];
+  const event: TaskEventView = {
+    event_id: `${task.task_id}-event-${events.length + 1}`,
+    task_id: task.task_id,
+    sequence: String(events.length + 1),
+    attempt: task.attempt,
+    kind,
+    state: task.state,
+    ...(fromState === undefined ? {} : { from_state: fromState, to_state: task.state }),
+    actor,
+    ...(message ? { message } : {}),
+    occurred_at_unix_ms: task.updated_at_unix_ms,
+    resource_version: task.resource_version,
+  };
+  events.push(event);
+  taskEvents.set(key, events);
+}
+
+function storeMaterializationTask(
+  materialization: MockMaterializationRecord,
+  requestId: string,
+): TaskView {
+  const key = taskKey(materialization.tenant_id, materialization.materialization_id);
+  const previous = operationTasks.get(key);
+  const next = taskFromMaterialization(materialization, previous?.request_id ?? requestId);
+  if (previous) {
+    next.created_at_unix_ms = previous.created_at_unix_ms;
+    next.resource_version = (BigInt(previous.resource_version) + 1n).toString();
+    const oldState = previous.state;
+    next.updated_at_unix_ms = String(Date.now());
+    operationTasks.set(key, next);
+    if (oldState !== next.state)
+      appendTaskEvent(next, 'state_changed', 'mock-materializer', oldState);
+    return next;
+  }
+  operationTasks.set(key, next);
+  taskAttempts.set(key, [
+    {
+      attempt_id: `${next.task_id}-attempt-${next.attempt}`,
+      task_id: next.task_id,
+      attempt: next.attempt,
+      state: next.state,
+      phase: next.phase,
+      created_at_unix_ms: next.created_at_unix_ms,
+      updated_at_unix_ms: next.updated_at_unix_ms,
+      resource_version: '1',
+    },
+  ]);
+  appendTaskEvent(next, 'created', 'mock-central');
+  return next;
+}
+
+function updateTaskForMaterialization(
+  materialization: MockMaterializationRecord,
+): TaskView | undefined {
+  const key = taskKey(materialization.tenant_id, materialization.materialization_id);
+  const current = operationTasks.get(key);
+  if (!current) return undefined;
+  return storeMaterializationTask(materialization, current.request_id);
 }
 
 function completesOnThisQuery(queryCounts: Map<string, number>, key: string): boolean {
@@ -1017,34 +1131,73 @@ function resolveSnapshotDelivery(
   return snapshot ? { delivery, snapshot } : undefined;
 }
 
+function boundSnapshotDelivery(
+  snapshot: (typeof snapshots)[number],
+): SnapshotDeliveryView | undefined {
+  return snapshotDeliveries.find(
+    (delivery) =>
+      delivery.snapshot_id === snapshot.snapshot_id &&
+      delivery.delivery_id === snapshot.delivery_id,
+  );
+}
+
+function requireReadySnapshotDelivery(
+  request: Request,
+  snapshot: (typeof snapshots)[number],
+): HttpResponse<ProblemDetails> | undefined {
+  if (snapshot.state !== 'ready') {
+    return mutationConflict(request, 'SNAPSHOT_UNAVAILABLE', 'Snapshot is not Ready');
+  }
+  const delivery = boundSnapshotDelivery(snapshot);
+  if (
+    !delivery ||
+    delivery.snapshot_id !== snapshot.snapshot_id ||
+    delivery.commit_id !== snapshot.commit_id ||
+    delivery.storage_volume_id !== snapshot.storage_volume_id ||
+    delivery.mode !== snapshot.delivery_mode ||
+    delivery.state !== 'ready'
+  ) {
+    return mutationConflict(
+      request,
+      'SNAPSHOT_UNAVAILABLE',
+      'The Snapshot has no Ready bound Delivery',
+    );
+  }
+  return undefined;
+}
+
 function seedSnapshotDeliveryState(): void {
   snapshotDeliveries.splice(0, snapshotDeliveries.length);
-  const snapshot = snapshots.find(
-    (item) => item.tenant_id === 'tenant-a' && item.snapshot_id === 'snap-road-main3-sha-01',
-  );
-  if (!snapshot) return;
-  snapshotDeliveries.push({
-    delivery_id: 'delivery-snapshot-main3-01',
-    snapshot_id: snapshot.snapshot_id,
-    commit_id: snapshot.commit_id,
-    storage_volume_id: 'volume-shanghai-vision',
-    mode: 'copy',
-    target_relative_root: `snapshots/${snapshot.project_id}/${snapshot.artifact_id}/${snapshot.snapshot_id}/deliveries/delivery-snapshot-main3-01`,
-    state: 'failed',
-    source_index_digest: snapshot.commit_id,
-    delivery_generation: '1',
-    file_count: snapshot.logical_file_count,
-    size_bytes: snapshot.logical_size_bytes,
-    object_set_digest: snapshot.commit_id,
-    resource_version: '1',
-    issue: {
-      code: 'COPY_INSUFFICIENT_SPACE',
-      message: 'The target Volume does not have enough reserved space',
-      retryable: true,
-    },
-    created_at_unix_ms: snapshot.created_at_unix_ms,
-    updated_at_unix_ms: snapshot.updated_at_unix_ms,
-  });
+  for (const snapshot of snapshots) {
+    if (snapshot.tenant_id !== 'tenant-a') continue;
+    const failed = snapshot.snapshot_id === 'snap-road-main2-sha-01';
+    snapshotDeliveries.push({
+      delivery_id: snapshot.delivery_id,
+      snapshot_id: snapshot.snapshot_id,
+      commit_id: snapshot.commit_id,
+      storage_volume_id: snapshot.storage_volume_id,
+      mode: snapshot.delivery_mode,
+      target_relative_root: `snapshots/${snapshot.project_id}/${snapshot.artifact_id}/${snapshot.snapshot_id}/deliveries/${snapshot.delivery_id}`,
+      state: failed ? 'failed' : snapshot.state === 'ready' ? 'ready' : 'materializing',
+      source_index_digest: snapshot.commit_id,
+      delivery_generation: '1',
+      file_count: snapshot.logical_file_count,
+      size_bytes: snapshot.logical_size_bytes,
+      object_set_digest: snapshot.commit_id,
+      resource_version: '1',
+      ...(failed
+        ? {
+            issue: {
+              code: 'COPY_INSUFFICIENT_SPACE',
+              message: 'The target Volume does not have enough reserved space',
+              retryable: true,
+            },
+          }
+        : {}),
+      created_at_unix_ms: snapshot.created_at_unix_ms,
+      updated_at_unix_ms: snapshot.updated_at_unix_ms,
+    });
+  }
 }
 
 function seedPreCommitState(): void {
@@ -1122,7 +1275,12 @@ function resolveS3AccessPoint(
   const accessPoint = s3AccessPoints.find(
     (item) => item.tenant_id === tenantId && item.access_point_id === accessPointId,
   );
-  return accessPoint ?? s3NotFound(request, 'access point');
+  if (!accessPoint) return s3NotFound(request, 'access point');
+  const snapshot = snapshots.find(
+    (item) => item.tenant_id === tenantId && item.snapshot_id === accessPoint.snapshot_id,
+  );
+  if (!snapshot) return s3NotFound(request, 'snapshot');
+  return requireReadySnapshotDelivery(request, snapshot) ?? accessPoint;
 }
 
 function s3ObjectEntries(
@@ -1149,74 +1307,6 @@ function s3ObjectEntries(
     values.push({ key, entry_type: 'prefix' });
   }
   return values.sort((left, right) => left.key.localeCompare(right.key));
-}
-
-function validateCreate(
-  request: Request,
-  body: CreateAddJobRequest,
-): HttpResponse<ProblemDetails> | null {
-  const failed = unavailable(request, body.tenant_id);
-  if (failed) return failed;
-  if (!body.all && body.paths.length === 0) {
-    return problem(
-      request,
-      422,
-      'PROTOCOL_INVALID',
-      'Request validation failed',
-      'paths must be non-empty unless all is true',
-      {
-        retryable: false,
-        violations: [{ field: 'paths', reason: 'must be non-empty unless all is true' }],
-      },
-    );
-  }
-  if (body.project_id === 'project-invalid') {
-    return problem(
-      request,
-      422,
-      'PROTOCOL_INVALID',
-      'Request validation failed',
-      'project_id is reserved by the mock validation scenario',
-      {
-        retryable: false,
-        violations: [{ field: 'project_id', reason: 'mock validation rejection' }],
-      },
-    );
-  }
-  if (BigInt(body.deadline_unix_ms) <= BigInt(Date.now())) {
-    return problem(
-      request,
-      408,
-      'JOB_DEADLINE_EXCEEDED',
-      'Job deadline exceeded',
-      'The managed Add deadline has elapsed',
-    );
-  }
-  return null;
-}
-
-function advance(stored: StoredJob): void {
-  if (stored.job.state === 'succeeded') return;
-  stored.queryCount += 1;
-  if (stored.queryCount === 1) {
-    stored.job.state = 'running';
-    stored.job.resource_version = '4';
-    stored.job.progress = {
-      state: 'running',
-      phase: 'hashing',
-      files_completed: '320',
-      bytes_completed: '4294967296',
-    };
-  } else if (stored.queryCount >= 2) {
-    stored.job.state = 'prepared';
-    stored.job.resource_version = '6';
-    stored.job.progress = {
-      state: 'prepared',
-      phase: 'metadata_ready',
-      files_completed: '864',
-      bytes_completed: '12884901888',
-    };
-  }
 }
 
 function mockCommitChanges(target: CommitNode, base?: CommitNode): CommitDiffEntry[] {
@@ -1366,6 +1456,19 @@ export const handlers = [
   // accidentally turn into a Fusen service invocation.
   http.get('*/road-scenes-snapshot/*', ({ request }) => {
     const resolved = resolveMockS3Path(new URL(request.url).pathname);
+    if (resolved) {
+      const accessPoint = s3AccessPoints.find((item) => item.bucket_name === resolved.bucketName);
+      if (accessPoint) {
+        const snapshot = snapshots.find(
+          (item) =>
+            item.tenant_id === accessPoint.tenant_id &&
+            item.snapshot_id === accessPoint.snapshot_id,
+        );
+        if (!snapshot) return s3NotFound(request, 'snapshot');
+        const unavailable = requireReadySnapshotDelivery(request, snapshot);
+        if (unavailable) return unavailable;
+      }
+    }
     if (!resolved) {
       return new HttpResponse(
         '<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>',
@@ -1399,6 +1502,19 @@ export const handlers = [
   }),
   http.head('*/road-scenes-snapshot/*', ({ request }) => {
     const resolved = resolveMockS3Path(new URL(request.url).pathname);
+    if (resolved) {
+      const accessPoint = s3AccessPoints.find((item) => item.bucket_name === resolved.bucketName);
+      if (accessPoint) {
+        const snapshot = snapshots.find(
+          (item) =>
+            item.tenant_id === accessPoint.tenant_id &&
+            item.snapshot_id === accessPoint.snapshot_id,
+        );
+        if (!snapshot) return s3NotFound(request, 'snapshot');
+        const unavailable = requireReadySnapshotDelivery(request, snapshot);
+        if (unavailable) return unavailable;
+      }
+    }
     if (!resolved?.file) {
       return new HttpResponse(null, { status: 404 });
     }
@@ -1424,11 +1540,10 @@ export const handlers = [
           'artifact_catalog',
           'artifact_commit_graph',
           'artifact_commit_diff',
-          'artifact_commit_replication',
+          'commit_materialization_v2',
           'playground_browser',
           'playground_materialize',
           'playground_precommit',
-          'snapshot_materialize',
           'commit_layout_selection_v2',
           'snapshot_delivery_fuse_v2',
           'snapshot_delivery_copy_v2',
@@ -1546,7 +1661,7 @@ export const handlers = [
         'project.create',
         'playground.create',
         'snapshot.create',
-        'job.create',
+        'task.manage',
         'resource.lifecycle.read',
         'resource.lifecycle.manage',
         'retention.manage',
@@ -3298,8 +3413,17 @@ export const handlers = [
     );
     if (!snapshot) return notFound(request, 'Snapshot');
     const snapshotKey = resourceKey(snapshot.tenant_id, snapshot.snapshot_id);
-    if (snapshot.state === 'creating' && completesOnThisQuery(snapshotQueryCounts, snapshotKey)) {
+    const delivery = boundSnapshotDelivery(snapshot);
+    if (
+      snapshot.state === 'creating' &&
+      delivery &&
+      ['requested', 'validating', 'materializing'].includes(delivery.state) &&
+      completesOnThisQuery(snapshotQueryCounts, snapshotKey)
+    ) {
       snapshot.state = 'ready';
+      delivery.state = 'ready';
+      delivery.resource_version = (BigInt(delivery.resource_version) + 1n).toString();
+      delivery.updated_at_unix_ms = Date.now().toString();
       snapshot.integrity = {
         state: 'verified',
         files_verified: snapshot.logical_file_count,
@@ -3332,22 +3456,49 @@ export const handlers = [
       response.replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
-    const existing = snapshots.find(
+    if (!body.target_edge_cluster_id || !body.target_storage_volume_id || !body.delivery_mode) {
+      return problem(
+        request,
+        422,
+        'PROTOCOL_INVALID',
+        'Request validation failed',
+        'target_edge_cluster_id, target_storage_volume_id and delivery_mode are required',
+      );
+    }
+    const targetVolume = storageVolumes.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
-        item.project_id === body.project_id &&
-        item.artifact_id === body.artifact_id &&
-        item.commit_id === body.commit_id,
+        item.storage_volume_id === body.target_storage_volume_id,
     );
-    if (existing) {
-      const response: CreateSnapshotResponse = {
-        snapshot: existing,
-        replayed: false,
-      };
-      snapshotCreateRequests.set(requestKey, { requestJson, response: structuredClone(response) });
-      return HttpResponse.json(response, { headers: headers(request) });
+    if (!targetVolume) return notFound(request, 'StorageVolume');
+    if (targetVolume.state !== 'ready' || targetVolume.lifecycle.state !== 'active') {
+      return mutationConflict(
+        request,
+        'STORAGE_VOLUME_NOT_READY',
+        'Snapshot targets require a Ready StorageVolume',
+      );
     }
-
+    if (targetVolume.edge_cluster_id !== body.target_edge_cluster_id) {
+      return mutationConflict(
+        request,
+        'STORAGE_VOLUME_EDGE_CLUSTER_MISMATCH',
+        'The target StorageVolume does not belong to the requested EdgeCluster',
+      );
+    }
+    if (!targetVolume.allowed_delivery_modes.includes(body.delivery_mode)) {
+      return mutationConflict(
+        request,
+        'DELIVERY_MODE_NOT_ALLOWED',
+        'The StorageVolume policy does not allow this delivery mode',
+      );
+    }
+    if (body.delivery_mode === 'hardlink' && targetVolume.hardlink_policy === 'disabled') {
+      return mutationConflict(
+        request,
+        'HARDLINK_UNSAFE_VOLUME',
+        'Hardlink delivery requires a sealed or trusted-local Volume policy',
+      );
+    }
     const graph = commitGraphs.get(resourceKey(body.tenant_id, body.project_id, body.artifact_id));
     const commit = graph?.nodes.find((node) => node.commit_id === body.commit_id);
     if (!commit) {
@@ -3359,6 +3510,9 @@ export const handlers = [
         'The requested Commit was not found',
       );
     }
+    // A Commit can be materialized into multiple independently targeted Snapshots.
+    // Keep IDs unique even when two requests arrive during the same millisecond.
+    const idSuffix = `${Date.now().toString(36)}-${(snapshotCreateRequests.size + 1).toString(36)}`;
     const sameCommitSnapshot = snapshots.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
@@ -3367,21 +3521,24 @@ export const handlers = [
         item.commit_id === body.commit_id,
     );
     const snapshot = {
-      snapshot_id: `snap-${body.artifact_id}-${Date.now().toString(36)}`,
+      snapshot_id: `snap-${body.artifact_id}-${idSuffix}`,
       tenant_id: body.tenant_id,
       project_id: body.project_id,
       artifact_id: body.artifact_id,
       commit_id: commit.commit_id,
+      delivery_id: `delivery-${body.artifact_id}-${idSuffix}`,
+      storage_volume_id: targetVolume.storage_volume_id,
+      edge_cluster_id: targetVolume.edge_cluster_id,
+      delivery_mode: body.delivery_mode,
       data_layout: commit.data_layout,
       message: commit.message,
       tag_names: [...commit.tag_names],
-      state: 'ready' as const,
-      data_health: 'available' as const,
+      state: 'creating' as const,
+      data_health: 'unavailable' as const,
       integrity: {
-        state: 'verified' as const,
-        files_verified: sameCommitSnapshot?.logical_file_count ?? '864',
-        bytes_verified: sameCommitSnapshot?.logical_size_bytes ?? '12884901888',
-        verified_at_unix_ms: Date.now().toString(),
+        state: 'pending' as const,
+        files_verified: '0',
+        bytes_verified: '0',
       },
       resource_version: '1',
       lifecycle: activeLifecycle(),
@@ -3391,6 +3548,23 @@ export const handlers = [
       updated_at_unix_ms: Date.now().toString(),
     };
     snapshots.unshift(snapshot);
+    snapshotDeliveries.unshift({
+      delivery_id: snapshot.delivery_id,
+      snapshot_id: snapshot.snapshot_id,
+      commit_id: snapshot.commit_id,
+      storage_volume_id: snapshot.storage_volume_id,
+      mode: snapshot.delivery_mode,
+      target_relative_root: `snapshots/${snapshot.project_id}/${snapshot.artifact_id}/${snapshot.snapshot_id}/deliveries/${snapshot.delivery_id}`,
+      state: 'requested',
+      source_index_digest: snapshot.commit_id,
+      delivery_generation: '1',
+      file_count: snapshot.logical_file_count,
+      size_bytes: snapshot.logical_size_bytes,
+      object_set_digest: snapshot.commit_id,
+      resource_version: '1',
+      created_at_unix_ms: snapshot.created_at_unix_ms,
+      updated_at_unix_ms: snapshot.updated_at_unix_ms,
+    });
     snapshotQueryCounts.set(resourceKey(snapshot.tenant_id, snapshot.snapshot_id), 0);
     const response: CreateSnapshotResponse = {
       snapshot,
@@ -3407,13 +3581,13 @@ export const handlers = [
     if (failed) return failed;
     const requestKey = resourceKey(body.tenant_id, body.request_id);
     const requestJson = stableJson(body);
-    const prior = commitReplicationRequests.get(requestKey);
+    const prior = commitMaterializationRequests.get(requestKey);
     if (prior) {
       if (prior.requestJson !== requestJson) {
         return mutationConflict(
           request,
-          'REPLICATION_REQUEST_ID_REUSED',
-          'The replication request ID is already bound to another request',
+          'MATERIALIZATION_REQUEST_ID_REUSED',
+          'The materialization request ID is already bound to another request',
         );
       }
       const response = structuredClone(prior.response);
@@ -3459,7 +3633,7 @@ export const handlers = [
       return mutationConflict(
         request,
         'STORAGE_VOLUME_NOT_READY',
-        'Replication targets require a Ready StorageVolume',
+        'Materialization targets require a Ready StorageVolume',
       );
     }
     const gatewayPool = gatewayPools.find(
@@ -3469,30 +3643,30 @@ export const handlers = [
       return mutationConflict(
         request,
         'TRANSFER_ROUTE_UNAVAILABLE',
-        'Replication targets require a Ready GatewayPool route',
+        'Materialization targets require a Ready GatewayPool route',
       );
     }
-    const existingPlacement = [...commitReplications.values()].find(
+    const existingPlacement = [...commitMaterializations.values()].find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.artifact_id === body.object_namespace_id &&
         item.commit_id === body.commit_id &&
         item.target_storage_volume_id === body.target_storage_volume_id &&
-        item.state === 'published',
+        item.state === 'complete',
     );
     if (existingPlacement) {
       return mutationConflict(
         request,
         'TARGET_COMMIT_PLACEMENT_EXISTS',
-        'The target StorageVolume already contains a published Commit PlacementSet',
+        'The target StorageVolume already has complete Commit coverage',
       );
     }
     const snapshot = snapshots.find(
       (item) => item.tenant_id === body.tenant_id && item.commit_id === body.commit_id,
     );
-    const replicationId = `replication-${fingerprint(body).slice(0, 24)}`;
-    const replication = {
-      replication_id: replicationId,
+    const materializationId = `materialization-${fingerprint(body).slice(0, 24)}`;
+    const materialization = {
+      materialization_id: materializationId,
       tenant_id: body.tenant_id,
       artifact_id: body.artifact_id,
       commit_id: body.commit_id,
@@ -3500,56 +3674,24 @@ export const handlers = [
       attempt: '1',
       state: 'queued' as const,
       object_set_digest: body.commit_id,
-      completed_objects: '0',
+      verified_objects: '0',
       total_objects: snapshot?.logical_file_count ?? '1',
-      target_edge_cluster_id: volume.edge_cluster_id,
-      target_gateway_pool_id: gatewayPool.gateway_pool_id,
-      completed_bytes: '0',
+      verified_bytes: '0',
       total_bytes: snapshot?.logical_size_bytes ?? '0',
     };
+    const task = storeMaterializationTask(materialization, body.request_id);
     const response: CreateCommitMaterializationResponse = {
-      materialization: toMaterializationView(replication),
+      materialization: toMaterializationView(materialization),
+      task,
       replayed: false,
     };
-    const replicationKey = resourceKey(body.tenant_id, replicationId);
-    commitReplications.set(replicationKey, replication);
-    commitReplicationQueryCounts.set(replicationKey, 0);
-    commitReplicationRequests.set(requestKey, { requestJson, response: structuredClone(response) });
-    return HttpResponse.json(response, { headers: headers(request) });
-  }),
-  http.post('*/api/commit/materialization/query', async ({ request }) => {
-    const denied = authorize(request);
-    if (denied) return denied;
-    const body = (await request.json()) as QueryCommitMaterializationRequest;
-    const failed = requireTenant(request, body.tenant_id);
-    if (failed) return failed;
-    const key = resourceKey(body.tenant_id, body.materialization_id);
-    const replication = commitReplications.get(key);
-    if (!replication) return notFound(request, 'Materialization');
-    if (replication.artifact_id !== body.object_namespace_id) {
-      return notFound(request, 'Materialization');
-    }
-    const response: QueryCommitMaterializationResponse = {
-      materialization: toMaterializationView(advanceCommitReplication(key, replication)),
-    };
-    return HttpResponse.json(response, { headers: headers(request) });
-  }),
-  http.post('*/api/commit/materialization/list/query', async ({ request }) => {
-    const denied = authorize(request);
-    if (denied) return denied;
-    const body = (await request.json()) as QueryCommitMaterializationListRequest;
-    const failed = requireTenant(request, body.tenant_id);
-    if (failed) return failed;
-    const response: QueryCommitMaterializationListResponse = {
-      materializations: [...commitReplications.entries()]
-        .filter(
-          ([, item]) =>
-            item.tenant_id === body.tenant_id &&
-            item.commit_id === body.commit_id &&
-            item.artifact_id === body.object_namespace_id,
-        )
-        .map(([key, item]) => toMaterializationView(advanceCommitReplication(key, item))),
-    };
+    const materializationKey = resourceKey(body.tenant_id, materializationId);
+    commitMaterializations.set(materializationKey, materialization);
+    commitMaterializationQueryCounts.set(materializationKey, 0);
+    commitMaterializationRequests.set(requestKey, {
+      requestJson,
+      response: structuredClone(response),
+    });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/commit/coverage/query', async ({ request }) => {
@@ -3558,13 +3700,15 @@ export const handlers = [
     const body = (await request.json()) as QueryCommitCoverageRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const coverage: VolumeCommitCoverageView[] = [...commitReplications.values()]
+    const coverage: VolumeCommitCoverageView[] = [...commitMaterializations.values()]
       .filter(
         (item) =>
           item.tenant_id === body.tenant_id &&
           item.commit_id === body.commit_id &&
           item.artifact_id === body.object_namespace_id &&
-          item.state === 'published',
+          item.state !== 'cancelled' &&
+          (body.storage_volume_id === undefined ||
+            item.target_storage_volume_id === body.storage_volume_id),
       )
       .map((item) => ({
         object_namespace_id: body.object_namespace_id,
@@ -3573,117 +3717,16 @@ export const handlers = [
         placement_generation: '1',
         object_set_digest: item.object_set_digest,
         total_objects: item.total_objects,
-        verified_objects: item.completed_objects,
+        verified_objects: item.verified_objects,
         total_bytes: item.total_bytes,
-        verified_bytes: item.completed_bytes,
+        verified_bytes: item.verified_bytes,
         missing_objects: String(
-          Math.max(0, Number(item.total_objects) - Number(item.completed_objects)),
+          Math.max(0, Number(item.total_objects) - Number(item.verified_objects)),
         ),
-        missing_bytes: String(Math.max(0, Number(item.total_bytes) - Number(item.completed_bytes))),
-        state: item.state === 'published' ? 'complete' : 'partial',
+        missing_bytes: String(Math.max(0, Number(item.total_bytes) - Number(item.verified_bytes))),
+        state: item.state === 'complete' ? 'complete' : 'partial',
       }));
     return HttpResponse.json({ coverage }, { headers: headers(request) });
-  }),
-  http.post('*/api/commit/materialization/retry', async ({ request }) => {
-    const denied = authorize(request);
-    if (denied) return denied;
-    const body = (await request.json()) as RetryCommitMaterializationRequest;
-    const failed = requireMutationAccess(request, body.tenant_id);
-    if (failed) return failed;
-    const receiptKey = resourceKey(body.tenant_id, body.request_id);
-    const receipt = commitReplicationRetryMutations.get(receiptKey);
-    if (receipt) {
-      if (
-        receipt.tenant_id !== body.tenant_id ||
-        receipt.object_namespace_id !== body.object_namespace_id ||
-        receipt.replication_id !== body.materialization_id ||
-        receipt.expected_attempt !== body.expected_plan_revision
-      ) {
-        return mutationConflict(
-          request,
-          'REQUEST_ID_REUSED',
-          'Materialization retry request ID is already bound to another payload',
-        );
-      }
-      return HttpResponse.json(
-        { ...receipt.response, replayed: true },
-        { headers: headers(request) },
-      );
-    }
-    const key = resourceKey(body.tenant_id, body.materialization_id);
-    const replication = commitReplications.get(key);
-    if (!replication) return notFound(request, 'Materialization');
-    if (replication.artifact_id !== body.object_namespace_id) {
-      return notFound(request, 'Materialization');
-    }
-    if (replication.attempt !== body.expected_plan_revision) {
-      return mutationConflict(
-        request,
-        'MATERIALIZATION_PLAN_CHANGED',
-        'Materialization plan revision changed',
-      );
-    }
-    if (!['failed', 'cancelled'].includes(replication.state)) {
-      return mutationConflict(
-        request,
-        'MATERIALIZATION_NOT_RETRYABLE',
-        'Materialization is not retryable',
-      );
-    }
-    const next = {
-      ...replication,
-      attempt: String(Number(replication.attempt) + 1),
-      state: 'queued' as const,
-    };
-    delete next.issue;
-    commitReplications.set(key, next);
-    commitReplicationQueryCounts.set(key, 0);
-    const response: RetryCommitMaterializationResponse = {
-      materialization: toMaterializationView(next),
-      replayed: false,
-    };
-    commitReplicationRetryMutations.set(receiptKey, {
-      tenant_id: body.tenant_id,
-      object_namespace_id: body.object_namespace_id,
-      replication_id: body.materialization_id,
-      expected_attempt: body.expected_plan_revision,
-      response,
-    });
-    return HttpResponse.json(response, { headers: headers(request) });
-  }),
-  http.post('*/api/commit/materialization/cancel', async ({ request }) => {
-    const denied = authorize(request);
-    if (denied) return denied;
-    const body = (await request.json()) as CancelCommitMaterializationRequest;
-    const failed = requireMutationAccess(request, body.tenant_id);
-    if (failed) return failed;
-    const key = resourceKey(body.tenant_id, body.materialization_id);
-    const replication = commitReplications.get(key);
-    if (!replication) return notFound(request, 'Materialization');
-    if (replication.artifact_id !== body.object_namespace_id) {
-      return notFound(request, 'Materialization');
-    }
-    if (replication.attempt !== body.expected_plan_revision) {
-      return mutationConflict(
-        request,
-        'MATERIALIZATION_PLAN_CHANGED',
-        'Materialization plan revision changed',
-      );
-    }
-    if (!['queued', 'planning', 'transferring', 'verifying'].includes(replication.state)) {
-      return mutationConflict(
-        request,
-        'MATERIALIZATION_NOT_CANCELLABLE',
-        'Materialization is not cancellable',
-      );
-    }
-    const next = { ...replication, state: 'cancelled' as const };
-    commitReplications.set(key, next);
-    commitReplicationQueryCounts.delete(key);
-    const response: CancelCommitMaterializationResponse = {
-      materialization: toMaterializationView(next),
-    };
-    return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/commit/availability/query', async ({ request }) => {
     const denied = authorize(request);
@@ -3691,25 +3734,25 @@ export const handlers = [
     const body = (await request.json()) as QueryCommitAvailabilityV2Request;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const verified_storage_volume_ids = [...commitReplications.values()]
+    const verified_storage_volume_ids = [...commitMaterializations.values()]
       .filter(
         (item) =>
           item.tenant_id === body.tenant_id &&
           item.commit_id === body.commit_id &&
           item.artifact_id === body.object_namespace_id &&
-          item.state === 'published',
+          item.state === 'complete',
       )
       .map((item) => item.target_storage_volume_id);
-    const verified_objects = [...commitReplications.values()]
+    const verified_objects = [...commitMaterializations.values()]
       .filter(
         (item) =>
           item.tenant_id === body.tenant_id &&
           item.commit_id === body.commit_id &&
           item.artifact_id === body.object_namespace_id &&
-          item.state === 'published',
+          item.state === 'complete',
       )
-      .reduce((sum, item) => sum + Number(item.completed_objects), 0);
-    const total_objects = [...commitReplications.values()]
+      .reduce((sum, item) => sum + Number(item.verified_objects), 0);
+    const total_objects = [...commitMaterializations.values()]
       .filter(
         (item) =>
           item.tenant_id === body.tenant_id &&
@@ -3750,108 +3793,6 @@ export const handlers = [
         verified_storage_volume_ids,
       },
     };
-    return HttpResponse.json(response, { headers: headers(request) });
-  }),
-  http.post('*/api/snapshot/delivery/create', async ({ request }) => {
-    const denied = authorize(request);
-    if (denied) return denied;
-    const body = (await request.json()) as CreateSnapshotDeliveryRequest;
-    const failed = requireMutationAccess(request, body.tenant_id);
-    if (failed) return failed;
-    const requestKey = resourceKey(body.tenant_id, body.request_id);
-    const requestJson = stableJson(body);
-    const priorRequest = snapshotDeliveryCreateRequests.get(requestKey);
-    if (priorRequest) {
-      if (priorRequest.requestJson !== requestJson) {
-        return mutationConflict(
-          request,
-          'DELIVERY_REQUEST_ID_REUSED',
-          'The delivery request ID already belongs to a different request',
-        );
-      }
-      const response = structuredClone(priorRequest.response);
-      response.replayed = true;
-      return HttpResponse.json(response, { headers: headers(request) });
-    }
-    const snapshot = snapshots.find(
-      (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
-    );
-    if (!snapshot) return notFound(request, 'Snapshot');
-    if (snapshot.state !== 'ready') {
-      return mutationConflict(
-        request,
-        'SNAPSHOT_NOT_READY',
-        'Snapshot deliveries require a Ready Snapshot',
-      );
-    }
-    const storageVolume = storageVolumes.find(
-      (item) =>
-        item.tenant_id === body.tenant_id &&
-        item.storage_volume_id === body.target_storage_volume_id,
-    );
-    if (!storageVolume) return notFound(request, 'StorageVolume');
-    if (!storageVolume.allowed_delivery_modes.includes(body.mode)) {
-      return mutationConflict(
-        request,
-        'DELIVERY_MODE_NOT_ALLOWED',
-        'The StorageVolume policy does not allow this delivery mode',
-      );
-    }
-    const placement = [...commitReplications.values()].find(
-      (item) =>
-        item.tenant_id === body.tenant_id &&
-        item.commit_id === snapshot.commit_id &&
-        item.target_storage_volume_id === body.target_storage_volume_id &&
-        item.state === 'published',
-    );
-    if (!placement) {
-      return problem(
-        request,
-        409,
-        'PLACEMENT_NOT_PUBLISHED',
-        'PlacementSet is not published',
-        'Replicate the Commit to the target Volume before creating Delivery',
-      );
-    }
-    if (body.mode === 'hardlink' && snapshot.data_layout !== 'whole_file') {
-      return mutationConflict(
-        request,
-        'HARDLINK_REQUIRES_WHOLE_FILE',
-        'Hardlink delivery requires a WholeFile Commit',
-      );
-    }
-    if (body.mode === 'hardlink' && storageVolume.hardlink_policy === 'disabled') {
-      return mutationConflict(
-        request,
-        'HARDLINK_UNSAFE_VOLUME',
-        'Hardlink delivery requires a sealed or trusted-local Volume policy',
-      );
-    }
-    const now = Date.now().toString();
-    const deliveryId = `delivery-${fingerprint(body)}`;
-    const delivery: SnapshotDeliveryView = {
-      delivery_id: deliveryId,
-      snapshot_id: snapshot.snapshot_id,
-      commit_id: snapshot.commit_id,
-      storage_volume_id: body.target_storage_volume_id,
-      mode: body.mode,
-      target_relative_root: `snapshots/${snapshot.project_id}/${snapshot.artifact_id}/${snapshot.snapshot_id}/deliveries/${deliveryId}`,
-      state: 'requested',
-      source_index_digest: snapshot.commit_id,
-      delivery_generation: '1',
-      file_count: snapshot.logical_file_count,
-      size_bytes: snapshot.logical_size_bytes,
-      object_set_digest: snapshot.commit_id,
-      resource_version: '1',
-      created_at_unix_ms: now,
-      updated_at_unix_ms: now,
-    };
-    snapshotDeliveries.unshift(delivery);
-    const response: CreateSnapshotDeliveryResponse = { delivery, replayed: false };
-    snapshotDeliveryCreateRequests.set(requestKey, {
-      requestJson,
-      response: structuredClone(response),
-    });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/snapshot/delivery/query', async ({ request }) => {
@@ -3926,6 +3867,19 @@ export const handlers = [
     ).toString();
     resolved.delivery.updated_at_unix_ms = now;
     delete resolved.delivery.issue;
+    if (resolved.snapshot.state === 'abnormal') {
+      resolved.snapshot.state = 'creating';
+      resolved.snapshot.data_health = 'unavailable';
+      resolved.snapshot.integrity = {
+        state: 'pending',
+        files_verified: '0',
+        bytes_verified: '0',
+      };
+      resolved.snapshot.resource_version = (
+        BigInt(resolved.snapshot.resource_version) + 1n
+      ).toString();
+      resolved.snapshot.updated_at_unix_ms = now;
+    }
     const response: RetrySnapshotDeliveryResponse = {
       delivery: resolved.delivery,
       replayed: false,
@@ -3981,13 +3935,8 @@ export const handlers = [
       (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
     );
     if (!snapshot) return notFound(request, 'Snapshot');
-    if (snapshot.state !== 'ready') {
-      return mutationConflict(
-        request,
-        'SNAPSHOT_NOT_READY',
-        'Snapshot files are available only when the Snapshot is Ready',
-      );
-    }
+    const snapshotUnavailable = requireReadySnapshotDelivery(request, snapshot);
+    if (snapshotUnavailable) return snapshotUnavailable;
     const filtered = mockLogicalFiles.filter(
       (item) =>
         (!body.path_prefix || item.path.startsWith(body.path_prefix)) &&
@@ -4014,6 +3963,8 @@ export const handlers = [
       (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
     );
     if (!snapshot) return notFound(request, 'Snapshot');
+    const snapshotUnavailable = requireReadySnapshotDelivery(request, snapshot);
+    if (snapshotUnavailable) return snapshotUnavailable;
     const items: QuerySnapshotActivityListResponse['items'] = [
       {
         activity_id: `activity-${snapshot.snapshot_id}-created`,
@@ -4064,6 +4015,8 @@ export const handlers = [
       (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
     );
     if (!snapshot) return notFound(request, 'Snapshot');
+    const snapshotUnavailable = requireReadySnapshotDelivery(request, snapshot);
+    if (snapshotUnavailable) return snapshotUnavailable;
     const response: QuerySnapshotDatasetProfileResponse = { profile: mockDatasetProfile };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
@@ -4074,6 +4027,15 @@ export const handlers = [
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
     const values = s3AccessPoints.filter((item) => item.tenant_id === body.tenant_id);
+    for (const accessPoint of values) {
+      const snapshot = snapshots.find(
+        (item) =>
+          item.tenant_id === accessPoint.tenant_id && item.snapshot_id === accessPoint.snapshot_id,
+      );
+      if (!snapshot) return s3NotFound(request, 'snapshot');
+      const unavailable = requireReadySnapshotDelivery(request, snapshot);
+      if (unavailable) return unavailable;
+    }
     const page = paginate(request, 's3-access-points', { tenant_id: body.tenant_id }, values, body);
     if (page instanceof HttpResponse) return page;
     const response: QueryS3AccessPointListResponse = page;
@@ -4100,11 +4062,20 @@ export const handlers = [
       (item) => item.tenant_id === body.tenant_id && item.snapshot_id === body.snapshot_id,
     );
     if (!snapshot) return s3NotFound(request, 'snapshot');
-    if (snapshot.state !== 'ready') {
+    const snapshotUnavailable = requireReadySnapshotDelivery(request, snapshot);
+    if (snapshotUnavailable) return snapshotUnavailable;
+    const delivery = boundSnapshotDelivery(snapshot);
+    if (!delivery) return s3NotFound(request, 'snapshot delivery');
+    const targetVolume = storageVolumes.find(
+      (item) =>
+        item.tenant_id === snapshot.tenant_id &&
+        item.storage_volume_id === delivery.storage_volume_id,
+    );
+    if (!targetVolume || targetVolume.edge_cluster_id !== snapshot.edge_cluster_id) {
       return mutationConflict(
         request,
-        'SNAPSHOT_INVALID_STATE',
-        'S3 access can only be enabled for a Ready Snapshot',
+        'SNAPSHOT_TARGET_CONFLICT',
+        'The Snapshot Delivery target binding is invalid',
       );
     }
     if (
@@ -4166,10 +4137,12 @@ export const handlers = [
       artifact_id: snapshot.artifact_id,
       snapshot_id: snapshot.snapshot_id,
       commit_id: snapshot.commit_id,
+      delivery_id: delivery.delivery_id,
+      storage_volume_id: delivery.storage_volume_id,
+      edge_cluster_id: targetVolume.edge_cluster_id,
       bucket_name: body.bucket_name,
       endpoint: runtimeConfig.s3Endpoint,
-      region:
-        storageVolumes.find((volume) => volume.tenant_id === snapshot.tenant_id)?.region ?? 'local',
+      region: targetVolume.region,
       state: 'active',
       policy_generation: '1',
       created_at_unix_ms: Date.now().toString(),
@@ -4805,123 +4778,230 @@ export const handlers = [
     });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/job/add/create', async ({ request }) => {
+  http.post('*/api/task/list/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as CreateAddJobRequest;
-    const invalid = validateCreate(request, body);
-    if (invalid) return invalid;
-    const jobKey = resourceKey(body.tenant_id, body.job_id);
-    const requestJson = stableJson(body);
-    const existing = jobs.get(jobKey);
-    if (existing) {
-      if (existing.requestJson !== requestJson) {
-        return problem(
-          request,
-          409,
-          'JOB_ID_REUSED',
-          'Job ID reused',
-          'The Job ID already belongs to a different managed Add request',
-        );
-      }
-      const response: CreateAddJobResponse = { job: existing.job, replayed: true };
-      return HttpResponse.json(response, { headers: headers(request) });
-    }
-    const job: JobView = {
-      operation: 'add',
-      tenant_id: body.tenant_id,
-      project_id: body.project_id,
-      artifact_id: body.artifact_id,
-      playground_id: body.playground_id,
-      job_id: body.job_id,
-      state: 'queued',
-      resource_version: '1',
-      deadline_unix_ms: body.deadline_unix_ms,
-    };
-    jobs.set(jobKey, { request: body, requestJson, job, queryCount: 0 });
-    const response: CreateAddJobResponse = { job, replayed: false };
-    return HttpResponse.json(response, { headers: headers(request) });
-  }),
-  http.post('*/api/job/query', async ({ request }) => {
-    const denied = authorize(request);
-    if (denied) return denied;
-    const body = (await request.json()) as { tenant_id: string; job_id: string };
-    const failed = unavailable(request, body.tenant_id);
+    const body = (await request.json()) as QueryTaskListRequest;
+    const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const stored = jobs.get(resourceKey(body.tenant_id, body.job_id));
-    if (!stored) {
-      return problem(
-        request,
-        404,
-        'JOB_NOT_FOUND',
-        'Job not found',
-        'The requested Job was not found',
-      );
+    const states = body.state ?? [];
+    const kinds = body.task_kind ?? [];
+    const all = [...operationTasks.values()]
+      .filter((task) => {
+        if (task.tenant_id !== body.tenant_id) return false;
+        if (body.project_id && task.project_id !== body.project_id) return false;
+        if (body.artifact_id && task.artifact_id !== body.artifact_id) return false;
+        if (body.object_namespace_id && task.object_namespace_id !== body.object_namespace_id)
+          return false;
+        if (body.commit_id && task.commit_id !== body.commit_id) return false;
+        if (body.playground_id && task.playground_id !== body.playground_id) return false;
+        if (body.snapshot_id && task.snapshot_id !== body.snapshot_id) return false;
+        if (body.storage_volume_id && task.storage_volume_id !== body.storage_volume_id)
+          return false;
+        if (body.parent_task_id && task.parent_task_id !== body.parent_task_id) return false;
+        if (states.length && !states.includes(task.state)) return false;
+        if (kinds.length && !kinds.includes(task.task_kind)) return false;
+        return true;
+      })
+      .sort((left, right) => left.created_at_unix_ms.localeCompare(right.created_at_unix_ms));
+    for (const task of all) {
+      const key = taskKey(task.tenant_id, task.task_id);
+      const materialization = commitMaterializations.get(key);
+      if (!materialization) continue;
+      const count = taskQueryCounts.get(key) ?? 0;
+      if (count < 4) {
+        taskQueryCounts.set(key, count + 1);
+        advanceCommitMaterialization(key, materialization);
+      }
     }
-    advance(stored);
-    const response: QueryJobResponse = { job: stored.job };
-    return HttpResponse.json(response, { headers: headers(request) });
+    const refreshed = all.map(
+      (task) => operationTasks.get(taskKey(task.tenant_id, task.task_id)) ?? task,
+    );
+    const pageSize = body.page_size ?? 50;
+    const start = body.cursor ? Math.max(0, Number(body.cursor)) : 0;
+    const items = refreshed.slice(start, start + pageSize);
+    const nextCursor =
+      start + items.length < refreshed.length ? String(start + items.length) : undefined;
+    return HttpResponse.json(
+      { items, ...(nextCursor ? { next_cursor: nextCursor } : {}) },
+      { headers: headers(request) },
+    );
   }),
-  http.post('*/api/job/add/finalize', async ({ request }) => {
+  http.post('*/api/task/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as { tenant_id: string; job_id: string };
-    const stored = jobs.get(resourceKey(body.tenant_id, body.job_id));
-    if (!stored) {
-      return problem(
-        request,
-        404,
-        'JOB_NOT_FOUND',
-        'Job not found',
-        'The requested Job was not found',
-      );
+    const body = (await request.json()) as QueryTaskRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const key = taskKey(body.tenant_id, body.task_id);
+    const task = operationTasks.get(key);
+    if (!task) return notFound(request, 'Task');
+    const materialization = commitMaterializations.get(key);
+    if (materialization) {
+      const count = taskQueryCounts.get(key) ?? 0;
+      if (count < 4) {
+        taskQueryCounts.set(key, count + 1);
+        advanceCommitMaterialization(key, materialization);
+      }
     }
-    if (stored.job.state === 'succeeded' && stored.job.decision && stored.finalizedAt) {
-      const replay: FinalizeAddJobResponse = {
-        job: stored.job,
-        decision: stored.job.decision,
-        finalized_at_unix_ms: stored.finalizedAt,
-        replayed: true,
-      };
-      return HttpResponse.json(replay, { headers: headers(request) });
-    }
-    if (stored.job.state !== 'prepared') {
-      return problem(
-        request,
-        409,
-        'JOB_INVALID_STATE',
-        'Job state does not allow finalization',
-        'Managed Add can only be finalized from Prepared or a stable terminal state',
-      );
-    }
-    const revision = (BigInt(stored.request.expected_index_version.revision) + 1n).toString();
-    const finalizedAt = Date.now().toString();
-    const decision = {
-      outcome: 'publish' as const,
-      final_state: 'succeeded' as const,
-      published_index_version: { revision, digest: 'e'.repeat(64) },
+    const latest = operationTasks.get(key) ?? task;
+    return HttpResponse.json(
+      {
+        task: latest,
+        attempts: taskAttempts.get(key) ?? [],
+        events: taskEvents.get(key) ?? [],
+        children: [],
+      },
+      { headers: headers(request) },
+    );
+  }),
+  http.post('*/api/task/event/list/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryTaskEventListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const key = taskKey(body.tenant_id, body.task_id);
+    if (!operationTasks.has(key)) return notFound(request, 'Task');
+    const events = taskEvents.get(key) ?? [];
+    const start = body.cursor ? Number(body.cursor) : 0;
+    const pageSize = body.page_size ?? 50;
+    const items = events.slice(start, start + pageSize);
+    const nextCursor =
+      start + items.length < events.length ? String(start + items.length) : undefined;
+    return HttpResponse.json(
+      { items, ...(nextCursor ? { next_cursor: nextCursor } : {}) },
+      { headers: headers(request) },
+    );
+  }),
+  http.post('*/api/task/summary/query', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as QueryTaskListRequest;
+    const failed = requireTenant(request, body.tenant_id);
+    if (failed) return failed;
+    const states = body.state ?? [];
+    const kinds = body.task_kind ?? [];
+    const selected = [...operationTasks.values()].filter(
+      (task) =>
+        task.tenant_id === body.tenant_id &&
+        (!body.project_id || task.project_id === body.project_id) &&
+        (!body.artifact_id || task.artifact_id === body.artifact_id) &&
+        (!body.object_namespace_id || task.object_namespace_id === body.object_namespace_id) &&
+        (!body.commit_id || task.commit_id === body.commit_id) &&
+        (!body.playground_id || task.playground_id === body.playground_id) &&
+        (!body.snapshot_id || task.snapshot_id === body.snapshot_id) &&
+        (!body.storage_volume_id || task.storage_volume_id === body.storage_volume_id) &&
+        (!states.length || states.includes(task.state)) &&
+        (!kinds.length || kinds.includes(task.task_kind)),
+    );
+    const summary = {
+      total: String(selected.length),
+      queued: String(selected.filter((task) => task.state === 'queued').length),
+      running: String(selected.filter((task) => task.state === 'running').length),
+      waiting: String(selected.filter((task) => task.state === 'waiting').length),
+      verifying: String(selected.filter((task) => task.state === 'verifying').length),
+      succeeded: String(selected.filter((task) => task.state === 'succeeded').length),
+      stalled: String(selected.filter((task) => task.state === 'stalled').length),
+      failed: String(selected.filter((task) => task.state === 'failed').length),
+      cancelled: String(selected.filter((task) => task.state === 'cancelled').length),
     };
-    stored.job.state = 'succeeded';
-    stored.job.resource_version = '7';
-    stored.job.decision = decision;
-    stored.job.finalized_at_unix_ms = finalizedAt;
-    stored.finalizedAt = finalizedAt;
-    const response: FinalizeAddJobResponse = {
-      job: stored.job,
-      decision,
-      finalized_at_unix_ms: finalizedAt,
-      replayed: false,
-    };
-    return HttpResponse.json(response, { headers: headers(request) });
+    return HttpResponse.json({ summary }, { headers: headers(request) });
+  }),
+  http.post('*/api/task/retry', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as RetryTaskRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const key = taskKey(body.tenant_id, body.task_id);
+    const task = operationTasks.get(key);
+    if (!task) return notFound(request, 'Task');
+    if (
+      body.expected_resource_version &&
+      body.expected_resource_version !== task.resource_version
+    ) {
+      return mutationConflict(request, 'RESOURCE_VERSION_CONFLICT', 'Task changed');
+    }
+    if (
+      task.state === 'queued' ||
+      task.state === 'running' ||
+      task.state === 'waiting' ||
+      task.state === 'verifying'
+    ) {
+      return HttpResponse.json({ task, replayed: true }, { headers: headers(request) });
+    }
+    if (task.state !== 'failed' && task.state !== 'stalled') {
+      return mutationConflict(request, 'TASK_NOT_RETRYABLE', 'Task is not retryable');
+    }
+    const oldState = task.state;
+    task.attempt = (BigInt(task.attempt) + 1n).toString();
+    task.state = 'queued';
+    task.phase = 'queued';
+    delete task.issue;
+    task.resource_version = (BigInt(task.resource_version) + 1n).toString();
+    task.updated_at_unix_ms = String(Date.now());
+    operationTasks.set(key, task);
+    const attempts = taskAttempts.get(key) ?? [];
+    attempts.push({
+      attempt_id: `${task.task_id}-attempt-${task.attempt}`,
+      task_id: task.task_id,
+      attempt: task.attempt,
+      state: task.state,
+      phase: task.phase,
+      created_at_unix_ms: task.updated_at_unix_ms,
+      updated_at_unix_ms: task.updated_at_unix_ms,
+      resource_version: task.resource_version,
+    });
+    taskAttempts.set(key, attempts);
+    appendTaskEvent(task, 'retried', 'mock-user', oldState, 'Task requeued');
+    const materialization = commitMaterializations.get(key);
+    if (materialization) {
+      const next = { ...materialization, attempt: task.attempt, state: 'queued' as const };
+      delete next.issue;
+      commitMaterializations.set(key, next);
+      commitMaterializationQueryCounts.set(key, 0);
+    }
+    return HttpResponse.json({ task, replayed: false }, { headers: headers(request) });
+  }),
+  http.post('*/api/task/cancel', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as CancelTaskRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const key = taskKey(body.tenant_id, body.task_id);
+    const task = operationTasks.get(key);
+    if (!task) return notFound(request, 'Task');
+    if (
+      body.expected_resource_version &&
+      body.expected_resource_version !== task.resource_version
+    ) {
+      return mutationConflict(request, 'RESOURCE_VERSION_CONFLICT', 'Task changed');
+    }
+    if (task.state === 'cancelled') {
+      return HttpResponse.json({ task, replayed: true }, { headers: headers(request) });
+    }
+    if (!['queued', 'running', 'waiting', 'verifying', 'stalled'].includes(task.state)) {
+      return mutationConflict(request, 'TASK_NOT_CANCELLABLE', 'Task is not cancellable');
+    }
+    const oldState = task.state;
+    task.state = 'cancelled';
+    task.phase = 'cancelled';
+    task.resource_version = (BigInt(task.resource_version) + 1n).toString();
+    task.updated_at_unix_ms = String(Date.now());
+    operationTasks.set(key, task);
+    appendTaskEvent(task, 'cancelled', 'mock-user', oldState, 'Task cancelled');
+    const materialization = commitMaterializations.get(key);
+    if (materialization) {
+      commitMaterializations.set(key, { ...materialization, state: 'cancelled' as const });
+      commitMaterializationQueryCounts.delete(key);
+    }
+    return HttpResponse.json({ task, replayed: false }, { headers: headers(request) });
   }),
 ];
 
-export function resetMockJobs(): void {
-  jobs.clear();
-}
-
 export function resetMockState(): void {
-  jobs.clear();
   tenantCreatePayloads.clear();
   projectCreatePayloads.clear();
   storageVolumeCreatePayloads.clear();
@@ -4939,12 +5019,14 @@ export function resetMockState(): void {
   precommitSourceHeads.clear();
   precommitMutationRequests.clear();
   snapshotCreateRequests.clear();
-  commitReplications.clear();
-  commitReplicationQueryCounts.clear();
-  commitReplicationRetryMutations.clear();
-  commitReplicationRequests.clear();
+  commitMaterializations.clear();
+  commitMaterializationQueryCounts.clear();
+  commitMaterializationRequests.clear();
+  operationTasks.clear();
+  taskAttempts.clear();
+  taskEvents.clear();
+  taskQueryCounts.clear();
   snapshotDeliveries.splice(0, snapshotDeliveries.length);
-  snapshotDeliveryCreateRequests.clear();
   snapshotRetryRequests.clear();
   snapshotDeliveryDeleteRequests.clear();
   snapshotQueryCounts.clear();

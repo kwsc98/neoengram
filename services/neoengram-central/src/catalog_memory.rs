@@ -32,11 +32,11 @@ use crate::{
     S3CredentialRecord, S3CredentialState, S3MutationKind, S3MutationRecord,
     SnapshotDeliveryInsertOutcome, SnapshotDeliveryInsertRequest, SnapshotDeliveryListRequest,
     SnapshotDeliveryMutationRecord, SnapshotDeliveryMutationRequest, SnapshotDeliveryRecord,
-    SnapshotDeliveryRetentionRoot, SnapshotInsertOutcome, SnapshotInsertRequest,
-    SnapshotListCursor, SnapshotListPage, SnapshotListRequest, SnapshotRecord, SnapshotState,
-    StorageBackendType, StorageVolumeListCursor, StorageVolumeListPage, StorageVolumeListRequest,
-    StorageVolumeRecord, StorageVolumeState, TenantListCursor, TenantListPage, TenantListRequest,
-    TenantRecord,
+    SnapshotDeliveryRetentionRoot, SnapshotInsertRequest, SnapshotListCursor, SnapshotListPage,
+    SnapshotListRequest, SnapshotRecord, SnapshotState, SnapshotWithDeliveryInsertRequest,
+    SnapshotWithDeliveryInsertResult, StorageBackendType, StorageVolumeListCursor,
+    StorageVolumeListPage, StorageVolumeListRequest, StorageVolumeRecord, StorageVolumeState,
+    TenantListCursor, TenantListPage, TenantListRequest, TenantRecord,
 };
 
 #[derive(Default)]
@@ -47,6 +47,10 @@ pub struct InMemoryControlCatalog {
     volumes: Mutex<BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>>,
     playgrounds: Mutex<BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>>,
     snapshots: Mutex<BTreeMap<(TenantId, SnapshotId), SnapshotRecord>>,
+    /// Serializes the aggregate publication path. The individual maps remain separately
+    /// lockable for the legacy repository methods, while this fence keeps a Snapshot and its
+    /// first Delivery on one linearizable in-memory write path.
+    snapshot_delivery_aggregate: Mutex<()>,
     snapshot_deliveries: Mutex<BTreeMap<(TenantId, SnapshotDeliveryId), SnapshotDeliveryRecord>>,
     snapshot_delivery_requests: Mutex<BTreeMap<(TenantId, RequestId), SnapshotDeliveryRecord>>,
     snapshot_delivery_retention_roots: Mutex<
@@ -802,68 +806,243 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         Ok(SnapshotListPage { records, next })
     }
 
-    async fn insert_snapshot_fenced(
+    async fn insert_snapshot_with_delivery(
         &self,
-        request: SnapshotInsertRequest,
-    ) -> CentralResult<SnapshotInsertOutcome> {
-        let SnapshotInsertRequest {
-            record,
-            artifact_head,
+        request: SnapshotWithDeliveryInsertRequest,
+    ) -> CentralResult<SnapshotWithDeliveryInsertResult> {
+        let SnapshotWithDeliveryInsertRequest {
+            snapshot:
+                SnapshotInsertRequest {
+                    record: snapshot_request,
+                    artifact_head,
+                },
+            delivery,
         } = request;
-        validate_new_resource(record.resource_version, &record.lifecycle, "Snapshot")?;
-        let artifacts = lock(&self.artifacts)?;
-        let mut snapshots = lock(&self.snapshots)?;
+        let delivery_request = delivery.request_id.clone();
+        let delivery_record = delivery.record.clone();
 
-        if let Some(existing) = snapshots.values().find(|existing| {
-            existing.tenant_id == record.tenant_id
-                && existing.snapshot_request_id == record.snapshot_request_id
+        validate_new_resource(
+            snapshot_request.resource_version,
+            &snapshot_request.lifecycle,
+            "Snapshot",
+        )?;
+        validate_snapshot_delivery_retention_roots(&delivery)?;
+        if snapshot_request.delivery_id != delivery_record.delivery_id
+            || snapshot_request.tenant_id != delivery_record.tenant_id
+            || snapshot_request.snapshot_id != delivery_record.snapshot_id
+            || snapshot_request.commit_id != delivery_record.commit_id
+            || snapshot_request.storage_volume_id != delivery_record.storage_volume_id
+            || snapshot_request.delivery_mode != delivery_record.mode
+        {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Snapshot and Delivery immutable identities do not match",
+            )
+            .with_retryable(false));
+        }
+        if delivery_record.create_request_id != delivery_request {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Snapshot delivery create request identity is inconsistent",
+            )
+            .with_retryable(false));
+        }
+        if snapshot_request.snapshot_request_id != delivery_request {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Snapshot and Delivery must share the same create request identity",
+            )
+            .with_retryable(false));
+        }
+        if delivery_record.delivery_generation.get() == 0 || delivery_record.resource_version == 0 {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "Snapshot delivery generations must be positive",
+            )
+            .with_retryable(false));
+        }
+
+        // No await occurs while these guards are held. This makes the aggregate operation a
+        // single in-memory critical section and ensures all validation completes before either
+        // map is mutated.
+        let _aggregate = lock(&self.snapshot_delivery_aggregate)?;
+        let artifacts = lock(&self.artifacts)?;
+        let volumes = lock(&self.volumes)?;
+        let mut snapshots = lock(&self.snapshots)?;
+        let mut deliveries = lock(&self.snapshot_deliveries)?;
+        let mut delivery_requests = lock(&self.snapshot_delivery_requests)?;
+        let mut retention_roots = lock(&self.snapshot_delivery_retention_roots)?;
+
+        let snapshot_key = (
+            snapshot_request.tenant_id.clone(),
+            snapshot_request.snapshot_id.clone(),
+        );
+        let mut snapshot_replayed = false;
+        let snapshot = if let Some(existing) = snapshots.values().find(|existing| {
+            existing.tenant_id == snapshot_request.tenant_id
+                && existing.snapshot_request_id == snapshot_request.snapshot_request_id
         }) {
             require_active(&existing.lifecycle, "Snapshot")?;
-            return if snapshot_request_matches(existing, &record) {
-                Ok(SnapshotInsertOutcome::ExistingRequest(existing.clone()))
-            } else {
-                Err(conflict("Snapshot request ID is already used"))
-            };
-        }
-        if snapshots.contains_key(&(record.tenant_id.clone(), record.snapshot_id.clone())) {
+            if !snapshot_request_matches(existing, &snapshot_request) {
+                return Err(conflict("Snapshot request ID is already used"));
+            }
+            snapshot_replayed = true;
+            existing.clone()
+        } else if snapshots.contains_key(&snapshot_key) {
             return Err(conflict("Snapshot ID is already used"));
-        }
-        if let Some(existing) = snapshots.values().find(|existing| {
-            existing.tenant_id == record.tenant_id
-                && existing.project_id == record.project_id
-                && existing.artifact_id == record.artifact_id
-                && existing.commit_id == record.commit_id
+        } else {
+            let artifact = artifacts
+                .get(&(
+                    snapshot_request.tenant_id.clone(),
+                    snapshot_request.artifact_id.clone(),
+                ))
+                .filter(|artifact| artifact.project_id == snapshot_request.project_id)
+                .ok_or_else(|| {
+                    catalog_parent_error(
+                        CentralErrorCode::ArtifactNotFound,
+                        "Snapshot Artifact does not exist",
+                    )
+                })?;
+            require_active(&artifact.lifecycle, "Snapshot Artifact")?;
+            if let ArtifactHeadExpectation::Exact(expected) = artifact_head {
+                if expected != Some(snapshot_request.commit_id) {
+                    return Err(CentralError::new(
+                        CentralErrorCode::ProtocolInvalid,
+                        "fenced Snapshot Commit does not match the observed Artifact Head",
+                    )
+                    .with_retryable(false));
+                }
+                if artifact.head_commit_id != expected {
+                    return Err(artifact_head_changed());
+                }
+            }
+            snapshot_request.clone()
+        };
+
+        let delivery_key = (
+            delivery_record.tenant_id.clone(),
+            delivery_record.delivery_id.clone(),
+        );
+        let delivery_result = if let Some(existing) = delivery_requests
+            .get(&(delivery_record.tenant_id.clone(), delivery_request.clone()))
+            .or_else(|| deliveries.get(&delivery_key))
+        {
+            if !existing.same_create_request(&delivery_record) {
+                return Err(conflict("Snapshot delivery identity is already used"));
+            }
+            (existing.clone(), true)
+        } else if deliveries.values().any(|existing| {
+            existing.tenant_id == delivery_record.tenant_id
+                && existing.snapshot_id == delivery_record.snapshot_id
         }) {
-            require_active(&existing.lifecycle, "Snapshot")?;
-            return Ok(SnapshotInsertOutcome::ExistingCommit(existing.clone()));
+            return Err(conflict("Snapshot already has a SnapshotDelivery"));
+        } else {
+            let volume = volumes
+                .get(&(
+                    delivery_record.tenant_id.clone(),
+                    delivery_record.storage_volume_id.clone(),
+                ))
+                .ok_or_else(|| {
+                    catalog_parent_error(
+                        CentralErrorCode::StorageVolumeNotFound,
+                        "SnapshotDelivery StorageVolume does not exist",
+                    )
+                })?;
+            validate_snapshot_delivery_parents(&delivery_record, &snapshot, volume)?;
+            (delivery_record.clone(), false)
+        };
+
+        // A replay may find the Snapshot but not its Delivery only in a corrupted store. Never
+        // silently recreate a missing child, because that would break the immutable aggregate
+        // identity promised by the API.
+        if snapshot_replayed && !delivery_result.1 {
+            return Err(corruption(
+                "Snapshot exists without its required SnapshotDelivery",
+            ));
         }
-        let artifact = artifacts
-            .get(&(record.tenant_id.clone(), record.artifact_id.clone()))
-            .filter(|artifact| artifact.project_id == record.project_id)
+        if !snapshot_replayed && delivery_result.1 {
+            return Err(corruption(
+                "SnapshotDelivery exists without its required Snapshot",
+            ));
+        }
+
+        if !snapshot_replayed {
+            snapshots.insert(snapshot_key, snapshot.clone());
+        }
+        if !delivery_result.1 {
+            let delivery_key = (
+                delivery_result.0.tenant_id.clone(),
+                delivery_result.0.delivery_id.clone(),
+            );
+            deliveries.insert(delivery_key, delivery_result.0.clone());
+            delivery_requests.insert(
+                (
+                    delivery_result.0.tenant_id.clone(),
+                    delivery_result.0.create_request_id.clone(),
+                ),
+                delivery_result.0.clone(),
+            );
+            for root in delivery.retention_roots {
+                retention_roots.insert((root.tenant_id, root.delivery_id, root.object_id));
+            }
+        }
+        Ok(SnapshotWithDeliveryInsertResult {
+            snapshot,
+            delivery: delivery_result.0,
+            replayed: snapshot_replayed || delivery_result.1,
+        })
+    }
+
+    async fn transition_snapshot_state(
+        &self,
+        tenant_id: &TenantId,
+        snapshot_id: &SnapshotId,
+        expected: SnapshotState,
+        next: SnapshotState,
+        updated_at_unix_ms: UnixMillis,
+    ) -> CentralResult<SnapshotRecord> {
+        let mut snapshots = lock(&self.snapshots)?;
+        let deliveries = lock(&self.snapshot_deliveries)?;
+        let record = snapshots
+            .get_mut(&(tenant_id.clone(), snapshot_id.clone()))
             .ok_or_else(|| {
-                catalog_parent_error(
+                CentralError::new(
                     CentralErrorCode::ArtifactNotFound,
-                    "Snapshot Artifact does not exist",
+                    "Snapshot does not exist",
                 )
             })?;
-        require_active(&artifact.lifecycle, "Snapshot Artifact")?;
-        if let ArtifactHeadExpectation::Exact(expected) = artifact_head {
-            if expected != Some(record.commit_id) {
+        if record.state == next {
+            return Ok(record.clone());
+        }
+        if record.state != expected {
+            return Err(CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "Snapshot state changed",
+            ));
+        }
+        if next == SnapshotState::Ready {
+            let delivery = deliveries
+                .get(&(record.tenant_id.clone(), record.delivery_id.clone()))
+                .ok_or_else(|| {
+                    corruption("Snapshot exists without its required SnapshotDelivery")
+                })?;
+            if delivery.state != SnapshotDeliveryState::Ready {
                 return Err(CentralError::new(
-                    CentralErrorCode::ProtocolInvalid,
-                    "fenced Snapshot Commit does not match the observed Artifact Head",
+                    CentralErrorCode::InvalidState,
+                    "Snapshot cannot become Ready before its SnapshotDelivery is Ready",
                 )
                 .with_retryable(false));
             }
-            if artifact.head_commit_id != expected {
-                return Err(artifact_head_changed());
-            }
         }
-        snapshots.insert(
-            (record.tenant_id.clone(), record.snapshot_id.clone()),
-            record.clone(),
-        );
-        Ok(SnapshotInsertOutcome::Inserted(record))
+        record.state = next;
+        record.resource_version = record.resource_version.checked_add(1).ok_or_else(|| {
+            CentralError::new(
+                CentralErrorCode::ConcurrentUpdate,
+                "Snapshot resource version exhausted",
+            )
+        })?;
+        record.updated_at_unix_ms = updated_at_unix_ms;
+        Ok(record.clone())
     }
 
     async fn get_snapshot_delivery(
@@ -950,6 +1129,12 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             }
             return Err(conflict("Snapshot delivery ID is already used"));
         }
+        if records.values().any(|existing| {
+            existing.tenant_id == request.record.tenant_id
+                && existing.snapshot_id == request.record.snapshot_id
+        }) {
+            return Err(conflict("Snapshot already has a SnapshotDelivery"));
+        }
         if request.record.delivery_generation.get() == 0 || request.record.resource_version == 0 {
             return Err(CentralError::new(
                 CentralErrorCode::ProtocolInvalid,
@@ -1017,6 +1202,13 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 CentralErrorCode::ConcurrentUpdate,
                 "Snapshot delivery ResourceVersion changed",
             ));
+        }
+        if !current.same_create_request(&record) {
+            return Err(CentralError::new(
+                CentralErrorCode::ProtocolInvalid,
+                "SnapshotDelivery replacement cannot change immutable identity",
+            )
+            .with_retryable(false));
         }
         record.resource_version = expected_resource_version.checked_add(1).ok_or_else(|| {
             CentralError::new(
@@ -1238,7 +1430,8 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         record: S3AccessPointRecord,
     ) -> CentralResult<S3AccessPointInsertOutcome> {
         let snapshots = lock(&self.snapshots)?;
-        require_s3_snapshot(&snapshots, &record)?;
+        let deliveries = lock(&self.snapshot_deliveries)?;
+        require_s3_snapshot(&snapshots, &deliveries, &record)?;
         let mut records = lock(&self.s3_access_points)?;
         if let Some(existing) =
             records.get(&(record.tenant_id.clone(), record.access_point_id.clone()))
@@ -1290,6 +1483,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         }
         let key = (mutation.tenant_id.clone(), mutation.request_id.clone());
         let snapshots = lock(&self.snapshots)?;
+        let deliveries = lock(&self.snapshot_deliveries)?;
         let mut mutations = lock(&self.s3_mutations)?;
         let mut access_points = lock(&self.s3_access_points)?;
         let mut credentials = lock(&self.s3_credentials)?;
@@ -1308,6 +1502,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 .get(&credential.credential_id)
                 .cloned()
                 .ok_or_else(|| corruption("S3 mutation references a missing credential"))?;
+            require_s3_snapshot(&snapshots, &deliveries, &existing_access_point)?;
             return Ok(CatalogInsertOutcome::Existing(S3AccessPointCreateResult {
                 access_point: existing_access_point,
                 credential: existing_credential,
@@ -1329,12 +1524,13 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 if !same_s3_credential_identity(&existing_credential, &credential) {
                     return Err(conflict("S3 credential identity is already used"));
                 }
+                require_s3_snapshot(&snapshots, &deliveries, &existing_access_point)?;
                 CatalogInsertOutcome::Existing(S3AccessPointCreateResult {
                     access_point: existing_access_point,
                     credential: existing_credential,
                 })
             } else {
-                require_s3_snapshot(&snapshots, &existing_access_point)?;
+                require_s3_snapshot(&snapshots, &deliveries, &existing_access_point)?;
                 if existing_access_point.state != S3AccessPointState::Active {
                     return Err(conflict("S3 Access Point is disabled"));
                 }
@@ -1347,7 +1543,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             mutations.insert(key, mutation);
             return Ok(result);
         }
-        require_s3_snapshot(&snapshots, &access_point)?;
+        require_s3_snapshot(&snapshots, &deliveries, &access_point)?;
         if access_points
             .values()
             .any(|existing| existing.bucket_name == access_point.bucket_name)
@@ -1397,6 +1593,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         let mutation_key = (mutation.tenant_id.clone(), mutation.request_id.clone());
         let access_point_key = (mutation.tenant_id.clone(), access_point_id.clone());
         let snapshots = lock(&self.snapshots)?;
+        let deliveries = lock(&self.snapshot_deliveries)?;
         let mut mutations = lock(&self.s3_mutations)?;
         let mut access_points = lock(&self.s3_access_points)?;
         let mut credentials = lock(&self.s3_credentials)?;
@@ -1408,6 +1605,9 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 .get(&access_point_key)
                 .cloned()
                 .ok_or_else(|| corruption("S3 mutation references a missing Access Point"))?;
+            if state == S3AccessPointState::Active {
+                require_s3_snapshot(&snapshots, &deliveries, &current)?;
+            }
             return Ok(CatalogInsertOutcome::Existing(current));
         }
         let access_point = access_points.get_mut(&access_point_key).ok_or_else(|| {
@@ -1417,7 +1617,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             )
         })?;
         if state == S3AccessPointState::Active {
-            require_s3_snapshot(&snapshots, access_point)?;
+            require_s3_snapshot(&snapshots, &deliveries, access_point)?;
         }
         let next_policy_generation = (access_point.state != state)
             .then(|| {
@@ -1458,6 +1658,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         updated_at_unix_ms: neoengram_domain::protocol::UnixMillis,
     ) -> CentralResult<S3AccessPointRecord> {
         let snapshots = lock(&self.snapshots)?;
+        let deliveries = lock(&self.snapshot_deliveries)?;
         let mut records = lock(&self.s3_access_points)?;
         let mut credentials = lock(&self.s3_credentials)?;
         let record = records
@@ -1469,7 +1670,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 )
             })?;
         if state == S3AccessPointState::Active {
-            require_s3_snapshot(&snapshots, record)?;
+            require_s3_snapshot(&snapshots, &deliveries, record)?;
         }
         record.state = state;
         record.policy_generation = policy_generation;
@@ -1514,6 +1715,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         record: S3CredentialRecord,
     ) -> CentralResult<S3CredentialInsertOutcome> {
         let snapshots = lock(&self.snapshots)?;
+        let deliveries = lock(&self.snapshot_deliveries)?;
         let access_points = lock(&self.s3_access_points)?;
         let access_point = access_points
             .values()
@@ -1522,7 +1724,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         if access_point.state != S3AccessPointState::Active {
             return Err(conflict("S3 Access Point is disabled"));
         }
-        require_s3_snapshot(&snapshots, access_point)?;
+        require_s3_snapshot(&snapshots, &deliveries, access_point)?;
         let mut records = lock(&self.s3_credentials)?;
         if let Some(existing) = records.get(&record.credential_id) {
             if same_s3_credential_identity(existing, &record) {
@@ -1564,6 +1766,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         }
         let mutation_key = (mutation.tenant_id.clone(), mutation.request_id.clone());
         let snapshots = lock(&self.snapshots)?;
+        let deliveries = lock(&self.snapshot_deliveries)?;
         let mut mutations = lock(&self.s3_mutations)?;
         let access_points = lock(&self.s3_access_points)?;
         let mut credentials = lock(&self.s3_credentials)?;
@@ -1575,6 +1778,16 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 .get(&credential.credential_id)
                 .cloned()
                 .ok_or_else(|| corruption("S3 mutation references a missing credential"))?;
+            let access_point = access_points
+                .get(&(
+                    mutation.tenant_id.clone(),
+                    credential.access_point_id.clone(),
+                ))
+                .ok_or_else(|| corruption("S3 mutation references a missing Access Point"))?;
+            if access_point.state != S3AccessPointState::Active {
+                return Err(conflict("S3 Access Point is disabled"));
+            }
+            require_s3_snapshot(&snapshots, &deliveries, access_point)?;
             return Ok(CatalogInsertOutcome::Existing(existing));
         }
         let access_point = access_points
@@ -1591,7 +1804,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         if access_point.state != S3AccessPointState::Active {
             return Err(conflict("S3 Access Point is disabled"));
         }
-        require_s3_snapshot(&snapshots, access_point)?;
+        require_s3_snapshot(&snapshots, &deliveries, access_point)?;
         if credentials.contains_key(&credential.credential_id)
             || credentials
                 .values()
@@ -1672,6 +1885,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         state: S3CredentialState,
     ) -> CentralResult<S3CredentialRecord> {
         let snapshots = lock(&self.snapshots)?;
+        let deliveries = lock(&self.snapshot_deliveries)?;
         let access_points = lock(&self.s3_access_points)?;
         let mut records = lock(&self.s3_credentials)?;
         let record = records.get_mut(credential_id).ok_or_else(|| {
@@ -1693,7 +1907,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             if access_point.state != S3AccessPointState::Active {
                 return Err(conflict("S3 Access Point is disabled"));
             }
-            require_s3_snapshot(&snapshots, access_point)?;
+            require_s3_snapshot(&snapshots, &deliveries, access_point)?;
         }
         record.state = state;
         if state == S3CredentialState::Revoked {
@@ -3414,8 +3628,13 @@ fn snapshot_request_matches(existing: &SnapshotRecord, requested: &SnapshotRecor
     existing.tenant_id == requested.tenant_id
         && existing.project_id == requested.project_id
         && existing.artifact_id == requested.artifact_id
+        && existing.snapshot_id == requested.snapshot_id
         && existing.snapshot_request_id == requested.snapshot_request_id
         && existing.commit_id == requested.commit_id
+        && existing.delivery_id == requested.delivery_id
+        && existing.edge_cluster_id == requested.edge_cluster_id
+        && existing.storage_volume_id == requested.storage_volume_id
+        && existing.delivery_mode == requested.delivery_mode
 }
 
 fn validate_limit(limit: u16) -> CentralResult<()> {
@@ -3479,6 +3698,7 @@ fn require_active(lifecycle: &ResourceLifecycle, kind: &'static str) -> CentralR
 
 fn require_s3_snapshot(
     snapshots: &BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
+    deliveries: &BTreeMap<(TenantId, SnapshotDeliveryId), SnapshotDeliveryRecord>,
     access_point: &S3AccessPointRecord,
 ) -> CentralResult<()> {
     let snapshot = snapshots
@@ -3495,6 +3715,28 @@ fn require_s3_snapshot(
     require_active(&snapshot.lifecycle, "S3 Access Point Snapshot")?;
     if snapshot.state != SnapshotState::Ready {
         return Err(conflict("S3 Access Point Snapshot is not Ready"));
+    }
+    if snapshot.delivery_id != access_point.delivery_id
+        || snapshot.storage_volume_id != access_point.storage_volume_id
+        || snapshot.edge_cluster_id != access_point.edge_cluster_id
+    {
+        return Err(conflict(
+            "S3 Access Point Snapshot target binding does not match",
+        ));
+    }
+    let delivery = deliveries
+        .get(&(
+            access_point.tenant_id.clone(),
+            access_point.delivery_id.clone(),
+        ))
+        .ok_or_else(|| conflict("S3 Access Point SnapshotDelivery does not exist"))?;
+    if delivery.snapshot_id != access_point.snapshot_id
+        || delivery.commit_id != access_point.commit_id
+        || delivery.storage_volume_id != access_point.storage_volume_id
+        || delivery.mode != snapshot.delivery_mode
+        || delivery.state != SnapshotDeliveryState::Ready
+    {
+        return Err(conflict("S3 Access Point SnapshotDelivery is not Ready"));
     }
     Ok(())
 }
@@ -3524,6 +3766,9 @@ fn same_s3_access_point_create_identity(
         && existing.artifact_id == requested.artifact_id
         && existing.snapshot_id == requested.snapshot_id
         && existing.commit_id == requested.commit_id
+        && existing.delivery_id == requested.delivery_id
+        && existing.storage_volume_id == requested.storage_volume_id
+        && existing.edge_cluster_id == requested.edge_cluster_id
         && existing.bucket_name == requested.bucket_name
 }
 

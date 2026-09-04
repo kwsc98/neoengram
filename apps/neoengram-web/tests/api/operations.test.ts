@@ -1,81 +1,63 @@
 import { describe, expect, it } from 'vitest';
 
-import { createAddJob, finalizeAddJob, queryJob } from '@/api/operations';
-import { ApiProblem } from '@/api/problem';
-import type { CreateAddJobRequest } from '@/api/types';
+import {
+  cancelTask,
+  materializeCommit,
+  queryTask,
+  queryTaskEventList,
+  queryTaskList,
+  queryTaskSummary,
+  retryTask,
+} from '@/api/operations';
 
-function request(overrides: Partial<CreateAddJobRequest> = {}): CreateAddJobRequest {
-  return {
-    tenant_id: 'tenant-a',
-    project_id: 'project-a',
-    artifact_id: 'artifact-a',
-    playground_id: 'playground-a',
-    job_id: 'job-test-1',
-    expected_index_version: { revision: '0', digest: 'a'.repeat(64) },
-    deadline_unix_ms: String(Date.now() + 60_000),
-    paths: ['dataset/images'],
-    all: false,
-    ...overrides,
-  };
-}
+const materializationRequest = {
+  tenant_id: 'tenant-a',
+  project_id: 'project-vision',
+  artifact_id: 'road-scenes',
+  object_namespace_id: 'road-scenes',
+  commit_id: 'b'.repeat(64),
+  target_storage_volume_id: 'volume-guangzhou-delivery',
+  request_id: 'task-materialize-1',
+  coverage_goal: 'complete' as const,
+};
 
-describe('public Job operations', () => {
-  it('injects auth/version/request headers and replays an identical create request', async () => {
-    const body = request();
-    const first = await createAddJob(body);
-    const replay = await createAddJob(body);
-
+describe('public operation task API', () => {
+  it('creates an idempotent materialization task and exposes it through task queries', async () => {
+    const first = await materializeCommit(materializationRequest);
+    const replay = await materializeCommit(materializationRequest);
     expect(first.data.replayed).toBe(false);
     expect(replay.data.replayed).toBe(true);
-    expect(first.requestId).toMatch(/^req-/);
-    expect(replay.data.job.job_id).toBe('job-test-1');
+    expect(first.data.task?.task_kind).toBe('commit.materialize');
+
+    const taskId = first.data.task?.task_id;
+    expect(taskId).toBeTruthy();
+    const detail = await queryTask({ tenant_id: 'tenant-a', task_id: taskId! });
+    expect(detail.data.task.task_id).toBe(taskId);
+    expect(detail.data.events[0]?.kind).toBe('created');
+
+    const list = await queryTaskList({ tenant_id: 'tenant-a', task_kind: ['commit.materialize'] });
+    expect(list.data.items.some((item) => item.task_id === taskId)).toBe(true);
+    const summary = await queryTaskSummary({
+      tenant_id: 'tenant-a',
+      task_kind: ['commit.materialize'],
+    });
+    expect(Number(summary.data.summary.total)).toBeGreaterThanOrEqual(1);
   });
 
-  it('rejects a different valid payload when a Job ID is reused', async () => {
-    await createAddJob(request());
-
-    await expect(createAddJob(request({ paths: ['dataset/other'] }))).rejects.toMatchObject({
+  it('uses task control endpoints and keeps the same task identity', async () => {
+    const created = await materializeCommit({
+      ...materializationRequest,
+      request_id: 'task-materialize-2',
+    });
+    const taskId = created.data.task!.task_id;
+    const cancelled = await cancelTask({ tenant_id: 'tenant-a', task_id: taskId });
+    expect(cancelled.data.task.task_id).toBe(taskId);
+    expect(cancelled.data.task.state).toBe('cancelled');
+    await expect(retryTask({ tenant_id: 'tenant-a', task_id: taskId })).rejects.toMatchObject({
       status: 409,
-      code: 'JOB_ID_REUSED',
-      retryable: false,
+      code: 'TASK_NOT_RETRYABLE',
     });
-  });
-
-  it('returns stable not-found, deadline and invalid-state problems', async () => {
-    await expect(queryJob('tenant-a', 'job-missing')).rejects.toMatchObject({
-      status: 404,
-      code: 'JOB_NOT_FOUND',
-    });
-    await expect(
-      createAddJob(request({ job_id: 'job-expired', deadline_unix_ms: '1' })),
-    ).rejects.toMatchObject({ status: 408, code: 'JOB_DEADLINE_EXCEEDED' });
-    await createAddJob(request({ job_id: 'job-not-prepared' }));
-    await expect(finalizeAddJob('tenant-a', 'job-not-prepared')).rejects.toMatchObject({
-      status: 409,
-      code: 'JOB_INVALID_STATE',
-    });
-  });
-
-  it('advances through Prepared and replays the stable finalize decision', async () => {
-    await createAddJob(request());
-    expect((await queryJob('tenant-a', 'job-test-1')).data.job.state).toBe('running');
-    expect((await queryJob('tenant-a', 'job-test-1')).data.job.state).toBe('prepared');
-
-    const finalized = await finalizeAddJob('tenant-a', 'job-test-1');
-    const replay = await finalizeAddJob('tenant-a', 'job-test-1');
-    expect(finalized.data.replayed).toBe(false);
-    expect(finalized.data.job.state).toBe('succeeded');
-    expect(replay.data.replayed).toBe(true);
-    expect(replay.data.decision).toEqual(finalized.data.decision);
-  });
-
-  it('maps validation and unavailable responses to RFC 9457 errors', async () => {
-    await expect(createAddJob(request({ paths: [] }))).rejects.toBeInstanceOf(ApiProblem);
-    await expect(createAddJob(request({ tenant_id: 'tenant-unavailable' }))).rejects.toMatchObject({
-      status: 503,
-      code: 'STORAGE_FAILURE',
-      retryable: true,
-      retryAfterMs: 1000,
-    });
+    const events = await queryTaskEventList({ tenant_id: 'tenant-a', task_id: taskId });
+    expect(events.data.items.some((event) => event.kind === 'cancelled')).toBe(true);
   });
 });

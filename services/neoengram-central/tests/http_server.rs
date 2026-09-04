@@ -12,7 +12,6 @@ use neoengram_central::{
     StorageBackendType, StorageVolumeRecord, StorageVolumeState, TenantRecord,
 };
 use neoengram_central::{AppState, Config};
-use neoengram_domain::core::IndexVersion;
 use neoengram_domain::protocol::{
     ArtifactId, EdgeClusterId, PlaygroundId, ProjectId, StorageVolumeId, TenantId, UnixMillis,
 };
@@ -72,9 +71,9 @@ async fn public_http_contract_runs_over_a_real_socket_and_drains() {
     let missing_token = exchange(
         address,
         "POST",
-        "/api/job/query",
+        "/api/task/query",
         &[("neoengram-api-version", "1")],
-        br#"{"tenant_id":"tenant-a","job_id":"job-a"}"#,
+        br#"{"tenant_id":"tenant-a","task_id":"task-a"}"#,
     )
     .await;
     assert_problem(
@@ -87,9 +86,9 @@ async fn public_http_contract_runs_over_a_real_socket_and_drains() {
     let missing_version = exchange(
         address,
         "POST",
-        "/api/job/query",
+        "/api/task/query",
         &[("authorization", "Bearer test-secret")],
-        br#"{"tenant_id":"tenant-a","job_id":"job-a"}"#,
+        br#"{"tenant_id":"tenant-a","task_id":"task-a"}"#,
     )
     .await;
     assert_problem(
@@ -109,12 +108,12 @@ async fn public_http_contract_runs_over_a_real_socket_and_drains() {
     let wrong_version = exchange(
         address,
         "POST",
-        "/api/job/query",
+        "/api/task/query",
         &[
             ("authorization", "Bearer test-secret"),
             ("neoengram-api-version", "2"),
         ],
-        br#"{"tenant_id":"tenant-a","job_id":"job-a"}"#,
+        br#"{"tenant_id":"tenant-a","task_id":"task-a"}"#,
     )
     .await;
     assert_problem(
@@ -134,7 +133,7 @@ async fn public_http_contract_runs_over_a_real_socket_and_drains() {
     let invalid_json = exchange(
         address,
         "POST",
-        "/api/job/query",
+        "/api/task/query",
         &protected_headers(),
         br#"{"#,
     )
@@ -150,7 +149,7 @@ async fn public_http_contract_runs_over_a_real_socket_and_drains() {
     let body_limit = exchange(
         address,
         "POST",
-        "/api/job/query",
+        "/api/task/query",
         &protected_headers(),
         &oversized,
     )
@@ -162,25 +161,9 @@ async fn public_http_contract_runs_over_a_real_socket_and_drains() {
         "urn:neoengram:problem:payload-too-large",
     );
 
-    let create_body = add_request(false);
-    let created = exchange(
-        address,
-        "POST",
-        "/api/job/add/create",
-        &protected_headers(),
-        &serde_json::to_vec(&create_body).unwrap(),
-    )
-    .await;
-    assert_eq!(
-        created.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&created.body)
-    );
-    assert_eq!(created.json()["replayed"], false);
-    assert_eq!(created.json()["job"]["state"], "queued");
-
-    let queried = exchange(
+    // v20 is clean-slate: the removed v1 Job API is a hard route miss, even for an
+    // authenticated caller. All lifecycle operations are exposed through /api/task/*.
+    let removed_job_route = exchange(
         address,
         "POST",
         "/api/job/query",
@@ -188,47 +171,11 @@ async fn public_http_contract_runs_over_a_real_socket_and_drains() {
         br#"{"tenant_id":"tenant-a","job_id":"job-a"}"#,
     )
     .await;
-    assert_eq!(queried.status, 200);
-
-    let replayed = exchange(
-        address,
-        "POST",
-        "/api/job/add/create",
-        &protected_headers(),
-        &serde_json::to_vec(&create_body).unwrap(),
-    )
-    .await;
-    assert_eq!(replayed.status, 200);
-    assert_eq!(replayed.json()["replayed"], true);
-
-    let conflicting = exchange(
-        address,
-        "POST",
-        "/api/job/add/create",
-        &protected_headers(),
-        &serde_json::to_vec(&add_request(true)).unwrap(),
-    )
-    .await;
     assert_problem(
-        &conflicting,
-        409,
-        "JOB_ID_REUSED",
-        "urn:neoengram:problem:job-id-reused",
-    );
-
-    let finalize = exchange(
-        address,
-        "POST",
-        "/api/job/add/finalize",
-        &protected_headers(),
-        br#"{"tenant_id":"tenant-a","job_id":"job-a"}"#,
-    )
-    .await;
-    assert_problem(
-        &finalize,
-        409,
-        "JOB_INVALID_STATE",
-        "urn:neoengram:problem:job-invalid-state",
+        &removed_job_route,
+        404,
+        "ROUTE_NOT_FOUND",
+        "urn:neoengram:problem:route-not-found",
     );
 
     let handle = running.handle();
@@ -270,24 +217,6 @@ fn protected_headers() -> [(&'static str, &'static str); 3] {
         ("neoengram-api-version", "1"),
         ("x-request-id", "req:http-test-1"),
     ]
-}
-
-fn add_request(all: bool) -> Value {
-    let index = IndexVersion::from_snapshot(0, &[]).unwrap();
-    json!({
-        "tenant_id": "tenant-a",
-        "project_id": "project-a",
-        "artifact_id": "artifact-a",
-        "playground_id": "playground-a",
-        "job_id": "job-a",
-        "expected_index_version": {
-            "revision": index.revision.to_string(),
-            "digest": index.digest.to_string()
-        },
-        "deadline_unix_ms": "4102444800000",
-        "paths": ["dataset/images"],
-        "all": all
-    })
 }
 
 async fn seed_job_scope(path: &Path) {

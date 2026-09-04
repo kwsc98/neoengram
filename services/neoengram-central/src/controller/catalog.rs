@@ -4,7 +4,6 @@ use fusen_rs::{interface, Call, Error, Response};
 
 use crate::{
     dto::{
-        CancelCommitMaterializationRequest, CancelCommitMaterializationResponse,
         CancelPreCommitRequest, CancelPreCommitResponse, CommitPlaygroundRequest,
         CommitPlaygroundResponse, CreateArtifactRequest, CreateArtifactResponse,
         CreateCommitMaterializationRequest, CreateCommitMaterializationResponse,
@@ -12,18 +11,15 @@ use crate::{
         CreateProjectRequest, CreateProjectResponse, CreateRetentionHoldRequest,
         CreateRetentionHoldResponse, CreateS3AccessPointRequest, CreateS3AccessPointResponse,
         CreateS3CredentialRequest, CreateS3CredentialResponse, CreateS3DownloadUrlRequest,
-        CreateS3DownloadUrlResponse, CreateSnapshotDeliveryRequest, CreateSnapshotDeliveryResponse,
-        CreateSnapshotRequest, CreateSnapshotResponse, CreateStorageVolumeRequest,
-        CreateStorageVolumeResponse, CreateTenantRequest, CreateTenantResponse,
-        CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteSnapshotDeliveryRequest,
-        DeleteSnapshotDeliveryResponse, DeletionMutationResponse, InternalS3AuthorizeRequest,
-        InternalS3AuthorizeResponse, QueryArtifactCommitDiffRequest,
+        CreateS3DownloadUrlResponse, CreateSnapshotRequest, CreateSnapshotResponse,
+        CreateStorageVolumeRequest, CreateStorageVolumeResponse, CreateTenantRequest,
+        CreateTenantResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+        DeleteSnapshotDeliveryRequest, DeleteSnapshotDeliveryResponse, DeletionMutationResponse,
+        InternalS3AuthorizeRequest, InternalS3AuthorizeResponse, QueryArtifactCommitDiffRequest,
         QueryArtifactCommitDiffResponse, QueryArtifactCommitGraphRequest,
         QueryArtifactCommitGraphResponse, QueryArtifactListRequest, QueryArtifactListResponse,
         QueryArtifactRequest, QueryArtifactResponse, QueryCommitAvailabilityV2Request,
         QueryCommitAvailabilityV2Response, QueryCommitCoverageRequest, QueryCommitCoverageResponse,
-        QueryCommitMaterializationListRequest, QueryCommitMaterializationListResponse,
-        QueryCommitMaterializationRequest, QueryCommitMaterializationResponse,
         QueryDeletionImpactRequest, QueryDeletionImpactResponse, QueryDeletionListRequest,
         QueryDeletionListResponse, QueryDeletionRequest, QueryDeletionResponse,
         QueryPlaygroundChangeListRequest, QueryPlaygroundChangeListResponse,
@@ -42,11 +38,9 @@ use crate::{
         QueryStorageVolumeListResponse, QueryStorageVolumeRequest, QueryStorageVolumeResponse,
         QueryTenantListRequest, QueryTenantListResponse, QueryTenantRequest, QueryTenantResponse,
         ReleaseRetentionHoldRequest, ReleaseRetentionHoldResponse, RestartPreCommitRequest,
-        RestartPreCommitResponse, RetryCommitMaterializationRequest,
-        RetryCommitMaterializationResponse, RetrySnapshotDeliveryRequest,
-        RetrySnapshotDeliveryResponse, RevokeS3CredentialRequest, StartPreCommitRequest,
-        StartPreCommitResponse, UpdateDeletionRequest, UpdateS3AccessPointRequest,
-        UpdateS3AccessPointResponse,
+        RestartPreCommitResponse, RetrySnapshotDeliveryRequest, RetrySnapshotDeliveryResponse,
+        RevokeS3CredentialRequest, StartPreCommitRequest, StartPreCommitResponse,
+        UpdateDeletionRequest, UpdateS3AccessPointRequest, UpdateS3AccessPointResponse,
     },
     service::CatalogService,
 };
@@ -62,40 +56,12 @@ pub trait PlacementApi {
         #[param(body)] request: CreateCommitMaterializationRequest,
     ) -> Result<Response<CreateCommitMaterializationResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/commit/materialization/query")]
-    async fn query_commit_materialization(
-        &self,
-        #[param(context)] call: Call,
-        #[param(body)] request: QueryCommitMaterializationRequest,
-    ) -> Result<Response<QueryCommitMaterializationResponse>, Error>;
-
-    #[fusen_rs::method(method = "POST", path = "/api/commit/materialization/list/query")]
-    async fn query_commit_materialization_list(
-        &self,
-        #[param(context)] call: Call,
-        #[param(body)] request: QueryCommitMaterializationListRequest,
-    ) -> Result<Response<QueryCommitMaterializationListResponse>, Error>;
-
     #[fusen_rs::method(method = "POST", path = "/api/commit/coverage/query")]
     async fn query_commit_coverage(
         &self,
         #[param(context)] call: Call,
         #[param(body)] request: QueryCommitCoverageRequest,
     ) -> Result<Response<QueryCommitCoverageResponse>, Error>;
-
-    #[fusen_rs::method(method = "POST", path = "/api/commit/materialization/retry")]
-    async fn retry_commit_materialization(
-        &self,
-        #[param(context)] call: Call,
-        #[param(body)] request: RetryCommitMaterializationRequest,
-    ) -> Result<Response<RetryCommitMaterializationResponse>, Error>;
-
-    #[fusen_rs::method(method = "POST", path = "/api/commit/materialization/cancel")]
-    async fn cancel_commit_materialization(
-        &self,
-        #[param(context)] call: Call,
-        #[param(body)] request: CancelCommitMaterializationRequest,
-    ) -> Result<Response<CancelCommitMaterializationResponse>, Error>;
 
     #[fusen_rs::method(method = "POST", path = "/api/commit/availability/query")]
     async fn query_commit_availability(
@@ -135,28 +101,6 @@ impl PlacementApi for PlacementController {
             .map(Response::new)
     }
 
-    async fn query_commit_materialization(
-        &self,
-        call: Call,
-        request: QueryCommitMaterializationRequest,
-    ) -> Result<Response<QueryCommitMaterializationResponse>, Error> {
-        self.service
-            .query_commit_materialization(&authenticated_identity(&call)?, request)
-            .await
-            .map(Response::new)
-    }
-
-    async fn query_commit_materialization_list(
-        &self,
-        call: Call,
-        request: QueryCommitMaterializationListRequest,
-    ) -> Result<Response<QueryCommitMaterializationListResponse>, Error> {
-        self.service
-            .query_commit_materialization_list(&authenticated_identity(&call)?, request)
-            .await
-            .map(Response::new)
-    }
-
     async fn query_commit_coverage(
         &self,
         call: Call,
@@ -164,28 +108,6 @@ impl PlacementApi for PlacementController {
     ) -> Result<Response<QueryCommitCoverageResponse>, Error> {
         self.service
             .query_commit_coverage(&authenticated_identity(&call)?, request)
-            .await
-            .map(Response::new)
-    }
-
-    async fn retry_commit_materialization(
-        &self,
-        call: Call,
-        request: RetryCommitMaterializationRequest,
-    ) -> Result<Response<RetryCommitMaterializationResponse>, Error> {
-        self.service
-            .retry_commit_materialization(&authenticated_identity(&call)?, request)
-            .await
-            .map(Response::new)
-    }
-
-    async fn cancel_commit_materialization(
-        &self,
-        call: Call,
-        request: CancelCommitMaterializationRequest,
-    ) -> Result<Response<CancelCommitMaterializationResponse>, Error> {
-        self.service
-            .cancel_commit_materialization(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
@@ -425,13 +347,6 @@ pub trait SnapshotApi {
         #[param(context)] call: Call,
         #[param(body)] request: CreateSnapshotRequest,
     ) -> Result<Response<CreateSnapshotResponse>, Error>;
-
-    #[fusen_rs::method(method = "POST", path = "/api/snapshot/delivery/create")]
-    async fn create_snapshot_delivery(
-        &self,
-        #[param(context)] call: Call,
-        #[param(body)] request: CreateSnapshotDeliveryRequest,
-    ) -> Result<Response<CreateSnapshotDeliveryResponse>, Error>;
 
     #[fusen_rs::method(method = "POST", path = "/api/snapshot/delivery/query")]
     async fn query_snapshot_delivery(
@@ -986,17 +901,6 @@ impl SnapshotApi for SnapshotController {
     ) -> Result<Response<CreateSnapshotResponse>, Error> {
         self.service
             .create_snapshot(&authenticated_identity(&call)?, request)
-            .await
-            .map(Response::new)
-    }
-
-    async fn create_snapshot_delivery(
-        &self,
-        call: Call,
-        request: CreateSnapshotDeliveryRequest,
-    ) -> Result<Response<CreateSnapshotDeliveryResponse>, Error> {
-        self.service
-            .create_snapshot_delivery(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }

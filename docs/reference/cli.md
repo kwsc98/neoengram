@@ -112,6 +112,7 @@ mixed 仓库未显式指定时，已跟踪文件继承原策略，新文件默�
 | `mount` / `unmount` | 固定 Commit | 系统挂载状态 | 按需读取只读快照 |
 | `recover` | 事务 journal | 工作区、Index、HEAD | 恢复中断的 checkout/rm |
 | `fsck` | 整个本地仓库 | 无 | 完整性检查 |
+| `neoengram-agent integrity-check` | Managed Volume CAS 和 Agent placement inventory | 无 | 检查 Volume 对象完整性 |
 | `gc` | 全部 roots 和对象 | ObjectStore | 回收无引用 Chunk |
 
 ## 6. 初始化与 Workspace
@@ -405,6 +406,88 @@ DAG、Manifest recipe、仓库分块策略、路径规则、引用大小，以�
 
 发现缺失或损坏会明确失败并给出对象/引用上下文，不会跳过、覆盖或自动修复。
 
+### Managed Volume 完整性检查与副本补齐
+
+Agent 的 Managed Volume 使用独立命令扫描。它会遍历
+`.neoengram/objects/tenants/<tenant>/artifacts/<artifact>/objects`，校验对象文件名、普通文件类型、
+文件大小和 BLAKE3，并和该 Agent 的 placement inventory 对照，区分 `missing`、`corrupt`、`orphan`
+和 `unknown`。命令只读，不会删除、恢复或改写对象：
+
+```bash
+cargo run --locked --offline -p neoengram-agent --bin neoengram-agent -- \
+  integrity-check \
+  --config "$HOME/Library/Application Support/NeoEngram/dev/agents/mount/agent.yaml"
+
+# 需要机器可读结果时：
+cargo run --locked --offline -p neoengram-agent --bin neoengram-agent -- \
+  integrity-check \
+  --config "$HOME/Library/Application Support/NeoEngram/dev/agents/mount/agent.yaml" \
+  --json
+```
+
+`--config` 应替换为实际 Volume 的 Agent 配置，例如 `mount2/agent.yaml` 或 `mount3/agent.yaml`。
+发现任意问题时命令以非零退出码结束。扫描本身始终是只读诊断，不会删除、恢复、改写对象，也不会
+自动复制；手工命令需要独占 Agent 状态数据库。如果对应 Agent 正在运行，请先停止它，或直接查看
+Agent 自动扫描的 `<state_dir>/volume-integrity.json`。Agent 启动时会立即执行一次扫描，运行期间约每
+15 分钟重复，并把运行时 scrub 结果通过已认证的 Agent channel 上报 Central；上报会使异常 Placement
+从健康来源和 Coverage 计算中排除，但不会把损坏对象标记为可用。手工 `integrity-check` 只返回本地诊断
+结果，不会直接更新 Central。
+
+#### 完整性异常后的副本补齐（v2）
+
+完整性上报后，使用 Central 的统一任务重试来补齐缺失或损坏对象。`/api/task/retry` 是显式
+修复入口，不是 Agent scrub 的隐式副作用；它会从其他健康 Volume/Agent Placement 重新选择
+primary/fallback。目标端已经 `Verified` 的对象保留，仍有效的 staging checkpoint 继续断点传输；被
+标记为 `missing`/`corrupt` 的对象从零重新传输。没有健康来源时任务会等待来源、停滞或失败，而不会把
+`partial` Coverage 变成可读视图。
+
+按以下顺序操作（所有 `<...>` 占位符都替换为实际值；`ObjectNamespaceId` 初期通常等于 `ArtifactId`）：
+
+1. 查询每个 Volume 的对象覆盖，以及 Commit 是否仍有可服务来源：
+
+   ```bash
+   curl -sS "$CENTRAL_URL/api/commit/coverage/query" \
+     -H "NeoEngram-API-Version: 1" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"tenant_id":"<tenant>","object_namespace_id":"<namespace>","commit_id":"<commit>"}'
+
+   curl -sS "$CENTRAL_URL/api/commit/availability/query" \
+     -H "NeoEngram-API-Version: 1" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"tenant_id":"<tenant>","object_namespace_id":"<namespace>","commit_id":"<commit>","target_storage_volume_id":"<target-volume>"}'
+   ```
+
+   `coverage` 返回各目标 Volume 的 `partial/complete` 和缺失计数；`availability` 返回
+   `content_presence`、`source_serving`、`durability`、`target_coverage`、`view_readiness` 及缺失对象。
+
+2. 查询目标 Volume 对应的统一操作任务，取得 `task_id` 和当前 `attempt`：
+
+   ```bash
+   curl -sS "$CENTRAL_URL/api/task/list/query" \
+     -H "NeoEngram-API-Version: 1" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"tenant_id":"<tenant>","object_namespace_id":"<namespace>","commit_id":"<commit>","storage_volume_id":"<target-volume>","task_kind":["commit.materialize"]}'
+   ```
+
+3. 使用查询到的 `task_id` 显式触发重试。重试复用原任务并创建新的 Attempt；若期间任务已变化而返回
+   `409`，重新执行第 2 步：
+
+   ```bash
+   curl -sS "$CENTRAL_URL/api/task/retry" \
+     -H "NeoEngram-API-Version: 1" \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"tenant_id":"<tenant>","task_id":"<task-id>","expected_resource_version":"<resource-version>"}'
+   ```
+
+   返回的 `task.state` 会重新进入 `queued`，并由 Materialization 明细重新规划；`succeeded` 只在目标达到
+   Coverage goal 后出现。重试完成后再次查询 Coverage/Availability
+   确认对象已由其他健康 Placement 补齐。当前没有公开的立即 scrub HTTP action；若要马上产生并上报新的
+   扫描，可重启 Agent。停止 Agent 后执行上面的 `integrity-check` 只用于本地诊断，不会直接更新 Central。
+
 ### `gc`
 
 ```bash
@@ -448,7 +531,9 @@ lock 文件不是永久锁；checkout/rm/restore 的 mutation journal 才是需�
 
 对象每次关键读取都会核对期望大小和 BLAKE3，包括对象复用、commit 发布、checkout、restore、
 export、FUSE cache miss、fsck 和 GC 删除前验证。损坏会 fail closed，不会用工作区或硬链接内容
-静默覆盖对象。当前没有自动修复 API。
+静默覆盖对象。本地仓库的 `fsck` 仍是只读检查；Managed Volume 的异常需要按上面的流程显式调用
+`/api/task/retry`，由 Central 重新规划并从健康 Placement 补齐。定时自动修复、真实跨 Gateway/Agent
+传输和生产级故障恢复尚未完成。
 
 ## 13. 存储格式与升级
 

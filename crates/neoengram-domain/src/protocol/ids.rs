@@ -138,7 +138,16 @@ resource_id!(ReplicationId, "replication ID");
 resource_id!(TransferId, "transfer ID");
 resource_id!(MaterializationId, "materialization ID");
 resource_id!(MaterializationBatchId, "materialization batch ID");
+resource_id!(IntegrityScanId, "integrity scan ID");
 resource_id!(WorkspaceId, "workspace ID");
+// Unified operation/audit identities. These remain opaque resource identifiers so Central can
+// choose an implementation-specific format while every wire boundary applies the same grammar.
+resource_id!(TaskId, "operation task ID");
+resource_id!(TaskAttemptId, "task attempt ID");
+resource_id!(TaskEventId, "task event ID");
+
+/// Explicit spelling used by persistence adapters when a generic task ID would be ambiguous.
+pub type OperationTaskId = TaskId;
 
 /// Alias used by placement APIs when the backend is specifically a storage volume or archive.
 pub type StorageBackendId = BackendId;

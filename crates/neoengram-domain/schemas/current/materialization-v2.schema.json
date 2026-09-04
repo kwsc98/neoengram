@@ -16,6 +16,9 @@
       "$ref": "#/$defs/VolumeCommitCoverage"
     },
     {
+      "$ref": "#/$defs/IntegrityScanReport"
+    },
+    {
       "$ref": "#/$defs/DurabilityPolicy"
     },
     {
@@ -421,6 +424,38 @@
       "minLength": 1,
       "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
     },
+    "IntegrityScanId": {
+      "description": "A validated integrity scan ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "IntegrityScanReport": {
+      "description": "Agent-to-Central report for one completed Volume scrub.\n\nThe scan aggregate is useful for operator diagnostics while the per-placement observations\nare the durable input to source selection and target coverage.  Agent/session/mount identity\nis supplied by the authenticated channel frame; Central still checks every scope field before\naccepting the observations.",
+      "type": "object",
+      "properties": {
+        "mount_generation": {
+          "$ref": "#/$defs/MountGeneration"
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PlacementHealthObservation"
+          },
+          "maxItems": 268431360
+        },
+        "scan": {
+          "$ref": "#/$defs/VolumeIntegrityScan"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "scan",
+        "mount_generation",
+        "observations"
+      ]
+    },
     "LeaseId": {
       "description": "A validated lease ID wire identifier.",
       "type": "string",
@@ -438,6 +473,10 @@
         "manifest": {
           "$ref": "#/$defs/BatchManifest"
         },
+        "operation_task_id": {
+          "description": "Unified operation identity copied from the signed ticket and durable Job.",
+          "$ref": "#/$defs/TaskId"
+        },
         "pages": {
           "type": "array",
           "items": {
@@ -447,10 +486,16 @@
         },
         "signed_ticket": {
           "$ref": "#/$defs/SignedMaterializationBatchTicket"
+        },
+        "task_attempt_id": {
+          "description": "Exact execution attempt authorized for this assignment.",
+          "$ref": "#/$defs/TaskAttemptId"
         }
       },
       "additionalProperties": false,
       "required": [
+        "operation_task_id",
+        "task_attempt_id",
         "signed_ticket",
         "batch",
         "manifest",
@@ -574,6 +619,9 @@
         "object_namespace_id": {
           "$ref": "#/$defs/ObjectNamespaceId"
         },
+        "operation_task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
         "plan_revision": {
           "$ref": "#/$defs/Generation"
         },
@@ -582,6 +630,9 @@
         },
         "target": {
           "$ref": "#/$defs/MaterializationTarget"
+        },
+        "task_attempt_id": {
+          "$ref": "#/$defs/TaskAttemptId"
         },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
@@ -593,6 +644,8 @@
       "additionalProperties": false,
       "required": [
         "ticket_id",
+        "operation_task_id",
+        "task_attempt_id",
         "materialization_id",
         "batch_id",
         "plan_revision",
@@ -650,6 +703,10 @@
         "object_count": {
           "$ref": "#/$defs/DecimalU64"
         },
+        "operation_task_id": {
+          "description": "Unified operation identity that owns this domain detail record.",
+          "$ref": "#/$defs/TaskId"
+        },
         "plan_revision": {
           "$ref": "#/$defs/Generation"
         },
@@ -658,6 +715,10 @@
         },
         "state": {
           "$ref": "#/$defs/MaterializationJobState"
+        },
+        "task_attempt_id": {
+          "description": "Attempt identity used when Central fences data-plane reports.",
+          "$ref": "#/$defs/TaskAttemptId"
         },
         "total_bytes": {
           "$ref": "#/$defs/DecimalU64"
@@ -675,6 +736,8 @@
       "additionalProperties": false,
       "required": [
         "materialization_id",
+        "operation_task_id",
+        "task_attempt_id",
         "key",
         "artifact_id",
         "state",
@@ -861,6 +924,9 @@
         "object_namespace_id": {
           "$ref": "#/$defs/ObjectNamespaceId"
         },
+        "operation_task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
         "plan_revision": {
           "$ref": "#/$defs/Generation"
         },
@@ -876,6 +942,9 @@
         "target_storage_volume_id": {
           "$ref": "#/$defs/StorageVolumeId"
         },
+        "task_attempt_id": {
+          "$ref": "#/$defs/TaskAttemptId"
+        },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
         },
@@ -889,6 +958,8 @@
       "additionalProperties": false,
       "required": [
         "receipt_id",
+        "operation_task_id",
+        "task_attempt_id",
         "materialization_id",
         "batch_id",
         "plan_revision",
@@ -992,6 +1063,9 @@
                 "object_namespace_id": {
                   "$ref": "#/$defs/ObjectNamespaceId"
                 },
+                "operation_task_id": {
+                  "$ref": "#/$defs/TaskId"
+                },
                 "plan_revision": {
                   "$ref": "#/$defs/Generation"
                 },
@@ -999,12 +1073,17 @@
                   "description": "The complete target fence from the signed assignment.  Failure reports must not rely\non whatever route happens to be current when Central receives them.",
                   "$ref": "#/$defs/MaterializationTarget"
                 },
+                "task_attempt_id": {
+                  "$ref": "#/$defs/TaskAttemptId"
+                },
                 "tenant_id": {
                   "$ref": "#/$defs/TenantId"
                 }
               },
               "additionalProperties": false,
               "required": [
+                "operation_task_id",
+                "task_attempt_id",
                 "materialization_id",
                 "batch_id",
                 "plan_revision",
@@ -1386,6 +1465,76 @@
       "minLength": 1,
       "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
     },
+    "PlacementHealthObservation": {
+      "description": "Durable observation emitted by an Agent Volume scrub.",
+      "type": "object",
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "object_id": {
+          "$ref": "#/$defs/ObjectId"
+        },
+        "object_namespace_id": {
+          "$ref": "#/$defs/ObjectNamespaceId"
+        },
+        "observed_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "observed_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "observed_size": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "placement_id": {
+          "$ref": "#/$defs/PlacementId"
+        },
+        "scan_id": {
+          "$ref": "#/$defs/IntegrityScanId"
+        },
+        "state": {
+          "$ref": "#/$defs/PlacementHealthState"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "scan_id",
+        "tenant_id",
+        "object_namespace_id",
+        "placement_id",
+        "object_id",
+        "storage_volume_id",
+        "placement_generation",
+        "state",
+        "observed_size",
+        "observed_digest",
+        "observed_at_unix_ms"
+      ]
+    },
+    "PlacementHealthState": {
+      "description": "Result of checking one physical object against the immutable Placement evidence.\n\nThis is deliberately separate from `ObjectPlacementState`: a transient I/O error must not\nsilently retire durable evidence, while an independently confirmed missing or corrupt file\nmust be excluded from source selection until a later scan proves it healthy again.",
+      "type": "string",
+      "enum": [
+        "healthy",
+        "missing",
+        "corrupt",
+        "orphan",
+        "unknown"
+      ]
+    },
     "PlacementId": {
       "description": "A validated object placement ID wire identifier.",
       "type": "string",
@@ -1491,6 +1640,20 @@
       "minLength": 1,
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     },
+    "TaskAttemptId": {
+      "description": "A validated task attempt ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TaskId": {
+      "description": "A validated operation task ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
     "TenantId": {
       "description": "A validated tenant ID wire identifier.",
       "type": "string",
@@ -1564,6 +1727,85 @@
         "total_bytes",
         "verified_bytes",
         "state"
+      ]
+    },
+    "VolumeIntegrityScan": {
+      "type": "object",
+      "properties": {
+        "checked_objects": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "corrupt_objects": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finished_at_unix_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnixMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "healthy_objects": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "missing_objects": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "orphan_objects": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "placement_generation": {
+          "$ref": "#/$defs/PlacementGeneration"
+        },
+        "scan_id": {
+          "$ref": "#/$defs/IntegrityScanId"
+        },
+        "started_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "state": {
+          "$ref": "#/$defs/VolumeIntegrityScanState"
+        },
+        "storage_volume_id": {
+          "$ref": "#/$defs/StorageVolumeId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "scan_id",
+        "tenant_id",
+        "storage_volume_id",
+        "placement_generation",
+        "state",
+        "checked_objects",
+        "healthy_objects",
+        "missing_objects",
+        "corrupt_objects",
+        "orphan_objects",
+        "started_at_unix_ms"
+      ]
+    },
+    "VolumeIntegrityScanState": {
+      "description": "Aggregate state of one explicit or scheduled Volume integrity scan.",
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "complete",
+        "failed",
+        "cancelled"
       ]
     }
   }

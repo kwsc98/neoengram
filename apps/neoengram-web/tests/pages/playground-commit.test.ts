@@ -60,7 +60,7 @@ async function mountPage(
       agent_wire_version: 1,
       capabilities: [
         'artifact_commit_graph',
-        'snapshot_materialize',
+        'commit_materialization_v2',
         'playground_browser',
         'playground_precommit',
       ],

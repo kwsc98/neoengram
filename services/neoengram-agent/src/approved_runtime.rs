@@ -17,9 +17,10 @@ use neoengram_domain::protocol::{
     new_control_envelope, AgentBootId, AgentChannelDownstreamFrame, AgentChannelDownstreamMessage,
     AgentChannelUpstreamMessage, AgentChannelUpstreamPayload, AgentHeartbeat,
     AgentHeartbeatReportPayload, AgentId, AgentInstallationId, AgentJobReportCreatePayload,
-    AgentSessionClosePayload, AgentSessionOpenPayload, Extensions, JobAssignment, JobDecision,
-    JobState, MessageId, MountAccessMode, RequestId, ResourceVersion, RunningJobObservation,
-    S3ReadChannelHello, SequenceNumber, SessionGeneration, TenantId, TraceId, UnixMillis,
+    AgentSessionClosePayload, AgentSessionOpenPayload, Extensions, IntegrityScanId, JobAssignment,
+    JobDecision, JobState, MessageId, MountAccessMode, RequestId, ResourceVersion,
+    RunningJobObservation, S3ReadChannelHello, SequenceNumber, SessionGeneration, TenantId,
+    TraceId, UnixMillis,
 };
 use tokio::time::{self, MissedTickBehavior};
 use uuid::Uuid;
@@ -40,7 +41,7 @@ use crate::{
     MountedVolumeReplicationExecutor, PlacementInventoryConfig, RuntimeHealthPhase, S3ReadExecutor,
     S3SnapshotSource, SessionExecutionBridge, SharedResourceVersion, SharedSessionFence,
     SnapshotCasReaderFactory, SnapshotDeliveryMountManager, SqlitePlacementInventory,
-    WorkspaceMaterializer,
+    VolumeIntegrityScanner, WorkspaceMaterializer,
 };
 
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
@@ -50,6 +51,8 @@ const MAX_REPORTS_PER_FLUSH: usize = 1;
 const CHANNEL_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const INTEGRITY_SCAN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const INTEGRITY_REPORT_FILE: &str = "volume-integrity.json";
 
 struct ShutdownSignalGuard(Arc<std::sync::atomic::AtomicBool>);
 
@@ -217,6 +220,7 @@ pub(crate) async fn run_approved_session<C, P, F>(
     signing_key: AgentSigningKey,
     initial_resource_version: ResourceVersion,
     command_trust_bundle: Option<Arc<CentralCommandTrustBundle>>,
+    replication_network: Option<Arc<crate::QuicTransferNetwork>>,
     shutdown: F,
 ) -> AgentDaemonResult<()>
 where
@@ -257,10 +261,9 @@ where
     )?);
     reports.integrity_check()?;
     let deferred = Arc::new(DeferredProcessor::default());
-    // Bind and preflight the replication data plane before opening the Central session. A
-    // replication-enabled Agent may stay online when the Gateway is temporarily unavailable, but
-    // Central must not persist the dynamic capability until the endpoint handshake succeeds.
-    let replication_network = build_replication_network(&config)?;
+    // The runtime binds this endpoint once during startup so enrollment, capability preflight,
+    // and every certificate-renewed session share the same socket. Rebinding the fixed listener
+    // races Quinn's asynchronous endpoint-driver shutdown and can report EADDRINUSE.
     let replication_ready = replication_preflight(replication_network.as_deref()).await;
     let mut open_payload = AgentSessionOpenPayload {
         mount_identity_digest,
@@ -345,6 +348,24 @@ where
         .with_placement_inventory(Arc::clone(&source_inventory));
     execution.initialize()?;
     let execution = Arc::new(execution);
+
+    // Physical CAS bytes are outside Central's authority, so periodically scrub the mounted
+    // Volume and persist a diagnostic report. The scan is read-only and deliberately does not
+    // make the Agent session fail: a missing/corrupt copy should trigger source re-planning while
+    // an unavailable mount remains governed by the existing mount probe and session fences.
+    let integrity_scanner = Arc::new(VolumeIntegrityScanner::new(
+        config.storage.mount_path.clone(),
+        volume.tenant_id.clone(),
+        volume.storage_volume_id.clone(),
+        Arc::clone(&source_inventory),
+    ));
+    let _integrity_scrubber = spawn_integrity_scrubber(
+        integrity_scanner,
+        config.storage.state_dir.clone(),
+        Arc::clone(&shutdown_signal),
+        reports.clone(),
+        volume.mount_generation,
+    );
 
     let (_replication_shutdown, replication_shutdown_receiver) = tokio::sync::watch::channel(false);
     if let (Some(network), Some(trust_bundle)) =
@@ -626,6 +647,98 @@ where
             )
         });
     }
+}
+
+fn spawn_integrity_scrubber(
+    scanner: Arc<VolumeIntegrityScanner>,
+    state_dir: std::path::PathBuf,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    reports: Arc<dyn OutboundReportQueue>,
+    mount_generation: neoengram_domain::protocol::MountGeneration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let report_path = state_dir.join(INTEGRITY_REPORT_FILE);
+        let run_scan = |scanner: Arc<VolumeIntegrityScanner>,
+                        report_path: std::path::PathBuf,
+                        reports: Arc<dyn OutboundReportQueue>| async move {
+            let scan_scanner = Arc::clone(&scanner);
+            match tokio::task::spawn_blocking(move || scan_scanner.scan()).await {
+                Ok(Ok(report)) => {
+                    if let Err(error) = report.write_json(&report_path) {
+                        tracing::warn!(%error, "failed to persist Volume integrity report");
+                    }
+                    if !report.is_healthy() {
+                        tracing::warn!(
+                            scanned_objects = report.scanned_objects,
+                            verified_objects = report.verified_objects,
+                            missing = report.missing.len(),
+                            corrupt = report.corrupt.len(),
+                            orphan = report.orphan.len(),
+                            unknown = report.unknown.len(),
+                            "Volume integrity scrub found unhealthy objects"
+                        );
+                    }
+                    let observed_at = UnixMillis::new(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|duration| duration.as_millis() as u64)
+                            .unwrap_or_default(),
+                    );
+                    let scan_id = match IntegrityScanId::new(format!(
+                        "scan-{}",
+                        Uuid::new_v4().simple()
+                    )) {
+                        Ok(scan_id) => scan_id,
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to allocate Volume integrity scan ID");
+                            return;
+                        }
+                    };
+                    match scanner.report_to_integrity_report(
+                        report,
+                        scan_id,
+                        mount_generation,
+                        observed_at,
+                    ) {
+                        Ok(integrity) => {
+                            if let Err(error) = reports
+                                .enqueue(AgentReport::Integrity(Box::new(integrity)), observed_at)
+                            {
+                                tracing::warn!(%error, "failed to queue Volume integrity report");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to build Volume integrity report")
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Volume integrity scrub could not complete")
+                }
+                Err(error) => tracing::warn!(%error, "Volume integrity scrub task failed"),
+            }
+        };
+
+        run_scan(
+            Arc::clone(&scanner),
+            report_path.clone(),
+            Arc::clone(&reports),
+        )
+        .await;
+        let mut ticker = time::interval(INTEGRITY_SCAN_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => run_scan(Arc::clone(&scanner), report_path.clone(), Arc::clone(&reports)).await,
+                _ = async {
+                    while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                        time::sleep(Duration::from_secs(1)).await;
+                    }
+                } => break,
+            }
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1261,6 +1374,9 @@ async fn send_queued_reports(
         let report_message = match &queued.report {
             AgentReport::Materialization(report) => {
                 AgentChannelUpstreamMessage::MaterializationReport(report.clone())
+            }
+            AgentReport::Integrity(report) => {
+                AgentChannelUpstreamMessage::IntegrityReport(report.clone())
             }
             _ => {
                 let request_id = RequestId::new(queued.message_id.to_string())

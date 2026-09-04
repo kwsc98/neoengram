@@ -1,0 +1,876 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskProtocolSchema",
+  "description": "Root containing every public operation-task contract for schema generation.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/OperationTask"
+    },
+    {
+      "$ref": "#/$defs/TaskScope"
+    },
+    {
+      "$ref": "#/$defs/TaskAttempt"
+    },
+    {
+      "$ref": "#/$defs/TaskEvent"
+    },
+    {
+      "$ref": "#/$defs/TaskResourceLink"
+    },
+    {
+      "$ref": "#/$defs/TaskRelation"
+    },
+    {
+      "$ref": "#/$defs/TaskIssue"
+    },
+    {
+      "$ref": "#/$defs/TaskProgressSummary"
+    }
+  ],
+  "$defs": {
+    "AgentId": {
+      "description": "A validated agent ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ArtifactId": {
+      "description": "A validated artifact ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "CommitId": {
+      "description": "A canonical lowercase BLAKE3-256 digest.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ContentDigest": {
+      "description": "A canonical lowercase BLAKE3-256 digest.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "DecimalU64": {
+      "description": "A unsigned integer encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "Generation": {
+      "description": "A generation encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^([1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "ObjectNamespaceId": {
+      "description": "A validated object namespace ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "OperationTask": {
+      "description": "Unified task row. Domain-specific execution data is referenced by `detail_kind/detail_id`.",
+      "type": "object",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/TaskActor"
+        },
+        "artifact_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "commit_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommitId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "created_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "deadline_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "detail_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "executable": {
+          "type": "boolean"
+        },
+        "finished_at_unix_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnixMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskIssue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "object_namespace_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ObjectNamespaceId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin": {
+          "$ref": "#/$defs/TaskOrigin"
+        },
+        "parent_task_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "type": "string"
+        },
+        "playground_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaygroundId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "progress_summary": {
+          "$ref": "#/$defs/TaskProgressSummary"
+        },
+        "project_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "resource_version": {
+          "$ref": "#/$defs/ResourceVersion"
+        },
+        "snapshot_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SnapshotId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "started_at_unix_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnixMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/TaskState"
+        },
+        "storage_volume_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StorageVolumeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
+        "task_kind": {
+          "$ref": "#/$defs/TaskKind"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        },
+        "updated_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "task_kind",
+        "state",
+        "phase",
+        "tenant_id",
+        "request_id",
+        "request_digest",
+        "actor",
+        "attempt",
+        "progress_summary",
+        "deadline_unix_ms",
+        "created_at_unix_ms",
+        "updated_at_unix_ms",
+        "resource_version",
+        "origin",
+        "executable"
+      ]
+    },
+    "PlaygroundId": {
+      "description": "A validated playground ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "PrincipalId": {
+      "description": "A validated principal ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "user",
+        "service",
+        "system"
+      ]
+    },
+    "PrincipalRef": {
+      "description": "No extension members are accepted by the current protocol.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ]
+    },
+    "ProjectId": {
+      "description": "A validated project ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "RequestId": {
+      "description": "A validated request ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "ResourceVersion": {
+      "description": "A resource version encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "SequenceNumber": {
+      "description": "A sequence number encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "SnapshotId": {
+      "description": "A validated snapshot ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "StorageVolumeId": {
+      "description": "A validated storage volume ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TaskActor": {
+      "description": "One actor visible in audit records. A principal is used for both user and system operations;\nan Agent actor is useful for events emitted after a control-plane assignment.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "$ref": "#/$defs/PrincipalRef",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent_id": {
+              "$ref": "#/$defs/AgentId"
+            },
+            "type": {
+              "type": "string",
+              "const": "agent"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "agent_id"
+          ]
+        }
+      ]
+    },
+    "TaskAttempt": {
+      "description": "One execution attempt. A retry keeps the parent [`TaskId`] while creating a new attempt ID.",
+      "type": "object",
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/TaskAttemptId"
+        },
+        "created_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "finished_at_unix_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnixMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskIssue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "type": "string"
+        },
+        "resource_version": {
+          "$ref": "#/$defs/ResourceVersion"
+        },
+        "started_at_unix_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnixMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/TaskState"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
+        "updated_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "attempt_id",
+        "task_id",
+        "attempt",
+        "state",
+        "phase",
+        "created_at_unix_ms",
+        "updated_at_unix_ms",
+        "resource_version"
+      ]
+    },
+    "TaskAttemptId": {
+      "description": "A validated task attempt ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TaskEvent": {
+      "description": "Immutable audit event. `from_state`/`to_state` are populated for a state-change event; the\noptional fields keep the event schema useful for assignment/report/resource events without\nembedding domain-specific payloads.",
+      "type": "object",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/TaskActor"
+        },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "event_id": {
+          "$ref": "#/$defs/TaskEventId"
+        },
+        "from_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskIssue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/TaskEventKind"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "occurred_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskProgressSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resource_version": {
+          "$ref": "#/$defs/ResourceVersion"
+        },
+        "sequence": {
+          "$ref": "#/$defs/SequenceNumber"
+        },
+        "state": {
+          "$ref": "#/$defs/TaskState"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
+        "to_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "task_id",
+        "sequence",
+        "attempt",
+        "kind",
+        "state",
+        "actor",
+        "occurred_at_unix_ms",
+        "resource_version"
+      ]
+    },
+    "TaskEventId": {
+      "description": "A validated task event ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TaskEventKind": {
+      "description": "Audit event category. Events are append-only and ordered by `sequence` per task.",
+      "type": "string",
+      "enum": [
+        "created",
+        "state_changed",
+        "attempt_started",
+        "attempt_finished",
+        "retried",
+        "cancel_requested",
+        "cancelled",
+        "assigned",
+        "reported",
+        "progress_updated",
+        "resource_linked",
+        "resource_published",
+        "failed"
+      ]
+    },
+    "TaskId": {
+      "description": "A validated operation task ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TaskIssue": {
+      "description": "Stable failure information. The retryable bit is part of the authority decision and cannot be\ninferred from a free-form error message.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "TaskKind": {
+      "description": "The write operation represented by an [`OperationTask`].\n\nValues intentionally use dotted stable names because they are also used as API filters and\ndatabase/reporting dimensions. Unknown values are rejected by Serde rather than silently\nfalling back to a generic operation.",
+      "type": "string",
+      "enum": [
+        "workspace.create",
+        "workspace.materialize",
+        "precommit.check",
+        "add.scan",
+        "commit.create",
+        "snapshot.create",
+        "snapshot.delivery.materialize",
+        "commit.materialize",
+        "integrity.scan",
+        "resource.repair",
+        "catalog.lifecycle",
+        "storage.lifecycle",
+        "gateway.lifecycle",
+        "s3.lifecycle"
+      ]
+    },
+    "TaskOrigin": {
+      "description": "Origin of a task record. Legacy records are queryable but must never be scheduled again.",
+      "type": "string",
+      "enum": [
+        "user",
+        "system",
+        "legacy"
+      ]
+    },
+    "TaskProgressSummary": {
+      "description": "Progress summary kept on the task row. Per-object or per-byte updates belong in the domain\ndetail tables and should not produce one audit event each.",
+      "type": "object",
+      "properties": {
+        "completed": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "completed_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "total": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/DecimalU64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "completed",
+        "total",
+        "completed_bytes",
+        "total_bytes"
+      ]
+    },
+    "TaskRelation": {
+      "type": "object",
+      "properties": {
+        "related_task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
+        "relation": {
+          "$ref": "#/$defs/TaskRelationKind"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "related_task_id",
+        "relation"
+      ]
+    },
+    "TaskRelationKind": {
+      "description": "Explicit relationship between two task records. Parent/causal edges are queried independently\nfrom `parent_task_id` so one task can be caused by several prior tasks.",
+      "type": "string",
+      "enum": [
+        "parent",
+        "caused_by",
+        "triggered_by",
+        "supersedes"
+      ]
+    },
+    "TaskResourceKind": {
+      "description": "Resource dimension used to navigate from a task to an asset or infrastructure object.",
+      "type": "string",
+      "enum": [
+        "tenant",
+        "project",
+        "artifact",
+        "object_namespace",
+        "commit",
+        "playground",
+        "snapshot",
+        "snapshot_delivery",
+        "storage_volume",
+        "storage_enrollment",
+        "agent",
+        "gateway",
+        "s3_access_point",
+        "s3_credential",
+        "deletion",
+        "retention_hold",
+        "materialization",
+        "materialization_batch",
+        "precommit",
+        "control_job"
+      ]
+    },
+    "TaskResourceLink": {
+      "description": "Link from a task to a resource. The typed scope on [`OperationTask`] is the common query path;\nlinks cover secondary resources such as a source Volume or a SnapshotDelivery.",
+      "type": "object",
+      "properties": {
+        "resource_id": {
+          "type": "string"
+        },
+        "resource_kind": {
+          "$ref": "#/$defs/TaskResourceKind"
+        },
+        "role": {
+          "$ref": "#/$defs/TaskResourceRole"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "resource_kind",
+        "resource_id",
+        "role"
+      ]
+    },
+    "TaskResourceRole": {
+      "type": "string",
+      "enum": [
+        "primary",
+        "source",
+        "target",
+        "related"
+      ]
+    },
+    "TaskScope": {
+      "description": "Optional resource scope used by list/query APIs and task indexes.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "commit_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommitId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "object_namespace_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ObjectNamespaceId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "playground_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlaygroundId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "project_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "snapshot_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SnapshotId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "storage_volume_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StorageVolumeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/TenantId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tenant_id"
+      ]
+    },
+    "TaskState": {
+      "description": "Coarse lifecycle shared by all write operations.",
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "waiting",
+        "verifying",
+        "succeeded",
+        "stalled",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "TenantId": {
+      "description": "A validated tenant ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "UnixMillis": {
+      "description": "A Unix millisecond timestamp encoded as a canonical decimal JSON string.",
+      "type": "string",
+      "maxLength": 20,
+      "minLength": 1,
+      "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    }
+  }
+}

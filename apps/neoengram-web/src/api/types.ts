@@ -1,12 +1,23 @@
 import type { components } from './generated/openapi';
 
 export type ApiVersionResponse = components['schemas']['ApiVersionResponse'];
-export type CreateAddJobRequest = components['schemas']['CreateAddJobRequest'];
-export type CreateAddJobResponse = components['schemas']['CreateAddJobResponse'];
-export type QueryJobResponse = components['schemas']['QueryJobResponse'];
-export type FinalizeAddJobResponse = components['schemas']['FinalizeAddJobResponse'];
-export type JobView = components['schemas']['JobView'];
-export type JobState = components['schemas']['JobState'];
+export type QueryTaskListRequest = components['schemas']['QueryTaskListRequest'];
+export type QueryTaskListResponse = components['schemas']['QueryTaskListResponse'];
+export type QueryTaskRequest = components['schemas']['QueryTaskRequest'];
+export type QueryTaskResponse = components['schemas']['QueryTaskResponse'];
+export type QueryTaskEventListRequest = components['schemas']['QueryTaskEventListRequest'];
+export type QueryTaskEventListResponse = components['schemas']['QueryTaskEventListResponse'];
+export type QueryTaskSummaryRequest = components['schemas']['QueryTaskSummaryRequest'];
+export type QueryTaskSummaryResponse = components['schemas']['QueryTaskSummaryResponse'];
+export type RetryTaskRequest = components['schemas']['RetryTaskRequest'];
+export type CancelTaskRequest = components['schemas']['CancelTaskRequest'];
+export type TaskMutationResponse = components['schemas']['TaskMutationResponse'];
+export type TaskView = components['schemas']['TaskView'];
+export type TaskAttemptView = components['schemas']['TaskAttemptView'];
+export type TaskEventView = components['schemas']['TaskEventView'];
+export type TaskSummaryView = components['schemas']['TaskSummaryView'];
+export type TaskState = components['schemas']['TaskState'];
+export type TaskKind = components['schemas']['TaskKind'];
 export type ProblemDetails = components['schemas']['ProblemDetails'];
 export type HealthResponse = components['schemas']['HealthResponse'];
 export type QueryTenantListRequest = components['schemas']['QueryTenantListRequest'];
@@ -143,22 +154,6 @@ export type CreateCommitMaterializationRequest =
   components['schemas']['CreateCommitMaterializationRequest'];
 export type CreateCommitMaterializationResponse =
   components['schemas']['CreateCommitMaterializationResponse'];
-export type QueryCommitMaterializationRequest =
-  components['schemas']['QueryCommitMaterializationRequest'];
-export type QueryCommitMaterializationResponse =
-  components['schemas']['QueryCommitMaterializationResponse'];
-export type QueryCommitMaterializationListRequest =
-  components['schemas']['QueryCommitMaterializationListRequest'];
-export type QueryCommitMaterializationListResponse =
-  components['schemas']['QueryCommitMaterializationListResponse'];
-export type RetryCommitMaterializationRequest =
-  components['schemas']['RetryCommitMaterializationRequest'];
-export type RetryCommitMaterializationResponse =
-  components['schemas']['RetryCommitMaterializationResponse'];
-export type CancelCommitMaterializationRequest =
-  components['schemas']['CancelCommitMaterializationRequest'];
-export type CancelCommitMaterializationResponse =
-  components['schemas']['CancelCommitMaterializationResponse'];
 export type QueryCommitCoverageRequest = components['schemas']['QueryCommitCoverageRequest'];
 export type QueryCommitCoverageResponse = components['schemas']['QueryCommitCoverageResponse'];
 export type QueryCommitAvailabilityV2Request =
@@ -167,118 +162,6 @@ export type QueryCommitAvailabilityV2Response =
   components['schemas']['QueryCommitAvailabilityResponse'];
 export type MaterializationView = components['schemas']['MaterializationView'];
 export type VolumeCommitCoverageView = components['schemas']['VolumeCommitCoverageView'];
-
-/**
- * Transitional names used by the existing Web feature modules.  These are local view models,
- * never wire contracts: operations.ts maps them to/from the v2 materialization responses.
- */
-export type CreateCommitReplicationRequest = Omit<
-  CreateCommitMaterializationRequest,
-  'object_namespace_id'
-> & { object_namespace_id?: string };
-export type LegacyReplicationView = {
-  replication_id: string;
-  tenant_id: string;
-  artifact_id?: string;
-  commit_id: string;
-  target_storage_volume_id: string;
-  attempt: string;
-  state:
-    'queued' | 'planning' | 'transferring' | 'verifying' | 'published' | 'failed' | 'cancelled';
-  object_set_digest: string;
-  completed_objects: string;
-  total_objects: string;
-  completed_bytes: string;
-  total_bytes: string;
-  source_storage_volume_id?: string;
-  target_edge_cluster_id?: string;
-  target_gateway_pool_id?: string;
-  issue?: components['schemas']['ResourceIssueSummary'];
-};
-export type CreateCommitReplicationResponse = {
-  replication: LegacyReplicationView;
-  replayed: boolean;
-};
-export type QueryCommitReplicationRequest = {
-  tenant_id: string;
-  object_namespace_id: string;
-  replication_id: string;
-};
-export type QueryCommitReplicationResponse = { replication: LegacyReplicationView };
-export type QueryCommitReplicationListRequest = {
-  tenant_id: string;
-  commit_id: string;
-  object_namespace_id?: string;
-  /** Local page context used to derive the initial v2 namespace mapping. */
-  artifact_id?: string;
-  target_storage_volume_id?: string;
-  cursor?: string;
-  page_size?: number;
-};
-export type QueryCommitReplicationListResponse = {
-  replications: LegacyReplicationView[];
-  next_cursor?: string;
-};
-export type QueryCommitPlacementListRequest = {
-  tenant_id: string;
-  commit_id: string;
-  object_namespace_id?: string;
-  /** Local page context used to derive the initial v2 namespace mapping. */
-  artifact_id?: string;
-  storage_volume_id?: string;
-  cursor?: string;
-  page_size?: number;
-};
-export type LegacyCommitPlacementView = {
-  placement_set_id: string;
-  commit_id: string;
-  backend_id: string;
-  storage_volume_id?: string;
-  object_set_digest: string;
-  object_count: string;
-  verified_object_count: string;
-  placement_generation: string;
-  state: 'staged' | 'published' | 'retiring' | 'deleted';
-};
-export type QueryCommitPlacementListResponse = {
-  placements: LegacyCommitPlacementView[];
-  next_cursor?: string;
-};
-export type RetryCommitReplicationRequest = {
-  tenant_id: string;
-  object_namespace_id: string;
-  replication_id: string;
-  expected_attempt: string;
-  request_id: string;
-};
-export type RetryCommitReplicationResponse = {
-  replication: LegacyReplicationView;
-  replayed: boolean;
-};
-export type CancelCommitReplicationRequest = {
-  tenant_id: string;
-  object_namespace_id: string;
-  replication_id: string;
-  expected_attempt: string;
-};
-export type CancelCommitReplicationResponse = { replication: LegacyReplicationView };
-export type QueryCommitAvailabilityRequest = Omit<
-  components['schemas']['QueryCommitAvailabilityRequest'],
-  'object_namespace_id'
-> & {
-  object_namespace_id?: string;
-  /** Local page context used to derive the initial v2 namespace mapping. */
-  artifact_id?: string;
-};
-export type QueryCommitAvailabilityResponse = {
-  availability: {
-    commit_id: string;
-    data_health: 'available' | 'degraded' | 'unavailable';
-    verified_placements: string;
-    missing_objects: string;
-    verified_storage_volume_ids: string[];
-  };
-};
 export type CreateWorkspaceRequest = components['schemas']['CreateWorkspaceRequest'];
 export type CreateWorkspaceResponse = components['schemas']['CreateWorkspaceResponse'];
 export type RetrySnapshotDeliveryRequest = components['schemas']['RetrySnapshotDeliveryRequest'];
@@ -302,9 +185,6 @@ export type DataLayout = components['schemas']['DataLayout'];
 export type SnapshotDeliveryMode = components['schemas']['SnapshotDeliveryMode'];
 export type SnapshotDeliveryState = components['schemas']['SnapshotDeliveryState'];
 export type SnapshotDeliveryView = components['schemas']['SnapshotDeliveryView'];
-export type CreateSnapshotDeliveryRequest = components['schemas']['CreateSnapshotDeliveryRequest'];
-export type CreateSnapshotDeliveryResponse =
-  components['schemas']['CreateSnapshotDeliveryResponse'];
 export type QuerySnapshotDeliveryRequest = components['schemas']['QuerySnapshotDeliveryRequest'];
 export type QuerySnapshotDeliveryResponse = components['schemas']['QuerySnapshotDeliveryResponse'];
 export type QuerySnapshotDeliveryListRequest =
@@ -327,6 +207,9 @@ export interface S3AccessPointView {
   artifact_id: string;
   snapshot_id: string;
   commit_id: string;
+  delivery_id: string;
+  storage_volume_id: string;
+  edge_cluster_id: string;
   bucket_name: string;
   endpoint: string;
   region: string;

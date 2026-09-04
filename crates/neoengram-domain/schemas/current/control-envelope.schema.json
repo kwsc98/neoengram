@@ -36,10 +36,6 @@
         "artifact.query",
         "commit.availability.query",
         "commit.coverage.query",
-        "commit.materialization.cancel",
-        "commit.materialization.list.query",
-        "commit.materialization.query",
-        "commit.materialization.retry",
         "commit.materialize",
         "gateway.bootstrap.certificate",
         "gateway.bootstrap.challenge",
@@ -60,9 +56,6 @@
         "internal.s3.authorize",
         "internal.s3.read-channel",
         "internal.s3.read-peer",
-        "job.add.create",
-        "job.add.finalize",
-        "job.query",
         "playground.change.list.query",
         "playground.commit.create",
         "playground.create",
@@ -98,7 +91,6 @@
         "snapshot.activity.list.query",
         "snapshot.create",
         "snapshot.dataset.profile.query",
-        "snapshot.delivery.create",
         "snapshot.delivery.delete",
         "snapshot.delivery.list.query",
         "snapshot.delivery.query",
@@ -116,6 +108,12 @@
         "storage.volume.list.query",
         "storage.volume.query",
         "system.version.query",
+        "task.cancel",
+        "task.event.list.query",
+        "task.list.query",
+        "task.query",
+        "task.retry",
+        "task.summary.query",
         "tenant.create",
         "tenant.list.query",
         "tenant.query",
@@ -1610,6 +1608,10 @@
         "manifest": {
           "$ref": "#/$defs/BatchManifest"
         },
+        "operation_task_id": {
+          "description": "Unified operation identity copied from the signed ticket and durable Job.",
+          "$ref": "#/$defs/TaskId"
+        },
         "pages": {
           "type": "array",
           "items": {
@@ -1619,10 +1621,16 @@
         },
         "signed_ticket": {
           "$ref": "#/$defs/SignedMaterializationBatchTicket"
+        },
+        "task_attempt_id": {
+          "description": "Exact execution attempt authorized for this assignment.",
+          "$ref": "#/$defs/TaskAttemptId"
         }
       },
       "additionalProperties": false,
       "required": [
+        "operation_task_id",
+        "task_attempt_id",
         "signed_ticket",
         "batch",
         "manifest",
@@ -1746,6 +1754,9 @@
         "object_namespace_id": {
           "$ref": "#/$defs/ObjectNamespaceId"
         },
+        "operation_task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
         "plan_revision": {
           "$ref": "#/$defs/Generation"
         },
@@ -1754,6 +1765,9 @@
         },
         "target": {
           "$ref": "#/$defs/MaterializationTarget"
+        },
+        "task_attempt_id": {
+          "$ref": "#/$defs/TaskAttemptId"
         },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
@@ -1765,6 +1779,8 @@
       "additionalProperties": false,
       "required": [
         "ticket_id",
+        "operation_task_id",
+        "task_attempt_id",
         "materialization_id",
         "batch_id",
         "plan_revision",
@@ -1834,6 +1850,9 @@
         "object_namespace_id": {
           "$ref": "#/$defs/ObjectNamespaceId"
         },
+        "operation_task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
         "plan_revision": {
           "$ref": "#/$defs/Generation"
         },
@@ -1849,6 +1868,9 @@
         "target_storage_volume_id": {
           "$ref": "#/$defs/StorageVolumeId"
         },
+        "task_attempt_id": {
+          "$ref": "#/$defs/TaskAttemptId"
+        },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
         },
@@ -1862,6 +1884,8 @@
       "additionalProperties": false,
       "required": [
         "receipt_id",
+        "operation_task_id",
+        "task_attempt_id",
         "materialization_id",
         "batch_id",
         "plan_revision",
@@ -1952,6 +1976,9 @@
                 "object_namespace_id": {
                   "$ref": "#/$defs/ObjectNamespaceId"
                 },
+                "operation_task_id": {
+                  "$ref": "#/$defs/TaskId"
+                },
                 "plan_revision": {
                   "$ref": "#/$defs/Generation"
                 },
@@ -1959,12 +1986,17 @@
                   "description": "The complete target fence from the signed assignment.  Failure reports must not rely\non whatever route happens to be current when Central receives them.",
                   "$ref": "#/$defs/MaterializationTarget"
                 },
+                "task_attempt_id": {
+                  "$ref": "#/$defs/TaskAttemptId"
+                },
                 "tenant_id": {
                   "$ref": "#/$defs/TenantId"
                 }
               },
               "additionalProperties": false,
               "required": [
+                "operation_task_id",
+                "task_attempt_id",
                 "materialization_id",
                 "batch_id",
                 "plan_revision",
@@ -3258,6 +3290,20 @@
     },
     "StorageVolumeId": {
       "description": "A validated storage volume ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TaskAttemptId": {
+      "description": "A validated task attempt ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TaskId": {
+      "description": "A validated operation task ID wire identifier.",
       "type": "string",
       "maxLength": 128,
       "minLength": 1,

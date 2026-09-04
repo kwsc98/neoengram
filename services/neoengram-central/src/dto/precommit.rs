@@ -1,7 +1,7 @@
 use fusen_rs::SensitiveFields;
 use serde::{Deserialize, Serialize};
 
-use super::{DataLayout, IndexVersionBody, PlaygroundView};
+use super::{DataLayout, IndexVersionBody, PlaygroundView, TaskView};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +23,8 @@ pub struct StartPreCommitResponse {
     pub precommit: PreCommitView,
     pub playground: PlaygroundView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -57,6 +59,8 @@ pub struct RestartPreCommitResponse {
     pub precommit: PreCommitView,
     pub playground: PlaygroundView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
@@ -75,6 +79,8 @@ pub struct CancelPreCommitResponse {
     pub precommit: PreCommitView,
     pub playground: PlaygroundView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]

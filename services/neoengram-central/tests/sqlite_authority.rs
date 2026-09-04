@@ -138,7 +138,7 @@ async fn sqlite_reopen_recovers_every_authority_port() {
 }
 
 #[tokio::test]
-async fn sqlite_rejects_v1_schema_without_implicit_migration() {
+async fn sqlite_rejects_previous_schema_without_implicit_migration() {
     let directory = TempDir::new().unwrap();
     {
         let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
@@ -149,13 +149,15 @@ async fn sqlite_rejects_v1_schema_without_implicit_migration() {
 
     execute_raw(
         directory.path(),
-        "PRAGMA application_id = 1313161557; PRAGMA user_version = 17;",
+        // v18 predates the immutable Snapshot -> Delivery binding and is not
+        // compatible with the v20 DDL. It must be reset explicitly.
+        "PRAGMA application_id = 1313161557; PRAGMA user_version = 18;",
     )
     .await;
 
     let error = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
-        .expect_err("v1 authority must require an explicit reset/inventory rebuild");
+        .expect_err("previous authority schema must require an explicit reset/inventory rebuild");
     assert!(error.to_string().contains("explicit reset"));
 }
 

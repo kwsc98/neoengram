@@ -16,7 +16,7 @@ npm run dev:mock
 [`../../docs/product.md`](../../docs/product.md) 提供多租户切换与
 创建、StorageVolume 登记、无固定放置的 Artifact、单 Volume Playground、单区域 Snapshot、
 Pre-commit、带描述和 Tags 的 Playground Commit、单 parent Commit 图、当前版本与父版本的文件
-及元数据 Diff，以及 Managed Add Job 的 create/query/finalize 状态机；它不能用于生产构建。
+及元数据 Diff，以及统一 OperationTask 列表、详情、Attempt、事件、重试和取消；它不能用于生产构建。
 
 真实 API 开发模式使用 `npm run dev`，默认 Bearer token 是 `local-development-token`，需与 Server
 的 `--development-token` 保持一致；可通过 `VITE_DEVELOPMENT_TOKEN` 和
@@ -54,8 +54,8 @@ npm run test:e2e
 
 `src/api/generated/openapi.d.ts` 由 OpenAPI 生成并提交，不能手工修改。服务端状态由 TanStack Vue
 Query 管理；路由中的 `tenantId` 是当前租户的唯一来源。Pinia 只保存认证视图、可见租户的内存
-视图、最近选择的 Tenant ID，以及最多 50 条浏览器本地最近 Job identity。token、权限和完整资源
-不会写入 localStorage。
+视图和最近选择的 Tenant ID。任务状态与事件始终从 Central 查询；token、权限、任务和完整资源不会
+写入 localStorage。
 
 ## 部署
 

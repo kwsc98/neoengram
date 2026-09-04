@@ -1343,7 +1343,8 @@ impl ReportSink for RecordingReportSink {
             AgentReport::Progress(_)
             | AgentReport::Lifecycle(_)
             | AgentReport::Replication(_)
-            | AgentReport::Materialization(_) => None,
+            | AgentReport::Materialization(_)
+            | AgentReport::Integrity(_) => None,
         };
         if let Some(event) = event {
             self.events.lock().unwrap().push(event);

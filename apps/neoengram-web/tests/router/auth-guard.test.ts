@@ -37,22 +37,22 @@ describe('OIDC route guard', () => {
     const { service, login } = authService(false);
     setAuthServiceForTest(service);
     const testRouter = createAppRouter(createMemoryHistory());
-    await testRouter.push('/tenants/tenant-a/jobs/new');
+    await testRouter.push('/tenants/tenant-a/tasks');
 
-    expect(login).toHaveBeenCalledWith('/tenants/tenant-a/jobs/new');
+    expect(login).toHaveBeenCalledWith('/tenants/tenant-a/tasks');
     expect(testRouter.currentRoute.value.path).toBe('/');
   });
 
-  it('allows an authenticated user to enter Job routes', async () => {
+  it('allows an authenticated user to enter Task routes', async () => {
     setActivePinia(createPinia());
     const { service, login } = authService(true);
     setAuthServiceForTest(service);
     const testRouter = createAppRouter(createMemoryHistory());
 
-    await testRouter.push('/tenants/tenant-a/jobs/query');
+    await testRouter.push('/tenants/tenant-a/tasks');
 
     expect(login).not.toHaveBeenCalled();
-    expect(testRouter.currentRoute.value.path).toBe('/tenants/tenant-a/jobs/query');
+    expect(testRouter.currentRoute.value.path).toBe('/tenants/tenant-a/tasks');
   });
 
   it('falls back to the first visible tenant for an invisible tenant route', async () => {
@@ -120,13 +120,13 @@ describe('OIDC route guard', () => {
     },
   );
 
-  it('allows Snapshot routes only when snapshot_materialize is advertised', async () => {
+  it('allows Snapshot routes only when commit materialization v2 is advertised', async () => {
     server.use(
       http.post('*/api/system/version/query', () =>
         HttpResponse.json({
           api_version: 1,
           agent_wire_version: 1,
-          capabilities: ['artifact_catalog', 'snapshot_materialize'],
+          capabilities: ['artifact_catalog', 'commit_materialization_v2'],
         }),
       ),
     );

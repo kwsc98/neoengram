@@ -26,6 +26,9 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     .await;
     assert_eq!(create_tenant.0, StatusCode::OK);
     assert_eq!(create_tenant.1["replayed"], false);
+    assert_eq!(create_tenant.1["task"]["task_kind"], "catalog.lifecycle");
+    assert_eq!(create_tenant.1["task"]["state"], "succeeded");
+    let tenant_task_id = create_tenant.1["task"]["task_id"].clone();
     let replay = post(
         &client,
         &base,
@@ -39,6 +42,7 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     .await;
     assert_eq!(replay.0, StatusCode::OK);
     assert_eq!(replay.1["replayed"], true);
+    assert_eq!(replay.1["task"]["task_id"], tenant_task_id);
 
     let volume = post(
         &client,
@@ -60,6 +64,8 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     )
     .await;
     assert_eq!(volume.0, StatusCode::OK);
+    assert_eq!(volume.1["task"]["task_kind"], "storage.lifecycle");
+    assert_eq!(volume.1["task"]["storage_volume_id"], "volume-nfs");
     let public = &volume.1["storage_volume"];
     assert_eq!(public["state"], "unavailable");
     assert!(public.get("nfs_reference").is_none());
@@ -91,6 +97,8 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     assert_eq!(artifact.0, StatusCode::OK);
     assert_eq!(artifact.1["artifact"]["initialization"]["mode"], "empty");
     assert_eq!(artifact.1["replayed"], false);
+    assert_eq!(artifact.1["task"]["task_kind"], "catalog.lifecycle");
+    assert_eq!(artifact.1["task"]["artifact_id"], "artifact-a");
     let artifact_replay = post(
         &client,
         &base,
@@ -166,7 +174,10 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     )
     .await;
     assert_eq!(missing_job_scope.0, StatusCode::NOT_FOUND);
-    assert_eq!(missing_job_scope.1["code"], "JOB_NOT_FOUND");
+    // v1 Job actions are intentionally removed in the clean-slate v20 API.  A caller
+    // attempting to use the retired route must receive the generic route error rather than
+    // being routed into the legacy Job state machine.
+    assert_eq!(missing_job_scope.1["code"], "ROUTE_NOT_FOUND");
 
     let derived = post(
         &client,

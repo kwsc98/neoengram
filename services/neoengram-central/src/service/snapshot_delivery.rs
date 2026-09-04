@@ -7,20 +7,18 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    CatalogInsertOutcome, SnapshotDeliveryInsertOutcome, SnapshotDeliveryInsertRequest,
-    SnapshotDeliveryListRequest, SnapshotDeliveryMutationKind, SnapshotDeliveryMutationRequest,
-    SnapshotDeliveryRecord, SnapshotDeliveryRetentionRoot, SnapshotState, StorageVolumeState,
+    CatalogInsertOutcome, SnapshotDeliveryListRequest, SnapshotDeliveryMutationKind,
+    SnapshotDeliveryMutationRequest, SnapshotDeliveryRecord, SnapshotDeliveryRetentionRoot,
 };
 use fusen_rs::{Error, ErrorCategory};
-use neoengram_domain::core::{ContentDigest, FileRecord, ObjectId};
+use neoengram_domain::core::{CommitId, ContentDigest, FileRecord, ObjectId};
 use neoengram_domain::protocol::{
-    CommitDataLayout, DeliveryGeneration, SnapshotDeliveryId, SnapshotDeliveryMode,
-    SnapshotDeliveryOperation, SnapshotDeliveryState, SnapshotId, StorageVolumeId, TenantId,
+    DeliveryGeneration, RequestId, SnapshotDeliveryId, SnapshotDeliveryMode, SnapshotDeliveryState,
+    SnapshotId, TaskKind, TaskResourceKind, TaskResourceRole, TaskScope, TaskState, TenantId,
 };
 
 use crate::{
     dto::{
-        CreateSnapshotDeliveryRequest, CreateSnapshotDeliveryResponse,
         DeleteSnapshotDeliveryRequest, DeleteSnapshotDeliveryResponse,
         QuerySnapshotDeliveryListRequest, QuerySnapshotDeliveryListResponse,
         QuerySnapshotDeliveryRequest, QuerySnapshotDeliveryResponse, ResourceIssueSummary,
@@ -33,11 +31,6 @@ use crate::{
 };
 
 use super::CatalogService;
-
-const HARDLINK_REQUIRES_WHOLE_FILE: &str = "HARDLINK_REQUIRES_WHOLE_FILE";
-const HARDLINK_UNSAFE_VOLUME: &str = "HARDLINK_UNSAFE_VOLUME";
-const DELIVERY_MODE_NOT_ALLOWED: &str = "DELIVERY_MODE_NOT_ALLOWED";
-const WHOLE_FILE_SIZE_LIMIT_EXCEEDED: &str = "WHOLE_FILE_SIZE_LIMIT_EXCEEDED";
 
 fn snapshot_delivery_needs_scheduling(state: SnapshotDeliveryState) -> bool {
     matches!(
@@ -59,19 +52,6 @@ fn parse_snapshot(value: String) -> Result<SnapshotId, Error> {
 
 fn parse_delivery(value: String) -> Result<SnapshotDeliveryId, Error> {
     SnapshotDeliveryId::new(value).map_err(|error| invalid_request(format!("delivery_id: {error}")))
-}
-
-fn parse_volume(value: String) -> Result<StorageVolumeId, Error> {
-    StorageVolumeId::new(value)
-        .map_err(|error| invalid_request(format!("target_storage_volume_id: {error}")))
-}
-
-fn to_mode(value: DeliveryModeBody) -> SnapshotDeliveryMode {
-    match value {
-        DeliveryModeBody::Fuse => SnapshotDeliveryMode::Fuse,
-        DeliveryModeBody::Copy => SnapshotDeliveryMode::Copy,
-        DeliveryModeBody::Hardlink => SnapshotDeliveryMode::Hardlink,
-    }
 }
 
 fn body_mode(value: SnapshotDeliveryMode) -> DeliveryModeBody {
@@ -140,7 +120,7 @@ fn view(record: &SnapshotDeliveryRecord) -> SnapshotDeliveryView {
     }
 }
 
-fn deterministic_delivery_id(
+pub(crate) fn deterministic_delivery_id(
     tenant_id: &TenantId,
     snapshot_id: &SnapshotId,
     mode: SnapshotDeliveryMode,
@@ -187,7 +167,67 @@ fn mutation_id_reused() -> Error {
 }
 
 impl CatalogService {
-    async fn best_effort_schedule_snapshot_delivery(&self, delivery: &SnapshotDeliveryRecord) {
+    /// A failed materialization moves its Snapshot to `Abnormal`. Retrying the same immutable
+    /// Delivery starts a new materialization attempt, so the aggregate must return to `Creating`
+    /// before the coordinator dispatches it. This is deliberately idempotent: a lost response or
+    /// a replay after the Delivery CAS may find the Snapshot already restored.
+    async fn restore_snapshot_for_retry(
+        &self,
+        delivery: &SnapshotDeliveryRecord,
+    ) -> Result<(), Error> {
+        // Only a successfully applied retry (Requested state) may reopen the Snapshot. Keeping
+        // this guard here prevents a failed CAS from leaving `Snapshot=Creating` while the
+        // Delivery is still Failed.
+        if delivery.state != SnapshotDeliveryState::Requested {
+            return Ok(());
+        }
+        let snapshot = self
+            .repository
+            .get_snapshot_for_lifecycle(&delivery.tenant_id, &delivery.snapshot_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("snapshot"))?;
+        if !snapshot.lifecycle.is_active() {
+            return Err(application_error(
+                ErrorCategory::Conflict,
+                "snapshot_not_active",
+                "SNAPSHOT_NOT_ACTIVE",
+                "the Snapshot is not active and cannot be retried",
+                false,
+            ));
+        }
+        if snapshot.delivery_id != delivery.delivery_id
+            || snapshot.commit_id != delivery.commit_id
+            || snapshot.storage_volume_id != delivery.storage_volume_id
+            || snapshot.delivery_mode != delivery.mode
+        {
+            return Err(application_error(
+                ErrorCategory::Internal,
+                "snapshot_delivery_binding_corrupt",
+                "INTERNAL",
+                "the Snapshot and Delivery immutable identities do not match",
+                false,
+            ));
+        }
+        if snapshot.state == crate::SnapshotState::Abnormal {
+            self.repository
+                .transition_snapshot_state(
+                    &snapshot.tenant_id,
+                    &snapshot.snapshot_id,
+                    crate::SnapshotState::Abnormal,
+                    crate::SnapshotState::Creating,
+                    self.clock.now(),
+                )
+                .await
+                .map_err(map_central_error)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn best_effort_schedule_snapshot_delivery(
+        &self,
+        delivery: &SnapshotDeliveryRecord,
+    ) {
         if !snapshot_delivery_needs_scheduling(delivery.state) {
             return;
         }
@@ -205,7 +245,7 @@ impl CatalogService {
         }
     }
 
-    async fn hardlink_retention_roots(
+    pub(crate) async fn hardlink_retention_roots(
         &self,
         tenant_id: &TenantId,
         artifact_id: &neoengram_domain::protocol::ArtifactId,
@@ -247,252 +287,6 @@ impl CatalogService {
 }
 
 impl CatalogService {
-    pub async fn create_snapshot_delivery(
-        &self,
-        identity: &AuthenticatedIdentity,
-        request: CreateSnapshotDeliveryRequest,
-    ) -> Result<CreateSnapshotDeliveryResponse, Error> {
-        let tenant_id = parse_tenant(request.tenant_id)?;
-        self.require_tenant(identity, Permission::SnapshotCreate, &tenant_id)
-            .await?;
-        let snapshot_id = parse_snapshot(request.snapshot_id)?;
-        let target_storage_volume_id = parse_volume(request.target_storage_volume_id)?;
-        let mode = to_mode(request.mode);
-        let request_id = neoengram_domain::protocol::RequestId::new(request.request_id)
-            .map_err(|error| invalid_request(format!("request_id: {error}")))?;
-        if let Some(existing) = self
-            .repository
-            .get_snapshot_delivery_by_create_request_id(&tenant_id, &request_id)
-            .await
-            .map_err(map_central_error)?
-        {
-            if existing.snapshot_id != snapshot_id
-                || existing.mode != mode
-                || existing.storage_volume_id != target_storage_volume_id
-            {
-                return Err(mutation_id_reused());
-            }
-            self.best_effort_schedule_snapshot_delivery(&existing).await;
-            return Ok(CreateSnapshotDeliveryResponse {
-                delivery: view(&existing),
-                replayed: true,
-            });
-        }
-        let snapshot = self
-            .repository
-            .get_snapshot(&tenant_id, &snapshot_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("snapshot"))?;
-        if !snapshot.lifecycle.is_active() {
-            return Err(application_error(
-                ErrorCategory::Conflict,
-                "snapshot_lifecycle_fenced",
-                "SNAPSHOT_LIFECYCLE_FENCED",
-                "the Snapshot is not active",
-                false,
-            ));
-        }
-        if snapshot.state != SnapshotState::Ready {
-            return Err(application_error(
-                ErrorCategory::Conflict,
-                "snapshot_not_ready",
-                "SNAPSHOT_NOT_READY",
-                "only a Ready Snapshot can create a delivery",
-                false,
-            ));
-        }
-        let precommits = self.precommits.as_ref().ok_or_else(|| {
-            application_error(
-                ErrorCategory::Unavailable,
-                "commit_authority_unavailable",
-                "COMMIT_AUTHORITY_UNAVAILABLE",
-                "Commit authority is unavailable",
-                true,
-            )
-        })?;
-        let commit = precommits
-            .get_commit(
-                &tenant_id,
-                &snapshot.project_id,
-                &snapshot.artifact_id,
-                neoengram_domain::core::CommitId::from_digest(snapshot.commit_id),
-            )
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("commit"))?;
-        let volume = self
-            .repository
-            .get_storage_volume(&tenant_id, &target_storage_volume_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("storage volume"))?;
-        if !volume.lifecycle.is_active() {
-            return Err(application_error(
-                ErrorCategory::Conflict,
-                "storage_volume_lifecycle_fenced",
-                "STORAGE_VOLUME_LIFECYCLE_FENCED",
-                "the target StorageVolume is not active",
-                false,
-            ));
-        }
-        if volume.state != StorageVolumeState::Ready {
-            return Err(application_error(
-                ErrorCategory::Conflict,
-                "storage_volume_not_ready",
-                "STORAGE_VOLUME_NOT_READY",
-                "the target StorageVolume is not ready",
-                true,
-            ));
-        }
-        // Delivery is visible only after the target Volume has complete v2 object Coverage.
-        // A legacy published PlacementSet or a global object union is not sufficient.
-        let coverage = self
-            .v2_commit_coverage_for_volume(
-                &tenant_id,
-                &snapshot.artifact_id,
-                &commit,
-                &target_storage_volume_id,
-                None,
-            )
-            .await?;
-        if !Self::v2_coverage_is_readable(coverage.as_ref()) {
-            return Err(application_error(
-                ErrorCategory::Conflict,
-                "snapshot_target_volume_has_no_commit_data",
-                "SNAPSHOT_TARGET_VOLUME_HAS_NO_COMMIT_DATA",
-                "the target StorageVolume does not hold this Commit's immutable objects; replicate the Commit first",
-                false,
-            ));
-        }
-        if !volume.allowed_delivery_modes.contains(&mode) {
-            return Err(application_error(
-                ErrorCategory::Conflict,
-                "delivery_mode_not_allowed",
-                DELIVERY_MODE_NOT_ALLOWED,
-                "the requested delivery mode is disabled by the StorageVolume policy",
-                false,
-            ));
-        }
-        if mode == SnapshotDeliveryMode::Hardlink
-            && commit.data_layout != CommitDataLayout::WholeFile
-        {
-            return Err(application_error(
-                ErrorCategory::Conflict,
-                "hardlink_requires_whole_file",
-                HARDLINK_REQUIRES_WHOLE_FILE,
-                "Hardlink delivery requires a WholeFile Commit",
-                false,
-            ));
-        }
-        if mode == SnapshotDeliveryMode::Hardlink
-            && matches!(
-                volume.hardlink_policy,
-                neoengram_domain::protocol::HardlinkPolicy::Disabled
-            )
-        {
-            return Err(application_error(
-                ErrorCategory::Conflict,
-                "hardlink_unsafe_volume",
-                HARDLINK_UNSAFE_VOLUME,
-                "StorageVolume has not enabled a sealed hardlink policy",
-                false,
-            ));
-        }
-        let delivery_id =
-            deterministic_delivery_id(&tenant_id, &snapshot_id, mode, request_id.as_str())?;
-        let target_relative_root = SnapshotDeliveryOperation::canonical_target_relative_root(
-            &snapshot.project_id,
-            &snapshot.artifact_id,
-            &snapshot_id,
-            &delivery_id,
-        )
-        .map_err(|error| invalid_request(error.to_string()))?;
-        let now = self.clock.now();
-        let records = &commit.records;
-        let file_count =
-            u64::try_from(records.len()).map_err(|_| invalid_request("file count exceeds u64"))?;
-        let size_bytes = records
-            .iter()
-            .try_fold(0_u64, |total, record| total.checked_add(record.total_size))
-            .ok_or_else(|| invalid_request("snapshot size exceeds u64"))?;
-        if commit.data_layout == CommitDataLayout::WholeFile
-            && records
-                .iter()
-                .any(|record| record.total_size > volume.max_whole_file_bytes.get())
-        {
-            return Err(application_error(
-                ErrorCategory::Conflict,
-                "whole_file_size_limit_exceeded",
-                WHOLE_FILE_SIZE_LIMIT_EXCEEDED,
-                "the Commit contains a file that exceeds the StorageVolume WholeFile size policy",
-                false,
-            ));
-        }
-        let coordinator = self.coordinator.as_ref().ok_or_else(|| {
-            application_error(
-                ErrorCategory::Unavailable,
-                "snapshot_delivery_unavailable",
-                "SNAPSHOT_DELIVERY_UNAVAILABLE",
-                "SnapshotDelivery execution is not configured",
-                true,
-            )
-        })?;
-        coordinator
-            .preflight_snapshot_delivery(&tenant_id, &target_storage_volume_id, mode)
-            .await
-            .map_err(map_central_error)?;
-        let retention_roots = if mode == SnapshotDeliveryMode::Hardlink {
-            self.hardlink_retention_roots(&tenant_id, &snapshot.artifact_id, &delivery_id, records)
-                .await?
-        } else {
-            Vec::new()
-        };
-        let record = SnapshotDeliveryRecord {
-            tenant_id: tenant_id.clone(),
-            delivery_id,
-            create_request_id: request_id.clone(),
-            snapshot_id: snapshot_id.clone(),
-            commit_id: snapshot.commit_id,
-            storage_volume_id: target_storage_volume_id,
-            mode,
-            target_relative_root,
-            state: SnapshotDeliveryState::Requested,
-            source_index_digest: commit.index_version.digest,
-            delivery_generation: DeliveryGeneration::new(1),
-            file_count,
-            size_bytes,
-            // Delivery is a physical view of the Commit, so its object-set identity must be the
-            // immutable Commit identity. Recomputing a second file-record digest here would let
-            // Delivery and Replication disagree about which objects are required.
-            object_set_digest: commit.object_set_digest,
-            resource_version: 1,
-            issue_code: None,
-            issue_message: None,
-            issue_retryable: false,
-            created_at_unix_ms: now,
-            updated_at_unix_ms: now,
-        };
-        let outcome = self
-            .repository
-            .insert_snapshot_delivery_idempotent(SnapshotDeliveryInsertRequest {
-                record,
-                request_id,
-                retention_roots,
-            })
-            .await
-            .map_err(map_central_error)?;
-        let (delivery, replayed) = match outcome {
-            SnapshotDeliveryInsertOutcome::Inserted(record) => (record, false),
-            SnapshotDeliveryInsertOutcome::Existing(record) => (record, true),
-        };
-        self.best_effort_schedule_snapshot_delivery(&delivery).await;
-        Ok(CreateSnapshotDeliveryResponse {
-            delivery: view(&delivery),
-            replayed,
-        })
-    }
-
     pub async fn query_snapshot_delivery(
         &self,
         identity: &AuthenticatedIdentity,
@@ -544,14 +338,48 @@ impl CatalogService {
         identity: &AuthenticatedIdentity,
         request: RetrySnapshotDeliveryRequest,
     ) -> Result<RetrySnapshotDeliveryResponse, Error> {
+        let task_request = request.clone();
         let tenant_id = parse_tenant(request.tenant_id)?;
         self.require_tenant(identity, Permission::SnapshotCreate, &tenant_id)
             .await?;
         let delivery_id = parse_delivery(request.delivery_id)?;
-        let request_id = neoengram_domain::protocol::RequestId::new(request.request_id)
+        let request_id = RequestId::new(request.request_id)
             .map_err(|error| invalid_request(format!("request_id: {error}")))?;
         let kind = SnapshotDeliveryMutationKind::Retry;
         let request_digest = delivery_mutation_digest(kind, &tenant_id, &delivery_id);
+        let current = self
+            .repository
+            .get_snapshot_delivery(&tenant_id, &delivery_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("snapshot delivery"))?;
+        let (task, task_replayed) = self
+            .begin_operation_task(
+                TaskKind::SnapshotDeliveryMaterialize,
+                TaskScope {
+                    tenant_id: tenant_id.clone(),
+                    project_id: None,
+                    artifact_id: None,
+                    object_namespace_id: None,
+                    commit_id: Some(CommitId::from_digest(current.commit_id)),
+                    playground_id: None,
+                    snapshot_id: Some(current.snapshot_id.clone()),
+                    storage_volume_id: Some(current.storage_volume_id.clone()),
+                },
+                request_id.clone(),
+                &task_request,
+                identity,
+                Some("snapshot_delivery"),
+                Some(delivery_id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(
+            &task,
+            TaskResourceKind::SnapshotDelivery,
+            delivery_id.to_string(),
+            TaskResourceRole::Primary,
+        )
+        .await?;
         if let Some(receipt) = self
             .repository
             .get_snapshot_delivery_mutation(&tenant_id, &request_id)
@@ -564,19 +392,23 @@ impl CatalogService {
             {
                 return Err(mutation_id_reused());
             }
+            self.restore_snapshot_for_retry(&receipt.delivery).await?;
             self.best_effort_schedule_snapshot_delivery(&receipt.delivery)
                 .await;
+            let task = self
+                .transition_operation_task(
+                    task,
+                    TaskState::Running,
+                    identity,
+                    Some("Snapshot Delivery retry scheduled".to_owned()),
+                )
+                .await?;
             return Ok(RetrySnapshotDeliveryResponse {
                 delivery: view(&receipt.delivery),
                 replayed: true,
+                task,
             });
         }
-        let current = self
-            .repository
-            .get_snapshot_delivery(&tenant_id, &delivery_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("snapshot delivery"))?;
         if !matches!(
             current.state,
             SnapshotDeliveryState::Failed | SnapshotDeliveryState::Requested
@@ -645,6 +477,7 @@ impl CatalogService {
             CatalogInsertOutcome::Inserted(receipt) => (receipt, false),
             CatalogInsertOutcome::Existing(receipt) => (receipt, true),
         };
+        self.restore_snapshot_for_retry(&receipt.delivery).await?;
         if replayed {
             self.best_effort_schedule_snapshot_delivery(&receipt.delivery)
                 .await;
@@ -656,9 +489,18 @@ impl CatalogService {
                     .map_err(map_central_error)?;
             }
         }
+        let task = self
+            .transition_operation_task(
+                task,
+                TaskState::Running,
+                identity,
+                Some("Snapshot Delivery retry scheduled".to_owned()),
+            )
+            .await?;
         Ok(RetrySnapshotDeliveryResponse {
             delivery: view(&receipt.delivery),
-            replayed,
+            replayed: replayed || task_replayed,
+            task,
         })
     }
 
@@ -667,14 +509,48 @@ impl CatalogService {
         identity: &AuthenticatedIdentity,
         request: DeleteSnapshotDeliveryRequest,
     ) -> Result<DeleteSnapshotDeliveryResponse, Error> {
+        let task_request = request.clone();
         let tenant_id = parse_tenant(request.tenant_id)?;
         self.require_tenant(identity, Permission::SnapshotCreate, &tenant_id)
             .await?;
         let delivery_id = parse_delivery(request.delivery_id)?;
-        let request_id = neoengram_domain::protocol::RequestId::new(request.request_id)
+        let request_id = RequestId::new(request.request_id)
             .map_err(|error| invalid_request(format!("request_id: {error}")))?;
         let kind = SnapshotDeliveryMutationKind::Delete;
         let request_digest = delivery_mutation_digest(kind, &tenant_id, &delivery_id);
+        let current = self
+            .repository
+            .get_snapshot_delivery(&tenant_id, &delivery_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("snapshot delivery"))?;
+        let (task, task_replayed) = self
+            .begin_operation_task(
+                TaskKind::CatalogLifecycle,
+                TaskScope {
+                    tenant_id: tenant_id.clone(),
+                    project_id: None,
+                    artifact_id: None,
+                    object_namespace_id: None,
+                    commit_id: Some(CommitId::from_digest(current.commit_id)),
+                    playground_id: None,
+                    snapshot_id: Some(current.snapshot_id.clone()),
+                    storage_volume_id: Some(current.storage_volume_id.clone()),
+                },
+                request_id.clone(),
+                &task_request,
+                identity,
+                Some("snapshot_delivery"),
+                Some(delivery_id.as_str()),
+            )
+            .await?;
+        self.link_operation_resource(
+            &task,
+            TaskResourceKind::SnapshotDelivery,
+            delivery_id.to_string(),
+            TaskResourceRole::Primary,
+        )
+        .await?;
         if let Some(receipt) = self
             .repository
             .get_snapshot_delivery_mutation(&tenant_id, &request_id)
@@ -689,17 +565,20 @@ impl CatalogService {
             }
             self.best_effort_schedule_snapshot_delivery(&receipt.delivery)
                 .await;
+            let task = self
+                .transition_operation_task(
+                    task,
+                    TaskState::Running,
+                    identity,
+                    Some("Snapshot Delivery deletion scheduled".to_owned()),
+                )
+                .await?;
             return Ok(DeleteSnapshotDeliveryResponse {
                 delivery: view(&receipt.delivery),
                 replayed: true,
+                task,
             });
         }
-        let current = self
-            .repository
-            .get_snapshot_delivery(&tenant_id, &delivery_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("snapshot delivery"))?;
         let desired = if matches!(
             current.state,
             SnapshotDeliveryState::Deleted | SnapshotDeliveryState::Deleting
@@ -756,9 +635,18 @@ impl CatalogService {
                     .map_err(map_central_error)?;
             }
         }
+        let task = self
+            .transition_operation_task(
+                task,
+                TaskState::Running,
+                identity,
+                Some("Snapshot Delivery deletion scheduled".to_owned()),
+            )
+            .await?;
         Ok(DeleteSnapshotDeliveryResponse {
             delivery: view(&receipt.delivery),
-            replayed,
+            replayed: replayed || task_replayed,
+            task,
         })
     }
 }

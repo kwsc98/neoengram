@@ -1,9 +1,12 @@
 use fusen_rs::SensitiveFields;
 use serde::{Deserialize, Serialize};
 
-use super::{DataLayout, ResourceIssueSummary, ResourceLifecycleView};
+use super::{
+    snapshot_delivery::SnapshotDeliveryMode, DataLayout, ResourceIssueSummary,
+    ResourceLifecycleView, TaskView,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
 pub struct QuerySnapshotListRequest {
@@ -54,15 +57,21 @@ pub struct CreateSnapshotRequest {
     pub project_id: String,
     pub artifact_id: String,
     pub commit_id: String,
+    /// The EdgeCluster and StorageVolume are selected before the immutable Snapshot is created.
+    pub target_edge_cluster_id: String,
+    pub target_storage_volume_id: String,
+    pub delivery_mode: SnapshotDeliveryMode,
     pub request_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
 pub struct CreateSnapshotResponse {
     pub snapshot: SnapshotView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -74,6 +83,10 @@ pub struct SnapshotView {
     pub project_id: String,
     pub artifact_id: String,
     pub commit_id: String,
+    pub delivery_id: String,
+    pub edge_cluster_id: String,
+    pub storage_volume_id: String,
+    pub delivery_mode: SnapshotDeliveryMode,
     /// Denormalized Commit layout for the read-only console; Commit remains authoritative.
     pub data_layout: DataLayout,
     pub message: String,

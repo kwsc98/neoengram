@@ -19,6 +19,8 @@ mod snapshot;
 pub use snapshot::*;
 mod snapshot_delivery;
 pub use snapshot_delivery::*;
+mod task;
+pub use task::*;
 mod s3;
 pub use s3::*;
 
@@ -241,6 +243,8 @@ pub struct CreateStorageEnrollmentTokenResponse {
     pub volume_descriptor_digest: String,
     pub expires_at_unix_ms: String,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 /// Tenant-scoped enrollment list request.
@@ -308,6 +312,8 @@ pub struct ApproveStorageEnrollmentResponse {
     pub enrollment: StorageEnrollmentView,
     pub storage_volume: StorageVolumeView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 /// Explicitly completes the recovery fence after a replacement Agent has reported a Ready
@@ -329,6 +335,8 @@ pub struct CompleteStorageRecoveryRequest {
 pub struct CompleteStorageRecoveryResponse {
     pub enrollment: StorageEnrollmentView,
     pub storage_volume: StorageVolumeView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 /// Public rejection mutation. The optional reason is never included in a public response.
@@ -351,6 +359,8 @@ pub struct RejectStorageEnrollmentRequest {
 pub struct RejectStorageEnrollmentResponse {
     pub enrollment: StorageEnrollmentView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 /// Deliberately whitelisted public enrollment projection.

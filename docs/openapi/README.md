@@ -15,7 +15,7 @@ POST /api/snapshot/dataset/profile/query
 ```
 
 这 3 条路径由 OpenAPI 和 Web Mock 冻结请求/响应形状，但当前没有 Central handler。其余公开路径（包括
-Project、Commit graph/diff/materialization、SnapshotDelivery、资源生命周期、Gateway 管理和 S3 管理/对象
+Project、Commit graph/diff/materialization 创建、统一 Task 审计、SnapshotDelivery、资源生命周期、Gateway 管理和 S3 管理/对象
 查询 action）都已进入 Central 路由 descriptor；具体是否可执行仍由 `/api/system/version/query` 的
 capability 和运行时依赖决定。
 
@@ -38,7 +38,7 @@ POST /api/gateway/replica/revoke
 
 这些接口只管理 Central 权威的 GatewayPool/Replica 状态、证书激活和排空；它们不让 Gateway 挂载
 Volume，也不把 Gateway 变成 metadata 或 Chunk authority。跨 Volume 的控制 action 通过 Commit
-materialization 路径提供，字节仍由 Agent/Gateway 数据面传输；只读 S3 另有 Central 管理 action、内部授权
+materialization 创建路径提供，任务查询、重试和取消统一走 Task API，字节仍由 Agent/Gateway 数据面传输；只读 S3 另有 Central 管理 action、内部授权
 路由和 Gateway public listener。生产凭据、GatewayPool readiness、Agent route 与真实跨节点 E2E 仍受
 能力开关和部署验收约束。
 
@@ -64,7 +64,7 @@ POST /agent/session/close
 对象字节不会进入 Gateway/Central 控制链路。Agent 将不可变 Chunk 直接持久化到获批 StorageVolume
 的 Volume-local CAS，只通过 MetadataBatch 上报 Manifest、IndexDelta 和带 Placement 的 ObjectReceipt。
 
-公开契约中的 Project、Artifact commit diff、Commit materialization/coverage/availability、Snapshot delivery 和 S3 管理 action
+公开契约中的 Project、Artifact commit diff、Commit materialization 创建、Coverage/Availability、统一 Task、Snapshot delivery 和 S3 管理 action
 已经注册到当前 Central descriptor；只有上面列出的 Snapshot file/activity/profile 三条仍是 contract-only。
 OpenAPI 路由已注册不等于数据面已经可用：Web 必须按 `/api/system/version/query` 返回的 capability 隐藏
 依赖 enrollment、coordinator、GatewayPool、placement 或 command keyring 的入口。
@@ -74,12 +74,12 @@ OpenAPI 路由已注册不等于数据面已经可用：Web 必须按 `/api/syst
 
 ## 设计约定
 
-- 业务路径采用“模块 / 子域 / 动作”，例如 `POST /api/job/add/create`。它借鉴支付宝开放平台
+- 业务路径采用“模块 / 子域 / 动作”，例如 `POST /api/task/list/query`。它借鉴支付宝开放平台
   的模块化方法命名，但不使用单一 gateway method，也不把版本放进 path。
 - API 主版本通过必需的 `NeoEngram-API-Version` header 协商。版本查询与健康探针例外。
 - 普通调用使用 JSON 请求/响应。成功直接返回业务 DTO；失败使用 RFC 9457
   `application/problem+json`，并附加稳定 `code`、`request_id` 和 `retryable`。
-- 服务端使用认证后的 PrincipalRef 和完整 Add operation 计算 request digest；它与 Job ID 形成业务
+- 服务端使用认证后的 PrincipalRef 和完整写操作计算 request digest；它与 OperationTask ID 形成业务
   幂等边界，参考 Temporal 等开源工作流系统的稳定 execution identity，不叠加另一套通用
   idempotency key，也不要求浏览器复制 canonical digest 实现。
 - `resource_version`、generation 和 CAS 语义借鉴 Kubernetes 的版本化并发控制，但公开路径不是
@@ -93,14 +93,16 @@ OpenAPI 路由已注册不等于数据面已经可用：Web 必须按 `/api/syst
 token，并从验证后的 issuer/sub 导出 `PrincipalRef`；tenant scope 只能由启动时加载的服务端 RBAC
 策略授予。JWT 中的 tenant、role、group 只作审计提示，客户端不能通过 token 或请求 body 覆盖授权。
 
-Tenant、StorageVolume、Artifact、Commit、Playground、Snapshot 与 `JobView` 均为脱敏视图。
+Tenant、StorageVolume、Artifact、Commit、Playground、Snapshot 与 `OperationTask` 均为脱敏视图。
 StorageVolume 的稳定逻辑 ID、region、EdgeCluster 和公开 PVC reference 可用于放置与运维识别；
 不得包含 Assignment target、Agent/Mount identity、generation、fencing token、NFS export、凭据、
 PublicationCandidate、Manifest、IndexDelta、物理路径或数据库信息。跨租户查询按
-对应资源的 `*_NOT_FOUND` 返回 404，不能泄漏目标资源是否存在。Artifact 和 Snapshot 不携带物理放置字段；
-Playground 的 Region 由所选 StorageVolume 派生，Snapshot 的数据健康由对象级 Verified Placement 和 Volume Coverage 动态解析。
+对应资源的 `*_NOT_FOUND` 返回 404，不能泄漏目标资源是否存在。Artifact 不携带物理放置字段；Snapshot
+view 包含创建时固定的 `edge_cluster_id`、`storage_volume_id`、`delivery_mode` 和唯一 `delivery_id`，
+但不暴露内部 mount/generation。Snapshot 的数据健康由对象级 Verified Placement 和 Volume Coverage 动态解析。
 
-只有 `state=ready` 的 StorageVolume 可以承接新的 Playground、Workspace 或 SnapshotDelivery；`degraded` 和
+只有 `state=ready` 的 StorageVolume 可以承接新的 Playground、Workspace 或 Snapshot（及其原子生成的
+SnapshotDelivery）；`degraded` 和
 `unavailable` 均拒绝新的物化或复制目标，但已有资源的公开元数据仍可查询。P0 Dashboard 只展示当前 Tenant、
 系统健康和资源导航；资源数量、关注项、区域统计、最近版本与跨资源活动依赖 P1 聚合接口。
 
@@ -123,13 +125,13 @@ probe 才能推进到 `enrolled` 和 `ready`；拒绝进入终态 `rejected`。
 资源 mutation 同样只接受公开 DTO：StorageVolume 登记已有 PVC/NFS，不负责创建底层存储资源。
 Artifact 创建通过 discriminator 表达空初始化或从同 Tenant 另一 Artifact 的明确 Commit 派生，派生来源显式
 携带来源 Project；当前 Central 只执行空初始化，`derived` 请求返回
-`409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED`。Playground/Workspace 和 SnapshotDelivery 创建各自
-选择一个同 Tenant Volume。
+`409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED`。Playground/Workspace 选择一个同 Tenant Volume；
+Snapshot create 同时选择同 Tenant 的 EdgeCluster、StorageVolume 和 delivery mode，并原子生成唯一 Delivery。
 
-Playground 继续使用完整资源 identity 幂等创建。Snapshot create 使用稳定 request identity，只创建
-`snapshot_id + commit_id` 的逻辑引用，不选择或绑定 Volume/Region；同一 Tenant/Artifact/Commit
-只保留一个活动逻辑 Snapshot。需要物理副本时显式调用 Commit Replicate，完成后再创建独立的
-SnapshotDelivery 并选择目标 Volume 和模式。
+Playground 继续使用完整资源 identity 幂等创建。Snapshot create 使用稳定 request identity，一次性提交
+`snapshot_id + commit_id + edge_cluster_id + storage_volume_id + delivery_mode`，并原子写入 Snapshot
+和唯一 SnapshotDelivery。创建后的目标和模式不可变；Delivery 只能通过 retry/delete 等状态 mutation
+推进或结束，不存在公开的第二个 Delivery create 或目标切换流程。
 Playground 的主状态仅为 Creating、Ready、Abnormal；扫描、哈希、上传和校验属于独立 Pre-commit。
 Pre-commit start 创建新的 `precommit_id`，并在服务端内部冻结当前 Head；running/ready 的重新检测
 使用 cancel 后 start，abnormal/cancelled 的失败重试才使用 restart，在同一 ID 上令 `attempt + 1`。
@@ -164,7 +166,7 @@ fence、sequence、message ID、correlation、type 和 payload。MetadataBatch �
 - [`../../crates/neoengram-domain/schemas/current/control-envelope.schema.json`](../../crates/neoengram-domain/schemas/current/control-envelope.schema.json)
 - [`../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json`](../../crates/neoengram-domain/schemas/current/metadata-batch.schema.json)
 
-`AssignJob`、`ExpireAddJob` 和 `ResumePublication` 是中心调度/恢复内部方法，不得加入公开 OpenAPI。
+`AssignJob`、`ExpireAddJob` 和 `ResumePublication` 是中心调度/恢复内部方法，不得加入公开 OpenAPI；任务查询、重试和取消统一通过 `/api/task/*` 完成，旧 Job/Materialization 查询接口不再注册。
 Storage Enrollment 公开 DTO 同样不得暴露 CSR、公私钥、证书、bootstrap credential、PVC UID、
 CSI handle、fsid/device、mount path/options/fingerprint、AgentId、AgentMountId、ComputeNodeId、session
 或 credential generation、heartbeat/job/assignment，以及 tenant owner、lease 或 fencing 信息。

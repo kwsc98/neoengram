@@ -4,7 +4,7 @@
 >
 > 生效日期：2026-08-09。
 >
-> 最后更新：2026-09-01。
+> 最后更新：2026-09-04。
 >
 > 本文是 Gateway 拓扑、资源、连接方向、安全、可用性、跨集群传输和 S3 暴露方式的专项权威文档。
 > 当前代码已包含 Gateway 协议、Gateway Registry、管理 API、三 listener、有界 H2 tunnel、Central outbound
@@ -44,7 +44,7 @@ GatewayPool”。一个 EdgeCluster 对应一个逻辑 `GatewayPool`，Pool 由�
 
 固定结论：
 
-- Central 是全局逻辑权威；Gateway 不拥有 Tenant、Artifact、Commit、Index、Placement、Job、Lease 或
+- Central 是全局逻辑权威；Gateway 不拥有 Tenant、Artifact、Commit、Index、Placement、OperationTask、Job、Lease 或
   Ticket 的最终决定权；
 - 每个 EdgeCluster 有一个逻辑 GatewayPool，生产默认至少两个 Replica，开发环境允许单 Replica；
 - Central 主动连接持久化登记的 GatewayReplica；Agent 只主动连接本集群 GatewayPool；
@@ -53,8 +53,8 @@ GatewayPool”。一个 EdgeCluster 对应一个逻辑 `GatewayPool`，Pool 由�
 - Gateway 只路由控制帧和后续的数据流，不保存对象 payload 或权威 metadata；
 - Gateway 多副本只提升网络入口可用性，不表示 Chunk、Volume 或 metadata 多副本；
 - Central 下行命令和 Agent 上行报告保留端到端签名，Gateway 不能修改已签名 payload；
-- Gateway 控制面与固定 Ready Snapshot 的一期只读 S3 数据面已实现；跨集群 v1 replication 控制记录仍为
-  legacy，v2 Materialization 的 ticket/fence/manifest 边界已有代码，payload 执行与生产验收仍是独立里程碑；
+- Gateway 控制面与固定 Ready Snapshot 的一期只读 S3 数据面已实现；跨集群 v1 replication 控制记录仅为
+  私有 legacy 残留且不再接受，v2 Materialization 的 ticket/fence/manifest 边界已有代码，payload 执行与生产验收仍是独立里程碑；
 - 迁移采用维护窗口一次性切换，不保留 Agent 直连 Central 的双栈或回退协议；
 - Fusen 不属于 Gateway 架构依赖或传输决策。
 
@@ -68,7 +68,7 @@ GatewayPool”。一个 EdgeCluster 对应一个逻辑 `GatewayPool`，Pool 由�
 | Agent 路由     | Gateway Registry 已持久化 RouteLease，Central 原子 session+lease grant 和 Agent stream/unary 转发代码已接入；InMemory/SQLite 共用的双 Replica 契约已覆盖活跃租约拒绝抢占、过期接管和旧 owner fencing，但尚无把真实 Registry、双 Replica transport、outbox 和签名串起来的故障恢复 E2E                                                                                                        | Central 权威 `AgentRouteLease` + Replica forwarding |
 | 传输安全       | Agent trust bundle、Central command signing、activation 防重放、Gateway/Agent mTLS/SAN/EKU、过期 credential CAS fencing、RouteLease owner 复核、Gateway 入站对端证书 notAfter deadline、Agent 半程续签安装和重连，以及 Gateway server leaf 到期驱动 Agent/Central 既有 H2 断开已实现；外部生产 issuer/KMS-HSM adapter、Gateway 证书交付切换和真实轮换演练待完成                        | H2 + mTLS，另保留端到端 Ed25519 签名                |
 | Volume 访问    | Agent 挂载并读写所属 Volume                                                                                                                                                                                                                                                                                                                                                            | 仍只有 Volume Owner Agent 挂载和访问 Volume         |
-| 跨集群 payload | v1 replication/route/ticket 仍为 legacy；v2 `MaterializationJob` 的 Ticket、分页 manifest、generation fence、Agent source/target stream 和 Gateway relay 已接入，目标 staging/checkpoint/receipt 也有执行路径；真实 route 编排、跨节点 payload、限流/背压和多 Agent E2E 待验收                                                                                                                                                                                                                                                                                                                                                                                 | Agent A -> Gateway A -> Gateway B -> Agent B        |
+| 跨集群 payload | v1 replication/route/ticket 仅是拒绝/迁移边界；v2 `MaterializationJob` 的 Ticket、分页 manifest、generation fence、Agent source/target stream 和 Gateway relay 已接入，目标 staging/checkpoint/receipt 也有执行路径；真实 route 编排、跨节点 payload、限流/背压和多 Agent E2E 待验收                                                                                                                                                                                                                                                                                                                                                                                 | Agent A -> Gateway A -> Gateway B -> Agent B        |
 | S3             | Ready Snapshot Access Point、SigV4/预签名、ListObjectsV2、HEAD/GET/Range、Agent 二进制流和 Web 对象浏览已实现；公网 DNS/TLS、生产 CA、真实双 Replica 故障演练仍由部署验收完成                                                                                                                                                                                                              | 固定 Ready Snapshot 的只读 S3 Access Point          |
 
 “目标架构”不能在对应代码、契约测试和部署验收完成前标记为当前能力。当前仓库处于不提供旧 endpoint
@@ -84,9 +84,10 @@ Central 继续权威管理：
 - Tenant、Project、Artifact、Commit、Directory、Manifest、IndexVersion 和 Ref；
 - EdgeCluster、StorageVolume、ArtifactPlacement、AgentInstance 和 Volume Owner generation；
 - GatewayPool、GatewayReplica、AgentRouteLease 和工作负载证书状态；
-- Job、Assignment、PlaygroundLease、fencing token、Decision 和审计事件；
-- v1 `TransferRoute`/`TransferTicket`/`TransferSession` legacy 控制记录，以及 v2
-  `MaterializationJob`/`MaterializationBatch`/batch Ticket/Lease 的控制记录；当前只读数据面的 S3AccessPoint、
+- `OperationTask`、TaskAttempt、TaskEvent、TaskResourceLink/Relation，以及由其关联的
+  `Job`/`Assignment`、PlaygroundLease、fencing token、Decision 和审计事件；
+- v2 `MaterializationJob`/`MaterializationBatch`/batch Ticket/Lease 的控制记录；v1
+  `TransferRoute`/`TransferTicket`/`TransferSession` 仅保留为私有迁移/拒绝边界，不参与调度；当前只读数据面的 S3AccessPoint、
   S3Credential 和策略 generation；payload 是否可执行由 route/keyring/capability 决定。
 
 Central 持久化 metadata 和 placement evidence，但不接收、不代理、不保存 Chunk payload。当前 SQLite
@@ -108,7 +109,7 @@ Gateway 是区域网络与协议边界，负责：
 
 Gateway 不得：
 
-- 成为 Tenant、Artifact、Commit、Index、Job、Placement、Lease 或 Ticket 的权威；
+- 成为 Tenant、Artifact、Commit、Index、OperationTask、Job、Placement、Lease 或 Ticket 的权威；
 - 挂载 NFS/PVC/StorageVolume，或读取 Playground、journal、Agent state database；
 - 把对象、metadata batch 或 S3 响应持久化为可恢复的业务副本；
 - 自行调度 Agent、签发 Ticket、提升 route generation 或抢占 Agent owner；
@@ -208,9 +209,9 @@ bootstrap endpoint 在 Registry 层固化；在证书轮换交付/切换协议�
 
 Central 增加 `GatewayRegistryRepository`，InMemory 和 SQLite 必须运行同一行为契约。GatewayPool、
 GatewayReplica、activation/certificate 记录和 AgentRouteLease 写入现有 Agent Registry 数据库；该库从
-  authority 使用单一 clean-slate schema identity `application_id = 0x4e454155`、`user_version = 18`；
-  已知的合并 authority v13-v17 显式迁移到 v18，未知 schema 与旧的拆分数据库布局直接拒绝，不能留下
-  半初始化 schema。
+  authority 使用单一 clean-slate schema identity `application_id = 0x4e454155`、`user_version = 20`；
+  v19 及更早 authority 与当前 DDL 不兼容，必须由运维显式 reset/inventory rebuild。未知 schema 与旧的
+  拆分数据库布局直接拒绝，不能留下半初始化 schema，也不执行隐式迁移。
 
 管理面至少提供 GatewayPool create/get/list/update/drain，以及 GatewayReplica create/list/drain/revoke。
 所有 mutation 使用稳定 request identity、expected resource version 和审计主体；重复 create 返回同一

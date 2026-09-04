@@ -1,7 +1,7 @@
 use fusen_rs::SensitiveFields;
 use serde::{Deserialize, Serialize};
 
-use super::ResourceIssueSummary;
+use super::{ResourceIssueSummary, TaskView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(rename_all = "snake_case")]
@@ -25,17 +25,6 @@ pub enum SnapshotDeliveryState {
     Deleted,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
-#[serde(deny_unknown_fields)]
-#[sensitive(opaque)]
-pub struct CreateSnapshotDeliveryRequest {
-    pub tenant_id: String,
-    pub snapshot_id: String,
-    pub target_storage_volume_id: String,
-    pub mode: SnapshotDeliveryMode,
-    pub request_id: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
@@ -57,14 +46,6 @@ pub struct SnapshotDeliveryView {
     pub issue: Option<ResourceIssueSummary>,
     pub created_at_unix_ms: String,
     pub updated_at_unix_ms: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
-#[serde(deny_unknown_fields)]
-#[sensitive(opaque)]
-pub struct CreateSnapshotDeliveryResponse {
-    pub delivery: SnapshotDeliveryView,
-    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -118,6 +99,8 @@ pub struct RetrySnapshotDeliveryRequest {
 pub struct RetrySnapshotDeliveryResponse {
     pub delivery: SnapshotDeliveryView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -135,4 +118,6 @@ pub struct DeleteSnapshotDeliveryRequest {
 pub struct DeleteSnapshotDeliveryResponse {
     pub delivery: SnapshotDeliveryView,
     pub replayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskView>,
 }

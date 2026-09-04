@@ -1,24 +1,25 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use neoengram_domain::protocol::materialization::{
-    BatchManifest, CoverageState, MaterializationBatch, MaterializationBatchState,
-    MaterializationBatchTicket, MaterializationObjectState, MaterializationReport,
+    BatchManifest, CoverageState, IntegrityScanReport, MaterializationBatch,
+    MaterializationBatchState, MaterializationBatchTicket, MaterializationJob,
+    MaterializationJobState, MaterializationObjectState, MaterializationReport,
     VolumeCommitCoverage,
 };
 use neoengram_domain::protocol::{
     object_read_lease_id, staging_lease_id, AgentId, AssignmentOperation, CommitObject,
     ControlError, ControlMessage, DecisionGeneration, DeletionOperationState, DeletionProof,
     DeletionProofId, DeletionProofResult, Envelope, EnvelopeHeader, ErrorCode, Extensions,
-    IndexRevision, JobAssignment, JobDecision, JobFinalized, JobState, LifecycleEvent,
+    Generation, IndexRevision, JobAssignment, JobDecision, JobFinalized, JobState, LifecycleEvent,
     LifecycleEventId, LifecycleEventKind, MessageId, MountGeneration, ObjectNamespaceId, ObjectSet,
     ObjectTicketId, PlacementGeneration, PrincipalKind, PublishDecision, ReplicationAssignment,
     ReplicationObjectState, ReplicationProgressReport, ReplicationState, RequestId,
     ResourceLifecycleReport, ResourceLifecycleReportState, ResourceVersion, RouteGeneration,
     SessionGeneration, SignedTransferTicket, SnapshotDeliveryAssignment, SnapshotDeliveryState,
-    TraceId, TransferEndpoint, TransferTicket, UnixMillis, WireIndexVersion,
-    WorkspaceMaterializeAssignment, AGENT_JOB_ASSIGNMENT_ACTION, AGENT_JOB_DECISION_ACTION,
-    AGENT_LIFECYCLE_ASSIGNMENT_ACTION, AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
-    CURRENT_WIRE_VERSION,
+    TaskActor, TaskIssue, TaskProgressSummary, TaskState, TraceId, TransferEndpoint,
+    TransferTicket, UnixMillis, WireIndexVersion, WorkspaceMaterializeAssignment,
+    AGENT_JOB_ASSIGNMENT_ACTION, AGENT_JOB_DECISION_ACTION, AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
+    AGENT_MATERIALIZATION_ASSIGNMENT_ACTION, CURRENT_WIRE_VERSION,
 };
 
 use crate::{
@@ -45,9 +46,28 @@ use crate::{
     StageMetadataBatchRequest, StageMetadataBatchResult,
 };
 
-use crate::service::{CentralCommandKeyring, DEFAULT_CENTRAL_COMMAND_TTL_MS};
+use crate::service::{
+    CentralCommandKeyring, TaskCoordinator, DEFAULT_CENTRAL_COMMAND_TTL_MS,
+    MAX_CENTRAL_COMMAND_TTL_MS,
+};
 
 const CONTROL_ERROR_MESSAGE_LIMIT: usize = 4096;
+
+fn task_text(value: &str) -> String {
+    const LIMIT: usize = neoengram_domain::protocol::MAX_TASK_TEXT_BYTES;
+    if value.len() <= LIMIT {
+        return value.to_owned();
+    }
+    let mut truncated = String::new();
+    for character in value.chars() {
+        if truncated.len().saturating_add(character.len_utf8()) > LIMIT.saturating_sub(3) {
+            break;
+        }
+        truncated.push(character);
+    }
+    truncated.push_str("...");
+    truncated
+}
 
 fn action_envelope(
     action: &'static str,
@@ -82,6 +102,28 @@ fn assignment_deadline(assignment: &JobAssignment) -> UnixMillis {
         AssignmentOperation::WorkspaceMaterialize { input, .. } => input.deadline_unix_ms,
         AssignmentOperation::SnapshotDelivery { input, .. } => input.deadline_unix_ms,
     }
+}
+
+/// Build the durable request ID for a materialization assignment.
+///
+/// Resource IDs are intentionally allowed to be fairly long, while MessageId has the same
+/// 128-byte limit as every other wire identifier.  Hashing the full assignment identity keeps the
+/// ID deterministic for replay/deduplication without allowing a long materialization or batch ID
+/// to make an otherwise valid assignment fail envelope validation.
+fn materialization_assignment_message_id(
+    materialization_id: &neoengram_domain::protocol::MaterializationId,
+    batch_id: &neoengram_domain::protocol::MaterializationBatchId,
+    plan_revision: Generation,
+    batch_attempt: Generation,
+) -> CentralResult<MessageId> {
+    let digest = blake3::hash(
+        format!(
+            "materialization-assignment-message\\0{}\\0{}\\0{}\\0{}",
+            materialization_id, batch_id, plan_revision, batch_attempt
+        )
+        .as_bytes(),
+    );
+    MessageId::new(format!("materialization-{}", &digest.to_hex()[..64])).map_err(Into::into)
 }
 
 async fn target_volume_coverage_complete(
@@ -178,6 +220,36 @@ fn replication_ticket_deadline(now: UnixMillis) -> CentralResult<UnixMillis> {
         })
 }
 
+fn materialization_ticket_window(
+    now: UnixMillis,
+    batch_deadline: UnixMillis,
+) -> CentralResult<(UnixMillis, u64)> {
+    if batch_deadline.get() <= now.get() {
+        return Err(invalid(
+            CentralErrorCode::DeadlineExceeded,
+            "materialization Batch deadline has elapsed",
+        ));
+    }
+    let remaining_ms = batch_deadline.get().checked_sub(now.get()).ok_or_else(|| {
+        invalid(
+            CentralErrorCode::DeadlineExceeded,
+            "materialization Batch deadline has elapsed",
+        )
+    })?;
+    let ttl_ms = remaining_ms.min(MAX_CENTRAL_COMMAND_TTL_MS);
+    let ticket_deadline = now
+        .get()
+        .checked_add(ttl_ms)
+        .map(UnixMillis::new)
+        .ok_or_else(|| {
+            invalid(
+                CentralErrorCode::DeadlineExceeded,
+                "materialization Ticket deadline overflowed",
+            )
+        })?;
+    Ok((ticket_deadline, ttl_ms))
+}
+
 fn lifecycle_event_id(
     assignment_id: &neoengram_domain::protocol::LifecycleAssignmentId,
     report_digest: &neoengram_domain::protocol::ContentDigest,
@@ -208,6 +280,7 @@ pub struct ControlPlane {
     placement: Option<Arc<dyn PlacementRepository>>,
     gateway_registry: Option<Arc<dyn GatewayRegistryRepository>>,
     replication_ticket_keyring: Option<Arc<CentralCommandKeyring>>,
+    task_coordinator: Option<Arc<TaskCoordinator>>,
     clock: Arc<dyn Clock>,
 }
 
@@ -222,6 +295,13 @@ pub struct ReplicationReportResult {
 /// the actual fencing keys are the plan revision, batch attempt, and target route generations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaterializationReportResult {
+    pub resource_version: ResourceVersion,
+    pub replayed: bool,
+}
+
+/// Result of applying one authenticated Volume integrity scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrityReportResult {
     pub resource_version: ResourceVersion,
     pub replayed: bool,
 }
@@ -324,7 +404,7 @@ async fn validate_materialization_route_fence(
         || route.route_generation != route_generation
     {
         return Err(invalid(
-            CentralErrorCode::ConcurrentUpdate,
+            CentralErrorCode::GatewayRouteFenced,
             "materialization route generation changed since the Batch was planned",
         ));
     }
@@ -353,7 +433,7 @@ async fn validate_materialization_owner_fence(
         || record.owner.owner_generation.get() != placement_generation.get()
     {
         return Err(invalid(
-            CentralErrorCode::ConcurrentUpdate,
+            CentralErrorCode::GatewayRouteFenced,
             "materialization Volume owner generation changed since the Batch was planned",
         ));
     }
@@ -568,6 +648,7 @@ impl ControlPlane {
             placement: authority.placement(),
             gateway_registry: authority.gateway_registry(),
             replication_ticket_keyring: None,
+            task_coordinator: None,
             clock,
         }
     }
@@ -589,6 +670,15 @@ impl ControlPlane {
         self
     }
 
+    /// Installs the unified operation-task coordinator used to mirror materialization state and
+    /// progress into the task/audit authority. Focused control-plane tests may omit it; the
+    /// production runtime always wires the coordinator from the SQLite authority.
+    #[must_use]
+    pub fn with_task_coordinator(mut self, coordinator: Arc<TaskCoordinator>) -> Self {
+        self.task_coordinator = Some(coordinator);
+        self
+    }
+
     /// Installs the Gateway route registry used to refresh session/route generations when a
     /// control channel reconnects. The immutable Agent, Volume, cluster, and pool bindings stay
     /// on the Replication record; only the live transport generations are refreshed.
@@ -596,6 +686,348 @@ impl ControlPlane {
     pub fn with_gateway_registry(mut self, registry: Arc<dyn GatewayRegistryRepository>) -> Self {
         self.gateway_registry = Some(registry);
         self
+    }
+
+    fn materialization_task_state(state: MaterializationJobState) -> TaskState {
+        match state {
+            MaterializationJobState::Queued => TaskState::Queued,
+            MaterializationJobState::Planning | MaterializationJobState::Materializing => {
+                TaskState::Running
+            }
+            MaterializationJobState::WaitingForSources => TaskState::Waiting,
+            MaterializationJobState::Verifying => TaskState::Verifying,
+            MaterializationJobState::Complete => TaskState::Succeeded,
+            MaterializationJobState::Stalled => TaskState::Stalled,
+            MaterializationJobState::Failed => TaskState::Failed,
+            MaterializationJobState::Cancelled => TaskState::Cancelled,
+        }
+    }
+
+    /// Mirrors the durable materialization aggregate into its unified operation task. The
+    /// materialization repository remains authoritative for object/Batch facts; this helper only
+    /// updates the coarse task state and latest progress summary used by operations screens.
+    async fn sync_materialization_task(
+        &self,
+        job: &MaterializationJob,
+        actor: TaskActor,
+        issue: Option<TaskIssue>,
+    ) -> CentralResult<()> {
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok(());
+        };
+        let repository = coordinator.repository();
+        let Some(current) = repository
+            .get(&job.key.tenant_id, &job.operation_task_id)
+            .await?
+        else {
+            // Standalone/legacy materializations can predate the unified task row. They remain
+            // queryable through the domain API and are deliberately not mutated here.
+            tracing::debug!(
+                materialization_id = %job.materialization_id,
+                task_id = %job.operation_task_id,
+                "materialization has no operation task to synchronize"
+            );
+            return Ok(());
+        };
+        let desired = Self::materialization_task_state(job.state);
+        if current.state.is_terminal() && current.state != desired {
+            // A cancelled/succeeded task is an explicit operator decision or completed history;
+            // a late data-plane report must not resurrect or regress it.
+            tracing::debug!(
+                materialization_id = %job.materialization_id,
+                task_id = %job.operation_task_id,
+                task_state = ?current.state,
+                materialization_state = ?job.state,
+                "ignoring materialization state that would regress a terminal operation task"
+            );
+            return Ok(());
+        }
+
+        let mut task_state = current.state;
+        // The domain state machine intentionally requires an active state before success or
+        // verification. A reconnected Agent may deliver the final receipt while the task still
+        // says queued/stalled, so advance through Running before the terminal/verification state.
+        let requires_running = (desired == TaskState::Succeeded
+            && matches!(
+                task_state,
+                TaskState::Queued | TaskState::Waiting | TaskState::Stalled
+            ))
+            || (desired == TaskState::Verifying
+                && matches!(task_state, TaskState::Queued | TaskState::Stalled))
+            || (desired == TaskState::Waiting && task_state == TaskState::Stalled);
+        if requires_running {
+            let resumed = match coordinator
+                .transition_with_issue(
+                    &job.operation_task_id,
+                    &job.key.tenant_id,
+                    TaskState::Running,
+                    actor.clone(),
+                    None,
+                    Some("materialization resumed".to_owned()),
+                )
+                .await
+            {
+                Ok(updated) => updated,
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        CentralErrorCode::ConcurrentUpdate
+                            | CentralErrorCode::ResourceNotFound
+                            | CentralErrorCode::InvalidState
+                    ) =>
+                {
+                    return Ok(())
+                }
+                Err(error) => return Err(error),
+            };
+            task_state = resumed.state;
+        }
+        if task_state != desired || current.issue != issue {
+            match coordinator
+                .transition_with_issue(
+                    &job.operation_task_id,
+                    &job.key.tenant_id,
+                    desired,
+                    actor.clone(),
+                    issue,
+                    Some(format!("materialization state: {:?}", job.state)),
+                )
+                .await
+            {
+                Ok(updated) => task_state = updated.state,
+                Err(error) if error.code() == CentralErrorCode::ConcurrentUpdate => return Ok(()),
+                Err(error) if error.code() == CentralErrorCode::ResourceNotFound => return Ok(()),
+                Err(error) if error.code() == CentralErrorCode::InvalidState => {
+                    tracing::debug!(
+                        materialization_id = %job.materialization_id,
+                        task_id = %job.operation_task_id,
+                        %error,
+                        "operation task state changed before materialization mirror"
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if task_state != TaskState::Cancelled {
+            let progress = TaskProgressSummary::new(
+                job.verified_object_count.get(),
+                job.object_count.get(),
+                job.verified_bytes.get(),
+                job.total_bytes.get(),
+            );
+            match coordinator
+                .update_progress(&job.operation_task_id, &job.key.tenant_id, progress)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.code() == CentralErrorCode::ConcurrentUpdate => {}
+                Err(error) if error.code() == CentralErrorCode::ResourceNotFound => {}
+                Err(error) if error.code() == CentralErrorCode::InvalidState => {
+                    tracing::debug!(
+                        materialization_id = %job.materialization_id,
+                        task_id = %job.operation_task_id,
+                        %error,
+                        "operation task progress changed before materialization mirror"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Refreshes only the ephemeral transport generations of an active materialization Batch.
+    ///
+    /// Agent reconnects advance the session and route fences without changing the Volume owner
+    /// or the selected object Placements. Reusing the durable Batch in that case preserves its
+    /// staging checkpoint and avoids making a reconnect look like a permanently unavailable
+    /// source. Owner/mount changes remain hard fences and are handled by the recovery path below.
+    async fn refresh_materialization_batch_routes(
+        &self,
+        placement: &dyn PlacementRepository,
+        batch: &MaterializationBatch,
+    ) -> CentralResult<MaterializationBatch> {
+        let Some(registry) = &self.gateway_registry else {
+            return Ok(batch.clone());
+        };
+        let now = self.clock.now();
+        let mut refreshed = batch.clone();
+        for (agent_id, edge_cluster_id, gateway_pool_id, session, route) in [
+            (
+                &batch.target.agent_id,
+                &batch.target.edge_cluster_id,
+                &batch.target.gateway_pool_id,
+                batch.target.session_generation,
+                batch.target.route_generation,
+            ),
+            (
+                &batch.source.agent_id,
+                &batch.source.edge_cluster_id,
+                &batch.source.gateway_pool_id,
+                batch.source.session_generation,
+                batch.source.route_generation,
+            ),
+        ] {
+            let current = registry
+                .get_agent_route(agent_id)
+                .await?
+                .filter(|candidate| candidate.is_active_at(now))
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::GatewayRouteUnavailable,
+                        "materialization route is unavailable after Agent reconnect",
+                    )
+                })?;
+            if current.edge_cluster_id != *edge_cluster_id
+                || current.gateway_pool_id != *gateway_pool_id
+                || current.session_generation < session
+                || current.route_generation < route
+            {
+                return Err(invalid(
+                    CentralErrorCode::GatewayRouteFenced,
+                    "materialization route identity or generation moved backwards",
+                ));
+            }
+            if agent_id == &batch.target.agent_id {
+                refreshed.target.session_generation = current.session_generation;
+                refreshed.target.route_generation = current.route_generation;
+            } else {
+                refreshed.source.session_generation = current.session_generation;
+                refreshed.source.route_generation = current.route_generation;
+            }
+        }
+        if refreshed == *batch {
+            return Ok(refreshed);
+        }
+        placement
+            .replace_materialization_batch(crate::MaterializationBatchCasRequest {
+                tenant_id: batch.target.tenant_id.clone(),
+                object_namespace_id: batch.target.object_namespace_id.clone(),
+                materialization_id: batch.materialization_id.clone(),
+                batch_id: batch.batch_id.clone(),
+                expected_plan_revision: batch.plan_revision,
+                expected_batch_attempt: batch.batch_attempt,
+                batch: refreshed,
+            })
+            .await
+    }
+
+    /// Converts a delivery-time route/deadline failure into durable recovery state. This is
+    /// deliberately idempotent and fenced: a newer plan or a terminal Batch wins the race and is
+    /// left untouched. A caller can then invoke the normal retry planner with the next revision.
+    async fn stall_materialization_batch(
+        &self,
+        batch: &MaterializationBatch,
+        issue: &'static str,
+    ) -> CentralResult<()> {
+        let Some(placement) = &self.placement else {
+            return Ok(());
+        };
+        let Some(job) = placement
+            .get_materialization(
+                &batch.target.tenant_id,
+                &batch.target.object_namespace_id,
+                &batch.materialization_id,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        if job.plan_revision != batch.plan_revision {
+            return Ok(());
+        }
+        let Some(current_batch) = placement
+            .list_materialization_batches(
+                &batch.target.tenant_id,
+                &batch.target.object_namespace_id,
+                &batch.materialization_id,
+            )
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.batch_id == batch.batch_id)
+        else {
+            return Ok(());
+        };
+        if matches!(
+            current_batch.state,
+            MaterializationBatchState::Succeeded | MaterializationBatchState::Failed
+        ) {
+            return Ok(());
+        }
+        let mut failed_batch = current_batch.clone();
+        failed_batch.state = MaterializationBatchState::Failed;
+        match placement
+            .replace_materialization_batch(crate::MaterializationBatchCasRequest {
+                tenant_id: job.key.tenant_id.clone(),
+                object_namespace_id: job.key.object_namespace_id.clone(),
+                materialization_id: job.materialization_id.clone(),
+                batch_id: current_batch.batch_id.clone(),
+                expected_plan_revision: current_batch.plan_revision,
+                expected_batch_attempt: current_batch.batch_attempt,
+                batch: failed_batch,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if error.code() == CentralErrorCode::ConcurrentUpdate => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        // Release protection only after the Batch CAS succeeds. If a retry won the race first,
+        // the CAS above fails and cannot accidentally release the new plan's leases.
+        release_materialization_batch_leases(placement.as_ref(), &job, &current_batch).await?;
+
+        let Some(latest) = placement
+            .get_materialization(
+                &job.key.tenant_id,
+                &job.key.object_namespace_id,
+                &job.materialization_id,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        if latest.plan_revision != job.plan_revision || latest.state.terminal() {
+            return Ok(());
+        }
+        if !latest
+            .state
+            .can_transition_to(MaterializationJobState::Stalled)
+        {
+            return Ok(());
+        }
+        let mut stalled = latest.clone();
+        stalled.state = MaterializationJobState::Stalled;
+        stalled.issue = Some(issue.to_owned());
+        stalled.updated_at_unix_ms = self.clock.now();
+        match placement
+            .replace_materialization(
+                &latest.key.tenant_id,
+                &latest.materialization_id,
+                latest.plan_revision,
+                stalled,
+            )
+            .await
+        {
+            Ok(updated) => {
+                let task_issue = Some(TaskIssue {
+                    code: issue.to_owned(),
+                    message: format!("materialization batch stalled: {issue}"),
+                    retryable: true,
+                    detail: None,
+                });
+                self.sync_materialization_task(
+                    &updated,
+                    TaskActor::Agent {
+                        agent_id: batch.target.agent_id.clone(),
+                    },
+                    task_issue,
+                )
+                .await
+            }
+            Err(error) if error.code() == CentralErrorCode::ConcurrentUpdate => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     async fn current_replication_route_generations(
@@ -889,14 +1321,40 @@ impl ControlPlane {
                             if matches!(
                                 error.code(),
                                 CentralErrorCode::GatewayRouteUnavailable
-                                    | CentralErrorCode::ConcurrentUpdate
+                                    | CentralErrorCode::GatewayRouteFenced
+                                    | CentralErrorCode::DeadlineExceeded
                             ) =>
                         {
+                            let issue = match error.code() {
+                                CentralErrorCode::DeadlineExceeded => {
+                                    "MATERIALIZATION_DEADLINE_EXPIRED"
+                                }
+                                _ => "MATERIALIZATION_ROUTE_UNAVAILABLE",
+                            };
+                            if let Err(recovery_error) =
+                                self.stall_materialization_batch(&batch, issue).await
+                            {
+                                tracing::warn!(
+                                    agent_id = %agent_id,
+                                    batch_id = %batch.batch_id,
+                                    %recovery_error,
+                                    "could not persist materialization recovery state"
+                                );
+                            }
                             tracing::debug!(
                                 agent_id = %agent_id,
                                 batch_id = %batch.batch_id,
                                 code = error.stable_code(),
-                                "skipping temporarily unavailable materialization batch"
+                                "materialization batch requires route/deadline recovery"
+                            );
+                            continue;
+                        }
+                        Err(error) if error.code() == CentralErrorCode::ConcurrentUpdate => {
+                            tracing::debug!(
+                                agent_id = %agent_id,
+                                batch_id = %batch.batch_id,
+                                code = error.stable_code(),
+                                "materialization batch changed while preparing delivery"
                             );
                             continue;
                         }
@@ -908,12 +1366,12 @@ impl ControlPlane {
                     let deadline = assignment.signed_ticket.ticket.deadline_unix_ms;
                     let envelope = action_envelope(
                         AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
-                        MessageId::new(format!(
-                            "materialization-{}-{}-{}",
-                            assignment.batch.materialization_id,
-                            assignment.batch.batch_id,
-                            assignment.batch.batch_attempt
-                        ))?,
+                        materialization_assignment_message_id(
+                            &assignment.batch.materialization_id,
+                            &assignment.batch.batch_id,
+                            assignment.batch.plan_revision,
+                            assignment.batch.batch_attempt,
+                        )?,
                         assignment.batch.target.tenant_id.clone(),
                         session_generation,
                         deadline,
@@ -934,9 +1392,6 @@ impl ControlPlane {
         batch: &MaterializationBatch,
         session_generation: SessionGeneration,
     ) -> CentralResult<Option<neoengram_domain::protocol::MaterializationAssignment>> {
-        if batch.target.session_generation != session_generation {
-            return Ok(None);
-        }
         let Some(placement) = &self.placement else {
             return Ok(None);
         };
@@ -956,6 +1411,23 @@ impl ControlPlane {
                 "materialization Batch references a missing Job",
             ));
         };
+        if job.plan_revision != batch.plan_revision
+            || job.key.object_namespace_id != batch.target.object_namespace_id
+            || job.key.target_storage_volume_id != batch.target.storage_volume_id
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "materialization Batch is stale relative to its Job",
+            ));
+        }
+        // Session/route generations are transport fences, not object identity. Refresh them
+        // after a reconnect while retaining the same Batch attempt and staging checkpoint.
+        let batch = self
+            .refresh_materialization_batch_routes(placement.as_ref(), batch)
+            .await?;
+        if batch.target.session_generation != session_generation {
+            return Ok(None);
+        }
         // Route generations are part of the signed Batch fence. Recheck both hops at delivery
         // time so a source or target reconnect cannot receive a ticket for an obsolete route.
         if let Some(gateway_registry) = &self.gateway_registry {
@@ -999,7 +1471,7 @@ impl ControlPlane {
                 .await?;
             }
         }
-        let mut batch = batch.clone();
+        let mut batch = batch;
         // Claim a queued Batch before exposing it on the reverse channel. This gives receipt
         // handling a monotonic state path (Assigned -> Transferring -> Verifying -> Succeeded)
         // while preserving the durable Batch identity across reconnects.
@@ -1017,15 +1489,6 @@ impl ControlPlane {
                     batch: claimed,
                 })
                 .await?;
-        }
-        if job.plan_revision != batch.plan_revision
-            || job.key.object_namespace_id != batch.target.object_namespace_id
-            || job.key.target_storage_volume_id != batch.target.storage_volume_id
-        {
-            return Err(invalid(
-                CentralErrorCode::ConcurrentUpdate,
-                "materialization Batch is stale relative to its Job",
-            ));
         }
         let mut tasks = placement
             .list_materialization_objects(
@@ -1101,8 +1564,17 @@ impl ControlPlane {
         );
         let ticket_id = ObjectTicketId::new(format!("ticket-{}", &ticket_digest.to_hex()[..32]))
             .map_err(CentralError::from)?;
+        // A materialization Job/Batch may live for a day, while a Central command signature is
+        // deliberately capped at the short command TTL.  The signed Ticket deadline must be the
+        // exact expiry produced by the signer; otherwise strict Ticket validation rejects every
+        // assignment before it can reach the Agent.  Keep the long Batch deadline for scheduling
+        // and use the bounded ticket deadline only for this delivery capability.
+        let (ticket_deadline, ticket_ttl_ms) =
+            materialization_ticket_window(now, batch.deadline_unix_ms)?;
         let ticket = MaterializationBatchTicket {
             ticket_id,
+            operation_task_id: job.operation_task_id.clone(),
+            task_attempt_id: job.task_attempt_id.clone(),
             materialization_id: batch.materialization_id.clone(),
             batch_id: batch.batch_id.clone(),
             plan_revision: batch.plan_revision,
@@ -1115,21 +1587,18 @@ impl ControlPlane {
             source: batch.source.clone(),
             target: batch.target.clone(),
             max_bytes: batch.max_bytes,
-            deadline_unix_ms: batch.deadline_unix_ms,
+            deadline_unix_ms: ticket_deadline,
             capability:
                 neoengram_domain::protocol::materialization::COMMIT_MATERIALIZATION_CAPABILITY_V2
                     .to_owned(),
         };
-        let remaining_ms = batch.deadline_unix_ms.get().saturating_sub(now.get());
         let signed_ticket = keyring
-            .sign_materialization_batch_ticket(
-                ticket,
-                now,
-                remaining_ms.min(DEFAULT_CENTRAL_COMMAND_TTL_MS),
-            )
+            .sign_materialization_batch_ticket(ticket, now, ticket_ttl_ms)
             .await
             .map_err(|error| invalid(CentralErrorCode::Internal, error.to_string()))?;
         let assignment = neoengram_domain::protocol::MaterializationAssignment {
+            operation_task_id: job.operation_task_id.clone(),
+            task_attempt_id: job.task_attempt_id.clone(),
             signed_ticket,
             batch: batch.clone(),
             manifest,
@@ -1173,6 +1642,14 @@ impl ControlPlane {
                     "materialization report references an unknown Job",
                 )
             })?;
+        if job.operation_task_id != *report.operation_task_id()
+            || job.task_attempt_id != *report.task_attempt_id()
+        {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "materialization report task identity differs from the owning operation task",
+            ));
+        }
         if job.key.object_namespace_id != *report.object_namespace_id() {
             return Err(invalid(
                 CentralErrorCode::ConcurrentUpdate,
@@ -1510,6 +1987,27 @@ impl ControlPlane {
                         state = next_state;
                     }
                 }
+                // The Placement authority updates the Job counters/state as part of the receipt
+                // durability barrier. Mirror that latest aggregate into the operation task only
+                // after the receipt and Batch CAS have succeeded, so task progress never gets
+                // ahead of durable object evidence.
+                if let Some(latest_job) = placement
+                    .get_materialization(
+                        tenant_id,
+                        &batch.target.object_namespace_id,
+                        &materialization_id,
+                    )
+                    .await?
+                {
+                    self.sync_materialization_task(
+                        &latest_job,
+                        TaskActor::Agent {
+                            agent_id: agent_id.clone(),
+                        },
+                        None,
+                    )
+                    .await?;
+                }
                 Ok(MaterializationReportResult {
                     resource_version: ResourceVersion::new(1),
                     replayed,
@@ -1524,6 +2022,12 @@ impl ControlPlane {
             } => {
                 let mut replayed = false;
                 let issue = format!("{issue_code}: {issue_message}");
+                let task_issue = Some(TaskIssue {
+                    code: task_text(&issue_code),
+                    message: task_text(&issue_message),
+                    retryable: true,
+                    detail: None,
+                });
                 // Check the Batch terminal fence before mutating an object task. A second
                 // failure report for an already-failed Batch must be an exact replay or a hard
                 // conflict; updating `last_error` first would leave a partially applied state
@@ -1689,8 +2193,9 @@ impl ControlPlane {
                             "materialization Job disappeared while applying failure",
                         )
                     })?;
-                if latest_job.state.terminal() {
+                let final_job = if latest_job.state.terminal() {
                     replayed = true;
+                    latest_job
                 } else {
                     let mut next_job = latest_job.clone();
                     next_job.state = neoengram_domain::protocol::materialization::MaterializationJobState::Stalled;
@@ -1703,14 +2208,90 @@ impl ControlPlane {
                             latest_job.plan_revision,
                             next_job,
                         )
-                        .await?;
-                }
+                        .await?
+                };
+                self.sync_materialization_task(
+                    &final_job,
+                    TaskActor::Agent {
+                        agent_id: agent_id.clone(),
+                    },
+                    task_issue,
+                )
+                .await?;
                 Ok(MaterializationReportResult {
                     resource_version: ResourceVersion::new(1),
                     replayed,
                 })
             }
         }
+    }
+
+    /// Persists a complete Agent Volume scrub after validating its authenticated Volume/session
+    /// binding. Health observations are append-only by scan identity and latest-state lookups are
+    /// used by the planner to exclude confirmed missing/corrupt source objects.
+    pub async fn receive_integrity_report(
+        &self,
+        tenant_id: &neoengram_domain::protocol::TenantId,
+        agent_id: &AgentId,
+        session_generation: SessionGeneration,
+        report: IntegrityScanReport,
+    ) -> CentralResult<IntegrityReportResult> {
+        report.validate().map_err(CentralError::from)?;
+        if &report.scan.tenant_id != tenant_id {
+            return Err(invalid(
+                CentralErrorCode::AssignmentMismatch,
+                "integrity report tenant differs from its authenticated Agent session",
+            ));
+        }
+        let placement = self.placement.as_ref().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::StorageFailure,
+                "placement health authority is unavailable",
+            )
+        })?;
+        if let Some(agent_registry) = &self.agent_registry {
+            let record = agent_registry
+                .get_by_agent(agent_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::GatewayRouteUnavailable,
+                        "integrity report Agent enrollment is unavailable",
+                    )
+                })?;
+            if record.mount.storage_volume_id != report.scan.storage_volume_id
+                || record.mount.mount_generation != report.mount_generation
+                || record.owner.storage_volume_id != report.scan.storage_volume_id
+                || record.owner.active_agent_id.as_ref() != Some(agent_id)
+                || record
+                    .instance
+                    .as_ref()
+                    .and_then(|instance| instance.session_generation)
+                    != Some(session_generation)
+            {
+                return Err(invalid(
+                    CentralErrorCode::AssignmentMismatch,
+                    "integrity report mount, owner, or session generation is stale",
+                ));
+            }
+        }
+        for observation in report.observations {
+            if observation.tenant_id != *tenant_id
+                || observation.storage_volume_id != report.scan.storage_volume_id
+            {
+                return Err(invalid(
+                    CentralErrorCode::AssignmentMismatch,
+                    "integrity observation is outside the authenticated Volume scope",
+                ));
+            }
+            placement
+                .record_placement_health_observation(observation)
+                .await?;
+        }
+        Ok(IntegrityReportResult {
+            resource_version: ResourceVersion::new(1),
+            replayed: false,
+        })
     }
 
     #[allow(dead_code)]
@@ -3838,6 +4419,28 @@ impl ControlPlane {
                             delivery = catalog
                                 .replace_snapshot_delivery(expected, delivery)
                                 .await?;
+                            if assignment.action
+                                == neoengram_domain::protocol::SnapshotDeliveryAction::Materialize
+                            {
+                                let snapshot = catalog
+                                    .get_snapshot(&assignment.tenant_id, &assignment.snapshot_id)
+                                    .await?;
+                                if let Some(snapshot) = snapshot {
+                                    if snapshot.delivery_id == assignment.delivery_id
+                                        && snapshot.state == crate::SnapshotState::Creating
+                                    {
+                                        let _ = catalog
+                                            .transition_snapshot_state(
+                                                &assignment.tenant_id,
+                                                &assignment.snapshot_id,
+                                                crate::SnapshotState::Creating,
+                                                crate::SnapshotState::Ready,
+                                                self.clock.now(),
+                                            )
+                                            .await?;
+                                    }
+                                }
+                            }
                         }
                         state => {
                             return Err(invalid(
@@ -3880,6 +4483,24 @@ impl ControlPlane {
                     delivery = catalog
                         .replace_snapshot_delivery(expected, delivery)
                         .await?;
+                    let snapshot = catalog
+                        .get_snapshot(&assignment.tenant_id, &assignment.snapshot_id)
+                        .await?;
+                    if let Some(snapshot) = snapshot {
+                        if snapshot.delivery_id == assignment.delivery_id
+                            && snapshot.state == crate::SnapshotState::Creating
+                        {
+                            let _ = catalog
+                                .transition_snapshot_state(
+                                    &assignment.tenant_id,
+                                    &assignment.snapshot_id,
+                                    crate::SnapshotState::Creating,
+                                    crate::SnapshotState::Abnormal,
+                                    self.clock.now(),
+                                )
+                                .await?;
+                        }
+                    }
                     let previous = job.resource_version.get();
                     job.state = report.final_state;
                     job.failure = Some(report);
@@ -4627,16 +5248,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        action_envelope, bounded_control_error_message,
-        reconnected_replication_report_matches_route, replication_delivery_can_wait_for_next_tick,
-        target_volume_coverage_complete, ReplicationRouteGenerations, AGENT_JOB_ASSIGNMENT_ACTION,
-        CONTROL_ERROR_MESSAGE_LIMIT,
+        action_envelope, bounded_control_error_message, materialization_assignment_message_id,
+        materialization_ticket_window, reconnected_replication_report_matches_route,
+        replication_delivery_can_wait_for_next_tick, target_volume_coverage_complete,
+        ReplicationRouteGenerations, AGENT_JOB_ASSIGNMENT_ACTION, CONTROL_ERROR_MESSAGE_LIMIT,
+        MAX_CENTRAL_COMMAND_TTL_MS,
     };
     use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
     use neoengram_domain::protocol::materialization::{ObjectPlacement, ObjectPlacementState};
     use neoengram_domain::protocol::{
         AgentId, ArtifactId, CommitObject, CommitObjectSet, ControlError, ControlMessage,
-        DecimalU64, EdgeClusterId, ErrorCode, Extensions, GatewayPoolId, MessageId,
+        DecimalU64, EdgeClusterId, ErrorCode, Extensions, GatewayPoolId, Generation, MessageId,
         MountGeneration, ObjectEncoding, ObjectNamespaceId, ObjectSet, PlacementGeneration,
         PlacementId, PlacementSetId, ReplicationId, ReplicationObjectState,
         ReplicationProgressReport, ReplicationState, RequestId, RouteGeneration, SessionGeneration,
@@ -4740,6 +5362,61 @@ mod tests {
                 &CentralError::new(code, "delivery must fail closed")
             ));
         }
+    }
+
+    #[test]
+    fn materialization_ticket_window_matches_the_signed_expiry() {
+        let now = UnixMillis::new(10_000);
+        let long_batch_deadline = UnixMillis::new(
+            now.get()
+                .checked_add(MAX_CENTRAL_COMMAND_TTL_MS + 1_000)
+                .unwrap(),
+        );
+        let (ticket_deadline, ttl_ms) =
+            materialization_ticket_window(now, long_batch_deadline).unwrap();
+        assert_eq!(ttl_ms, MAX_CENTRAL_COMMAND_TTL_MS);
+        assert_eq!(ticket_deadline.get(), now.get() + ttl_ms);
+
+        let short_batch_deadline = UnixMillis::new(now.get() + 1_000);
+        let (ticket_deadline, ttl_ms) =
+            materialization_ticket_window(now, short_batch_deadline).unwrap();
+        assert_eq!(ttl_ms, 1_000);
+        assert_eq!(ticket_deadline, short_batch_deadline);
+
+        assert!(materialization_ticket_window(now, now).is_err());
+    }
+
+    #[test]
+    fn materialization_assignment_message_id_is_bounded_and_replay_stable() {
+        let materialization_id =
+            neoengram_domain::protocol::MaterializationId::new("m".repeat(128)).unwrap();
+        let batch_id =
+            neoengram_domain::protocol::MaterializationBatchId::new("b".repeat(128)).unwrap();
+        let first = materialization_assignment_message_id(
+            &materialization_id,
+            &batch_id,
+            Generation::new(7),
+            Generation::new(3),
+        )
+        .unwrap();
+        let replay = materialization_assignment_message_id(
+            &materialization_id,
+            &batch_id,
+            Generation::new(7),
+            Generation::new(3),
+        )
+        .unwrap();
+        let next_attempt = materialization_assignment_message_id(
+            &materialization_id,
+            &batch_id,
+            Generation::new(7),
+            Generation::new(4),
+        )
+        .unwrap();
+
+        assert!(first.as_str().len() <= 128);
+        assert_eq!(first, replay);
+        assert_ne!(first, next_attempt);
     }
 
     #[test]

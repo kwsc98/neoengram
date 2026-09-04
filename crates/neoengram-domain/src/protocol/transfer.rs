@@ -225,6 +225,10 @@ enum FrameKind {
     OpenMaterializationSigned = 10,
     MaterializationManifest = 11,
     MaterializationManifestPage = 12,
+    /// Network-only capability probe. It carries no business ticket or object scope; the
+    /// Gateway validates the negotiated v2 ALPN and mTLS peer before replying with Ack.
+    Preflight = 13,
+    PreflightAck = 14,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -244,6 +248,8 @@ impl TryFrom<u8> for FrameKind {
             10 => Self::OpenMaterializationSigned,
             11 => Self::MaterializationManifest,
             12 => Self::MaterializationManifestPage,
+            13 => Self::Preflight,
+            14 => Self::PreflightAck,
             _ => return Err(TransferFrameError::UnknownKind(value)),
         })
     }
@@ -258,6 +264,8 @@ pub enum TransferFrame {
     OpenMaterializationSigned(SignedMaterializationBatchTicket),
     MaterializationManifest(BatchManifest),
     MaterializationManifestPage(BatchManifestPage),
+    Preflight,
+    PreflightAck,
     ObjectRequest(ObjectRequest),
     ObjectChunk(ObjectChunk),
     ObjectProof(ObjectProof),
@@ -444,6 +452,8 @@ impl TransferFrame {
                 payload.push(FrameKind::MaterializationManifestPage as u8);
                 encode_materialization_json(&mut payload, page, "materialization_manifest_page")?;
             }
+            Self::Preflight => payload.push(FrameKind::Preflight as u8),
+            Self::PreflightAck => payload.push(FrameKind::PreflightAck as u8),
             Self::ObjectRequest(request) => {
                 payload.push(FrameKind::ObjectRequest as u8);
                 put_object_id(&mut payload, request.object_id);
@@ -569,6 +579,8 @@ impl TransferFrame {
                 })?;
                 Self::MaterializationManifestPage(page)
             }
+            FrameKind::Preflight => Self::Preflight,
+            FrameKind::PreflightAck => Self::PreflightAck,
             FrameKind::ObjectRequest => Self::ObjectRequest(ObjectRequest {
                 object_id: reader.object_id()?,
                 offset: reader.u64()?,
@@ -1098,6 +1110,28 @@ mod tests {
             bytes.len() - 4
         );
         assert_eq!(TransferFrame::decode(&bytes).unwrap(), frame);
+    }
+
+    #[test]
+    fn preflight_frames_round_trip_without_a_business_scope() {
+        for frame in [TransferFrame::Preflight, TransferFrame::PreflightAck] {
+            let bytes = frame.encode().unwrap();
+            assert_eq!(
+                bytes,
+                vec![
+                    0,
+                    0,
+                    0,
+                    1,
+                    if frame == TransferFrame::Preflight {
+                        13
+                    } else {
+                        14
+                    }
+                ]
+            );
+            assert_eq!(TransferFrame::decode(&bytes).unwrap(), frame);
+        }
     }
 
     #[test]
